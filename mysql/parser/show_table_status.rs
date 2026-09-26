@@ -92,7 +92,11 @@ mod tests {
 
     #[test]
     fn reads_show_table_status_and_leaves_its_neighbours_alone() {
-        for sql in ["SHOW TABLE STATUS", "show table status", "SHOW TABLE STATUS;"] {
+        for sql in [
+            "SHOW TABLE STATUS",
+            "show table status",
+            "SHOW TABLE STATUS;",
+        ] {
             let command = parse(sql).unwrap_or_else(|| panic!("{sql}"));
             assert_eq!(command.database(), None, "{sql}");
             assert!(command.pattern().is_none(), "{sql}");

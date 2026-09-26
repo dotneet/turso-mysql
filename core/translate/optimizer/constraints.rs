@@ -651,7 +651,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable,
+                                usable: usable
+                                    && !schema.is_builtin_mysql_decimal_type(&table_column.ty_str),
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
@@ -751,7 +752,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable,
+                                usable: usable
+                                    && !schema.is_builtin_mysql_decimal_type(&table_column.ty_str),
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
@@ -1959,6 +1961,7 @@ pub(crate) fn summarize_binary_term_for_index(
     expr: &ast::Expr,
     table_id: TableInternalId,
     table_reference: &JoinedTable,
+    schema: &Schema,
     query_where_clause: &[WhereTerm],
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
@@ -1972,6 +1975,12 @@ pub(crate) fn summarize_binary_term_for_index(
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    if table_col_pos.is_some_and(|column| {
+        schema.is_builtin_mysql_decimal_type(&table_reference.table.columns()[column].ty_str)
+    }) {
+        return None;
+    }
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2033,6 +2042,12 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+
+    if table_col_pos.is_some_and(|column| {
+        schema.is_builtin_mysql_decimal_type(&table_reference.table.columns()[column].ty_str)
+    }) {
+        return None;
+    }
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(

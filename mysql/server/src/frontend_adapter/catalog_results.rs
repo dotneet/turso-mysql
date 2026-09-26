@@ -631,6 +631,8 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             return Err(FrontendErrorKind::Internal);
         }
         let column_type = show_column_type_name(&column)?;
+        let (character_maximum_length, numeric_precision, numeric_scale, collation_name) =
+            information_schema_column_sizes(&column, &column_type);
         let extra = show_column_extra(column.extra())?;
         let default = match column.default_value() {
             Some(MySqlColumnDefault::Text(value)) if value.len() > MAX_TEXT_ROW_VALUE_LENGTH => {
@@ -659,6 +661,10 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             key.len(),
             extra.len(),
             column.comment().len(),
+            character_maximum_length.as_ref().map_or(0, Vec::len),
+            numeric_precision.as_ref().map_or(0, Vec::len),
+            numeric_scale.as_ref().map_or(0, Vec::len),
+            collation_name.as_ref().map_or(0, Vec::len),
         ];
         if value_lengths
             .iter()
@@ -708,6 +714,10 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             Some(key.to_vec()),
             Some(extra.to_vec()),
             Some(column.comment().as_bytes().to_vec()),
+            character_maximum_length,
+            numeric_precision,
+            numeric_scale,
+            collation_name,
         ];
         // The row holds what the query named, in the order it named it.
         rows.push(
@@ -739,7 +749,79 @@ fn information_schema_columns_position(column: MySqlInformationSchemaColumnsColu
         MySqlInformationSchemaColumnsColumn::ColumnKey => 6,
         MySqlInformationSchemaColumnsColumn::Extra => 7,
         MySqlInformationSchemaColumnsColumn::ColumnComment => 8,
+        MySqlInformationSchemaColumnsColumn::CharacterMaximumLength => 9,
+        MySqlInformationSchemaColumnsColumn::NumericPrecision => 10,
+        MySqlInformationSchemaColumnsColumn::NumericScale => 11,
+        MySqlInformationSchemaColumnsColumn::CollationName => 12,
     }
+}
+
+type InformationSchemaColumnSizes = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn information_schema_column_sizes(
+    column: &MySqlColumnMetadata,
+    column_type: &[u8],
+) -> InformationSchemaColumnSizes {
+    let data_type = the_type_without_its_own_words(column_type);
+    let characters = match data_type {
+        b"char" | b"varchar" | b"varbinary" => column.character_length().map(u64::from),
+        b"tinytext" | b"tinyblob" => Some(255),
+        b"text" | b"blob" => Some(65_535),
+        b"mediumtext" | b"mediumblob" => Some(16_777_215),
+        b"longtext" | b"longblob" => Some(4_294_967_295),
+        b"enum" => turso_mysql_parser::enum_members(column.type_name()).and_then(|members| {
+            members
+                .iter()
+                .map(|member| member.chars().count())
+                .max()
+                .map(|length| length as u64)
+        }),
+        b"set" => turso_mysql_parser::set_members(column.type_name()).map(|members| {
+            members
+                .iter()
+                .map(|member| member.chars().count() as u64)
+                .sum::<u64>()
+                + members.len().saturating_sub(1) as u64
+        }),
+        _ => None,
+    };
+    let precision = if let Some((precision, _)) = column.decimal_size() {
+        Some(precision)
+    } else {
+        match data_type {
+            b"tinyint" => Some(3),
+            b"smallint" => Some(5),
+            b"mediumint" => Some(7),
+            b"int" | b"integer" => Some(10),
+            b"bigint" if column_type.ends_with(b" unsigned") => Some(20),
+            b"bigint" => Some(19),
+            b"float" => Some(12),
+            b"double" => Some(22),
+            _ => None,
+        }
+    };
+    let scale = if let Some((_, scale)) = column.decimal_size() {
+        Some(scale)
+    } else if matches!(
+        data_type,
+        b"tinyint" | b"smallint" | b"mediumint" | b"int" | b"integer" | b"bigint"
+    ) {
+        Some(0)
+    } else {
+        None
+    };
+    let collation = column.collation_name().map(|name| name.as_bytes().to_vec());
+    (
+        characters.map(|value| value.to_string().into_bytes()),
+        precision.map(|value| value.to_string().into_bytes()),
+        scale.map(|value| value.to_string().into_bytes()),
+        collation,
+    )
 }
 
 /// The type a column holds, without the size and the sign the declaration
@@ -849,6 +931,41 @@ pub(super) fn information_schema_columns_columns(
     );
     column_comment.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
 
+    let mut character_maximum_length = information_schema_column_definition(
+        "CHARACTER_MAXIMUM_LENGTH",
+        MYSQL_TYPE_LONGLONG,
+        21,
+        MYSQL_BINARY_COLLATION,
+        false,
+    );
+    character_maximum_length.flags = MYSQL_NUM_FLAG;
+
+    let mut numeric_precision = information_schema_column_definition(
+        "NUMERIC_PRECISION",
+        MYSQL_TYPE_LONGLONG,
+        10,
+        MYSQL_BINARY_COLLATION,
+        false,
+    );
+    numeric_precision.flags = MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG;
+
+    let mut numeric_scale = information_schema_column_definition(
+        "NUMERIC_SCALE",
+        MYSQL_TYPE_LONGLONG,
+        10,
+        MYSQL_BINARY_COLLATION,
+        false,
+    );
+    numeric_scale.flags = MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG;
+
+    let collation_name = information_schema_column_definition(
+        "COLLATION_NAME",
+        MYSQL_TYPE_VAR_STRING,
+        256,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+
     let whole = [
         column_name,
         ordinal_position,
@@ -859,6 +976,10 @@ pub(super) fn information_schema_columns_columns(
         column_key,
         extra,
         column_comment,
+        character_maximum_length,
+        numeric_precision,
+        numeric_scale,
+        collation_name,
     ];
     projected
         .iter()
@@ -1216,15 +1337,13 @@ fn show_create_table_columns(statement_length: usize) -> Vec<ColumnDefinitionCon
 /// included. The comment is the text the column was declared with, empty where
 /// it was declared with none.
 ///
-/// `Privileges` is answered NULL. MySQL reports the connected user's grants on
-/// the column, and this server's grants are per database and per table rather
-/// than per column, so it does not keep the figure — the same answer `SHOW
-/// TABLE STATUS` gives for the storage figures InnoDB keeps and this does not.
-/// The column is nullable in MySQL too, so NULL is a value a client can read.
+/// The connected user's effective table grants supply `Privileges`. This
+/// frontend has no separate column grants.
 pub(super) fn show_columns_result(
     columns: Vec<MySqlColumnMetadata>,
     status_flags: u16,
     full: bool,
+    privileges: &[u8],
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if columns.len() > MAX_DISPATCH_RESULT_ROWS {
         return Err(FrontendErrorKind::Internal);
@@ -1244,10 +1363,7 @@ pub(super) fn show_columns_result(
             Some(show_column_type_name(&column)?),
         ];
         if full {
-            row.push(
-                matches!(column.type_name(), "VARCHAR" | "CHAR" | "TEXT")
-                    .then(|| b"utf8mb4_0900_ai_ci".to_vec()),
-            );
+            row.push(column.collation_name().map(|name| name.as_bytes().to_vec()));
         }
         row.extend([
             Some(if column.nullable() {
@@ -1265,7 +1381,7 @@ pub(super) fn show_columns_result(
             Some(show_column_extra(column.extra())?.to_vec()),
         ]);
         if full {
-            row.push(None);
+            row.push(Some(privileges.to_vec()));
             row.push(Some(column.comment().as_bytes().to_vec()));
         }
         checked_text_result_row_payload_len(&row)?;

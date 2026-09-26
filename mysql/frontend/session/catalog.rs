@@ -847,7 +847,12 @@ impl MySqlConnection {
     /// name that is not there answers the way MySQL's does rather than
     /// silently analysing everything.
     pub fn analyze_table(&self, table: &MySqlTableName) -> Result<()> {
-        if self.inner.current_schema().get_table(table.as_str()).is_none() {
+        if self
+            .inner
+            .current_schema()
+            .get_table(table.as_str())
+            .is_none()
+        {
             return Err(LimboError::SchemaUpdated);
         }
         // `ANALYZE` is the engine's own statement, not one the MySQL parser
@@ -863,7 +868,12 @@ impl MySqlConnection {
     /// found nothing wrong; otherwise the first thing it reported comes back,
     /// so a client sees what MySQL would put in `Msg_text`.
     pub fn check_table(&self, table: &MySqlTableName) -> Result<Option<String>> {
-        if self.inner.current_schema().get_table(table.as_str()).is_none() {
+        if self
+            .inner
+            .current_schema()
+            .get_table(table.as_str())
+            .is_none()
+        {
             return Err(LimboError::SchemaUpdated);
         }
         let rows = self
@@ -895,7 +905,10 @@ impl MySqlConnection {
     pub fn count_rows(&self, table: &str) -> Result<u64> {
         let table = MySqlTableName::parse(table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.as_str().replace('"', "\"\""));
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{}\"",
+            table.as_str().replace('"', "\"\"")
+        );
         let rows = self.prepare_select(&sql)?.run_collect_rows()?;
         let [row] = rows.as_slice() else {
             return Err(LimboError::InternalError(

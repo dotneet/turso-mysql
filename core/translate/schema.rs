@@ -514,6 +514,8 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::TestUintMul
         | ScalarFunc::TestUintDiv
         | ScalarFunc::NumericEncode
+        | ScalarFunc::MysqlDecimalEncode
+        | ScalarFunc::MysqlUnsignedDecimalEncode
         | ScalarFunc::NumericDecode
         | ScalarFunc::NumericAdd
         | ScalarFunc::NumericSub

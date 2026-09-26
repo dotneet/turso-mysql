@@ -2,7 +2,10 @@ use super::{
     parse_one_statement, unsupported, MySqlTableName, ParseError, SessionMySqlDialect,
     SessionSqlMode,
 };
-use sqlparser::ast::{ObjectNamePart, SetExpr, Statement};
+use sqlparser::ast::{
+    BinaryOperator, Expr, ObjectNamePart, SelectFlavor, SelectItem, SetExpr, Statement,
+    TableFactor, Value,
+};
 use sqlparser::tokenizer::{Location, Token, Tokenizer};
 
 /// One `INSERT INTO t <SELECT>` written with no column list.
@@ -11,6 +14,171 @@ pub struct MySqlInsertSelectWithoutColumns {
     table: MySqlTableName,
     replaces: bool,
     select_sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlDirectInsertSelectProjection {
+    All,
+    Columns(Vec<String>),
+    ColumnsAndLiterals(Vec<Option<String>>),
+    IntegerArithmetic(Vec<Vec<String>>),
+}
+
+/// Identifies a plain one-table copy whose projected values are stored columns.
+pub fn direct_insert_select_projection(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Option<MySqlDirectInsertSelectProjection> {
+    insert_select_projection(sql, mode, false, false)
+}
+
+pub fn filtered_insert_select_projection(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Option<MySqlDirectInsertSelectProjection> {
+    insert_select_projection(sql, mode, true, true)
+}
+
+fn insert_select_projection(
+    sql: &str,
+    mode: SessionSqlMode,
+    allow_filter: bool,
+    allow_arithmetic: bool,
+) -> Option<MySqlDirectInsertSelectProjection> {
+    let Statement::Insert(insert) = parse_one_statement(sql, mode).ok()? else {
+        return None;
+    };
+    if insert.on.is_some() || insert.ignore || insert.replace_into {
+        return None;
+    }
+    let query = insert.source.as_deref()?;
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if !matches!(select.flavor, SelectFlavor::Standard)
+        || !select.optimizer_hints.is_empty()
+        || select.distinct.is_some()
+        || select.select_modifiers.is_some()
+        || select.top.is_some()
+        || select.top_before_distinct
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || (select.selection.is_some() && !allow_filter)
+        || !select.connect_by.is_empty()
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.window_before_qualify
+        || select.value_table_mode.is_some()
+    {
+        return None;
+    }
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    if !from.joins.is_empty() || !matches!(&from.relation, TableFactor::Table { alias: None, .. }) {
+        return None;
+    }
+    if matches!(select.projection.as_slice(), [SelectItem::Wildcard(_)]) {
+        return Some(MySqlDirectInsertSelectProjection::All);
+    }
+    if allow_arithmetic {
+        let arithmetic = select
+            .projection
+            .iter()
+            .map(|item| {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return None,
+                };
+                let Expr::BinaryOp { .. } = expr else {
+                    return None;
+                };
+                let columns = integer_arithmetic_columns(expr)?;
+                (!columns.is_empty()).then_some(columns)
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(columns) = arithmetic {
+            return Some(MySqlDirectInsertSelectProjection::IntegerArithmetic(
+                columns,
+            ));
+        }
+    }
+    let values = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(column))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(column),
+                ..
+            } => Some(Some(column.value.clone())),
+            SelectItem::UnnamedExpr(Expr::Value(value))
+                if matches!(&value.value,
+                    Value::Number(written, false)
+                        if written.bytes().all(|byte| byte.is_ascii_digit())
+                            && written.parse::<i64>().is_ok())
+                    || matches!(&value.value, Value::Null) =>
+            {
+                Some(None)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if values.is_empty() {
+        return None;
+    }
+    if values.iter().all(Option::is_some) {
+        return Some(MySqlDirectInsertSelectProjection::Columns(
+            values.into_iter().map(Option::unwrap).collect(),
+        ));
+    }
+    Some(MySqlDirectInsertSelectProjection::ColumnsAndLiterals(
+        values,
+    ))
+}
+
+fn integer_arithmetic_columns(expr: &Expr) -> Option<Vec<String>> {
+    match expr {
+        Expr::Identifier(column) => Some(vec![column.value.clone()]),
+        Expr::Value(value)
+            if matches!(&value.value,
+            Value::Number(written, false)
+                if written.bytes().all(|byte| byte.is_ascii_digit())
+                    && written.parse::<i64>().is_ok()) =>
+        {
+            Some(Vec::new())
+        }
+        Expr::Nested(inner) => integer_arithmetic_columns(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply,
+            right,
+        } => {
+            let mut columns = integer_arithmetic_columns(left)?;
+            columns.extend(integer_arithmetic_columns(right)?);
+            Some(columns)
+        }
+        _ => None,
+    }
 }
 
 impl MySqlInsertSelectWithoutColumns {
@@ -269,6 +437,51 @@ fn mysql_quoted(identifier: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_insert_select_needs_plain_stored_columns() {
+        let mode = SessionSqlMode::default();
+        assert_eq!(
+            direct_insert_select_projection("INSERT INTO dst (v) SELECT v FROM src", mode),
+            Some(MySqlDirectInsertSelectProjection::Columns(vec!["v".into()]))
+        );
+        assert_eq!(
+            direct_insert_select_projection("INSERT INTO dst (id, v) SELECT * FROM src", mode),
+            Some(MySqlDirectInsertSelectProjection::All)
+        );
+        assert_eq!(
+            direct_insert_select_projection("INSERT INTO dst (id) SELECT 1 FROM src", mode),
+            Some(MySqlDirectInsertSelectProjection::ColumnsAndLiterals(vec![
+                None
+            ]))
+        );
+        assert_eq!(
+            filtered_insert_select_projection(
+                "INSERT INTO dst (count) SELECT n AS count FROM src WHERE n > 1",
+                mode,
+            ),
+            Some(MySqlDirectInsertSelectProjection::Columns(vec!["n".into()]))
+        );
+        assert_eq!(
+            filtered_insert_select_projection(
+                "INSERT INTO dst (s, d) SELECT id + 1 AS s, n * 2 AS d FROM src",
+                mode,
+            ),
+            Some(MySqlDirectInsertSelectProjection::IntegerArithmetic(vec![
+                vec!["id".into()],
+                vec!["n".into()],
+            ]))
+        );
+        for sql in [
+            "INSERT INTO dst (v) SELECT v / 2 FROM src",
+            "INSERT INTO dst (v) SELECT 1.2 FROM src",
+            "INSERT INTO dst (v) SELECT v FROM src WHERE v = 1.2",
+            "INSERT INTO dst (v) SELECT v FROM src JOIN other ON src.id = other.id",
+            "INSERT INTO dst (v) SELECT v FROM src ORDER BY v",
+        ] {
+            assert_eq!(direct_insert_select_projection(sql, mode), None, "{sql}");
+        }
+    }
 
     #[test]
     fn insert_set_is_written_out_as_the_column_list_form() {

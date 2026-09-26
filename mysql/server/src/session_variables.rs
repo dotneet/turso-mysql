@@ -53,6 +53,7 @@ pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
     /// Whether a row this session writes has to name a parent that is there.
     foreign_key_checks: bool,
+    raw_character_set_results: bool,
     /// A foreign-key switch this session asked for and the caller has not
     /// applied yet.
     pending_foreign_key_checks: Option<bool>,
@@ -76,6 +77,7 @@ impl Default for MySqlSessionVariables {
         Self {
             sql_notes: true,
             foreign_key_checks: true,
+            raw_character_set_results: false,
             pending_foreign_key_checks: None,
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
@@ -87,6 +89,10 @@ impl Default for MySqlSessionVariables {
 impl MySqlSessionVariables {
     pub(crate) const fn sql_notes(&self) -> bool {
         self.sql_notes
+    }
+
+    pub(crate) const fn raw_character_set_results(&self) -> bool {
+        self.raw_character_set_results
     }
 
     /// Takes the lock wait this session last asked for, if it asked since this
@@ -127,6 +133,12 @@ impl MySqlSessionVariables {
                     self.foreign_key_checks = enabled;
                     self.pending_foreign_key_checks = Some(enabled);
                 }
+                MySqlSessionSetting::CharacterSetResultsNull => {
+                    self.raw_character_set_results = true;
+                }
+                MySqlSessionSetting::Names { .. } => {
+                    self.raw_character_set_results = false;
+                }
                 MySqlSessionSetting::TimeZone(zone) => {
                     self.time_zone = the_zone_read_back(&zone);
                 }
@@ -165,17 +177,9 @@ impl MySqlSessionVariables {
             // server has no answer for is one it does not have. Measured on
             // MySQL 8.4.11: that is 1193, not a refusal of the statement's
             // shape.
-            return system_variable_result(
-                &query,
-                session_sql_mode,
-                settings,
-                status_flags,
-                self.foreign_key_checks,
-                self.sql_notes,
-                &self.time_zone,
-            )
-            .map(Some)
-            .ok_or(FrontendErrorKind::UnknownSystemVariable);
+            return system_variable_result(&query, session_sql_mode, settings, status_flags, self)
+                .map(Some)
+                .ok_or(FrontendErrorKind::UnknownSystemVariable);
         }
         if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -336,7 +340,17 @@ impl MySqlSessionVariables {
                     sql_notes,
                     time_zone,
                 )
-                .map(|value| vec![Some(name.as_bytes().to_vec()), Some(value.into_bytes())])
+                .map(|value| {
+                    let value = if command.scope() == MySqlVariableScope::Session
+                        && self.raw_character_set_results
+                        && name.eq_ignore_ascii_case("character_set_results")
+                    {
+                        String::new()
+                    } else {
+                        value
+                    };
+                    vec![Some(name.as_bytes().to_vec()), Some(value.into_bytes())]
+                })
             })
             .collect();
         CommandExecutionResult::ResultSet(TextResultSet {
@@ -352,7 +366,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 26] = [
+const SHOWN_VARIABLES: [&str; 27] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -370,6 +384,7 @@ const SHOWN_VARIABLES: [&str; 26] = [
     "license",
     "lower_case_table_names",
     "max_allowed_packet",
+    "net_write_timeout",
     "performance_schema",
     "sql_mode",
     "sql_notes",
@@ -446,6 +461,7 @@ fn accept_session_setting(
         // apply, and the engine's own switch says exactly what MySQL's does,
         // so both values are taken.
         MySqlSessionSetting::ForeignKeyChecks(_) => Ok(()),
+        MySqlSessionSetting::CharacterSetResultsNull => Ok(()),
         // How long to wait for a lock is the caller's to apply. MySQL takes a
         // whole number of seconds from one to 1073741824 and answers 1231 for
         // anything else, which is what this refuses.
@@ -534,9 +550,7 @@ fn system_variable_result(
     session_sql_mode: SessionSqlMode,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
-    foreign_key_checks: bool,
-    sql_notes: bool,
-    time_zone: &str,
+    session_variables: &MySqlSessionVariables,
 ) -> Option<CommandExecutionResult> {
     let mut columns = Vec::with_capacity(query.reads().len());
     let mut row = Vec::with_capacity(query.reads().len());
@@ -548,12 +562,19 @@ fn system_variable_result(
             session_sql_mode,
             settings,
             status_flags,
-            foreign_key_checks,
-            sql_notes,
-            time_zone,
+            session_variables.foreign_key_checks,
+            session_variables.sql_notes,
+            &session_variables.time_zone,
         )?;
         columns.push(column);
-        row.push(Some(value.into_bytes()));
+        if session_variables.raw_character_set_results
+            && read.scope() == MySqlVariableScope::Session
+            && read.name().eq_ignore_ascii_case("character_set_results")
+        {
+            row.push(None);
+        } else {
+            row.push(Some(value.into_bytes()));
+        }
     }
     Some(CommandExecutionResult::ResultSet(TextResultSet {
         columns,
@@ -656,6 +677,9 @@ fn counted_system_variable(
     }
     if name.eq_ignore_ascii_case("max_allowed_packet") {
         return Some((settings.max_allowed_packet().to_string(), 21, true));
+    }
+    if name.eq_ignore_ascii_case("net_write_timeout") {
+        return Some((settings.net_write_timeout_seconds().to_string(), 21, true));
     }
     if name.eq_ignore_ascii_case("wait_timeout") {
         return Some((settings.wait_timeout_seconds().to_string(), 21, true));
@@ -1297,6 +1321,42 @@ mod tests {
     }
 
     #[test]
+    fn null_result_charset_reads_back_until_set_names_resets_it() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session
+                .execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        run("SET character_set_results = NULL");
+        let CommandExecutionResult::ResultSet(read) = run("SELECT @@character_set_results") else {
+            panic!("expected a variable result");
+        };
+        assert_eq!(read.rows, vec![vec![None]]);
+        let CommandExecutionResult::ResultSet(shown) =
+            run("SHOW VARIABLES LIKE 'character_set_results'")
+        else {
+            panic!("expected a SHOW result");
+        };
+        assert_eq!(
+            named(&shown),
+            vec![("character_set_results".to_owned(), String::new())]
+        );
+        run("SET NAMES utf8mb4");
+        let CommandExecutionResult::ResultSet(read) = run("SELECT @@character_set_results") else {
+            panic!("expected a variable result");
+        };
+        assert_eq!(read.rows, vec![vec![Some(b"utf8mb4".to_vec())]]);
+    }
+
+    #[test]
     fn a_session_in_ansi_quotes_takes_the_mode_it_is_in() {
         let mut session = MySqlSessionVariables::default();
         let ansi = SessionSqlMode {
@@ -1582,6 +1642,7 @@ mod tests {
                 ("license", "MIT"),
                 ("lower_case_table_names", "1"),
                 ("max_allowed_packet", "67108864"),
+                ("net_write_timeout", "60"),
                 ("performance_schema", "OFF"),
                 (
                     "sql_mode",

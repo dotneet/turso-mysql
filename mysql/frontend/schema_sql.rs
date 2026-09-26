@@ -15,6 +15,7 @@ use turso_mysql_parser::{
 const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
 const VERSION_PREFIX: &str = "v1:";
 const V2_VERSION_PREFIX: &str = "v2:";
+const V3_VERSION_PREFIX: &str = "v3:";
 const MARKER_END: &str = "*/ ";
 
 /// Largest accepted decoded creation context.
@@ -184,10 +185,16 @@ struct StoredSchemaSqlContextV2 {
 pub struct DecodedSchemaSql<'a> {
     pub context: SchemaSqlContext,
     pub normalized_ddl: &'a str,
+    version: SchemaSqlEnvelopeVersion,
     v2_metadata: Option<SchemaSqlV2Metadata>,
 }
 
 impl DecodedSchemaSql<'_> {
+    /// Whether this row was built with the frozen UCA 9 collation.
+    pub const fn uses_uca9(&self) -> bool {
+        matches!(self.version, SchemaSqlEnvelopeVersion::V3)
+    }
+
     /// Returns the immutable database/table identities carried by a v2 envelope.
     pub const fn v2_metadata(&self) -> Option<SchemaSqlV2Metadata> {
         self.v2_metadata
@@ -336,7 +343,8 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             _ => unreachable!("checked supported MySQL schema kind"),
         }
         .map_err(|error| turso_core::LimboError::ParseError(error.to_string()))?;
-        encode_schema_sql(self.for_kind(kind), &normalized).map_err(schema_sql_error_to_limbo)
+        encode_schema_sql_v3(self.for_kind(kind), None, &normalized)
+            .map_err(schema_sql_error_to_limbo)
     }
 
     fn format_rewritten_schema_sql(
@@ -456,6 +464,36 @@ pub fn encode_schema_sql_v2(
     ))
 }
 
+/// Encode a new schema row with frozen UCA 9 collation semantics.
+///
+/// AUTO_INCREMENT tables carry the same durable identities as v2. An ordinary
+/// table, index, view, or trigger has the same canonical context as v1.
+pub fn encode_schema_sql_v3(
+    context: SchemaSqlContext,
+    metadata: Option<SchemaSqlV2Metadata>,
+    normalized_ddl: &str,
+) -> Result<String, SchemaSqlError> {
+    validate_context(context)?;
+    validate_statement(normalized_ddl)?;
+    let context_json = match metadata {
+        Some(metadata) => {
+            let stored = StoredSchemaSqlContextV2::from_context(context, metadata)?;
+            canonical_context_json_v2(&stored)?
+        }
+        None => {
+            let stored = StoredSchemaSqlContext::from_context(context)?;
+            canonical_context_json(&stored)?
+        }
+    };
+    if context_json.len() > MAX_CONTEXT_JSON_BYTES {
+        return Err(SchemaSqlError::ContextTooLong);
+    }
+    let encoded_context = URL_SAFE_NO_PAD.encode(context_json);
+    Ok(format!(
+        "{RESERVED_PREFIX}{V3_VERSION_PREFIX}{encoded_context}{MARKER_END}{normalized_ddl}"
+    ))
+}
+
 /// Re-encode a decoded row without changing its envelope version or metadata.
 ///
 /// Schema rewrites and VACUUM replay must use this helper: encoding a decoded
@@ -465,16 +503,22 @@ pub(crate) fn reencode_schema_sql(
     decoded: DecodedSchemaSql<'_>,
     normalized_ddl: &str,
 ) -> Result<String, SchemaSqlError> {
-    match decoded.v2_metadata {
-        Some(metadata) => encode_schema_sql_v2(decoded.context, metadata, normalized_ddl),
-        None => encode_schema_sql(decoded.context, normalized_ddl),
+    match (decoded.version, decoded.v2_metadata) {
+        (SchemaSqlEnvelopeVersion::V1, None) => encode_schema_sql(decoded.context, normalized_ddl),
+        (SchemaSqlEnvelopeVersion::V2, Some(metadata)) => {
+            encode_schema_sql_v2(decoded.context, metadata, normalized_ddl)
+        }
+        (SchemaSqlEnvelopeVersion::V3, metadata) => {
+            encode_schema_sql_v3(decoded.context, metadata, normalized_ddl)
+        }
+        _ => Err(SchemaSqlError::InvalidContext),
     }
 }
 
 /// Decode a stored schema row.
 ///
 /// `Ok(None)` is reserved for unmarked SQLite internal schema SQL. Any row
-/// beginning with the reserved marker namespace is either a valid v1 or v2 envelope
+/// beginning with the reserved marker namespace is either a valid v1, v2, or v3 envelope
 /// or an error; it never falls back to SQLite parsing.
 pub fn decode_schema_sql(
     expected_kind: SchemaSqlKind,
@@ -503,6 +547,8 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
             (SchemaSqlEnvelopeVersion::V1, after_version)
         } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V2_VERSION_PREFIX) {
             (SchemaSqlEnvelopeVersion::V2, after_version)
+        } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V3_VERSION_PREFIX) {
+            (SchemaSqlEnvelopeVersion::V3, after_version)
         } else {
             return Err(SchemaSqlError::UnsupportedVersion);
         };
@@ -543,9 +589,31 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
             }
             (context, Some(metadata))
         }
+        SchemaSqlEnvelopeVersion::V3 => {
+            if let Ok(stored_context) =
+                serde_json::from_slice::<StoredSchemaSqlContextV2>(&context_json)
+            {
+                let (context, metadata) = stored_context.to_context()?;
+                validate_context(context)?;
+                if canonical_context_json_v2(&stored_context)? != context_json {
+                    return Err(SchemaSqlError::NonCanonicalContext);
+                }
+                (context, Some(metadata))
+            } else {
+                let stored_context: StoredSchemaSqlContext = serde_json::from_slice(&context_json)
+                    .map_err(|_| SchemaSqlError::InvalidContext)?;
+                let context = stored_context.to_context()?;
+                validate_context(context)?;
+                if canonical_context_json(&stored_context)? != context_json {
+                    return Err(SchemaSqlError::NonCanonicalContext);
+                }
+                (context, None)
+            }
+        }
     };
     Ok(Some(DecodedSchemaSql {
         context,
+        version,
         v2_metadata,
         normalized_ddl,
     }))
@@ -555,6 +623,7 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
 enum SchemaSqlEnvelopeVersion {
     V1,
     V2,
+    V3,
 }
 
 /// Decode persisted schema SQL for the core schema loader.
@@ -925,6 +994,7 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.context, context);
         assert_eq!(decoded.v2_metadata(), None);
+        assert!(!decoded.uses_uca9());
         assert_eq!(decoded.normalized_ddl, TABLE_DDL);
     }
 
@@ -973,7 +1043,101 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.context, table_context());
         assert_eq!(decoded.v2_metadata(), Some(metadata));
+        assert!(!decoded.uses_uca9());
         assert_eq!(decoded.normalized_ddl, TABLE_DDL);
+    }
+
+    #[test]
+    fn v3_ordinary_and_counted_rows_keep_distinct_collation_semantics() {
+        let ordinary = encode_schema_sql_v3(table_context(), None, TABLE_DDL).unwrap();
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, &ordinary)
+            .unwrap()
+            .unwrap();
+        assert!(ordinary.starts_with("/*@turso:mysql-schema:v3:"));
+        assert!(decoded.uses_uca9());
+        assert_eq!(decoded.v2_metadata(), None);
+        assert_eq!(decoded.context, table_context());
+        assert_eq!(decoded.normalized_ddl, TABLE_DDL);
+
+        let metadata = v2_metadata();
+        let counted_ddl = auto_increment_ddl("counted");
+        let counted = encode_schema_sql_v3(table_context(), Some(metadata), &counted_ddl).unwrap();
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, &counted)
+            .unwrap()
+            .unwrap();
+        assert!(decoded.uses_uca9());
+        assert_eq!(decoded.v2_metadata(), Some(metadata));
+        assert_eq!(decoded.normalized_ddl, counted_ddl);
+        validate_encoded_schema_sql_catalog(metadata.database_id, [&counted]).unwrap();
+
+        let v2 = encode_schema_sql_v2(table_context(), metadata, &counted_ddl).unwrap();
+        let v2_context = v2.split_once(MARKER_END).unwrap().0;
+        let v3_context = counted.split_once(MARKER_END).unwrap().0;
+        assert_eq!(
+            v2_context.rsplit_once(':').unwrap().1,
+            v3_context.rsplit_once(':').unwrap().1
+        );
+    }
+
+    #[test]
+    fn schema_reencode_preserves_every_version_and_counted_identity() {
+        let metadata = v2_metadata();
+        for (version, original, new_ddl) in [
+            (
+                "v1",
+                encode_schema_sql(table_context(), TABLE_DDL).unwrap(),
+                plain_table_ddl("renamed"),
+            ),
+            (
+                "v2",
+                encode_schema_sql_v2(table_context(), metadata, &auto_increment_ddl("t")).unwrap(),
+                auto_increment_ddl("renamed"),
+            ),
+            (
+                "v3",
+                encode_schema_sql_v3(table_context(), None, TABLE_DDL).unwrap(),
+                plain_table_ddl("renamed"),
+            ),
+            (
+                "v3",
+                encode_schema_sql_v3(table_context(), Some(metadata), &auto_increment_ddl("t"))
+                    .unwrap(),
+                auto_increment_ddl("renamed"),
+            ),
+        ] {
+            let decoded = decode_schema_sql(SchemaSqlKind::Table, &original)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reencode_schema_sql(decoded, decoded.normalized_ddl).unwrap(),
+                original
+            );
+            let rewritten = reencode_schema_sql(decoded, &new_ddl).unwrap();
+            let after = decode_schema_sql(SchemaSqlKind::Table, &rewritten)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.uses_uca9(), decoded.uses_uca9());
+            assert_eq!(after.v2_metadata(), decoded.v2_metadata());
+            assert_eq!(after.context, decoded.context);
+            assert_eq!(after.normalized_ddl, new_ddl);
+            assert!(rewritten.starts_with(&format!("{RESERVED_PREFIX}{version}:")));
+        }
+    }
+
+    #[test]
+    fn v3_rejects_identity_metadata_on_an_index() {
+        let mut index = table_context();
+        index.kind = SchemaSqlKind::Index;
+        assert_eq!(
+            encode_schema_sql_v3(index, Some(v2_metadata()), "CREATE INDEX i ON t (id)"),
+            Err(SchemaSqlError::InvalidContext)
+        );
+        let plain = encode_schema_sql_v3(index, None, "CREATE INDEX i ON t (id)").unwrap();
+        let decoded = decode_schema_sql(SchemaSqlKind::Index, &plain)
+            .unwrap()
+            .unwrap();
+        assert!(decoded.uses_uca9());
+        assert_eq!(decoded.v2_metadata(), None);
     }
 
     #[test]
@@ -1071,7 +1235,7 @@ mod tests {
         }
 
         let unknown_version = format!(
-            "{RESERVED_PREFIX}v3:{}{MARKER_END}{TABLE_DDL}",
+            "{RESERVED_PREFIX}v4:{}{MARKER_END}{TABLE_DDL}",
             URL_SAFE_NO_PAD.encode("{}")
         );
         assert_eq!(
@@ -1285,6 +1449,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(decoded.context, formatter.for_kind(SchemaSqlKind::Table));
+        assert!(decoded.uses_uca9());
         assert_eq!(decoded.normalized_ddl, TABLE_DDL);
     }
 

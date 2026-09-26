@@ -239,20 +239,34 @@ fn a_constraint_that_cannot_be_printed_is_refused_rather_than_dropped() {
 
 #[test]
 fn a_written_word_as_the_default_of_a_column_of_numbers_is_refused() {
-    // Measured on MySQL 8.4.11: `INT DEFAULT 'x'` answers 1067, and
-    // `DECIMAL(10,2) DEFAULT '4.5'` is taken and prints `DEFAULT '4.50'`.
-    // Reading a word as a number is a rule this has not got, so the statement
-    // is refused rather than one of the two answered wrongly.
+    // Measured on MySQL 8.4.11: `INT DEFAULT 'x'` answers 1067.
     for ddl in [
         "CREATE TABLE sc_s (a INT DEFAULT 'x')",
         "CREATE TABLE sc_s (a INT DEFAULT 'it''s')",
         "CREATE TABLE sc_s (a INT DEFAULT 'one\ntwo')",
-        "CREATE TABLE sc_s (a DECIMAL(10,2) DEFAULT '4.5')",
     ] {
         let connection = connection();
         assert!(connection.execute(ddl).is_err(), "{ddl}");
         connection.close().unwrap();
     }
+}
+
+#[test]
+fn decimal_default_rounds_and_keeps_mysql_type_spelling() {
+    let connection = connection();
+    connection
+        .execute("CREATE TABLE sc_decimal (v DECIMAL(5,2) DEFAULT 1.235, u DECIMAL(5,2) UNSIGNED DEFAULT '4.5')")
+        .unwrap();
+    assert_eq!(
+        show(&connection, "sc_decimal"),
+        format!(
+            "CREATE TABLE `sc_decimal` (\n  \
+             `v` decimal(5,2) DEFAULT '1.24',\n  \
+             `u` decimal(5,2) unsigned DEFAULT '4.50'\n\
+             ) ENGINE=InnoDB{TRAILER}"
+        )
+    );
+    connection.close().unwrap();
 }
 
 #[test]

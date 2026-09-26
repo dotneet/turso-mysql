@@ -506,6 +506,7 @@ fn consume_partial_index_predicate_terms(
 pub(super) fn choose_best_in_seek_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
+    schema: &Schema,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -559,6 +560,11 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             };
             if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+                continue;
+            }
+            if constraint.table_col_pos.is_some_and(|column| {
+                schema.is_builtin_mysql_decimal_type(&rhs_table.table.columns()[column].ty_str)
+            }) {
                 continue;
             }
 
@@ -631,9 +637,11 @@ pub(super) fn choose_best_in_seek_candidate(
     Ok(best_in_seek)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
+    schema: &Schema,
     lhs_mask: &TableMask,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
@@ -643,6 +651,7 @@ fn consider_in_seek_access_method(
     choose_best_in_seek_candidate(
         rhs_table,
         rhs_constraints,
+        schema,
         lhs_mask,
         input_cardinality,
         base_row_count,
@@ -974,6 +983,7 @@ fn find_best_access_method_for_btree(
         if let Some(in_seek_method) = consider_in_seek_access_method(
             rhs_table,
             rhs_constraints,
+            schema,
             lhs_mask,
             input_cardinality,
             base_row_count,
@@ -1249,6 +1259,7 @@ pub fn try_hash_join_access_method(
     probe_cardinality: f64,
     probe_multiplier: f64,
     subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     // Only works for B-tree tables
@@ -1348,11 +1359,24 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let join_keys = find_hash_join_keys(
+    let mut join_keys = find_hash_join_keys(
         build_table.internal_id,
         probe_table.internal_id,
         equal_terms,
     );
+    join_keys.retain(|key| {
+        !hash_key_uses_mysql_decimal(
+            key.get_build_expr(where_clause),
+            build_table,
+            probe_table,
+            schema,
+        ) && !hash_key_uses_mysql_decimal(
+            key.get_probe_expr(where_clause),
+            build_table,
+            probe_table,
+            schema,
+        )
+    });
     tracing::debug!(
         build_table = build_table.table.get_name(),
         probe_table = probe_table.table.get_name(),
@@ -1487,6 +1511,28 @@ pub fn try_hash_join_access_method(
             join_type: hash_join_type,
         },
     }))
+}
+
+fn hash_key_uses_mysql_decimal(
+    expr: &ast::Expr,
+    build_table: &JoinedTable,
+    probe_table: &JoinedTable,
+    schema: &Schema,
+) -> bool {
+    let mut contains_decimal = false;
+    walk_expr(expr, &mut |part| {
+        if let ast::Expr::Column { table, column, .. } = part {
+            let source = [build_table, probe_table]
+                .into_iter()
+                .find(|source| source.internal_id == *table);
+            contains_decimal |= source
+                .and_then(|source| source.columns().get(*column))
+                .is_some_and(|column| schema.is_builtin_mysql_decimal_type(&column.ty_str));
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("checking a hash join expression cannot fail");
+    contains_decimal
 }
 
 /// Returns true when the expression is a simple column/rowid reference to the table.

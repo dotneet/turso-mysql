@@ -545,7 +545,7 @@ pub fn emit_upsert(
     // current_start itself stays encoded for trigger OLD registers and before_start.
     // After SET evaluation, we encode ALL columns in new_start before writing to disk.
     let (decoded_current_start, excluded_decoded_start) = if let Some(bt) = table.btree() {
-        if bt.is_strict {
+        if bt.is_strict || bt.has_mysql_decimal_columns() {
             // Create decoded copy of current_start for WHERE/SET expressions
             let decoded_current = program.alloc_registers(num_cols);
             program.emit_insn(Insn::Copy {
@@ -726,18 +726,20 @@ pub fn emit_upsert(
     }
 
     if let Some(bt) = table.btree() {
-        if bt.is_strict {
+        if bt.is_strict || bt.has_mysql_decimal_columns() {
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: true,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &bt,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
+            if bt.is_strict {
+                program.emit_insn(Insn::TypeCheck {
+                    start_reg: new_start,
+                    count: layout.num_non_virtual_cols(),
+                    check_generated: true,
+                    table_reference: BTreeTable::input_type_check_table_ref(
+                        &bt,
+                        resolver.schema(),
+                        None,
+                    )?,
+                });
+            }
 
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
             // and SET columns (user-facing values from expressions) need encoding
@@ -753,13 +755,16 @@ pub fn emit_upsert(
             )?;
 
             // Post-encode TypeCheck: validate encoded values match storage type.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: true,
-                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
-            });
-        } else {
+            if bt.is_strict {
+                program.emit_insn(Insn::TypeCheck {
+                    start_reg: new_start,
+                    count: layout.num_non_virtual_cols(),
+                    check_generated: true,
+                    table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
+                });
+            }
+        }
+        if !bt.is_strict {
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
             // use the converted values.

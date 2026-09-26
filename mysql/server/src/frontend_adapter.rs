@@ -41,44 +41,42 @@ use turso_mysql::{
     MySqlShowCreateTableError, MySqlShowCreateTableResult,
 };
 use turso_mysql::{
-    MySqlAffectedRowsMode, MySqlConnection, MySqlDropTableError, MySqlMarkerType,
-    MySqlAlterTableIndexError, MySqlCreateTableAsSelectError, MySqlTruncateTableError,
+    MySqlAffectedRowsMode, MySqlAlterTableIndexError, MySqlConnection,
+    MySqlCreateTableAsSelectError, MySqlDropTableError, MySqlMarkerType,
     MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
-    MySqlQueryError,
+    MySqlQueryError, MySqlTruncateTableError,
 };
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
-use turso_mysql_parser::{
-    parse_optional_drop_table, parse_optional_drop_view,
-    parse_optional_truncate_table,
-    parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
-    parse_select,
-    SessionSqlMode,
-};
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_describe, parse_optional_information_schema_columns,
-    parse_optional_information_schema_schemata, parse_optional_information_schema_tables,
+    parse_optional_account_admin_command, parse_optional_alter_table_indexes,
+    parse_optional_analyze_table, parse_optional_check_table,
+    parse_optional_create_table_as_select, parse_optional_create_table_with_keys,
+    parse_optional_created_table, parse_optional_describe, parse_optional_flush_tables,
+    parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
+    parse_optional_information_schema_tables, parse_optional_lock_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
-    parse_optional_analyze_table, parse_optional_check_table, parse_optional_flush_tables,
-    parse_optional_lock_tables, MySqlLockTablesCommand,
-    parse_optional_show_table_status,
-    parse_optional_alter_table_indexes, parse_optional_create_table_as_select,
-    rename_table_spelled_as_alter_table, parse_optional_created_table,
-    parse_optional_create_table_with_keys,
-    parse_optional_show_index, parse_optional_show_tables,
-    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlDatabaseName,
-    MySqlCatalogTable, MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
-    MySqlSelectSource,
-    MySqlTableName, ScalarFunction,
+    parse_optional_show_index, parse_optional_show_table_status, parse_optional_show_tables,
+    rename_table_spelled_as_alter_table, select_projection_origins, ArithmeticOperand,
+    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlAccountAdminCommand,
+    MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
+    MySqlInformationSchemaTablesColumn, MySqlLockTablesCommand, MySqlSelectProjectionOrigin,
+    MySqlSelectSource, MySqlTableName, ScalarFunction,
+};
+use turso_mysql_parser::{
+    parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
+    parse_optional_show_errors, parse_optional_show_warnings, parse_optional_truncate_table,
+    parse_select, SessionSqlMode,
 };
 
 use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
 #[cfg(unix)]
 use crate::{
-    authorization_frontend_error, AuthenticatedCommandExecutor, AuthenticatedExecutorFactory,
-    AuthenticatedPrincipal, AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
+    authorization_frontend_error, AccountAdministration, AdminMutation,
+    AuthenticatedCommandExecutor, AuthenticatedExecutorFactory, AuthenticatedPrincipal,
+    AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
 };
 use crate::{
     decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
@@ -102,6 +100,7 @@ const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
 pub struct MySqlBootstrapSettings {
     max_allowed_packet: usize,
     wait_timeout: Duration,
+    net_write_timeout: Duration,
 }
 
 impl MySqlBootstrapSettings {
@@ -115,7 +114,15 @@ impl MySqlBootstrapSettings {
         Self {
             max_allowed_packet,
             wait_timeout: whole_second_timeout(wait_timeout),
+            net_write_timeout: Duration::from_secs(60),
         }
+    }
+
+    /// Reports the runtime's bounded socket-write deadline to clients.
+    pub fn with_net_write_timeout(mut self, timeout: Duration) -> Self {
+        assert!(!timeout.is_zero(), "write timeout must be non-zero");
+        self.net_write_timeout = whole_second_timeout(timeout);
+        self
     }
 
     /// Returns the packet payload limit reported to the client.
@@ -131,6 +138,10 @@ impl MySqlBootstrapSettings {
     /// Returns the integer seconds reported by MySQL's `wait_timeout` value.
     pub const fn wait_timeout_seconds(self) -> u64 {
         self.wait_timeout.as_secs()
+    }
+
+    pub const fn net_write_timeout_seconds(self) -> u64 {
+        self.net_write_timeout.as_secs()
     }
 }
 
@@ -179,6 +190,7 @@ struct StatementLongData {
 struct DatabasePreparedStatement {
     database: String,
     source_tables: Vec<MySqlSelectSource>,
+    read_only_select: bool,
     connection: MySqlConnection,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
@@ -222,11 +234,20 @@ impl MySqlCommandAdapter {
         self.bootstrap_settings = MySqlBootstrapSettings::new(max_allowed_packet, wait_timeout);
         self
     }
+
+    pub fn with_net_write_timeout(mut self, timeout: Duration) -> Self {
+        self.bootstrap_settings = self.bootstrap_settings.with_net_write_timeout(timeout);
+        self
+    }
 }
 
 impl CommandExecutor for MySqlCommandAdapter {
     fn status_flags(&self) -> u16 {
         connection_status_flags(&self.connection)
+    }
+
+    fn no_backslash_escapes(&self) -> bool {
+        self.connection.parser_mode().no_backslash_escapes
     }
 
     fn execute_init_db(
@@ -292,7 +313,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             ));
         }
         self.raised_warnings.clear();
-        execute_checked_query(
+        let mut result = execute_checked_query(
             &self.connection,
             sql,
             None,
@@ -303,7 +324,15 @@ impl CommandExecutor for MySqlCommandAdapter {
                 sql_notes: self.session_variables.sql_notes(),
                 raised: &mut self.raised_warnings,
             },
-        )
+        )?;
+        if let CommandExecutionResult::ResultSet(rows) = &mut result {
+            apply_raw_column_collations(
+                &self.connection,
+                &mut rows.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+        }
+        Ok(result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -324,7 +353,17 @@ impl CommandExecutor for MySqlCommandAdapter {
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
-        prepare_checked_statement(&self.connection, sql)
+        let mut result = prepare_checked_statement(&self.connection, sql)?;
+        if let Err(error) = apply_raw_column_collations(
+            &self.connection,
+            &mut result.columns,
+            self.session_variables.raw_character_set_results(),
+        ) {
+            self.connection
+                .remove_prepared_statement(result.statement_id);
+            return Err(error);
+        }
+        Ok(result)
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
@@ -362,7 +401,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         let long_data = self.pending_long_data.take_statement(statement_id);
-        execute_prepared_statement(
+        let mut result = execute_prepared_statement(
             &self.connection,
             &mut self.prepared_types,
             statement_id,
@@ -370,7 +409,15 @@ impl CommandExecutor for MySqlCommandAdapter {
             long_data,
             None,
             MySqlAffectedRowsMode::Changed,
-        )
+        )?;
+        if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
+            apply_raw_column_collations(
+                &self.connection,
+                &mut rows.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+        }
+        Ok(result)
     }
 }
 
@@ -386,6 +433,7 @@ pub struct AuthorizedDatabaseAdapterFactory<A> {
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
 }
 
 #[cfg(unix)]
@@ -403,6 +451,7 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
             prepared_statement_authority: MySqlPreparedStatementAuthority::default(),
             query_timeout: None,
             bootstrap_settings: MySqlBootstrapSettings::default(),
+            account_administration: None,
         }
     }
 
@@ -429,6 +478,19 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
         wait_timeout: Duration,
     ) -> Self {
         self.bootstrap_settings = MySqlBootstrapSettings::new(max_allowed_packet, wait_timeout);
+        self
+    }
+
+    pub fn with_net_write_timeout(mut self, timeout: Duration) -> Self {
+        self.bootstrap_settings = self.bootstrap_settings.with_net_write_timeout(timeout);
+        self
+    }
+
+    pub fn with_account_administration(
+        mut self,
+        administration: Arc<dyn AccountAdministration>,
+    ) -> Self {
+        self.account_administration = Some(administration);
         self
     }
 }
@@ -461,6 +523,7 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             bootstrap_settings: self.bootstrap_settings,
+            account_administration: self.account_administration,
             session_variables: crate::session_variables::MySqlSessionVariables::default(),
             raised_warnings: Vec::new(),
             command_options,
@@ -484,6 +547,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
     session_variables: crate::session_variables::MySqlSessionVariables,
     /// What the last statement warned about, which `SHOW WARNINGS` reports.
     raised_warnings: Vec<MySqlWarning>,
@@ -529,6 +593,65 @@ where
         self.authorizer
             .authorize(&self.principal, action)
             .map_err(authorization_frontend_error)
+    }
+
+    fn execute_account_admin_command(
+        &self,
+        mut command: MySqlAccountAdminCommand,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        self.authorize(DatabaseAction::ManageAccounts)?;
+        let administration = self
+            .account_administration
+            .as_ref()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        if let Ok(connection) = self.session.connection() {
+            connection
+                .execute_transaction_command("COMMIT")
+                .map_err(frontend_query_error)?;
+        }
+        match &mut command {
+            MySqlAccountAdminCommand::CreateUser { username, password } => {
+                administration.apply(
+                    &self.principal,
+                    AdminMutation::CreateUser {
+                        username,
+                        password: password.as_mut_bytes(),
+                    },
+                )?;
+            }
+            MySqlAccountAdminCommand::GrantTableSelect {
+                username,
+                database,
+                table,
+            } => {
+                administration.apply(
+                    &self.principal,
+                    AdminMutation::GrantTableSelect {
+                        username,
+                        database: database.as_str(),
+                        table: table.as_str(),
+                    },
+                )?;
+            }
+            MySqlAccountAdminCommand::RevokeTableSelect {
+                username,
+                database,
+                table,
+            } => {
+                administration.apply(
+                    &self.principal,
+                    AdminMutation::RevokeTableSelect {
+                        username,
+                        database: database.as_str(),
+                        table: table.as_str(),
+                    },
+                )?;
+            }
+        }
+        Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: self.status_flags(),
+            ..CommandOkResult::default()
+        }))
     }
 
     fn authorize_table_select(&self, database: &str, table: &str) -> Result<(), FrontendErrorKind> {
@@ -595,10 +718,13 @@ where
         &self,
         database: &str,
         table: &str,
-    ) -> Result<(), FrontendErrorKind> {
+    ) -> Result<CatalogVisibility, FrontendErrorKind> {
         match self.authorize_catalog_visibility(database)? {
-            CatalogVisibility::All => Ok(()),
-            CatalogVisibility::GrantedTables => self.authorize_table_select(database, table),
+            CatalogVisibility::All => Ok(CatalogVisibility::All),
+            CatalogVisibility::GrantedTables => {
+                self.authorize_table_select(database, table)?;
+                Ok(CatalogVisibility::GrantedTables)
+            }
         }
     }
 
@@ -652,6 +778,8 @@ where
         sql: &str,
     ) -> Result<(Vec<MySqlSelectSource>, CatalogVisibility), FrontendErrorKind> {
         let source_tables = parsed_source_tables(sql);
+        let read_only_select = parse_select(sql, self.session.session_sql_mode())
+            .is_ok_and(|select| !select.locks_rows());
         match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::Query { database })
@@ -666,6 +794,9 @@ where
                 Ok((source_tables, CatalogVisibility::All))
             }
             Err(AuthorizationError::Denied) => {
+                if !read_only_select {
+                    return Err(FrontendErrorKind::AccessDenied);
+                }
                 // A join reads every table it names, so a grant on one of them
                 // is not a grant on the statement.
                 if source_tables.is_empty() {
@@ -694,6 +825,7 @@ where
         &self,
         database: &str,
         source_tables: &[MySqlSelectSource],
+        read_only_select: bool,
     ) -> Result<(), FrontendErrorKind> {
         match self
             .authorizer
@@ -701,7 +833,7 @@ where
         {
             Ok(()) => Ok(()),
             Err(AuthorizationError::Denied) => {
-                if source_tables.is_empty() {
+                if !read_only_select || source_tables.is_empty() {
                     return Err(FrontendErrorKind::AccessDenied);
                 }
                 for source in source_tables {
@@ -769,6 +901,10 @@ where
             .unwrap_or(SERVER_STATUS_AUTOCOMMIT)
     }
 
+    fn no_backslash_escapes(&self) -> bool {
+        self.session.session_sql_mode().no_backslash_escapes
+    }
+
     fn execute_init_db(
         &mut self,
         database: &str,
@@ -802,6 +938,13 @@ where
             return Ok(result);
         }
         refuse_an_unknown_system_variable(sql)?;
+        if is_account_admin_statement(sql) {
+            let command =
+                parse_optional_account_admin_command(sql, self.session.session_sql_mode())
+                    .map_err(|_| FrontendErrorKind::Syntax)?
+                    .ok_or(FrontendErrorKind::Syntax)?;
+            return self.execute_account_admin_command(command);
+        }
         if let Some(command) = self
             .session
             .parse_admin_command(sql)
@@ -954,10 +1097,14 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            self.authorize_catalog_visibility(&selected_database)?;
             let connection = self.session.connection().map_err(database_error_kind)?;
             match command {
-                MySqlLockTablesCommand::Lock => connection.lock_tables(),
+                MySqlLockTablesCommand::Lock => {
+                    self.authorize(DatabaseAction::Query {
+                        database: &selected_database,
+                    })?;
+                    connection.lock_tables()
+                }
                 MySqlLockTablesCommand::Unlock => connection.unlock_tables(),
             }
             .map_err(frontend_query_error)?;
@@ -993,18 +1140,9 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            // The same two steps every read takes: the database-wide grant
-            // first, and the table's own only when that is denied.
-            match self
-                .authorizer
-                .authorize(&self.principal, DatabaseAction::Query { database: &selected_database })
-            {
-                Ok(()) => {}
-                Err(AuthorizationError::Denied) => {
-                    self.authorize_table_select(&selected_database, command.table().as_str())?;
-                }
-                Err(error) => return Err(authorization_frontend_error(error)),
-            }
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
             self.session
                 .connection()
                 .map_err(database_error_kind)?
@@ -1067,6 +1205,9 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
+            if let Some(command) = &full_tables {
+                reject_other_database_qualifier(command.database(), &selected_database)?;
+            }
             let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let tables = self
                 .session
@@ -1158,7 +1299,8 @@ where
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
             reject_other_database_qualifier(command.database(), &selected_database)?;
-            self.authorize_catalog_table(&selected_database, command.table().as_str())?;
+            let visibility =
+                self.authorize_catalog_table(&selected_database, command.table().as_str())?;
             let columns = self
                 .session
                 .connection()
@@ -1175,7 +1317,11 @@ where
                     .collect(),
                 None => columns,
             };
-            return show_columns_result(columns, self.status_flags(), command.full());
+            let privileges = match visibility {
+                CatalogVisibility::All => b"select,insert,update,references".as_slice(),
+                CatalogVisibility::GrantedTables => b"select".as_slice(),
+            };
+            return show_columns_result(columns, self.status_flags(), command.full(), privileges);
         }
 
         let selected_database = self
@@ -1241,7 +1387,7 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
-        execute_checked_query(
+        let mut result = execute_checked_query(
             connection,
             sql,
             Some(&selected_database),
@@ -1252,7 +1398,15 @@ where
                 sql_notes: self.session_variables.sql_notes(),
                 raised: &mut self.raised_warnings,
             },
-        )
+        )?;
+        if let CommandExecutionResult::ResultSet(rows) = &mut result {
+            apply_raw_column_collations(
+                connection,
+                &mut rows.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+        }
+        Ok(result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -1307,9 +1461,18 @@ where
                 ..metadata
             },
             &type_metadata,
+            Some(sql),
             Some(&selected_database),
             &source_tables,
-        );
+        )
+        .and_then(|mut result| {
+            apply_raw_column_collations(
+                &connection,
+                &mut result.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+            Ok(result)
+        });
         if result.is_err() {
             connection.remove_prepared_statement(connection_statement_id);
             return result;
@@ -1320,6 +1483,8 @@ where
             DatabasePreparedStatement {
                 database: selected_database,
                 source_tables,
+                read_only_select: parse_select(sql, self.session.session_sql_mode())
+                    .is_ok_and(|select| !select.locks_rows()),
                 connection,
                 connection_statement_id,
                 parameter_types: None,
@@ -1376,13 +1541,19 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
-        let (database, source_tables) = self
+        let (database, source_tables, read_only_select) = self
             .prepared_statements
             .statements
             .get(&statement_id)
-            .map(|statement| (statement.database.clone(), statement.source_tables.clone()))
+            .map(|statement| {
+                (
+                    statement.database.clone(),
+                    statement.source_tables.clone(),
+                    statement.read_only_select,
+                )
+            })
             .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-        self.authorize_prepared_query(&database, &source_tables)?;
+        self.authorize_prepared_query(&database, &source_tables, read_only_select)?;
         let long_data = self.pending_long_data.take_statement(statement_id);
         let statement = self
             .prepared_statements
@@ -1394,13 +1565,21 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
-        execute_database_prepared_statement(
+        let mut result = execute_database_prepared_statement(
             statement,
             parameter_payload,
             long_data,
             self.query_timeout,
             affected_rows_mode,
-        )
+        )?;
+        if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
+            apply_raw_column_collations(
+                &statement.connection,
+                &mut rows.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+        }
+        Ok(result)
     }
 }
 
@@ -1445,6 +1624,19 @@ where
 }
 
 #[cfg(unix)]
+fn is_account_admin_statement(sql: &str) -> bool {
+    let mut words = sql.split_ascii_whitespace();
+    match words.next() {
+        Some(word) if word.eq_ignore_ascii_case("GRANT") || word.eq_ignore_ascii_case("REVOKE") => {
+            true
+        }
+        Some(word) if word.eq_ignore_ascii_case("CREATE") => words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("USER")),
+        _ => false,
+    }
+}
+
 impl<A> AuthenticatedCommandExecutor for AuthorizedDatabaseCommandAdapter<A>
 where
     A: DatabaseAuthorizer,
@@ -1699,7 +1891,7 @@ fn prepare_checked_statement(
         connection.remove_prepared_statement(connection_statement_id);
         return Err(FrontendErrorKind::Internal);
     };
-    let result = prepared_statement_result(connection, metadata, &type_metadata, None, &[]);
+    let result = prepared_statement_result(connection, metadata, &type_metadata, None, None, &[]);
     if result.is_err() {
         connection.remove_prepared_statement(connection_statement_id);
     }
@@ -1916,9 +2108,7 @@ fn execute_prepared_values(
         .map(|row| {
             row.into_iter()
                 .zip(&columns)
-                .map(|(value, column)| {
-                    binary_result_value(value, column.column_type, column.decimals)
-                })
+                .map(|(value, column)| binary_result_value(value, column))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1941,6 +2131,49 @@ fn statement_parameter_to_frontend(value: StatementParameterValue) -> MySqlPrepa
         StatementParameterValue::String(value) => MySqlPreparedValue::Text(value),
         StatementParameterValue::Bytes(value) => MySqlPreparedValue::Blob(value),
     }
+}
+
+fn apply_raw_column_collations(
+    connection: &MySqlConnection,
+    columns: &mut [ColumnDefinitionConfig],
+    raw_character_set_results: bool,
+) -> Result<(), FrontendErrorKind> {
+    if !raw_character_set_results {
+        return Ok(());
+    }
+    let mut tables = HashMap::<String, Vec<turso_mysql::MySqlColumnMetadata>>::new();
+    for definition in columns {
+        if definition.character_set != u16::from(DEFAULT_UTF8MB4_COLLATION)
+            || definition.original_table.is_empty()
+            || definition.original_name.is_empty()
+            || definition.schema.eq_ignore_ascii_case("information_schema")
+        {
+            continue;
+        }
+        let table_name = definition.original_table.as_str();
+        if !tables.contains_key(table_name) {
+            let parsed = turso_mysql_parser::MySqlTableName::parse(table_name)
+                .map_err(|_| FrontendErrorKind::Unsupported)?;
+            let metadata = connection
+                .list_columns(&parsed)
+                .map_err(|_| FrontendErrorKind::Unsupported)?;
+            tables.insert(table_name.to_owned(), metadata);
+        }
+        let column = tables[table_name]
+            .iter()
+            .find(|column| {
+                column
+                    .name()
+                    .eq_ignore_ascii_case(&definition.original_name)
+            })
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        definition.character_set = match column.collation_name() {
+            Some("utf8mb4_0900_ai_ci") => 255,
+            Some("utf8mb4_bin") => 46,
+            _ => return Err(FrontendErrorKind::Unsupported),
+        };
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1993,11 +2226,18 @@ fn binary_result_value_type(value: &MySqlPreparedValue) -> Option<u8> {
 
 fn binary_result_value(
     value: MySqlPreparedValue,
-    column_type: u8,
-    // A DECIMAL crosses as text, and MySQL writes it at the scale the column
-    // declared, so the binary protocol needs that scale as much as the text one.
-    decimals: u8,
+    column: &ColumnDefinitionConfig,
 ) -> Result<BinaryResultValue, FrontendErrorKind> {
+    let column_type = column.column_type;
+    let decimals = column.decimals;
+    if is_exact_decimal_column(column)
+        && !matches!(
+            &value,
+            MySqlPreparedValue::Null | MySqlPreparedValue::Text(_)
+        )
+    {
+        return Err(FrontendErrorKind::Internal);
+    }
     match value {
         MySqlPreparedValue::Null => Ok(BinaryResultValue::Null),
         MySqlPreparedValue::Integer(value)
@@ -2023,7 +2263,7 @@ fn binary_result_value(
             BinaryResultValue::Text(format!("{:.*}", usize::from(decimals), value)),
         ),
         MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_NEWDECIMAL => Ok(
-            BinaryResultValue::Text(format!("{:.*}", usize::from(decimals), value as f64)),
+            BinaryResultValue::Text(format_mysql_scaled_integer(value, decimals)),
         ),
         // A CHAR and a DECIMAL both cross as length-encoded text, which is
         // what MySQL sends for them.
@@ -2179,11 +2419,12 @@ fn prepared_statement_result(
     connection: &MySqlConnection,
     metadata: MySqlPreparedStatementMetadata,
     type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
+    sql: Option<&str>,
     selected_database: Option<&str>,
     source_tables: &[MySqlSelectSource],
 ) -> Result<PreparedStatementResult, FrontendErrorKind> {
     #[cfg(not(unix))]
-    let _ = (selected_database, source_tables);
+    let _ = (sql, selected_database, source_tables);
     if metadata.result_columns.len() != type_metadata.len() {
         return Err(FrontendErrorKind::Internal);
     }
@@ -2191,17 +2432,38 @@ fn prepared_statement_result(
         .map(|index| column_definition(format!("?{}", index + 1), MYSQL_TYPE_NULL))
         .collect();
     #[cfg(unix)]
+    let result_column_count = metadata.result_columns.len();
+    #[cfg(unix)]
     let source_metadata = prepared_table_result_metadata(
         connection,
         type_metadata,
         selected_database,
         source_tables,
     )?;
+    #[cfg(unix)]
+    let windowed = type_metadata
+        .iter()
+        .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
+        .any(is_window_call);
+    #[cfg(unix)]
+    let compound = source_tables.iter().any(|source| source.branch() > 0);
+    #[cfg(unix)]
+    let projection_origins = if windowed || compound {
+        sql.map(|sql| select_projection_origins(sql, connection.parser_mode()))
+            .transpose()
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let columns = metadata
         .result_columns
         .into_iter()
         .zip(type_metadata)
-        .map(|(column, type_metadata)| {
+        .enumerate()
+        .map(|(index, (column, type_metadata))| {
+            #[cfg(not(unix))]
+            let _ = index;
             if let Some(metadata) = type_metadata.static_metadata() {
                 if let Some(definition) = static_column_definition(column.name.clone(), metadata) {
                     return Ok(definition);
@@ -2226,6 +2488,31 @@ fn prepared_statement_result(
                 mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
             #[cfg(unix)]
             if let Some(source_metadata) = source_metadata.as_ref() {
+                if windowed
+                    && projection_origins.len() == 1
+                    && projection_origins[0].len() == result_column_count
+                {
+                    if let MySqlSelectProjectionOrigin::Column {
+                        table,
+                        column: source,
+                    } = &projection_origins[0][index]
+                    {
+                        if let Some((table, ordinal)) =
+                            source_metadata.projection_source(0, table.as_deref(), source)
+                        {
+                            let mut definition = source_metadata.column_definition_for_reference(
+                                Some((table.table_reference.clone(), ordinal)),
+                                column.name,
+                                Some(column_type),
+                            )?;
+                            definition.flags &= !(MYSQL_PRI_KEY_FLAG
+                                | MYSQL_PART_KEY_FLAG
+                                | MYSQL_UNIQUE_KEY_FLAG
+                                | MYSQL_AUTO_INCREMENT_FLAG);
+                            return Ok(definition);
+                        }
+                    }
+                }
                 return source_metadata.column_definition_for_reference(
                     type_metadata
                         .source_reference()
@@ -2237,6 +2524,12 @@ fn prepared_statement_result(
             Ok(column_definition(column.name, column_type))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(unix)]
+    let mut columns = columns;
+    #[cfg(unix)]
+    if compound {
+        apply_compound_nullability(&mut columns, &projection_origins, source_metadata.as_ref());
+    }
     Ok(PreparedStatementResult {
         statement_id: metadata.statement_id,
         parameters,
@@ -2456,6 +2749,15 @@ fn execute_checked_select_with_timeout(
     #[cfg(unix)]
     let windowed = static_result_metadata.iter().flatten().any(is_window_call);
     #[cfg(unix)]
+    let compound = source_tables.iter().any(|source| source.branch() > 0);
+    #[cfg(unix)]
+    let projection_origins = if windowed || compound {
+        select_projection_origins(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+    } else {
+        Vec::new()
+    };
+    #[cfg(unix)]
     let source_references = if windowed {
         Vec::new()
     } else {
@@ -2476,6 +2778,7 @@ fn execute_checked_select_with_timeout(
         // A `LAG` reads a column and the engine points at the window's sorter,
         // so the table has to be looked up even though nothing points at it.
         windowed
+            || compound
             || static_result_metadata
                 .iter()
                 .flatten()
@@ -2499,12 +2802,37 @@ fn execute_checked_select_with_timeout(
                     return Err(FrontendErrorKind::Unsupported);
                 }
                 None => {
-                    // A windowed statement's other columns have no provenance
-                    // left to report: the engine answers them out of the
-                    // window's own sorter.
                     #[cfg(unix)]
-                    if !windowed {
-                        if let Some(source_metadata) = source_metadata.as_ref() {
+                    if let Some(source_metadata) = source_metadata.as_ref() {
+                        if windowed {
+                            // The sorter drops source references. A result
+                            // name that uniquely names a source column still
+                            // has enough information to restore its table and
+                            // nullability. MySQL drops its key flags here.
+                            if projection_origins.len() == 1
+                                && projection_origins[0].len() == column_count
+                            {
+                                if let MySqlSelectProjectionOrigin::Column { table, column } =
+                                    &projection_origins[0][index]
+                                {
+                                    if let Some((table, ordinal)) = source_metadata
+                                        .projection_source(0, table.as_deref(), column)
+                                    {
+                                        let mut definition = source_metadata
+                                            .column_definition_for_reference(
+                                                Some((table.table_reference.clone(), ordinal)),
+                                                name,
+                                                column_types[index],
+                                            )?;
+                                        definition.flags &= !(MYSQL_PRI_KEY_FLAG
+                                            | MYSQL_PART_KEY_FLAG
+                                            | MYSQL_UNIQUE_KEY_FLAG
+                                            | MYSQL_AUTO_INCREMENT_FLAG);
+                                        return Ok(definition);
+                                    }
+                                }
+                            }
+                        } else {
                             return source_metadata.column_definition(
                                 &statement,
                                 index,
@@ -2521,6 +2849,12 @@ fn execute_checked_select_with_timeout(
             }
         })
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(unix)]
+    let mut columns = columns;
+    #[cfg(unix)]
+    if compound {
+        apply_compound_nullability(&mut columns, &projection_origins, source_metadata.as_ref());
+    }
     let rendering = columns
         .iter()
         .map(TextValueRendering::for_column)
@@ -2596,6 +2930,8 @@ fn execute_checked_select_with_timeout(
 struct SourceTableColumns {
     source_table: String,
     table_reference: String,
+    branch: usize,
+    subquery: bool,
     columns: Vec<MySqlColumnMetadata>,
     /// An `information_schema` table's columns, whose shapes are the ones
     /// MySQL reports for them rather than shapes read out of stored DDL. A
@@ -2686,6 +3022,95 @@ impl TableResultMetadata {
             found = Some((table, ordinal));
         }
         found.ok_or(FrontendErrorKind::UnknownColumn)
+    }
+
+    fn projection_source(
+        &self,
+        branch: usize,
+        table_name: Option<&str>,
+        column_name: &str,
+    ) -> Option<(&SourceTableColumns, usize)> {
+        let mut matches = self
+            .tables
+            .iter()
+            .filter(|table| {
+                table.branch == branch
+                    && !table.subquery
+                    && table_name
+                        .is_none_or(|name| table.table_reference.eq_ignore_ascii_case(name))
+            })
+            .filter_map(|table| {
+                let ordinal = if !table.projected_columns.is_empty() {
+                    table
+                        .projected_columns
+                        .iter()
+                        .position(|name| name.eq_ignore_ascii_case(column_name))
+                } else if !table.catalog_columns.is_empty() {
+                    table
+                        .catalog_columns
+                        .iter()
+                        .position(|column| column.name.eq_ignore_ascii_case(column_name))
+                } else {
+                    table
+                        .columns
+                        .iter()
+                        .position(|column| column.name().eq_ignore_ascii_case(column_name))
+                }?;
+                Some((table, ordinal))
+            });
+        let one = matches.next()?;
+        matches.next().is_none().then_some(one)
+    }
+
+    fn projection_is_not_null(
+        &self,
+        branch: usize,
+        origin: &MySqlSelectProjectionOrigin,
+    ) -> Option<bool> {
+        match origin {
+            MySqlSelectProjectionOrigin::NonNullLiteral => Some(true),
+            MySqlSelectProjectionOrigin::Null => Some(false),
+            MySqlSelectProjectionOrigin::Other => None,
+            MySqlSelectProjectionOrigin::Column { table, column } => {
+                let (source, ordinal) = self.projection_source(branch, table.as_deref(), column)?;
+                let ordinal = source.column_ordinal(ordinal).ok()?;
+                if let Some(column) = source.columns.get(ordinal) {
+                    Some(!column.nullable() && !source.outer)
+                } else {
+                    source
+                        .catalog_columns
+                        .get(ordinal)
+                        .map(|column| column.flags & MYSQL_NOT_NULL_FLAG != 0 && !source.outer)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn apply_compound_nullability(
+    columns: &mut [ColumnDefinitionConfig],
+    branches: &[Vec<MySqlSelectProjectionOrigin>],
+    source_metadata: Option<&TableResultMetadata>,
+) {
+    if branches.len() < 2 || branches.iter().any(|branch| branch.len() != columns.len()) {
+        return;
+    }
+    for (index, definition) in columns.iter_mut().enumerate() {
+        let all_not_null =
+            branches
+                .iter()
+                .enumerate()
+                .all(|(branch, origins)| match &origins[index] {
+                    MySqlSelectProjectionOrigin::NonNullLiteral => true,
+                    MySqlSelectProjectionOrigin::Null | MySqlSelectProjectionOrigin::Other => false,
+                    origin @ MySqlSelectProjectionOrigin::Column { .. } => source_metadata
+                        .and_then(|metadata| metadata.projection_is_not_null(branch, origin))
+                        .unwrap_or(false),
+                });
+        if all_not_null {
+            definition.flags |= MYSQL_NOT_NULL_FLAG;
+        }
     }
 }
 
@@ -2941,6 +3366,10 @@ impl TableResultMetadata {
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         } else if kind != ColumnAggregateKind::MinMax {
             apply_summing_aggregate_metadata(&mut definition, source, kind)?;
+        } else if source.type_name() == "TEXT" {
+            // MySQL gives MIN/MAX over TEXT the aggregate's own width, rather
+            // than the width of the TEXT column it reads.
+            definition.column_length = 1_048_560;
         }
         definition.schema.clear();
         definition.table.clear();
@@ -2968,7 +3397,7 @@ impl TableResultMetadata {
         Ok(definition)
     }
 
-    /// Builds the result column an integer arithmetic expression reports.
+    /// Builds the result column an arithmetic expression reports.
     ///
     /// Measured on MySQL 8.4.11. `+` and `-` give a precision of
     /// `max(left, right) + 1` and `*` gives `left + right`, and the reported
@@ -3004,7 +3433,15 @@ impl TableResultMetadata {
             );
             return Ok(definition);
         }
-        if precision > MYSQL_MAX_DECIMAL_PRECISION {
+        let max_precision = MYSQL_MAX_DECIMAL_PRECISION
+            + u32::from(
+                decimal
+                    && matches!(
+                        shape.operator,
+                        ArithmeticOperator::Add | ArithmeticOperator::Subtract
+                    ),
+            );
+        if precision > max_precision {
             return Err(FrontendErrorKind::Unsupported);
         }
         let column_type = if decimal {
@@ -3070,6 +3507,13 @@ impl TableResultMetadata {
                 precision: *digit_count,
                 scale: 0,
                 decimal: false,
+                float: false,
+                not_null: true,
+            }),
+            ArithmeticOperand::DecimalLiteral { precision, scale } => Ok(ArithmeticOperandShape {
+                precision: *precision,
+                scale: *scale,
+                decimal: true,
                 float: false,
                 not_null: true,
             }),
@@ -3140,8 +3584,16 @@ impl TableResultMetadata {
                 // A SUM and an AVG answer a decimal whatever they were given;
                 // a MIN and a MAX answer the column's own kind.
                 let (precision, scale, decimal) = match kind {
-                    ColumnAggregateKind::Sum => (precision + 22, scale, true),
-                    ColumnAggregateKind::Avg => (precision + 4, scale + 4, true),
+                    ColumnAggregateKind::Sum => (
+                        (precision + 22).min(MYSQL_MAX_DECIMAL_PRECISION),
+                        scale,
+                        true,
+                    ),
+                    ColumnAggregateKind::Avg => (
+                        (precision + 4).min(MYSQL_MAX_DECIMAL_PRECISION),
+                        (scale + 4).min(MYSQL_MAX_DECIMAL_SCALE),
+                        true,
+                    ),
                     ColumnAggregateKind::MinMax => {
                         (precision, scale, source.decimal_size().is_some())
                     }
@@ -3200,8 +3652,10 @@ struct ArithmeticOperandShape {
 /// the widest scale and add a digit — `amount + 1` over a `DECIMAL(10,2)`
 /// answers 11 digits with 2 places, and `SUM(n) + SUM(amount)` 35 with 2.
 /// Multiplying adds both precisions and both scales: `SUM(amount) * 2` answers
-/// 33 with 2. Dividing widens the left side by four digits and four places
-/// whatever the right side is: `AVG(n) / 2` answers 18 with 8.
+/// 33 with 2. Dividing widens the left side by four digits and four places,
+/// plus the divisor's scale in the precision: `AVG(n) / 2` answers 18 with 8.
+/// Multiplication and division stop at 65 digits and 30 decimal places for wide decimals;
+/// addition can report a 66th digit for a carry.
 #[cfg(unix)]
 fn arithmetic_result_shape(
     operator: ArithmeticOperator,
@@ -3231,18 +3685,27 @@ fn arithmetic_result_shape(
                 not_null: left.not_null && right.not_null,
             }
         }
-        ArithmeticOperator::Multiply => ArithmeticOperandShape {
-            precision: left.precision + right.precision,
-            scale: left.scale + right.scale,
-            decimal: left.decimal || right.decimal,
-            float: false,
-            not_null: left.not_null && right.not_null,
-        },
+        ArithmeticOperator::Multiply => {
+            let decimal = left.decimal || right.decimal;
+            let precision = left.precision + right.precision;
+            let scale = left.scale + right.scale;
+            ArithmeticOperandShape {
+                precision: if decimal {
+                    precision.min(MYSQL_MAX_DECIMAL_PRECISION)
+                } else {
+                    precision
+                },
+                scale: scale.min(MYSQL_MAX_DECIMAL_SCALE),
+                decimal,
+                float: false,
+                not_null: left.not_null && right.not_null,
+            }
+        }
         // A division always answers a decimal, whichever whole numbers it was
         // given: MySQL's `/` is decimal division.
         ArithmeticOperator::Divide => ArithmeticOperandShape {
-            precision: left.precision + 4,
-            scale: left.scale + 4,
+            precision: (left.precision + 4 + right.scale).min(MYSQL_MAX_DECIMAL_PRECISION),
+            scale: (left.scale + 4).min(MYSQL_MAX_DECIMAL_SCALE),
             decimal: true,
             float: false,
             not_null: false,
@@ -3257,8 +3720,9 @@ fn arithmetic_result_shape(
 /// `SMALLINT` 28, `MEDIUMINT` 31, `INT` 33, `BIGINT` 42, and `DECIMAL(10,2)` 34
 /// with 2 decimals. An `AVG` widens precision by 4 and scale by 4: over
 /// `TINYINT` it reports length 9, over `INT` 16, and over `DECIMAL(10,2)` 16
-/// with 6 decimals. Over a `DOUBLE` both answer `DOUBLE` with length 23 and 31
-/// decimals, which is what a float column carries anyway.
+/// with 6 decimals. The reported precision still widens past 65 for wide
+/// columns, while the scale stops at 30. Over a `DOUBLE` both answer `DOUBLE`
+/// with length 23 and 31 decimals, which is what a float column carries anyway.
 #[cfg(unix)]
 fn apply_summing_aggregate_metadata(
     definition: &mut ColumnDefinitionConfig,
@@ -3276,7 +3740,7 @@ fn apply_summing_aggregate_metadata(
     let (precision, scale) = decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
     let (precision, scale) = match kind {
         ColumnAggregateKind::Sum => (precision + 22, scale),
-        ColumnAggregateKind::Avg => (precision + 4, scale + 4),
+        ColumnAggregateKind::Avg => (precision + 4, (scale + 4).min(MYSQL_MAX_DECIMAL_SCALE)),
         ColumnAggregateKind::MinMax
         | ColumnAggregateKind::Concatenated
         | ColumnAggregateKind::DeviatesBySample => {
@@ -4608,12 +5072,19 @@ fn prepared_table_result_metadata(
     selected_database: Option<&str>,
     source_tables: &[MySqlSelectSource],
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
-    let needs_source_columns = type_metadata
+    let windowed = type_metadata
         .iter()
         .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
-        .any(needs_source_columns);
+        .any(is_window_call);
+    let needs_source_columns = windowed
+        || source_tables.iter().any(|source| source.branch() > 0)
+        || type_metadata
+            .iter()
+            .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
+            .any(needs_source_columns);
     let source_references = type_metadata
         .iter()
+        .filter(|_| !windowed)
         .filter_map(|metadata| {
             metadata
                 .source_reference()
@@ -4659,6 +5130,8 @@ fn table_result_metadata_for_references(
             tables.push(SourceTableColumns {
                 source_table: source.table().as_str().to_owned(),
                 table_reference: source.reference().to_owned(),
+                branch: source.branch(),
+                subquery: source.subquery(),
                 columns: Vec::new(),
                 catalog_columns: catalog_table_columns(catalog),
                 outer: source.outer(),
@@ -4683,6 +5156,8 @@ fn table_result_metadata_for_references(
         tables.push(SourceTableColumns {
             source_table: source.table().as_str().to_owned(),
             table_reference: source.reference().to_owned(),
+            branch: source.branch(),
+            subquery: source.subquery(),
             columns,
             catalog_columns: Vec::new(),
             outer: source.outer(),
@@ -4813,9 +5288,11 @@ fn unsigned_integer_column_length(name: &str) -> Option<u32> {
     None
 }
 
-/// MySQL refuses a `DECIMAL` wider than this, so a result that would need one
-/// is refused rather than reported with a precision MySQL cannot express.
+/// MySQL refuses a declared `DECIMAL` or arithmetic result wider than this.
+/// `SUM` and `AVG` still report widths above it for a wide source column.
 const MYSQL_MAX_DECIMAL_PRECISION: u32 = 65;
+/// MySQL keeps aggregate result scale within the DECIMAL column limit.
+const MYSQL_MAX_DECIMAL_SCALE: u32 = 30;
 
 const MYSQL_TYPE_TINY: u8 = 0x01;
 const MYSQL_TYPE_SHORT: u8 = 0x02;
@@ -5522,6 +5999,9 @@ enum TextValueRendering {
     /// A `DECIMAL`, which MySQL renders at the scale the column declared, so a
     /// `DECIMAL(10,2)` holding 1.5 reads back as `1.50`.
     Scaled(u8),
+    /// A stored DECIMAL is decoded to text by the engine, with every digit and
+    /// the declared scale intact.
+    ExactDecimal,
     /// An integer, which the engine answers as a float only when an arithmetic
     /// result left the range an integer can hold.
     Integer,
@@ -5535,6 +6015,7 @@ impl TextValueRendering {
         match column.column_type {
             MYSQL_TYPE_FLOAT => Self::Binary32,
             MYSQL_TYPE_DOUBLE => Self::Binary64,
+            MYSQL_TYPE_NEWDECIMAL if is_exact_decimal_column(column) => Self::ExactDecimal,
             MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
             MYSQL_TYPE_YEAR => Self::Year,
             MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
@@ -5542,6 +6023,10 @@ impl TextValueRendering {
             _ => Self::Engine,
         }
     }
+}
+
+fn is_exact_decimal_column(column: &ColumnDefinitionConfig) -> bool {
+    column.column_type == MYSQL_TYPE_NEWDECIMAL && !column.original_table.is_empty()
 }
 
 /// Where MySQL stops writing a `DOUBLE` out in full and starts writing an
@@ -5607,6 +6092,13 @@ fn value_to_text_ref(
     value: &Value,
     rendering: TextValueRendering,
 ) -> Result<Option<Vec<u8>>, LimboError> {
+    if rendering == TextValueRendering::ExactDecimal
+        && !matches!(value, Value::Null | Value::Text(_))
+    {
+        return Err(LimboError::InternalError(
+            "stored DECIMAL was not decoded to exact text".to_owned(),
+        ));
+    }
     match value {
         Value::Null => Ok(None),
         Value::Numeric(Numeric::Float(float)) if rendering == TextValueRendering::Binary32 => {
@@ -5626,7 +6118,7 @@ fn value_to_text_ref(
         Value::Numeric(Numeric::Integer(integer)) => {
             if let TextValueRendering::Scaled(scale) = rendering {
                 return Ok(Some(
-                    format!("{:.*}", usize::from(scale), *integer as f64).into_bytes(),
+                    format_mysql_scaled_integer(*integer, scale).into_bytes(),
                 ));
             }
             if rendering == TextValueRendering::Year {
@@ -5647,6 +6139,15 @@ fn value_to_text_ref(
             Ok(Some(blob.to_vec()))
         }
     }
+}
+
+fn format_mysql_scaled_integer(value: i64, scale: u8) -> String {
+    let mut rendered = value.to_string();
+    if scale != 0 {
+        rendered.push('.');
+        rendered.push_str(&"0".repeat(usize::from(scale)));
+    }
+    rendered
 }
 
 fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {

@@ -10,9 +10,8 @@ use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
 
 /// What MySQL puts after `ENGINE=InnoDB`, past the optional counter.
 ///
-/// Turso is not InnoDB and does not use `utf8mb4_0900_ai_ci`, but MySQL always
-/// sends these bytes and clients parse them, so the compatibility surface
-/// repeats them verbatim.
+/// The engine uses frozen Unicode 9 weights for MySQL's default collation.
+/// MySQL clients read this table option from the schema text.
 const TABLE_TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
 
 /// Renders the `Create Table` column of `SHOW CREATE TABLE`.
@@ -139,6 +138,9 @@ fn render_keys(indexes: &[MySqlIndexEntry]) -> Vec<String> {
 
 fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
     let mut rendered = format!("{} {}", quoted(column.name()), type_name(column)?);
+    if column.collation_name() == Some("utf8mb4_bin") {
+        rendered.push_str(" CHARACTER SET utf8mb4 COLLATE utf8mb4_bin");
+    }
     if !column.nullable() {
         rendered.push_str(" NOT NULL");
     } else if column.type_name() == "TIMESTAMP" {
@@ -219,7 +221,14 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
         // written this way is what every `ENUM` column carrying one prints,
         // and what a word column's own default prints.
         MySqlColumnDefault::Text(text) => {
-            format!(" DEFAULT {}", turso_mysql_parser::quoted_mysql_text(text))
+            if column.decimal_size().is_some() {
+                format!(
+                    " DEFAULT '{}'",
+                    at_the_columns_scale(column.decimal_size(), text)
+                )
+            } else {
+                format!(" DEFAULT {}", turso_mysql_parser::quoted_mysql_text(text))
+            }
         }
     })
 }
@@ -231,17 +240,11 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
 /// `'3.00'` and `DEFAULT 1.5` on a `DECIMAL(6,3)` prints `'1.500'`. A column
 /// with no scale of its own, a `DOUBLE` among them, prints what was written.
 pub fn at_the_columns_scale(scale: Option<(u32, u32)>, written: &str) -> String {
-    let Some((_, scale)) = scale else {
+    let Some((precision, scale)) = scale else {
         return written.to_owned();
     };
-    let (whole, fraction) = written.split_once('.').unwrap_or((written, ""));
-    if scale == 0 {
-        return whole.to_owned();
-    }
-    format!(
-        "{whole}.{fraction}{}",
-        "0".repeat((scale as usize).saturating_sub(fraction.len()))
-    )
+    turso_mysql_parser::round_decimal_to_scale(written, precision, scale)
+        .unwrap_or_else(|_| written.to_owned())
 }
 
 /// Renders the type the way MySQL 8.4.11 prints it here, lower case and

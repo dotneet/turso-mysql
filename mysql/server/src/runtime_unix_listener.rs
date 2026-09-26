@@ -24,7 +24,8 @@ use crate::unix_socket_fs::{
     SocketEndpointIdentity, SocketOwnerLock, UnixSocketDirectory, UnixSocketFsError,
 };
 use crate::{
-    AccountStoreCheckpointReader, RuntimeAccountReload, RuntimeAccountStore,
+    AccountAdministration, AccountStoreAdminAuthority, AccountStoreCheckpointReader,
+    RuntimeAccountAdministration, RuntimeAccountReload, RuntimeAccountStore,
     RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts, UnixSocketPolicy,
 };
 
@@ -42,6 +43,7 @@ pub struct RuntimeUnixListener {
     endpoint_identity: SocketEndpointIdentity,
     peer_verifier: UnixPeerVerifier,
     accounts: Arc<RuntimeAccountStore>,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
     reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
@@ -70,6 +72,22 @@ impl RuntimeUnixListener {
     pub fn bind(
         config: &RuntimeConfig,
         checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+    ) -> Result<Self, RuntimeUnixListenerError> {
+        Self::bind_inner(config, checkpoint_reader, None)
+    }
+
+    pub(crate) fn bind_with_account_authority(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        account_authority: Box<dyn AccountStoreAdminAuthority>,
+    ) -> Result<Self, RuntimeUnixListenerError> {
+        Self::bind_inner(config, checkpoint_reader, Some(account_authority))
+    }
+
+    fn bind_inner(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        account_authority: Option<Box<dyn AccountStoreAdminAuthority>>,
     ) -> Result<Self, RuntimeUnixListenerError> {
         if config.tcp().is_some() {
             return Err(RuntimeUnixListenerError::TcpListenerUnsupported);
@@ -134,6 +152,15 @@ impl RuntimeUnixListener {
                 return Err(RuntimeUnixListenerError::AccountStore(error));
             }
         }
+        let account_administration = account_authority.map(|authority| {
+            Arc::new(RuntimeAccountAdministration::new(
+                config.account_root().to_owned(),
+                config.checkpoint_authority().clone(),
+                authority,
+                Arc::clone(&accounts),
+                config.timeouts().query(),
+            )) as Arc<dyn AccountAdministration>
+        });
 
         let (wake_reader, wake_writer) =
             UnixStream::pair().map_err(|_| RuntimeUnixListenerError::WakeUnavailable)?;
@@ -200,6 +227,7 @@ impl RuntimeUnixListener {
             endpoint_identity,
             peer_verifier,
             accounts,
+            account_administration,
             reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
             prepared_statement_authority,
@@ -346,6 +374,7 @@ impl RuntimeUnixListener {
             },
             authentication_deadline,
             accounts: Arc::clone(&self.accounts),
+            account_administration: self.account_administration.clone(),
             catalog: Arc::clone(&self.catalog),
             prepared_statement_authority: self.prepared_statement_authority.clone(),
             limits: self.limits,
@@ -505,6 +534,7 @@ pub(crate) struct AcceptedUnixStream {
     lease: ConnectionLease,
     authentication_deadline: Instant,
     accounts: Arc<RuntimeAccountStore>,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     limits: RuntimeLimits,
@@ -532,6 +562,10 @@ impl AcceptedUnixStream {
     /// Clones the account store retained for the protocol owner.
     pub(crate) fn account_store(&self) -> Arc<RuntimeAccountStore> {
         Arc::clone(&self.accounts)
+    }
+
+    pub(crate) fn account_administration(&self) -> Option<Arc<dyn AccountAdministration>> {
+        self.account_administration.clone()
     }
 
     /// Clones the catalog retained for the protocol owner.
@@ -1439,7 +1473,7 @@ mod tests {
         fs,
         os::fd::AsRawFd,
         os::unix::fs::PermissionsExt,
-        sync::{Arc, Barrier, Mutex, mpsc},
+        sync::{mpsc, Arc, Barrier, Mutex},
         thread,
     };
 
@@ -1447,8 +1481,8 @@ mod tests {
     use crate::{
         AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
         AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest, CheckpointAuthorityId,
-        CheckpointPersistence, CheckpointReadError, GlobalPrivileges, MIN_WRITE_LIMIT,
-        OfflineAccountProvisioner, RuntimeTimeouts, UnixSocketConfig,
+        CheckpointPersistence, CheckpointReadError, GlobalPrivileges, OfflineAccountProvisioner,
+        RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
     };
 
     struct FakeCheckpointReader {

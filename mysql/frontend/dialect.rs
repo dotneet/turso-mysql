@@ -15,10 +15,10 @@ use turso_mysql_parser::{
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
     render_create_view_mysql_with_mode, SessionSqlMode,
 };
-use turso_parser::ast::{Cmd, Stmt};
+use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
 use crate::schema_sql::{
-    decode_persisted_schema_sql, decode_schema_sql_any, encode_schema_sql, reencode_schema_sql,
+    decode_persisted_schema_sql, decode_schema_sql_any, reencode_schema_sql,
     validate_schema_sql_catalog, DecodedSchemaSql, SchemaSqlCatalogEntry, SchemaSqlId,
     SchemaSqlMode, SchemaSqlSessionContext,
 };
@@ -384,7 +384,7 @@ impl Dialect for MySqlDialect {
                 .map_err(|error| {
                     LimboError::Corrupt(format!("cannot replay MySQL index SQL: {error}"))
                 })?;
-                return encode_schema_sql(decoded.context, &normalized)
+                return reencode_schema_sql(decoded, &normalized)
                     .map_err(|error| LimboError::Corrupt(error.to_string()));
             }
             SchemaSqlKind::View => {
@@ -399,7 +399,7 @@ impl Dialect for MySqlDialect {
                 .map_err(|error| {
                     LimboError::Corrupt(format!("cannot replay MySQL view SQL: {error}"))
                 })?;
-                return encode_schema_sql(decoded.context, &normalized)
+                return reencode_schema_sql(decoded, &normalized)
                     .map_err(|error| LimboError::Corrupt(error.to_string()));
             }
             SchemaSqlKind::Trigger => {
@@ -414,7 +414,7 @@ impl Dialect for MySqlDialect {
                 .map_err(|error| {
                     LimboError::Corrupt(format!("cannot replay MySQL trigger SQL: {error}"))
                 })?;
-                return encode_schema_sql(decoded.context, &normalized)
+                return reencode_schema_sql(decoded, &normalized)
                     .map_err(|error| LimboError::Corrupt(error.to_string()));
             }
             _ => {}
@@ -453,6 +453,19 @@ impl Dialect for MySqlDialect {
             return Ok(Some(Func::Dialect(MYSQL_REGEXP.to_string())));
         }
         if arg_count == 1
+            && (name.eq_ignore_ascii_case(MYSQL_LOWER) || name.eq_ignore_ascii_case(MYSQL_UPPER))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if (arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_INSTR))
+            || ((arg_count == 2 || arg_count == 3) && name.eq_ignore_ascii_case(MYSQL_LOCATE))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
+            return Ok(Some(Func::Dialect(MYSQL_UCA9_LIKE.to_string())));
+        }
+        if arg_count == 1
             && (name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT))
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
@@ -461,6 +474,15 @@ impl Dialect for MySqlDialect {
             && (name.eq_ignore_ascii_case(MYSQL_FIELD) || name.eq_ignore_ascii_case(MYSQL_ELT))
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count >= 2
+            && (name.eq_ignore_ascii_case(MYSQL_TEXT_GREATEST)
+                || name.eq_ignore_ascii_case(MYSQL_TEXT_LEAST))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_TEXT_NULLIF) {
+            return Ok(Some(Func::Dialect(MYSQL_TEXT_NULLIF.to_string())));
         }
         if arg_count == 4 && name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_SEARCH.to_string())));
@@ -516,10 +538,26 @@ impl Dialect for MySqlDialect {
             };
             let found = choices.iter().position(|choice| {
                 matches!(choice, Value::Text(choice)
-                    if choice.as_str().eq_ignore_ascii_case(looked_for.as_str()))
+                    if turso_core::mysql_uca9_compare(choice.as_str(), looked_for.as_str()).is_eq())
             });
             let found = found.map_or(0, |position| position as i64 + 1);
             return Ok(Value::from_i64(found));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_TEXT_GREATEST)
+            || name.eq_ignore_ascii_case(MYSQL_TEXT_LEAST)
+        {
+            return checked_mysql_text_extreme(
+                args,
+                name.eq_ignore_ascii_case(MYSQL_TEXT_GREATEST),
+            );
+        }
+        if name.eq_ignore_ascii_case(MYSQL_TEXT_NULLIF) {
+            let [first, second] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            return checked_mysql_text_nullif(first, second);
         }
         if name.eq_ignore_ascii_case(MYSQL_ELT) {
             let [which, choices @ ..] = args else {
@@ -554,7 +592,67 @@ impl Dialect for MySqlDialect {
             let (Some(value), Value::Text(pattern)) = (matched_text(value), pattern) else {
                 return Ok(Value::Null);
             };
-            let matched = compiled_pattern(pattern.as_str())?.is_match(&value);
+            let matched = checked_regexp_match(&value, pattern.as_str())?;
+            return Ok(Value::from_i64(i64::from(matched)));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_LOWER) || name.eq_ignore_ascii_case(MYSQL_UPPER) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            return checked_mysql_case(value, name.eq_ignore_ascii_case(MYSQL_UPPER));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_INSTR) {
+            let [haystack, needle] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            return checked_mysql_search(haystack, needle, 1);
+        }
+        if name.eq_ignore_ascii_case(MYSQL_LOCATE) {
+            let [needle, haystack, rest @ ..] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two or three arguments"
+                )));
+            };
+            let start = match rest {
+                [] => 1,
+                [Value::Numeric(Numeric::Integer(start))] => *start,
+                [Value::Null] => return Ok(Value::Null),
+                _ => {
+                    return Err(LimboError::ParseError(
+                        "MySQL LOCATE requires an integer start".to_string(),
+                    ))
+                }
+            };
+            return checked_mysql_search(haystack, needle, start);
+        }
+        if name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
+            let [value, pattern, escape] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes three arguments"
+                )));
+            };
+            if args.iter().any(|arg| matches!(arg, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (Value::Text(value), Value::Text(pattern), Value::Text(escape)) =
+                (value, pattern, escape)
+            else {
+                return Err(LimboError::ParseError(
+                    "MySQL LIKE requires text values".to_string(),
+                ));
+            };
+            let escape = match escape.as_str().chars().collect::<Vec<_>>()[..] {
+                [] => None,
+                [character] => Some(character),
+                _ => {
+                    return Err(LimboError::ParseError(
+                        "MySQL LIKE escape must be one character".to_string(),
+                    ))
+                }
+            };
+            let matched = turso_core::mysql_uca9_like(value.as_str(), pattern.as_str(), escape)?;
             return Ok(Value::from_i64(i64::from(matched)));
         }
         if name.eq_ignore_ascii_case(MYSQL_MD5) {
@@ -788,6 +886,117 @@ pub(crate) const MYSQL_ELT: &str = "mysql_elt";
 /// The engine keeps its own matching in an extension this frontend does not
 /// register, and MySQL's is held to a collation rather than to the pattern.
 pub(crate) const MYSQL_REGEXP: &str = "mysql_regexp";
+pub(crate) const MYSQL_UCA9_LIKE: &str = "mysql_uca9_like";
+pub(crate) const MYSQL_LOWER: &str = "mysql_lower";
+pub(crate) const MYSQL_UPPER: &str = "mysql_upper";
+pub(crate) const MYSQL_INSTR: &str = "mysql_instr";
+pub(crate) const MYSQL_LOCATE: &str = "mysql_locate";
+pub(crate) const MYSQL_TEXT_GREATEST: &str = "mysql_text_greatest";
+pub(crate) const MYSQL_TEXT_LEAST: &str = "mysql_text_least";
+pub(crate) const MYSQL_TEXT_NULLIF: &str = "mysql_text_nullif";
+
+fn checked_mysql_case(value: &Value, uppercase: bool) -> Result<Value> {
+    let Value::Text(value) = value else {
+        return if matches!(value, Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(LimboError::InvalidArgument(
+                "MySQL case conversion requires text".to_string(),
+            ))
+        };
+    };
+    let value = value.as_str();
+    if !value.is_ascii() {
+        return Err(LimboError::InvalidArgument(
+            "Unicode LOWER/UPPER requires MySQL-compatible case conversion".to_string(),
+        ));
+    }
+    Ok(Value::build_text(if uppercase {
+        value.to_ascii_uppercase()
+    } else {
+        value.to_ascii_lowercase()
+    }))
+}
+
+fn checked_mysql_search(haystack: &Value, needle: &Value, start: i64) -> Result<Value> {
+    if matches!(haystack, Value::Null) || matches!(needle, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Value::Text(haystack), Value::Text(needle)) = (haystack, needle) else {
+        return Err(LimboError::InvalidArgument(
+            "MySQL INSTR/LOCATE requires text".to_string(),
+        ));
+    };
+    let (haystack, needle) = (haystack.as_str(), needle.as_str());
+    if !haystack.is_ascii() || !needle.is_ascii() {
+        return Err(LimboError::InvalidArgument(
+            "Unicode INSTR/LOCATE requires MySQL-compatible case folding".to_string(),
+        ));
+    }
+    let Ok(start) = usize::try_from(start) else {
+        return Ok(Value::from_i64(0));
+    };
+    let Some(offset) = start.checked_sub(1) else {
+        return Ok(Value::from_i64(0));
+    };
+    let Some(tail) = haystack.get(offset..) else {
+        return Ok(Value::from_i64(0));
+    };
+    let found = tail
+        .to_ascii_lowercase()
+        .find(&needle.to_ascii_lowercase())
+        .map(|position| i64::try_from(offset + position + 1))
+        .transpose()
+        .map_err(|_| LimboError::IntegerOverflow)?
+        .unwrap_or(0);
+    Ok(Value::from_i64(found))
+}
+
+fn checked_mysql_text_extreme(values: &[Value], greatest: bool) -> Result<Value> {
+    if values.iter().any(|value| matches!(value, Value::Null)) {
+        return Ok(Value::Null);
+    }
+    let mut best = match values.first() {
+        Some(Value::Text(text)) => text,
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "MySQL text GREATEST/LEAST requires text values".to_string(),
+            ))
+        }
+    };
+    for value in values.iter().skip(1) {
+        let Value::Text(candidate) = value else {
+            return Err(LimboError::InvalidArgument(
+                "MySQL text GREATEST/LEAST requires text values".to_string(),
+            ));
+        };
+        let order = turso_core::mysql_uca9_compare(candidate.as_str(), best.as_str());
+        if (greatest && !order.is_lt()) || (!greatest && order.is_lt()) {
+            best = candidate;
+        }
+    }
+    Ok(Value::build_text(best.as_str().to_owned()))
+}
+
+fn checked_mysql_text_nullif(first: &Value, second: &Value) -> Result<Value> {
+    let Value::Text(first) = first else {
+        return Err(LimboError::InvalidArgument(
+            "MySQL text NULLIF requires text values".to_string(),
+        ));
+    };
+    match second {
+        Value::Null => Ok(Value::build_text(first.as_str().to_owned())),
+        Value::Text(second)
+            if turso_core::mysql_uca9_compare(first.as_str(), second.as_str()).is_eq() =>
+        {
+            Ok(Value::Null)
+        }
+        Value::Text(_) => Ok(Value::build_text(first.as_str().to_owned())),
+        _ => Err(LimboError::InvalidArgument(
+            "MySQL text NULLIF requires text values".to_string(),
+        )),
+    }
+}
 
 /// The text a `REGEXP` matches against.
 ///
@@ -799,6 +1008,15 @@ fn matched_text(value: &Value) -> Option<String> {
         Value::Numeric(turso_core::Numeric::Integer(number)) => Some(number.to_string()),
         _ => None,
     }
+}
+
+fn checked_regexp_match(value: &str, pattern: &str) -> Result<bool> {
+    if !value.is_ascii() || !pattern.is_ascii() {
+        return Err(LimboError::InvalidArgument(
+            "Unicode REGEXP requires MySQL-compatible full case folding".to_string(),
+        ));
+    }
+    Ok(compiled_pattern(pattern)?.is_match(value))
 }
 
 /// Compiles a `REGEXP` pattern, remembering the last one compiled.
@@ -943,6 +1161,9 @@ fn temporal_value(
     let read = match type_name {
         "DATE" => turso_mysql_parser::normalize_date(&written),
         "TIME" => turso_mysql_parser::normalize_time(&written),
+        "TIMESTAMP" => turso_mysql_parser::normalize_datetime(&written).filter(|moment| {
+            ("1970-01-01 00:00:01"..="2038-01-19 03:14:07").contains(&moment.as_str())
+        }),
         _ => turso_mysql_parser::normalize_datetime(&written),
     };
     Ok(Value::build_text(read.ok_or_else(refuse)?))
@@ -1219,6 +1440,11 @@ pub(crate) fn check_mysql_assignment(
         // here rather than checked, which keeps each of them to one read.
         let stored = if spec.is_json(column_index) {
             Some(document_value(table_name, column_index, value)?)
+        } else if spec.is_float(column_index) {
+            if spec.is_unsigned_real(column_index) {
+                reject_negative_real(table_name, column_index, value)?;
+            }
+            Some(float_value(table_name, column_index, value)?)
         } else if let Some(members) = spec.enum_members(column_index) {
             Some(member_value(table_name, column_index, members, value)?)
         } else if let Some(members) = spec.set_members(column_index) {
@@ -1226,6 +1452,13 @@ pub(crate) fn check_mysql_assignment(
                 table_name,
                 column_index,
                 members,
+                value,
+            )?)
+        } else if spec.is_timestamp(column_index) {
+            Some(temporal_value(
+                table_name,
+                column_index,
+                "TIMESTAMP",
                 value,
             )?)
         } else if spec.is_datetime(column_index) {
@@ -1273,6 +1506,43 @@ pub(crate) fn check_mysql_assignment(
         }
     }
     Ok(rewritten)
+}
+
+/// A FLOAT is rounded when stored, so later comparisons and aggregates read
+/// the same binary32 value MySQL stored.
+fn float_value(table_name: &str, column_index: usize, value: &Value) -> Result<Value> {
+    let number = match value {
+        Value::Numeric(Numeric::Integer(number)) => *number as f64,
+        Value::Numeric(Numeric::Float(number)) => f64::from(*number),
+        Value::Text(text) => {
+            text.as_str()
+                .parse::<f64>()
+                .map_err(|_| AssignmentError::IncorrectType {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name: "FLOAT".to_string(),
+                })?
+        }
+        _ => {
+            return Err(AssignmentError::IncorrectType {
+                table: table_name.to_string(),
+                column: column_index + 1,
+                type_name: "FLOAT".to_string(),
+            }
+            .into())
+        }
+    };
+    let rounded = number as f32;
+    if !rounded.is_finite() {
+        return Err(AssignmentError::OutOfRange {
+            table: table_name.to_string(),
+            column: column_index + 1,
+            type_name: "FLOAT".to_string(),
+            value: 0,
+        }
+        .into());
+    }
+    Ok(Value::from_f64(f64::from(rounded)))
 }
 
 /// Puts a `VARCHAR` or a `CHAR` value into the form its column stores.
@@ -1352,6 +1622,16 @@ fn reject_negative_real(table_name: &str, column_index: usize, value: &Value) ->
     let negative = match value {
         Value::Numeric(Numeric::Float(float)) => f64::from(*float) < 0.0,
         Value::Numeric(Numeric::Integer(integer)) => *integer < 0,
+        Value::Text(text) => {
+            let written = text.as_str();
+            written.parse::<f64>().is_ok()
+                && written.starts_with('-')
+                && written.split(['e', 'E']).next().is_some_and(|mantissa| {
+                    mantissa
+                        .bytes()
+                        .any(|byte| byte.is_ascii_digit() && byte != b'0')
+                })
+        }
         _ => false,
     };
     if !negative {
@@ -1468,13 +1748,14 @@ fn parse_marked_table(decoded: DecodedSchemaSql<'_>) -> Result<Stmt> {
         // A v2 envelope is an allocator identity, not a general table marker.
         // Check its AUTO_INCREMENT shape before the generic parser can lower
         // an ordinary PRIMARY KEY table and accidentally accept the wrong row.
-        return parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+        let statement = parse_auto_increment_create_table(decoded.normalized_ddl, mode)
             .map(|checked| checked.sqlite_statement)
             .map_err(|error| {
                 LimboError::Corrupt(format!(
                     "invalid persisted MySQL AUTO_INCREMENT table SQL: {error}"
                 ))
-            });
+            })?;
+        return refuse_legacy_text_collation(decoded, statement);
     }
     if decoded.v2_metadata().is_none() {
         if let Ok(checked) = parse_checked_primary_key_create_table(decoded.normalized_ddl, mode) {
@@ -1483,15 +1764,40 @@ fn parse_marked_table(decoded: DecodedSchemaSql<'_>) -> Result<Stmt> {
                     "persisted MySQL PRIMARY KEY table SQL is not canonical".to_string(),
                 ));
             }
-            return Ok(checked.sqlite_statement);
+            return refuse_legacy_text_collation(decoded, checked.sqlite_statement);
         }
     }
     match parse_create_table_ast(decoded.normalized_ddl, mode) {
-        Ok(statement) => Ok(statement),
+        Ok(statement) => refuse_legacy_text_collation(decoded, statement),
         Err(error) => Err(LimboError::Corrupt(format!(
             "invalid persisted MySQL table SQL: {error}"
         ))),
     }
+}
+
+fn refuse_legacy_text_collation(decoded: DecodedSchemaSql<'_>, statement: Stmt) -> Result<Stmt> {
+    if decoded.uses_uca9() {
+        return Ok(statement);
+    }
+    let Stmt::CreateTable {
+        body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    } = &statement
+    else {
+        return Ok(statement);
+    };
+    let has_text_collation = columns.iter().any(|column| {
+        column.constraints.iter().any(|constraint| {
+            matches!(&constraint.constraint, ColumnConstraint::Collate { collation_name }
+                if collation_name.as_str().eq_ignore_ascii_case("MYSQL_UCA9_AI_CI"))
+        })
+    });
+    if has_text_collation {
+        return Err(LimboError::Corrupt(
+            "legacy MySQL text table needs collation migration before it can be opened".to_string(),
+        ));
+    }
+    Ok(statement)
 }
 
 fn parse_marked_index(decoded: DecodedSchemaSql<'_>) -> Result<Stmt> {
@@ -1565,10 +1871,70 @@ fn session_sql_mode(mode: SchemaSqlMode) -> SessionSqlMode {
 mod tests {
     use super::*;
     use crate::schema_sql::{
-        encode_schema_sql, encode_schema_sql_v2, CharacterSet, Collation, SchemaSqlContext,
-        SchemaSqlMode, SchemaSqlV2Metadata,
+        encode_schema_sql, encode_schema_sql_v2, encode_schema_sql_v3, CharacterSet, Collation,
+        SchemaSqlContext, SchemaSqlMode, SchemaSqlV2Metadata,
     };
     use turso_parser::{ast::Cmd, parser::Parser};
+
+    #[test]
+    fn regexp_refuses_unicode_case_folds_it_cannot_match() {
+        assert!(checked_regexp_match("Alpha", "alpha").unwrap());
+        assert!(checked_regexp_match("ß", "ss")
+            .unwrap_err()
+            .to_string()
+            .contains("full case folding"));
+    }
+
+    #[test]
+    fn mysql_case_calls_keep_ascii_values_and_refuse_unicode() {
+        assert_eq!(
+            checked_mysql_case(&Value::build_text("AbC"), false).unwrap(),
+            Value::build_text("abc")
+        );
+        assert_eq!(
+            checked_mysql_case(&Value::build_text("AbC"), true).unwrap(),
+            Value::build_text("ABC")
+        );
+        assert_eq!(
+            checked_mysql_case(&Value::Null, false).unwrap(),
+            Value::Null
+        );
+        // MySQL 8.4.11 answers LOWER('É') = 'é' and UPPER('é') = 'É'.
+        for (value, uppercase) in [("É", false), ("é", true)] {
+            assert!(checked_mysql_case(&Value::build_text(value), uppercase)
+                .unwrap_err()
+                .to_string()
+                .contains("case conversion"));
+        }
+    }
+
+    #[test]
+    fn mysql_search_matches_ascii_without_case_and_refuses_unicode() {
+        // MySQL 8.4.11 answers INSTR('ABC','a') = 1 and
+        // LOCATE('B','aBcB',3) = 4.
+        assert_eq!(
+            checked_mysql_search(&Value::build_text("ABC"), &Value::build_text("a"), 1).unwrap(),
+            Value::from_i64(1)
+        );
+        assert_eq!(
+            checked_mysql_search(&Value::build_text("aBcB"), &Value::build_text("B"), 3).unwrap(),
+            Value::from_i64(4)
+        );
+        for (start, expected) in [(0, 0), (1, 1), (4, 4), (5, 0)] {
+            assert_eq!(
+                checked_mysql_search(&Value::build_text("abc"), &Value::build_text(""), start)
+                    .unwrap(),
+                Value::from_i64(expected)
+            );
+        }
+        // MySQL 8.4.11 answers LOCATE('SS','straße') = 5.
+        assert!(
+            checked_mysql_search(&Value::build_text("straße"), &Value::build_text("SS"), 1)
+                .unwrap_err()
+                .to_string()
+                .contains("case folding")
+        );
+    }
 
     fn trusted_context(database_id: u8) -> SchemaCatalogValidationContext {
         SchemaCatalogValidationContext::new([database_id; 16])
@@ -1633,6 +1999,32 @@ mod tests {
             root_page: 2,
             sql: sql.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn old_text_tables_require_collation_migration_before_replay() {
+        let ddl = "CREATE TABLE `words` (`word` VARCHAR(20))";
+        let old = encode_schema_sql(table_context(), ddl).unwrap();
+        let old = decode_persisted_schema_sql(SchemaSqlKind::Table, &old)
+            .unwrap()
+            .unwrap();
+        assert!(parse_marked_table(old)
+            .unwrap_err()
+            .to_string()
+            .contains("collation migration"));
+
+        let current = encode_schema_sql_v3(table_context(), None, ddl).unwrap();
+        let current = decode_persisted_schema_sql(SchemaSqlKind::Table, &current)
+            .unwrap()
+            .unwrap();
+        assert!(parse_marked_table(current).is_ok());
+
+        let old_numeric =
+            encode_schema_sql(table_context(), "CREATE TABLE `numbers` (`value` INTEGER)").unwrap();
+        let old_numeric = decode_persisted_schema_sql(SchemaSqlKind::Table, &old_numeric)
+            .unwrap()
+            .unwrap();
+        assert!(parse_marked_table(old_numeric).is_ok());
     }
 
     #[test]
@@ -1859,7 +2251,7 @@ mod tests {
         let stored = encode_schema_sql_v2(
             table_context(),
             metadata,
-            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` TEXT)",
+            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `counter` INTEGER)",
         )
         .unwrap();
 
@@ -1870,7 +2262,7 @@ mod tests {
         assert_eq!(decoded.v2_metadata(), Some(metadata));
         assert_eq!(
             decoded.normalized_ddl,
-            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` TEXT)"
+            "CREATE TABLE `users` (`id` INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY, `counter` INTEGER)"
         );
     }
 
@@ -2038,6 +2430,125 @@ mod tests {
                 ),
                 Err(LimboError::Assignment(error))
                     if matches!(error.as_ref(), AssignmentError::OutOfRange { type_name, .. } if type_name == "MEDIUMINT")
+            ));
+        }
+    }
+
+    #[test]
+    fn float_assignment_rounds_the_value_before_storage() {
+        let stored = stored_table(
+            "CREATE TABLE `numbers` (`value` FLOAT, `positive` FLOAT UNSIGNED, `double` DOUBLE)",
+        );
+        let values = [
+            Value::from_f64(0.1),
+            Value::from_i64(16_777_217),
+            Value::from_f64(0.1),
+        ];
+        let rewritten = MySqlIntegerValidator
+            .check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &values,
+            )
+            .unwrap()
+            .expect("FLOAT values must be rounded before storage");
+        assert_eq!(rewritten[0], Value::from_f64(f64::from(0.1_f32)));
+        assert_eq!(rewritten[1], Value::from_f64(16_777_216.0));
+        assert_eq!(rewritten[2], Value::from_f64(0.1));
+
+        let decimal_literal = MySqlIntegerValidator
+            .check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &[Value::build_text("0.1"), Value::Null, Value::Null],
+            )
+            .unwrap()
+            .expect("a written fraction is rounded to FLOAT storage");
+        assert_eq!(decimal_literal[0], Value::from_f64(f64::from(0.1_f32)));
+
+        assert_eq!(
+            MySqlIntegerValidator
+                .check_assignment(
+                    "numbers",
+                    Some(&stored),
+                    AssignmentOperation::Update,
+                    &[rewritten[0].clone(), Value::Null, Value::Null],
+                )
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            MySqlIntegerValidator.check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &[Value::Null, Value::from_f64(-0.1), Value::Null],
+            ),
+            Err(LimboError::Assignment(error))
+                if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            MySqlIntegerValidator.check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &[Value::Null, Value::build_text("-0.1"), Value::Null],
+            ),
+            Err(LimboError::Assignment(error))
+                if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            reject_negative_real("numbers", 1, &Value::build_text("-0.001")),
+            Err(LimboError::Assignment(error))
+                if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+        ));
+        assert!(reject_negative_real("numbers", 1, &Value::build_text("-0.000")).is_ok());
+        assert!(matches!(
+            MySqlIntegerValidator.check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &[Value::from_f64(1e40), Value::Null, Value::Null],
+            ),
+            Err(LimboError::Assignment(error))
+                if matches!(error.as_ref(), AssignmentError::OutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn timestamp_assignment_stays_within_the_mysql_utc_range() {
+        let stored =
+            stored_table("CREATE TABLE `moments` (`stamp` TIMESTAMP NULL, `plain` DATETIME)");
+
+        for stamp in ["1970-01-01 00:00:01", "2038-01-19 03:14:07"] {
+            MySqlIntegerValidator
+                .check_assignment(
+                    "moments",
+                    Some(&stored),
+                    AssignmentOperation::Insert,
+                    &[
+                        Value::build_text(stamp.to_owned()),
+                        Value::build_text(stamp.to_owned()),
+                    ],
+                )
+                .unwrap();
+        }
+
+        for stamp in ["1970-01-01 00:00:00", "2038-01-19 03:14:08"] {
+            assert!(matches!(
+                MySqlIntegerValidator.check_assignment(
+                    "moments",
+                    Some(&stored),
+                    AssignmentOperation::Update,
+                    &[
+                        Value::build_text(stamp.to_owned()),
+                        Value::build_text(stamp.to_owned()),
+                    ],
+                ),
+                Err(LimboError::Assignment(error))
+                    if matches!(error.as_ref(), AssignmentError::IncorrectTemporal { type_name, .. } if type_name == "TIMESTAMP")
             ));
         }
     }

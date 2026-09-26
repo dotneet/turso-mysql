@@ -423,6 +423,7 @@ impl Display for FtsFunc {
 #[derive(Debug, Clone, strum::EnumIter)]
 pub enum AggFunc {
     Avg,
+    MysqlDecimalAvg,
     Count,
     Count0,
     GroupConcat,
@@ -430,6 +431,7 @@ pub enum AggFunc {
     Min,
     StringAgg,
     Sum,
+    MysqlDecimalSum,
     Total,
     #[cfg(feature = "json")]
     JsonbGroupArray,
@@ -677,12 +679,14 @@ impl PartialEq for AggFunc {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Avg, Self::Avg)
+            | (Self::MysqlDecimalAvg, Self::MysqlDecimalAvg)
             | (Self::Count, Self::Count)
             | (Self::GroupConcat, Self::GroupConcat)
             | (Self::Max, Self::Max)
             | (Self::Min, Self::Min)
             | (Self::StringAgg, Self::StringAgg)
             | (Self::Sum, Self::Sum)
+            | (Self::MysqlDecimalSum, Self::MysqlDecimalSum)
             | (Self::Total, Self::Total)
             | (Self::ArrayAgg, Self::ArrayAgg)
             | (Self::Mode, Self::Mode)
@@ -708,14 +712,14 @@ impl std::fmt::Display for AggFunc {
 impl AggFunc {
     pub fn num_args(&self) -> usize {
         match self {
-            Self::Avg => 1,
+            Self::Avg | Self::MysqlDecimalAvg => 1,
             Self::Count0 => 0,
             Self::Count => 1,
             Self::GroupConcat => 1,
             Self::Max => 1,
             Self::Min => 1,
             Self::StringAgg => 2,
-            Self::Sum => 1,
+            Self::Sum | Self::MysqlDecimalSum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
@@ -737,14 +741,14 @@ impl AggFunc {
     /// Most aggregates have a single arity, but group_concat accepts 1 or 2 args.
     pub fn arities(&self) -> &'static [i32] {
         match self {
-            Self::Avg => &[1],
+            Self::Avg | Self::MysqlDecimalAvg => &[1],
             Self::Count0 => &[0],
             Self::Count => &[1],
             Self::GroupConcat => &[1, 2],
             Self::Max => &[1],
             Self::Min => &[1],
             Self::StringAgg => &[2],
-            Self::Sum => &[1],
+            Self::Sum | Self::MysqlDecimalSum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
@@ -760,6 +764,7 @@ impl AggFunc {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Avg => "avg",
+            Self::MysqlDecimalAvg => "mysql_decimal_avg",
             Self::Count0 => "count",
             Self::Count => "count",
             Self::GroupConcat => "group_concat",
@@ -767,6 +772,7 @@ impl AggFunc {
             Self::Min => "min",
             Self::StringAgg => "string_agg",
             Self::Sum => "sum",
+            Self::MysqlDecimalSum => "mysql_decimal_sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
@@ -884,6 +890,11 @@ pub enum ScalarFunc {
     ValidateIpAddr,
     // Numeric type functions
     NumericEncode,
+    MysqlDecimalEncode,
+    MysqlUnsignedDecimalEncode,
+    MysqlDecimalRound,
+    MysqlDecimalDivideRounded,
+    MysqlDecimalTruncate,
     NumericDecode,
     NumericAdd,
     NumericSub,
@@ -1013,6 +1024,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
+            | ScalarFunc::MysqlDecimalEncode
+            | ScalarFunc::MysqlUnsignedDecimalEncode
+            | ScalarFunc::MysqlDecimalRound
+            | ScalarFunc::MysqlDecimalDivideRounded
+            | ScalarFunc::MysqlDecimalTruncate
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
@@ -1161,6 +1177,11 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
+            Self::MysqlDecimalEncode => "mysql_decimal_encode",
+            Self::MysqlUnsignedDecimalEncode => "mysql_unsigned_decimal_encode",
+            Self::MysqlDecimalRound => "mysql_decimal_round",
+            Self::MysqlDecimalDivideRounded => "mysql_decimal_div_round",
+            Self::MysqlDecimalTruncate => "mysql_decimal_truncate",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
             Self::NumericSub => "numeric_sub",
@@ -1316,7 +1337,12 @@ impl ScalarFunc {
             | Self::NumericDiv
             | Self::NumericLt
             | Self::NumericEq => &[2],
-            Self::NumericEncode => &[3],
+            Self::MysqlDecimalRound => &[2],
+            Self::MysqlDecimalTruncate => &[2],
+            Self::NumericEncode
+            | Self::MysqlDecimalEncode
+            | Self::MysqlUnsignedDecimalEncode
+            | Self::MysqlDecimalDivideRounded => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],

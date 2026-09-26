@@ -90,14 +90,14 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     CollationSeq::NoCase => {
                         hash_text_nocase(&mut hasher, text.as_str());
                     }
-                    CollationSeq::Rtrim => {
+                    CollationSeq::Rtrim | CollationSeq::MySqlUtf8mb4Bin => {
                         let trimmed = text.as_str().trim_end_matches(' ');
                         hasher.write(trimmed.as_bytes());
                     }
                     CollationSeq::Binary | CollationSeq::Unset => {
                         hasher.write(text.as_bytes());
                     }
-                    CollationSeq::Locale(_) => {
+                    CollationSeq::Locale(_) | CollationSeq::MySqlUca9 => {
                         hasher.write(&collation.hash_key(text.as_str()));
                     }
                     CollationSeq::Custom(_) => {

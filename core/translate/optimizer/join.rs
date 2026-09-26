@@ -670,6 +670,7 @@ fn join_lhs_and_rhs<'a>(
                     probe_cardinality,
                     probe_multiplier,
                     subqueries,
+                    schema,
                     params,
                 )? {
                     let mut hash_join_method = hash_join_method;
@@ -4137,6 +4138,7 @@ mod tests {
             1_000.0,
             1.0,
             &[],
+            &empty_schema(),
             &DEFAULT_PARAMS,
         )
         .unwrap()

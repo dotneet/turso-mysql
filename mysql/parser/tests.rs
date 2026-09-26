@@ -7,6 +7,205 @@ use super::*;
 use turso_parser::ast::{AlterTable as TursoAlterTable, AlterTableBody as TursoAlterTableBody};
 
 #[test]
+fn decimal_ddl_and_values_keep_their_written_digits() {
+    let mode = SessionSqlMode::default();
+    let table = parse_create_table(
+        "CREATE TABLE amounts (v DECIMAL(65,30) DEFAULT 1.235, u DECIMAL(5,2) UNSIGNED)",
+        mode,
+    )
+    .unwrap();
+    assert!(table
+        .as_sql()
+        .contains("mysql_decimal(65,30) DEFAULT '1.235000000000000000000000000000'"));
+    assert!(table.as_sql().contains("mysql_decimal_unsigned(5,2)"));
+
+    let insert = parse_dml(
+        "INSERT INTO amounts (v,u) VALUES (1.234567890123456789012345678901, 1.235)",
+        mode,
+    )
+    .unwrap();
+    assert!(insert
+        .as_sql()
+        .contains("'1.234567890123456789012345678901'"));
+    assert!(insert.as_sql().contains("'1.235'"));
+
+    assert_eq!(round_decimal_to_scale("-1.235", 5, 2).unwrap(), "-1.24");
+    assert!(round_decimal_to_scale("999.995", 5, 2).is_err());
+    assert!(round_decimal_to_scale("1e100000000", 65, 30).is_err());
+    assert_eq!(
+        round_decimal_to_scale("1e-100000000", 65, 30).unwrap(),
+        format!("0.{}", "0".repeat(30))
+    );
+}
+
+#[test]
+fn decimal_aggregates_use_exact_core_functions() {
+    assert!(parse_select(
+        "SELECT SUM(v), AVG(v) FROM amounts",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .needs_column_types());
+    let translated = parse_select_knowing_decimal_columns(
+        "SELECT SUM(v), AVG(v) FROM amounts",
+        SessionSqlMode::default(),
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .unwrap();
+    assert!(translated.as_sql().contains("mysql_decimal_sum(\"v\")"));
+    assert!(translated.as_sql().contains("mysql_decimal_avg(\"v\")"));
+}
+
+#[test]
+fn decimal_arithmetic_keeps_fractional_literals_exact() {
+    let mode = SessionSqlMode::default();
+    for (source, rendered) in [
+        ("v + 0.001", "numeric_add(\"v\", '0.001')"),
+        ("v - 0.001", "numeric_sub(\"v\", '0.001')"),
+        ("v * 0.001", "numeric_mul(\"v\", '0.001')"),
+        (
+            "SUM(v) + 0.001",
+            "numeric_add(mysql_decimal_sum(\"v\"), '0.001')",
+        ),
+    ] {
+        let sql = format!("SELECT {source} FROM amounts");
+        assert!(
+            parse_select(&sql, mode).unwrap().needs_column_types(),
+            "{sql}"
+        );
+        let translated = parse_select_knowing_decimal_columns(
+            &sql,
+            mode,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[("v".to_string(), 2)],
+        )
+        .unwrap();
+        assert!(
+            translated.as_sql().contains(rendered),
+            "{sql}: {}",
+            translated.as_sql()
+        );
+    }
+    let wide = parse_select_knowing_decimal_columns(
+        "SELECT v * 0.5 FROM amounts",
+        mode,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 30)],
+    )
+    .unwrap();
+    assert!(wide
+        .as_sql()
+        .contains("mysql_decimal_round(numeric_mul(\"v\", '0.5'), 30)"));
+    let divided = parse_select_knowing_decimal_columns(
+        "SELECT v / 2 FROM amounts",
+        mode,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .unwrap();
+    assert!(divided
+        .as_sql()
+        .contains("mysql_decimal_div_round(\"v\", '2', 6)"));
+    assert!(parse_select_knowing_decimal_columns(
+        "SELECT v / 0 FROM amounts",
+        mode,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .is_err());
+}
+
+#[test]
+fn scalar_numbers_and_mixed_numeric_columns_keep_their_kinds() {
+    let mode = SessionSqlMode::default();
+    let json = parse_select("SELECT JSON_ARRAY(1, 'a', NULL, 1.5) FROM amounts", mode).unwrap();
+    assert!(json.as_sql().contains("json_array(1, 'a', NULL, 1.5)"));
+    let deviation = parse_select("SELECT STDDEV_SAMP(n) FROM amounts", mode).unwrap();
+    assert!(deviation.as_sql().contains("stddev(\"n\")"));
+    let truncate_sql = "SELECT TRUNCATE(amount, 1) FROM amounts";
+    assert!(parse_select(truncate_sql, mode)
+        .unwrap()
+        .needs_column_types());
+    let decimal_truncate = parse_select_knowing_numeric_columns(
+        truncate_sql,
+        mode,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("amount".to_string(), 2)],
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert!(decimal_truncate
+        .as_sql()
+        .contains("mysql_decimal_truncate(\"amount\", 1)"));
+    for (expression, expected) in [
+        ("n + amount", "numeric_add(\"n\", \"amount\")"),
+        (
+            "SUM(n) + SUM(amount)",
+            "numeric_add(SUM(\"n\"), mysql_decimal_sum(\"amount\"))",
+        ),
+    ] {
+        let sql = format!("SELECT {expression} FROM amounts");
+        let translated = parse_select_knowing_numeric_columns(
+            &sql,
+            mode,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[("amount".to_string(), 2)],
+            &["n".to_string()],
+            &["d".to_string()],
+        )
+        .unwrap();
+        assert!(
+            translated.as_sql().contains(expected),
+            "{sql}: {}",
+            translated.as_sql()
+        );
+    }
+    assert!(parse_select_knowing_numeric_columns(
+        "SELECT d + amount FROM amounts",
+        mode,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("amount".to_string(), 2)],
+        &["n".to_string()],
+        &["d".to_string()],
+    )
+    .is_err());
+}
+
+#[test]
 fn translates_the_checked_sqlite_subset() {
     let translated = parse_create_table(
         "CREATE TABLE app.users (id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL UNIQUE DEFAULT 'guest', data BLOB, CHECK (id >= 0), FOREIGN KEY (id) REFERENCES accounts (id) ON DELETE CASCADE)",
@@ -16,8 +215,30 @@ fn translates_the_checked_sqlite_subset() {
 
     assert_eq!(
         translated.as_sql(),
-        "CREATE TABLE \"app\".\"users\" (\"id\" INTEGER NOT NULL UNIQUE, \"name\" TEXT NOT NULL UNIQUE DEFAULT 'guest' COLLATE NOCASE, \"data\" BLOB, CHECK (id >= 0), FOREIGN KEY (\"id\") REFERENCES \"accounts\" (\"id\") ON DELETE CASCADE)"
+        "CREATE TABLE \"app\".\"users\" (\"id\" INTEGER NOT NULL UNIQUE, \"name\" TEXT NOT NULL UNIQUE DEFAULT 'guest' COLLATE MYSQL_UCA9_AI_CI, \"data\" BLOB, CHECK (id >= 0), FOREIGN KEY (\"id\") REFERENCES \"accounts\" (\"id\") ON DELETE CASCADE)"
     );
+}
+
+#[test]
+fn mysql_ddl_renderer_hides_both_current_and_legacy_internal_collations() {
+    for internal in ["MYSQL_UCA9_AI_CI", "NOCASE"] {
+        let statement =
+            parse_sqlite_create_table(&format!("CREATE TABLE t (name TEXT COLLATE {internal})"));
+        let shown =
+            render_create_table_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap();
+        assert!(shown.contains("`name` TEXT"), "{internal}: {shown}");
+        assert!(!shown.contains("COLLATE"), "{internal}: {shown}");
+    }
+}
+
+#[test]
+fn an_explicit_utf8mb4_bin_column_keeps_its_pad_space_collation() {
+    let sql = "CREATE TABLE t (name VARCHAR(8) COLLATE utf8mb4_bin UNIQUE)";
+    let translated = parse_create_table(sql, SessionSqlMode::default()).unwrap();
+    assert!(translated.as_sql().contains("COLLATE MYSQL_UTF8MB4_BIN"));
+    let statement = parse_create_table_ast(sql, SessionSqlMode::default()).unwrap();
+    let shown = render_create_table_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap();
+    assert!(shown.contains("COLLATE utf8mb4_bin"), "{shown}");
 }
 
 #[test]
@@ -53,7 +274,7 @@ fn no_backslash_escapes_preserves_default_string_bytes() {
 
     assert_eq!(
         translated.as_sql(),
-        r#"CREATE TABLE "t" ("value" TEXT DEFAULT 'a\nb' COLLATE NOCASE)"#
+        r#"CREATE TABLE "t" ("value" TEXT DEFAULT 'a\nb' COLLATE MYSQL_UCA9_AI_CI)"#
     );
 }
 
@@ -417,7 +638,7 @@ fn null_safe_equal_translates_to_is() {
     .unwrap();
     assert_eq!(
         collated.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IS 'admin')"
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" IS 'admin')"
     );
     assert_eq!(
         collated.checked_comparisons()[0].operator(),
@@ -469,7 +690,7 @@ fn qualified_column_comparisons_render_and_validate_qualifiers() {
     .unwrap();
     assert_eq!(
         collated.as_sql(),
-        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" COLLATE NOCASE = 'alice')"
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" = 'alice')"
     );
 
     // CTE with qualified comparison
@@ -494,7 +715,7 @@ fn qualified_column_comparisons_render_and_validate_qualifiers() {
     let like = parse_select("SELECT id FROM users u WHERE u.name LIKE 'a%'", mode).unwrap();
     assert_eq!(
         like.as_sql(),
-        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (\"u\".\"name\" LIKE 'a%' ESCAPE '\\')"
+        "SELECT \"id\" FROM \"users\" AS \"u\" WHERE (mysql_uca9_like(\"u\".\"name\", 'a%', '\\'))"
     );
 
     let in_list = parse_select("SELECT id FROM users u WHERE u.id IN (1, 2)", mode).unwrap();
@@ -591,10 +812,9 @@ fn between_is_rendered_as_checked_bounds() {
 }
 
 #[test]
-fn a_text_comparison_asks_the_engine_for_a_case_insensitive_collation() {
-    // MySQL's default collation ignores case, so the rendered SQL says so.
-    // Every other comparison is left alone, because a collation the index
-    // does not carry stops the planner from using it.
+fn a_text_comparison_uses_the_columns_stored_collation() {
+    // A bare column keeps its stored collation, including an explicit
+    // utf8mb4_bin override.
     let translated = parse_select(
         "SELECT id FROM users WHERE name = 'a''b' AND id = 1",
         SessionSqlMode::default(),
@@ -602,7 +822,7 @@ fn a_text_comparison_asks_the_engine_for_a_case_insensitive_collation() {
     .unwrap();
     assert_eq!(
         translated.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE ((\"name\" COLLATE NOCASE = 'a''b') AND (\"id\" = 1))"
+        "SELECT \"id\" FROM \"users\" WHERE ((\"name\" = 'a''b') AND (\"id\" = 1))"
     );
     assert_eq!(
         translated.checked_comparisons()[0].rhs(),
@@ -611,15 +831,50 @@ fn a_text_comparison_asks_the_engine_for_a_case_insensitive_collation() {
 }
 
 #[test]
+fn text_equality_order_group_and_unique_key_use_the_same_uca9_collation() {
+    let mode = SessionSqlMode::default();
+    let table = parse_create_table("CREATE TABLE names (name VARCHAR(64) UNIQUE)", mode).unwrap();
+    assert!(table
+        .as_sql()
+        .contains("\"name\" VARCHAR(64) UNIQUE COLLATE MYSQL_UCA9_AI_CI"));
+
+    let equality = parse_select("SELECT name FROM names WHERE name = 'café'", mode).unwrap();
+    assert!(equality.as_sql().contains("\"name\" = 'café'"));
+
+    let columns = ["name".to_owned()];
+    let ordered = parse_select_with_column_types(
+        "SELECT name FROM names ORDER BY name",
+        mode,
+        &columns,
+        &columns,
+        &[],
+    )
+    .unwrap();
+    assert!(ordered.as_sql().contains("ORDER BY \"name\" ASC"));
+
+    let grouped = parse_select_with_column_types(
+        "SELECT name, COUNT(*) FROM names GROUP BY name",
+        mode,
+        &columns,
+        &columns,
+        &[],
+    )
+    .unwrap();
+    // The CREATE TABLE collation travels with the column reference used by
+    // GROUP BY, so the grouping key needs no explicit COLLATE expression.
+    assert!(grouped.as_sql().contains("GROUP BY \"name\""));
+}
+
+#[test]
 fn a_scalar_call_renders_as_the_engine_spells_it() {
     for (sql, rendered) in [
         (
             "SELECT LOWER(v) FROM s",
-            "SELECT lower(\"v\") AS \"LOWER(v)\" FROM \"s\"",
+            "SELECT mysql_lower(\"v\") AS \"LOWER(v)\" FROM \"s\"",
         ),
         (
             "SELECT UPPER(v) FROM s",
-            "SELECT upper(\"v\") AS \"UPPER(v)\" FROM \"s\"",
+            "SELECT mysql_upper(\"v\") AS \"UPPER(v)\" FROM \"s\"",
         ),
         // MySQL's LENGTH counts bytes and its CHAR_LENGTH counts
         // characters, which the engine spells the other way round.
@@ -637,7 +892,7 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT lower(v) AS folded FROM s",
-            "SELECT lower(\"v\") AS \"folded\" FROM \"s\"",
+            "SELECT mysql_lower(\"v\") AS \"folded\" FROM \"s\"",
         ),
         (
             "SELECT ABS(n) FROM s",
@@ -695,11 +950,11 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT INSTR(v, 'b') FROM s",
-            "SELECT instr(\"v\", 'b') AS \"INSTR(v, 'b')\" FROM \"s\"",
+            "SELECT mysql_instr(\"v\", 'b') AS \"INSTR(v, 'b')\" FROM \"s\"",
         ),
         (
             "SELECT LOCATE('b', v) FROM s",
-            "SELECT instr(\"v\", 'b') AS \"LOCATE('b', v)\" FROM \"s\"",
+            "SELECT mysql_locate('b', \"v\") AS \"LOCATE('b', v)\" FROM \"s\"",
         ),
         (
             "SELECT HEX(v) FROM s",
@@ -731,19 +986,19 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT GREATEST(n, 10) FROM s",
-            "SELECT max(\"n\", 10) AS \"GREATEST(n, 10)\" FROM \"s\"",
+            "SELECT CASE WHEN typeof(\"n\") = 'text' OR typeof(10) = 'text' THEN mysql_text_greatest(\"n\", 10) ELSE max(\"n\", 10) END AS \"GREATEST(n, 10)\" FROM \"s\"",
         ),
         (
             "SELECT LEAST(n, 10) FROM s",
-            "SELECT min(\"n\", 10) AS \"LEAST(n, 10)\" FROM \"s\"",
+            "SELECT CASE WHEN typeof(\"n\") = 'text' OR typeof(10) = 'text' THEN mysql_text_least(\"n\", 10) ELSE min(\"n\", 10) END AS \"LEAST(n, 10)\" FROM \"s\"",
         ),
         (
             "SELECT NULLIF(n, 0) FROM s",
-            "SELECT nullif(\"n\", 0) AS \"NULLIF(n, 0)\" FROM \"s\"",
+            "SELECT CASE WHEN typeof(\"n\") = 'text' THEN mysql_text_nullif(\"n\", 0) ELSE nullif(\"n\", 0) END AS \"NULLIF(n, 0)\" FROM \"s\"",
         ),
         (
             "SELECT NULLIF(v, 'abc') FROM s",
-            "SELECT nullif(\"v\", 'abc') AS \"NULLIF(v, 'abc')\" FROM \"s\"",
+            "SELECT CASE WHEN typeof(\"v\") = 'text' THEN mysql_text_nullif(\"v\", 'abc') ELSE nullif(\"v\", 'abc') END AS \"NULLIF(v, 'abc')\" FROM \"s\"",
         ),
         // MySQL's `IF` is the call spelling of a two-branch `CASE`, which
         // is the shape the engine reads.
@@ -1583,7 +1838,7 @@ fn a_joined_delete_deletes_the_rows_the_join_finds() {
         using.as_sql(),
         concat!(
             "DELETE FROM \"a\" WHERE _rowid_ IN (SELECT \"a\"._rowid_ FROM \"a\" ",
-            "JOIN \"b\" ON (\"a\".\"id\" = \"b\".\"a_id\") WHERE (\"b\".\"tag\" COLLATE NOCASE = 'z'))"
+            "JOIN \"b\" ON (\"a\".\"id\" = \"b\".\"a_id\") WHERE (\"b\".\"tag\" = 'z'))"
         )
     );
 
@@ -2024,7 +2279,7 @@ fn an_update_renders_a_call_in_its_set() {
     for (sql, normalized) in [
         (
             "UPDATE users SET name = LOWER(name) WHERE id = 1",
-            "UPDATE \"users\" SET \"name\" = lower(\"name\") WHERE (\"id\" = 1)",
+            "UPDATE \"users\" SET \"name\" = mysql_lower(\"name\") WHERE (\"id\" = 1)",
         ),
         (
             "UPDATE users SET name = CONCAT(name, 'x') WHERE id = 1",
@@ -2055,28 +2310,26 @@ fn an_update_renders_a_call_in_its_set() {
 }
 
 /// A comparison may name a collation, on the column or on the value.
-/// `utf8mb4_bin` compares the bytes, which the engine has to be asked for now
-/// that a column of words is declared with the collation words are matched
-/// under; the case-ignoring ones are the NOCASE a text comparison already
-/// gets.
+/// `utf8mb4_bin` compares bytes after ignoring trailing spaces. The engine
+/// needs its own PAD SPACE collation because a text column uses UCA9 by default.
 #[test]
 fn a_comparison_renders_the_collation_it_names() {
     for (sql, normalized) in [
         (
             "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_bin",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY = 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE MYSQL_UTF8MB4_BIN = 'a')",
         ),
         (
             "SELECT id FROM users WHERE name COLLATE utf8mb4_bin = 'a'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY = 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE MYSQL_UTF8MB4_BIN = 'a')",
         ),
         (
             "SELECT id FROM users WHERE name = 'a' COLLATE utf8mb4_0900_ai_ci",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE = 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE MYSQL_UCA9_AI_CI = 'a')",
         ),
         (
             "SELECT id FROM users WHERE name < 'a' COLLATE utf8mb4_bin",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE BINARY < 'a')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE MYSQL_UTF8MB4_BIN < 'a')",
         ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
@@ -2097,10 +2350,8 @@ fn a_comparison_renders_the_collation_it_names() {
     }
 }
 
-/// An ordering may name a collation. `utf8mb4_bin` is the engine's own byte
-/// order, so the ordering asks for no collation at all; the two case-ignoring
-/// collations are what the engine calls NOCASE, which a bare text column
-/// already gets.
+/// An ordering may name a collation. The first rendering pass has no column
+/// type, and the second applies PAD SPACE to a text column when requested.
 #[test]
 fn an_ordering_renders_the_collation_it_names() {
     for (sql, normalized) in [
@@ -2121,6 +2372,18 @@ fn an_ordering_renders_the_collation_it_names() {
         assert_eq!(translated.as_sql(), normalized, "{sql}");
         assert!(translated.parse_ast().is_ok(), "{sql}");
     }
+    let columns = ["name".to_owned()];
+    let with_types = parse_select_with_column_types(
+        "SELECT id FROM users ORDER BY name COLLATE utf8mb4_bin",
+        SessionSqlMode::default(),
+        &columns,
+        &columns,
+        &[],
+    )
+    .unwrap();
+    assert!(with_types
+        .as_sql()
+        .contains("ORDER BY \"name\" COLLATE MYSQL_UTF8MB4_BIN ASC"));
     for sql in [
         // 1253 in MySQL: the collation belongs to another character set.
         "SELECT id FROM users ORDER BY name COLLATE latin1_swedish_ci",
@@ -2370,30 +2633,29 @@ fn a_like_pattern_renders_from_the_pieces_it_is_written_in() {
     for (sql, normalized) in [
         (
             "SELECT id FROM users WHERE name LIKE CONCAT('%', 'lph', '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%' ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", '%lph%', '\\'))",
         ),
         (
             "SELECT id FROM users WHERE name LIKE '%lph%'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE '%lph%' ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", '%lph%', '\\'))",
         ),
         (
             "SELECT id FROM users WHERE name NOT LIKE CONCAT('al', '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" NOT LIKE 'al%' ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (NOT mysql_uca9_like(\"name\", 'al%', '\\'))",
         ),
-        // A backslash reads the same in either engine once the escape is
-        // named, whichever piece it is written in.
+        // A backslash remains the pattern escape after written pieces join.
         (
             "SELECT id FROM users WHERE name LIKE CONCAT('a\\\\b', '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\b%' ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", 'a\\b%', '\\'))",
         ),
         (
             "SELECT id FROM users WHERE name LIKE CONCAT('%', ?, '%')",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ('%' || ? || '%') ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", ('%' || ? || '%'), '\\'))",
         ),
-        // A pattern written as one `?` keeps the spelling it always had.
+        // A pattern written as one `?` remains one bound argument.
         (
             "SELECT id FROM users WHERE name LIKE ?",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ? ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", ?, '\\'))",
         ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
@@ -2799,34 +3061,32 @@ fn an_aggregate_carries_the_column_whose_type_it_answers() {
 }
 
 #[test]
-fn a_like_crosses_without_a_collation_and_names_its_escape() {
+fn a_like_uses_mysql_uca9_weights_and_names_its_escape() {
     let translated = parse_select(
         "SELECT id FROM users WHERE name LIKE 'a%' AND name NOT LIKE '_b'",
         SessionSqlMode::default(),
     )
     .unwrap();
     // MySQL takes a backslash as the pattern's escape where the statement
-    // names none, and the engine has no escape of its own, so the clause says
-    // what MySQL would have taken.
+    // names none.
     assert_eq!(
         translated.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE ((\"name\" LIKE 'a%' ESCAPE '\\') AND (\"name\" NOT LIKE '_b' ESCAPE '\\'))"
+        "SELECT \"id\" FROM \"users\" WHERE ((mysql_uca9_like(\"name\", 'a%', '\\')) AND (NOT mysql_uca9_like(\"name\", '_b', '\\')))"
     );
     assert_eq!(
         translated.checked_comparisons()[1].operator(),
         CheckedSelectComparisonOperator::NotLike
     );
 
-    // An escaped wildcard and an escape the statement names both render the
-    // clause the engine reads them by.
+    // An escaped wildcard and an explicit escape reach the same matcher.
     for (sql, normalized) in [
         (
             "SELECT id FROM users WHERE name LIKE 'a\\%'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\%' ESCAPE '\\')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", 'a\\%', '\\'))",
         ),
         (
             "SELECT id FROM users WHERE name LIKE 'a%' ESCAPE '!'",
-            "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a%' ESCAPE '!')",
+            "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", 'a%', '!'))",
         ),
     ] {
         assert_eq!(
@@ -2837,8 +3097,7 @@ fn a_like_crosses_without_a_collation_and_names_its_escape() {
             "{sql}"
         );
     }
-    // Under `NO_BACKSLASH_ESCAPES` a pattern has no escape at all, measured,
-    // and the engine has none either, so no clause is written.
+    // Under `NO_BACKSLASH_ESCAPES` a pattern has no implicit escape.
     assert_eq!(
         parse_select(
             "SELECT id FROM users WHERE name LIKE 'a\\%'",
@@ -2849,7 +3108,7 @@ fn a_like_crosses_without_a_collation_and_names_its_escape() {
         )
         .unwrap()
         .as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE 'a\\%')"
+        "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", 'a\\%', ''))"
     );
     // A `LIKE` reads one column, and a qualifier names a table this cannot
     // resolve it against.
@@ -2859,9 +3118,7 @@ fn a_like_crosses_without_a_collation_and_names_its_escape() {
     )
     .is_err());
 
-    // A pattern is bound as readily as it is written. What a written one is
-    // checked for — a backslash, which MySQL reads as an escape and the engine
-    // reads as itself — is checked where a bound one arrives instead.
+    // A pattern is bound as readily as it is written.
     let bound = parse_select(
         "SELECT id FROM users WHERE name LIKE ?",
         SessionSqlMode::default(),
@@ -2869,7 +3126,7 @@ fn a_like_crosses_without_a_collation_and_names_its_escape() {
     .unwrap();
     assert_eq!(
         bound.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" LIKE ? ESCAPE '\\')"
+        "SELECT \"id\" FROM \"users\" WHERE (mysql_uca9_like(\"name\", ?, '\\'))"
     );
     assert_eq!(bound.parameter_count(), 1);
     assert_eq!(
@@ -2887,17 +3144,29 @@ fn rejects_select_comparison_coercions_and_non_column_operands() {
         // A string is not here: the parser cannot know whether the column
         // is text, so a string against an integer column is refused by the
         // frontend, which can see the column's type.
-        for rhs in [
-            "id",
-            "CAST(1 AS SIGNED)",
-            "9223372036854775808",
-            "-9223372036854775809",
-        ] {
+        for rhs in ["id", "CAST(1 AS SIGNED)"] {
             let sql = format!("SELECT id FROM users WHERE id {operator} {rhs}");
             assert!(
                 parse_select(&sql, SessionSqlMode::default()).is_err(),
                 "expected unsupported comparison form for {sql}"
             );
+        }
+        for rhs in ["9223372036854775808", "-9223372036854775809"] {
+            let sql = format!("SELECT id FROM users WHERE id {operator} {rhs}");
+            assert!(parse_select(&sql, SessionSqlMode::default())
+                .unwrap()
+                .needs_column_types());
+            assert!(parse_select_knowing_decimal_columns(
+                &sql,
+                SessionSqlMode::default(),
+                &[],
+                &["id".to_string()],
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .is_err());
         }
         for sql in [
             format!("SELECT id FROM users WHERE other.id {operator} ?"),
@@ -2952,7 +3221,7 @@ fn reversed_comparison_is_normalized_to_column_comparison() {
         ),
         (
             "SELECT id FROM users WHERE 'admin' = id",
-            "SELECT \"id\" FROM \"users\" WHERE (\"id\" COLLATE NOCASE = 'admin')",
+            "SELECT \"id\" FROM \"users\" WHERE (\"id\" = 'admin')",
             CheckedSelectComparisonOperator::Equal,
         ),
         (
@@ -3058,7 +3327,7 @@ fn select_in_list_compares_each_member_under_the_column_collation() {
     .unwrap();
     assert_eq!(
         text.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IN ('a', 'C'))"
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" IN ('a', 'C'))"
     );
     assert!(text.checked_comparisons()[0].collated());
 }
@@ -3086,7 +3355,7 @@ fn select_in_list_collates_a_placeholder_over_a_text_column() {
     .unwrap();
     assert_eq!(
         collated.as_sql(),
-        "SELECT \"id\" FROM \"users\" WHERE (\"name\" COLLATE NOCASE IN (?, ?))"
+        "SELECT \"id\" FROM \"users\" WHERE (\"name\" IN (?, ?))"
     );
     assert!(collated.checked_comparisons()[1].collated());
 }
@@ -3098,17 +3367,17 @@ fn a_comparison_carries_a_fraction_as_it_was_written() {
     for (sql, rendered, expected) in [
         (
             "SELECT id FROM users WHERE n > 1.5",
-            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > 1.5)",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > '1.5')",
             "1.5",
         ),
         (
             "SELECT id FROM users WHERE n >= 1e6",
-            "SELECT \"id\" FROM \"users\" WHERE (\"n\" >= 1e6)",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" >= '1e6')",
             "1e6",
         ),
         (
             "SELECT id FROM users WHERE n > -1.5",
-            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > (-1.5))",
+            "SELECT \"id\" FROM \"users\" WHERE (\"n\" > '-1.5')",
             "-1.5",
         ),
     ] {
@@ -3121,13 +3390,297 @@ fn a_comparison_carries_a_fraction_as_it_was_written() {
         );
     }
 
-    // A run of digits too long for an i64 is still refused rather than read as
-    // the nearest number it names.
-    assert!(parse_select(
-        "SELECT id FROM users WHERE n > 9223372036854775808",
-        SessionSqlMode::default()
+    // A large integer needs a second pass to prove its column is DECIMAL.
+    let large = "SELECT id FROM users WHERE n > 9223372036854775808";
+    assert!(parse_select(large, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    assert!(parse_select_knowing_decimal_columns(
+        large,
+        SessionSqlMode::default(),
+        &[],
+        &["id".to_string(), "n".to_string()],
+        &[],
+        &[],
+        &[],
+        &[],
     )
     .is_err());
+}
+
+#[test]
+fn decimal_comparison_accepts_65_digit_integer_only_for_decimal_column() {
+    let digits = "1".repeat(65);
+    let sql = format!("SELECT v FROM amounts WHERE v = {digits}");
+    assert!(parse_select(&sql, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    let translated = parse_select_knowing_decimal_columns(
+        &sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 0)],
+    )
+    .unwrap();
+    assert!(translated
+        .as_sql()
+        .contains(&format!("WHERE (\"v\" = '{digits}')")));
+    assert!(parse_select_knowing_decimal_columns(
+        &sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
+    .is_err());
+}
+
+#[test]
+fn decimal_abs_keeps_exact_digits_and_scale() {
+    let sql = "SELECT ABS(v) FROM amounts";
+    assert!(parse_select(sql, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    let translated = parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .unwrap();
+    assert!(translated
+        .as_sql()
+        .contains("CASE WHEN numeric_lt(\"v\", '0') THEN numeric_sub('0', \"v\") ELSE \"v\" END"));
+    translated.parse_ast().unwrap();
+}
+
+#[test]
+fn decimal_scalar_calls_without_exact_comparison_are_rejected() {
+    for sql in [
+        "SELECT ROUND(v) FROM amounts",
+        "SELECT CEILING(v) FROM amounts",
+        "SELECT FLOOR(v) FROM amounts",
+        "SELECT CEIL(v) FROM amounts",
+        "SELECT MOD(v, 3) FROM amounts",
+        "SELECT GREATEST(v, w) FROM amounts",
+        "SELECT LEAST(v, w) FROM amounts",
+        "SELECT HEX(v) FROM amounts",
+        "SELECT FORMAT(v, 2) FROM amounts",
+        "SELECT NULLIF(v, 0) FROM amounts",
+        "SELECT CAST(v AS SIGNED) FROM amounts",
+        "SELECT CONVERT(v, SIGNED) FROM amounts",
+        "SELECT SQRT(v) FROM amounts",
+        "SELECT POW(v, 2) FROM amounts",
+        "SELECT LENGTH(v) FROM amounts",
+        "SELECT SUBSTRING(v, 1, 1) FROM amounts",
+        "SELECT TRIM(v) FROM amounts",
+        "SELECT EXTRACT(YEAR FROM v) FROM amounts",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default())
+                .unwrap()
+                .needs_column_types(),
+            "{sql}"
+        );
+        assert!(
+            parse_select_knowing_decimal_columns(
+                sql,
+                SessionSqlMode::default(),
+                &[],
+                &["v".to_string(), "w".to_string()],
+                &[],
+                &[],
+                &[],
+                &[("v".to_string(), 2), ("w".to_string(), 2)],
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn typed_select_keeps_non_decimal_casts_and_defaulted_aggregates() {
+    for sql in [
+        "SELECT CAST(ratio AS SIGNED), CAST(n AS SIGNED) FROM readings ORDER BY id",
+        "SELECT IFNULL(SUM(n), 0) FROM readings",
+        "SELECT COALESCE(MAX(n), 0) FROM readings",
+        "SELECT IFNULL(COUNT(*), 0) FROM readings",
+    ] {
+        let translated = parse_select_knowing_decimal_columns(
+            sql,
+            SessionSqlMode::default(),
+            &[],
+            &[
+                "id".to_string(),
+                "ratio".to_string(),
+                "n".to_string(),
+                "money".to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[("money".to_string(), 2)],
+        )
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        translated.parse_ast().unwrap();
+    }
+
+    for sql in [
+        "SELECT CAST(money AS SIGNED) FROM readings",
+        "SELECT IFNULL(SUM(money), 0) FROM readings",
+    ] {
+        assert!(
+            parse_select_knowing_decimal_columns(
+                sql,
+                SessionSqlMode::default(),
+                &[],
+                &[
+                    "id".to_string(),
+                    "ratio".to_string(),
+                    "n".to_string(),
+                    "money".to_string()
+                ],
+                &[],
+                &[],
+                &[],
+                &[("money".to_string(), 2)],
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn decimal_window_arguments_are_rejected() {
+    for sql in [
+        "SELECT SUM(v) OVER (ORDER BY id) FROM amounts",
+        "SELECT AVG(v) OVER (ORDER BY id) FROM amounts",
+        "SELECT LAG(v) OVER (ORDER BY id) FROM amounts",
+    ] {
+        assert!(
+            parse_select_knowing_decimal_columns(
+                sql,
+                SessionSqlMode::default(),
+                &[],
+                &["id".to_string(), "v".to_string()],
+                &[],
+                &[],
+                &[],
+                &[("v".to_string(), 2)],
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn decimal_order_expressions_require_exact_numeric_ordering() {
+    for sql in [
+        "SELECT id FROM amounts ORDER BY ABS(v)",
+        "SELECT id FROM amounts ORDER BY GREATEST(v, w)",
+        "SELECT id FROM amounts ORDER BY v + 1",
+        "SELECT id FROM amounts GROUP BY id ORDER BY SUM(v)",
+        "SELECT ABS(v) AS magnitude FROM amounts ORDER BY magnitude",
+        "SELECT v + 1 AS next_amount FROM amounts ORDER BY next_amount",
+        "SELECT SUM(v) AS total FROM amounts ORDER BY total",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default())
+                .unwrap()
+                .needs_column_types(),
+            "{sql}"
+        );
+        assert!(
+            parse_select_knowing_decimal_columns(
+                sql,
+                SessionSqlMode::default(),
+                &[],
+                &["id".to_string(), "v".to_string(), "w".to_string()],
+                &[],
+                &[],
+                &[],
+                &[("v".to_string(), 2), ("w".to_string(), 2)],
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
+
+    let sql = "SELECT id FROM amounts ORDER BY LENGTH(v)";
+    assert!(parse_select(sql, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    assert!(parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &["id".to_string(), "v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .is_err());
+
+    let sql = "SELECT v AS amount FROM amounts ORDER BY amount";
+    assert!(parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &["v".to_string()],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .is_ok());
+}
+
+#[test]
+fn decimal_predicates_do_not_use_blob_numeric_or_text_rules() {
+    for sql in [
+        "SELECT id FROM amounts WHERE FIELD(v, '2') = 1",
+        "SELECT id FROM amounts WHERE LENGTH(v) = 4",
+        "SELECT id FROM amounts WHERE v LIKE '1%'",
+        "SELECT id FROM amounts WHERE v REGEXP '^1'",
+        "SELECT id FROM amounts WHERE v",
+        "SELECT id FROM amounts GROUP BY id HAVING SUM(v) > 1",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default())
+                .unwrap()
+                .needs_column_types(),
+            "{sql}"
+        );
+        assert!(
+            parse_select_knowing_decimal_columns(
+                sql,
+                SessionSqlMode::default(),
+                &[],
+                &["id".to_string(), "v".to_string()],
+                &[],
+                &[],
+                &[],
+                &[("v".to_string(), 2)],
+            )
+            .is_err(),
+            "{sql}"
+        );
+    }
 }
 
 /// The members follow the same coercion rule a single literal comparison
@@ -3298,6 +3851,100 @@ fn select_order_by_an_enum_orders_by_the_declared_position() {
     );
 }
 
+#[test]
+fn select_order_by_a_set_uses_the_declared_bits() {
+    let set_columns = vec![(
+        "flags".to_string(),
+        vec!["read".to_string(), "write".to_string(), "exec".to_string()],
+    )];
+    let mode = SessionSqlMode::default();
+    let initial = parse_select("SELECT id FROM permissions ORDER BY flags", mode).unwrap();
+    assert!(initial.needs_column_types());
+
+    for sql in [
+        "SELECT id FROM permissions ORDER BY flags",
+        "SELECT id FROM permissions ORDER BY permissions.flags",
+        "SELECT id, flags FROM permissions ORDER BY 2",
+        "SELECT flags AS ordered FROM permissions ORDER BY ordered",
+    ] {
+        let translated =
+            parse_select_knowing_the_columns(sql, mode, &[], &[], &[], &set_columns, &[]).unwrap();
+        assert!(
+            matches!(translated.parse_ast(), Ok(Stmt::Select(_))),
+            "{sql}"
+        );
+        let order = translated.as_sql().split_once(" ORDER BY ").unwrap().1;
+        assert!(order.contains("',exec,') > 0 END ASC"), "{sql}: {order}");
+        assert!(order.contains("',write,') > 0 END ASC"), "{sql}: {order}");
+        assert!(order.contains("',read,') > 0 END ASC"), "{sql}: {order}");
+        assert!(
+            order.find("',exec,')").unwrap() < order.find("',write,')").unwrap()
+                && order.find("',write,')").unwrap() < order.find("',read,')").unwrap(),
+            "{sql}: {order}"
+        );
+        assert!(order.contains("IS NULL THEN NULL"), "{sql}: {order}");
+    }
+
+    let descending = parse_select_knowing_the_columns(
+        "SELECT * FROM permissions ORDER BY 2 DESC",
+        mode,
+        &[],
+        &["id".to_string(), "flags".to_string()],
+        &[],
+        &set_columns,
+        &[],
+    )
+    .unwrap();
+    assert!(descending.as_sql().contains("',exec,') > 0 END DESC, CASE"));
+
+    let alias = parse_select_knowing_the_columns(
+        "SELECT id AS flags FROM permissions ORDER BY flags",
+        mode,
+        &[],
+        &[],
+        &[],
+        &set_columns,
+        &[],
+    )
+    .unwrap();
+    assert!(alias.as_sql().ends_with(" ORDER BY \"flags\" ASC"));
+}
+
+#[test]
+fn select_order_by_a_set_keeps_all_64_bits_exact() {
+    let members = (0..64).map(|bit| format!("bit{bit}")).collect::<Vec<_>>();
+    let set_columns = vec![("flags".to_string(), members)];
+    let translated = parse_select_knowing_the_columns(
+        "SELECT flags FROM permissions ORDER BY flags",
+        SessionSqlMode::default(),
+        &[],
+        &[],
+        &[],
+        &set_columns,
+        &[],
+    )
+    .unwrap();
+    assert!(matches!(translated.parse_ast(), Ok(Stmt::Select(_))));
+    let order = translated.as_sql().split_once(" ORDER BY ").unwrap().1;
+    assert_eq!(order.matches(" END ASC").count(), 64);
+    assert!(order.find("',bit63,')").unwrap() < order.find("',bit0,')").unwrap());
+}
+
+#[test]
+fn float_columns_are_included_in_assignment_metadata() {
+    let spec = parse_mysql_numeric_spec(
+        "CREATE TABLE samples (f FLOAT, fu FLOAT UNSIGNED, d DOUBLE, n INT)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(!spec.is_empty());
+    assert!(spec.is_float(0));
+    assert!(spec.is_float(1));
+    assert!(!spec.is_float(2));
+    assert!(!spec.is_float(3));
+    assert!(spec.is_unsigned_real(1));
+}
+
 /// An ordinal that lands on a text column has to be collated the way the same
 /// column is when it is spelled out, or `ORDER BY 2` and `ORDER BY name` would
 /// answer different orders.
@@ -3313,7 +3960,7 @@ fn select_order_by_ordinal_collates_a_text_column() {
     .unwrap();
     assert_eq!(
         translated.as_sql(),
-        "SELECT \"id\", \"name\" FROM \"users\" ORDER BY \"name\" COLLATE NOCASE ASC"
+        "SELECT \"id\", \"name\" FROM \"users\" ORDER BY \"name\" ASC"
     );
 }
 
@@ -3358,7 +4005,7 @@ fn select_order_by_ordinal_over_wildcard_projection() {
     .unwrap();
     assert_eq!(
         collated.as_sql(),
-        "SELECT * FROM \"users\" ORDER BY \"name\" COLLATE NOCASE ASC"
+        "SELECT * FROM \"users\" ORDER BY \"name\" ASC"
     );
 
     let non_text = parse_select_with_column_types(
@@ -3384,7 +4031,7 @@ fn select_order_by_ordinal_over_wildcard_projection() {
     .unwrap();
     assert_eq!(
         desc.as_sql(),
-        "SELECT * FROM \"users\" ORDER BY \"name\" COLLATE NOCASE DESC, \"id\" ASC"
+        "SELECT * FROM \"users\" ORDER BY \"name\" DESC, \"id\" ASC"
     );
 
     // Ordinal 0 is refused immediately in pass 1
@@ -3955,6 +4602,22 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_ok(), "{sql}");
     }
+    let delete_like = parse_dml(
+        "DELETE FROM t WHERE value LIKE 'café%'",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(delete_like
+        .as_sql()
+        .contains("mysql_uca9_like(\"value\", 'café%', '\\')"));
+    let update_like = parse_dml(
+        "UPDATE t SET value = 1 WHERE value NOT LIKE 'ß_'",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(update_like
+        .as_sql()
+        .contains("NOT mysql_uca9_like(\"value\", 'ß_', '\\')"));
 
     let delete_in = parse_dml(
         "DELETE FROM t WHERE value IN (1, 2)",
@@ -4106,7 +4769,7 @@ fn select_count_distinct_collates_text_columns() {
     .unwrap();
     assert_eq!(
         collated.as_sql(),
-        "SELECT COUNT(DISTINCT \"team\" COLLATE NOCASE) AS \"COUNT(DISTINCT team)\" FROM \"users\""
+        "SELECT COUNT(DISTINCT \"team\") AS \"COUNT(DISTINCT team)\" FROM \"users\""
     );
 }
 
@@ -5482,6 +6145,15 @@ fn accepts_only_the_supported_information_schema_columns_query() {
                 MySqlInformationSchemaColumnsColumn::ColumnName,
             ],
         ),
+        (
+            "SELECT CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION",
+            vec![
+                MySqlInformationSchemaColumnsColumn::CharacterMaximumLength,
+                MySqlInformationSchemaColumnsColumn::NumericPrecision,
+                MySqlInformationSchemaColumnsColumn::NumericScale,
+                MySqlInformationSchemaColumnsColumn::CollationName,
+            ],
+        ),
     ] {
         assert_eq!(
             parse_information_schema_columns(sql, mode)
@@ -5503,9 +6175,7 @@ fn accepts_only_the_supported_information_schema_columns_query() {
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports.other' ORDER BY ORDINAL_POSITION",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'reports other' ORDER BY ORDINAL_POSITION",
-        // A column MySQL has and this does not answer, and the same column
-        // named twice.
-        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+        // The same column named twice is refused.
         "SELECT COLUMN_NAME, COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
@@ -5550,6 +6220,7 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
         ("SHOW COLUMNS FROM reports LIKE 'id%'", "reports"),
         ("SHOW FULL COLUMNS FROM reports", "reports"),
         ("SHOW FULL COLUMNS FROM reports LIKE 'id%'", "reports"),
+        ("SHOW FULL COLUMNS FROM reports FROM `archive`", "reports"),
         // MySQL's own synonyms, which a schema reader written against it
         // reaches for: `FIELDS` for `COLUMNS` and `IN` for `FROM`.
         ("SHOW FIELDS FROM reports", "reports"),
@@ -5566,7 +6237,7 @@ fn accepts_only_plain_show_columns_for_one_unqualified_table() {
 
     for sql in [
         "SHOW COLUMNS reports",
-        "SHOW COLUMNS FROM reports IN archive",
+        "SHOW COLUMNS FROM archive.reports IN archive",
         "SHOW COLUMNS FROM `report columns`",
         // Measured: MySQL answers 1064 for a name after the pattern, and the
         // pattern has to be a string literal.
@@ -6538,7 +7209,7 @@ fn translates_text_and_blob_size_variants() {
     let translated = parse_create_table(sql, mode).unwrap();
     assert_eq!(
         translated.as_sql(),
-        "CREATE TABLE \"t\" (\"id\" INT NOT NULL UNIQUE, \"a\" TINYTEXT COLLATE NOCASE, \"b\" TEXT COLLATE NOCASE, \"c\" MEDIUMTEXT COLLATE NOCASE, \"d\" LONGTEXT COLLATE NOCASE, \"e\" TINYBLOB, \"f\" BLOB, \"g\" MEDIUMBLOB, \"h\" LONGBLOB)"
+        "CREATE TABLE \"t\" (\"id\" INT NOT NULL UNIQUE, \"a\" TINYTEXT COLLATE MYSQL_UCA9_AI_CI, \"b\" TEXT COLLATE MYSQL_UCA9_AI_CI, \"c\" MEDIUMTEXT COLLATE MYSQL_UCA9_AI_CI, \"d\" LONGTEXT COLLATE MYSQL_UCA9_AI_CI, \"e\" TINYBLOB, \"f\" BLOB, \"g\" MEDIUMBLOB, \"h\" LONGBLOB)"
     );
 
     let statement = parse_create_table_ast(sql, mode).unwrap();

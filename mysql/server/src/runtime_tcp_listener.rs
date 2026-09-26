@@ -19,7 +19,8 @@ use crate::runtime_account_reload_supervisor::{
 };
 use crate::runtime_tcp_connection::{RuntimeTcpConnection, RuntimeTcpConnectionError};
 use crate::{
-    AccountStoreCheckpointReader, ConnectionLimitError, RuntimeAccountReload, RuntimeAccountStore,
+    AccountAdministration, AccountStoreAdminAuthority, AccountStoreCheckpointReader,
+    ConnectionLimitError, RuntimeAccountAdministration, RuntimeAccountReload, RuntimeAccountStore,
     RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts, TlsMaterialError,
     TlsServerConfig,
 };
@@ -31,6 +32,7 @@ pub struct RuntimeTcpListener {
     wake_reader: UnixStream,
     config: RuntimeConfig,
     accounts: Arc<RuntimeAccountStore>,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
     reload_supervisor: Mutex<Option<RuntimeAccountReloadSupervisor>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
@@ -49,13 +51,41 @@ impl RuntimeTcpListener {
             .ok_or(RuntimeTcpListenerError::TcpListenerRequired)?;
         let tls_config =
             TlsServerConfig::load(tcp.tls()).map_err(RuntimeTcpListenerError::TlsMaterial)?;
-        Self::bind_with_tls(config, checkpoint_reader, tls_config)
+        Self::bind_with_tls_and_authority(config, checkpoint_reader, tls_config, None)
     }
 
+    pub(crate) fn bind_with_account_authority(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        account_authority: Box<dyn AccountStoreAdminAuthority>,
+    ) -> Result<Self, RuntimeTcpListenerError> {
+        let tcp = config
+            .tcp()
+            .ok_or(RuntimeTcpListenerError::TcpListenerRequired)?;
+        let tls_config =
+            TlsServerConfig::load(tcp.tls()).map_err(RuntimeTcpListenerError::TlsMaterial)?;
+        Self::bind_with_tls_and_authority(
+            config,
+            checkpoint_reader,
+            tls_config,
+            Some(account_authority),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn bind_with_tls(
         config: &RuntimeConfig,
         checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
         tls_config: TlsServerConfig,
+    ) -> Result<Self, RuntimeTcpListenerError> {
+        Self::bind_with_tls_and_authority(config, checkpoint_reader, tls_config, None)
+    }
+
+    fn bind_with_tls_and_authority(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        tls_config: TlsServerConfig,
+        account_authority: Option<Box<dyn AccountStoreAdminAuthority>>,
     ) -> Result<Self, RuntimeTcpListenerError> {
         let tcp = config
             .tcp()
@@ -72,6 +102,15 @@ impl RuntimeTcpListener {
                 return Err(RuntimeTcpListenerError::AccountStore(error));
             }
         }
+        let account_administration = account_authority.map(|authority| {
+            Arc::new(RuntimeAccountAdministration::new(
+                config.account_root().to_owned(),
+                config.checkpoint_authority().clone(),
+                authority,
+                Arc::clone(&accounts),
+                config.timeouts().query(),
+            )) as Arc<dyn AccountAdministration>
+        });
 
         let listener =
             TcpListener::bind(tcp.bind()).map_err(|_| RuntimeTcpListenerError::BindUnavailable)?;
@@ -103,6 +142,7 @@ impl RuntimeTcpListener {
             wake_reader,
             config: config.clone(),
             accounts,
+            account_administration,
             reload_supervisor: Mutex::new(Some(reload_supervisor)),
             catalog,
             prepared_statement_authority,
@@ -195,6 +235,7 @@ impl RuntimeTcpListener {
                 registration,
             },
             accounts: Arc::clone(&self.accounts),
+            account_administration: self.account_administration.clone(),
             catalog: Arc::clone(&self.catalog),
             prepared_statement_authority: self.prepared_statement_authority.clone(),
             tls_config: Arc::clone(&self.tls_config),
@@ -371,6 +412,7 @@ pub(crate) struct AcceptedTcpStream {
     stream: TcpStream,
     lease: ConnectionLease,
     accounts: Arc<RuntimeAccountStore>,
+    account_administration: Option<Arc<dyn AccountAdministration>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     tls_config: Arc<TlsServerConfig>,
@@ -405,6 +447,10 @@ impl AcceptedTcpStream {
     /// Clones the account store retained for the protocol owner.
     pub(crate) fn account_store(&self) -> Arc<RuntimeAccountStore> {
         Arc::clone(&self.accounts)
+    }
+
+    pub(crate) fn account_administration(&self) -> Option<Arc<dyn AccountAdministration>> {
+        self.account_administration.clone()
     }
 
     /// Clones the database catalog retained for the protocol owner.
@@ -1776,6 +1822,27 @@ mod tests {
         let runtime = protocol_runtime(Duration::from_secs(1));
         let (client, worker) = start_worker(&runtime.listener);
         let client = authenticate_over_tls(client);
+
+        let state = runtime.listener.control.lock();
+        let (state, _) = runtime
+            .listener
+            .control
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(1), |state| {
+                state
+                    .connections
+                    .values()
+                    .any(|connection| connection.admission_active)
+            })
+            .unwrap();
+        assert!(
+            state
+                .connections
+                .values()
+                .all(|connection| !connection.admission_active),
+            "ready connection must release its admission permit"
+        );
+        drop(state);
 
         let report = runtime.listener.shutdown();
         assert_eq!(report.connections_at_start(), 1);

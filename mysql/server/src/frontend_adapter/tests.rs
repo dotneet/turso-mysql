@@ -58,6 +58,375 @@ fn binary_context() -> SchemaSqlSessionContext {
 }
 
 #[test]
+fn decimal_integer_text_and_binary_results_keep_every_digit() {
+    for (value, scale, expected) in [
+        (i64::MAX, 0, "9223372036854775807"),
+        (i64::MIN, 2, "-9223372036854775808.00"),
+    ] {
+        let mut column = column_definition("computed".to_owned(), MYSQL_TYPE_NEWDECIMAL);
+        column.decimals = scale;
+        assert_eq!(
+            value_to_text_ref(&Value::from_i64(value), TextValueRendering::Scaled(scale)).unwrap(),
+            Some(expected.as_bytes().to_vec())
+        );
+        assert_eq!(
+            binary_result_value(MySqlPreparedValue::Integer(value), &column),
+            Ok(BinaryResultValue::Text(expected.to_owned()))
+        );
+    }
+}
+
+#[test]
+fn stored_decimal_requires_exact_text_in_both_protocols() {
+    let mut column = column_definition("amount".to_owned(), MYSQL_TYPE_NEWDECIMAL);
+    column.original_table = "amounts".to_owned();
+    column.decimals = 30;
+    let exact = "-12345678901234567890123456789012345.123456789012345678901234567890";
+    let rendering = TextValueRendering::for_column(&column);
+    assert_eq!(rendering, TextValueRendering::ExactDecimal);
+    assert_eq!(
+        value_to_text_ref(&Value::from_text(exact), rendering).unwrap(),
+        Some(exact.as_bytes().to_vec())
+    );
+    assert_eq!(
+        binary_result_value(MySqlPreparedValue::Text(exact.to_owned()), &column),
+        Ok(BinaryResultValue::Text(exact.to_owned()))
+    );
+
+    for value in [
+        Value::from_i64(1),
+        Value::from_f64(1.5),
+        Value::from_slice(b"1.5").unwrap(),
+    ] {
+        assert!(matches!(
+            value_to_text_ref(&value, rendering),
+            Err(LimboError::InternalError(_))
+        ));
+    }
+    for value in [
+        MySqlPreparedValue::Integer(1),
+        MySqlPreparedValue::Real(1.5),
+        MySqlPreparedValue::Blob(b"1.5".to_vec()),
+    ] {
+        assert_eq!(
+            binary_result_value(value, &column),
+            Err(FrontendErrorKind::Internal)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stored_decimal_keeps_65_digits_in_text_and_prepared_rows() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([198; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE exact_decimals (id INT PRIMARY KEY, signed_amount DECIMAL(65,30), unsigned_amount DECIMAL(65,30) UNSIGNED)",
+        )
+        .unwrap();
+    let signed = "-12345678901234567890123456789012345.123456789012345678901234567890";
+    let unsigned = "98765432109876543210987654321098765.987654321098765432109876543210";
+    adapter
+        .execute_query(&format!(
+            "INSERT INTO exact_decimals VALUES (1, '{signed}', '{unsigned}'), (2, '-0.01', '1')"
+        ))
+        .unwrap();
+
+    let sql = "SELECT signed_amount, unsigned_amount FROM exact_decimals ORDER BY id";
+    let expected_columns = [
+        (MYSQL_TYPE_NEWDECIMAL, 67, 30),
+        (MYSQL_TYPE_NEWDECIMAL, 66, 30),
+    ];
+    let padded_negative = format!("-0.01{}", "0".repeat(28));
+    let padded_one = format!("1.{}", "0".repeat(30));
+    let expected_rows = vec![
+        vec![
+            Some(signed.as_bytes().to_vec()),
+            Some(unsigned.as_bytes().to_vec()),
+        ],
+        vec![
+            Some(padded_negative.as_bytes().to_vec()),
+            Some(padded_one.as_bytes().to_vec()),
+        ],
+    ];
+    let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+        panic!("SELECT must produce a text result set");
+    };
+    assert_eq!(
+        text.columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_columns
+    );
+    assert_eq!(text.rows, expected_rows);
+
+    let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+    assert_eq!(
+        prepared
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_columns
+    );
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    assert_eq!(binary.columns, prepared.columns);
+    assert_eq!(
+        binary.rows,
+        vec![
+            vec![
+                BinaryResultValue::Text(signed.to_owned()),
+                BinaryResultValue::Text(unsigned.to_owned()),
+            ],
+            vec![
+                BinaryResultValue::Text(padded_negative),
+                BinaryResultValue::Text(padded_one),
+            ],
+        ]
+    );
+
+    let aggregate_sql =
+        "SELECT SUM(signed_amount), AVG(signed_amount) FROM exact_decimals WHERE id < 0";
+    let expected_aggregate_columns = [
+        (MYSQL_TYPE_NEWDECIMAL, 89, 30),
+        (MYSQL_TYPE_NEWDECIMAL, 71, 30),
+    ];
+    let CommandExecutionResult::ResultSet(aggregate_text) =
+        adapter.execute_query(aggregate_sql).unwrap()
+    else {
+        panic!("aggregate SELECT must produce a text result set");
+    };
+    assert_eq!(aggregate_text.rows, vec![vec![None, None]]);
+    assert_eq!(
+        aggregate_text
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_aggregate_columns
+    );
+    let aggregate_prepared = adapter.execute_stmt_prepare(aggregate_sql).unwrap();
+    assert_eq!(
+        aggregate_prepared
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_aggregate_columns
+    );
+
+    let arithmetic_sql = "SELECT signed_amount + 0.5, signed_amount * 0.5, signed_amount / 2 FROM exact_decimals WHERE id < 0";
+    let expected_arithmetic_columns = [
+        (MYSQL_TYPE_NEWDECIMAL, 68, 30),
+        (MYSQL_TYPE_NEWDECIMAL, 67, 30),
+        (MYSQL_TYPE_NEWDECIMAL, 67, 30),
+    ];
+    let CommandExecutionResult::ResultSet(arithmetic_text) =
+        adapter.execute_query(arithmetic_sql).unwrap()
+    else {
+        panic!("arithmetic SELECT must produce a text result set");
+    };
+    assert!(arithmetic_text.rows.is_empty());
+    assert_eq!(
+        arithmetic_text
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_arithmetic_columns
+    );
+    let arithmetic_prepared = adapter.execute_stmt_prepare(arithmetic_sql).unwrap();
+    assert_eq!(arithmetic_prepared.columns, arithmetic_text.columns);
+
+    let aggregate_arithmetic_sql =
+        "SELECT SUM(signed_amount) + 0.001 FROM exact_decimals WHERE id < 0";
+    let CommandExecutionResult::ResultSet(aggregate_arithmetic_text) =
+        adapter.execute_query(aggregate_arithmetic_sql).unwrap()
+    else {
+        panic!("aggregate arithmetic SELECT must produce a text result set");
+    };
+    assert_eq!(aggregate_arithmetic_text.rows, vec![vec![None]]);
+    assert_eq!(
+        (
+            aggregate_arithmetic_text.columns[0].column_type,
+            aggregate_arithmetic_text.columns[0].column_length,
+            aggregate_arithmetic_text.columns[0].decimals,
+        ),
+        (MYSQL_TYPE_NEWDECIMAL, 68, 30)
+    );
+    let aggregate_arithmetic_prepared = adapter
+        .execute_stmt_prepare(aggregate_arithmetic_sql)
+        .unwrap();
+    assert_eq!(
+        aggregate_arithmetic_prepared.columns,
+        aggregate_arithmetic_text.columns
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn decimal_sum_and_average_keep_exact_digits_in_both_protocols() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([199; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE decimal_totals (id INT PRIMARY KEY, amount DECIMAL(30,10))")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO decimal_totals VALUES (1, '12345678901234567890.1234567890'), (2, '-1.1234567890')",
+        )
+        .unwrap();
+
+    let sql = "SELECT SUM(amount), AVG(amount) FROM decimal_totals";
+    let expected_columns = [
+        (MYSQL_TYPE_NEWDECIMAL, 54, 10),
+        (MYSQL_TYPE_NEWDECIMAL, 36, 14),
+    ];
+    let sum = "12345678901234567889.0000000000";
+    let average = "6172839450617283944.50000000000000";
+    let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+        panic!("SELECT must produce a text result set");
+    };
+    assert_eq!(
+        text.columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_columns
+    );
+    assert_eq!(
+        text.rows,
+        vec![vec![
+            Some(sum.as_bytes().to_vec()),
+            Some(average.as_bytes().to_vec())
+        ]]
+    );
+
+    let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+    assert_eq!(
+        prepared
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.decimals))
+            .collect::<Vec<_>>(),
+        expected_columns
+    );
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    assert_eq!(binary.columns, prepared.columns);
+    assert_eq!(
+        binary.rows,
+        vec![vec![
+            BinaryResultValue::Text(sum.to_owned()),
+            BinaryResultValue::Text(average.to_owned()),
+        ]]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn decimal_arithmetic_with_fractional_literals_has_exact_wire_values_and_types() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([197; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    adapter
+        .execute_query("CREATE TABLE decimal_arithmetic (id INT PRIMARY KEY, v DECIMAL(5,2))")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO decimal_arithmetic VALUES (1, '1.24'), (2, '-1.24'), (3, '999.99')",
+        )
+        .unwrap();
+
+    for (sql, expected_columns, expected_values) in [
+        (
+            "SELECT v + 0.001, v - 0.001, v * 0.001, v / 2, v / 0.5, v / 0.001 FROM decimal_arithmetic WHERE id = 1",
+            vec![(9, 3), (9, 3), (11, 5), (11, 6), (12, 6), (14, 6)],
+            vec!["1.241", "1.239", "0.00124", "0.620000", "2.480000", "1240.000000"],
+        ),
+        (
+            "SELECT SUM(v) + 0.001 FROM decimal_arithmetic",
+            vec![(31, 3)],
+            vec!["999.991"],
+        ),
+        (
+            "SELECT SUM(v) / 2, AVG(v) / 2 FROM decimal_arithmetic",
+            vec![(33, 6), (15, 10)],
+            vec!["499.995000", "166.6650000000"],
+        ),
+    ] {
+        let CommandExecutionResult::ResultSet(text) = adapter.execute_query(sql).unwrap() else {
+            panic!("{sql} must produce a text result set");
+        };
+        assert_eq!(
+            text.columns
+                .iter()
+                .map(|column| (column.column_type, column.column_length, column.decimals))
+                .collect::<Vec<_>>(),
+            expected_columns
+                .iter()
+                .map(|&(length, scale)| (MYSQL_TYPE_NEWDECIMAL, length, scale))
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+        assert_eq!(
+            text.rows,
+            vec![expected_values
+                .iter()
+                .map(|value| Some(value.as_bytes().to_vec()))
+                .collect::<Vec<_>>()],
+            "{sql}"
+        );
+
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(prepared.columns, text.columns, "{sql}");
+        let binary = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap(),
+        );
+        assert_eq!(binary.columns, prepared.columns, "{sql}");
+        assert_eq!(
+            binary.rows,
+            vec![expected_values
+                .iter()
+                .map(|value| BinaryResultValue::Text((*value).to_owned()))
+                .collect::<Vec<_>>()],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn varchar_columns_answer_what_mysql_8_4_answers() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
@@ -3872,12 +4241,11 @@ fn replace_into_overwrites_the_row_it_collides_with() {
 
     // Measured on MySQL 8.4.11: a new row counts 1, a replaced one counts
     // 2 because it is a delete and an insert, and the mixed statement
-    // counts 3. The engine does not count the delete, so this counts the
-    // inserts alone.
+    // counts 3.
     for (sql, affected) in [
         ("REPLACE INTO r (id, n) VALUES (1, 10)", 1),
-        ("REPLACE INTO r (id, n) VALUES (1, 20)", 1),
-        ("REPLACE INTO r (id, n) VALUES (2, 30), (1, 40)", 2),
+        ("REPLACE INTO r (id, n) VALUES (1, 20)", 2),
+        ("REPLACE INTO r (id, n) VALUES (2, 30), (1, 40)", 3),
     ] {
         let CommandExecutionResult::Ok(result) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must report affected rows");
@@ -4778,8 +5146,28 @@ fn a_union_answers_both_branches_and_names_no_table() {
     assert_eq!(distinct.columns[0].column_length, 11);
     assert_eq!(distinct.columns[0].table, "");
     assert_eq!(distinct.columns[0].original_table, "");
-    // Measured: a numeric result carries NUM whatever else it carries.
-    assert_eq!(distinct.columns[0].flags, MYSQL_NUM_FLAG);
+    // Both source columns are NOT NULL, and MySQL keeps that fact even though
+    // the result has no source table or key flags.
+    assert_eq!(
+        distinct.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+    );
+
+    let CommandExecutionResult::ResultSet(nullable_branch) = adapter
+        .execute_query("SELECT id AS result FROM ua UNION SELECT n FROM ub")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(nullable_branch.columns[0].flags, MYSQL_NUM_FLAG);
+
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id FROM ua UNION SELECT id FROM ub")
+        .unwrap();
+    assert_eq!(
+        prepared.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+    );
 
     // Both branches are read, so both are authorized and neither can hide
     // an internal catalog table behind the other.
@@ -5549,13 +5937,6 @@ fn a_defaulted_aggregate_answers_the_aggregates_shape_and_never_null() {
             4,
         ),
         (
-            "SELECT IFNULL(SUM(amount), 0) FROM ag",
-            "6.75",
-            MYSQL_TYPE_NEWDECIMAL,
-            34,
-            2,
-        ),
-        (
             "SELECT IFNULL(MIN(n), 0) FROM ag",
             "3",
             MYSQL_TYPE_LONGLONG,
@@ -5600,6 +5981,10 @@ fn a_defaulted_aggregate_answers_the_aggregates_shape_and_never_null() {
             "{sql}"
         );
     }
+
+    assert!(adapter
+        .execute_query("SELECT IFNULL(SUM(amount), 0) FROM ag")
+        .is_err());
 
     // The result column is named after the call as written, or after an alias.
     let CommandExecutionResult::ResultSet(named) = adapter
@@ -6881,9 +7266,9 @@ fn the_math_readings_the_two_work_out_alike() {
 /// would otherwise get the collation's own. Measured on MySQL 8.4.11 over
 /// 'beta', 'Alpha', 'alpha', 'Beta', 'Zulu' and 'apple': naming no collation
 /// orders them without regard to case, `utf8mb4_bin` puts every capital first,
-/// and `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` each order them the way
-/// naming none does. Backwards is the same order reversed, and a collation
-/// over a column of numbers changes nothing.
+/// and `utf8mb4_0900_ai_ci` orders them the way naming none does. Backwards
+/// is the same order reversed, and a collation over a column of numbers
+/// changes nothing.
 #[cfg(unix)]
 #[test]
 fn an_ordering_takes_the_collation_it_names() {
@@ -6917,10 +7302,6 @@ fn an_ordering_takes_the_collation_it_names() {
             ["2", "3", "6", "1", "4", "5"],
         ),
         (
-            "SELECT id FROM co ORDER BY name COLLATE utf8mb4_general_ci, id",
-            ["2", "3", "6", "1", "4", "5"],
-        ),
-        (
             "SELECT id FROM co ORDER BY name COLLATE utf8mb4_bin DESC, id",
             ["1", "6", "3", "5", "4", "2"],
         ),
@@ -6946,6 +7327,8 @@ fn an_ordering_takes_the_collation_it_names() {
     for sql in [
         // 1253 in MySQL: the collation belongs to another character set.
         "SELECT id FROM co ORDER BY name COLLATE latin1_swedish_ci, id",
+        // This collation has different weights from MySQL 8.4's default.
+        "SELECT id FROM co ORDER BY name COLLATE utf8mb4_general_ci, id",
         // A collation over something that is not a column has not been measured.
         "SELECT id FROM co ORDER BY LOWER(name) COLLATE utf8mb4_bin, id",
     ] {
@@ -7089,7 +7472,6 @@ fn arithmetic_touching_a_float_answers_a_float() {
         ("SELECT d / 2 FROM db WHERE id = 1", "0.75"),
         ("SELECT d + e FROM db WHERE id = 1", "1.75"),
         ("SELECT d + n FROM db WHERE id = 1", "4.5"),
-        ("SELECT d + amount FROM db WHERE id = 1", "4"),
         ("SELECT n + d FROM db WHERE id = 1", "4.5"),
         // An aggregate over a float answers a float, and arithmetic over it
         // stays one.
@@ -7114,6 +7496,9 @@ fn arithmetic_touching_a_float_answers_a_float() {
             "{sql}"
         );
     }
+    assert!(adapter
+        .execute_query("SELECT d + amount FROM db WHERE id = 1")
+        .is_err());
 }
 
 /// A comparison may name a collation, on the column or on the value.
@@ -7550,6 +7935,42 @@ fn analyze_table_refreshes_the_statistics_and_says_so() {
     assert!(adapter.execute_query("ANALYZE TABLE t, t").is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn table_select_grant_cannot_lock_or_analyze_the_database() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(Arc::clone(&authorizer));
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([44; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    authorizer
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    authorizer.table_decisions.lock().unwrap().push_back(Ok(()));
+    assert_eq!(
+        adapter.execute_query("LOCK TABLES records WRITE"),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+    assert!(!adapter.session.connection().unwrap().tables_are_locked());
+
+    authorizer
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    assert_eq!(
+        adapter.execute_query("ANALYZE TABLE records"),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+}
+
 /// `INSERT ... SELECT` reads rows rather than listing them. Measured on MySQL
 /// 8.4.11 over rows (1,10),(2,20),(3,30):
 /// `INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15` writes two rows
@@ -7618,6 +8039,73 @@ fn insert_select_writes_the_rows_it_reads_and_names_the_table_it_read() {
     assert!(adapter
         .execute_query("INSERT INTO dst SELECT id, n FROM sqlite_schema")
         .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn table_select_grant_does_not_allow_insert_select_or_prepared_writes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(Arc::clone(&authorizer));
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([43; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE grant_src (id INT)")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE grant_dst (id INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO grant_src (id) VALUES (1)")
+        .unwrap();
+
+    authorizer
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    authorizer.table_decisions.lock().unwrap().push_back(Ok(()));
+    let CommandExecutionResult::ResultSet(source) =
+        adapter.execute_query("SELECT id FROM grant_src").unwrap()
+    else {
+        panic!("a table SELECT grant must allow reading its table");
+    };
+    assert_eq!(source.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    let insert_select = "INSERT INTO grant_dst (id) SELECT id FROM grant_src";
+    authorizer
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    authorizer.table_decisions.lock().unwrap().push_back(Ok(()));
+    assert_eq!(
+        adapter.execute_query(insert_select),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+
+    let prepared = adapter.execute_stmt_prepare(insert_select).unwrap();
+    authorizer
+        .decisions
+        .lock()
+        .unwrap()
+        .push_back(Err(AuthorizationError::Denied));
+    authorizer.table_decisions.lock().unwrap().push_back(Ok(()));
+    assert_eq!(
+        adapter.execute_stmt_execute(prepared.statement_id, &[]),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+
+    let CommandExecutionResult::ResultSet(target) =
+        adapter.execute_query("SELECT id FROM grant_dst").unwrap()
+    else {
+        panic!("the target must return a result set");
+    };
+    assert!(target.rows.is_empty());
 }
 
 /// `SHOW TABLE STATUS` describes each table. Measured on MySQL 8.4.11 for the
@@ -7744,14 +8232,12 @@ fn show_table_status_answers_what_it_knows_and_nulls_the_rest() {
 }
 
 /// A dumped schema spells out the charset and collation on every text column,
-/// so refusing them stops a mysqldump from being restored. Naming the one this
-/// server has is taken; naming another is refused, because it is a claim about
-/// ordering and case this cannot keep.
+/// so refusing them stops a mysqldump from being restored. Naming the default
+/// UCA9 collation or the binary collation is taken; other collation rules are
+/// refused.
 ///
-/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` echoes the clause back even
-/// when it names the table default. This does not — the engine has no place to
-/// keep the words — so the column's DDL comes back without them. COMPAT.md
-/// records that.
+/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` echoes a column's explicit
+/// binary collation. The checked DDL renderer keeps that distinction.
 #[cfg(unix)]
 #[test]
 fn a_column_charset_and_collation_are_taken_when_they_name_this_server() {
@@ -7769,15 +8255,14 @@ fn a_column_charset_and_collation_are_taken_when_they_name_this_server() {
         .execute_query(
             "CREATE TABLE c (a VARCHAR(10) CHARACTER SET utf8mb4, \
              b VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, \
-             d VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci)",
+             d VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin)",
         )
         .unwrap();
     adapter
         .execute_query("INSERT INTO c (a, b, d) VALUES ('x', 'y', 'z')")
         .unwrap();
-    let CommandExecutionResult::ResultSet(read) = adapter
-        .execute_query("SELECT a, b, d FROM c")
-        .unwrap()
+    let CommandExecutionResult::ResultSet(read) =
+        adapter.execute_query("SELECT a, b, d FROM c").unwrap()
     else {
         panic!("SELECT must return a result set");
     };
@@ -7789,11 +8274,86 @@ fn a_column_charset_and_collation_are_taken_when_they_name_this_server() {
             Some(b"z".to_vec())
         ]]
     );
+    let CommandExecutionResult::ResultSet(full) =
+        adapter.execute_query("SHOW FULL COLUMNS FROM c").unwrap()
+    else {
+        panic!("SHOW FULL COLUMNS must return a result set");
+    };
+    assert_eq!(
+        full.rows
+            .iter()
+            .map(|row| row[2].clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            Some(b"utf8mb4_bin".to_vec()),
+        ]
+    );
+    let CommandExecutionResult::ResultSet(converted) =
+        adapter.execute_query("SELECT a, b, d FROM c").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        converted
+            .columns
+            .iter()
+            .map(|column| column.character_set)
+            .collect::<Vec<_>>(),
+        [45, 45, 45]
+    );
 
-    // A collation this server does not have is refused rather than ignored:
-    // utf8mb4_bin compares case-sensitively and this does not.
+    adapter
+        .execute_query("SET character_set_results = NULL")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(raw) =
+        adapter.execute_query("SELECT a, b, d FROM c").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        raw.columns
+            .iter()
+            .map(|column| column.character_set)
+            .collect::<Vec<_>>(),
+        [255, 255, 46]
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT a, b, d FROM c")
+        .unwrap();
+    assert_eq!(
+        prepared
+            .columns
+            .iter()
+            .map(|column| column.character_set)
+            .collect::<Vec<_>>(),
+        [255, 255, 46]
+    );
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    assert_eq!(binary.columns, prepared.columns);
+    adapter.execute_query("SET NAMES utf8mb4").unwrap();
+    let CommandExecutionResult::ResultSet(converted) =
+        adapter.execute_query("SELECT a, b, d FROM c").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        converted
+            .columns
+            .iter()
+            .map(|column| column.character_set)
+            .collect::<Vec<_>>(),
+        [45, 45, 45]
+    );
+
+    // A collation with different weights is refused rather than ignored.
     assert!(adapter
-        .execute_query("CREATE TABLE n (a VARCHAR(10) COLLATE utf8mb4_bin)")
+        .execute_query("CREATE TABLE n (a VARCHAR(10) COLLATE utf8mb4_general_ci)")
         .is_err());
     assert!(adapter
         .execute_query("CREATE TABLE n (a VARCHAR(10) CHARACTER SET latin1)")
@@ -7947,8 +8507,7 @@ fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
         .execute_query("INSERT INTO b (id, v) VALUES (1, 'cd')")
         .unwrap();
 
-    let CommandExecutionResult::ResultSet(read) =
-        adapter.execute_query("SELECT v FROM b").unwrap()
+    let CommandExecutionResult::ResultSet(read) = adapter.execute_query("SELECT v FROM b").unwrap()
     else {
         panic!("SELECT must return a result set");
     };
@@ -8985,7 +9544,7 @@ fn an_information_schema_query_is_answered_in_the_order_it_asked() {
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT TABLE_NAME, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
-        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'",
+        "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -9484,8 +10043,7 @@ fn show_engines_answers_the_one_engine_and_says_what_it_does_not_do() {
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("REPORTS").unwrap();
 
-    let CommandExecutionResult::ResultSet(engines) =
-        adapter.execute_query("SHOW ENGINES").unwrap()
+    let CommandExecutionResult::ResultSet(engines) = adapter.execute_query("SHOW ENGINES").unwrap()
     else {
         panic!("SHOW ENGINES must return a result set");
     };
@@ -9943,12 +10501,13 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
         )
         .unwrap();
     adapter
-        .execute_query("INSERT INTO u (id, a, b, c, d) VALUES (1, 255, 65535, 16777215, 4294967295)")
+        .execute_query(
+            "INSERT INTO u (id, a, b, c, d) VALUES (1, 255, 65535, 16777215, 4294967295)",
+        )
         .unwrap();
 
-    let CommandExecutionResult::ResultSet(selected) = adapter
-        .execute_query("SELECT a, b, c, d FROM u")
-        .unwrap()
+    let CommandExecutionResult::ResultSet(selected) =
+        adapter.execute_query("SELECT a, b, c, d FROM u").unwrap()
     else {
         panic!("SELECT must return a result set");
     };
@@ -10034,13 +10593,16 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
     // two inserts answer 1 and 2, and LAST_INSERT_ID reports the first of the
     // pair.
     adapter
-        .execute_query("CREATE TABLE ai (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
+        .execute_query(
+            "CREATE TABLE ai (id INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        )
         .unwrap();
     adapter
         .execute_query("INSERT INTO ai (v) VALUES (1), (2)")
         .unwrap();
-    let CommandExecutionResult::ResultSet(numbered) =
-        adapter.execute_query("SELECT id, v FROM ai ORDER BY id").unwrap()
+    let CommandExecutionResult::ResultSet(numbered) = adapter
+        .execute_query("SELECT id, v FROM ai ORDER BY id")
+        .unwrap()
     else {
         panic!("SELECT must return a result set");
     };
@@ -10066,7 +10628,9 @@ fn unsigned_integer_columns_report_their_measured_mysql_shapes() {
     adapter
         .execute_query("CREATE TABLE si (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)")
         .unwrap();
-    adapter.execute_query("INSERT INTO si (v) VALUES (1)").unwrap();
+    adapter
+        .execute_query("INSERT INTO si (v) VALUES (1)")
+        .unwrap();
     assert!(adapter
         .execute_query("UPDATE si SET id = 3000000000 WHERE id = 1")
         .is_err());
@@ -10954,7 +11518,7 @@ fn an_aggregate_reports_the_column_it_named() {
     adapter.execute_init_db("REPORTS").unwrap();
     adapter
         .execute_query(
-            "CREATE TABLE m (id INT NOT NULL PRIMARY KEY, big BIGINT, price DECIMAL(10,2), rate DOUBLE, label VARCHAR(8))",
+            "CREATE TABLE m (id INT NOT NULL PRIMARY KEY, big BIGINT, price DECIMAL(10,2), rate DOUBLE, label VARCHAR(8), body TEXT)",
         )
         .unwrap();
 
@@ -10992,6 +11556,18 @@ fn an_aggregate_reports_the_column_it_named() {
         ]
     );
     assert_eq!(empty.rows, vec![vec![None, None]]);
+
+    let CommandExecutionResult::ResultSet(text_minimum) = adapter
+        .execute_query("SELECT MIN(body), MAX(body) FROM m")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    for column in &text_minimum.columns {
+        assert_eq!(column.column_type, MYSQL_TYPE_BLOB);
+        assert_eq!(column.column_length, 1_048_560);
+        assert_eq!(column.flags, 0);
+    }
 
     // SUM widens the argument's decimal precision by 22 and keeps its
     // scale; AVG widens precision by 4 and scale by 4. Over a DOUBLE both
@@ -11076,12 +11652,11 @@ fn an_aggregate_reports_the_column_it_named() {
     assert_eq!(executed.rows, vec![vec![BinaryResultValue::Integer(3)]]);
 }
 
-/// MySQL's default collation ignores both case and accents. A comparison
-/// asks the engine for NOCASE and a LIKE needs nothing, and both reproduce
-/// the case half and not the accent half; measured on 8.4.11.
+/// MySQL's default collation ignores both case and accents in comparisons.
+/// Fresh text columns use the same UCA9 primary weights for equality and LIKE.
 #[cfg(unix)]
 #[test]
-fn a_text_where_ignores_case_but_not_accents() {
+fn a_text_where_ignores_case_and_accents() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -11117,18 +11692,14 @@ fn a_text_where_ignores_case_but_not_accents() {
         ["1", "2", "3"]
     );
     // Ordering goes through the same collation as equality. Measured:
-    // 'B' > 'a' is true in MySQL and false byte for byte, so byte order
-    // would answer 1 alone where MySQL and NOCASE answer all four.
+    // 'B' > 'a' is true in MySQL and false byte for byte.
     assert_eq!(
         ids("SELECT id FROM people WHERE name > 'a' AND name < 'ca'"),
         ["1", "2", "3", "4"]
     );
-    // Measured: MySQL answers 5 and 6, because its collation ignores the
-    // accent too. NOCASE does not, so this answers 5 alone.
-    assert_eq!(ids("SELECT id FROM people WHERE name = 'cafe'"), ["5"]);
-    // LIKE needs no collation of its own: the engine already matches it
-    // without regard to ASCII case, which is what MySQL's default
-    // collation does.
+    // Measured: MySQL answers 5 and 6 because its collation ignores accents.
+    assert_eq!(ids("SELECT id FROM people WHERE name = 'cafe'"), ["5", "6"]);
+    // LIKE uses the same frozen weights for literal characters.
     assert_eq!(
         ids("SELECT id FROM people WHERE name LIKE 'A%'"),
         ["1", "2", "3"]
@@ -11251,6 +11822,12 @@ fn bootstrap_settings_round_positive_idle_durations_up_to_seconds() {
         MySqlBootstrapSettings::new(4096, Duration::from_millis(1500)).wait_timeout_seconds(),
         2
     );
+    assert_eq!(
+        MySqlBootstrapSettings::new(4096, Duration::from_secs(7))
+            .with_net_write_timeout(Duration::from_millis(1500))
+            .net_write_timeout_seconds(),
+        2
+    );
 }
 
 #[test]
@@ -11283,6 +11860,37 @@ fn direct_adapter_serves_the_typed_driver_bootstrap_result() {
         ]]
     );
     assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+}
+
+#[test]
+fn direct_adapter_serves_connector_j_bootstrap_variables() {
+    let mut adapter = adapter();
+    let sql =
+        "/* 8.0.36-turso */SELECT @@session.auto_increment_increment AS auto_increment_increment, \
+        @@character_set_client AS character_set_client, \
+        @@character_set_connection AS character_set_connection, \
+        @@character_set_results AS character_set_results, \
+        @@character_set_server AS character_set_server, \
+        @@collation_server AS collation_server, \
+        @@collation_connection AS collation_connection, \
+        @@init_connect AS init_connect, \
+        @@interactive_timeout AS interactive_timeout, \
+        @@license AS license, \
+        @@lower_case_table_names AS lower_case_table_names, \
+        @@max_allowed_packet AS max_allowed_packet, \
+        @@net_write_timeout AS net_write_timeout, \
+        @@performance_schema AS performance_schema, \
+        @@sql_mode AS sql_mode, \
+        @@system_time_zone AS system_time_zone, \
+        @@time_zone AS time_zone, \
+        @@transaction_isolation AS transaction_isolation, \
+        @@wait_timeout AS wait_timeout";
+    let CommandExecutionResult::ResultSet(result) = adapter.execute_query(sql).unwrap() else {
+        panic!("Connector/J bootstrap query must produce a result set");
+    };
+    assert_eq!(result.columns.len(), 19);
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][12], Some(b"60".to_vec()));
 }
 
 /// Measured on MySQL 8.4.11: reading a variable no build of it has answers
@@ -12084,6 +12692,184 @@ enum RecordedDatabaseAction {
     Create(String),
     Drop(String),
     List,
+    ManageAccounts,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct RecordingAccountAdministration {
+    actions: Mutex<Vec<&'static str>>,
+}
+
+#[cfg(unix)]
+impl AccountAdministration for RecordingAccountAdministration {
+    fn apply(
+        &self,
+        _principal: &AuthenticatedPrincipal,
+        mutation: AdminMutation<'_>,
+    ) -> Result<(), FrontendErrorKind> {
+        let action = match mutation {
+            AdminMutation::CreateUser { username, password } => {
+                assert_eq!(username, "sqlreader");
+                assert_eq!(password, b"secret");
+                "create"
+            }
+            AdminMutation::GrantTableSelect {
+                username,
+                database,
+                table,
+            } => {
+                assert_eq!(
+                    (username, database, table),
+                    ("sqlreader", "reports", "records")
+                );
+                "grant"
+            }
+            AdminMutation::RevokeTableSelect {
+                username,
+                database,
+                table,
+            } => {
+                assert_eq!(
+                    (username, database, table),
+                    ("sqlreader", "reports", "records")
+                );
+                "revoke"
+            }
+        };
+        self.actions.lock().unwrap().push(action);
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn account_sql_requires_management_authorization_and_a_durable_writer() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let administration = Arc::new(RecordingAccountAdministration::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
+    let mut adapter = factory
+        .with_account_administration(administration.clone())
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([31; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    for sql in [
+        "CREATE USER 'sqlreader'@'%' IDENTIFIED BY 'secret'",
+        "GRANT SELECT ON reports.records TO 'sqlreader'@'%'",
+        "REVOKE SELECT ON reports.records FROM 'sqlreader'@'%'",
+    ] {
+        assert!(matches!(
+            adapter.execute_query(sql),
+            Ok(CommandExecutionResult::Ok(_))
+        ));
+    }
+    assert_eq!(
+        *administration.actions.lock().unwrap(),
+        ["create", "grant", "revoke"]
+    );
+    assert_eq!(
+        authorizer
+            .actions()
+            .iter()
+            .filter(|action| **action == RecordedDatabaseAction::ManageAccounts)
+            .count(),
+        3
+    );
+
+    let denied = Arc::new(RecordingAuthorizer::with_decisions([
+        Ok(()),
+        Err(AuthorizationError::Denied),
+    ]));
+    let (_directory, _catalog, factory) = catalog_factory(denied);
+    let mut adapter = factory
+        .with_account_administration(administration.clone())
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([32; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    assert_eq!(
+        adapter.execute_query("CREATE USER 'sqlreader'@'%' IDENTIFIED BY 'secret'"),
+        Err(FrontendErrorKind::AccessDenied)
+    );
+    assert_eq!(administration.actions.lock().unwrap().len(), 3);
+
+    let (_directory, _catalog, factory) = catalog_factory(Arc::new(RecordingAuthorizer::default()));
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([33; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    assert_eq!(
+        adapter.execute_query("CREATE USER 'sqlreader'@'%' IDENTIFIED BY 'secret'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn account_sql_commits_the_current_transaction_before_changing_accounts() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let administration = Arc::new(RecordingAccountAdministration::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .with_account_administration(administration.clone())
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([34; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE account_data (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+
+    for (id, sql) in [
+        (1, "CREATE USER 'sqlreader'@'%' IDENTIFIED BY 'secret'"),
+        (2, "GRANT SELECT ON reports.records TO 'sqlreader'@'%'"),
+        (3, "REVOKE SELECT ON reports.records FROM 'sqlreader'@'%'"),
+    ] {
+        adapter.execute_query("START TRANSACTION").unwrap();
+        adapter
+            .execute_query(&format!("INSERT INTO account_data VALUES ({id})"))
+            .unwrap();
+        let CommandExecutionResult::Ok(result) = adapter.execute_query(sql).unwrap() else {
+            panic!("account change must return OK");
+        };
+        assert_eq!(result.status_flags, SERVER_STATUS_AUTOCOMMIT);
+        adapter.execute_query("ROLLBACK").unwrap();
+        let CommandExecutionResult::ResultSet(rows) = adapter
+            .execute_query(&format!("SELECT id FROM account_data WHERE id = {id}"))
+            .unwrap()
+        else {
+            panic!("committed insert must return a result set");
+        };
+        assert_eq!(rows.rows.len(), 1, "{sql}");
+    }
+
+    adapter.execute_query("SET autocommit = 0").unwrap();
+    adapter
+        .execute_query("INSERT INTO account_data VALUES (4)")
+        .unwrap();
+    let CommandExecutionResult::Ok(result) = adapter
+        .execute_query("GRANT SELECT ON reports.records TO 'sqlreader'@'%'")
+        .unwrap()
+    else {
+        panic!("account change must return OK");
+    };
+    assert_eq!(result.status_flags, 0);
+    adapter.execute_query("ROLLBACK").unwrap();
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT id FROM account_data WHERE id = 4")
+        .unwrap()
+    else {
+        panic!("committed insert must return a result set");
+    };
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(administration.actions.lock().unwrap().len(), 4);
 }
 
 #[cfg(unix)]
@@ -12143,6 +12929,7 @@ impl DatabaseAuthorizer for RecordingAuthorizer {
             }
             DatabaseAction::Drop { database } => RecordedDatabaseAction::Drop(database.to_owned()),
             DatabaseAction::List => RecordedDatabaseAction::List,
+            DatabaseAction::ManageAccounts => RecordedDatabaseAction::ManageAccounts,
         };
         self.actions.lock().unwrap().push(action);
         self.decisions.lock().unwrap().pop_front().unwrap_or(Ok(()))
@@ -13575,16 +14362,39 @@ fn window_calls_answer_the_shape_mysql_answers() {
             .collect::<Vec<_>>(),
         ["1", "4", "2", "3"]
     );
-    // A divergence, recorded in COMPAT.md: the engine answers every column of
-    // a windowed statement out of its own sorter, so the other columns lose
-    // the table they came from and the key flags that go with it. MySQL
-    // reports `id` here against `w` with NOT_NULL and PRI_KEY.
+    // The engine reads the column back from the window sorter. The adapter
+    // restores the one unambiguous source column's table and nullability.
     let carried = &numbered.columns[0];
     assert_eq!(carried.name, "id");
-    assert_eq!(carried.table, "");
-    assert_eq!(carried.original_table, "");
-    // Only the numeric flag survives, because that one comes from the type.
-    assert_eq!(carried.flags, MYSQL_NUM_FLAG);
+    assert_eq!(carried.table, "w");
+    assert_eq!(carried.original_table, "w");
+    assert_eq!(
+        carried.flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+    );
+
+    let CommandExecutionResult::ResultSet(aliased) = adapter
+        .execute_query("SELECT id AS carried_id, ROW_NUMBER() OVER (ORDER BY n) FROM w")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(aliased.columns[0].name, "carried_id");
+    assert_eq!(aliased.columns[0].table, "w");
+    assert_eq!(aliased.columns[0].original_name, "id");
+    assert_eq!(
+        aliased.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT id AS carried_id, ROW_NUMBER() OVER (ORDER BY n) FROM w")
+        .unwrap();
+    assert_eq!(prepared.columns[0].table, "w");
+    assert_eq!(prepared.columns[0].original_name, "id");
+    assert_eq!(
+        prepared.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_NUM_FLAG
+    );
 
     // Measured: 'a' and 'A' are one partition, because MySQL's default
     // collation ignores case when it groups just as when it compares.
@@ -14121,6 +14931,49 @@ fn create_table_as_select_copies_the_columns_and_the_rows() {
         panic!("SELECT must return rows");
     };
     assert_eq!(kept.rows.len(), 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn create_table_as_select_keeps_binary_text_collation() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([29; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE source_words (word VARCHAR(16) COLLATE utf8mb4_bin)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO source_words VALUES ('A'), ('a')")
+        .unwrap();
+    adapter
+        .execute_query("CREATE TABLE copied_words AS SELECT word FROM source_words")
+        .unwrap();
+
+    let CommandExecutionResult::ResultSet(rows) = adapter
+        .execute_query("SELECT word FROM copied_words WHERE word = 'A'")
+        .unwrap()
+    else {
+        panic!("SELECT must return rows");
+    };
+    assert_eq!(rows.rows, vec![vec![Some(b"A".to_vec())]]);
+
+    let CommandExecutionResult::ResultSet(created) = adapter
+        .execute_query("SHOW CREATE TABLE copied_words")
+        .unwrap()
+    else {
+        panic!("SHOW CREATE TABLE must return a result set");
+    };
+    let ddl = String::from_utf8(created.rows[0][1].clone().unwrap()).unwrap();
+    assert!(
+        ddl.contains("`word` varchar(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+        "{ddl}"
+    );
 }
 
 /// `ALTER TABLE` adds and drops indexes, which is how a migration writes one.
@@ -16164,9 +17017,8 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
     // Measured on MySQL 8.4.11: `FULL` puts `Collation` third and appends
     // `Privileges` and `Comment`. The collation is the text one for a VARCHAR,
     // CHAR or TEXT and NULL for every other type. The comment is empty, which
-    // is the only comment a column here can have. `Privileges` is answered
-    // NULL, a divergence recorded in COMPAT.md: MySQL reports the user's
-    // grants on the column and this server's grants are not per column.
+    // is the only comment a column here can have. Query permission gives the
+    // column-level operations the session can perform.
     let CommandExecutionResult::ResultSet(full) = adapter
         .execute_query("SHOW FULL COLUMNS FROM records")
         .unwrap()
@@ -16203,11 +17055,16 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
             ))
             .collect::<Vec<_>>(),
         [
-            ("id".to_owned(), None, None, Some(Vec::new())),
+            (
+                "id".to_owned(),
+                None,
+                Some(b"select,insert,update,references".to_vec()),
+                Some(Vec::new())
+            ),
             (
                 "label".to_owned(),
                 Some("utf8mb4_0900_ai_ci".to_owned()),
-                None,
+                Some(b"select,insert,update,references".to_vec()),
                 Some(Vec::new())
             ),
         ]
@@ -16219,6 +17076,43 @@ fn show_columns_requires_selection_and_reauthorizes_the_selected_database() {
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn show_catalog_accepts_an_explicit_selected_database() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([249; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_query("USE reports").unwrap();
+
+    let CommandExecutionResult::ResultSet(tables) = adapter
+        .execute_query("SHOW FULL TABLES FROM `reports` LIKE 'records'")
+        .unwrap()
+    else {
+        panic!("expected SHOW FULL TABLES rows");
+    };
+    assert_eq!(tables.rows[0][0], Some(b"records".to_vec()));
+    let CommandExecutionResult::ResultSet(columns) = adapter
+        .execute_query("SHOW FULL COLUMNS FROM `records` FROM `reports`")
+        .unwrap()
+    else {
+        panic!("expected SHOW FULL COLUMNS rows");
+    };
+    assert_eq!(columns.rows[0][0], Some(b"id".to_vec()));
+    assert_eq!(
+        adapter.execute_query("SHOW FULL TABLES FROM archive LIKE 'records'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("SHOW FULL COLUMNS FROM records FROM archive"),
+        Err(FrontendErrorKind::Unsupported)
+    );
 }
 
 #[cfg(unix)]
@@ -16276,12 +17170,20 @@ fn show_columns_and_describe_fall_back_to_granted_table_permission() {
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("reports").unwrap();
 
-    for sql in ["SHOW COLUMNS FROM RECORDS", "DESCRIBE records"] {
-        assert!(matches!(
-            adapter.execute_query(sql),
-            Ok(CommandExecutionResult::ResultSet(_))
-        ));
-    }
+    let CommandExecutionResult::ResultSet(full) = adapter
+        .execute_query("SHOW FULL COLUMNS FROM RECORDS")
+        .unwrap()
+    else {
+        panic!("SHOW FULL COLUMNS must return a result set");
+    };
+    assert!(full
+        .rows
+        .iter()
+        .all(|row| row[7] == Some(b"select".to_vec())));
+    assert!(matches!(
+        adapter.execute_query("DESCRIBE records"),
+        Ok(CommandExecutionResult::ResultSet(_))
+    ));
     assert_eq!(
         authorizer.actions(),
         vec![
@@ -16440,7 +17342,7 @@ fn show_columns_encodes_typed_default_values() {
         .unwrap()
         .list_columns(&MySqlTableName::parse("metadata").unwrap())
         .unwrap();
-    let result = show_columns_result(columns, SERVER_STATUS_AUTOCOMMIT, false).unwrap();
+    let result = show_columns_result(columns, SERVER_STATUS_AUTOCOMMIT, false, b"select").unwrap();
 
     let CommandExecutionResult::ResultSet(result) = result else {
         panic!("SHOW COLUMNS must produce a result set");
@@ -16751,6 +17653,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
             vec![bounded[0].clone(); MAX_DISPATCH_RESULT_ROWS + 1],
             SERVER_STATUS_AUTOCOMMIT,
             false,
+            b"select",
         ),
         Err(FrontendErrorKind::Internal)
     );
@@ -16768,7 +17671,12 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("oversized_default").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result(oversized_default, SERVER_STATUS_AUTOCOMMIT, false),
+        show_columns_result(
+            oversized_default,
+            SERVER_STATUS_AUTOCOMMIT,
+            false,
+            b"select"
+        ),
         Err(FrontendErrorKind::Internal)
     );
 
@@ -16785,7 +17693,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .list_columns(&MySqlTableName::parse("packet_bound").unwrap())
         .unwrap();
     assert_eq!(
-        show_columns_result(packet_bound, SERVER_STATUS_AUTOCOMMIT, false),
+        show_columns_result(packet_bound, SERVER_STATUS_AUTOCOMMIT, false, b"select"),
         Err(FrontendErrorKind::Internal)
     );
 
@@ -16804,6 +17712,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
             vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
             SERVER_STATUS_AUTOCOMMIT,
             false,
+            b"select",
         ),
         Err(FrontendErrorKind::Internal)
     );
@@ -18420,6 +19329,86 @@ fn information_schema_columns_returns_exact_metadata_and_rows() {
 
 #[cfg(unix)]
 #[test]
+fn information_schema_columns_reports_lengths_precision_scale_and_collation() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    let mut seed = catalog.new_session(binary_context());
+    seed.select_database("reports").unwrap();
+    seed.connection()
+        .unwrap()
+        .execute_schema_ddl(
+            "CREATE TABLE field_types (id INT, title VARCHAR(20), exact VARCHAR(20) COLLATE utf8mb4_bin, price DECIMAL(10,2), body TEXT, enabled BOOLEAN)",
+        )
+        .unwrap();
+    drop(seed);
+
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([77; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query(
+            "SELECT CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'field_types' ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.COLUMNS must return a result set");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![None, Some(b"10".to_vec()), Some(b"0".to_vec()), None],
+            vec![
+                Some(b"20".to_vec()),
+                None,
+                None,
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ],
+            vec![
+                Some(b"20".to_vec()),
+                None,
+                None,
+                Some(b"utf8mb4_bin".to_vec()),
+            ],
+            vec![None, Some(b"10".to_vec()), Some(b"2".to_vec()), None],
+            vec![
+                Some(b"65535".to_vec()),
+                None,
+                None,
+                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+            ],
+            vec![None, Some(b"3".to_vec()), Some(b"0".to_vec()), None],
+        ]
+    );
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.column_length, column.flags))
+            .collect::<Vec<_>>(),
+        vec![
+            (MYSQL_TYPE_LONGLONG, 21, MYSQL_NUM_FLAG),
+            (
+                MYSQL_TYPE_LONGLONG,
+                10,
+                MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                10,
+                MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+            ),
+            (MYSQL_TYPE_VAR_STRING, 256, 0),
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn information_schema_columns_returns_the_requested_table_or_view() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
@@ -18825,7 +19814,7 @@ fn information_schema_columns_rejects_malformed_queries_without_fallthrough() {
     for query in [
         "SELECT * FROM information_schema.COLUMNS",
         // A column MySQL has and this does not answer.
-        "SELECT COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
+        "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
         "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION; SELECT 1",
@@ -19720,7 +20709,11 @@ fn text_and_blob_sizes_metadata_show_create_and_columns_match_mysql() {
                 row[1].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
                 row[2].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
                 row[3].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
-                row[4].as_deref().map(std::str::from_utf8).transpose().unwrap(),
+                row[4]
+                    .as_deref()
+                    .map(std::str::from_utf8)
+                    .transpose()
+                    .unwrap(),
                 row[5].as_deref().map(std::str::from_utf8).unwrap().unwrap(),
             ))
             .collect::<Vec<_>>(),
@@ -19741,21 +20734,78 @@ fn text_and_blob_sizes_metadata_show_create_and_columns_match_mysql() {
         .execute_query("INSERT INTO t (id, a, b, c, d) VALUES (1, 'x', 'x', 'x', 'x')")
         .unwrap();
 
-    let CommandExecutionResult::ResultSet(select_result) =
-        adapter.execute_query("SELECT a, b, c, d, e, f, g, h FROM t").unwrap()
+    let CommandExecutionResult::ResultSet(select_result) = adapter
+        .execute_query("SELECT a, b, c, d, e, f, g, h FROM t")
+        .unwrap()
     else {
         panic!("SELECT must return a result set");
     };
 
     let expected = [
-        ("a", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 1_020u32, 0u8, MYSQL_BLOB_FLAG),
-        ("b", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 262_140u32, 0u8, MYSQL_BLOB_FLAG),
-        ("c", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), 67_108_860u32, 0u8, MYSQL_BLOB_FLAG),
-        ("d", MYSQL_TYPE_BLOB, u16::from(DEFAULT_UTF8MB4_COLLATION), u32::MAX, 0u8, MYSQL_BLOB_FLAG),
-        ("e", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 255u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
-        ("f", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 65_535u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
-        ("g", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, 16_777_215u32, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
-        ("h", MYSQL_TYPE_BLOB, MYSQL_BINARY_COLLATION, u32::MAX, 0u8, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG),
+        (
+            "a",
+            MYSQL_TYPE_BLOB,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            1_020u32,
+            0u8,
+            MYSQL_BLOB_FLAG,
+        ),
+        (
+            "b",
+            MYSQL_TYPE_BLOB,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            262_140u32,
+            0u8,
+            MYSQL_BLOB_FLAG,
+        ),
+        (
+            "c",
+            MYSQL_TYPE_BLOB,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            67_108_860u32,
+            0u8,
+            MYSQL_BLOB_FLAG,
+        ),
+        (
+            "d",
+            MYSQL_TYPE_BLOB,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            u32::MAX,
+            0u8,
+            MYSQL_BLOB_FLAG,
+        ),
+        (
+            "e",
+            MYSQL_TYPE_BLOB,
+            MYSQL_BINARY_COLLATION,
+            255u32,
+            0u8,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "f",
+            MYSQL_TYPE_BLOB,
+            MYSQL_BINARY_COLLATION,
+            65_535u32,
+            0u8,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "g",
+            MYSQL_TYPE_BLOB,
+            MYSQL_BINARY_COLLATION,
+            16_777_215u32,
+            0u8,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "h",
+            MYSQL_TYPE_BLOB,
+            MYSQL_BINARY_COLLATION,
+            u32::MAX,
+            0u8,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
     ];
 
     assert_eq!(select_result.columns.len(), 8);
@@ -19881,17 +20931,15 @@ fn dml_order_by_and_limit_updates_and_deletes_expected_rows() {
     );
 
     // DELETE with ORDER BY without LIMIT: deletes remaining id 3
-    let CommandExecutionResult::Ok(del3) = adapter
-        .execute_query("DELETE FROM t ORDER BY id")
-        .unwrap()
+    let CommandExecutionResult::Ok(del3) =
+        adapter.execute_query("DELETE FROM t ORDER BY id").unwrap()
     else {
         panic!("DELETE must return Ok packet");
     };
     assert_eq!(del3.affected_rows, 1);
 
-    let CommandExecutionResult::ResultSet(res4) = adapter
-        .execute_query("SELECT id FROM t")
-        .unwrap()
+    let CommandExecutionResult::ResultSet(res4) =
+        adapter.execute_query("SELECT id FROM t").unwrap()
     else {
         panic!("SELECT must return ResultSet");
     };
@@ -21153,9 +22201,7 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
     // Measured: reading a whole number out rounds away from zero, where the
     // engine's own cast would cut the fraction off.
     let CommandExecutionResult::ResultSet(rounded) = adapter
-        .execute_query(
-            "SELECT CAST(ratio AS SIGNED), CAST(money AS SIGNED), CAST(n AS SIGNED) FROM readings ORDER BY id",
-        )
+        .execute_query("SELECT CAST(ratio AS SIGNED), CAST(n AS SIGNED) FROM readings ORDER BY id")
         .unwrap()
     else {
         panic!("SELECT must return a result set");
@@ -21163,16 +22209,8 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
     assert_eq!(
         rounded.rows,
         vec![
-            vec![
-                Some(b"2".to_vec()),
-                Some(b"12".to_vec()),
-                Some(b"42".to_vec()),
-            ],
-            vec![
-                Some(b"-2".to_vec()),
-                Some(b"0".to_vec()),
-                Some(b"-3".to_vec()),
-            ],
+            vec![Some(b"2".to_vec()), Some(b"42".to_vec())],
+            vec![Some(b"-2".to_vec()), Some(b"-3".to_vec())],
         ]
     );
     assert_eq!(
@@ -21184,7 +22222,7 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
         // The numeric flag rides along with the type, the way it does for every
         // other number this answers. The golden cannot show it: the driver the
         // observations are recorded through does not report it.
-        vec![(MYSQL_TYPE_LONGLONG, 21, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG); 3]
+        vec![(MYSQL_TYPE_LONGLONG, 21, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG); 2]
     );
 
     let CommandExecutionResult::ResultSet(moments) = adapter
@@ -21253,6 +22291,7 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
         // Measured: a DECIMAL keeps its declared scale, so `1.50` is written
         // out as `1.50` there and would be `1.5` here.
         "SELECT CAST(money AS CHAR) FROM readings",
+        "SELECT CAST(money AS SIGNED) FROM readings",
         // A DOUBLE prints by a rule of its own.
         "SELECT CAST(ratio AS CHAR) FROM readings",
         // Measured: cutting a word short warns, and the warning is not raised
@@ -21502,9 +22541,7 @@ fn a_like_binds_its_pattern() {
             })
     };
 
-    // The engine already matches a pattern without regard to ASCII case, which
-    // is what MySQL's default collation does, so a bound pattern needs no
-    // collation of its own.
+    // Bound patterns use the same UCA9 matcher as written patterns.
     assert_eq!(
         matched("SELECT id FROM names WHERE name LIKE ? ORDER BY id", b"ad%").unwrap(),
         vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(3)]
@@ -21522,14 +22559,15 @@ fn a_like_binds_its_pattern() {
         vec![BinaryResultValue::Integer(2)]
     );
 
-    // MySQL reads a backslash in a pattern as an escape and the engine reads it
-    // as itself, so a bound pattern carrying one is refused the way a written
-    // one is.
-    assert!(matched(
-        "SELECT id FROM names WHERE name LIKE ? ORDER BY id",
-        b"a\\%"
-    )
-    .is_err());
+    // A backslash makes the percent a literal; none of these names has one.
+    assert_eq!(
+        matched(
+            "SELECT id FROM names WHERE name LIKE ? ORDER BY id",
+            b"a\\%"
+        )
+        .unwrap(),
+        Vec::<BinaryResultValue>::new()
+    );
 }
 
 /// `(a, b) IN ((1, 'x'), (2, 'y'))`, which is how a lookup by a key of more
@@ -23213,6 +24251,7 @@ fn a_client_reads_the_system_variables_this_server_has() {
         ("SELECT @@performance_schema", 1, false, "0"),
         ("SELECT @@auto_increment_increment", 21, true, "1"),
         ("SELECT @@auto_increment_offset", 21, true, "1"),
+        ("SELECT @@net_write_timeout", 21, true, "60"),
         // A table written as `Users` is found as `users` and reads back
         // lowercased, which is what MySQL's 1 means. MySQL on Linux answers 0.
         ("SELECT @@lower_case_table_names", 21, true, "1"),
@@ -23289,7 +24328,7 @@ fn a_client_reads_the_system_variables_this_server_has() {
         // A variable this server has no honest answer for is turned down as
         // one this build does not have, rather than answered with a value it
         // does not keep.
-        "SELECT @@net_write_timeout",
+        "SELECT @@net_read_timeout",
         "SELECT @@innodb_version",
         "SELECT @@socket",
     ] {
@@ -27596,16 +28635,25 @@ fn a_column_prints_the_default_it_was_declared_with() {
         ]]
     );
 
+    adapter
+        .execute_query(
+            "CREATE TABLE rounded_defaults (id INT PRIMARY KEY, amount DECIMAL(10,2) DEFAULT 1.239, quoted DECIMAL(10,2) DEFAULT '4.5')",
+        )
+        .unwrap();
+    let rounded_schema = printed_schema(&mut adapter, "rounded_defaults");
+    assert!(rounded_schema.contains("`amount` decimal(10,2) DEFAULT '1.24'"));
+    assert!(rounded_schema.contains("`quoted` decimal(10,2) DEFAULT '4.50'"));
+    adapter
+        .execute_query("INSERT INTO rounded_defaults (id) VALUES (1)")
+        .unwrap();
+    assert_eq!(
+        counted_rows(&mut adapter, "SELECT amount, quoted FROM rounded_defaults"),
+        vec![vec![Some("1.24".to_owned()), Some("4.50".to_owned())]]
+    );
+
     for ddl in [
-        // Measured: MySQL rounds this to the places the column holds, printing
-        // `'1.24'`, and rounding the way MySQL rounds is not a rule this has.
-        "CREATE TABLE refused (a DECIMAL(10,2) DEFAULT 1.239)",
         "CREATE TABLE refused (a INT DEFAULT 1.25)",
-        // Measured: a word as the default of a column of numbers is 1067 on an
-        // `INT` and read as a number on a `DECIMAL`, and reading one is not a
-        // rule this has either.
         "CREATE TABLE refused (a INT DEFAULT 'x')",
-        "CREATE TABLE refused (a DECIMAL(10,2) DEFAULT '4.5')",
     ] {
         assert!(adapter.execute_query(ddl).is_err(), "{ddl}");
     }

@@ -1,15 +1,22 @@
 use super::{
-    consume_admin_like_pattern, consume_admin_word, like_pattern::MySqlLikePattern,
-    skip_admin_comments, tokenize_admin_command, AdminToken, ParseError, SessionSqlMode,
+    consume_admin_database_name, consume_admin_like_pattern, consume_admin_word,
+    like_pattern::MySqlLikePattern, skip_admin_comments, tokenize_admin_command, AdminToken,
+    MySqlDatabaseName, ParseError, SessionSqlMode,
 };
 
 /// Lists names and object kinds in the selected database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlShowFullTablesCommand {
+    database: Option<MySqlDatabaseName>,
     pattern: Option<MySqlLikePattern>,
 }
 
 impl MySqlShowFullTablesCommand {
+    /// Returns the database named by `FROM` or `IN`, if present.
+    pub fn database(&self) -> Option<&MySqlDatabaseName> {
+        self.database.as_ref()
+    }
+
     /// Returns the pattern the command names its tables with, if any.
     pub fn pattern(&self) -> Option<&MySqlLikePattern> {
         self.pattern.as_ref()
@@ -33,7 +40,7 @@ pub fn parse_show_full_tables(
     })
 }
 
-/// Accepts an optional single semicolon; filters, qualifiers and comments are unsupported.
+/// Accepts the selected database in `FROM` or `IN` and an optional pattern.
 pub fn parse_optional_show_full_tables(
     sql: &str,
     mode: SessionSqlMode,
@@ -52,6 +59,13 @@ pub fn parse_optional_show_full_tables(
             feature: "comments in SHOW FULL TABLES command",
         });
     }
+    let database = if consume_admin_word(&tokens, &mut cursor, "FROM")
+        || consume_admin_word(&tokens, &mut cursor, "IN")
+    {
+        Some(consume_admin_database_name(&tokens, &mut cursor)?)
+    } else {
+        None
+    };
     let pattern = consume_admin_like_pattern(&tokens, &mut cursor, mode)?;
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
@@ -59,7 +73,7 @@ pub fn parse_optional_show_full_tables(
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowFullTablesCommand { pattern }))
+    Ok(Some(MySqlShowFullTablesCommand { database, pattern }))
 }
 
 #[cfg(test)]
@@ -75,7 +89,10 @@ mod tests {
         ] {
             assert_eq!(
                 parse_show_full_tables(sql, SessionSqlMode::default()),
-                Ok(MySqlShowFullTablesCommand { pattern: None })
+                Ok(MySqlShowFullTablesCommand {
+                    database: None,
+                    pattern: None
+                })
             );
         }
         for (sql, pattern) in [
@@ -91,9 +108,14 @@ mod tests {
         assert_eq!(filtered.pattern().unwrap().text(), "Alpha%");
         assert!(filtered.covers("Alpha_two"));
         assert!(!filtered.covers("alpha_two"));
+        let selected = parse_show_full_tables(
+            "SHOW FULL TABLES FROM `reports` LIKE 'records'",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.database().unwrap().as_str(), "reports");
+        assert!(selected.covers("records"));
         for sql in [
-            "SHOW FULL TABLES FROM app",
-            "SHOW FULL TABLES IN app",
             "SHOW FULL TABLES LIKE",
             "SHOW FULL TABLES LIKE alpha",
             "SHOW FULL TABLES LIKE 123",

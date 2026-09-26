@@ -1,0 +1,322 @@
+//! Frozen Unicode 9 primary weights for MySQL's `utf8mb4_0900_ai_ci`.
+//!
+//! The table is generated from Unicode 9.0.0 `allkeys.txt` and `PropList.txt`
+//! by `generate_mysql_uca9.py`. Copyright 2016 Unicode, Inc. The Unicode data
+//! license is in `licenses/core/unicode-data-license.md`. No MySQL source tables are copied.
+//! The source files and their SHA-256 hashes are in the generator.
+
+use std::{cmp::Ordering, str::Chars};
+
+const DATA: &[u8] = include_bytes!("mysql_uca9_primary.bin");
+const HEADER_LEN: usize = 20;
+const RECORD_LEN: usize = 9;
+
+/// Compare the primary collation weights, ignoring accents and case.
+pub fn compare(lhs: &str, rhs: &str) -> Ordering {
+    PrimaryWeights::new(lhs).cmp(PrimaryWeights::new(rhs))
+}
+
+/// The same primary weights as a byte key for hash joins and grouping.
+pub(crate) fn sort_key(text: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(text.len() * 2);
+    for weight in PrimaryWeights::new(text) {
+        key.extend_from_slice(&weight.to_be_bytes());
+    }
+    key
+}
+
+/// Match MySQL LIKE one Unicode scalar at a time. Collation expansions do not
+/// change how many characters `_` and literal pattern characters consume.
+pub fn like(text: &str, pattern: &str, escape: Option<char>) -> crate::Result<bool> {
+    const MAX_PATTERN_BYTES: usize = 50_000;
+    const MAX_MATCH_STEPS: usize = 10_000_000;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(crate::LimboError::Constraint(
+            "LIKE pattern too complex".to_owned(),
+        ));
+    }
+
+    let mut units = Vec::new();
+    let mut pattern_chars = pattern.chars();
+    while let Some(character) = pattern_chars.next() {
+        let unit = if escape == Some(character) {
+            LikeUnit::Literal(pattern_chars.next().unwrap_or(character))
+        } else {
+            match character {
+                '%' => LikeUnit::AnyMany,
+                '_' => LikeUnit::AnyOne,
+                _ => LikeUnit::Literal(character),
+            }
+        };
+        if unit != LikeUnit::AnyMany || units.last() != Some(&LikeUnit::AnyMany) {
+            units.push(unit);
+        }
+    }
+
+    let (mut text_index, mut pattern_index) = (0, 0);
+    let mut last_many = None;
+    let mut steps = 0;
+    while text_index < text.len() {
+        steps += 1;
+        if steps > MAX_MATCH_STEPS {
+            return Err(crate::LimboError::Constraint(
+                "LIKE match too complex".to_owned(),
+            ));
+        }
+        let character = text[text_index..].chars().next().unwrap();
+        match units.get(pattern_index) {
+            Some(LikeUnit::AnyMany) => {
+                pattern_index += 1;
+                last_many = Some((pattern_index, text_index));
+            }
+            Some(LikeUnit::AnyOne) => {
+                text_index += character.len_utf8();
+                pattern_index += 1;
+            }
+            Some(LikeUnit::Literal(pattern_character))
+                if same_primary_character(character, *pattern_character) =>
+            {
+                text_index += character.len_utf8();
+                pattern_index += 1;
+            }
+            _ => {
+                let Some((after_many, consumed)) = last_many else {
+                    return Ok(false);
+                };
+                text_index = consumed + text[consumed..].chars().next().unwrap().len_utf8();
+                pattern_index = after_many;
+                last_many = Some((after_many, text_index));
+            }
+        }
+    }
+    Ok(units[pattern_index..]
+        .iter()
+        .all(|unit| *unit == LikeUnit::AnyMany))
+}
+
+#[derive(PartialEq, Eq)]
+enum LikeUnit {
+    Literal(char),
+    AnyOne,
+    AnyMany,
+}
+
+fn same_primary_character(lhs: char, rhs: char) -> bool {
+    let mut lhs_bytes = [0; 4];
+    let mut rhs_bytes = [0; 4];
+    compare(
+        lhs.encode_utf8(&mut lhs_bytes),
+        rhs.encode_utf8(&mut rhs_bytes),
+    ) == Ordering::Equal
+}
+
+struct PrimaryWeights<'a> {
+    characters: Chars<'a>,
+    offset: usize,
+    remaining: usize,
+    implicit: [u16; 2],
+    implicit_next: usize,
+}
+
+impl<'a> PrimaryWeights<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            characters: text.chars(),
+            offset: 0,
+            remaining: 0,
+            implicit: [0; 2],
+            implicit_next: 2,
+        }
+    }
+}
+
+impl Iterator for PrimaryWeights<'_> {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.remaining > 0 {
+                let bytes = &DATA[self.offset..self.offset + 2];
+                self.offset += 2;
+                self.remaining -= 1;
+                return Some(u16::from_be_bytes(bytes.try_into().unwrap()));
+            }
+            if self.implicit_next < 2 {
+                let weight = self.implicit[self.implicit_next];
+                self.implicit_next += 1;
+                return Some(weight);
+            }
+            let codepoint = self.characters.next()? as u32;
+            if let Some((offset, count)) = explicit_weights(codepoint) {
+                self.offset = offset;
+                self.remaining = count;
+            } else {
+                self.implicit = implicit_weights(codepoint);
+                self.implicit_next = 0;
+            }
+        }
+    }
+}
+
+fn explicit_weights(codepoint: u32) -> Option<(usize, usize)> {
+    let count = read_u32(8) as usize;
+    let weights_start = HEADER_LEN + count * RECORD_LEN;
+    let mut lo = 0;
+    let mut hi = count;
+    while lo < hi {
+        let middle = lo + (hi - lo) / 2;
+        let record = HEADER_LEN + middle * RECORD_LEN;
+        match read_u32(record).cmp(&codepoint) {
+            Ordering::Less => lo = middle + 1,
+            Ordering::Greater => hi = middle,
+            Ordering::Equal => {
+                let offset = read_u32(record + 4) as usize;
+                let len = DATA[record + 8] as usize;
+                return Some((weights_start + offset * 2, len));
+            }
+        }
+    }
+    None
+}
+
+fn implicit_weights(codepoint: u32) -> [u16; 2] {
+    let (base, remainder) = if (0x17000..=0x18aff).contains(&codepoint) {
+        // Tangut uses the dedicated base named in UCA 9 allkeys.txt.
+        (0xfb00 + ((codepoint - 0x17000) >> 15), codepoint - 0x17000)
+    } else if is_unified_ideograph(codepoint) {
+        if (0x4e00..=0x9fff).contains(&codepoint) || (0xf900..=0xfaff).contains(&codepoint) {
+            (0xfb40 + (codepoint >> 15), codepoint)
+        } else {
+            (0xfb80 + (codepoint >> 15), codepoint)
+        }
+    } else {
+        (0xfbc0 + (codepoint >> 15), codepoint)
+    };
+    [base as u16, ((remainder & 0x7fff) | 0x8000) as u16]
+}
+
+fn is_unified_ideograph(codepoint: u32) -> bool {
+    let record_count = read_u32(8) as usize;
+    let weight_count = read_u32(12) as usize;
+    let range_count = read_u32(16) as usize;
+    let ranges_start = HEADER_LEN + record_count * RECORD_LEN + weight_count * 2;
+    let mut lo = 0;
+    let mut hi = range_count;
+    while lo < hi {
+        let middle = lo + (hi - lo) / 2;
+        let range = ranges_start + middle * 8;
+        let start = read_u32(range);
+        let end = read_u32(range + 4);
+        if codepoint < start {
+            hi = middle;
+        } else if codepoint > end {
+            lo = middle + 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_u32(offset: usize) -> u32 {
+    u32::from_le_bytes(DATA[offset..offset + 4].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frozen_table_has_expected_shape() {
+        assert_eq!(&DATA[..8], b"UCA9P1\0\0");
+        assert_eq!(read_u32(8), 40_981);
+        assert_eq!(read_u32(12), 65_049);
+        assert_eq!(read_u32(16), 13);
+        assert_eq!(DATA.len(), 499_051);
+    }
+
+    #[test]
+    fn case_accent_expansion_and_normalization_share_primary_weights() {
+        for (left, right) in [
+            ("Cafe", "café"),
+            ("CAFÉ", "cafe"),
+            ("é", "e\u{301}"),
+            ("Straße", "strasse"),
+            ("İ", "i"),
+            ("가", "가"),
+        ] {
+            assert_eq!(
+                compare(left, right),
+                Ordering::Equal,
+                "{left:?} / {right:?}"
+            );
+            assert_eq!(sort_key(left), sort_key(right));
+        }
+    }
+
+    #[test]
+    fn no_pad_and_unicode_order_are_preserved() {
+        assert_eq!(compare("a", "a "), Ordering::Less);
+        assert_eq!(compare("i", "ı"), Ordering::Less);
+        assert_eq!(compare("😀", "😃"), Ordering::Less);
+        assert_eq!(compare("𐐀", "😀"), Ordering::Greater);
+        assert_eq!(compare("\u{4e00}", "\u{20000}"), Ordering::Less);
+        assert_eq!(compare("", "a"), Ordering::Less);
+    }
+
+    #[test]
+    fn oracle_primary_weights_for_explicit_and_implicit_characters() {
+        for (input, expected) in [
+            ("a", "1c47"),
+            ("é", "1caa"),
+            ("ß", "1e711e71"),
+            ("😀", "15fb"),
+            (" ", "0209"),
+            ("一", "fb40ce00"),
+            ("𠀀", "fb848000"),
+            ("𗀀", "fb008000"),
+            ("\u{10ffff}", "fbe1ffff"),
+            ("ﷺ", "2364239c23c50209230b239c239c23b1"),
+        ] {
+            let key = sort_key(input);
+            let hex = key
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(hex, expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn mysql_like_uses_primary_weights_per_character() {
+        for (text, pattern, expected) in [
+            ("café", "cafe", true),
+            ("é", "e", true),
+            ("Straße", "stra%", true),
+            ("ß", "ss", false),
+            ("ß", "_", true),
+            ("e\u{301}", "é", false),
+            ("e\u{301}", "e_", true),
+            ("a\u{200d}", "a", false),
+            ("a\u{200d}", "a%", true),
+            ("ﬃ", "ffi", false),
+            ("😀", "_", true),
+            ("a", "a ", false),
+            ("a ", "a", false),
+            ("a%", "a!%", true),
+        ] {
+            let escape = pattern.contains('!').then_some('!');
+            assert_eq!(
+                like(text, pattern, escape).unwrap(),
+                expected,
+                "{text:?} LIKE {pattern:?}"
+            );
+        }
+        assert!(like("a!", "a!", Some('!')).unwrap());
+        assert!(!like("a", "a!", Some('!')).unwrap());
+        assert!(like("a%", "a\\%", Some('\\')).unwrap());
+        assert!(!like("a", "a\\%", Some('\\')).unwrap());
+        assert!(like("abc", "a%%_c", None).unwrap());
+        assert!(!like("ab", "a%%_c", None).unwrap());
+    }
+}

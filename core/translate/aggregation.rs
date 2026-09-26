@@ -363,7 +363,7 @@ pub fn translate_aggregation_step(
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
     let dest = match func {
-        AggFunc::Avg => {
+        AggFunc::Avg | AggFunc::MysqlDecimalAvg => {
             if num_args != 1 {
                 crate::bail_parse_error!("avg bad number of arguments");
             }
@@ -374,7 +374,7 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Avg),
+                    func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
                     collation: None,
                 }),
@@ -550,7 +550,7 @@ pub fn translate_aggregation_step(
 
             target_register
         }
-        AggFunc::Sum => {
+        AggFunc::Sum | AggFunc::MysqlDecimalSum => {
             if num_args != 1 {
                 crate::bail_parse_error!("sum bad number of arguments");
             }
@@ -561,7 +561,7 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Sum),
+                    func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
                     collation: None,
                 }),

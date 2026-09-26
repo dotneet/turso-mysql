@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    account_store::GrantMutationError,
     account_store_fs::{AccountStoreFsError, AccountStoreRoot, MAX_PENDING_BYTES},
     validate_username, AccountDefinition, AccountGenerationBuilder, AccountId,
     AccountStoreCheckpoint, AccountStoreCheckpointReader, CheckpointAuthorityId,
@@ -295,6 +296,33 @@ pub struct ProvisionedAccount {
     definition: AccountDefinition,
 }
 
+/// One database or table privilege change for an existing account.
+#[derive(Debug)]
+pub enum AccountGrantChange {
+    /// Adds database privileges to the current grant.
+    GrantDatabase {
+        database: String,
+        privileges: DatabasePrivileges,
+    },
+    /// Removes database privileges from the current grant.
+    RevokeDatabase {
+        database: String,
+        privileges: DatabasePrivileges,
+    },
+    /// Adds table privileges to the current grant.
+    GrantTable {
+        database: String,
+        table: String,
+        privileges: TablePrivileges,
+    },
+    /// Removes table privileges from the current grant.
+    RevokeTable {
+        database: String,
+        table: String,
+        privileges: TablePrivileges,
+    },
+}
+
 impl ProvisionedAccount {
     /// Returns the opaque account identity needed to create database grants.
     pub fn account_id(&self) -> &AccountId {
@@ -487,6 +515,14 @@ pub enum OfflineProvisioningError {
     ProvisioningBusy,
     /// A supplied grant belongs to an account other than the new account.
     GrantOwnerMismatch,
+    /// The actor cannot manage accounts in the exact generation being changed.
+    NotAuthorized,
+    /// An account with the exact username already exists.
+    AccountAlreadyExists,
+    /// The named account does not exist in the current generation.
+    AccountMissing,
+    /// A revocation named a privilege that was not granted.
+    PrivilegeMissing,
 }
 
 impl fmt::Display for OfflineProvisioningError {
@@ -527,6 +563,12 @@ impl fmt::Display for OfflineProvisioningError {
             Self::GrantOwnerMismatch => {
                 f.write_str("offline provisioning supplied grant belongs to another account")
             }
+            Self::NotAuthorized => f.write_str("offline provisioning actor is not authorized"),
+            Self::AccountAlreadyExists => {
+                f.write_str("offline provisioning account already exists")
+            }
+            Self::AccountMissing => f.write_str("offline provisioning account does not exist"),
+            Self::PrivilegeMissing => f.write_str("offline provisioning privilege is not granted"),
         }
     }
 }
@@ -744,11 +786,61 @@ impl OfflineAccountProvisioner {
         authority: &mut A,
         deadline: Instant,
     ) -> Result<Self, OfflineProvisioningError> {
+        Self::add_account_with_grants_crash_safe_checked(
+            root,
+            authority_id,
+            account,
+            (database_grants, table_grants),
+            None,
+            authority,
+            deadline,
+        )
+    }
+
+    /// Adds an account only if the actor still has management permission in
+    /// the exact generation read from the external checkpoint authority.
+    pub fn add_account_with_grants_crash_safe_authorized<
+        A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+        I: IntoIterator<Item = DatabaseGrant>,
+        J: IntoIterator<Item = TableGrant>,
+    >(
+        root: impl AsRef<Path>,
+        authority_id: CheckpointAuthorityId,
+        account: ProvisionedAccount,
+        grants: (I, J),
+        actor: &AccountId,
+        authority: &mut A,
+        deadline: Instant,
+    ) -> Result<Self, OfflineProvisioningError> {
+        Self::add_account_with_grants_crash_safe_checked(
+            root,
+            authority_id,
+            account,
+            grants,
+            Some(actor),
+            authority,
+            deadline,
+        )
+    }
+
+    fn add_account_with_grants_crash_safe_checked<
+        A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+        I: IntoIterator<Item = DatabaseGrant>,
+        J: IntoIterator<Item = TableGrant>,
+    >(
+        root: impl AsRef<Path>,
+        authority_id: CheckpointAuthorityId,
+        account: ProvisionedAccount,
+        grants: (I, J),
+        actor: Option<&AccountId>,
+        authority: &mut A,
+        deadline: Instant,
+    ) -> Result<Self, OfflineProvisioningError> {
         if !authority.serves_authority(&authority_id) {
             return Err(OfflineProvisioningError::PendingAuthorityMismatch);
         }
-        let database_grants: Vec<_> = database_grants.into_iter().collect();
-        let table_grants: Vec<_> = table_grants.into_iter().collect();
+        let database_grants: Vec<_> = grants.0.into_iter().collect();
+        let table_grants: Vec<_> = grants.1.into_iter().collect();
         if database_grants
             .iter()
             .any(|grant| grant.account_id() != account.account_id())
@@ -776,8 +868,17 @@ impl OfflineAccountProvisioner {
         let store = PersistentAccountStore::open_until(&root, &expected, deadline)
             .map_err(map_provisioning_store_error)?;
         let expected_revision = store.revision().map_err(OfflineProvisioningError::Store)?;
+        let username = account.definition.username().to_owned();
         let prepared = store
-            .prepare_replacement_from_current(expected_revision, move |builder| {
+            .prepare_replacement_from_current_checked(expected_revision, |builder| {
+                if let Some(actor) = actor {
+                    if !builder.can_manage_accounts(actor) {
+                        return Err(OfflineProvisioningError::NotAuthorized);
+                    }
+                }
+                if builder.contains_username(&username) {
+                    return Err(OfflineProvisioningError::AccountAlreadyExists);
+                }
                 builder.add_account(account.into_definition());
                 for grant in database_grants {
                     builder.add_grant(grant);
@@ -785,8 +886,9 @@ impl OfflineAccountProvisioner {
                 for grant in table_grants {
                     builder.add_table_grant(grant);
                 }
+                Ok(())
             })
-            .map_err(map_provisioning_store_error)?;
+            .map_err(map_provisioning_store_error)??;
         let replacement = prepared.checkpoint();
         let pending =
             PendingAccountStoreUpdate::new_replacement(authority_id, expected, replacement)?;
@@ -816,6 +918,110 @@ impl OfflineAccountProvisioner {
                     .map_err(map_journal_error)?;
                 #[cfg(any(test, feature = "test-support"))]
                 stop_at_add_account_crash_point(AddAccountCrashPoint::JournalCleared);
+                Ok(Self {
+                    root,
+                    state: ProvisioningState::Active {
+                        store,
+                        checkpoint: replacement,
+                    },
+                })
+            }
+            outcome => Err(checkpoint_failure(
+                outcome,
+                pending_checkpoint(Some(expected), replacement),
+            )),
+        }
+    }
+
+    /// Changes one existing account grant through the same durable replacement
+    /// journal and external checkpoint CAS used for account creation.
+    pub fn change_grant_crash_safe<
+        A: AccountStoreCheckpointAuthority + AccountStoreCheckpointReader,
+    >(
+        root: impl AsRef<Path>,
+        authority_id: CheckpointAuthorityId,
+        username: &str,
+        change: AccountGrantChange,
+        actor: &AccountId,
+        authority: &mut A,
+        deadline: Instant,
+    ) -> Result<Self, OfflineProvisioningError> {
+        if !authority.serves_authority(&authority_id) {
+            return Err(OfflineProvisioningError::PendingAuthorityMismatch);
+        }
+
+        let root = root.as_ref().to_owned();
+        let journal_root = AccountStoreRoot::open(&root).map_err(map_journal_error)?;
+        let _lock = journal_root
+            .acquire_provisioning_lock_until(deadline)
+            .map_err(map_journal_error)?;
+        if journal_root
+            .read_provisioning_journal()
+            .map_err(map_journal_error)?
+            .is_some()
+        {
+            return Err(OfflineProvisioningError::PendingJournalInvalid);
+        }
+
+        let expected = read_authority_checkpoint_until(authority, &authority_id, deadline)?;
+        let store = PersistentAccountStore::open_until(&root, &expected, deadline)
+            .map_err(map_provisioning_store_error)?;
+        let expected_revision = store.revision().map_err(OfflineProvisioningError::Store)?;
+        let prepared = store
+            .prepare_replacement_from_current_checked(expected_revision, |builder| {
+                if !builder.can_manage_accounts(actor) {
+                    return Err(OfflineProvisioningError::NotAuthorized);
+                }
+                let result = match change {
+                    AccountGrantChange::GrantDatabase {
+                        database,
+                        privileges,
+                    } => builder.change_database_privileges(username, &database, privileges, true),
+                    AccountGrantChange::RevokeDatabase {
+                        database,
+                        privileges,
+                    } => builder.change_database_privileges(username, &database, privileges, false),
+                    AccountGrantChange::GrantTable {
+                        database,
+                        table,
+                        privileges,
+                    } => builder
+                        .change_table_privileges(username, &database, &table, privileges, true),
+                    AccountGrantChange::RevokeTable {
+                        database,
+                        table,
+                        privileges,
+                    } => builder
+                        .change_table_privileges(username, &database, &table, privileges, false),
+                };
+                result.map_err(|error| match error {
+                    GrantMutationError::AccountMissing => OfflineProvisioningError::AccountMissing,
+                    GrantMutationError::PrivilegeMissing => {
+                        OfflineProvisioningError::PrivilegeMissing
+                    }
+                })
+            })
+            .map_err(map_provisioning_store_error)??;
+
+        let replacement = prepared.checkpoint();
+        let pending =
+            PendingAccountStoreUpdate::new_replacement(authority_id, expected, replacement)?;
+        let journal = pending.encode()?;
+        journal_root
+            .publish_provisioning_journal(&journal)
+            .map_err(map_journal_error)?;
+
+        store
+            .publish_replacement(prepared)
+            .map_err(map_provisioning_store_error)?;
+        let checkpoint_persistence = authority.compare_and_persist(Some(&expected), &replacement);
+        match checkpoint_persistence {
+            CheckpointPersistence::Durable => {
+                let store = PersistentAccountStore::open_until(&root, &replacement, deadline)
+                    .map_err(map_provisioning_store_error)?;
+                journal_root
+                    .clear_provisioning_journal_if_matches(&journal)
+                    .map_err(map_journal_error)?;
                 Ok(Self {
                     root,
                     state: ProvisioningState::Active {
@@ -1402,6 +1608,16 @@ mod tests {
         AccountGenerationBuilder::new().with_account(
             AccountDefinition::new("alice", account_id, true, [verifier; 32])
                 .with_global_privileges(GlobalPrivileges::new(true, false)),
+        )
+    }
+
+    fn admin_builder(verifier: u8) -> AccountGenerationBuilder {
+        let account_id = AccountId::from_bytes([verifier; SHA256_DIGEST_LENGTH]);
+        AccountGenerationBuilder::new().with_account(
+            AccountDefinition::new("alice", account_id, true, [verifier; 32])
+                .with_global_privileges(
+                    GlobalPrivileges::new(true, false).with_manage_accounts(true),
+                ),
         )
     }
 
@@ -2269,6 +2485,365 @@ mod tests {
             .is_none());
         let store = PersistentAccountStore::open(root.path(), &expected).unwrap();
         assert!(store.lookup("bob").unwrap().is_none());
+    }
+
+    #[test]
+    fn crash_safe_add_account_rejects_existing_username_without_publication() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected =
+            OfflineAccountProvisioner::initialize(root.path(), builder(0x11), &mut authority)
+                .unwrap()
+                .checkpoint()
+                .unwrap();
+        let mut password = *b"correct horse battery staple";
+        let account = provision_account(
+            "alice",
+            ProtectedPassword::new(&mut password),
+            true,
+            GlobalPrivileges::new(true, false),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            OfflineAccountProvisioner::add_account_with_grants_crash_safe(
+                root.path(),
+                authority_id(),
+                account,
+                std::iter::empty(),
+                std::iter::empty(),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::AccountAlreadyExists)
+        ));
+        assert_eq!(authority.checkpoint, Some(expected));
+        assert_eq!(
+            PersistentAccountStore::open(root.path(), &expected)
+                .unwrap()
+                .revision(),
+            Ok(0)
+        );
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn authorized_add_account_uses_the_current_actor_privilege() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let initial =
+            OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+                .unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let (account, _, _) = new_bob_account();
+        let added = OfflineAccountProvisioner::add_account_with_grants_crash_safe_authorized(
+            root.path(),
+            authority_id(),
+            account,
+            (std::iter::empty(), std::iter::empty()),
+            &actor,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(added.revision(), Ok(initial.revision().unwrap() + 1));
+        assert!(added.store().unwrap().lookup("bob").unwrap().is_some());
+        assert_eq!(authority.checkpoint, added.checkpoint().ok());
+    }
+
+    #[test]
+    fn stale_actor_cannot_add_an_account_or_grant_after_management_is_revoked() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let mut initial =
+            OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+                .unwrap();
+        initial.replace(builder(0x11), &mut authority).unwrap();
+        let expected = initial.checkpoint().unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let (account, _, _) = new_bob_account();
+
+        assert!(matches!(
+            OfflineAccountProvisioner::add_account_with_grants_crash_safe_authorized(
+                root.path(),
+                authority_id(),
+                account,
+                (std::iter::empty(), std::iter::empty()),
+                &actor,
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::NotAuthorized)
+        ));
+        assert!(matches!(
+            OfflineAccountProvisioner::change_grant_crash_safe(
+                root.path(),
+                authority_id(),
+                "alice",
+                AccountGrantChange::GrantTable {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                    privileges: TablePrivileges::new(true),
+                },
+                &actor,
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::NotAuthorized)
+        ));
+        assert_eq!(authority.checkpoint, Some(expected));
+        let store = PersistentAccountStore::open(root.path(), &expected).unwrap();
+        assert_eq!(store.revision(), Ok(1));
+        assert!(store.lookup("bob").unwrap().is_none());
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn crash_safe_grant_and_revoke_table_select_persist_exact_checkpoints() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+            .unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let principal = AuthenticatedPrincipal::from_account_id_for_testing(actor.clone());
+        let select = TableAction::Select {
+            database: "reports",
+            table: "records",
+        };
+
+        let granted = OfflineAccountProvisioner::change_grant_crash_safe(
+            root.path(),
+            authority_id(),
+            "alice",
+            AccountGrantChange::GrantTable {
+                database: "reports".to_owned(),
+                table: "records".to_owned(),
+                privileges: TablePrivileges::new(true),
+            },
+            &actor,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(granted.revision(), Ok(1));
+        assert_eq!(authority.checkpoint, granted.checkpoint().ok());
+        assert_eq!(
+            granted.store().unwrap().authorize_table(&principal, select),
+            Ok(())
+        );
+        assert_eq!(
+            granted.store().unwrap().authorize_table(
+                &principal,
+                TableAction::Select {
+                    database: "reports",
+                    table: "other",
+                },
+            ),
+            Err(crate::AuthorizationError::Denied)
+        );
+
+        let revoked = OfflineAccountProvisioner::change_grant_crash_safe(
+            root.path(),
+            authority_id(),
+            "alice",
+            AccountGrantChange::RevokeTable {
+                database: "reports".to_owned(),
+                table: "records".to_owned(),
+                privileges: TablePrivileges::new(true),
+            },
+            &actor,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(revoked.revision(), Ok(2));
+        assert_eq!(authority.checkpoint, revoked.checkpoint().ok());
+        let reopened =
+            PersistentAccountStore::open(root.path(), &revoked.checkpoint().unwrap()).unwrap();
+        assert_eq!(
+            reopened.authorize_table(&principal, select),
+            Err(crate::AuthorizationError::Denied)
+        );
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn crash_safe_database_grant_and_revoke_keep_other_accounts() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+            .unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let principal = AuthenticatedPrincipal::from_account_id_for_testing(actor.clone());
+        let granted = OfflineAccountProvisioner::change_grant_crash_safe(
+            root.path(),
+            authority_id(),
+            "alice",
+            AccountGrantChange::GrantDatabase {
+                database: "reports".to_owned(),
+                privileges: DatabasePrivileges::new(false, true, false, false),
+            },
+            &actor,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            granted.store().unwrap().authorize(
+                &principal,
+                DatabaseAction::Query {
+                    database: "reports"
+                },
+            ),
+            Ok(())
+        );
+
+        let revoked = OfflineAccountProvisioner::change_grant_crash_safe(
+            root.path(),
+            authority_id(),
+            "alice",
+            AccountGrantChange::RevokeDatabase {
+                database: "reports".to_owned(),
+                privileges: DatabasePrivileges::new(false, true, false, false),
+            },
+            &actor,
+            &mut authority,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert_eq!(
+            revoked.store().unwrap().authorize(
+                &principal,
+                DatabaseAction::Query {
+                    database: "reports"
+                },
+            ),
+            Err(crate::AuthorizationError::Denied)
+        );
+        assert!(revoked.store().unwrap().lookup("alice").unwrap().is_some());
+    }
+
+    #[test]
+    fn crash_safe_grant_rejects_missing_account_and_ungranted_privilege_before_publication() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected =
+            OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+                .unwrap()
+                .checkpoint()
+                .unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        assert!(matches!(
+            OfflineAccountProvisioner::change_grant_crash_safe(
+                root.path(),
+                authority_id(),
+                "bob",
+                AccountGrantChange::GrantTable {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                    privileges: TablePrivileges::new(true),
+                },
+                &actor,
+                &mut authority,
+                deadline,
+            ),
+            Err(OfflineProvisioningError::AccountMissing)
+        ));
+        assert!(matches!(
+            OfflineAccountProvisioner::change_grant_crash_safe(
+                root.path(),
+                authority_id(),
+                "alice",
+                AccountGrantChange::RevokeTable {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                    privileges: TablePrivileges::new(true),
+                },
+                &actor,
+                &mut authority,
+                deadline,
+            ),
+            Err(OfflineProvisioningError::PrivilegeMissing)
+        ));
+        assert_eq!(authority.checkpoint, Some(expected));
+        assert_eq!(
+            PersistentAccountStore::open(root.path(), &expected)
+                .unwrap()
+                .revision(),
+            Ok(0)
+        );
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn crash_safe_grant_keeps_ambiguous_checkpoint_for_reconciliation() {
+        let root = root();
+        let mut authority = MemoryAuthority::new(CheckpointPersistence::Durable);
+        let expected =
+            OfflineAccountProvisioner::initialize(root.path(), admin_builder(0x11), &mut authority)
+                .unwrap()
+                .checkpoint()
+                .unwrap();
+        let actor = AccountId::from_bytes([0x11; SHA256_DIGEST_LENGTH]);
+        authority.next = CheckpointPersistence::Ambiguous;
+
+        assert!(matches!(
+            OfflineAccountProvisioner::change_grant_crash_safe(
+                root.path(),
+                authority_id(),
+                "alice",
+                AccountGrantChange::GrantTable {
+                    database: "reports".to_owned(),
+                    table: "records".to_owned(),
+                    privileges: TablePrivileges::new(true),
+                },
+                &actor,
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Err(OfflineProvisioningError::CheckpointAmbiguous(_))
+        ));
+        assert_eq!(authority.checkpoint, Some(expected));
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_some());
+
+        authority.next = CheckpointPersistence::Durable;
+        assert_eq!(
+            OfflineAccountProvisioner::reconcile_crash_safe(
+                root.path(),
+                &authority_id(),
+                &mut authority,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            Ok(CrashSafeReconcileOutcome::Reconciled { revision: 1 })
+        );
+        assert_ne!(authority.checkpoint, Some(expected));
+        assert!(AccountStoreRoot::open(root.path())
+            .unwrap()
+            .read_provisioning_journal()
+            .unwrap()
+            .is_none());
     }
 
     #[test]

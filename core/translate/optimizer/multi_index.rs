@@ -405,6 +405,7 @@ fn choose_multi_index_branch_access(
     if let Some(chosen_in_seek) = choose_best_in_seek_candidate(
         rhs_table,
         table_constraints,
+        schema,
         lhs_mask,
         1.0,
         base_row_count,
@@ -837,6 +838,7 @@ fn analyze_and_terms_for_multi_index(
             &term.expr,
             table_id,
             table_reference,
+            schema,
             where_clause,
             indexes,
             rowid_alias_column,

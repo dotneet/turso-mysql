@@ -278,6 +278,7 @@ pub(crate) enum AdminToken {
     LeftParen,
     RightParen,
     Star,
+    At,
     Comment,
     Other,
 }
@@ -372,6 +373,7 @@ pub(crate) fn tokenize_admin_command(
             b'(' => AdminToken::LeftParen,
             b')' => AdminToken::RightParen,
             b'*' => AdminToken::Star,
+            b'@' => AdminToken::At,
             _ => AdminToken::Other,
         });
         cursor += 1;
@@ -392,7 +394,7 @@ fn consume_admin_string_literal(
 ) -> Result<(String, usize), ParseError> {
     let quote = bytes[cursor];
     let mut cursor = cursor + 1;
-    let mut value = Vec::new();
+    let mut value = zeroize::Zeroizing::new(Vec::new());
     while cursor < bytes.len() {
         let byte = bytes[cursor];
         if byte == quote {
@@ -401,7 +403,10 @@ fn consume_admin_string_literal(
                 cursor += 2;
                 continue;
             }
-            return Ok((decoded_string_literal(value), cursor + 1));
+            return Ok((
+                decoded_string_literal(std::mem::take(&mut *value)),
+                cursor + 1,
+            ));
         }
         if byte == b'\\' && !mode.no_backslash_escapes {
             let Some(escaped) = bytes.get(cursor + 1).copied() else {
@@ -415,6 +420,10 @@ fn consume_admin_string_literal(
                 b't' => value.push(b'\t'),
                 b'Z' => value.push(0x1a),
                 b'%' | b'_' => value.extend_from_slice(&[b'\\', escaped]),
+                0x80..=u8::MAX => {
+                    cursor += 1;
+                    continue;
+                }
                 other => value.push(other),
             }
             cursor += 2;

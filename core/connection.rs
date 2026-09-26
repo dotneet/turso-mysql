@@ -538,6 +538,7 @@ pub struct Connection {
     pub(super) last_insert_rowid: AtomicI64,
     pub(super) mysql_last_insert_id: AtomicU64,
     pub(super) mysql_changed_rows: AtomicI64,
+    pub(super) mysql_replaced_rows: AtomicI64,
     /// Rows the last statement wrote over a row that was already there.
     pub(super) mysql_updated_rows: AtomicI64,
     pub(super) mysql_upserted_rowid: AtomicI64,
@@ -2903,6 +2904,14 @@ impl Connection {
 
     pub fn mysql_changed_rows(&self) -> i64 {
         self.mysql_changed_rows.load(Ordering::SeqCst)
+    }
+
+    pub fn mysql_replaced_rows(&self) -> i64 {
+        self.mysql_replaced_rows.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_mysql_replaced_rows(&self, rows: i64) {
+        self.mysql_replaced_rows.store(rows, Ordering::SeqCst);
     }
 
     pub(crate) fn set_mysql_changed_rows(&self, rows: i64) {

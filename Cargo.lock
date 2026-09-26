@@ -7462,8 +7462,10 @@ dependencies = [
 name = "turso_mysql_parser"
 version = "0.8.0-pre.7"
 dependencies = [
+ "bigdecimal",
  "sqlparser",
  "turso_parser",
+ "zeroize",
 ]
 
 [[package]]

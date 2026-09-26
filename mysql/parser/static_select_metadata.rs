@@ -98,7 +98,9 @@ impl ArithmeticShape {
         [&self.left, &self.right]
             .into_iter()
             .any(|operand| match operand {
-                ArithmeticOperand::Literal { .. } | ArithmeticOperand::Count => false,
+                ArithmeticOperand::Literal { .. }
+                | ArithmeticOperand::DecimalLiteral { .. }
+                | ArithmeticOperand::Count => false,
                 ArithmeticOperand::Column { .. } | ArithmeticOperand::Aggregate { .. } => true,
                 ArithmeticOperand::Nested(shape) => shape.names_a_column(),
             })
@@ -111,6 +113,8 @@ pub enum ArithmeticOperand {
     /// An integer literal. MySQL uses its digit count as the precision, so a
     /// sign and any leading zeroes do not count.
     Literal { digit_count: u32 },
+    /// A plain decimal literal with a point, whose written digits set its shape.
+    DecimalLiteral { precision: u32, scale: u32 },
     /// A column, whose precision and nullability live in the table.
     Column { column_name: String },
     /// A nested arithmetic expression.
@@ -479,6 +483,37 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
             })
         }
         Expr::Nested(inner) => classify_arithmetic_operand(inner),
+        Expr::Value(value) => {
+            if let Value::Number(written, false) = &value.value {
+                if let Some((precision, scale)) = decimal_literal_shape(written) {
+                    return Some(ArithmeticOperand::DecimalLiteral { precision, scale });
+                }
+            }
+            match classify_static_select_expr(expr)? {
+                StaticSelectMetadata::Integer { digit_count, .. } => {
+                    Some(ArithmeticOperand::Literal { digit_count })
+                }
+                _ => None,
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => {
+            if let Expr::Value(value) = inner.as_ref() {
+                if let Value::Number(written, false) = &value.value {
+                    if let Some((precision, scale)) = decimal_literal_shape(written) {
+                        return Some(ArithmeticOperand::DecimalLiteral { precision, scale });
+                    }
+                }
+            }
+            match classify_static_select_expr(expr)? {
+                StaticSelectMetadata::Integer { digit_count, .. } => {
+                    Some(ArithmeticOperand::Literal { digit_count })
+                }
+                _ => None,
+            }
+        }
         Expr::BinaryOp { .. } => {
             let shape = classify_arithmetic(expr)?;
             if shape.operator == ArithmeticOperator::Divide {
@@ -493,6 +528,22 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
             _ => None,
         },
     }
+}
+
+fn decimal_literal_shape(written: &str) -> Option<(u32, u32)> {
+    let (whole, fraction) = written.split_once('.')?;
+    if whole.is_empty()
+        || fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let precision = u32::try_from(whole.len().checked_add(fraction.len())?).ok()?;
+    let scale = u32::try_from(fraction.len()).ok()?;
+    Some((precision, scale))
 }
 
 /// Classifies a `CASE` or an `IF`, whose answer is as wide as its widest

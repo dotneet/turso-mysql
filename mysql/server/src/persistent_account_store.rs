@@ -250,6 +250,7 @@ impl PersistentAccountStore {
     }
 
     /// Rebuilds and edits one pinned generation before preparing its replacement.
+    #[cfg(test)]
     pub(crate) fn prepare_replacement_from_current<F>(
         &self,
         expected_revision: u64,
@@ -268,6 +269,30 @@ impl PersistentAccountStore {
             .map_err(map_replacement_error)?;
         edit(&mut builder);
         Self::prepare_replacement_from_history(history, expected_revision, builder)
+    }
+
+    /// Runs a checked edit against the pinned generation before building a
+    /// replacement. A rejected edit leaves no prepared replacement behind.
+    pub(crate) fn prepare_replacement_from_current_checked<F, E>(
+        &self,
+        expected_revision: u64,
+        edit: F,
+    ) -> Result<Result<PreparedAccountStoreReplacement, E>, PersistentAccountStoreError>
+    where
+        F: FnOnce(&mut AccountGenerationBuilder) -> Result<(), E>,
+    {
+        let history = self.current_generation()?;
+        if history.revision != expected_revision {
+            return Err(PersistentAccountStoreError::Conflict);
+        }
+        let mut builder = history
+            .accounts
+            .full_generation_builder()
+            .map_err(map_replacement_error)?;
+        if let Err(error) = edit(&mut builder) {
+            return Ok(Err(error));
+        }
+        Self::prepare_replacement_from_history(history, expected_revision, builder).map(Ok)
     }
 
     fn prepare_replacement_from_history(

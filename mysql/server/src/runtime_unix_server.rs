@@ -4,19 +4,20 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::{
-        Arc, Condvar, Mutex,
         mpsc::{self, Receiver, SyncSender},
+        Arc, Condvar, Mutex,
     },
     thread,
     time::Instant,
 };
 
 use crate::{
-    AccountStoreCheckpointReader, ConnectionLimitError, RuntimeAccountReload, RuntimeConfig,
-    RuntimeUnixConnectionSpawnError, RuntimeUnixConnectionWorker, RuntimeUnixConnectionWorkerError,
-    RuntimeUnixListener, RuntimeUnixListenerError, RuntimeUnixShutdownReport,
+    AccountStoreAdminAuthority, AccountStoreCheckpointReader, ConnectionLimitError,
+    RuntimeAccountReload, RuntimeConfig, RuntimeUnixConnectionSpawnError,
+    RuntimeUnixConnectionWorker, RuntimeUnixConnectionWorkerError, RuntimeUnixListener,
+    RuntimeUnixListenerError, RuntimeUnixShutdownReport,
 };
 
 /// A blocking Unix MySQL server with joinable ownership of every connection worker.
@@ -61,14 +62,35 @@ impl RuntimeUnixServer {
         config: &RuntimeConfig,
         checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
     ) -> Result<Self, RuntimeUnixServerBindError> {
-        let listener = Arc::new(
-            RuntimeUnixListener::bind(config, checkpoint_reader)
-                .map_err(RuntimeUnixServerBindError::Listener)?,
-        );
+        let listener = RuntimeUnixListener::bind(config, checkpoint_reader)
+            .map_err(RuntimeUnixServerBindError::Listener)?;
+        Self::from_listener(listener, config.limits().max_connections())
+    }
+
+    /// Binds a server that can publish durable SQL account changes.
+    pub fn bind_with_account_authority(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        account_authority: Box<dyn AccountStoreAdminAuthority>,
+    ) -> Result<Self, RuntimeUnixServerBindError> {
+        let listener = RuntimeUnixListener::bind_with_account_authority(
+            config,
+            checkpoint_reader,
+            account_authority,
+        )
+        .map_err(RuntimeUnixServerBindError::Listener)?;
+        Self::from_listener(listener, config.limits().max_connections())
+    }
+
+    fn from_listener(
+        listener: RuntimeUnixListener,
+        max_connections: usize,
+    ) -> Result<Self, RuntimeUnixServerBindError> {
+        let listener = Arc::new(listener);
         let control = Arc::new(RuntimeUnixServerControl::new());
         let reaper_completion = Arc::new(ReaperCompletion::new());
         let reaper_snapshot = Arc::new(Mutex::new(ReaperSnapshot::default()));
-        let (events, receiver) = worker_event_channel(config.limits().max_connections());
+        let (events, receiver) = worker_event_channel(max_connections);
         let reaper = spawn_reaper(
             receiver,
             Arc::clone(&listener),
@@ -1100,14 +1122,14 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::{
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
-        AuthMoreData, AuthMoreDataKind, AuthOkPacket, CACHING_SHA2_PASSWORD_PLUGIN,
-        CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF, COM_PING, COM_QUERY, COM_QUIT,
-        COMMAND_SEQUENCE_ID, CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
-        ClientHandshakeResponseConfig, DEFAULT_UTF8MB4_COLLATION, DatabasePrivileges,
-        GlobalPrivileges, InitialHandshake, MIN_WRITE_LIMIT, OfflineAccountProvisioner,
-        PACKET_HEADER_LEN, ProtectedPassword, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-        ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
-        RuntimeUnixEndpointCleanup, TextRowPacket, TextRowValue, UnixSocketConfig,
+        AuthMoreData, AuthMoreDataKind, AuthOkPacket, CheckpointAuthorityId, CheckpointPersistence,
+        CheckpointReadError, ClientHandshakeResponseConfig, DatabasePrivileges, GlobalPrivileges,
+        InitialHandshake, OfflineAccountProvisioner, ProtectedPassword, ResultTerminatorPacket,
+        RuntimeConfig, RuntimeLimits, RuntimeTimeouts, RuntimeUnixEndpointCleanup, TextRowPacket,
+        TextRowValue, UnixSocketConfig, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB,
+        CLIENT_DEPRECATE_EOF, COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT,
+        DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, PACKET_HEADER_LEN,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
 
     #[test]
@@ -1185,17 +1207,15 @@ mod tests {
         sender.send(ReaperEvent::Finished(2)).unwrap();
         sender.send(ReaperEvent::AcceptStopped).unwrap();
 
-        assert!(
-            run_reaper_safely(
-                receiver,
-                Arc::clone(&snapshot),
-                || panic!("synthetic worker-panic callback failure"),
-                || {
-                    failure_count.fetch_add(1, Ordering::Relaxed);
-                },
-            )
-            .is_err()
-        );
+        assert!(run_reaper_safely(
+            receiver,
+            Arc::clone(&snapshot),
+            || panic!("synthetic worker-panic callback failure"),
+            || {
+                failure_count.fetch_add(1, Ordering::Relaxed);
+            },
+        )
+        .is_err());
 
         let snapshot = *snapshot.lock().unwrap();
         assert_eq!(snapshot.started, 2);

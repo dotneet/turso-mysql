@@ -1,5 +1,6 @@
 //! Conservative MySQL parsing for the SQLite-compatible path.
 
+mod account_admin;
 mod admin_command;
 mod alter_table_indexes;
 mod analyze_table;
@@ -16,6 +17,7 @@ mod like_pattern;
 mod lock_tables;
 mod mysql_ddl;
 mod number_format;
+mod select_projection_origins;
 mod session_queries;
 mod session_settings;
 mod session_variables;
@@ -31,9 +33,9 @@ mod truncate_table;
 
 use admin_command::{
     admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
-    consume_admin_table_name,
-    consume_admin_u64, consume_admin_word, savepoint_command, skip_admin_comments,
-    tokenize_admin_command, transaction_token_kind, AdminToken, TransactionTokenKind,
+    consume_admin_table_name, consume_admin_u64, consume_admin_word, savepoint_command,
+    skip_admin_comments, tokenize_admin_command, transaction_token_kind, AdminToken,
+    TransactionTokenKind,
 };
 use information_schema::{
     contains_information_schema_object, contains_information_schema_tables,
@@ -51,6 +53,9 @@ use translate::{
     SelectRenderContext,
 };
 
+pub use account_admin::{
+    parse_optional_account_admin_command, AccountAdminPassword, MySqlAccountAdminCommand,
+};
 pub use admin_command::{parse_admin_command, parse_optional_admin_command};
 pub use alter_table_indexes::rename_table_spelled_as_alter_table;
 pub use alter_table_indexes::{
@@ -73,9 +78,10 @@ pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
+    direct_insert_select_projection, filtered_insert_select_projection,
     parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
-    parse_optional_insert_values_without_columns, MySqlInsertSelectWithoutColumns,
-    MySqlInsertValuesWithoutColumns,
+    parse_optional_insert_values_without_columns, MySqlDirectInsertSelectProjection,
+    MySqlInsertSelectWithoutColumns, MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
     json_contains, json_keys, json_length, json_merge_patch, json_merge_preserve, json_overlaps,
@@ -91,6 +97,7 @@ pub use mysql_ddl::{
     render_create_view_mysql_with_mode, stored_character_length,
 };
 pub use number_format::{format_number, truncate_number};
+pub use select_projection_origins::{select_projection_origins, MySqlSelectProjectionOrigin};
 pub use session_queries::{
     parse_optional_select_database, parse_optional_system_variable_query,
     parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSystemVariableQuery,
@@ -103,11 +110,11 @@ pub use session_settings::{
 pub use session_variables::parse_optional_session_sql_notes;
 pub use shift_moment::shifted_moment;
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
-pub use show_table_status::{
-    parse_optional_show_table_status, parse_show_table_status, MySqlShowTableStatusCommand,
-};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
+};
+pub use show_table_status::{
+    parse_optional_show_table_status, parse_show_table_status, MySqlShowTableStatusCommand,
 };
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ScalarFunction,
@@ -595,13 +602,16 @@ impl BoundAutoIncrementInsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
+    collation_sensitive_call_columns: Vec<String>,
     reads_table: bool,
     orders_a_bare_column: bool,
+    checks_type_sensitive_expression: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
     tests_a_bare_column: bool,
     compares_a_written_day: bool,
+    compares_a_large_decimal_integer: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
     source_tables: Vec<MySqlSelectSource>,
@@ -1012,12 +1022,14 @@ pub struct MySqlNumericSpec {
     fixed_widths: Vec<bool>,
     binary_lengths: Vec<Option<u32>>,
     datetimes: Vec<bool>,
+    timestamps: Vec<bool>,
     dates: Vec<bool>,
     times: Vec<bool>,
     years: Vec<bool>,
     enums: Vec<Option<Vec<String>>>,
     sets: Vec<Option<Vec<String>>>,
     jsons: Vec<bool>,
+    floats: Vec<bool>,
     unsigned_reals: Vec<bool>,
 }
 
@@ -1047,6 +1059,11 @@ impl MySqlNumericSpec {
     /// Reports whether a stored column position holds a `DATETIME`.
     pub fn is_datetime(&self, index: usize) -> bool {
         self.datetimes.get(index).copied().unwrap_or(false)
+    }
+
+    /// Reports whether a stored column position holds a `TIMESTAMP`.
+    pub fn is_timestamp(&self, index: usize) -> bool {
+        self.timestamps.get(index).copied().unwrap_or(false)
     }
 
     /// Reports whether a stored column position holds a `DATE`.
@@ -1079,6 +1096,11 @@ impl MySqlNumericSpec {
         self.jsons.get(index).copied().unwrap_or(false)
     }
 
+    /// Reports whether a stored column holds MySQL's binary32 `FLOAT`.
+    pub fn is_float(&self, index: usize) -> bool {
+        self.floats.get(index).copied().unwrap_or(false)
+    }
+
     /// Reports whether a stored column position holds an unsigned `DOUBLE` or
     /// `FLOAT`, which takes no negative value.
     pub fn is_unsigned_real(&self, index: usize) -> bool {
@@ -1095,12 +1117,15 @@ impl MySqlNumericSpec {
         self.columns.iter().all(Option::is_none)
             && self.character_lengths.iter().all(Option::is_none)
             && !self.datetimes.iter().any(|is_datetime| *is_datetime)
+            && !self.timestamps.iter().any(|is_timestamp| *is_timestamp)
             && !self.dates.iter().any(|is_date| *is_date)
             && !self.times.iter().any(|is_time| *is_time)
             && !self.years.iter().any(|is_year| *is_year)
             && !self.enums.iter().any(Option::is_some)
             && !self.sets.iter().any(Option::is_some)
             && !self.jsons.iter().any(|is_json| *is_json)
+            && !self.floats.iter().any(|is_float| *is_float)
+            && !self.unsigned_reals.iter().any(|is_unsigned| *is_unsigned)
     }
 }
 
@@ -1125,18 +1150,64 @@ impl TranslatedSelect {
         self.source_table.as_ref().map(MySqlTableName::as_str)
     }
 
+    pub fn collation_sensitive_call_columns(&self) -> &[String] {
+        &self.collation_sensitive_call_columns
+    }
+
+    pub fn checks_type_sensitive_expression(&self) -> bool {
+        self.checks_type_sensitive_expression
+    }
+
     /// Reports whether this statement's rendering depends on a column's type.
     ///
     /// An `ORDER BY` over a bare column and a comparison against a `?` are the
     /// two places it does, and both want the same answer: whether the column is
     /// text, and so wants MySQL's collation.
-    pub const fn needs_column_types(&self) -> bool {
+    pub fn needs_column_types(&self) -> bool {
         self.orders_a_bare_column
+            || self.checks_type_sensitive_expression
             || self.compares_a_placeholder
             || self.counts_distinct_column
             || self.tests_a_bare_column
             || self.compares_a_written_day
+            || self.compares_a_large_decimal_integer
             || self.orders_wildcard_ordinal
+            || self.checked_comparisons.iter().any(|comparison| {
+                matches!(
+                    comparison.operator(),
+                    CheckedSelectComparisonOperator::In | CheckedSelectComparisonOperator::NotIn
+                )
+            })
+            || self.static_result_metadata.iter().any(|projection| {
+                matches!(projection,
+                    StaticSelectProjectionMetadata::Literal(
+                        StaticSelectMetadata::ScalarCall { columns, .. }
+                    ) if !columns.is_empty())
+            })
+            || self.static_result_metadata.iter().any(|projection| {
+                matches!(
+                    projection,
+                    StaticSelectProjectionMetadata::Literal(
+                        StaticSelectMetadata::ColumnAggregate {
+                            kind: ColumnAggregateKind::Sum | ColumnAggregateKind::Avg,
+                            ..
+                        } | StaticSelectMetadata::ScalarCall {
+                            function: ScalarFunction::CutsDigits
+                                | ScalarFunction::KeepsNumericShape
+                                | ScalarFunction::Truncates
+                                | ScalarFunction::Modulo
+                                | ScalarFunction::Widest
+                                | ScalarFunction::Hexadecimal
+                                | ScalarFunction::GroupsDigits
+                                | ScalarFunction::NullsOnMatch
+                                | ScalarFunction::WritesInAnotherRadix
+                                | ScalarFunction::FindsThePlace
+                                | ScalarFunction::ReadsThePlace,
+                            ..
+                        } | StaticSelectMetadata::Arithmetic(_)
+                    )
+                )
+            })
     }
 
     /// Returns whether this SELECT contains an ORDER BY ordinal over a wildcard projection.
@@ -1195,8 +1266,12 @@ pub enum ParseError {
     TursoParser(String),
     ExpectedOneStatement { actual: usize },
     ExpectedAdminCommand,
+    ExpectedAccountAdminCommand,
     ExpectedTransactionCommand,
     TrailingAdminCommandTokens,
+    TrailingAccountAdminCommandTokens,
+    InvalidAccountUsername { reason: &'static str },
+    UnsupportedAccountHost,
     InvalidDatabaseName { reason: &'static str },
     InvalidTableName { reason: &'static str },
     InvalidSavepointName { reason: &'static str },
@@ -1221,12 +1296,22 @@ impl fmt::Display for ParseError {
             Self::ExpectedAdminCommand => {
                 f.write_str("expected CREATE DATABASE, DROP DATABASE, or USE")
             }
+            Self::ExpectedAccountAdminCommand => {
+                f.write_str("expected CREATE USER, GRANT SELECT, or REVOKE SELECT")
+            }
             Self::ExpectedTransactionCommand => {
                 f.write_str("expected BEGIN, START TRANSACTION, COMMIT, or ROLLBACK")
             }
             Self::TrailingAdminCommandTokens => {
                 f.write_str("unexpected token after database-management command")
             }
+            Self::TrailingAccountAdminCommandTokens => {
+                f.write_str("unexpected token after account-management command")
+            }
+            Self::InvalidAccountUsername { reason } => {
+                write!(f, "invalid MySQL account username: {reason}")
+            }
+            Self::UnsupportedAccountHost => f.write_str("only @'%' account host is supported"),
             Self::InvalidDatabaseName { reason } => {
                 write!(f, "invalid MySQL database name: {reason}")
             }
@@ -1504,6 +1589,10 @@ pub enum MySqlInformationSchemaColumnsColumn {
     ColumnKey,
     Extra,
     ColumnComment,
+    CharacterMaximumLength,
+    NumericPrecision,
+    NumericScale,
+    CollationName,
 }
 
 impl MySqlInformationSchemaColumnsColumn {
@@ -1519,6 +1608,12 @@ impl MySqlInformationSchemaColumnsColumn {
             () if name.eq_ignore_ascii_case("COLUMN_KEY") => Self::ColumnKey,
             () if name.eq_ignore_ascii_case("EXTRA") => Self::Extra,
             () if name.eq_ignore_ascii_case("COLUMN_COMMENT") => Self::ColumnComment,
+            () if name.eq_ignore_ascii_case("CHARACTER_MAXIMUM_LENGTH") => {
+                Self::CharacterMaximumLength
+            }
+            () if name.eq_ignore_ascii_case("NUMERIC_PRECISION") => Self::NumericPrecision,
+            () if name.eq_ignore_ascii_case("NUMERIC_SCALE") => Self::NumericScale,
+            () if name.eq_ignore_ascii_case("COLLATION_NAME") => Self::CollationName,
             () => return None,
         })
     }
@@ -2159,7 +2254,15 @@ pub fn parse_optional_show_columns(
     {
         return Err(ParseError::ExpectedAdminCommand);
     }
-    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    let (mut database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    if consume_admin_word(&tokens, &mut cursor, "FROM")
+        || consume_admin_word(&tokens, &mut cursor, "IN")
+    {
+        if database.is_some() {
+            return unsupported("two SHOW COLUMNS database qualifiers");
+        }
+        database = Some(consume_admin_database_name(&tokens, &mut cursor)?);
+    }
     let pattern = if consume_admin_word(&tokens, &mut cursor, "LIKE") {
         let Some(AdminToken::StringLiteral(pattern)) = tokens.get(cursor) else {
             return Err(ParseError::ExpectedAdminCommand);
@@ -3199,8 +3302,8 @@ pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect,
     parse_select_with_column_types(sql, mode, &[], &[], &[])
 }
 
-/// Parses a checked `SELECT`, told which columns hold text, which hold a
-/// moment, and what columns the table has.
+/// Parses a checked `SELECT`, told which columns hold text or a moment, what
+/// columns the table has, and which columns declare `ENUM` or `SET` members.
 ///
 /// This is the whole of what the frontend knows and the parser cannot see.
 /// [`parse_select_with_column_types`] is the same thing for a caller that has
@@ -3211,7 +3314,58 @@ pub fn parse_select_knowing_the_columns(
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
     moment_columns: &[String],
+) -> Result<TranslatedSelect, ParseError> {
+    parse_select_knowing_decimal_columns(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        set_columns,
+        moment_columns,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn parse_select_knowing_decimal_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
+    decimal_columns: &[(String, u32)],
+) -> Result<TranslatedSelect, ParseError> {
+    parse_select_knowing_numeric_columns(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        set_columns,
+        moment_columns,
+        decimal_columns,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn parse_select_knowing_numeric_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    table_columns: &[String],
+    member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
+    moment_columns: &[String],
+    decimal_columns: &[(String, u32)],
+    integer_columns: &[String],
+    real_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
     parse_select_inner(
         sql,
@@ -3219,7 +3373,11 @@ pub fn parse_select_knowing_the_columns(
         text_columns,
         table_columns,
         member_columns,
+        set_columns,
         moment_columns,
+        decimal_columns,
+        integer_columns,
+        real_columns,
     )
 }
 
@@ -3237,16 +3395,32 @@ pub fn parse_select_with_column_types(
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
 ) -> Result<TranslatedSelect, ParseError> {
-    parse_select_inner(sql, mode, text_columns, table_columns, member_columns, &[])
+    parse_select_inner(
+        sql,
+        mode,
+        text_columns,
+        table_columns,
+        member_columns,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_select_inner(
     sql: &str,
     mode: SessionSqlMode,
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
     moment_columns: &[String],
+    decimal_columns: &[(String, u32)],
+    integer_columns: &[String],
+    real_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
@@ -3269,6 +3443,7 @@ fn parse_select_inner(
     let static_result_metadata = select_static_result_metadata(&query);
     let RenderedSelect {
         sqlite_sql,
+        collation_sensitive_call_columns,
         source_table,
         source_tables,
         checked_comparisons,
@@ -3276,11 +3451,13 @@ fn parse_select_inner(
         row_count_parameters,
         parameter_count,
         orders_a_bare_column,
+        checks_type_sensitive_expression,
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,
         tests_a_bare_column,
         compares_a_written_day,
+        compares_a_large_decimal_integer,
         checked_subquery_comparisons,
     } = translate_select_query(
         &query,
@@ -3289,16 +3466,23 @@ fn parse_select_inner(
         text_columns,
         table_columns,
         member_columns,
+        set_columns,
         moment_columns,
+        decimal_columns,
+        integer_columns,
+        real_columns,
     )?;
     Ok(TranslatedSelect {
+        collation_sensitive_call_columns,
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
+        checks_type_sensitive_expression,
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,
         tests_a_bare_column,
         compares_a_written_day,
+        compares_a_large_decimal_integer,
         checked_subquery_comparisons,
         sqlite_sql,
         source_table,
@@ -3332,14 +3516,35 @@ pub fn parse_dml_rewriting_on_update(
     mode: SessionSqlMode,
     rewritten_on_update: &[String],
 ) -> Result<TranslatedDml, ParseError> {
+    parse_dml_knowing_decimal_columns(sql, mode, rewritten_on_update, &[])
+}
+
+pub fn parse_dml_knowing_decimal_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    rewritten_on_update: &[String],
+    decimal_columns: &[(String, u32)],
+) -> Result<TranslatedDml, ParseError> {
+    parse_dml_knowing_numeric_columns(sql, mode, rewritten_on_update, decimal_columns, &[])
+}
+
+pub fn parse_dml_knowing_numeric_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    rewritten_on_update: &[String],
+    decimal_columns: &[(String, u32)],
+    integer_columns: &[String],
+) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
     let mut render_context =
-        SelectRenderContext::new(sql, mode, &[], &[], &[], &[], rewritten_on_update);
+        SelectRenderContext::new(sql, mode, &[], &[], &[], &[], &[], rewritten_on_update)
+            .knowing_decimal_columns(decimal_columns)
+            .knowing_integer_columns(integer_columns);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
-            let rendered = translate_insert(&insert, sql, mode)?;
+            let rendered = translate_insert(&insert, sql, mode, decimal_columns)?;
             read_tables = rendered.read_tables;
             inherited_comparisons = rendered.checked_comparisons;
             // An INSERT ... SELECT compares against the table the SELECT reads,
@@ -3537,7 +3742,7 @@ fn parse_checked_auto_increment_insert(
 
     // Reuse the existing checked SQL normalizer only after the stricter shape
     // checks above. The executable path exposes the typed AST, not this SQL.
-    let normalized = translate_insert(insert, sql, mode)?;
+    let normalized = translate_insert(insert, sql, mode, &[])?;
     let sqlite_statement = parse_normalized_dml(&normalized.sqlite_sql)?;
     let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES rows",
@@ -3782,11 +3987,15 @@ pub fn parse_mysql_numeric_spec(
         datetimes: table
             .columns
             .iter()
+            .map(|column| matches!(column.data_type, DataType::Datetime(None)))
+            .collect(),
+        timestamps: table
+            .columns
+            .iter()
             .map(|column| {
                 matches!(
                     column.data_type,
-                    DataType::Datetime(None)
-                        | DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None)
+                    DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None)
                 )
             })
             .collect(),
@@ -3841,6 +4050,17 @@ pub fn parse_mysql_numeric_spec(
             .columns
             .iter()
             .map(|column| matches!(column.data_type, DataType::JSON))
+            .collect(),
+        floats: table
+            .columns
+            .iter()
+            .map(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::Float(sqlparser::ast::ExactNumberInfo::None)
+                        | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                )
+            })
             .collect(),
         unsigned_reals: table
             .columns
@@ -5549,7 +5769,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Timestamp(None, sqlparser::ast::TimezoneInfo::None) => "TIMESTAMP".to_owned(),
         DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => {
             let (precision, scale) = declared_decimal_size(*info)?;
-            format!("DECIMAL({precision},{scale})")
+            format!("mysql_decimal({precision},{scale})")
         }
         // The sign has to go in front of the name here, not after it: the
         // engine's declared type takes a word before its arguments and not
@@ -5557,19 +5777,22 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         // read, so nothing above this sees the inversion.
         DataType::DecimalUnsigned(info) | DataType::DecUnsigned(info) => {
             let (precision, scale) = declared_decimal_size(*info)?;
-            format!("UNSIGNED DECIMAL({precision},{scale})")
+            format!("mysql_decimal_unsigned({precision},{scale})")
         }
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
-    // MySQL matches two words without regard to case, and the engine matches
-    // them byte for byte, so every comparison this renders asks the engine for
-    // `NOCASE`. A key cannot ask: it matches with whatever collation the
-    // column was declared with. So the column is declared with that one, and
-    // the whole server reads a word the same way — a `WHERE`, a key, an
-    // ordering and a grouping alike.
+    // A key uses the column's collation. Declare MySQL's default collation on
+    // text columns so keys and queries use the same Unicode weights.
     let collation = if a_column_of_words(&column.data_type) {
-        WORDS_COLLATION
+        if column.options.iter().any(|option| {
+            matches!(&option.option, ColumnOption::Collation(name)
+                if unqualified_name_is(name, &["utf8mb4_bin"]))
+        }) {
+            " COLLATE MYSQL_UTF8MB4_BIN"
+        } else {
+            WORDS_COLLATION
+        }
     } else {
         ""
     };
@@ -5592,12 +5815,8 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
 
 /// The collation this server declares a column of words with.
 ///
-/// MySQL matches two words without regard to case and the engine matches them
-/// byte for byte, so every comparison this renders asks the engine for
-/// `NOCASE`. A key cannot ask: it matches with whatever collation the column
-/// was declared with. So the column is declared with this one, and a `WHERE`,
-/// a key, an ordering and a grouping all read a word the same way.
-pub(crate) const WORDS_COLLATION: &str = " COLLATE NOCASE";
+/// A column, its keys, and queries against it use one frozen UCA 9 order.
+pub(crate) const WORDS_COLLATION: &str = " COLLATE MYSQL_UCA9_AI_CI";
 
 /// Reports whether a column holds words rather than bytes or numbers.
 ///
@@ -5776,6 +5995,14 @@ fn render_column_option(
                 }
                 return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
             }
+            if let Some((precision, scale)) = decimal_size_of(data_type)? {
+                if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
+                    return Ok(Some("DEFAULT NULL".to_owned()));
+                }
+                let written = decimal_default_text(expr)?;
+                let rounded = round_decimal_to_scale(&written, precision, scale)?;
+                return Ok(Some(format!("DEFAULT '{rounded}'")));
+            }
             reject_a_default_the_column_would_round(expr, data_type)?;
             Ok(Some(format!("DEFAULT {}", render_default(expr)?)))
         }
@@ -5791,8 +6018,8 @@ fn render_column_option(
         // A dumped schema spells out the charset and collation on every text
         // column. Naming the one this server has describes where it already is,
         // so it is taken; naming another would be a claim about ordering and
-        // case that this cannot keep, so it is refused. The engine has no place
-        // to keep the words, so they are written nowhere.
+        // case that this cannot keep, so it is refused. Text columns already
+        // receive the engine's fixed UCA9 collation when rendered.
         ColumnOption::CharacterSet(name) if option.name.is_none() => {
             if !unqualified_name_is(name, &["utf8mb4"]) {
                 return unsupported("column CHARACTER SET");
@@ -5800,7 +6027,9 @@ fn render_column_option(
             Ok(None)
         }
         ColumnOption::Collation(name) if option.name.is_none() => {
-            if !unqualified_name_is(name, &["utf8mb4_general_ci", "utf8mb4_0900_ai_ci"]) {
+            if !a_column_of_words(data_type)
+                || !unqualified_name_is(name, &["utf8mb4_0900_ai_ci", "utf8mb4_bin"])
+            {
                 return unsupported("column COLLATE");
             }
             Ok(None)
@@ -5879,6 +6108,74 @@ fn reject_a_default_the_column_would_round(
         return unsupported("DEFAULT with more places than the column holds");
     }
     Ok(())
+}
+
+fn decimal_size_of(data_type: &DataType) -> Result<Option<(u32, u32)>, ParseError> {
+    match data_type {
+        DataType::Decimal(info)
+        | DataType::Numeric(info)
+        | DataType::Dec(info)
+        | DataType::DecimalUnsigned(info)
+        | DataType::DecUnsigned(info) => declared_decimal_size(*info).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn decimal_default_text(expr: &Expr) -> Result<String, ParseError> {
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::Number(written, false) | Value::SingleQuotedString(written) => {
+                Ok(written.clone())
+            }
+            _ => unsupported("DECIMAL DEFAULT literal"),
+        },
+        Expr::UnaryOp { op, expr } => {
+            let sign = match op {
+                UnaryOperator::Minus => "-",
+                UnaryOperator::Plus => "+",
+                _ => return unsupported("DECIMAL DEFAULT literal"),
+            };
+            let Expr::Value(value) = expr.as_ref() else {
+                return unsupported("DECIMAL DEFAULT literal");
+            };
+            let Value::Number(written, false) = &value.value else {
+                return unsupported("DECIMAL DEFAULT literal");
+            };
+            Ok(format!("{sign}{written}"))
+        }
+        _ => unsupported("DECIMAL DEFAULT literal"),
+    }
+}
+
+pub fn round_decimal_to_scale(
+    written: &str,
+    precision: u32,
+    scale: u32,
+) -> Result<String, ParseError> {
+    use bigdecimal::{BigDecimal, RoundingMode};
+    use std::str::FromStr;
+
+    if !(1..=65).contains(&precision) || scale > 30 || scale > precision {
+        return unsupported("DECIMAL DEFAULT precision or scale");
+    }
+    let parsed = BigDecimal::from_str(written).map_err(|_| ParseError::Unsupported {
+        feature: "DECIMAL literal",
+    })?;
+    let (coefficient, input_scale) = parsed.as_bigint_and_exponent();
+    let digits = coefficient.to_string().trim_start_matches('-').len() as i128;
+    if parsed != 0 && digits - i128::from(input_scale) > i128::from(precision - scale) {
+        return unsupported("DECIMAL DEFAULT out of range");
+    }
+    let rounded = if parsed == 0 || i128::from(input_scale) - i128::from(scale) > digits {
+        BigDecimal::from(0).with_scale_round(i64::from(scale), RoundingMode::HalfUp)
+    } else {
+        parsed.with_scale_round(i64::from(scale), RoundingMode::HalfUp)
+    };
+    let (coefficient, _) = rounded.as_bigint_and_exponent();
+    if coefficient.to_string().trim_start_matches('-').len() > precision as usize {
+        return unsupported("DECIMAL DEFAULT out of range");
+    }
+    Ok(rounded.to_plain_string())
 }
 
 /// The scale a column holds its values at, for the types that hold a number

@@ -206,6 +206,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             }
             Ok(Some(Func::Agg(AggFunc::Avg)))
         }
+        "mysql_decimal_avg" if arg_count == 1 => Ok(Some(Func::Agg(AggFunc::MysqlDecimalAvg))),
         "count" => {
             // Handle both COUNT() and COUNT(expr) cases
             if arg_count == 0 {
@@ -250,6 +251,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
             }
             Ok(Some(Func::Agg(AggFunc::Sum)))
         }
+        "mysql_decimal_sum" if arg_count == 1 => Ok(Some(Func::Agg(AggFunc::MysqlDecimalSum))),
         "total" => {
             if arg_count != 1 {
                 crate::bail_parse_error!("wrong number of arguments to function {}()", name)
@@ -536,6 +538,13 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
+        "mysql_decimal_encode" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalEncode))),
+        "mysql_unsigned_decimal_encode" => {
+            Ok(Some(Func::Scalar(ScalarFunc::MysqlUnsignedDecimalEncode)))
+        }
+        "mysql_decimal_round" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalRound))),
+        "mysql_decimal_div_round" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalDivideRounded))),
+        "mysql_decimal_truncate" => Ok(Some(Func::Scalar(ScalarFunc::MysqlDecimalTruncate))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),

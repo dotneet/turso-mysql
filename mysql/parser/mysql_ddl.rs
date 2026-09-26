@@ -400,7 +400,9 @@ fn names_the_collation_of_words(constraint: &NamedColumnConstraint) -> bool {
     matches!(
         &constraint.constraint,
         TursoColumnConstraint::Collate { collation_name }
-            if constraint.name.is_none() && collation_name.as_str().eq_ignore_ascii_case("NOCASE")
+            if constraint.name.is_none()
+                && (collation_name.as_str().eq_ignore_ascii_case("MYSQL_UCA9_AI_CI")
+                    || collation_name.as_str().eq_ignore_ascii_case("NOCASE"))
     )
 }
 
@@ -459,13 +461,16 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
             return Ok(format!("{sized}({})", stored_character_length(data_type)?));
         }
     }
-    if data_type.name.eq_ignore_ascii_case("DECIMAL") {
+    if data_type.name.eq_ignore_ascii_case("mysql_decimal") {
         let (precision, scale) = stored_decimal_size(data_type)?;
         return Ok(format!("DECIMAL({precision},{scale})"));
     }
     // The engine's declared type takes the sign before the arguments and MySQL
     // writes it after them, and this renderer writes MySQL.
-    if data_type.name.eq_ignore_ascii_case("UNSIGNED DECIMAL") {
+    if data_type
+        .name
+        .eq_ignore_ascii_case("mysql_decimal_unsigned")
+    {
         let (precision, scale) = stored_decimal_size(data_type)?;
         return Ok(format!("DECIMAL({precision},{scale}) UNSIGNED"));
     }
@@ -613,6 +618,14 @@ fn render_mysql_column_constraint(
             auto_increment: false,
         } if constraint.name.is_none() => Ok("PRIMARY KEY".to_owned()),
         TursoColumnConstraint::PrimaryKey { .. } => unsupported("PRIMARY KEY attribute"),
+        TursoColumnConstraint::Collate { collation_name }
+            if constraint.name.is_none()
+                && collation_name
+                    .as_str()
+                    .eq_ignore_ascii_case("MYSQL_UTF8MB4_BIN") =>
+        {
+            Ok("COLLATE utf8mb4_bin".to_owned())
+        }
         TursoColumnConstraint::ForeignKey { .. } => unsupported("column REFERENCES constraint"),
         TursoColumnConstraint::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),

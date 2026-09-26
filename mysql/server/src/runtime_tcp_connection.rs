@@ -386,14 +386,18 @@ impl RuntimeTcpConnection {
         let timeouts = stream.timeouts();
         let settings = tcp_handshake_settings(stream.connection_id());
         let verifier = CachingSha2Verifier::new(stream.account_store());
-        let factory = AuthorizedDatabaseAdapterFactory::new(
+        let mut factory = AuthorizedDatabaseAdapterFactory::new(
             stream.catalog(),
             binary_schema_context(),
             stream.account_store(),
         )
         .with_prepared_statement_authority(stream.prepared_statement_authority())
         .with_query_timeout(timeouts.query())
-        .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle());
+        .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle())
+        .with_net_write_timeout(timeouts.write());
+        if let Some(administration) = stream.account_administration() {
+            factory = factory.with_account_administration(administration);
+        }
         let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH)
             .map_err(RuntimeTcpConnectionError::PacketCodec)?;
         let orchestrator = ClassicConnectionOrchestrator::new(

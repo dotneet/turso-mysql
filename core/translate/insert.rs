@@ -670,6 +670,9 @@ pub fn translate_insert(
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
+    if !ctx.table.is_strict && ctx.table.has_mysql_decimal_columns() {
+        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+    }
 
     // For AUTOINCREMENT tables with an explicit rowid, update sqlite_sequence
     // before CHECK constraints. SQLite updates sqlite_sequence even when
@@ -3921,6 +3924,7 @@ fn emit_replace_delete_conflicting_row(
         table_name: table_name.to_string(),
         is_part_of_update: true,
     });
+    program.emit_insn(Insn::CountMysqlReplaceDelete);
 
     // Phase 2: After Delete - fire CASCADE/SetNull/SetDefault FK actions.
     prepared_fk_actions.fire_prepared_fk_delete_actions(

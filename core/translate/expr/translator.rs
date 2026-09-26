@@ -1833,6 +1833,11 @@ pub fn translate_expr(
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
+                        | ScalarFunc::MysqlDecimalEncode
+                        | ScalarFunc::MysqlUnsignedDecimalEncode
+                        | ScalarFunc::MysqlDecimalRound
+                        | ScalarFunc::MysqlDecimalDivideRounded
+                        | ScalarFunc::MysqlDecimalTruncate
                         | ScalarFunc::NumericDecode
                         | ScalarFunc::NumericAdd
                         | ScalarFunc::NumericSub

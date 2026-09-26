@@ -1377,6 +1377,9 @@ pub enum Insn {
         is_part_of_update: bool,
     },
 
+    /// Count a row deleted by REPLACE separately from SQLite's change count.
+    CountMysqlReplaceDelete,
+
     /// If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry
     /// is found. This happens when running an UPDATE or DELETE statement and the index entry to
     /// be updated or deleted is not found. For some uses of IdxDelete (example: the EXCEPT operator)
@@ -2307,6 +2310,9 @@ pub(crate) fn dispatch_insn(
         Insn::Int64 { .. } => execute::op_int_64(program, state, insn, pager),
         Insn::IdxInsert { .. } => execute::op_idx_insert(program, state, insn, pager),
         Insn::Delete { .. } => execute::op_delete(program, state, insn, pager),
+        Insn::CountMysqlReplaceDelete => {
+            execute::op_count_mysql_replace_delete(program, state, insn, pager)
+        }
         Insn::NewRowid { .. } => execute::op_new_rowid(program, state, insn, pager),
         Insn::MustBeInt { .. } => execute::op_must_be_int(program, state, insn, pager),
         Insn::SoftNull { .. } => execute::op_soft_null(program, state, insn, pager),
@@ -2527,6 +2533,7 @@ impl InsnVariants {
             InsnVariants::Program => execute::op_program,
             InsnVariants::ResetCount => execute::op_reset_count,
             InsnVariants::ChangeCount => execute::op_change_count,
+            InsnVariants::CountMysqlReplaceDelete => execute::op_count_mysql_replace_delete,
             InsnVariants::Real => execute::op_real,
             InsnVariants::RealAffinity => execute::op_real_affinity,
             InsnVariants::String8 => execute::op_string8,

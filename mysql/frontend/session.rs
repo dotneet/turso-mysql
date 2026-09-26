@@ -9,23 +9,12 @@ use std::{
 };
 
 use turso_core::{
-    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IO, IOExt as _,
-    LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
-    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, Value,
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator},
+    AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
+    LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
+    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, Value, IO,
 };
 use turso_mysql_parser::{
-    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedPrimaryKeyCreateTable,
-    CheckedComparisonAnswer, CheckedComparisonNow, CheckedSelectComparison,
-    CheckedSelectComparisonOperator,
-    CheckedSelectComparisonRhs,
-    CheckedInsertValue,
-    CheckedSubqueryComparison,
-    CheckedUpdateAssignmentValue, MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlTableName,
-    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
-    MySqlCreateTableAsSelectSource, MySqlSelectSource, TranslatedDml,
-    MySqlTransactionCommand, MySqlTruncateTableCommand,
-    ParseError as MySqlParseError, SessionSqlMode,
     parse_auto_increment_create_table, parse_auto_increment_insert,
     parse_auto_increment_insert_target, parse_autocommit_setting,
     parse_checked_primary_key_create_table, parse_create_table_ast, parse_create_view_ast,
@@ -33,20 +22,28 @@ use turso_mysql_parser::{
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, StaticSelectMetadata, StaticSelectProjectionMetadata,
+    render_create_view_mysql_with_mode, CheckedAutoIncrementCreateTable,
+    CheckedAutoIncrementInsert, CheckedComparisonAnswer, CheckedComparisonNow, CheckedInsertValue,
+    CheckedPrimaryKeyCreateTable, CheckedSelectComparison, CheckedSelectComparisonOperator,
+    CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
+    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
+    MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
+    MySqlSelectSource, MySqlTableName, MySqlTransactionCommand, MySqlTruncateTableCommand,
+    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
+    StaticSelectProjectionMetadata, TranslatedDml,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
     ResultColumn, SelectTable, Stmt, UnaryOperator,
 };
 
-use crate::schema_sql::{
-    SchemaSqlSessionContext, SchemaSqlV2Metadata, decode_schema_sql, decode_schema_sql_any,
-    encode_schema_sql_v2,
-};
-use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 use crate::alter_table_indexes::MySqlAlterTableIndexError;
 use crate::create_table_as_select::MySqlCreateTableAsSelectError;
+use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
+use crate::schema_sql::{
+    decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v3, SchemaSqlSessionContext,
+    SchemaSqlV2Metadata,
+};
 use crate::truncate_table::MySqlTruncateTableError;
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
@@ -259,6 +256,7 @@ pub struct MySqlColumnMetadata {
     type_name: String,
     character_length: Option<u32>,
     decimal_size: Option<(u32, u32)>,
+    collation_name: Option<&'static str>,
     nullable: bool,
     key: MySqlColumnKey,
     default_sql: Option<String>,
@@ -286,6 +284,11 @@ impl MySqlColumnMetadata {
     /// Returns the declared precision and scale of a `DECIMAL`.
     pub const fn decimal_size(&self) -> Option<(u32, u32)> {
         self.decimal_size
+    }
+
+    /// Returns the collation used by a character column.
+    pub const fn collation_name(&self) -> Option<&'static str> {
+        self.collation_name
     }
 
     /// Returns whether the stored declaration permits NULL values.
@@ -763,6 +766,7 @@ enum PreparedExecutionPlan {
     OrdinaryWrite {
         is_update: bool,
         insert_target: Option<CheckedInsertTarget>,
+        written_table: Option<String>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
 }
@@ -817,6 +821,15 @@ enum CheckedInsertTarget {
     DefaultValues(MySqlTableName),
     /// `INSERT INTO t (c1, ..., cn) VALUES (...)`.
     Listed(ListedInsert),
+}
+
+impl CheckedInsertTarget {
+    fn table(&self) -> &MySqlTableName {
+        match self {
+            Self::DefaultValues(table) => table,
+            Self::Listed(insert) => &insert.table,
+        }
+    }
 }
 
 struct ListedInsert {
@@ -877,7 +890,10 @@ impl ListedInsert {
                 }
                 InsertedValue::Value => false,
             };
-            is_null && not_null.iter().any(|name| name.eq_ignore_ascii_case(column))
+            is_null
+                && not_null
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(column))
         })
     }
 
@@ -989,6 +1005,14 @@ impl From<MySqlQueryError> for LimboError {
     }
 }
 
+type CheckedDmlTranslation = (
+    TranslatedDml,
+    Vec<String>,
+    Vec<(String, u32)>,
+    Vec<String>,
+    Option<(String, String)>,
+);
+
 impl MySqlConnection {
     pub fn new(inner: Arc<Connection>, schema_context: SchemaSqlSessionContext) -> Result<Self> {
         Self::new_with_prepared_statement_authority(
@@ -1016,6 +1040,7 @@ impl MySqlConnection {
                 "the current MySQL table slice supports only binary character contexts".to_string(),
             ));
         }
+        reject_legacy_decimal_tables(&inner)?;
         // MySQL has no SQLite DQS misfeature. Left on, an identifier that does
         // not resolve becomes a string literal, so `SELECT id, nosuchcolumn
         // FROM t` answers with a fabricated `nosuchcolumn` beside a real value
@@ -1096,7 +1121,6 @@ impl MySqlConnection {
         self.inner.mysql_last_insert_id()
     }
 
-
     /// Prepares and stores one checked MySQL `SELECT` or DML statement.
     ///
     /// This validates and compiles SQL but does not run it or start a transaction.
@@ -1113,6 +1137,8 @@ impl MySqlConnection {
         {
             Ok(translated) => {
                 Self::reject_internal_catalog_select(&translated)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
+                self.reject_binary_scalar_collation(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.validate_select_comparison_columns(
                     translated.source_tables(),
@@ -1131,13 +1157,8 @@ impl MySqlConnection {
                 let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
-                let mode = self.parser_mode();
-                let options =
-                    PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
-                        mode,
-                        source_table: translated.source_table().map(str::to_owned),
-                        checked_comparisons: checked_comparisons.clone(),
-                    }));
+                let frozen = self.frozen_select_parser(sql, &translated, &statement);
+                let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
                 let statement = self
                     .inner
                     .prepare_translated_stmt_with_options(statement, sql, &options)
@@ -1282,27 +1303,298 @@ impl MySqlConnection {
         &self,
         sql: &str,
         mode: SessionSqlMode,
-    ) -> std::result::Result<(TranslatedDml, Vec<String>), MySqlParseError> {
+    ) -> std::result::Result<CheckedDmlTranslation, MySqlParseError> {
         let translated = parse_dml(sql, mode)?;
-        let Some(update) = translated.checked_update() else {
-            return Ok((translated, Vec::new()));
+        let insert_target = translated
+            .parse_ast()
+            .ok()
+            .and_then(|statement| checked_insert_target(&statement).ok().flatten());
+        if let Some(target) = &insert_target {
+            if !translated.read_tables().is_empty() {
+                let mut has_decimal = false;
+                for source in std::iter::once(target.table()).chain(
+                    translated
+                        .read_tables()
+                        .iter()
+                        .map(MySqlSelectSource::table),
+                ) {
+                    let columns =
+                        self.list_columns(source)
+                            .map_err(|_| MySqlParseError::Unsupported {
+                                feature: "INSERT SELECT table metadata",
+                            })?;
+                    if columns.iter().any(|column| column.decimal_size().is_some()) {
+                        has_decimal = true;
+                    }
+                }
+                if has_decimal
+                    && !self.insert_select_copies_decimal_columns(sql, mode, target, &translated)
+                    && !self.insert_select_ignores_decimal_columns(sql, mode, target, &translated)
+                {
+                    return Err(MySqlParseError::Unsupported {
+                        feature: "INSERT SELECT with DECIMAL source or target columns",
+                    });
+                }
+            }
+        }
+        let table = if let Some(update) = translated.checked_update() {
+            MySqlTableName::parse(update.table_name()).ok()
+        } else {
+            insert_target
+                .map(|target| target.table().clone())
+                .or_else(|| {
+                    translated
+                        .source_table()
+                        .and_then(|name| MySqlTableName::parse(name).ok())
+                })
         };
-        let Ok(table) = MySqlTableName::parse(update.table_name()) else {
-            return Ok((translated, Vec::new()));
+        let Some(table) = table else {
+            return Ok((translated, Vec::new(), Vec::new(), Vec::new(), None));
         };
+        let table_definition = self
+            .inner
+            .current_schema()
+            .get_btree_table(table.as_str())
+            .map(|stored| (table.as_str().to_owned(), stored.to_sql()));
         let Ok(columns) = self.list_columns(&table) else {
-            return Ok((translated, Vec::new()));
+            return Ok((
+                translated,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                table_definition,
+            ));
         };
-        let rewritten = columns
+        let rewritten = if translated.checked_update().is_some() {
+            columns
+                .iter()
+                .filter(|column| column.extra().contains("on update CURRENT_TIMESTAMP"))
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let decimal_columns = columns
             .iter()
-            .filter(|column| column.extra().contains("on update CURRENT_TIMESTAMP"))
+            .filter_map(|column| {
+                column
+                    .decimal_size()
+                    .map(|(_, scale)| (column.name().to_owned(), scale))
+            })
+            .collect::<Vec<_>>();
+        let integer_columns = columns
+            .iter()
+            .filter(|column| is_integer_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        if rewritten.is_empty() {
-            return Ok((translated, rewritten));
+        if rewritten.is_empty() && decimal_columns.is_empty() {
+            return Ok((
+                translated,
+                rewritten,
+                decimal_columns,
+                integer_columns,
+                table_definition,
+            ));
         }
-        let translated = turso_mysql_parser::parse_dml_rewriting_on_update(sql, mode, &rewritten)?;
-        Ok((translated, rewritten))
+        let translated = turso_mysql_parser::parse_dml_knowing_numeric_columns(
+            sql,
+            mode,
+            &rewritten,
+            &decimal_columns,
+            &integer_columns,
+        )?;
+        Ok((
+            translated,
+            rewritten,
+            decimal_columns,
+            integer_columns,
+            table_definition,
+        ))
+    }
+
+    fn insert_select_copies_decimal_columns(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+        target: &CheckedInsertTarget,
+        translated: &TranslatedDml,
+    ) -> bool {
+        let CheckedInsertTarget::Listed(target) = target else {
+            return false;
+        };
+        let [source] = translated.read_tables() else {
+            return false;
+        };
+        if source.subquery()
+            || source.catalog().is_some()
+            || self
+                .inner
+                .current_schema()
+                .get_btree_table(source.table().as_str())
+                .is_none()
+        {
+            return false;
+        }
+        let Some(projection) = turso_mysql_parser::direct_insert_select_projection(sql, mode)
+        else {
+            return false;
+        };
+        let Ok(source_columns) = self.list_columns(source.table()) else {
+            return false;
+        };
+        let Ok(target_columns) = self.list_columns(&target.table) else {
+            return false;
+        };
+        let projected = match projection {
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::All => source_columns
+                .iter()
+                .map(|column| Some(column.name().to_owned()))
+                .collect::<Vec<_>>(),
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::Columns(columns) => {
+                columns.into_iter().map(Some).collect()
+            }
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::ColumnsAndLiterals(values) => {
+                values
+            }
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::IntegerArithmetic(_) => {
+                return false;
+            }
+        };
+        projected.len() == target.columns.len()
+            && projected
+                .iter()
+                .zip(&target.columns)
+                .all(|(read, written)| {
+                    let target = target_columns
+                        .iter()
+                        .find(|column| column.name().eq_ignore_ascii_case(written));
+                    target.is_some_and(|target| match read {
+                        Some(read) => source_columns
+                            .iter()
+                            .find(|column| column.name().eq_ignore_ascii_case(read))
+                            .is_some_and(|source| source.decimal_size() == target.decimal_size()),
+                        None => target.decimal_size().is_none(),
+                    })
+                })
+    }
+
+    fn insert_select_ignores_decimal_columns(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+        target: &CheckedInsertTarget,
+        translated: &TranslatedDml,
+    ) -> bool {
+        let CheckedInsertTarget::Listed(target) = target else {
+            return false;
+        };
+        let [source] = translated.read_tables() else {
+            return false;
+        };
+        if source.subquery()
+            || source.catalog().is_some()
+            || self
+                .inner
+                .current_schema()
+                .get_btree_table(source.table().as_str())
+                .is_none()
+        {
+            return false;
+        }
+        let Some(projection) = turso_mysql_parser::filtered_insert_select_projection(sql, mode)
+        else {
+            return false;
+        };
+        let (Ok(source_columns), Ok(target_columns)) = (
+            self.list_columns(source.table()),
+            self.list_columns(&target.table),
+        ) else {
+            return false;
+        };
+        if source_columns
+            .iter()
+            .filter(|column| column.decimal_size().is_some())
+            .any(|column| sql_mentions_column(sql, column.name()))
+        {
+            return false;
+        }
+        if let turso_mysql_parser::MySqlDirectInsertSelectProjection::IntegerArithmetic(
+            expressions,
+        ) = &projection
+        {
+            return expressions.len() == target.columns.len()
+                && expressions.iter().all(|columns| {
+                    columns.iter().all(|read| {
+                        source_columns.iter().any(|column| {
+                            column.name().eq_ignore_ascii_case(read)
+                                && is_integer_type(column.type_name())
+                        })
+                    })
+                })
+                && target.columns.iter().all(|written| {
+                    target_columns.iter().any(|column| {
+                        column.name().eq_ignore_ascii_case(written)
+                            && is_integer_type(column.type_name())
+                    })
+                });
+        }
+        let projected = match projection {
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::All => return false,
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::Columns(columns) => columns,
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::ColumnsAndLiterals(values) => {
+                if values.iter().any(Option::is_none) {
+                    return false;
+                }
+                values.into_iter().map(Option::unwrap).collect()
+            }
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::IntegerArithmetic(_) => {
+                unreachable!()
+            }
+        };
+        projected.len() == target.columns.len()
+            && projected.iter().all(|read| {
+                source_columns
+                    .iter()
+                    .any(|column| column.name().eq_ignore_ascii_case(read))
+            })
+            && target.columns.iter().all(|written| {
+                target_columns.iter().any(|column| {
+                    column.name().eq_ignore_ascii_case(written) && column.decimal_size().is_none()
+                })
+            })
+    }
+
+    fn frozen_dml_parser(
+        &self,
+        mode: SessionSqlMode,
+        rewritten_on_update: Vec<String>,
+        decimal_columns: Vec<(String, u32)>,
+        integer_columns: Vec<String>,
+        table_definition: Option<(String, String)>,
+        translated: &TranslatedDml,
+    ) -> FrozenDmlParser {
+        let mut read_table_definitions = Vec::new();
+        let mut untracked_read_source = false;
+        for source in translated.read_tables() {
+            if let Some(table) = self
+                .inner
+                .current_schema()
+                .get_btree_table(source.table().as_str())
+            {
+                read_table_definitions.push((source.table().as_str().to_owned(), table.to_sql()));
+            } else {
+                untracked_read_source = true;
+            }
+        }
+        FrozenDmlParser {
+            mode,
+            rewritten_on_update,
+            decimal_columns,
+            integer_columns,
+            table_definition,
+            read_table_definitions,
+            untracked_read_source,
+        }
     }
 
     fn prepare_checked_dml_statement(
@@ -1311,23 +1603,23 @@ impl MySqlConnection {
     ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
     {
         let mode = self.parser_mode();
-        let (translated, rewritten_on_update) = match self.parse_checked_dml_translation(sql, mode)
-        {
-            Ok(read) => read,
-            Err(MySqlParseError::ExpectedDml) => {
-                return Err(MySqlPreparedStatementError::Prepare(
-                    MySqlQueryError::Unsupported(
-                        "prepared statements support only SELECT, INSERT, UPDATE, and DELETE"
-                            .to_string(),
-                    ),
-                ));
-            }
-            Err(error) => {
-                return Err(MySqlPreparedStatementError::Prepare(
-                    mysql_query_parse_error(error),
-                ));
-            }
-        };
+        let (translated, rewritten_on_update, decimal_columns, integer_columns, table_definition) =
+            match self.parse_checked_dml_translation(sql, mode) {
+                Ok(read) => read,
+                Err(MySqlParseError::ExpectedDml) => {
+                    return Err(MySqlPreparedStatementError::Prepare(
+                        MySqlQueryError::Unsupported(
+                            "prepared statements support only SELECT, INSERT, UPDATE, and DELETE"
+                                .to_string(),
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    return Err(MySqlPreparedStatementError::Prepare(
+                        mysql_query_parse_error(error),
+                    ));
+                }
+            };
         self.validate_dml_comparison_columns(&translated)
             .map_err(|error| {
                 MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
@@ -1354,21 +1646,31 @@ impl MySqlConnection {
         if is_update {
             self.reject_prepared_auto_increment_update(translated.checked_update())?;
         }
-        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
+        let frozen = self.frozen_dml_parser(
             mode,
             rewritten_on_update,
-        }));
+            decimal_columns,
+            integer_columns,
+            table_definition,
+            &translated,
+        );
+        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
             .map_err(|error| {
                 MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
             })?;
+        let written_table = insert_target
+            .as_ref()
+            .map(|target| target.table().as_str().to_owned())
+            .or_else(|| translated.source_table().map(str::to_owned));
         Ok((
             Some(statement),
             PreparedExecutionPlan::OrdinaryWrite {
                 is_update,
                 insert_target,
+                written_table,
             },
         ))
     }
@@ -1645,8 +1947,7 @@ impl MySqlConnection {
             && matches!(
                 &prepared.execution_plan,
                 PreparedExecutionPlan::Select { .. }
-            )
-        {
+            ) {
             refresh_prepared_statement_entry(statement_id, prepared)
         } else {
             Ok(())
@@ -1678,7 +1979,14 @@ impl MySqlConnection {
         {
             bound_temporal =
                 self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
-            Self::validate_select_comparison_values(checked_comparisons, values, &bound_temporal)?;
+            let bound_decimal =
+                self.decimal_comparison_parameters(source_tables, checked_comparisons)?;
+            Self::validate_select_comparison_values(
+                checked_comparisons,
+                values,
+                &bound_temporal,
+                &bound_decimal,
+            )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
         }
         // A value meeting a column that holds a day or a moment is put into
@@ -1723,7 +2031,11 @@ impl MySqlConnection {
                 })?;
                 Ok(MySqlPreparedExecutionResult::Rows(rows))
             }
-            PreparedExecutionPlan::OrdinaryWrite { is_update, .. } => {
+            PreparedExecutionPlan::OrdinaryWrite {
+                is_update,
+                written_table,
+                ..
+            } => {
                 let deadline = self.write_deadline(timeout);
                 self.check_write_deadline(deadline)?;
                 self.begin_implicit_transaction_for_write()?;
@@ -1734,7 +2046,9 @@ impl MySqlConnection {
                 })?;
                 bind_prepared_values(statement, &values)?;
                 let timeout = self.remaining_write_timeout(deadline)?;
-                run_checked_write_statement(statement, timeout)?;
+                run_checked_write_statement(statement, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, written_table.as_deref())
+                })?;
                 Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
                     affected_rows: self.affected_rows(*is_update, affected_rows_mode)?,
                     last_insert_id: 0,
@@ -1818,6 +2132,7 @@ impl MySqlConnection {
                 .remaining_write_timeout(deadline)
                 .map_err(Into::<LimboError>::into)?;
             run_checked_write_statement(&mut statement, timeout)
+                .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))
         })();
         let reset_result = statement.reset();
         match (result, reset_result) {
@@ -2038,8 +2353,7 @@ impl MySqlConnection {
             // Measured on MySQL 8.4.11: they leave the session in a transaction
             // even when autocommit is on and there was none to end, so the
             // ending half is skipped rather than the whole statement.
-            MySqlTransactionCommand::CommitAndChain
-            | MySqlTransactionCommand::RollbackAndChain
+            MySqlTransactionCommand::CommitAndChain | MySqlTransactionCommand::RollbackAndChain
                 if self.inner.get_auto_commit() =>
             {
                 return self.run_transaction_statement(
@@ -2057,10 +2371,12 @@ impl MySqlConnection {
         *self.read_only_transaction.lock().unwrap() =
             matches!(command, MySqlTransactionCommand::BeginReadOnly);
         let statement = match command {
-            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly => Stmt::Begin {
-                typ: None,
-                name: None,
-            },
+            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly => {
+                Stmt::Begin {
+                    typ: None,
+                    name: None,
+                }
+            }
             MySqlTransactionCommand::Commit | MySqlTransactionCommand::CommitAndChain => {
                 Stmt::Commit { name: None }
             }
@@ -3198,7 +3514,10 @@ impl MySqlConnection {
                 .map_err(MySqlDropTableError::Engine)?;
         }
         let tables = self.list_tables().map_err(MySqlDropTableError::Engine)?;
-        match tables.iter().find(|table| table.name() == command.table().as_str()) {
+        match tables
+            .iter()
+            .find(|table| table.name() == command.table().as_str())
+        {
             None if command.if_exists() => {
                 return Ok(MySqlDropTableResult { dropped: false });
             }
@@ -3462,12 +3781,10 @@ impl MySqlConnection {
     pub fn prepare_select_with_metadata(
         &self,
         sql: &str,
-    ) -> std::result::Result<
-        (Statement, Vec<Option<StaticSelectMetadata>>),
-        MySqlQueryError,
-    > {
+    ) -> std::result::Result<(Statement, Vec<Option<StaticSelectMetadata>>), MySqlQueryError> {
         let translated = self.parse_select_knowing_column_types(sql)?;
         Self::reject_internal_catalog_select(&translated)?;
+        self.reject_binary_scalar_collation(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.reject_index_hints_naming_no_key(&translated)?;
         self.validate_select_comparison_columns(
@@ -3489,13 +3806,8 @@ impl MySqlConnection {
         let stmt = translated
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
-        let mode = self.parser_mode();
-        let options =
-            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenSelectParser {
-                mode,
-                source_table: translated.source_table().map(str::to_owned),
-                checked_comparisons: translated.checked_comparisons().to_vec(),
-            }));
+        let frozen = self.frozen_select_parser(sql, &translated, &stmt);
+        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let stmt = self
             .inner
             .prepare_translated_stmt_with_options(stmt, sql, &options)
@@ -3510,19 +3822,85 @@ impl MySqlConnection {
         Ok((stmt, static_result_metadata))
     }
 
+    fn frozen_select_parser(
+        &self,
+        sql: &str,
+        translated: &turso_mysql_parser::TranslatedSelect,
+        statement: &Stmt,
+    ) -> FrozenSelectParser {
+        let mode = self.parser_mode();
+        let typed_rendering =
+            parse_select(sql, mode).is_ok_and(|untyped| untyped.as_sql() != translated.as_sql());
+        let reads_decimal = translated.source_tables().iter().any(|source| {
+            self.list_columns(source.table())
+                .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))
+        });
+        let typed_statement = (typed_rendering && reads_decimal).then(|| statement.clone());
+        let mut table_definitions = Vec::new();
+        let mut source_columns = Vec::new();
+        let mut untracked_source = false;
+        if typed_statement.is_some()
+            || typed_rendering
+            || translated.needs_column_types()
+            || !translated.checked_comparisons().is_empty()
+        {
+            for source in translated.source_tables() {
+                if let Some(table) = self
+                    .inner
+                    .current_schema()
+                    .get_btree_table(source.table().as_str())
+                {
+                    if typed_statement.is_some() {
+                        table_definitions
+                            .push((source.table().as_str().to_owned(), table.to_sql()));
+                    }
+                    source_columns.push((
+                        source.table().as_str().to_owned(),
+                        table
+                            .columns()
+                            .iter()
+                            .map(|column| format!("{column:?}"))
+                            .collect(),
+                    ));
+                } else {
+                    untracked_source = true;
+                }
+            }
+        }
+        FrozenSelectParser {
+            mode,
+            source_table: translated.source_table().map(str::to_owned),
+            checked_comparisons: translated.checked_comparisons().to_vec(),
+            typed_statement,
+            table_definitions,
+            source_columns,
+            untracked_source,
+        }
+    }
+
     fn prepare_non_schema(&self, sql: &str) -> Result<Statement> {
         let mode = self.parser_mode();
         match self.parse_checked_dml_translation(sql, mode) {
-            Ok((translated, rewritten_on_update)) => {
+            Ok((
+                translated,
+                rewritten_on_update,
+                decimal_columns,
+                integer_columns,
+                table_definition,
+            )) => {
                 self.validate_dml_comparison_columns(&translated)?;
                 let stmt = translated
                     .parse_ast()
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let options =
-                    PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
-                        mode,
-                        rewritten_on_update,
-                    }));
+                let frozen = self.frozen_dml_parser(
+                    mode,
+                    rewritten_on_update,
+                    decimal_columns,
+                    integer_columns,
+                    table_definition,
+                    &translated,
+                );
+                let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
                 self.inner
                     .prepare_translated_stmt_with_options(stmt, sql, &options)
             }
@@ -3682,7 +4060,124 @@ impl MySqlConnection {
         let mode = self.parser_mode();
         let translated =
             parse_select(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let has_decimal_source = translated.source_tables().iter().any(|source| {
+            self.list_columns(source.table())
+                .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))
+        });
+        if translated
+            .source_tables()
+            .iter()
+            .any(|source| source.branch() > 0)
+        {
+            let projects_only_literals = !translated.needs_column_types()
+                && translated.checked_comparisons().is_empty()
+                && turso_mysql_parser::select_projection_origins(sql, mode).is_ok_and(|branches| {
+                    branches.iter().all(|branch| {
+                        !branch.is_empty()
+                            && branch.iter().all(|origin| {
+                                matches!(
+                                    origin,
+                                    turso_mysql_parser::MySqlSelectProjectionOrigin::NonNullLiteral
+                                        | turso_mysql_parser::MySqlSelectProjectionOrigin::Null
+                                )
+                            })
+                    })
+                });
+            for source in translated.source_tables() {
+                if source.catalog().is_some() {
+                    continue;
+                }
+                if source.subquery()
+                    || !source.projected_columns().is_empty()
+                    || self
+                        .inner
+                        .current_schema()
+                        .get_btree_table(source.table().as_str())
+                        .is_none()
+                {
+                    return Err(MySqlQueryError::Unsupported(
+                        "compound SELECT source column types cannot be checked".to_string(),
+                    ));
+                }
+                let columns = self.list_columns(source.table()).map_err(|error| {
+                    MySqlQueryError::Unsupported(format!(
+                        "cannot resolve compound SELECT column types: {error}"
+                    ))
+                })?;
+                if !projects_only_literals
+                    && columns.iter().any(|column| column.decimal_size().is_some())
+                {
+                    return Err(MySqlQueryError::Unsupported(
+                        "compound SELECT over DECIMAL columns is unsupported".to_string(),
+                    ));
+                }
+            }
+        }
+        if has_decimal_source && translated.source_tables().len() > 1
+            && (translated.checks_type_sensitive_expression()
+                || translated.static_result_metadata().iter().any(|projection| {
+                matches!(projection,
+                    StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Arithmetic(shape)) if shape.names_a_column())
+                    || matches!(projection,
+                        StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. })
+                        | StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::WindowAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. }))
+                    || matches!(projection,
+                        StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ScalarCall {
+                            columns,
+                            ..
+                        }) if !columns.is_empty())
+            }))
+        {
+            for source in translated.source_tables() {
+                if source.catalog().is_some() {
+                    continue;
+                }
+                if source.subquery()
+                    || !source.projected_columns().is_empty()
+                    || self.inner.current_schema().get_btree_table(source.table().as_str()).is_none()
+                {
+                    return Err(MySqlQueryError::Unsupported(
+                        "SELECT source column types cannot be checked".to_string(),
+                    ));
+                }
+                let columns = self.list_columns(source.table()).map_err(|error| {
+                    MySqlQueryError::Unsupported(format!(
+                        "cannot resolve SELECT arithmetic column types: {error}"
+                    ))
+                })?;
+                if columns.iter().any(|column| {
+                    column.decimal_size().is_some()
+                        && sql_mentions_column(sql, column.name())
+                }) {
+                    return Err(MySqlQueryError::Unsupported(
+                        "DECIMAL numeric projection over multiple source tables is unsupported"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         if !translated.needs_column_types() {
+            let decimal_source = translated
+                .source_tables()
+                .iter()
+                .all(|source| !source.subquery() && source.projected_columns().is_empty())
+                && translated.source_table().is_some_and(|source| {
+                    MySqlTableName::parse(source).ok().is_some_and(|table| {
+                        self.list_columns(&table).is_ok_and(|columns| {
+                            columns.iter().any(|column| column.decimal_size().is_some())
+                        })
+                    })
+                });
+            if !decimal_source {
+                return Ok(translated);
+            }
+        }
+        if !has_decimal_source
+            && translated
+                .source_tables()
+                .iter()
+                .any(|source| source.subquery() || !source.projected_columns().is_empty())
+        {
             return Ok(translated);
         }
         // An `information_schema` table has no stored DDL to read a column's
@@ -3719,6 +4214,39 @@ impl MySqlConnection {
         let Ok(table) = MySqlTableName::parse(source_table) else {
             return Ok(translated);
         };
+        if translated
+            .source_tables()
+            .iter()
+            .any(|source| source.subquery() || !source.projected_columns().is_empty())
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "SELECT expression needs a base table's column types".to_string(),
+            ));
+        }
+        if self
+            .inner
+            .current_schema()
+            .get_btree_table(table.as_str())
+            .is_none()
+        {
+            let safe_view = self
+                .inner
+                .current_schema()
+                .get_view(table.as_str())
+                .is_some_and(|view| {
+                    view.columns.iter().all(|column| {
+                        !is_decimal_type(&column.ty_str)
+                            && !column.ty_str.eq_ignore_ascii_case("mysql_decimal")
+                            && !column.ty_str.eq_ignore_ascii_case("mysql_decimal_unsigned")
+                    })
+                });
+            if !safe_view {
+                return Err(MySqlQueryError::Unsupported(
+                    "SELECT expression needs a base table's column types".to_string(),
+                ));
+            }
+            return Ok(translated);
+        }
         let Ok(columns) = self.list_columns(&table) else {
             return Ok(translated);
         };
@@ -3749,8 +4277,6 @@ impl MySqlConnection {
                 .map(|column| column.name().to_owned())
                 .collect::<Vec<_>>()
         };
-        // An ENUM orders by the position its members were declared in rather
-        // than by their text, so the members travel with the column names.
         let member_columns = columns
             .iter()
             .filter_map(|column| {
@@ -3758,22 +4284,91 @@ impl MySqlConnection {
                     .map(|members| (column.name().to_owned(), members))
             })
             .collect::<Vec<_>>();
+        let set_columns = columns
+            .iter()
+            .filter_map(|column| {
+                turso_mysql_parser::set_members(column.type_name())
+                    .map(|members| (column.name().to_owned(), members))
+            })
+            .collect::<Vec<_>>();
+        let decimal_columns = columns
+            .iter()
+            .filter_map(|column| {
+                column
+                    .decimal_size()
+                    .map(|(_, scale)| (column.name().to_owned(), scale))
+            })
+            .collect::<Vec<_>>();
+        let integer_columns = columns
+            .iter()
+            .filter(|column| is_integer_type(column.type_name()))
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
+        let real_columns = columns
+            .iter()
+            .filter(|column| {
+                matches!(
+                    column.type_name(),
+                    "FLOAT" | "FLOAT UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED"
+                )
+            })
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
         if text_columns.is_empty()
             && member_columns.is_empty()
+            && set_columns.is_empty()
+            && decimal_columns.is_empty()
+            && integer_columns.is_empty()
+            && real_columns.is_empty()
             && moment_columns.is_empty()
             && !translated.orders_wildcard_ordinal()
         {
             return Ok(translated);
         }
-        turso_mysql_parser::parse_select_knowing_the_columns(
+        turso_mysql_parser::parse_select_knowing_numeric_columns(
             sql,
             mode,
             &text_columns,
             &table_columns,
             &member_columns,
+            &set_columns,
             &moment_columns,
+            &decimal_columns,
+            &integer_columns,
+            &real_columns,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
+    }
+
+    fn reject_binary_scalar_collation(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if translated.collation_sensitive_call_columns().is_empty() {
+            return Ok(());
+        }
+        let schema = self.inner.current_schema();
+        for source in translated.source_tables() {
+            if source.subquery() {
+                continue;
+            }
+            let Some(table) = schema.get_table(source.table().as_str()) else {
+                return Err(MySqlQueryError::Unsupported(
+                    "text call needs a base table's column collation".to_string(),
+                ));
+            };
+            for name in translated.collation_sensitive_call_columns() {
+                let Some((_, column)) = table.get_column_by_name(name) else {
+                    continue;
+                };
+                if column.collation().name() == "MYSQL_UTF8MB4_BIN" {
+                    return Err(MySqlQueryError::Unsupported(format!(
+                        "text call on utf8mb4_bin column {name} requires binary collation semantics"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Holds each comparison to the type of the column it names.
@@ -3815,7 +4410,24 @@ impl MySqlConnection {
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
+                refuse_binary_column_like(
+                    &self.inner.current_schema(),
+                    table.as_str(),
+                    comparison,
+                )?;
                 if let Some(type_name) = self.comparison_column_type(&table, comparison)? {
+                    if source_tables.len() > 1
+                        && is_decimal_type(&type_name)
+                        && matches!(
+                            comparison.operator(),
+                            CheckedSelectComparisonOperator::In
+                                | CheckedSelectComparisonOperator::NotIn
+                        )
+                    {
+                        return Err(LimboError::InvalidArgument(
+                            "DECIMAL IN over multiple source tables is unsupported".to_string(),
+                        ));
+                    }
                     bound.extend(select_comparison_fits_column(comparison, &type_name)?);
                     found = true;
                     break;
@@ -3823,6 +4435,31 @@ impl MySqlConnection {
             }
             if !found {
                 return Err(LimboError::SchemaUpdated);
+            }
+        }
+        Ok(bound)
+    }
+
+    fn decimal_comparison_parameters(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<Vec<usize>> {
+        let mut bound = Vec::new();
+        for comparison in comparisons {
+            let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
+                continue;
+            };
+            if comparison.answers().is_some() {
+                continue;
+            }
+            for table in comparison_tables(source_tables, comparison)? {
+                if let Some(type_name) = self.comparison_column_type(&table, comparison)? {
+                    if is_decimal_type(&type_name) {
+                        bound.push(*ordinal);
+                    }
+                    break;
+                }
             }
         }
         Ok(bound)
@@ -3889,6 +4526,7 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
+            refuse_binary_column_like(&self.inner.current_schema(), table.as_str(), comparison)?;
             let Some(type_name) = self.comparison_column_type(&table, comparison)? else {
                 return Err(LimboError::SchemaUpdated);
             };
@@ -4019,6 +4657,7 @@ impl MySqlConnection {
         comparisons: &[CheckedSelectComparison],
         values: &[MySqlPreparedValue],
         bound_temporal: &[BoundTemporalParameter],
+        bound_decimal: &[usize],
     ) -> Result<()> {
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -4031,10 +4670,7 @@ impl MySqlConnection {
             })?;
             // A collated comparison names a text column, which is the one
             // that takes a string. A `LIKE` binds a pattern, which is a string
-            // whatever the column's collation was rendered as — and one
-            // carrying a backslash is refused here for the reason a written
-            // one is refused at the parser: MySQL reads it as an escape and
-            // the engine reads it as itself.
+            // regardless of the column's collation.
             let patterns = matches!(
                 comparison.operator(),
                 CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
@@ -4049,11 +4685,13 @@ impl MySqlConnection {
             let fits = match value {
                 MySqlPreparedValue::Null => true,
                 MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment,
-                MySqlPreparedValue::Text(text) => {
+                MySqlPreparedValue::Text(_) => {
                     if patterns {
-                        !text.contains('\\')
+                        true
                     } else {
-                        comparison.collated() || stored_as_a_moment
+                        comparison.collated()
+                            || stored_as_a_moment
+                            || bound_decimal.contains(ordinal)
                     }
                 }
                 _ => false,
@@ -4196,18 +4834,15 @@ impl MySqlConnection {
         counted: Option<&AutoIncrementTable>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
-        let (translated, rewritten_on_update) = self
-            .parse_checked_dml_translation(sql, mode)
-            .map_err(mysql_query_parse_error)?;
+        let (translated, rewritten_on_update, decimal_columns, integer_columns, table_definition) =
+            self.parse_checked_dml_translation(sql, mode)
+                .map_err(mysql_query_parse_error)?;
         // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
         // rows a comparison names cannot depend on the statement asking.
         self.validate_dml_comparison_columns(&translated)
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
-        self.validate_dml_ordered_columns(
-            translated.source_table(),
-            translated.ordered_columns(),
-        )
-        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.validate_dml_ordered_columns(translated.source_table(), translated.ordered_columns())
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if let Some(update) = translated.checked_update() {
             if let Some(table) = self
                 .load_auto_increment_table(update.table_name())
@@ -4240,11 +4875,15 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
-        let mut options =
-            PrepareOptions::default().with_reprepare_parser(Arc::new(FrozenDmlParser {
-                mode,
-                rewritten_on_update,
-            }));
+        let frozen = self.frozen_dml_parser(
+            mode,
+            rewritten_on_update,
+            decimal_columns,
+            integer_columns,
+            table_definition,
+            &translated,
+        );
+        let mut options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         if let Some(table) = counted {
             options =
                 options.with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
@@ -4257,10 +4896,10 @@ impl MySqlConnection {
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
-        if let Some(target) = insert_target {
+        if let Some(target) = &insert_target {
             self.check_write_deadline(deadline)?;
             let missing = self
-                .missing_required_insert_column(&target, &[])
+                .missing_required_insert_column(target, &[])
                 .map_err(MySqlQueryError::Engine)?;
             self.check_write_deadline(deadline)?;
             if let Some(column) = missing {
@@ -4268,11 +4907,54 @@ impl MySqlConnection {
             }
         }
         let timeout = self.remaining_write_timeout(deadline)?;
-        run_checked_write_statement(&mut statement, timeout).map_err(MySqlQueryError::Engine)?;
+        run_checked_write_statement(&mut statement, timeout)
+            .map_err(|error| {
+                self.map_unsigned_decimal_write_error(
+                    error,
+                    insert_target
+                        .as_ref()
+                        .map(|target| target.table().as_str())
+                        .or_else(|| translated.source_table()),
+                )
+            })
+            .map_err(MySqlQueryError::Engine)?;
         Ok(MySqlWriteResult {
             affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
             last_insert_id: 0,
         })
+    }
+
+    fn map_unsigned_decimal_write_error(
+        &self,
+        error: LimboError,
+        table_name: Option<&str>,
+    ) -> LimboError {
+        if !matches!(&error, LimboError::Constraint(message) if message == "negative value for unsigned DECIMAL")
+        {
+            return error;
+        }
+        let Some(table_name) = table_name else {
+            return error;
+        };
+        let Ok(table) = MySqlTableName::parse(table_name) else {
+            return error;
+        };
+        let Ok(columns) = self.list_columns(&table) else {
+            return error;
+        };
+        let Some(column_index) = columns
+            .iter()
+            .position(|column| column.type_name().eq_ignore_ascii_case("DECIMAL UNSIGNED"))
+        else {
+            return error;
+        };
+        turso_core::AssignmentError::OutOfRange {
+            table: table_name.to_string(),
+            column: column_index + 1,
+            type_name: "DECIMAL UNSIGNED".to_string(),
+            value: 0,
+        }
+        .into()
     }
 
     /// The `DEFAULT VALUES` form keeps going through `list_columns`, so it still
@@ -4355,6 +5037,14 @@ impl MySqlConnection {
     ) -> std::result::Result<u64, MySqlQueryError> {
         let rows = match (is_update, affected_rows_mode) {
             (true, MySqlAffectedRowsMode::Changed) => self.inner.mysql_changed_rows(),
+            (false, _) if self.inner.mysql_replaced_rows() > 0 => self
+                .inner
+                .changes()
+                .saturating_add(self.inner.mysql_replaced_rows()),
+            (false, MySqlAffectedRowsMode::Matched) if self.inner.mysql_updated_rows() > 0 => self
+                .inner
+                .changes()
+                .saturating_add(self.inner.mysql_changed_rows()),
             // An `INSERT ... ON DUPLICATE KEY UPDATE` counts by what it did to
             // each row rather than by how many it touched. Measured on MySQL
             // 8.4.11: one for a row it wrote, two for a row it changed and
@@ -4579,6 +5269,7 @@ impl MySqlConnection {
         let statement = bound
             .inject_reserved_range(range.first())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let table_name = table.name.clone();
         let options = PrepareOptions::default()
             .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
                 statement: statement.clone(),
@@ -4594,7 +5285,8 @@ impl MySqlConnection {
         let timeout = self
             .remaining_write_timeout(deadline)
             .map_err(Into::<LimboError>::into)?;
-        run_checked_write_statement(&mut statement, timeout)?;
+        run_checked_write_statement(&mut statement, timeout)
+            .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table_name)))?;
         // Measured on MySQL 8.4.11: an upsert that wrote over a row reports
         // that row's own id back to the client and leaves `LAST_INSERT_ID()`
         // where it stood, while one that added a row reports the number it
@@ -4833,6 +5525,39 @@ impl MySqlConnection {
         }
         Ok(())
     }
+}
+
+fn reject_legacy_decimal_tables(connection: &Arc<Connection>) -> Result<()> {
+    let tables = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")?
+        .run_collect_rows()?;
+    let schema = connection.current_schema();
+    for row in tables {
+        let [name] = row.as_slice() else {
+            return Err(LimboError::Corrupt(
+                "sqlite_schema table name has an invalid shape".to_string(),
+            ));
+        };
+        let name = name.to_string();
+        let name = name.trim_matches('\'');
+        let Some(table) = schema.get_btree_table(name) else {
+            continue;
+        };
+        if table
+            .columns()
+            .iter()
+            .any(|column| legacy_decimal_type(&column.ty_str))
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "table '{name}' has legacy DECIMAL values stored through binary64; re-import this table from the original decimal data"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn legacy_decimal_type(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("DECIMAL") || type_name.eq_ignore_ascii_case("UNSIGNED DECIMAL")
 }
 
 /// The same stored DDL with every `ON UPDATE CURRENT_TIMESTAMP` taken out.
@@ -5189,13 +5914,16 @@ fn mysql_column_metadata(
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         sized_text
-    } else if data_type.name.eq_ignore_ascii_case("DECIMAL") {
+    } else if data_type.name.eq_ignore_ascii_case("mysql_decimal") {
         decimal_size = Some(
             turso_mysql_parser::stored_decimal_size(data_type)
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?,
         );
         "DECIMAL"
-    } else if data_type.name.eq_ignore_ascii_case("UNSIGNED DECIMAL") {
+    } else if data_type
+        .name
+        .eq_ignore_ascii_case("mysql_decimal_unsigned")
+    {
         // The engine's declared type takes the sign before the arguments and
         // MySQL writes it after them; the MySQL word order goes back on here,
         // so nothing above this reads the inversion.
@@ -5219,6 +5947,7 @@ fn mysql_column_metadata(
         return Ok(MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            collation_name: Some(stored_text_collation_name(column)),
             name: column.col_name.as_str().to_owned(),
             type_name: data_type.name.clone(),
             nullable,
@@ -5327,6 +6056,7 @@ fn mysql_column_metadata(
     Ok(MySqlColumnMetadata {
         character_length,
         decimal_size,
+        collation_name: is_text_type(type_name).then(|| stored_text_collation_name(column)),
         name: column.col_name.as_str().to_owned(),
         type_name: type_name.to_owned(),
         nullable,
@@ -5340,6 +6070,17 @@ fn mysql_column_metadata(
         },
         comment: String::new(),
     })
+}
+
+fn stored_text_collation_name(column: &turso_parser::ast::ColumnDefinition) -> &'static str {
+    if column.constraints.iter().any(|constraint| {
+        matches!(&constraint.constraint, ColumnConstraint::Collate { collation_name }
+            if collation_name.as_str().eq_ignore_ascii_case("MYSQL_UTF8MB4_BIN"))
+    }) {
+        "utf8mb4_bin"
+    } else {
+        "utf8mb4_0900_ai_ci"
+    }
 }
 
 /// Reads what an `ENUM` column was declared NOT NULL and defaulting to.
@@ -5376,19 +6117,14 @@ fn enum_column_shape(
     Ok((nullable, default))
 }
 
-/// Reports whether one column constraint is the collation this server declares
-/// a column of words with.
-///
-/// MySQL matches two words without regard to case and gives a character column
-/// the table's collation. The engine matches them byte for byte and takes the
-/// collation on the column, so a column of words is declared with it — a key
-/// over one then matches the way every comparison here already does. It says
-/// nothing about the column that MySQL prints.
+/// Recognize the text collations the checked MySQL DDL can persist.
 fn names_the_collation_of_words(constraint: &turso_parser::ast::NamedColumnConstraint) -> bool {
     matches!(
         &constraint.constraint,
         ColumnConstraint::Collate { collation_name }
-            if constraint.name.is_none() && collation_name.as_str().eq_ignore_ascii_case("NOCASE")
+            if constraint.name.is_none()
+                && ["MYSQL_UCA9_AI_CI", "MYSQL_UTF8MB4_BIN", "NOCASE"].iter().any(|name|
+                    collation_name.as_str().eq_ignore_ascii_case(name))
     )
 }
 
@@ -5440,6 +6176,24 @@ fn is_real_type(type_name: &str) -> bool {
         type_name,
         "DECIMAL" | "DECIMAL UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED" | "FLOAT" | "FLOAT UNSIGNED"
     )
+}
+
+fn is_decimal_type(type_name: &str) -> bool {
+    matches!(type_name, "DECIMAL" | "DECIMAL UNSIGNED")
+}
+
+fn sql_mentions_column(sql: &str, column: &str) -> bool {
+    if !column
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return true;
+    }
+    let pattern = format!(
+        r"(?i)(^|[^a-z0-9_$]){}([^a-z0-9_$]|$)",
+        regex::escape(column)
+    );
+    regex::Regex::new(&pattern).map_or(true, |pattern| pattern.is_match(sql))
 }
 
 /// Answers whether a comparison's right side can meet this column at all.
@@ -5500,7 +6254,9 @@ fn checked_comparison_fits_column(
             ) {
                 return is_text_type(type_name);
             }
-            is_integer_type(type_name) || (collated && is_text_type(type_name))
+            is_integer_type(type_name)
+                || is_decimal_type(type_name)
+                || (collated && is_text_type(type_name))
         }
     }
 }
@@ -5788,6 +6544,7 @@ fn validate_frozen_select_comparison_columns(
             if comparison.answers().is_some() {
                 continue;
             }
+            refuse_binary_column_like(schema, source_table, comparison)?;
             let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
@@ -5816,6 +6573,7 @@ fn validate_frozen_select_comparison_columns(
         if comparison.answers().is_some() {
             continue;
         }
+        refuse_binary_column_like(schema, source_table, comparison)?;
         let Some(column) = view.columns.iter().find(|column| {
             column
                 .name
@@ -5836,6 +6594,34 @@ fn validate_frozen_select_comparison_columns(
                 &column.ty_str,
             ));
         }
+    }
+    Ok(())
+}
+
+fn refuse_binary_column_like(
+    schema: &turso_core::schema::Schema,
+    table_name: &str,
+    comparison: &CheckedSelectComparison,
+) -> Result<()> {
+    if !matches!(
+        comparison.operator(),
+        CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
+    ) {
+        return Ok(());
+    }
+    if let Some(table) = schema.get_table(table_name) {
+        let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
+            return Err(LimboError::SchemaUpdated);
+        };
+        if column.collation().name() == "MYSQL_UTF8MB4_BIN" {
+            return Err(LimboError::InvalidArgument(
+                "LIKE over utf8mb4_bin needs a binary pattern matcher".to_string(),
+            ));
+        }
+    } else if schema.get_view(table_name).is_some() {
+        return Err(LimboError::InvalidArgument(
+            "LIKE over a view needs its source column collation".to_string(),
+        ));
     }
     Ok(())
 }
@@ -5930,6 +6716,11 @@ struct FrozenDmlParser {
     /// The columns an `UPDATE` rewrites, read when the statement was prepared.
     /// A reprepare has no connection to read them again from.
     rewritten_on_update: Vec<String>,
+    decimal_columns: Vec<(String, u32)>,
+    integer_columns: Vec<String>,
+    table_definition: Option<(String, String)>,
+    read_table_definitions: Vec<(String, String)>,
+    untracked_read_source: bool,
 }
 
 /// Holds an `UPDATE` or `DELETE` `WHERE` to the same rule a `SELECT` `WHERE`
@@ -5979,6 +6770,10 @@ struct FrozenSelectParser {
     mode: SessionSqlMode,
     source_table: Option<String>,
     checked_comparisons: Vec<CheckedSelectComparison>,
+    typed_statement: Option<Stmt>,
+    table_definitions: Vec<(String, String)>,
+    source_columns: Vec<(String, Vec<String>)>,
+    untracked_source: bool,
 }
 
 struct AutoIncrementTable {
@@ -6156,6 +6951,9 @@ fn inserted_value(expr: &Expr) -> InsertedValue {
 /// Answers `None` for a string `DEFAULT`, whose escaping this does not decide.
 fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option<String> {
     let mut rendered = format!("{} {}", mysql_quoted(name), copied_column_type(column));
+    if column.collation_name() == Some("utf8mb4_bin") {
+        rendered.push_str(" COLLATE utf8mb4_bin");
+    }
     if !column.nullable() {
         rendered.push_str(" NOT NULL");
     }
@@ -6264,10 +7062,41 @@ impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
 
 impl ReprepareParser for FrozenDmlParser {
     fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
-        let translated = turso_mysql_parser::parse_dml_rewriting_on_update(
+        if let Some((name, definition)) = &self.table_definition {
+            let current = context
+                .schema
+                .get_btree_table(name)
+                .ok_or(LimboError::SchemaUpdated)?;
+            if &current.to_sql() != definition {
+                return Err(LimboError::ParseError(
+                    "prepared DML table definition changed; prepare the statement again"
+                        .to_string(),
+                ));
+            }
+        }
+        if self.untracked_read_source {
+            return Err(LimboError::ParseError(
+                "prepared DML source cannot be checked after a schema change; prepare the statement again".to_string(),
+            ));
+        }
+        for (name, definition) in &self.read_table_definitions {
+            let current = context
+                .schema
+                .get_btree_table(name)
+                .ok_or(LimboError::SchemaUpdated)?;
+            if &current.to_sql() != definition {
+                return Err(LimboError::ParseError(
+                    "prepared DML source table definition changed; prepare the statement again"
+                        .to_string(),
+                ));
+            }
+        }
+        let translated = turso_mysql_parser::parse_dml_knowing_numeric_columns(
             sql,
             self.mode,
             &self.rewritten_on_update,
+            &self.decimal_columns,
+            &self.integer_columns,
         )
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_dml_comparison_columns(context.schema, &translated)?;
@@ -6281,13 +7110,49 @@ impl ReprepareParser for FrozenDmlParser {
 
 impl ReprepareParser for FrozenSelectParser {
     fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
-        let translated = parse_select(sql, self.mode)
-            .map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_frozen_select_comparison_columns(
             context.schema,
             self.source_table.as_deref(),
             &self.checked_comparisons,
         )?;
+        if self.untracked_source {
+            return Err(LimboError::ParseError(
+                "prepared SELECT source cannot be checked after a schema change; prepare the statement again".to_string(),
+            ));
+        }
+        for (name, columns) in &self.source_columns {
+            let current = context
+                .schema
+                .get_btree_table(name)
+                .ok_or(LimboError::SchemaUpdated)?;
+            let current_columns = current
+                .columns()
+                .iter()
+                .map(|column| format!("{column:?}"))
+                .collect::<Vec<_>>();
+            if !current_columns.starts_with(columns) {
+                return Err(LimboError::ParseError(
+                    "prepared SELECT column types changed; prepare the statement again".to_string(),
+                ));
+            }
+        }
+        if let Some(statement) = &self.typed_statement {
+            for (name, definition) in &self.table_definitions {
+                let current = context
+                    .schema
+                    .get_btree_table(name)
+                    .ok_or(LimboError::SchemaUpdated)?;
+                if &current.to_sql() != definition {
+                    return Err(LimboError::ParseError(
+                        "prepared SELECT table definition changed; prepare the statement again"
+                            .to_string(),
+                    ));
+                }
+            }
+            return Ok((Some(Cmd::Stmt(statement.clone())), sql.len()));
+        }
+        let translated = parse_select(sql, self.mode)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let stmt = translated
             .parse_ast()
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -6328,9 +7193,9 @@ impl SchemaSqlFormatter for AutoIncrementSchemaSqlFormatter {
                 "AUTO_INCREMENT schema formatter received a different statement".to_string(),
             ));
         }
-        encode_schema_sql_v2(
+        encode_schema_sql_v3(
             self.context.for_kind(SchemaSqlKind::Table),
-            self.metadata,
+            Some(self.metadata),
             &self.normalized_mysql_ddl,
         )
         .map_err(|error| LimboError::InternalError(error.to_string()))

@@ -222,12 +222,15 @@ impl MySqlSelectSource {
 
 pub(crate) struct RenderedSelect {
     pub(crate) sqlite_sql: String,
+    pub(crate) collation_sensitive_call_columns: Vec<String>,
     pub(crate) orders_a_bare_column: bool,
+    pub(crate) checks_type_sensitive_expression: bool,
     pub(crate) orders_wildcard_ordinal: bool,
     pub(crate) compares_a_placeholder: bool,
     pub(crate) counts_distinct_column: bool,
     pub(crate) tests_a_bare_column: bool,
     pub(crate) compares_a_written_day: bool,
+    pub(crate) compares_a_large_decimal_integer: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
@@ -240,6 +243,7 @@ pub(crate) struct RenderedSelect {
     pub(crate) parameter_count: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_select_query(
     query: &sqlparser::ast::Query,
     sql: &str,
@@ -247,7 +251,11 @@ pub(crate) fn translate_select_query(
     text_columns: &[String],
     table_columns: &[String],
     member_columns: &[(String, Vec<String>)],
+    set_columns: &[(String, Vec<String>)],
     moment_columns: &[String],
+    decimal_columns: &[(String, u32)],
+    integer_columns: &[String],
+    real_columns: &[String],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -264,9 +272,13 @@ pub(crate) fn translate_select_query(
         text_columns,
         table_columns,
         member_columns,
+        set_columns,
         moment_columns,
         &[],
     );
+    render_context.decimal_columns = decimal_columns;
+    render_context.integer_columns = integer_columns;
+    render_context.real_columns = real_columns;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     if let Some(with) = &query.with {
         let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
@@ -390,12 +402,15 @@ pub(crate) fn translate_select_query(
     }
     Ok(RenderedSelect {
         sqlite_sql: normalized,
+        collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
         orders_a_bare_column: render_context.orders_a_bare_column,
+        checks_type_sensitive_expression: render_context.checks_type_sensitive_expression,
         orders_wildcard_ordinal: render_context.orders_wildcard_ordinal,
         compares_a_placeholder: render_context.compares_a_placeholder,
         counts_distinct_column: render_context.counts_distinct_column,
         tests_a_bare_column: render_context.tests_a_bare_column,
         compares_a_written_day: render_context.compares_a_written_day,
+        compares_a_large_decimal_integer: render_context.compares_a_large_decimal_integer,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
         source_tables,
@@ -1328,6 +1343,16 @@ fn render_having_predicate(
                 return unsupported("HAVING comparison requires an exact signed integer");
             }
             if let Some((_, column)) = static_select_metadata::column_aggregate_argument(function) {
+                render_context.checks_type_sensitive_expression = true;
+                if render_context
+                    .decimal_columns
+                    .iter()
+                    .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
+                {
+                    return unsupported(
+                        "HAVING aggregate over DECIMAL requires exact numeric comparison",
+                    );
+                }
                 render_context
                     .checked_comparisons
                     .push(CheckedSelectComparison {
@@ -1500,6 +1525,36 @@ fn render_select_order_by(
             } else {
                 "ASC"
             };
+            if let Expr::Identifier(order_name) = &expression.expr {
+                if let Some(aliased) = projection.iter().find_map(|item| match item {
+                    SelectItem::ExprWithAlias { expr, alias }
+                        if alias.value.eq_ignore_ascii_case(&order_name.value) =>
+                    {
+                        Some(expr)
+                    }
+                    _ => None,
+                }) {
+                    if order_expression_uses_decimal(aliased, render_context.decimal_columns) {
+                        return unsupported(
+                            "SELECT ORDER BY alias over DECIMAL expression requires exact numeric ordering",
+                        );
+                    }
+                    let set_column = match aliased {
+                        Expr::Identifier(column) => Some(&column.value),
+                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                            Some(&parts[1].value)
+                        }
+                        _ => None,
+                    };
+                    if set_column.is_some_and(|column| render_context.set_column(column).is_some())
+                    {
+                        return render_order_by_expr(aliased, direction, render_context);
+                    }
+                    if render_context.set_column(&order_name.value).is_some() {
+                        return Ok(format!("{} {direction}", render_ident(order_name)));
+                    }
+                }
+            }
             if let Some(ordinal) = order_by_ordinal(&expression.expr) {
                 if ordinal == 0 {
                     return unsupported("SELECT ORDER BY ordinal outside the projection");
@@ -1520,19 +1575,18 @@ fn render_select_order_by(
                     render_context.orders_wildcard_ordinal = true;
                     render_context.orders_a_bare_column = true;
                     let column_name = &render_context.table_columns[ordinal - 1];
+                    if let Some(members) = render_context.set_column(column_name) {
+                        return set_member_order(
+                            &render_ident_str(column_name),
+                            members,
+                            direction,
+                        );
+                    }
                     if let Some(members) = render_context.member_column(column_name) {
                         let position = member_position(&render_ident_str(column_name), members);
                         return Ok(format!("{position} {direction}"));
                     }
-                    let collation = if render_context.is_text_column(column_name) {
-                        " COLLATE NOCASE"
-                    } else {
-                        ""
-                    };
-                    return Ok(format!(
-                        "{}{collation} {direction}",
-                        render_ident_str(column_name)
-                    ));
+                    return Ok(format!("{} {direction}", render_ident_str(column_name)));
                 }
                 let expr = projected_expr(projection, ordinal)?;
                 return render_order_by_expr(expr, direction, render_context);
@@ -1548,13 +1602,25 @@ fn render_order_by_expr(
     direction: &str,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    if order_expression_uses_decimal(expr, render_context.decimal_columns) {
+        return unsupported(
+            "SELECT ORDER BY expression over DECIMAL requires exact numeric ordering",
+        );
+    }
     match expr {
         Expr::Identifier(_) => {}
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {}
         Expr::Function(function)
             if static_select_metadata::is_count_call(function)
-                || static_select_metadata::column_aggregate_argument(function).is_some() => {}
-        Expr::BinaryOp { .. } if static_select_metadata::classify_arithmetic(expr).is_some() => {}
+                || static_select_metadata::column_aggregate_argument(function).is_some() =>
+        {
+            if !static_select_metadata::is_count_call(function) {
+                render_context.checks_type_sensitive_expression = true;
+            }
+        }
+        Expr::BinaryOp { .. } if static_select_metadata::classify_arithmetic(expr).is_some() => {
+            render_context.checks_type_sensitive_expression = true;
+        }
         // `ORDER BY n IS NULL, n` is how a statement asks for the rows holding
         // nothing to come last, which neither MySQL nor the engine has a word
         // for. Both answer the test as 0 or 1 and sort by that, so the two
@@ -1563,8 +1629,7 @@ fn render_order_by_expr(
             if matches!(inner.as_ref(), Expr::Identifier(_))
                 || matches!(inner.as_ref(), Expr::CompoundIdentifier(parts) if parts.len() == 2) => {
         }
-        // `ORDER BY name COLLATE utf8mb4_bin` asks for byte order where the
-        // statement would otherwise get the collation's own.
+        // `ORDER BY name COLLATE utf8mb4_bin` asks for PAD SPACE byte order.
         Expr::Collate { expr: inner, .. } if matches!(inner.as_ref(), Expr::Identifier(_)) => {}
         // `ORDER BY LOWER(name)` is how a report asks for an order it has
         // worked out rather than one a column holds. Any call this already
@@ -1575,6 +1640,7 @@ fn render_order_by_expr(
         // `DATE` order by what they answer. A collation says nothing about a
         // number in the engine, so the same rendering covers both.
         _ if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            render_context.checks_type_sensitive_expression = true;
             // A call answering something new each time it is read orders the
             // rows by nothing a client can hold this to, and whether each
             // engine reads it once or once a row is a rule of its own.
@@ -1588,7 +1654,7 @@ fn render_order_by_expr(
                 return unsupported("SELECT ORDER BY a random number");
             }
             return Ok(format!(
-                "{} COLLATE NOCASE {direction}",
+                "{} COLLATE MYSQL_UCA9_AI_CI {direction}",
                 render_select_expr(expr, render_context)?
             ));
         }
@@ -1597,15 +1663,25 @@ fn render_order_by_expr(
     let collation = match expr {
         Expr::Identifier(column) => {
             render_context.orders_a_bare_column = true;
+            if let Some(members) = render_context.set_column(&column.value) {
+                return set_member_order(&render_ident(column), members, direction);
+            }
             if let Some(members) = render_context.member_column(&column.value) {
                 let position = member_position(&render_ident(column), members);
                 return Ok(format!("{position} {direction}"));
             }
-            if render_context.is_text_column(&column.value) {
-                " COLLATE NOCASE"
-            } else {
-                ""
+            ""
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            render_context.orders_a_bare_column = true;
+            if render_context.set_column(&parts[1].value).is_some() {
+                let column = render_select_expr(expr, render_context)?;
+                let members = render_context
+                    .set_column(&parts[1].value)
+                    .expect("the SET column was found above");
+                return set_member_order(&column, members, direction);
             }
+            ""
         }
         Expr::Collate {
             expr: inner,
@@ -1620,7 +1696,9 @@ fn render_order_by_expr(
             render_context.orders_a_bare_column = true;
             // An ENUM orders by the order its members were declared in, which
             // is not an order a collation has anything to say about.
-            if render_context.member_column(&column.value).is_some() {
+            if render_context.member_column(&column.value).is_some()
+                || render_context.set_column(&column.value).is_some()
+            {
                 return unsupported("SELECT ORDER BY collation over a member column");
             }
             // A column of words is declared with the collation this server
@@ -1630,7 +1708,8 @@ fn render_order_by_expr(
                 orders_by_bytes,
                 render_context.is_text_column(&column.value),
             ) {
-                (false, true) => " COLLATE NOCASE",
+                (false, true) => " COLLATE MYSQL_UCA9_AI_CI",
+                (true, true) if collation_is_utf8mb4_bin(collation) => " COLLATE MYSQL_UTF8MB4_BIN",
                 (true, true) => " COLLATE BINARY",
                 (_, false) => "",
             }
@@ -1644,13 +1723,36 @@ fn render_order_by_expr(
     Ok(format!("{ordered}{collation} {direction}"))
 }
 
+fn order_expression_uses_decimal(expr: &Expr, decimal_columns: &[(String, u32)]) -> bool {
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+        return false;
+    }
+    if contains_decimal_operand(expr, decimal_columns) {
+        return true;
+    }
+    let names_decimal = |column: &str| {
+        decimal_columns
+            .iter()
+            .any(|(known, _)| known.eq_ignore_ascii_case(column))
+    };
+    match static_select_metadata::classify_static_select_expr(expr) {
+        Some(StaticSelectMetadata::ScalarCall { columns, .. }) => {
+            columns.iter().any(|column| names_decimal(column))
+        }
+        Some(StaticSelectMetadata::ColumnAggregate { column_name, .. }) => {
+            names_decimal(&column_name)
+        }
+        _ => false,
+    }
+}
+
 /// Reports whether a collation orders text by its bytes, or nothing when it is
 /// not one of the collations this holds.
 ///
 /// Measured on MySQL 8.4.11 over 'beta', 'Alpha', 'alpha', 'Beta', 'Zulu' and
 /// 'apple': `utf8mb4_bin` puts every capital first, which is byte order, and
-/// `utf8mb4_0900_ai_ci` and `utf8mb4_general_ci` each order them the way the
-/// statement orders them with no collation named at all. A collation from
+/// `utf8mb4_0900_ai_ci` orders them the way the statement orders them with no
+/// collation named at all. A collation from
 /// another character set is 1253 there and refused here.
 fn collation_orders_by_bytes(collation: &ObjectName) -> Option<bool> {
     let [ObjectNamePart::Identifier(name)] = collation.0.as_slice() else {
@@ -1659,9 +1761,16 @@ fn collation_orders_by_bytes(collation: &ObjectName) -> Option<bool> {
     if name.value.eq_ignore_ascii_case("utf8mb4_bin") || name.value.eq_ignore_ascii_case("binary") {
         return Some(true);
     }
-    (name.value.eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
-        || name.value.eq_ignore_ascii_case("utf8mb4_general_ci"))
-    .then_some(false)
+    name.value
+        .eq_ignore_ascii_case("utf8mb4_0900_ai_ci")
+        .then_some(false)
+}
+
+fn collation_is_utf8mb4_bin(collation: &ObjectName) -> bool {
+    let [ObjectNamePart::Identifier(name)] = collation.0.as_slice() else {
+        return false;
+    };
+    name.value.eq_ignore_ascii_case("utf8mb4_bin")
 }
 
 /// Reads the ordinal out of an `ORDER BY 2`, if that is what this is.
@@ -1835,6 +1944,7 @@ pub(crate) fn translate_insert(
     insert: &Insert,
     sql: &str,
     mode: SessionSqlMode,
+    decimal_columns: &[(String, u32)],
 ) -> Result<RenderedInsert, ParseError> {
     if !insert.optimizer_hints.is_empty()
         || insert.or.is_some()
@@ -1911,7 +2021,8 @@ pub(crate) fn translate_insert(
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
-        let rendered = translate_select_query(source, sql, mode, &[], &[], &[], &[])?;
+        let rendered =
+            translate_select_query(source, sql, mode, &[], &[], &[], &[], &[], &[], &[], &[])?;
         // A SELECT that needs a second rendering pass to learn its column types
         // has no way to ask for one from here, so it is refused rather than
         // rendered from the first pass alone.
@@ -2020,7 +2131,7 @@ pub(crate) fn translate_insert(
             "{verb} {table} ({}) VALUES {}{}",
             columns.join(", "),
             rows.join(", "),
-            render_duplicate_key_update(insert)?
+            render_duplicate_key_update(insert, decimal_columns)?
         ),
         read_tables: Vec::new(),
         compared_table: None,
@@ -2109,7 +2220,10 @@ pub(crate) fn names_the_columns_default(value: &Expr, column: &str) -> bool {
 /// MySQL counts the attempted insert and the update, and a row the update
 /// leaves identical counts 0. The engine counts the changed row once, so the
 /// middle case reports 1 here.
-fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
+fn render_duplicate_key_update(
+    insert: &Insert,
+    decimal_columns: &[(String, u32)],
+) -> Result<String, ParseError> {
     let Some(on) = &insert.on else {
         return Ok(String::new());
     };
@@ -2141,13 +2255,28 @@ fn render_duplicate_key_update(insert: &Insert) -> Result<String, ParseError> {
         let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
             return unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target");
         };
+        let [ObjectNamePart::Identifier(column)] = name.0.as_slice() else {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target");
+        };
+        let assigned_decimal = decimal_columns
+            .iter()
+            .any(|(known, _)| known.eq_ignore_ascii_case(&column.value));
         rendered.push(format!(
             "{} = {}",
             render_unqualified_name(name)?,
-            render_duplicate_key_value(&assignment.value, &table, offered)?
+            render_duplicate_key_value(
+                &assignment.value,
+                &table,
+                offered,
+                decimal_columns,
+                assigned_decimal,
+            )?
         ));
     }
-    Ok(format!(" ON CONFLICT DO UPDATE SET {}", rendered.join(", ")))
+    Ok(format!(
+        " ON CONFLICT DO UPDATE SET {}",
+        rendered.join(", ")
+    ))
 }
 
 /// Renders one `ON DUPLICATE KEY UPDATE` value.
@@ -2166,6 +2295,8 @@ fn render_duplicate_key_value(
     value: &Expr,
     table: &str,
     offered: Option<&str>,
+    decimal_columns: &[(String, u32)],
+    assigned_decimal: bool,
 ) -> Result<String, ParseError> {
     match value {
         Expr::Function(function) if names_the_offered_row(function) => {
@@ -2178,12 +2309,30 @@ fn render_duplicate_key_value(
             else {
                 return unsupported("VALUES() requires one unqualified column");
             };
+            if !assigned_decimal
+                && decimal_columns
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE DECIMAL value assigned to a non-DECIMAL column",
+                );
+            }
             Ok(format!("\"excluded\".{}", render_ident(column)))
         }
         // A column qualified by the alias names the offered row, and one
         // qualified by the table names the row already there.
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             let (qualifier, column) = (&parts[0].value, &parts[1]);
+            if !assigned_decimal
+                && decimal_columns
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE DECIMAL value assigned to a non-DECIMAL column",
+                );
+            }
             if offered.is_some_and(|offered| qualifier.eq_ignore_ascii_case(offered)) {
                 return Ok(format!("\"excluded\".{}", render_ident(column)));
             }
@@ -2195,6 +2344,15 @@ fn render_duplicate_key_value(
         // A bare column is the row already there — but only while nothing is
         // offered under a name, which is what makes one ambiguous.
         Expr::Identifier(column) => {
+            if !assigned_decimal
+                && decimal_columns
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE DECIMAL value assigned to a non-DECIMAL column",
+                );
+            }
             if offered.is_some() {
                 return unsupported(
                     "INSERT ON DUPLICATE KEY UPDATE bare column beside an aliased row",
@@ -2204,26 +2362,143 @@ fn render_duplicate_key_value(
         }
         Expr::Nested(inner) => Ok(format!(
             "({})",
-            render_duplicate_key_value(inner, table, offered)?
+            render_duplicate_key_value(inner, table, offered, decimal_columns, assigned_decimal)?
         )),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } if duplicate_key_decimal_operand(expr, decimal_columns) => {
+            if !assigned_decimal {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column",
+                );
+            }
+            render_duplicate_key_value(expr, table, offered, decimal_columns, assigned_decimal)
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if duplicate_key_decimal_operand(expr, decimal_columns) => {
+            if !assigned_decimal {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column",
+                );
+            }
+            Ok(format!(
+                "numeric_sub('0', {})",
+                render_duplicate_key_value(
+                    expr,
+                    table,
+                    offered,
+                    decimal_columns,
+                    assigned_decimal
+                )?
+            ))
+        }
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
                 BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
             ) =>
         {
+            let decimal = assigned_decimal
+                || duplicate_key_decimal_operand(left, decimal_columns)
+                || duplicate_key_decimal_operand(right, decimal_columns);
+            if decimal {
+                if !assigned_decimal {
+                    return unsupported("ON DUPLICATE KEY UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column");
+                }
+                for operand in [left.as_ref(), right.as_ref()] {
+                    if assigned_decimal
+                        && duplicate_key_names_column(operand)
+                        && !duplicate_key_decimal_operand(operand, decimal_columns)
+                    {
+                        return unsupported(
+                            "ON DUPLICATE KEY UPDATE mixed DECIMAL column arithmetic",
+                        );
+                    }
+                }
+                let function = match op {
+                    BinaryOperator::Plus => "numeric_add",
+                    BinaryOperator::Minus => "numeric_sub",
+                    BinaryOperator::Multiply => "numeric_mul",
+                    _ => unreachable!("the guard requires arithmetic"),
+                };
+                return Ok(format!(
+                    "{function}({}, {})",
+                    render_duplicate_key_value(
+                        left,
+                        table,
+                        offered,
+                        decimal_columns,
+                        assigned_decimal
+                    )?,
+                    render_duplicate_key_value(
+                        right,
+                        table,
+                        offered,
+                        decimal_columns,
+                        assigned_decimal
+                    )?
+                ));
+            }
             Ok(format!(
                 "({} {} {})",
-                render_duplicate_key_value(left, table, offered)?,
+                render_duplicate_key_value(
+                    left,
+                    table,
+                    offered,
+                    decimal_columns,
+                    assigned_decimal
+                )?,
                 match op {
                     BinaryOperator::Plus => "+",
                     BinaryOperator::Minus => "-",
                     _ => "*",
                 },
-                render_duplicate_key_value(right, table, offered)?
+                render_duplicate_key_value(
+                    right,
+                    table,
+                    offered,
+                    decimal_columns,
+                    assigned_decimal
+                )?
             ))
         }
         _ => render_dml_expr(value),
+    }
+}
+
+fn duplicate_key_decimal_operand(expr: &Expr, decimal_columns: &[(String, u32)]) -> bool {
+    if decimal_operand_scale(expr, decimal_columns).is_some() {
+        return true;
+    }
+    match expr {
+        Expr::Nested(inner) => duplicate_key_decimal_operand(inner, decimal_columns),
+        Expr::UnaryOp { expr, .. } => duplicate_key_decimal_operand(expr, decimal_columns),
+        Expr::BinaryOp { left, right, .. } => {
+            duplicate_key_decimal_operand(left, decimal_columns)
+                || duplicate_key_decimal_operand(right, decimal_columns)
+        }
+        Expr::Function(function) if names_the_offered_row(function) => {
+            let FunctionArguments::List(arguments) = &function.args else {
+                return false;
+            };
+            matches!(arguments.args.as_slice(),
+                [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(column)))]
+                if decimal_columns.iter().any(|(name, _)| name.eq_ignore_ascii_case(&column.value)))
+        }
+        _ => false,
+    }
+}
+
+fn duplicate_key_names_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(inner) => duplicate_key_names_column(inner),
+        Expr::UnaryOp { expr, .. } => duplicate_key_names_column(expr),
+        Expr::Function(function) if names_the_offered_row(function) => true,
+        _ => false,
     }
 }
 
@@ -2904,10 +3179,9 @@ fn render_dml_order_by(
                 }
                 Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
                     let qualifier = MySqlTableName::parse(&parts[0].value)?;
-                    render_context.ordered_columns.push((
-                        Some(qualifier.as_str().to_owned()),
-                        parts[1].value.clone(),
-                    ));
+                    render_context
+                        .ordered_columns
+                        .push((Some(qualifier.as_str().to_owned()), parts[1].value.clone()));
                     Ok(format!(
                         "{}.{} {direction}",
                         render_ident(&parts[0]),
@@ -2992,12 +3266,22 @@ fn render_update_assignment_value(
             unsupported("UPDATE assignment writing a column default")
         }
         Expr::Identifier(ident) => {
+            if contains_decimal_operand(value, render_context.decimal_columns)
+                && !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written))
+            {
+                return unsupported("UPDATE DECIMAL value assigned to a non-DECIMAL column");
+            }
             if refuse_if_assigned(&ident.value) {
                 return unsupported("UPDATE assignment reading a column it has already assigned");
             }
             Ok(render_ident(ident))
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            if contains_decimal_operand(value, render_context.decimal_columns)
+                && !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written))
+            {
+                return unsupported("UPDATE DECIMAL value assigned to a non-DECIMAL column");
+            }
             if refuse_if_assigned(&parts[1].value) {
                 return unsupported("UPDATE assignment reading a column it has already assigned");
             }
@@ -3014,10 +3298,27 @@ fn render_update_assignment_value(
         Expr::UnaryOp {
             op: UnaryOperator::Plus,
             expr,
-        } => Ok(format!(
-            "(+{})",
-            render_update_assignment_value(expr, written, assigned, render_context)?
-        )),
+        } => {
+            let decimal = contains_decimal_operand(expr, render_context.decimal_columns);
+            if decimal && !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written)) {
+                return unsupported("UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column");
+            }
+            let rendered = render_update_assignment_value(expr, written, assigned, render_context)?;
+            if decimal {
+                Ok(rendered)
+            } else {
+                Ok(format!("(+{rendered})"))
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } if contains_decimal_operand(expr, render_context.decimal_columns) => {
+            if !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written)) {
+                return unsupported("UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column");
+            }
+            Ok(format!("numeric_sub('0', {})", render_update_assignment_value(expr, written, assigned, render_context)?))
+        }
         // `SET ratio = score / 2` is how a statement scales a column down.
         // MySQL's `/` is decimal division where the engine's is integer
         // division, and what lands in the column is rounded to the column's
@@ -3033,6 +3334,36 @@ fn render_update_assignment_value(
             left,
             op: BinaryOperator::Divide,
             right,
+        } if (decimal_operand_scale(left, render_context.decimal_columns).is_some()
+            || render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written)))
+            && direct_signed_integer(right).is_some_and(|divisor| divisor != 0) =>
+        {
+            if !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written)) {
+                return unsupported("UPDATE DECIMAL division assigned to a non-DECIMAL column");
+            }
+            let Some(input_scale) = decimal_operand_scale(left, render_context.decimal_columns)
+                .or_else(|| direct_signed_integer(left).map(|_| 0))
+                .or_else(|| known_typed_numeric_operand(left, render_context.integer_columns).then_some(0)) else {
+                    return unsupported("UPDATE DECIMAL division over an untyped column");
+                };
+            let scale = input_scale.saturating_add(4).min(30);
+            let divisor = direct_signed_integer(right).expect("the guard requires a divisor");
+            Ok(format!(
+                "mysql_decimal_div_round({}, '{divisor}', {scale})",
+                render_update_assignment_value(left, written, assigned, render_context)?
+            ))
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Divide, right }
+            if render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written))
+                || contains_decimal_operand(left, render_context.decimal_columns)
+                || contains_decimal_operand(right, render_context.decimal_columns) =>
+        {
+            unsupported("UPDATE DECIMAL division requires a DECIMAL column or integer numerator and a written nonzero integer divisor")
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Divide,
+            right,
         } if direct_signed_integer(right).is_some_and(|divisor| divisor != 0) => Ok(format!(
             "(CAST({} AS REAL) / {})",
             render_update_assignment_value(left, written, assigned, render_context)?,
@@ -3044,6 +3375,35 @@ fn render_update_assignment_value(
                 BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
             ) =>
         {
+            let left_is_decimal = contains_decimal_operand(left, render_context.decimal_columns);
+            let right_is_decimal = contains_decimal_operand(right, render_context.decimal_columns);
+            let assigned_decimal = render_context
+                .decimal_columns
+                .iter()
+                .any(|(column, _)| column.eq_ignore_ascii_case(written));
+            if assigned_decimal || left_is_decimal || right_is_decimal {
+                if !assigned_decimal {
+                    return unsupported("UPDATE DECIMAL arithmetic assigned to a non-DECIMAL column");
+                }
+                for operand in [left.as_ref(), right.as_ref()] {
+                    if matches!(operand, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                        && decimal_operand_scale(operand, render_context.decimal_columns).is_none()
+                    {
+                        return unsupported("UPDATE mixed DECIMAL column arithmetic");
+                    }
+                }
+                let function = match op {
+                    BinaryOperator::Plus => "numeric_add",
+                    BinaryOperator::Minus => "numeric_sub",
+                    BinaryOperator::Multiply => "numeric_mul",
+                    _ => unreachable!("the guard requires DECIMAL arithmetic"),
+                };
+                return Ok(format!(
+                    "{function}({}, {})",
+                    render_update_assignment_value(left, written, assigned, render_context)?,
+                    render_update_assignment_value(right, written, assigned, render_context)?
+                ));
+            }
             Ok(format!(
                 "({} {} {})",
                 render_update_assignment_value(left, written, assigned, render_context)?,
@@ -3069,6 +3429,14 @@ fn render_update_assignment_value(
         | Expr::Convert { .. }
             if static_select_metadata::classify_static_select_expr(value).is_some() =>
         {
+            if contains_decimal_operand(value, render_context.decimal_columns)
+                && !render_context
+                    .decimal_columns
+                    .iter()
+                    .any(|(column, _)| column.eq_ignore_ascii_case(written))
+            {
+                return unsupported("UPDATE DECIMAL value assigned to a non-DECIMAL column");
+            }
             if !reads_only_unassigned_columns(value, assigned) {
                 return unsupported("UPDATE assignment reading a column it has already assigned");
             }
@@ -3232,10 +3600,10 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
                 unreachable!("guard requires a numeric literal");
             };
             let Ok(magnitude) = value.parse::<u64>() else {
-                return Ok(format!("(-{})", render_dml_number(value)?));
+                return Ok(format!("'-{value}'"));
             };
             if magnitude > (i64::MAX as u64) + 1 {
-                return unsupported("DML numeric literal outside signed 64-bit integer range");
+                return Ok(format!("'-{value}'"));
             }
             Ok(format!("(-{magnitude})"))
         }
@@ -3269,16 +3637,14 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
 /// Renders a numeric literal a DML statement may carry.
 ///
 /// An integer is normalized through `i64` so that `007` reads back as `7`. A
-/// fractional literal is passed through as written, because it is a `DOUBLE`'s
-/// value and the engine reads the same IEEE 754 binary64 MySQL does. The
-/// dialect's assignment validator holds an integer column to integers, so a
-/// fractional value cannot land in one.
+/// number outside i64 stays as text until the destination column converts it.
+/// A DECIMAL column must see every written digit before rounding to scale.
 fn render_dml_number(value: &str) -> Result<String, ParseError> {
     if let Ok(integer) = value.parse::<i64>() {
         return Ok(integer.to_string());
     }
     if value.parse::<f64>().is_ok_and(f64::is_finite) {
-        return Ok(value.to_owned());
+        return Ok(format!("'{value}'"));
     }
     unsupported("DML numeric literal outside signed 64-bit integer range")
 }
@@ -3411,11 +3777,17 @@ pub(crate) struct SelectRenderContext<'a> {
     /// without this and a second one, for the statements that need it, renders
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
+    collation_sensitive_call_columns: Vec<String>,
+    decimal_columns: &'a [(String, u32)],
+    integer_columns: &'a [String],
+    real_columns: &'a [String],
     table_columns: &'a [String],
     /// The members of each `ENUM` column the caller knows of, in the order
     /// they were declared. MySQL orders an `ENUM` by that order rather than by
     /// the member text, so a statement ordering by one renders differently.
     member_columns: &'a [(String, Vec<String>)],
+    /// The members of each `SET` column, whose numeric bit value sets its order.
+    set_columns: &'a [(String, Vec<String>)],
     /// The columns the caller knows an `UPDATE` rewrites to the moment it runs
     /// at. The engine has no such attribute, so what it means is written into
     /// the statement here.
@@ -3426,6 +3798,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// renders as; `compares_a_written_day` says when it matters.
     moment_columns: &'a [String],
     orders_a_bare_column: bool,
+    checks_type_sensitive_expression: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
@@ -3435,6 +3808,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether a comparison names a column against a written day, which reads
     /// differently depending on whether the column holds a day or a moment.
     compares_a_written_day: bool,
+    compares_a_large_decimal_integer: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
@@ -3442,12 +3816,14 @@ pub(crate) struct SelectRenderContext<'a> {
 }
 
 impl<'a> SelectRenderContext<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source: &'a str,
         mode: SessionSqlMode,
         text_columns: &'a [String],
         table_columns: &'a [String],
         member_columns: &'a [(String, Vec<String>)],
+        set_columns: &'a [(String, Vec<String>)],
         moment_columns: &'a [String],
         rewritten_on_update: &'a [String],
     ) -> Self {
@@ -3455,22 +3831,39 @@ impl<'a> SelectRenderContext<'a> {
             no_backslash_escapes: mode.no_backslash_escapes,
             source,
             text_columns,
+            collation_sensitive_call_columns: Vec::new(),
+            decimal_columns: &[],
+            integer_columns: &[],
+            real_columns: &[],
             table_columns,
             member_columns,
+            set_columns,
             moment_columns,
             rewritten_on_update,
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
+            checks_type_sensitive_expression: false,
             orders_wildcard_ordinal: false,
             compares_a_placeholder: false,
             counts_distinct_column: false,
             tests_a_bare_column: false,
             compares_a_written_day: false,
+            compares_a_large_decimal_integer: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
             parameter_count: 0,
         }
+    }
+
+    pub(crate) fn knowing_decimal_columns(mut self, decimal_columns: &'a [(String, u32)]) -> Self {
+        self.decimal_columns = decimal_columns;
+        self
+    }
+
+    pub(crate) fn knowing_integer_columns(mut self, integer_columns: &'a [String]) -> Self {
+        self.integer_columns = integer_columns;
+        self
     }
 
     fn is_text_column(&self, name: &str) -> bool {
@@ -3487,6 +3880,13 @@ impl<'a> SelectRenderContext<'a> {
 
     fn member_column(&self, name: &str) -> Option<&[String]> {
         self.member_columns
+            .iter()
+            .find(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|(_, members)| members.as_slice())
+    }
+
+    fn set_column(&self, name: &str) -> Option<&[String]> {
+        self.set_columns
             .iter()
             .find(|(column, _)| column.eq_ignore_ascii_case(name))
             .map(|(_, members)| members.as_slice())
@@ -3655,6 +4055,21 @@ fn render_aggregate_call(
         .eq_ignore_ascii_case("STDDEV_SAMP")
     {
         "stddev".to_owned()
+    } else if let Some((kind, column)) = static_select_metadata::column_aggregate_argument(function)
+    {
+        if render_context
+            .decimal_columns
+            .iter()
+            .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
+        {
+            match kind {
+                static_select_metadata::ColumnAggregateKind::Sum => "mysql_decimal_sum".to_owned(),
+                static_select_metadata::ColumnAggregateKind::Avg => "mysql_decimal_avg".to_owned(),
+                _ => function.name.to_string(),
+            }
+        } else {
+            function.name.to_string()
+        }
     } else {
         function.name.to_string()
     };
@@ -3717,12 +4132,7 @@ fn render_aggregate_argument(
             if is_distinct {
                 render_context.counts_distinct_column = true;
             }
-            let collation = if is_distinct && render_context.is_text_column(&column.value) {
-                " COLLATE NOCASE"
-            } else {
-                ""
-            };
-            format!("{prefix}{}{collation}", render_ident(column))
+            format!("{prefix}{}", render_ident(column))
         }
         // Only a count reaches here qualified, and a count does not depend on
         // what the column holds, so there is no collation to ask for.
@@ -3927,6 +4337,9 @@ fn render_select_expr(
             format,
             array,
         } => {
+            if contains_decimal_operand(expr, render_context.decimal_columns) {
+                return unsupported("SELECT CAST over DECIMAL requires exact numeric handling");
+            }
             let Some(target) = static_select_metadata::checked_cast_target(
                 kind,
                 expr,
@@ -3946,6 +4359,9 @@ fn render_select_expr(
             syntax,
             expr: extracted,
         } => {
+            if contains_decimal_operand(extracted, render_context.decimal_columns) {
+                return unsupported("SELECT EXTRACT over DECIMAL requires exact numeric handling");
+            }
             if !matches!(syntax, sqlparser::ast::ExtractSyntax::From)
                 || static_select_metadata::classify_static_select_expr(expr).is_none()
             {
@@ -3962,6 +4378,9 @@ fn render_select_expr(
         // `CONVERT(col, <type>)` means what `CAST(col AS <type>)` means, so it
         // is written out the same way.
         Expr::Convert { .. } => {
+            if contains_decimal_operand(expr, render_context.decimal_columns) {
+                return unsupported("SELECT CONVERT over DECIMAL requires exact numeric handling");
+            }
             let Some((inner, target)) = static_select_metadata::checked_convert_target(expr) else {
                 return unsupported("SELECT CONVERT target");
             };
@@ -4030,6 +4449,9 @@ fn render_select_expr(
             substring_for: Some(substring_for),
             ..
         } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            if contains_decimal_operand(expr, render_context.decimal_columns) {
+                return unsupported("SELECT SUBSTRING over DECIMAL requires text conversion");
+            }
             let target = render_select_expr(target, render_context)?;
             let from = render_select_expr(substring_from, render_context)?;
             let for_len = render_select_expr(substring_for, render_context)?;
@@ -4044,6 +4466,9 @@ fn render_select_expr(
             expr: target,
             ..
         } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            if contains_decimal_operand(expr, render_context.decimal_columns) {
+                return unsupported("SELECT TRIM over DECIMAL requires text conversion");
+            }
             use sqlparser::ast::TrimWhereField;
             let name = match trim_where {
                 Some(TrimWhereField::Leading) => "ltrim",
@@ -4062,6 +4487,9 @@ fn render_select_expr(
         Expr::Floor { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
         {
+            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
+                return unsupported("SELECT FLOOR over DECIMAL requires exact numeric handling");
+            }
             let sqlparser::ast::CeilFloorKind::DateTimeField(
                 sqlparser::ast::DateTimeField::NoDateTime,
             ) = field
@@ -4074,6 +4502,9 @@ fn render_select_expr(
         Expr::Ceil { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
         {
+            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
+                return unsupported("SELECT CEIL over DECIMAL requires exact numeric handling");
+            }
             let sqlparser::ast::CeilFloorKind::DateTimeField(
                 sqlparser::ast::DateTimeField::NoDateTime,
             ) = field
@@ -4091,6 +4522,11 @@ fn render_select_expr(
             op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow),
             right,
         } => {
+            if contains_decimal_operand(left, render_context.decimal_columns)
+                || contains_decimal_operand(right, render_context.decimal_columns)
+            {
+                return unsupported("SELECT JSON path over DECIMAL requires text conversion");
+            }
             let left = render_select_expr(left, render_context)?;
             let right = render_select_expr(right, render_context)?;
             if matches!(op, BinaryOperator::LongArrow) {
@@ -4101,8 +4537,94 @@ fn render_select_expr(
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
         {
-            let left = render_select_expr(left, render_context)?;
-            let right = render_select_expr(right, render_context)?;
+            if !arithmetic_names_column(expr)
+                && [left.as_ref(), right.as_ref()].iter().any(|operand| {
+                    decimal_numeric_literal(operand).is_some_and(|(_, scale)| scale > 0)
+                })
+            {
+                return unsupported("SELECT fractional literal arithmetic");
+            }
+            let left_scale = decimal_operand_scale(left, render_context.decimal_columns);
+            let right_scale = decimal_operand_scale(right, render_context.decimal_columns);
+            if left_scale.is_some() || right_scale.is_some() {
+                let other = if left_scale.is_some() && right_scale.is_none() {
+                    Some(right.as_ref())
+                } else if right_scale.is_some() && left_scale.is_none() {
+                    Some(left.as_ref())
+                } else {
+                    None
+                };
+                if other.is_some_and(|operand| {
+                    known_typed_numeric_operand(operand, render_context.real_columns)
+                }) {
+                    return unsupported("DECIMAL arithmetic with an approximate column");
+                }
+                let literal = other.and_then(decimal_numeric_literal);
+                if let Some(operand) = other {
+                    if literal.is_none()
+                        && !known_typed_numeric_operand(operand, render_context.integer_columns)
+                        && !matches!(operand, Expr::Function(function) if static_select_metadata::is_count_call(function))
+                    {
+                        return unsupported("DECIMAL arithmetic operands");
+                    }
+                }
+                if matches!(op, BinaryOperator::Divide) {
+                    let Some((written, _)) = literal else {
+                        return unsupported("DECIMAL division operand");
+                    };
+                    if left_scale.is_none()
+                        || !written
+                            .bytes()
+                            .any(|byte| byte.is_ascii_digit() && byte != b'0')
+                    {
+                        return unsupported("DECIMAL division operand");
+                    }
+                    let decimal = render_select_expr(left, render_context)?;
+                    return Ok(format!(
+                        "mysql_decimal_div_round({decimal}, '{written}', {})",
+                        left_scale
+                            .expect("division requires decimal left operand")
+                            .saturating_add(4)
+                            .min(30)
+                    ));
+                }
+                let name = match op {
+                    BinaryOperator::Plus => "numeric_add",
+                    BinaryOperator::Minus => "numeric_sub",
+                    BinaryOperator::Multiply => "numeric_mul",
+                    _ => return unsupported("DECIMAL arithmetic operator"),
+                };
+                let left = if let Some((written, _)) = decimal_numeric_literal(left) {
+                    format!("'{written}'")
+                } else {
+                    render_select_expr(left, render_context)?
+                };
+                let right = if let Some((written, _)) = decimal_numeric_literal(right) {
+                    format!("'{written}'")
+                } else {
+                    render_select_expr(right, render_context)?
+                };
+                let result = format!("{name}({left}, {right})");
+                if matches!(op, BinaryOperator::Multiply)
+                    && left_scale
+                        .unwrap_or_else(|| literal.as_ref().map_or(0, |(_, scale)| *scale))
+                        .saturating_add(
+                            right_scale
+                                .unwrap_or_else(|| literal.as_ref().map_or(0, |(_, scale)| *scale)),
+                        )
+                        > 30
+                {
+                    return Ok(format!("mysql_decimal_round({result}, 30)"));
+                }
+                return Ok(result);
+            }
+            if contains_decimal_operand(left, render_context.decimal_columns)
+                || contains_decimal_operand(right, render_context.decimal_columns)
+            {
+                return unsupported("DECIMAL arithmetic form");
+            }
+            let left = render_arithmetic_operand(left, render_context)?;
+            let right = render_arithmetic_operand(right, render_context)?;
             // MySQL's `/` is decimal division and the engine's is integer
             // division, so `3/2` would answer 1 rather than 1.5 without this.
             if matches!(op, BinaryOperator::Divide) {
@@ -4146,10 +4668,179 @@ fn render_select_expr(
     }
 }
 
+fn decimal_operand_scale(expr: &Expr, columns: &[(String, u32)]) -> Option<u32> {
+    let name = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => &parts[1],
+        Expr::Function(function) => {
+            let (kind, column) = static_select_metadata::column_aggregate_argument(function)?;
+            let scale = columns
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(&column.value))?
+                .1;
+            return match kind {
+                static_select_metadata::ColumnAggregateKind::MinMax
+                | static_select_metadata::ColumnAggregateKind::Sum => Some(scale),
+                static_select_metadata::ColumnAggregateKind::Avg => Some((scale + 4).min(30)),
+                _ => None,
+            };
+        }
+        Expr::Nested(inner) => return decimal_operand_scale(inner, columns),
+        _ => return None,
+    };
+    columns
+        .iter()
+        .find(|(column, _)| column.eq_ignore_ascii_case(&name.value))
+        .map(|(_, scale)| *scale)
+}
+
+fn known_typed_numeric_operand(expr: &Expr, columns: &[String]) -> bool {
+    let name = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => &parts[1],
+        Expr::Function(function) => {
+            let Some((_, column)) = static_select_metadata::column_aggregate_argument(function)
+            else {
+                return false;
+            };
+            column
+        }
+        Expr::Nested(inner) => return known_typed_numeric_operand(inner, columns),
+        _ => return false,
+    };
+    columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case(&name.value))
+}
+
+fn contains_decimal_operand(expr: &Expr, columns: &[(String, u32)]) -> bool {
+    if decimal_operand_scale(expr, columns).is_some() {
+        return true;
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            contains_decimal_operand(left, columns) || contains_decimal_operand(right, columns)
+        }
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Convert { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Floor { expr: inner, .. }
+        | Expr::Ceil { expr: inner, .. } => contains_decimal_operand(inner, columns),
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
+                matches!(argument,
+                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner))
+                        if contains_decimal_operand(inner, columns))
+            }),
+            _ => false,
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| contains_decimal_operand(operand, columns))
+                || conditions.iter().any(|arm| {
+                    contains_decimal_operand(&arm.condition, columns)
+                        || contains_decimal_operand(&arm.result, columns)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|result| contains_decimal_operand(result, columns))
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            contains_decimal_operand(expr, columns)
+                || substring_from
+                    .as_ref()
+                    .is_some_and(|from| contains_decimal_operand(from, columns))
+                || substring_for
+                    .as_ref()
+                    .is_some_and(|count| contains_decimal_operand(count, columns))
+        }
+        Expr::Trim {
+            expr, trim_what, ..
+        } => {
+            contains_decimal_operand(expr, columns)
+                || trim_what
+                    .as_ref()
+                    .is_some_and(|what| contains_decimal_operand(what, columns))
+        }
+        _ => false,
+    }
+}
+
+fn decimal_numeric_literal(expr: &Expr) -> Option<(String, u32)> {
+    let (sign, literal) = match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => ("-", expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => ("", expr.as_ref()),
+        _ => ("", expr),
+    };
+    let Expr::Value(value) = literal else {
+        return None;
+    };
+    let Value::Number(written, false) = &value.value else {
+        return None;
+    };
+    let (whole, scale) = if let Some((whole, fraction)) = written.split_once('.') {
+        if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        (whole, u32::try_from(fraction.len()).ok()?)
+    } else {
+        (written.as_str(), 0)
+    };
+    if whole.is_empty() || !whole.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((format!("{sign}{written}"), scale))
+}
+
+fn render_arithmetic_operand(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if let Some((written, _)) = decimal_numeric_literal(expr) {
+        return Ok(written);
+    }
+    render_select_expr(expr, render_context)
+}
+
+fn arithmetic_names_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Function(function) => {
+            static_select_metadata::column_aggregate_argument(function).is_some()
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            arithmetic_names_column(left) || arithmetic_names_column(right)
+        }
+        Expr::Nested(inner) => arithmetic_names_column(inner),
+        _ => false,
+    }
+}
+
 /// Renders `ROW_NUMBER()`, `RANK()` or `DENSE_RANK()` over its window.
 ///
 /// Both engines spell the three the same way, so only the window is rewritten:
-/// a text column is partitioned and ordered under the case-ignoring collation
+/// a text column is partitioned and ordered under the default UCA 9 collation
 /// MySQL's default gives it, the same treatment an outer `ORDER BY` gets.
 fn render_window_call(
     function: &sqlparser::ast::Function,
@@ -4170,6 +4861,13 @@ fn render_window_call(
     let FunctionArguments::List(arguments) = &function.args else {
         unreachable!("a checked window call was checked to have an argument list");
     };
+    if arguments.args.iter().any(|argument| {
+        matches!(argument,
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))
+                if contains_decimal_operand(expr, render_context.decimal_columns))
+    }) {
+        return unsupported("SELECT window function over DECIMAL requires exact numeric handling");
+    }
     // `NTILE` carries a count and `LAG` and `LEAD` a column; the rest carry
     // nothing, and each spelling is the engine's own.
     let arguments = arguments
@@ -4256,6 +4954,35 @@ fn member_position(column: &str, members: &[String]) -> String {
     rendered
 }
 
+/// A SET's numeric value has one bit per declared member. Comparing those
+/// bits from highest to lowest also works for all 64 members without relying
+/// on signed or floating-point arithmetic in the engine.
+fn set_member_order(
+    column: &str,
+    members: &[String],
+    direction: &str,
+) -> Result<String, ParseError> {
+    if members.is_empty()
+        || members.len() > 64
+        || members
+            .iter()
+            .any(|member| member.is_empty() || member.contains(','))
+    {
+        return unsupported("SELECT ORDER BY SET members");
+    }
+    Ok(members
+        .iter()
+        .rev()
+        .map(|member| {
+            let member = member.replace('\'', "''");
+            format!(
+                "CASE WHEN {column} IS NULL THEN NULL ELSE instr(',' || {column} || ',', ',{member},') > 0 END {direction}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
 /// Renders one column a window partitions or orders by.
 fn render_window_column(
     expr: &Expr,
@@ -4265,12 +4992,7 @@ fn render_window_column(
         unreachable!("a checked window was checked to name plain columns");
     };
     render_context.orders_a_bare_column = true;
-    let collation = if render_context.is_text_column(&column.value) {
-        " COLLATE NOCASE"
-    } else {
-        ""
-    };
-    Ok(format!("{}{collation}", render_ident(column)))
+    Ok(render_ident(column))
 }
 
 /// Renders a checked scalar call as the engine's own spelling of it.
@@ -4285,6 +5007,27 @@ fn render_scalar_call(
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         unreachable!("a checked scalar call was checked to have one name");
     };
+    if matches!(
+        static_select_metadata::scalar_call(function),
+        Some(StaticSelectMetadata::ScalarCall { columns, .. }) if !columns.is_empty()
+    ) {
+        render_context.checks_type_sensitive_expression = true;
+    }
+    let has_decimal_argument = match &function.args {
+        FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
+            matches!(argument,
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))
+                    if decimal_operand_scale(expr, render_context.decimal_columns).is_some())
+        }),
+        _ => false,
+    };
+    if has_decimal_argument
+        && !["ABS", "TRUNCATE"]
+            .iter()
+            .any(|call| name.value.eq_ignore_ascii_case(call))
+    {
+        return unsupported("SELECT function over DECIMAL requires exact numeric handling");
+    }
     let engine = if name.value.eq_ignore_ascii_case("LENGTH") {
         "octet_length"
     } else if name.value.eq_ignore_ascii_case("CHAR_LENGTH")
@@ -4395,9 +5138,9 @@ fn render_scalar_call(
             "CAST(julianday(date({left})) - julianday(date({right})) AS INTEGER)"
         ));
     } else if name.value.eq_ignore_ascii_case("LOWER") {
-        "lower"
+        "mysql_lower"
     } else if name.value.eq_ignore_ascii_case("UPPER") {
-        "upper"
+        "mysql_upper"
     } else if name.value.eq_ignore_ascii_case("REVERSE") {
         "string_reverse"
     } else if name.value.eq_ignore_ascii_case("HEX") {
@@ -4410,6 +5153,12 @@ fn render_scalar_call(
             "CASE WHEN typeof({value}) IN ('integer', 'real') THEN printf('%X', CAST(round({value}) AS INTEGER)) ELSE hex({value}) END"
         ));
     } else if name.value.eq_ignore_ascii_case("ABS") {
+        if has_decimal_argument {
+            let value = single_column_argument(function);
+            return Ok(format!(
+                "CASE WHEN numeric_lt({value}, '0') THEN numeric_sub('0', {value}) ELSE {value} END"
+            ));
+        }
         "abs"
     } else if name.value.eq_ignore_ascii_case("SIGN") {
         "sign"
@@ -4420,6 +5169,9 @@ fn render_scalar_call(
             single_column_argument(function)
         ));
     } else if name.value.eq_ignore_ascii_case("FIELD") || name.value.eq_ignore_ascii_case("ELT") {
+        if name.value.eq_ignore_ascii_case("FIELD") {
+            record_collation_sensitive_call_column(function, 0, render_context);
+        }
         return Ok(format!(
             "mysql_{}({})",
             name.value.to_lowercase(),
@@ -4679,32 +5431,29 @@ fn render_scalar_call(
             render_select_expr(read, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("INSTR") {
+        record_collation_sensitive_call_column(function, 0, render_context);
         return Ok(format!(
-            "instr({}, {})",
+            "mysql_instr({}, {})",
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("LOCATE") {
+        record_collation_sensitive_call_column(function, 1, render_context);
         let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
             unreachable!("a checked scalar call was checked to have an argument list");
         };
         if arguments.args.len() == 3 {
-            // MySQL counts from the front of the whole haystack, so what the
-            // engine finds in the tail has the tail's own start added back —
-            // and a start before the first character finds nothing at all.
             let (needle, haystack, start) = (
                 scalar_argument(function, 0)?,
                 scalar_argument(function, 1)?,
                 scalar_argument(function, 2)?,
             );
-            return Ok(format!(
-                "CASE WHEN {start} < 1 THEN 0 WHEN instr(substr({haystack}, {start}), {needle}) = 0 THEN 0 ELSE instr(substr({haystack}, {start}), {needle}) + {start} - 1 END"
-            ));
+            return Ok(format!("mysql_locate({needle}, {haystack}, {start})"));
         }
         return Ok(format!(
-            "instr({}, {})",
-            scalar_argument(function, 1)?,
-            scalar_argument(function, 0)?
+            "mysql_locate({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("RAND") {
         // Measured on MySQL 8.4.11: a double between zero and one. The engine
@@ -4715,8 +5464,17 @@ fn render_scalar_call(
     } else if name.value.eq_ignore_ascii_case("UUID") {
         return Ok("uuid4_str()".to_owned());
     } else if name.value.eq_ignore_ascii_case("TRUNCATE") {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked TRUNCATE call has an argument list");
+        };
+        let decimal = matches!(arguments.args.first(), Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))) if decimal_operand_scale(expr, render_context.decimal_columns).is_some());
         return Ok(format!(
-            "mysql_truncate({}, {})",
+            "{}({}, {})",
+            if decimal {
+                "mysql_decimal_truncate"
+            } else {
+                "mysql_truncate"
+            },
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
@@ -4749,9 +5507,15 @@ fn render_scalar_call(
             scalar_argument(function, 1)?,
             scalar_argument(function, 2)?
         ));
+    } else if name.value.eq_ignore_ascii_case("NULLIF") {
+        record_collation_sensitive_call_column(function, 0, render_context);
+        let first = scalar_argument(function, 0)?;
+        let second = scalar_argument(function, 1)?;
+        return Ok(format!(
+            "CASE WHEN typeof({first}) = 'text' THEN mysql_text_nullif({first}, {second}) ELSE nullif({first}, {second}) END"
+        ));
     } else if name.value.eq_ignore_ascii_case("IFNULL")
         || name.value.eq_ignore_ascii_case("COALESCE")
-        || name.value.eq_ignore_ascii_case("NULLIF")
     {
         return Ok(format!(
             "{}({})",
@@ -4759,14 +5523,28 @@ fn render_scalar_call(
             render_scalar_arguments(function, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("GREATEST") {
+        record_all_collation_sensitive_call_columns(function, render_context);
+        let values = scalar_arguments(function)?;
+        let has_text = values
+            .iter()
+            .map(|value| format!("typeof({value}) = 'text'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let values = values.join(", ");
         return Ok(format!(
-            "max({})",
-            render_scalar_arguments(function, render_context)?
+            "CASE WHEN {has_text} THEN mysql_text_greatest({values}) ELSE max({values}) END"
         ));
     } else if name.value.eq_ignore_ascii_case("LEAST") {
+        record_all_collation_sensitive_call_columns(function, render_context);
+        let values = scalar_arguments(function)?;
+        let has_text = values
+            .iter()
+            .map(|value| format!("typeof({value}) = 'text'"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let values = values.join(", ");
         return Ok(format!(
-            "min({})",
-            render_scalar_arguments(function, render_context)?
+            "CASE WHEN {has_text} THEN mysql_text_least({values}) ELSE min({values}) END"
         ));
     } else {
         unreachable!("a checked scalar call was already recognized");
@@ -4875,7 +5653,90 @@ fn scalar_argument(
     };
     match expr {
         Expr::Identifier(column) => Ok(render_ident(column)),
+        _ => render_scalar_argument_expr(expr),
+    }
+}
+
+fn render_scalar_argument_expr(expr: &Expr) -> Result<String, ParseError> {
+    match expr {
+        Expr::Value(value) if matches!(&value.value, Value::Number(_, false)) => {
+            let Value::Number(written, false) = &value.value else {
+                unreachable!("guard requires a numeric literal");
+            };
+            if written.parse::<f64>().is_ok_and(f64::is_finite) {
+                Ok(written.clone())
+            } else {
+                unsupported("SELECT call numeric argument")
+            }
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } if matches!(inner.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) =>
+        {
+            let sign = if matches!(
+                expr,
+                Expr::UnaryOp {
+                    op: UnaryOperator::Minus,
+                    ..
+                }
+            ) {
+                "-"
+            } else {
+                "+"
+            };
+            let Expr::Value(value) = inner.as_ref() else {
+                unreachable!("guard requires a numeric literal");
+            };
+            let Value::Number(written, false) = &value.value else {
+                unreachable!("guard requires a numeric literal");
+            };
+            if written.parse::<f64>().is_ok_and(f64::is_finite) {
+                Ok(format!("{sign}{written}"))
+            } else {
+                unsupported("SELECT call numeric argument")
+            }
+        }
         _ => render_dml_expr(expr),
+    }
+}
+
+fn scalar_arguments(function: &sqlparser::ast::Function) -> Result<Vec<String>, ParseError> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    (0..arguments.args.len())
+        .map(|index| scalar_argument(function, index))
+        .collect()
+}
+
+fn record_collation_sensitive_call_column(
+    function: &sqlparser::ast::Function,
+    index: usize,
+    render_context: &mut SelectRenderContext<'_>,
+) {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call has an argument list");
+    };
+    if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(column),
+    ))) = arguments.args.get(index)
+    {
+        render_context
+            .collation_sensitive_call_columns
+            .push(column.value.clone());
+    }
+}
+
+fn record_all_collation_sensitive_call_columns(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call has an argument list");
+    };
+    for index in 0..arguments.args.len() {
+        record_collation_sensitive_call_column(function, index, render_context);
     }
 }
 
@@ -4927,7 +5788,7 @@ fn render_scalar_arguments(
                 {
                     Ok(render_aggregate_call(inner, render_context))
                 }
-                _ => render_dml_expr(expr),
+                _ => render_scalar_argument_expr(expr),
             }
         })
         .collect::<Result<Vec<_>, _>>()
@@ -5224,6 +6085,13 @@ fn render_select_predicate(
         // their kinds, so the two would keep different rows.
         Expr::Identifier(column) => {
             render_context.tests_a_bare_column = true;
+            if render_context
+                .decimal_columns
+                .iter()
+                .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported("SELECT WHERE testing a DECIMAL column");
+            }
             if render_context.is_text_column(&column.value) {
                 return unsupported("SELECT WHERE testing a column of words");
             }
@@ -5231,6 +6099,13 @@ fn render_select_predicate(
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             render_context.tests_a_bare_column = true;
+            if render_context
+                .decimal_columns
+                .iter()
+                .any(|(known, _)| known.eq_ignore_ascii_case(&parts[1].value))
+            {
+                return unsupported("SELECT WHERE testing a DECIMAL column");
+            }
             if render_context.is_text_column(&parts[1].value) {
                 return unsupported("SELECT WHERE testing a column of words");
             }
@@ -5367,16 +6242,32 @@ fn render_checked_in_list(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
-    let rendered = format!(
-        "({rendered_column}{} {}IN ({}))",
-        if collated { " COLLATE NOCASE" } else { "" },
-        if negated { "NOT " } else { "" },
-        members
+    let decimal_column = render_context
+        .decimal_columns
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&column_name));
+    let rendered = if decimal_column {
+        let matches = members
             .iter()
-            .map(|(rendered, _)| rendered.as_str())
+            .map(|(member, _)| format!("numeric_eq({rendered_column}, {member})"))
             .collect::<Vec<_>>()
-            .join(", ")
-    );
+            .join(" OR ");
+        if negated {
+            format!("(NOT ({matches}))")
+        } else {
+            format!("({matches})")
+        }
+    } else {
+        format!(
+            "({rendered_column} {}IN ({}))",
+            if negated { "NOT " } else { "" },
+            members
+                .iter()
+                .map(|(rendered, _)| rendered.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     for (_, rhs) in members {
         render_context
             .checked_comparisons
@@ -5521,17 +6412,24 @@ fn render_checked_select_comparison(
         _ => return unsupported("SELECT comparison requires one column"),
     };
     let column_name = column.value.clone();
-    let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
+    let decimal_column = render_context
+        .decimal_columns
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&column_name));
+    let allow_large_decimal_integer = render_context.table_columns.is_empty() || decimal_column;
+    let (rendered_rhs, rhs) = render_checked_select_comparison_rhs_allowing_large_integer(
+        rhs_expr,
+        render_context,
+        allow_large_decimal_integer,
+    )?;
     let (rendered_rhs, rhs) =
         midnight_of_a_written_day(rendered_rhs, rhs, &column_name, render_context);
     let operator =
         checked_select_comparison_operator(&op_reversed).expect("comparison operator guard");
-    // MySQL's default collation ignores case, so a text comparison asks the
-    // engine for NOCASE rather than its byte order. This is left off every
-    // other comparison because a collation the index does not carry stops the
-    // planner from using it, and an integer comparison gains nothing from it.
-    // A `?` carries no type of its own, so it is collated when the caller has
-    // said the column is text.
+    // A bare column already has its declared collation in the stored schema.
+    // Keep it for implicit comparisons; an explicit COLLATE overrides it.
+    // A `?` carries no type of its own, so the metadata still records whether
+    // it is compared with a text column.
     // Under the single-source assumption verified in `translate_select_query`,
     // the unqualified column name is sufficient to look up the column's type.
     // A collation is named over text and nothing else. A bound value carries
@@ -5548,13 +6446,15 @@ fn render_checked_select_comparison(
         }
         _ => false,
     };
-    // A column of words is declared with the collation this server matches
-    // words under, so a comparison that wants their bytes has to say so rather
-    // than say nothing.
-    let collation = match (collated, compares_bytes) {
-        (true, _) => " COLLATE NOCASE",
-        (false, true) => " COLLATE BINARY",
-        (false, false) => "",
+    // An explicit collation is the only one that belongs in rendered SQL.
+    let collation = match (collated, compares_bytes, named_collation) {
+        (true, _, Some(_)) => " COLLATE MYSQL_UCA9_AI_CI",
+        (true, _, None) => "",
+        (false, true, Some(collation)) if collation_is_utf8mb4_bin(collation) => {
+            " COLLATE MYSQL_UTF8MB4_BIN"
+        }
+        (false, true, _) => " COLLATE BINARY",
+        (false, false, _) => "",
     };
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
@@ -5777,7 +6677,11 @@ fn render_comparison_over_a_call(
     let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
     let collated = answers == crate::CheckedComparisonAnswer::Text
         && matches!(rhs, CheckedSelectComparisonRhs::Text(_));
-    let collation = if collated { " COLLATE NOCASE" } else { "" };
+    let collation = if collated {
+        " COLLATE MYSQL_UCA9_AI_CI"
+    } else {
+        ""
+    };
     let rendered = format!(
         "({rendered_call}{collation} {} {rendered_rhs})",
         checked_select_comparison_sql_operator(&op_reversed)
@@ -5798,8 +6702,7 @@ fn render_comparison_over_a_call(
     Ok(Some(rendered))
 }
 
-/// Renders a `LIKE` against one column, which the engine already matches the
-/// way MySQL's default collation does: both ignore ASCII case.
+/// Renders a `LIKE` against one text column using MySQL's Unicode 9 weights.
 fn render_checked_like(
     negated: bool,
     any: bool,
@@ -5811,13 +6714,8 @@ fn render_checked_like(
     if any {
         return unsupported("SELECT LIKE option");
     }
-    // MySQL takes a character to escape the pattern's own `%` and `_` with,
-    // and where the statement names none it takes a backslash — unless the
-    // session runs with `NO_BACKSLASH_ESCAPES`, which leaves the pattern with
-    // no escape at all. Measured on 8.4.11: `LIKE 'a\_b'` matches `a_b` alone
-    // under the default mode and matches nothing under that one. The engine
-    // has no escape of its own and takes the clause, so the clause says what
-    // MySQL would have taken.
+    // MySQL takes a character to escape `%` and `_`. NO_BACKSLASH_ESCAPES
+    // removes the usual implicit backslash escape.
     let escape = match escape_char {
         Some(named) => {
             let Value::SingleQuotedString(named) = &named.value else {
@@ -5836,6 +6734,14 @@ fn render_checked_like(
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
         _ => return unsupported("SELECT LIKE requires one column"),
     };
+    render_context.checks_type_sensitive_expression = true;
+    if render_context
+        .decimal_columns
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
+    {
+        return unsupported("SELECT LIKE over DECIMAL requires decimal text conversion");
+    }
     let Some(pieces) = like_pattern_pieces(pattern) else {
         return unsupported("SELECT LIKE requires a string pattern");
     };
@@ -5875,14 +6781,17 @@ fn render_checked_like(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
-    let rendered = format!(
-        "({rendered_column} {}LIKE {rendered_pattern}{})",
-        if negated { "NOT " } else { "" },
-        match escape {
-            Some(character) => format!(" ESCAPE '{}'", character.to_string().replace('\'', "''")),
-            None => String::new(),
-        }
-    );
+    let escape_argument = match escape {
+        Some(character) => format!("'{}'", character.to_string().replace('\'', "''")),
+        None => "''".to_owned(),
+    };
+    let matched =
+        format!("mysql_uca9_like({rendered_column}, {rendered_pattern}, {escape_argument})");
+    let rendered = if negated {
+        format!("(NOT {matched})")
+    } else {
+        format!("({matched})")
+    };
     render_context
         .checked_comparisons
         .push(CheckedSelectComparison {
@@ -5983,6 +6892,14 @@ fn render_checked_regexp(
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
         _ => return unsupported("SELECT REGEXP requires one column"),
     };
+    render_context.checks_type_sensitive_expression = true;
+    if render_context
+        .decimal_columns
+        .iter()
+        .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
+    {
+        return unsupported("SELECT REGEXP over DECIMAL requires decimal text conversion");
+    }
     let Expr::Value(value) = pattern else {
         return unsupported("SELECT REGEXP requires a written pattern");
     };
@@ -6020,23 +6937,35 @@ fn render_checked_select_comparison_rhs(
     expr: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
+    render_checked_select_comparison_rhs_allowing_large_integer(expr, render_context, false)
+}
+
+fn render_checked_select_comparison_rhs_allowing_large_integer(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+    allow_large_integer: bool,
+) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
     match expr {
         Expr::Nested(expr) => {
-            let (rendered, rhs) = render_checked_select_comparison_rhs(expr, render_context)?;
+            let (rendered, rhs) = render_checked_select_comparison_rhs_allowing_large_integer(
+                expr,
+                render_context,
+                allow_large_integer,
+            )?;
             Ok((format!("({rendered})"), rhs))
         }
         Expr::Value(value) => match &value.value {
             Value::Number(number, false) if is_written_as_a_whole_number(number) => {
-                let value = number.parse::<i64>().map_err(|_| ParseError::Unsupported {
-                    feature: "SELECT comparison literal outside signed 64-bit integer range",
-                })?;
-                Ok((
-                    value.to_string(),
-                    CheckedSelectComparisonRhs::SignedInteger(value),
-                ))
+                if let Ok(value) = number.parse::<i64>() {
+                    return Ok((
+                        value.to_string(),
+                        CheckedSelectComparisonRhs::SignedInteger(value),
+                    ));
+                }
+                large_integer_comparison(number, "", render_context, allow_large_integer)
             }
             Value::Number(number, false) => Ok((
-                number.clone(),
+                format!("'{number}'"),
                 CheckedSelectComparisonRhs::Decimal(checked_decimal_literal(number)?),
             )),
             Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => Ok((
@@ -6089,17 +7018,32 @@ fn render_checked_select_comparison_rhs(
                     "+"
                 };
                 return Ok((
-                    format!("({sign}{written})"),
+                    format!("'{sign}{written}'"),
                     CheckedSelectComparisonRhs::Decimal(format!("{sign}{written}")),
                 ));
             }
-            let magnitude = number.parse::<u64>().map_err(|_| ParseError::Unsupported {
-                feature: "SELECT comparison literal outside signed 64-bit integer range",
-            })?;
+            let magnitude = match number.parse::<u64>() {
+                Ok(magnitude) => magnitude,
+                Err(_) => {
+                    return large_integer_comparison(
+                        number,
+                        if matches!(op, UnaryOperator::Minus) {
+                            "-"
+                        } else {
+                            ""
+                        },
+                        render_context,
+                        allow_large_integer,
+                    );
+                }
+            };
             let value = if matches!(op, UnaryOperator::Minus) {
                 if magnitude > (i64::MAX as u64) + 1 {
-                    return unsupported(
-                        "SELECT comparison literal outside signed 64-bit integer range",
+                    return large_integer_comparison(
+                        number,
+                        "-",
+                        render_context,
+                        allow_large_integer,
                     );
                 }
                 if magnitude == (i64::MAX as u64) + 1 {
@@ -6108,9 +7052,17 @@ fn render_checked_select_comparison_rhs(
                     -(magnitude as i64)
                 }
             } else {
-                i64::try_from(magnitude).map_err(|_| ParseError::Unsupported {
-                    feature: "SELECT comparison literal outside signed 64-bit integer range",
-                })?
+                match i64::try_from(magnitude) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return large_integer_comparison(
+                            number,
+                            "",
+                            render_context,
+                            allow_large_integer,
+                        );
+                    }
+                }
             };
             Ok((
                 if matches!(op, UnaryOperator::Minus) {
@@ -6125,6 +7077,23 @@ fn render_checked_select_comparison_rhs(
             unsupported("SELECT comparison requires an exact signed integer, a string, NULL, or ?")
         }
     }
+}
+
+fn large_integer_comparison(
+    number: &str,
+    sign: &str,
+    render_context: &mut SelectRenderContext<'_>,
+    allowed: bool,
+) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
+    if !allowed || number.len() > 65 || !is_written_as_a_whole_number(number) {
+        return unsupported("SELECT comparison literal outside signed 64-bit integer range");
+    }
+    render_context.compares_a_large_decimal_integer = true;
+    let written = format!("{sign}{number}");
+    Ok((
+        format!("'{written}'"),
+        CheckedSelectComparisonRhs::Decimal(written),
+    ))
 }
 
 /// Reports whether a number was written as a run of digits and nothing else.

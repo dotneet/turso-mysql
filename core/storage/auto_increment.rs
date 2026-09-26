@@ -12,15 +12,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     mem,
     sync::{
-        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex, Weak,
     },
 };
 
 use crate::{
-    Buffer, Completion, CompletionError, IOResult, LimboError, Result,
-    io::{File, FileId, FileSyncType, IO, OpenFlags},
+    io::{File, FileId, FileSyncType, OpenFlags, IO},
     types::{IOCompletions, IOResultOr},
+    Buffer, Completion, CompletionError, IOResult, LimboError, Result,
 };
 
 const HEADER_MAGIC: [u8; 8] = *b"TURSOAI1";
@@ -1329,16 +1329,16 @@ fn decode_record(record: &[u8]) -> Result<(AutoIncrementKey, u64)> {
 mod tests {
     use std::{
         sync::{
-            Arc, Barrier,
             atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Barrier,
         },
         thread,
     };
 
     use super::*;
     use crate::{
+        io::{Clock, FileId, MemoryIO, IO},
         IOExt, MonotonicInstant, WallClockInstant,
-        io::{Clock, FileId, IO, MemoryIO},
     };
 
     const KEY_A: AutoIncrementKey = AutoIncrementKey(*b"table-key-000001");
@@ -1696,16 +1696,14 @@ mod tests {
     fn empty_sidecars_require_explicit_creation_and_wrong_identity_is_corrupt() {
         let io = MemoryIO::new();
         assert!(AllocatorDatabaseIdentity::new([0; 16]).is_err());
-        assert!(
-            DurableRangeAllocator::open(
-                &io,
-                "missing-auto-increment.test",
-                DATABASE_A,
-                AllocatorOpenMode::Reopen,
-                FileSyncType::Fsync,
-            )
-            .is_err()
-        );
+        assert!(DurableRangeAllocator::open(
+            &io,
+            "missing-auto-increment.test",
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .is_err());
 
         let file = io
             .open_file(

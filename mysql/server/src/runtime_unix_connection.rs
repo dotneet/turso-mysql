@@ -12,11 +12,11 @@ use std::{
 use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
 
 use crate::{
-    AcceptedUnixStream, AuthorizedDatabaseAdapterFactory, CLIENT_SSL, CachingSha2Verifier,
-    ClassicConnectionOrchestrator, ClassicFrame, InitialHandshakeSettings,
-    MAX_COMMAND_PAYLOAD_LENGTH, OrchestratorError, OrchestratorEvent, PacketCodec,
-    PacketCodecError, PacketStreamDecoder, RuntimeUnixListenerError,
-    SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, StreamDecoderError, TransportSecurity,
+    AcceptedUnixStream, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
+    ClassicConnectionOrchestrator, ClassicFrame, InitialHandshakeSettings, OrchestratorError,
+    OrchestratorEvent, PacketCodec, PacketCodecError, PacketStreamDecoder,
+    RuntimeUnixListenerError, StreamDecoderError, TransportSecurity, CLIENT_SSL,
+    MAX_COMMAND_PAYLOAD_LENGTH, SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
 const READ_BUFFER_BYTES: usize = MAX_COMMAND_PAYLOAD_LENGTH;
@@ -201,14 +201,18 @@ where
     let timeouts = stream.timeouts();
     let settings = unix_handshake_settings(stream.connection_id());
     let verifier = CachingSha2Verifier::new(stream.account_store());
-    let factory = AuthorizedDatabaseAdapterFactory::new(
+    let mut factory = AuthorizedDatabaseAdapterFactory::new(
         stream.catalog(),
         binary_schema_context(),
         stream.account_store(),
     )
     .with_prepared_statement_authority(stream.prepared_statement_authority())
     .with_query_timeout(timeouts.query())
-    .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle());
+    .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle())
+    .with_net_write_timeout(timeouts.write());
+    if let Some(administration) = stream.account_administration() {
+        factory = factory.with_account_administration(administration);
+    }
     let mut orchestrator = ClassicConnectionOrchestrator::with_transport_security(
         settings,
         TransportSecurity::Secure,
@@ -533,8 +537,8 @@ mod tests {
         os::unix::{fs::PermissionsExt, net::UnixStream},
         path::Path,
         sync::{
-            Arc, Barrier, Mutex,
             atomic::{AtomicUsize, Ordering},
+            Arc, Barrier, Mutex,
         },
         thread,
         time::Duration,
@@ -546,16 +550,15 @@ mod tests {
     use crate::{
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
         AuthMoreData, AuthMoreDataKind, AuthOkPacket, BinaryRowColumnType, BinaryRowPacket,
-        BinaryRowValue, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
-        COM_PING, COM_QUERY, COM_QUIT, COM_RESET_CONNECTION, COM_STMT_CLOSE, COM_STMT_EXECUTE,
-        COM_STMT_PREPARE,
-        COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, COMMAND_SEQUENCE_ID, CURSOR_TYPE_NO_CURSOR,
-        CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
+        BinaryRowValue, CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
         ClientHandshakeResponseConfig, ColumnCountPacket, ColumnDefinitionPacket,
         DatabasePrivileges, GlobalPrivileges, InitialHandshake, OfflineAccountProvisioner,
         ProtectedPassword, ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
         RuntimeUnixListener, StmtPrepareOkPacket, TextRowPacket, TextRowValue, UnixSocketConfig,
-        DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB,
+        CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_CONNECT_WITH_DB, CLIENT_DEPRECATE_EOF,
+        COMMAND_SEQUENCE_ID, COM_PING, COM_QUERY, COM_QUIT, COM_RESET_CONNECTION, COM_STMT_CLOSE,
+        COM_STMT_EXECUTE, COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA,
+        CURSOR_TYPE_NO_CURSOR, DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, MYSQL_TYPE_BLOB,
         MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NULL, MYSQL_TYPE_VAR_STRING, PACKET_HEADER_LEN,
         REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, SERVER_STATUS_AUTOCOMMIT,
         SERVER_STATUS_IN_TRANS,

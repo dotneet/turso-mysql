@@ -11,11 +11,12 @@ use crate::{
     ClassicConnection, ColumnCountPacket, ColumnDefinitionConfig, CommandPacketError,
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
-    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, COMMAND_SEQUENCE_ID,
-    MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE,
-    MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG,
-    MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME,
-    MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
+    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS,
+    COMMAND_SEQUENCE_ID, MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
+    MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG,
+    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT,
+    MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
+    MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -24,8 +25,16 @@ pub const SERVER_RESPONSE_SEQUENCE_ID: u8 = COMMAND_SEQUENCE_ID.wrapping_add(1);
 pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 /// The session has autocommit enabled.
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+/// Another result follows in the same `COM_QUERY` response.
+pub const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 /// Maximum rows retained in one dispatcher result set.
 pub const MAX_DISPATCH_RESULT_ROWS: usize = 4096;
+/// Maximum statements accepted in one `COM_QUERY` packet.
+pub const MAX_MULTI_QUERY_STATEMENTS: usize = 32;
+/// Maximum response frames buffered for one multi-statement command.
+pub const MAX_MULTI_QUERY_RESPONSE_FRAMES: usize = 512;
+/// Maximum response bytes buffered for one multi-statement command.
+pub const MAX_MULTI_QUERY_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// A successful command response returned by an execution port.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +194,11 @@ pub trait CommandExecutor {
         SERVER_STATUS_AUTOCOMMIT
     }
 
+    /// Returns whether backslashes escape characters inside quoted SQL text.
+    fn no_backslash_escapes(&self) -> bool {
+        false
+    }
+
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
         &mut self,
@@ -327,10 +341,11 @@ impl CommandDispatcher {
                 let capabilities = negotiated_capabilities(connection)?;
                 close_on_response_error(
                     connection,
-                    encode_execution_result(
+                    execute_query_batch(
                         connection.response_packet_codec(),
                         capabilities,
-                        executor.execute_query(sql),
+                        executor,
+                        sql,
                     ),
                 )
             }
@@ -413,6 +428,221 @@ impl CommandDispatcher {
             }
         }
     }
+}
+
+fn execute_query_batch<E: CommandExecutor + ?Sized>(
+    codec: PacketCodec,
+    capability_flags: u32,
+    executor: &mut E,
+    sql: &str,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    let statements = match split_query_statements(sql, executor.no_backslash_escapes()) {
+        Ok(statements) => statements,
+        Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
+    };
+    if statements.len() == 1 {
+        let result = executor.execute_query(sql).map(|mut result| {
+            set_more_results(&mut result, false);
+            result
+        });
+        return encode_execution_result(codec, capability_flags, result);
+    }
+    if capability_flags & CLIENT_MULTI_STATEMENTS == 0 {
+        return encode_frontend_error(codec, capability_flags, FrontendErrorKind::Syntax);
+    }
+    if statements.len() > MAX_MULTI_QUERY_STATEMENTS {
+        return encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported);
+    }
+
+    let mut frames = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
+    for (index, statement) in statements.iter().enumerate() {
+        if frames.len() >= MAX_MULTI_QUERY_RESPONSE_FRAMES
+            || total_bytes >= MAX_MULTI_QUERY_RESPONSE_BYTES
+        {
+            let error =
+                encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
+            append_multi_query_frames(&mut frames, &mut sequence, error);
+            break;
+        }
+        let more_results = index + 1 < statements.len();
+        let result = executor.execute_query(statement);
+        let failed = result.is_err();
+        let result_is_set = matches!(&result, Ok(CommandExecutionResult::ResultSet(_)));
+        let result = result.map(|mut result| {
+            set_more_results(&mut result, more_results);
+            result
+        });
+        let encoded = match encode_execution_result(codec, capability_flags, result) {
+            Ok(encoded) => encoded,
+            Err(CommandDispatcherError::ResultSetTooLarge { .. }) => {
+                let error =
+                    encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
+                append_multi_query_frames(&mut frames, &mut sequence, error);
+                break;
+            }
+            Err(error) => return Err(error),
+        };
+        let total_frames = frames.len().saturating_add(encoded.len());
+        let encoded_bytes = encoded.iter().map(Vec::len).sum::<usize>();
+        // An OK may acknowledge a committed write, so it must reach the client.
+        if result_is_set
+            && (total_frames > MAX_MULTI_QUERY_RESPONSE_FRAMES
+                || total_bytes.saturating_add(encoded_bytes) > MAX_MULTI_QUERY_RESPONSE_BYTES)
+        {
+            let error =
+                encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
+            append_multi_query_frames(&mut frames, &mut sequence, error);
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(encoded_bytes);
+        append_multi_query_frames(&mut frames, &mut sequence, encoded);
+        if failed {
+            break;
+        }
+    }
+    Ok(frames)
+}
+
+fn append_multi_query_frames(
+    frames: &mut Vec<Vec<u8>>,
+    sequence: &mut PacketSequence,
+    encoded: Vec<Vec<u8>>,
+) {
+    for mut frame in encoded {
+        assert!(frame.len() >= crate::PACKET_HEADER_LEN);
+        frame[crate::PACKET_HEADER_LEN - 1] = sequence.next_sequence_id();
+        frames.push(frame);
+    }
+}
+
+fn set_more_results(result: &mut CommandExecutionResult, more_results: bool) {
+    let status_flags = match result {
+        CommandExecutionResult::Ok(ok) => &mut ok.status_flags,
+        CommandExecutionResult::ResultSet(set) => &mut set.status_flags,
+    };
+    *status_flags &= !SERVER_MORE_RESULTS_EXISTS;
+    if more_results {
+        *status_flags |= SERVER_MORE_RESULTS_EXISTS;
+    }
+}
+
+fn split_query_statements(
+    sql: &str,
+    no_backslash_escapes: bool,
+) -> Result<Vec<&str>, FrontendErrorKind> {
+    let (ranges, executable_comment) = scan_statement_ranges(sql, no_backslash_escapes)?;
+    if ranges.len() > 1 {
+        let (other_mode_ranges, _) = scan_statement_ranges(sql, !no_backslash_escapes)?;
+        if executable_comment || ranges != other_mode_ranges {
+            return Err(FrontendErrorKind::Syntax);
+        }
+    }
+    Ok(ranges
+        .into_iter()
+        .map(|(start, end)| &sql[start..end])
+        .collect())
+}
+
+fn scan_statement_ranges(
+    sql: &str,
+    no_backslash_escapes: bool,
+) -> Result<(Vec<(usize, usize)>, bool), FrontendErrorKind> {
+    let bytes = sql.as_bytes();
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    let mut quote = None;
+    let mut block_comment = false;
+    let mut line_comment = false;
+    let mut has_code = false;
+    let mut executable_comment = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if line_comment {
+            if byte == b'\n' || byte == b'\r' {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_comment {
+            if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if byte == b'\\' && !no_backslash_escapes {
+                index += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quote = Some(byte);
+                has_code = true;
+                index += 1;
+            }
+            b'#' => {
+                line_comment = true;
+                index += 1;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-')
+                && bytes
+                    .get(index + 2)
+                    .is_some_and(|next| next.is_ascii_whitespace() || next.is_ascii_control()) =>
+            {
+                line_comment = true;
+                index += 2;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                if bytes.get(index + 2) == Some(&b'!') {
+                    executable_comment = true;
+                    has_code = true;
+                }
+                block_comment = true;
+                index += 2;
+            }
+            b';' => {
+                if !has_code {
+                    return Err(FrontendErrorKind::Syntax);
+                }
+                ranges.push((start, index));
+                start = index + 1;
+                has_code = false;
+                index += 1;
+            }
+            _ => {
+                has_code |= !byte.is_ascii_whitespace();
+                index += 1;
+            }
+        }
+    }
+    if quote.is_some() || block_comment {
+        return Err(FrontendErrorKind::Syntax);
+    }
+    if has_code {
+        ranges.push((start, bytes.len()));
+    }
+    if ranges.is_empty() {
+        return Err(FrontendErrorKind::Syntax);
+    }
+    Ok((ranges, executable_comment))
 }
 
 /// Dispatches one command with the default stateless dispatcher.
@@ -717,7 +947,7 @@ fn encode_result_set(
             sequence.next_sequence_id(),
             capability_flags,
             warnings,
-            status_flags,
+            status_flags & !SERVER_MORE_RESULTS_EXISTS,
         )?);
     }
 
@@ -948,12 +1178,14 @@ fn binary_result_value_to_row_value<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::{
         AuthOkPacket, ClientHandshakeResponseConfig, ConnectionState, InitialHandshakeSettings,
         PacketCodec, ResultTerminatorPacket, TransportSecurity, CACHING_SHA2_PASSWORD_PLUGIN,
-        CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-        REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
+        CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES, REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES,
     };
 
     const CODEC: PacketCodec = PacketCodec {
@@ -965,6 +1197,8 @@ mod tests {
         status_flags: u16,
         init_db_calls: Vec<String>,
         query_calls: Vec<String>,
+        query_results: VecDeque<Result<CommandExecutionResult, FrontendErrorKind>>,
+        no_backslash_escapes: bool,
         reset_connection_calls: usize,
         prepare_calls: Vec<String>,
         close_calls: Vec<u32>,
@@ -988,6 +1222,10 @@ mod tests {
             }
         }
 
+        fn no_backslash_escapes(&self) -> bool {
+            self.no_backslash_escapes
+        }
+
         fn execute_init_db(
             &mut self,
             database: &str,
@@ -1003,6 +1241,9 @@ mod tests {
             sql: &str,
         ) -> Result<CommandExecutionResult, FrontendErrorKind> {
             self.query_calls.push(sql.to_owned());
+            if let Some(result) = self.query_results.pop_front() {
+                return result;
+            }
             self.query_result
                 .take()
                 .unwrap_or_else(|| Ok(CommandExecutionResult::Ok(CommandOkResult::default())))
@@ -1255,6 +1496,275 @@ mod tests {
             ResultTerminatorPacket::Ok(packet)
                 if packet.header == crate::RESPONSE_OK_TERMINATOR_HEADER
         ));
+    }
+
+    #[test]
+    fn multi_query_sequences_results_and_marks_only_final_terminators() {
+        for deprecated_eof in [false, true] {
+            let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+                | CLIENT_MULTI_STATEMENTS
+                | CLIENT_MULTI_RESULTS
+                | if deprecated_eof {
+                    CLIENT_DEPRECATE_EOF
+                } else {
+                    0
+                };
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor {
+                query_results: VecDeque::from([
+                    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                        columns: vec![ColumnDefinitionConfig::new("value", MYSQL_TYPE_LONG)],
+                        rows: vec![vec![Some(b"1".to_vec())]],
+                        warnings: 0,
+                        status_flags: SERVER_STATUS_AUTOCOMMIT,
+                    })),
+                    Ok(CommandExecutionResult::Ok(CommandOkResult {
+                        status_flags: SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS,
+                        ..CommandOkResult::default()
+                    })),
+                ]),
+                ..TestExecutor::default()
+            };
+            let frames = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_QUERY, b"SELECT 1; UPDATE t SET value = 2"),
+            )
+            .unwrap();
+            assert_eq!(
+                executor.query_calls,
+                ["SELECT 1", " UPDATE t SET value = 2"]
+            );
+            assert_eq!(frames.len(), if deprecated_eof { 5 } else { 6 });
+            for (index, frame) in frames.iter().enumerate() {
+                assert_eq!(CODEC.decode(frame).unwrap().sequence_id, (index + 1) as u8);
+            }
+            if !deprecated_eof {
+                assert_eq!(
+                    EofPacket::decode(CODEC, &frames[2]).unwrap().status_flags,
+                    SERVER_STATUS_AUTOCOMMIT
+                );
+            }
+            let result_end = &frames[frames.len() - 2];
+            let end_status =
+                match ResultTerminatorPacket::decode(CODEC, result_end, capabilities).unwrap() {
+                    ResultTerminatorPacket::Eof(packet) => packet.status_flags,
+                    ResultTerminatorPacket::Ok(packet) => packet.status_flags,
+                };
+            assert_eq!(
+                end_status,
+                SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
+            );
+            assert_eq!(
+                AuthOkPacket::decode(CODEC, frames.last().unwrap())
+                    .unwrap()
+                    .status_flags,
+                SERVER_STATUS_AUTOCOMMIT
+            );
+        }
+    }
+
+    #[test]
+    fn multi_query_needs_negotiation_before_any_statement_runs() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_QUERY, b"SELECT 1; SELECT 2"),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::ErrPacket::decode(CODEC, &frames[0], capabilities)
+                .unwrap()
+                .error_code,
+            1064
+        );
+        assert!(executor.query_calls.is_empty());
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn multi_query_stops_after_an_error_with_continuous_sequence_ids() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            query_results: VecDeque::from([
+                Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+                Err(FrontendErrorKind::ConstraintViolation),
+                Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+            ]),
+            ..TestExecutor::default()
+        };
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_QUERY, b"SELECT 1; INSERT bad; SELECT 3"),
+        )
+        .unwrap();
+        assert_eq!(executor.query_calls, ["SELECT 1", " INSERT bad"]);
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            AuthOkPacket::decode(CODEC, &frames[0])
+                .unwrap()
+                .status_flags,
+            SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
+        );
+        let error = crate::ErrPacket::decode(CODEC, &frames[1], capabilities).unwrap();
+        assert_eq!(error.sequence_id, 2);
+        assert_eq!(error.error_code, 1062);
+    }
+
+    #[test]
+    fn multi_query_checks_all_quotes_and_comments_before_execution() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        for sql in [
+            "SELECT 1; SELECT 'unterminated",
+            "SELECT 1; SELECT /* unterminated",
+            "SELECT 1; SELECT 'a\\'; SELECT 3",
+            "SELECT 1; /*! SELECT 2 */ SELECT 3",
+        ] {
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor::default();
+            let frames = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_QUERY, sql.as_bytes()),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::ErrPacket::decode(CODEC, &frames[0], capabilities)
+                    .unwrap()
+                    .error_code,
+                1064,
+                "{sql}"
+            );
+            assert!(executor.query_calls.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn multi_query_ignores_semicolons_inside_text_and_comments() {
+        let sql = "SELECT ';', `a;b`, \"c;d\" /* ; */; # ;\n SELECT 2; -- end\n";
+        assert_eq!(
+            split_query_statements(sql, false).unwrap(),
+            ["SELECT ';', `a;b`, \"c;d\" /* ; */", " # ;\n SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn multi_query_rejects_excess_statements_before_execution() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+        let sql = "SELECT 1;".repeat(MAX_MULTI_QUERY_STATEMENTS + 1);
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_QUERY, sql.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            crate::ErrPacket::decode(CODEC, &frames[0], capabilities)
+                .unwrap()
+                .error_code,
+            1235
+        );
+        assert!(executor.query_calls.is_empty());
+    }
+
+    #[test]
+    fn multi_query_response_budget_returns_error_without_closing_connection() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            query_result: Some(Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![ColumnDefinitionConfig::new("value", MYSQL_TYPE_LONG)],
+                rows: vec![vec![Some(b"1".to_vec())]; MAX_MULTI_QUERY_RESPONSE_FRAMES],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))),
+            ..TestExecutor::default()
+        };
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_QUERY, b"SELECT 1; SELECT 2"),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            crate::ErrPacket::decode(CODEC, &frames[0], capabilities)
+                .unwrap()
+                .error_code,
+            1235
+        );
+        assert_eq!(executor.query_calls, ["SELECT 1"]);
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn multi_query_budget_keeps_a_completed_write_visible_to_the_client() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        for row_count in [
+            MAX_MULTI_QUERY_RESPONSE_FRAMES,
+            MAX_DISPATCH_RESULT_ROWS + 1,
+        ] {
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor {
+                query_results: VecDeque::from([
+                    Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+                    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                        columns: vec![ColumnDefinitionConfig::new("value", MYSQL_TYPE_LONG)],
+                        rows: vec![vec![Some(b"1".to_vec())]; row_count],
+                        warnings: 0,
+                        status_flags: SERVER_STATUS_AUTOCOMMIT,
+                    })),
+                ]),
+                ..TestExecutor::default()
+            };
+            let frames = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(
+                    crate::COM_QUERY,
+                    b"INSERT INTO t VALUES (1); SELECT value FROM large_table; SELECT 3",
+                ),
+            )
+            .unwrap();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(CODEC.decode(&frames[0]).unwrap().sequence_id, 1);
+            assert_eq!(CODEC.decode(&frames[1]).unwrap().sequence_id, 2);
+            assert_eq!(
+                AuthOkPacket::decode(CODEC, &frames[0])
+                    .unwrap()
+                    .status_flags,
+                SERVER_STATUS_AUTOCOMMIT | SERVER_MORE_RESULTS_EXISTS
+            );
+            assert_eq!(
+                crate::ErrPacket::decode(CODEC, &frames[1], capabilities)
+                    .unwrap()
+                    .error_code,
+                1235
+            );
+            assert_eq!(
+                executor.query_calls,
+                ["INSERT INTO t VALUES (1)", " SELECT value FROM large_table"]
+            );
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
     }
 
     #[test]

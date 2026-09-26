@@ -148,6 +148,10 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/checkpoint-authority-cross-uid-target
         run: |
+          docker build \
+            --file mysql/runtime/tests/fixtures/cross-uid.Dockerfile \
+            --tag turso-mysql-cross-uid-cli:${GITHUB_RUN_ID} \
+            mysql/runtime/tests/fixtures
           cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
           cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
           cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
@@ -188,6 +192,9 @@ jobs:
             echo "expected exactly one runtime TCP E2E test executable" >&2
             exit 1
           fi
+          TURSO_MYSQL_CROSS_UID_IMAGE="turso-mysql-cross-uid-cli:${GITHUB_RUN_ID}" \
+          TURSO_MYSQL_CLI_REQUIRED=1 \
+          TURSO_MYSQL_DRIVERS_REQUIRED=1 \
           CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
             scripts/test-checkpoint-authority-cross-uid.sh \
               "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}"

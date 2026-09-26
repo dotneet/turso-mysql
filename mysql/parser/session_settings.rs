@@ -28,6 +28,8 @@ pub enum MySqlSessionSetting {
     /// and a dumped schema each say, both of them writing rows in an order no
     /// foreign key would allow.
     ForeignKeyChecks(bool),
+    /// `SET character_set_results = NULL` disables result conversion.
+    CharacterSetResultsNull,
     /// `SET NAMES <charset> [COLLATE <collation>]`, with what it named.
     Names {
         character_set: String,
@@ -135,6 +137,11 @@ pub fn parse_optional_session_setting(
             None => return Ok(None),
         };
         MySqlSessionSetting::ForeignKeyChecks(value)
+    } else if name.eq_ignore_ascii_case("character_set_results") {
+        if !scanner.take_keyword("NULL") {
+            return Ok(None);
+        }
+        MySqlSessionSetting::CharacterSetResultsNull
     } else {
         return Ok(None);
     };
@@ -581,6 +588,15 @@ mod tests {
                 collation: None
             })
         );
+    }
+
+    #[test]
+    fn reads_connector_j_result_conversion_setting() {
+        assert_eq!(
+            parse("SET character_set_results = NULL"),
+            Some(MySqlSessionSetting::CharacterSetResultsNull)
+        );
+        assert_eq!(parse("SET character_set_results = latin1"), None);
     }
 
     /// Every one of MySQL's four levels is read, with or without a scope word.

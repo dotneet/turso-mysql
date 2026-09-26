@@ -24,6 +24,8 @@ mod orchestrator;
 mod persistent_account_store;
 mod response;
 #[cfg(unix)]
+mod runtime_account_administration;
+#[cfg(unix)]
 mod runtime_account_reload_supervisor;
 #[cfg(unix)]
 mod runtime_account_store;
@@ -68,6 +70,8 @@ pub use orchestrator::*;
 #[cfg(unix)]
 pub use persistent_account_store::*;
 pub use response::*;
+#[cfg(unix)]
+pub use runtime_account_administration::*;
 #[cfg(unix)]
 pub use runtime_account_store::*;
 #[cfg(unix)]

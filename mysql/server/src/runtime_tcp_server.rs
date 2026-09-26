@@ -15,9 +15,10 @@ use std::{
 };
 
 use crate::{
-    AccountStoreCheckpointReader, ConnectionLimitError, RuntimeAccountReload, RuntimeConfig,
-    RuntimeTcpConnectionSpawnError, RuntimeTcpConnectionWorker, RuntimeTcpConnectionWorkerError,
-    RuntimeTcpListener, RuntimeTcpListenerError, RuntimeTcpShutdownReport,
+    AccountStoreAdminAuthority, AccountStoreCheckpointReader, ConnectionLimitError,
+    RuntimeAccountReload, RuntimeConfig, RuntimeTcpConnectionSpawnError,
+    RuntimeTcpConnectionWorker, RuntimeTcpConnectionWorkerError, RuntimeTcpListener,
+    RuntimeTcpListenerError, RuntimeTcpShutdownReport,
 };
 
 /// A blocking mandatory-TLS TCP server with joinable ownership of every worker.
@@ -64,6 +65,21 @@ impl RuntimeTcpServer {
     ) -> Result<Self, RuntimeTcpServerBindError> {
         let listener = RuntimeTcpListener::bind(config, checkpoint_reader)
             .map_err(RuntimeTcpServerBindError::Listener)?;
+        Self::from_listener(listener, config.limits().max_connections())
+    }
+
+    /// Binds a server that can publish durable SQL account changes.
+    pub fn bind_with_account_authority(
+        config: &RuntimeConfig,
+        checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
+        account_authority: Box<dyn AccountStoreAdminAuthority>,
+    ) -> Result<Self, RuntimeTcpServerBindError> {
+        let listener = RuntimeTcpListener::bind_with_account_authority(
+            config,
+            checkpoint_reader,
+            account_authority,
+        )
+        .map_err(RuntimeTcpServerBindError::Listener)?;
         Self::from_listener(listener, config.limits().max_connections())
     }
 

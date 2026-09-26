@@ -173,6 +173,8 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::mysql_uca9::compare as mysql_uca9_compare;
+pub use translate::mysql_uca9::like as mysql_uca9_like;
 pub use turso_ext::ContextDestructor;
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,

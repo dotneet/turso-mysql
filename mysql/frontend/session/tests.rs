@@ -30,6 +30,771 @@ fn binary_context() -> SchemaSqlSessionContext {
     }
 }
 
+#[test]
+fn decimal_values_survive_prepared_insert_index_and_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-exact-decimal.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute(
+            "CREATE TABLE exact_amounts (id INT NOT NULL PRIMARY KEY, v DECIMAL(65,30))",
+        )?;
+        assert_eq!(
+            connection
+                .inner()
+                .current_schema()
+                .get_btree_table("exact_amounts")
+                .unwrap()
+                .columns()[1]
+                .ty_str,
+            "mysql_decimal"
+        );
+        connection.execute("CREATE INDEX amount_index ON exact_amounts (v)")?;
+        connection.execute("INSERT INTO exact_amounts (id, v) VALUES (1, 0.100000000000000000000000000001), (2, -1.235)")?;
+        let prepared = connection
+            .prepare_checked_statement("INSERT INTO exact_amounts (id, v) VALUES (?, ?)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection
+            .execute_prepared_statement(
+                prepared.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(3),
+                    MySqlPreparedValue::Text("0.100000000000000000000000000002".to_string()),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM exact_amounts ORDER BY v")
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(3)]
+            ]
+        );
+        connection.close()?;
+    }
+
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert_eq!(
+        connection
+            .prepare_select(
+                "SELECT v FROM exact_amounts WHERE v = 0.100000000000000000000000000001"
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.100000000000000000000000000001")]]
+    );
+    let prepared_select = connection
+        .prepare_checked_statement("SELECT id FROM exact_amounts WHERE v = ?")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                prepared_select.statement_id,
+                &[MySqlPreparedValue::Text(
+                    "0.100000000000000000000000000002".to_string(),
+                )],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![vec![MySqlPreparedValue::Integer(3)]]
+    );
+    let prepared_less = connection
+        .prepare_checked_statement("SELECT id FROM exact_amounts WHERE v < ? ORDER BY id")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                prepared_less.statement_id,
+                &[MySqlPreparedValue::Text(
+                    "0.100000000000000000000000000002".to_string(),
+                )],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![
+            vec![MySqlPreparedValue::Integer(1)],
+            vec![MySqlPreparedValue::Integer(2)],
+        ]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT SUM(v), AVG(v) FROM exact_amounts WHERE id IN (1, 3)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![
+            Value::build_text("0.200000000000000000000000000003"),
+            Value::build_text("0.100000000000000000000000000002"),
+        ]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v * 0.5 FROM exact_amounts WHERE id = 1")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.050000000000000000000000000001")]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT SUM(v) + 0.001 FROM exact_amounts WHERE id IN (1, 3)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.201000000000000000000000000003")]]
+    );
+    let wide_integer = "1".repeat(65);
+    connection.execute("CREATE TABLE whole_decimals (v DECIMAL(65,0))")?;
+    connection.execute(&format!(
+        "INSERT INTO whole_decimals (v) VALUES ({wide_integer})"
+    ))?;
+    assert_eq!(
+        connection
+            .prepare_select(&format!(
+                "SELECT v FROM whole_decimals WHERE v = {wide_integer}"
+            ))
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text(wide_integer)]]
+    );
+    connection.execute("CREATE TABLE divided_amounts (v DECIMAL(5,2))")?;
+    connection.execute("INSERT INTO divided_amounts (v) VALUES (1.24)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v / 0.5 FROM divided_amounts")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("2.480000")]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT SUM(v) / 2 FROM divided_amounts")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.620000")]]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn decimal_updates_keep_operand_precision_until_assignment() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-decimal-update.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE d (v DECIMAL(5,2))")?;
+    connection.execute("CREATE INDEX d_v ON d(v)")?;
+    connection.execute("INSERT INTO d (v) VALUES (1.23)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v = 1.234")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v < 1.234")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v >= 1.234")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v IN (1.23, 1.234)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v IN (1.234)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(0)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM d WHERE v = 1.234 OR v = 1.23")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
+    connection.execute("UPDATE d SET v = v - 0.005")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM d")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("1.23")]]
+    );
+    connection.execute("UPDATE d SET v = v / 2")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM d")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.62")]]
+    );
+
+    connection.execute("CREATE TABLE wide (v DECIMAL(65,30))")?;
+    connection.execute("INSERT INTO wide (v) VALUES (0.100000000000000000000000000001)")?;
+    connection.execute("UPDATE wide SET v = v / 2")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM wide")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.050000000000000000000000000001")]]
+    );
+    let prepared = connection
+        .prepare_checked_statement("UPDATE wide SET v = v + ?")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[MySqlPreparedValue::Text(
+                "0.000000000000000000000000000001".to_string(),
+            )],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM wide")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.050000000000000000000000000002")]]
+    );
+    assert!(connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[MySqlPreparedValue::Text("1e100000000".to_string())],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .is_err());
+
+    connection.execute("CREATE TABLE signed_wide (v DECIMAL(65,0))")?;
+    connection.execute("INSERT INTO signed_wide (v) VALUES (-9223372036854775809)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM signed_wide")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("-9223372036854775809")]]
+    );
+    connection.execute("CREATE TABLE upsert_decimal (id INT PRIMARY KEY, v DECIMAL(65,30))")?;
+    connection.execute(
+        "INSERT INTO upsert_decimal (id, v) VALUES (1, 0.100000000000000000000000000001)",
+    )?;
+    connection.execute("INSERT INTO upsert_decimal (id, v) VALUES (1, 0.000000000000000000000000000001) ON DUPLICATE KEY UPDATE v = v + VALUES(v)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM upsert_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.100000000000000000000000000002")]]
+    );
+    connection.execute("INSERT INTO upsert_decimal (id, v) VALUES (1, 0.000000000000000000000000000001) ON DUPLICATE KEY UPDATE v = (v + VALUES(v)) + 0.000000000000000000000000000001")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM upsert_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.100000000000000000000000000004")]]
+    );
+    connection.execute(
+        "INSERT INTO upsert_decimal (id, v) VALUES (1, 0) ON DUPLICATE KEY UPDATE v = 0.1 + 0.2",
+    )?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM upsert_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.300000000000000000000000000000")]]
+    );
+    connection.execute("UPDATE upsert_decimal SET v = 0.100000000000000000000000000001 + 0.000000000000000000000000000001")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM upsert_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("0.100000000000000000000000000002")]]
+    );
+    connection.execute("CREATE TABLE mixed (v DECIMAL(20,2), r DOUBLE, i BIGINT)")?;
+    connection.execute("INSERT INTO mixed (v, r, i) VALUES (1.25, 2.0, 9007199254740993)")?;
+    assert!(connection
+        .prepare_select("SELECT v / r FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT CAST(v AS SIGNED) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT CONVERT(v, SIGNED) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT SQRT(v) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT POW(v, 2) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT LENGTH(v) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT SUBSTRING(v, 1, 1) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT TRIM(v) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT EXTRACT(YEAR FROM v) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT SUM(v) OVER (ORDER BY i) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT AVG(v) OVER (ORDER BY i) FROM mixed")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT LAG(v) OVER (ORDER BY i) FROM mixed")
+        .is_err());
+    connection.execute("UPDATE mixed SET v = i / 2")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM mixed")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("4503599627370496.50")]]
+    );
+    assert!(connection
+        .execute("UPDATE mixed SET v = CAST(v AS SIGNED)")
+        .is_err());
+    assert!(connection
+        .execute("UPDATE mixed SET v = CONVERT(v, SIGNED)")
+        .is_err());
+    assert!(connection.execute("UPDATE mixed SET i = v + 0").is_err());
+    assert!(connection.execute("UPDATE mixed SET i = v").is_err());
+    assert!(connection
+        .execute("UPDATE mixed SET i = (v + 0) + 0")
+        .is_err());
+    assert!(connection.execute("UPDATE mixed SET i = (+v) + 0").is_err());
+    assert!(connection.execute("UPDATE mixed SET i = v / 2").is_err());
+    assert!(connection.execute("UPDATE mixed SET i = -v").is_err());
+    assert!(connection.execute("UPDATE mixed SET i = ABS(v)").is_err());
+    assert!(connection
+        .execute("UPDATE mixed SET i = TRUNCATE(v, 1)")
+        .is_err());
+    assert!(connection
+        .execute("UPDATE mixed SET i = CAST(v AS SIGNED)")
+        .is_err());
+    assert!(connection
+        .execute("UPDATE mixed SET i = CASE WHEN 1 = 1 THEN v ELSE 0 END")
+        .is_err());
+    connection.execute("CREATE TABLE upsert_mixed (id INT PRIMARY KEY, v DECIMAL(5,2), i INT)")?;
+    connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1)")?;
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = v + 0").is_err());
+    assert!(connection
+        .execute(
+            "INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = v"
+        )
+        .is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = VALUES(v)").is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = (v + 0) + 0").is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = (+v) + 0").is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = -v").is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = ABS(v)").is_err());
+    assert!(connection.execute("INSERT INTO upsert_mixed (id, v, i) VALUES (1, 1.23, 1) ON DUPLICATE KEY UPDATE i = TRUNCATE(v, 1)").is_err());
+    connection.execute("CREATE TABLE left_decimal (v DECIMAL(5,2))")?;
+    connection.execute("CREATE TABLE right_decimal (v DECIMAL(5,1))")?;
+    connection.execute("INSERT INTO left_decimal (v) VALUES (1.20)")?;
+    connection.execute("INSERT INTO right_decimal (v) VALUES (1.2)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM left_decimal WHERE v IN (1.2)")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select(
+                "SELECT COUNT(*) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
+    assert!(connection
+        .prepare_select("SELECT a.v FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v WHERE a.v IN (1.2)")
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT a.v / 2 FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT a.v + 0.123456789012345678901234567890 FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v")
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT SUM(a.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT AVG(a.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT TRUNCATE(a.v, 1) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT ABS(a.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT GREATEST(a.v, b.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select(
+            "SELECT LEAST(a.v, b.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
+        )
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT x / 2 FROM (SELECT v AS x FROM left_decimal) AS q")
+        .is_err());
+    assert!(connection
+        .prepare_select("WITH q AS (SELECT v AS x FROM left_decimal) SELECT x / 2 FROM q")
+        .is_err());
+    connection.execute("CREATE TABLE scalar_join (id INT)")?;
+    connection.execute("INSERT INTO scalar_join (id) VALUES (1)")?;
+    for sql in [
+        "SELECT SQRT(v) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
+        "SELECT CAST(v AS SIGNED) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
+        "SELECT LENGTH(v) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
+        "SELECT b.id FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id ORDER BY ABS(v)",
+    ] {
+        assert!(connection.prepare_select(sql).is_err(), "{sql}");
+    }
+    assert!(connection
+        .prepare_select(
+            "SELECT COUNT(*) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id"
+        )
+        .is_ok());
+    assert!(connection
+        .prepare_select(
+            "SELECT b.id FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id ORDER BY b.id"
+        )
+        .is_ok());
+    assert!(connection
+        .prepare_select("SELECT v FROM left_decimal UNION SELECT v FROM right_decimal")
+        .is_err());
+    connection.execute("CREATE TABLE delete_decimal (v DECIMAL(5,2))")?;
+    connection.execute("INSERT INTO delete_decimal (v) VALUES (1.20)")?;
+    connection.execute("DELETE FROM delete_decimal WHERE v IN (1.2)")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT COUNT(*) FROM delete_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(0)]]
+    );
+    connection.execute("CREATE TABLE insert_select_integer (i BIGINT)")?;
+    assert!(connection
+        .execute("INSERT INTO insert_select_integer (i) SELECT v FROM left_decimal")
+        .is_err());
+    connection.execute("CREATE TABLE insert_select_decimal (v DECIMAL(65,30))")?;
+    assert!(connection
+        .execute("INSERT INTO insert_select_decimal (v) SELECT v / 2 FROM left_decimal")
+        .is_err());
+    connection.execute("CREATE TABLE insert_select_same_decimal (v DECIMAL(5,2))")?;
+    connection.execute("INSERT INTO insert_select_same_decimal (v) SELECT v FROM left_decimal")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT v FROM insert_select_same_decimal")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::build_text("1.20")]]
+    );
+    connection.execute("CREATE TABLE insert_select_other_scale (v DECIMAL(5,1))")?;
+    assert!(connection
+        .execute("INSERT INTO insert_select_other_scale (v) SELECT v FROM left_decimal")
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_decimal_update_refuses_changed_table_definition() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-decimal-reprepare.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE d(v DECIMAL(5,2))")?;
+    let prepared = connection
+        .prepare_checked_statement("UPDATE d SET v = v / 3")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let drop =
+        turso_mysql_parser::parse_optional_drop_table("DROP TABLE d", SessionSqlMode::default())
+            .expect("DROP TABLE parses")
+            .expect("DROP TABLE is recognized");
+    connection
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection.execute("CREATE TABLE d(v DECIMAL(65,30))")?;
+    connection.execute("INSERT INTO d(v) VALUES (1.000000000000000000000000000001)")?;
+    assert!(connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_decimal_select_keeps_typed_sql_after_schema_change() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-decimal-select-reprepare.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE d (v DECIMAL(65,30))")?;
+    connection.execute("INSERT INTO d (v) VALUES (0.100000000000000000000000000001)")?;
+    let prepared = connection
+        .prepare_checked_statement("SELECT v / 2 FROM d")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let expected = vec![vec![MySqlPreparedValue::Text(
+        "0.050000000000000000000000000001".to_string(),
+    )]];
+    connection.execute("CREATE VIEW d_view AS SELECT v FROM d")?;
+    assert!(connection
+        .prepare_checked_statement("SELECT v / 2 FROM d_view")
+        .is_err());
+    assert_eq!(
+        connection
+            .execute_prepared_select(prepared.statement_id, &[], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        expected
+    );
+    connection.execute("CREATE TABLE unrelated (id INT)")?;
+    assert_eq!(
+        connection
+            .execute_prepared_select(prepared.statement_id, &[], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        expected
+    );
+    let drop =
+        turso_mysql_parser::parse_optional_drop_table("DROP TABLE d", SessionSqlMode::default())
+            .expect("DROP TABLE parses")
+            .expect("DROP TABLE is recognized");
+    connection
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection.execute("CREATE TABLE d (v DECIMAL(5,2))")?;
+    assert!(connection
+        .execute_prepared_select(prepared.statement_id, &[], None)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_select_refuses_new_decimal_type_after_reprepare() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-select-new-decimal-reprepare.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE changing (v INT)")?;
+    connection.execute("INSERT INTO changing (v) VALUES (1)")?;
+    let statements = [
+        "SELECT ABS(v) FROM changing",
+        "SELECT LENGTH(v) FROM changing",
+        "SELECT v FROM changing WHERE v = 1",
+    ]
+    .into_iter()
+    .map(|sql| {
+        connection
+            .prepare_checked_statement(sql)
+            .map(|prepared| prepared.statement_id)
+    })
+    .collect::<std::result::Result<Vec<_>, _>>()
+    .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    for statement_id in &statements {
+        assert_eq!(
+            connection
+                .execute_prepared_select(*statement_id, &[], None)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .len(),
+            1
+        );
+    }
+    let drop = turso_mysql_parser::parse_optional_drop_table(
+        "DROP TABLE changing",
+        SessionSqlMode::default(),
+    )
+    .expect("DROP TABLE parses")
+    .expect("DROP TABLE is recognized");
+    connection
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection.execute("CREATE TABLE changing (v DECIMAL(5,2))")?;
+    connection.execute("INSERT INTO changing (v) VALUES (1.20)")?;
+    for statement_id in statements {
+        assert!(connection
+            .execute_prepared_select(statement_id, &[], None)
+            .is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn unreferenced_decimal_columns_do_not_block_checked_selects_or_copies() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-unused-decimal.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE a (id INT, v DECIMAL(5,2))")?;
+    connection.execute("CREATE TABLE b (k INT)")?;
+    connection.execute("INSERT INTO a (id, v) VALUES (2, 1.20)")?;
+    connection.execute("INSERT INTO b (k) VALUES (2)")?;
+
+    let mut result = connection
+        .prepare_select("SELECT ABS(id) FROM a CROSS JOIN b ORDER BY ABS(id)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(result.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
+    let mut result = connection
+        .prepare_select("SELECT 1 FROM a UNION SELECT 1 FROM b")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(result.run_collect_rows()?, vec![vec![Value::from_i64(1)]]);
+    connection.execute("INSERT INTO b (k) SELECT 1 FROM a")?;
+    let mut result = connection
+        .prepare_select("SELECT COUNT(*) FROM b")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(result.run_collect_rows()?, vec![vec![Value::from_i64(2)]]);
+
+    assert!(connection
+        .prepare_select("SELECT ABS(v) FROM a CROSS JOIN b")
+        .is_err());
+    assert!(connection
+        .prepare_select("SELECT 1 FROM a UNION SELECT v FROM a")
+        .is_err());
+    assert!(connection
+        .execute("INSERT INTO b (k) SELECT v FROM a")
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_insert_select_refuses_changed_source_definition() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-insert-select-reprepare.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE source_numbers (v INT)")?;
+    connection.execute("CREATE TABLE copied_numbers (v INT)")?;
+    connection.execute("INSERT INTO source_numbers (v) VALUES (1)")?;
+    let prepared = connection
+        .prepare_checked_statement("INSERT INTO copied_numbers (v) SELECT v FROM source_numbers")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let drop = turso_mysql_parser::parse_optional_drop_table(
+        "DROP TABLE source_numbers",
+        SessionSqlMode::default(),
+    )
+    .expect("DROP TABLE parses")
+    .expect("DROP TABLE is recognized");
+    connection
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    connection.execute("CREATE TABLE source_numbers (v DECIMAL(5,2))")?;
+    connection.execute("INSERT INTO source_numbers (v) VALUES (1.20)")?;
+    assert!(connection
+        .execute_prepared_statement(
+            prepared.statement_id,
+            &[],
+            None,
+            MySqlAffectedRowsMode::Changed
+        )
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn unsigned_decimal_negative_reports_out_of_range_for_text_and_prepared_writes() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-unsigned-decimal-range.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE amounts (id INT, v DECIMAL(10,2) UNSIGNED)")?;
+    assert!(matches!(
+        connection.execute_checked_write("INSERT INTO amounts (id, v) VALUES (1, -1.5)", None),
+        Err(MySqlQueryError::Engine(LimboError::Assignment(error)))
+            if matches!(*error, AssignmentError::OutOfRange { column: 2, .. })
+    ));
+    let prepared = connection
+        .prepare_checked_statement("INSERT INTO amounts (id, v) VALUES (?, ?)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert!(matches!(
+        connection.execute_prepared_statement(
+            prepared.statement_id,
+            &[
+                MySqlPreparedValue::Integer(2),
+                MySqlPreparedValue::Text("-0.001".to_string()),
+            ],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        ),
+        Err(MySqlPreparedStatementError::Engine(LimboError::Assignment(error)))
+            if matches!(*error, AssignmentError::OutOfRange { column: 2, .. })
+    ));
+    Ok(())
+}
+
+#[test]
+fn recognizes_legacy_decimal_columns() {
+    assert!(legacy_decimal_type("DECIMAL"));
+    assert!(legacy_decimal_type("unsigned decimal"));
+    assert!(!legacy_decimal_type("mysql_decimal"));
+    assert!(!legacy_decimal_type("mysql_decimal_unsigned"));
+}
+
 fn open_database(io: Arc<dyn IO>, path: &str, flags: OpenFlags) -> Result<Arc<Database>> {
     let file = io.open_file(path, flags, true)?;
     Database::open(
@@ -86,6 +851,84 @@ fn open_allocator_connection(
         MySqlPreparedStatementAuthority::default(),
     )?;
     Ok((connection, allocator, io))
+}
+
+#[test]
+fn set_rows_order_by_member_bits_instead_of_text() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-set-order.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE member_rows (id INT, rights SET('read','write','exec'))")?;
+    connection.execute(
+        "INSERT INTO member_rows (id, rights) VALUES \
+         (1, 'read,write'), (2, 'read'), (3, 'exec'), \
+         (4, 'write'), (5, ''), (6, NULL)",
+    )?;
+
+    for (sql, expected) in [
+        (
+            "SELECT id FROM member_rows ORDER BY rights",
+            vec![6, 5, 2, 4, 1, 3],
+        ),
+        (
+            "SELECT id FROM member_rows ORDER BY rights DESC",
+            vec![3, 1, 4, 2, 5, 6],
+        ),
+        (
+            "SELECT id, rights FROM member_rows ORDER BY 2",
+            vec![6, 5, 2, 4, 1, 3],
+        ),
+    ] {
+        let rows = connection.prepare_select(sql)?.run_collect_rows()?;
+        let ids = rows
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            expected
+                .into_iter()
+                .map(Value::from_i64)
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn float_rows_are_rounded_before_reads_comparisons_and_sums() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-float-storage.db", [0xf1; 16])?;
+    connection.execute("CREATE TABLE numbers (id INT, value FLOAT)")?;
+    connection.execute("INSERT INTO numbers (id, value) VALUES (1, 0.1), (2, 0.1), (3, 0.1)")?;
+
+    let stored = Value::from_f64(f64::from(0.1_f32));
+    assert_eq!(
+        connection
+            .prepare_select("SELECT value FROM numbers WHERE id = 1")?
+            .run_collect_rows()?,
+        vec![vec![stored]]
+    );
+    assert_eq!(
+        connection
+            .inner()
+            .prepare("SELECT id FROM numbers WHERE value > 0.100000001 ORDER BY id")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)],
+        ]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT SUM(value) FROM numbers")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_f64(f64::from(0.1_f32) * 3.0)]]
+    );
+    connection.close()?;
+    Ok(())
 }
 
 fn auto_increment_key(connection: &MySqlConnection, table: &str) -> Result<AutoIncrementKey> {
@@ -662,6 +1505,117 @@ fn autocommit_off_table_select_starts_before_engine_prepare_error() -> Result<()
 }
 
 #[test]
+fn checked_replace_counts_each_deleted_row_and_each_inserted_row() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-replace-affected-rows.db", [0x83; 16])?;
+    connection.execute("CREATE TABLE notes (id INT PRIMARY KEY, body INT UNIQUE)")?;
+    connection.execute("INSERT INTO notes (id, body) VALUES (1, 10), (2, 20)")?;
+
+    let new_row = connection
+        .execute_checked_write("REPLACE INTO notes (id, body) VALUES (3, 30)", None)
+        .unwrap();
+    assert_eq!(new_row.affected_rows, 1);
+
+    let one_conflict = connection
+        .execute_checked_write("REPLACE INTO notes (id, body) VALUES (1, 11)", None)
+        .unwrap();
+    assert_eq!(one_conflict.affected_rows, 2);
+
+    let two_conflicts = connection
+        .execute_checked_write("REPLACE INTO notes (id, body) VALUES (1, 20)", None)
+        .unwrap();
+    assert_eq!(two_conflicts.affected_rows, 3);
+
+    let mixed = connection
+        .execute_checked_write(
+            "REPLACE INTO notes (id, body) VALUES (1, 21), (4, 40)",
+            None,
+        )
+        .unwrap();
+    assert_eq!(mixed.affected_rows, 3);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn checked_upsert_counts_insert_change_and_no_op() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-upsert-affected-rows.db", [0x84; 16])?;
+    connection.execute("CREATE TABLE notes (id INT PRIMARY KEY, body INT)")?;
+    connection.execute("INSERT INTO notes (id, body) VALUES (1, 10)")?;
+
+    let inserted = connection
+        .execute_checked_write(
+            "INSERT INTO notes (id, body) VALUES (2, 20) ON DUPLICATE KEY UPDATE body = 99",
+            None,
+        )
+        .unwrap();
+    assert_eq!(inserted.affected_rows, 1);
+
+    let changed = connection
+        .execute_checked_write(
+            "INSERT INTO notes (id, body) VALUES (1, 11) ON DUPLICATE KEY UPDATE body = 99",
+            None,
+        )
+        .unwrap();
+    assert_eq!(changed.affected_rows, 2);
+
+    let no_op = connection
+        .execute_checked_write(
+            "INSERT INTO notes (id, body) VALUES (1, 11) ON DUPLICATE KEY UPDATE body = 99",
+            None,
+        )
+        .unwrap();
+    assert_eq!(no_op.affected_rows, 0);
+
+    let found_no_op = connection
+        .execute_checked_write_with_affected_rows_mode(
+            "INSERT INTO notes (id, body) VALUES (1, 11) ON DUPLICATE KEY UPDATE body = 99",
+            None,
+            MySqlAffectedRowsMode::Matched,
+        )
+        .unwrap();
+    assert_eq!(found_no_op.affected_rows, 1);
+
+    let found_inserted = connection
+        .execute_checked_write_with_affected_rows_mode(
+            "INSERT INTO notes (id, body) VALUES (4, 40) ON DUPLICATE KEY UPDATE body = 100",
+            None,
+            MySqlAffectedRowsMode::Matched,
+        )
+        .unwrap();
+    assert_eq!(found_inserted.affected_rows, 1);
+
+    let found_changed = connection
+        .execute_checked_write_with_affected_rows_mode(
+            "INSERT INTO notes (id, body) VALUES (2, 20) ON DUPLICATE KEY UPDATE body = 100",
+            None,
+            MySqlAffectedRowsMode::Matched,
+        )
+        .unwrap();
+    assert_eq!(found_changed.affected_rows, 2);
+
+    let mixed = connection
+        .execute_checked_write(
+            "INSERT INTO notes (id, body) VALUES (3, 30), (1, 11) ON DUPLICATE KEY UPDATE body = 100",
+            None,
+        )
+        .unwrap();
+    assert_eq!(mixed.affected_rows, 3);
+
+    let found_mixed = connection
+        .execute_checked_write_with_affected_rows_mode(
+            "INSERT INTO notes (id, body) VALUES (5, 50), (1, 11) ON DUPLICATE KEY UPDATE body = 100",
+            None,
+            MySqlAffectedRowsMode::Matched,
+        )
+        .unwrap();
+    assert_eq!(found_mixed.affected_rows, 2);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn checked_update_reports_changed_rows_for_actual_values() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-checked-update-actual.db", [0x5a; 16])?;
@@ -1135,7 +2089,7 @@ fn create_table_persists_marker_and_reopens_with_mysql_dialect() -> Result<()> {
         assert!(rows[0][0]
             .to_string()
             .trim_matches('\'')
-            .starts_with("/*@turso:mysql-schema:v1:"));
+            .starts_with("/*@turso:mysql-schema:v3:"));
         connection.inner().close()?;
     }
 
@@ -1155,6 +2109,123 @@ fn create_table_persists_marker_and_reopens_with_mysql_dialect() -> Result<()> {
             .run_collect_rows()?,
         vec![vec![Value::build_text("Ada")]]
     );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn fresh_text_collations_keep_equality_like_and_unique_keys_after_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-uca9-and-pad-space.db";
+    for flags in [OpenFlags::Create, OpenFlags::None] {
+        let db = open_database(io.clone(), path, flags)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        if flags == OpenFlags::Create {
+            connection.execute(
+                "CREATE TABLE names (id INT, name VARCHAR(16) UNIQUE, exact VARCHAR(16) COLLATE utf8mb4_bin UNIQUE)",
+            )?;
+            connection.execute("INSERT INTO names (id, name, exact) VALUES (1, 'café', 'a')")?;
+            connection.execute("INSERT INTO names (id, name, exact) VALUES (2, 'other', 'B')")?;
+        }
+        for sql in [
+            "SELECT id FROM names WHERE name = 'cafe'",
+            "SELECT id FROM names WHERE name LIKE 'cafe'",
+            "SELECT id FROM names WHERE exact = 'a  '",
+            "SELECT id FROM names WHERE exact = 'a  ' COLLATE utf8mb4_bin",
+            "SELECT id FROM names WHERE exact IN ('a  ')",
+        ] {
+            assert_eq!(
+                connection
+                    .prepare_select(sql)
+                    .map_err(|error| LimboError::InternalError(error.to_string()))?
+                    .run_collect_rows()?,
+                vec![vec![Value::from_i64(1)]],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM names ORDER BY exact")
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(2)], vec![Value::from_i64(1)]]
+        );
+        assert!(connection
+            .prepare_select("SELECT id FROM names WHERE exact LIKE 'a%'")
+            .is_err());
+        assert!(connection
+            .execute("INSERT INTO names (id, name, exact) VALUES (3, 'CAFE', 'c')")
+            .is_err());
+        assert!(connection
+            .execute("INSERT INTO names (id, name, exact) VALUES (4, 'new', 'a  ')")
+            .is_err());
+        connection.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scalar_text_calls_use_mysql_case_rules_or_refuse_unsupported_collations() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-scalar-text-calls.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection
+        .execute("CREATE TABLE words (v VARCHAR(16), exact VARCHAR(16) COLLATE utf8mb4_bin)")?;
+    connection.execute("INSERT INTO words (v, exact) VALUES ('ABC', 'ABC')")?;
+
+    for (sql, expected) in [
+        ("SELECT LOWER(v) FROM words", Value::build_text("abc")),
+        ("SELECT UPPER(v) FROM words", Value::build_text("ABC")),
+        ("SELECT INSTR(v, 'a') FROM words", Value::from_i64(1)),
+        ("SELECT LOCATE('b', v) FROM words", Value::from_i64(2)),
+        ("SELECT LOCATE('b', v, 3) FROM words", Value::from_i64(0)),
+        ("SELECT FIELD(v, 'abc') FROM words", Value::from_i64(1)),
+        (
+            "SELECT GREATEST(v, 'abc') FROM words",
+            Value::build_text("abc"),
+        ),
+        (
+            "SELECT LEAST(v, 'abc') FROM words",
+            Value::build_text("ABC"),
+        ),
+        ("SELECT NULLIF(v, 'abc') FROM words", Value::Null),
+    ] {
+        assert_eq!(
+            connection
+                .prepare_select(sql)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            vec![vec![expected]],
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT INSTR(exact, 'a') FROM words",
+        "SELECT LOCATE('a', exact) FROM words",
+        "SELECT FIELD(exact, 'abc') FROM words",
+        "SELECT GREATEST(exact, 'abc') FROM words",
+        "SELECT LEAST(exact, 'abc') FROM words",
+        "SELECT NULLIF(exact, 'abc') FROM words",
+    ] {
+        assert!(connection.prepare_select(sql).is_err(), "{sql}");
+    }
+
+    connection.execute("INSERT INTO words (v, exact) VALUES ('Éclair', 'Éclair')")?;
+    for sql in [
+        "SELECT LOWER(v) FROM words WHERE exact = 'Éclair'",
+        "SELECT UPPER(v) FROM words WHERE exact = 'Éclair'",
+        "SELECT INSTR(v, 'é') FROM words WHERE exact = 'Éclair'",
+        "SELECT LOCATE('é', v) FROM words WHERE exact = 'Éclair'",
+    ] {
+        assert!(
+            connection
+                .prepare_select(sql)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()
+                .is_err(),
+            "{sql}"
+        );
+    }
     connection.close()?;
     Ok(())
 }
@@ -1461,6 +2532,7 @@ fn create_view_preserves_its_marker_through_reopen_and_vacuum() -> Result<()> {
             vec![MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,
@@ -2066,6 +3138,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
                 nullable: false,
@@ -2078,6 +3151,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,
@@ -2098,6 +3172,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "id".to_owned(),
                 type_name: "INT".to_owned(),
                 nullable: false,
@@ -2113,6 +3188,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "name".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,
@@ -2125,6 +3201,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "payload".to_owned(),
                 type_name: "BLOB".to_owned(),
                 nullable: true,
@@ -2137,6 +3214,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "tiny".to_owned(),
                 type_name: "TINYINT".to_owned(),
                 nullable: true,
@@ -2149,6 +3227,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "small".to_owned(),
                 type_name: "SMALLINT".to_owned(),
                 nullable: true,
@@ -2161,6 +3240,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: None,
                 name: "maybe".to_owned(),
                 type_name: "MEDIUMINT".to_owned(),
                 nullable: true,
@@ -2173,6 +3253,7 @@ fn lists_supported_columns_from_durable_mysql_ddl() -> Result<()> {
             MySqlColumnMetadata {
                 character_length: None,
                 decimal_size: None,
+                collation_name: Some("utf8mb4_0900_ai_ci"),
                 name: "Camel".to_owned(),
                 type_name: "TEXT".to_owned(),
                 nullable: true,
@@ -2339,6 +3420,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
         MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            collation_name: None,
             name: "id".to_owned(),
             type_name: "INT".to_owned(),
             nullable: false,
@@ -2351,6 +3433,7 @@ fn view_columns_survive_reopen_and_vacuum_into() -> Result<()> {
         MySqlColumnMetadata {
             character_length: None,
             decimal_size: None,
+            collation_name: Some("utf8mb4_0900_ai_ci"),
             name: "name".to_owned(),
             type_name: "TEXT".to_owned(),
             nullable: true,

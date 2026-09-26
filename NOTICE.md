@@ -8,6 +8,11 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
+This project includes Unicode 9.0 collation data distributed by Unicode, Inc.:
+
+* License: licenses/core/unicode-data-license.md (Unicode License V3)
+* Homepage: https://www.unicode.org/Public/UCA/9.0.0/
+
 This product depends on Error Prone, distributed by the Error Prone project:
 
 * License: licenses/bindings/java/assertj-license.md (Apache License v2.0)

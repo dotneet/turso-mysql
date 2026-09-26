@@ -13,8 +13,10 @@ description = "Conservative MySQL CREATE TABLE parser for Turso"
 path = "lib.rs"
 
 [dependencies]
+bigdecimal = "0.4"
 sqlparser = "=0.62.0"
 turso_parser.workspace = true
+zeroize = "=1.8.2"
 
 [lints]
 workspace = true

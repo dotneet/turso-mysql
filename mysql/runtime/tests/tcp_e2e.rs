@@ -15,12 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use mysql_async::{Conn, OptsBuilder, SslOpts, prelude::Queryable};
+use mysql_async::{prelude::Queryable, Conn, OptsBuilder, Row, SslOpts};
 use tempfile::TempDir;
 use turso_mysql::MySqlDatabaseCatalog;
 use turso_mysql_server::{
-    CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_HANDSHAKE_SEQUENCE_ID, ClientHandshakeResponseConfig,
-    DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, PacketCodec,
+    ClientHandshakeResponseConfig, PacketCodec, CACHING_SHA2_PASSWORD_PLUGIN,
+    CLIENT_HANDSHAKE_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
     REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
@@ -143,7 +143,7 @@ impl RuntimeProcess {
                 "--max-write-bytes",
                 "8192",
                 "--max-write-frames",
-                "16",
+                "64",
                 "--checkpoint-timeout-ms",
                 "1000",
                 "--tls-timeout-ms",
@@ -296,6 +296,337 @@ async fn mysql_async_0_37_1_over_tls_tcp_validates_localhost_and_releases_port()
     );
 
     runtime.stop_after_sigterm();
+}
+
+#[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with MySQL 8.0.46 CLI"]
+fn mysql_cli_8_0_46_over_tls_tcp_exercises_schema_data_transactions_and_reconnect() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    let first = run_mysql_cli(
+        runtime.endpoint,
+        &roots.ca,
+        "CREATE TABLE cli_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL);\n\
+         INSERT INTO cli_records (id, name) VALUES (1, 'alpha');\n\
+         SELECT id, name FROM cli_records ORDER BY id;\n\
+         START TRANSACTION;\n\
+         UPDATE cli_records SET name = 'beta' WHERE id = 1;\n\
+         SELECT id, name FROM cli_records ORDER BY id;\n\
+         ROLLBACK;\n\
+         SELECT id, name FROM cli_records ORDER BY id;\n\
+         SHOW COLUMNS FROM cli_records;\n",
+    );
+    let lines: Vec<_> = first.lines().collect();
+    assert_eq!(lines.len(), 5, "unexpected MySQL CLI output: {first}");
+    assert_eq!(&lines[..3], ["1\talpha", "1\tbeta", "1\talpha"]);
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("id\tint\tNO\tPRI\t")));
+    assert!(lines
+        .iter()
+        .any(|line| line.starts_with("name\tvarchar(20)\tNO\t")));
+
+    let second = run_mysql_cli(
+        runtime.endpoint,
+        &roots.ca,
+        "SELECT id, name FROM cli_records ORDER BY id;\nDROP TABLE cli_records;\n",
+    );
+    assert_eq!(second.trim(), "1\talpha");
+
+    runtime.stop_after_sigterm();
+}
+
+#[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with go-sql-driver/mysql 1.9.3"]
+fn go_sql_driver_1_9_3_over_tls_tcp_exercises_prepared_crud_and_migration() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_external_driver(
+        &["/usr/local/bin/mysql-go-driver-e2e"],
+        runtime.endpoint,
+        &roots.ca,
+    );
+    runtime.stop_after_sigterm();
+}
+
+#[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with Connector/J 9.6.0"]
+fn connector_j_9_6_0_over_tls_tcp_exercises_prepared_crud_and_migration() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_external_driver(
+        &[
+            "java",
+            "-cp",
+            "/opt/mysql-drivers:/opt/mysql-drivers/mysql-connector-j-9.6.0.jar",
+            "JdbcDriver",
+        ],
+        runtime.endpoint,
+        &roots.ca,
+    );
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn mysql_value_regressions_over_tls_tcp() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    let ssl = SslOpts::default()
+        .with_root_certs(vec![roots.ca.clone().into()])
+        .with_disable_built_in_roots(true);
+    let mut connection = Conn::new(tcp_options(runtime.endpoint, ssl))
+        .await
+        .expect("connect over verified TLS");
+    connection
+        .query_drop("USE reports")
+        .await
+        .expect("select reports");
+
+    connection
+        .query_drop("CREATE TABLE values_test (id INT NOT NULL PRIMARY KEY, amount FLOAT, rights SET('read','write','exec'))")
+        .await
+        .expect("create value test table");
+    connection
+        .query_drop("INSERT INTO values_test VALUES (1,0.1,'read,write'),(2,0.1,'read'),(3,0.1,'exec'),(4,NULL,'write'),(5,NULL,''),(6,NULL,NULL)")
+        .await
+        .expect("insert numeric and set values");
+    let amount: Option<f32> = connection
+        .query_first("SELECT amount FROM values_test WHERE id = 1")
+        .await
+        .expect("read rounded float");
+    assert_eq!(amount, Some(0.1_f32));
+    let rows: Vec<Row> = connection
+        .query("SELECT id FROM values_test ORDER BY rights")
+        .await
+        .expect("sort set by declared member bits");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<u64, _>(0).expect("id"))
+            .collect::<Vec<_>>(),
+        vec![6, 5, 2, 4, 1, 3]
+    );
+
+    connection
+        .query_drop("CREATE TABLE replace_test (id INT NOT NULL PRIMARY KEY, value INT)")
+        .await
+        .expect("create replace table");
+    connection
+        .query_drop("INSERT INTO replace_test VALUES (1,10)")
+        .await
+        .expect("insert old row");
+    connection
+        .query_drop("REPLACE INTO replace_test VALUES (1,20)")
+        .await
+        .expect("replace old row");
+    assert_eq!(connection.affected_rows(), 2);
+
+    connection
+        .query_drop("CREATE TABLE moment_test (stamp TIMESTAMP NULL)")
+        .await
+        .expect("create timestamp table");
+    connection
+        .query_drop("INSERT INTO moment_test VALUES ('2038-01-19 03:14:07')")
+        .await
+        .expect("largest accepted timestamp");
+    assert!(connection
+        .query_drop("INSERT INTO moment_test VALUES ('2038-01-19 03:14:08')")
+        .await
+        .is_err());
+
+    connection
+        .query_drop(
+            "CREATE TABLE decimal_test (id INT NOT NULL PRIMARY KEY, amount DECIMAL(65,30))",
+        )
+        .await
+        .expect("create exact decimal table");
+    connection
+        .query_drop(
+            "INSERT INTO decimal_test (id, amount) VALUES (1,'1.234567890123456789012345678901')",
+        )
+        .await
+        .expect("insert exact decimal");
+    let exact: Option<String> = connection
+        .query_first("SELECT amount FROM decimal_test WHERE id = 1")
+        .await
+        .expect("read decimal over text protocol");
+    assert_eq!(exact.as_deref(), Some("1.234567890123456789012345678901"));
+    let prepared_exact: Option<String> = connection
+        .exec_first("SELECT amount FROM decimal_test WHERE id = ?", (1,))
+        .await
+        .expect("read decimal over prepared binary protocol");
+    assert_eq!(prepared_exact, exact);
+
+    connection.disconnect().await.expect("disconnect");
+    runtime.stop_after_sigterm();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the privileged Linux cross-UID fixture"]
+async fn sql_account_administration_persists_and_reauthorizes_over_tls_tcp() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    let ssl = SslOpts::default()
+        .with_root_certs(vec![roots.ca.clone().into()])
+        .with_disable_built_in_roots(true);
+    let mut admin = Conn::new(tcp_options(runtime.endpoint, ssl.clone()))
+        .await
+        .expect("admin connects");
+    admin
+        .query_drop("USE reports")
+        .await
+        .expect("select reports");
+    admin
+        .query_drop(
+            "CREATE TABLE admin_records (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL)",
+        )
+        .await
+        .expect("create table");
+    admin
+        .query_drop("INSERT INTO admin_records (id, name) VALUES (1, 'alpha')")
+        .await
+        .expect("insert row");
+    assert!(admin
+        .query_drop("GRANT SELECT ON reports.admin_records TO 'unknown'@'%'")
+        .await
+        .is_err());
+    admin
+        .query_drop("CREATE USER 'sqlreader'@'%' IDENTIFIED BY 'sql-secret'")
+        .await
+        .expect("create account through durable checkpoint");
+    admin
+        .query_drop("GRANT SELECT ON reports.admin_records TO 'sqlreader'@'%'")
+        .await
+        .expect("grant table select");
+
+    let reader_options = OptsBuilder::default()
+        .ip_or_hostname("localhost")
+        .resolved_ips(Some(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]))
+        .tcp_port(runtime.endpoint.port())
+        .user(Some("sqlreader"))
+        .pass(Some("sql-secret"))
+        .prefer_socket(false)
+        .ssl_opts(ssl);
+    let mut reader = Conn::new(reader_options)
+        .await
+        .expect("new account authenticates");
+    reader
+        .query_drop("USE reports")
+        .await
+        .expect("granted database");
+    let name: Option<String> = reader
+        .query_first("SELECT name FROM admin_records WHERE id = 1")
+        .await
+        .expect("granted table read");
+    assert_eq!(name.as_deref(), Some("alpha"));
+    let columns: Vec<Row> = reader
+        .query("SHOW FULL COLUMNS FROM admin_records")
+        .await
+        .expect("table grant permits column metadata");
+    assert_eq!(columns.len(), 2);
+    assert!(columns
+        .iter()
+        .all(|column| column.get::<String, _>(7).as_deref() == Some("select")));
+    assert!(reader
+        .query_drop("CREATE USER 'denied'@'%' IDENTIFIED BY 'secret'")
+        .await
+        .is_err());
+
+    admin
+        .query_drop("REVOKE SELECT ON reports.admin_records FROM 'sqlreader'@'%'")
+        .await
+        .expect("revoke table select");
+    assert!(reader
+        .query_first::<String, _>("SELECT name FROM admin_records WHERE id = 1")
+        .await
+        .is_err());
+    reader.disconnect().await.expect("reader disconnects");
+    admin.disconnect().await.expect("admin disconnects");
+    runtime.stop_after_sigterm();
+}
+
+fn run_external_driver(command: &[&str], endpoint: SocketAddr, ca: &Path) {
+    let output = Command::new("timeout")
+        .args(["--signal=KILL", "15s"])
+        .args(command)
+        .env(
+            "TURSO_MYSQL_DRIVER_ENDPOINT",
+            format!("localhost:{}", endpoint.port()),
+        )
+        .env("TURSO_MYSQL_DRIVER_CA", ca)
+        .env("TURSO_MYSQL_DRIVER_PASSWORD", PASSWORD)
+        .output()
+        .expect("external driver starts");
+    assert!(
+        output.status.success(),
+        "external driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_mysql_cli(endpoint: SocketAddr, ca: &Path, sql: &str) -> String {
+    let mut child = Command::new("timeout")
+        .args(["--signal=KILL", "15s", "mysql"])
+        .args([
+            "--no-defaults",
+            "--protocol=tcp",
+            "--host=localhost",
+            "--user=gateadmin",
+            "--ssl-mode=VERIFY_IDENTITY",
+            "--default-character-set=utf8mb4",
+            "--connect-timeout=3",
+            "--batch",
+            "--raw",
+            "--skip-column-names",
+        ])
+        .arg(format!("--port={}", endpoint.port()))
+        .arg(format!("--ssl-ca={}", ca.display()))
+        .arg("reports")
+        .env("HOME", ca.parent().expect("TLS fixture has a directory"))
+        .env("MYSQL_PWD", PASSWORD)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("MySQL CLI starts");
+    child
+        .stdin
+        .take()
+        .expect("MySQL CLI stdin is piped")
+        .write_all(sql.as_bytes())
+        .expect("MySQL CLI accepts the SQL script");
+    let output = child.wait_with_output().expect("MySQL CLI exits");
+    assert!(
+        output.status.success(),
+        "MySQL CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("MySQL CLI returns UTF-8 output")
 }
 
 fn tcp_options(endpoint: SocketAddr, ssl_opts: SslOpts) -> OptsBuilder {

@@ -621,13 +621,10 @@ impl JsonReader<'_> {
                 return Ok(JsonValue::Unsigned(unsigned));
             }
         }
-        let read = written
-            .parse::<f64>()
-            .expect("the digits just read spell a double");
-        if read.is_infinite() {
+        let Some(read) = read_mysql_double(written) else {
             self.at = start;
             return Err(self.fail("Number too big to be stored in double."));
-        }
+        };
         Ok(JsonValue::Double(read))
     }
 
@@ -651,6 +648,118 @@ impl JsonReader<'_> {
             position: self.at,
         }
     }
+}
+
+/// MySQL uses RapidJSON's normal precision conversion for JSON numbers. It
+/// builds a double from at most 17 significant fractional digits, then scales
+/// that double by a power of ten. Parsing the whole token with Rust's `f64`
+/// parser can choose the adjacent double instead.
+fn read_mysql_double(written: &str) -> Option<f64> {
+    let unsigned = written.strip_prefix('-').unwrap_or(written);
+    let (significand, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], Some(&unsigned[at + 1..])),
+        None => (unsigned, None),
+    };
+    let (integer, fraction) = match significand.split_once('.') {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (significand, None),
+    };
+
+    let limit = if written.starts_with('-') {
+        1u64 << 63
+    } else {
+        u64::MAX
+    };
+    let mut whole = 0u64;
+    let mut large = None;
+    let mut significant_digits = 0;
+    for (index, digit) in integer.bytes().enumerate() {
+        let digit = u64::from(digit - b'0');
+        if let Some(value) = large.as_mut() {
+            *value = *value * 10.0 + digit as f64;
+        } else if let Some(value) = whole.checked_mul(10).and_then(|n| n.checked_add(digit)) {
+            if value <= limit {
+                whole = value;
+                if index > 0 && whole != 0 {
+                    significant_digits += 1;
+                }
+            } else {
+                large = Some(whole as f64 * 10.0 + digit as f64);
+            }
+        } else {
+            large = Some(whole as f64 * 10.0 + digit as f64);
+        }
+    }
+    let mut value = large.unwrap_or(whole as f64);
+    let mut fraction_exponent = 0i64;
+    if let Some(fraction) = fraction {
+        let mut digits = fraction.bytes();
+        if large.is_none() {
+            while whole < (1u64 << 53) {
+                let Some(digit) = digits.next() else { break };
+                whole = whole * 10 + u64::from(digit - b'0');
+                fraction_exponent -= 1;
+                if whole != 0 {
+                    significant_digits += 1;
+                }
+            }
+            value = whole as f64;
+        }
+        for digit in digits {
+            if significant_digits < 17 {
+                value = value * 10.0 + f64::from(digit - b'0');
+                fraction_exponent -= 1;
+                if value > 0.0 {
+                    significant_digits += 1;
+                }
+            }
+        }
+    }
+
+    let exponent = exponent.map_or(0, |text| {
+        text.parse::<i64>().unwrap_or_else(|_| {
+            if text.starts_with('-') {
+                i64::MIN
+            } else {
+                i64::MAX
+            }
+        })
+    });
+    if exponent > 308 - fraction_exponent {
+        return None;
+    }
+    let power = exponent.saturating_add(fraction_exponent);
+    if power < -308 {
+        value /= mysql_power_of_ten(308);
+        value = scale_mysql_double(value, power.saturating_add(308));
+    } else {
+        value = scale_mysql_double(value, power);
+    }
+    if value.is_finite() {
+        Some(if written.starts_with('-') {
+            -value
+        } else {
+            value
+        })
+    } else {
+        None
+    }
+}
+
+fn scale_mysql_double(value: f64, power: i64) -> f64 {
+    match power {
+        ..=-309 => 0.0,
+        -308..=-1 => value / mysql_power_of_ten(-power as u32),
+        0 => value,
+        1..=308 => value * mysql_power_of_ten(power as u32),
+        _ => f64::INFINITY,
+    }
+}
+
+fn mysql_power_of_ten(power: u32) -> f64 {
+    format!("1e{power}")
+        .parse()
+        .expect("the power is within the range of a double")
 }
 
 /// Puts an object's members in the order MySQL keeps them: shorter keys first,
@@ -741,7 +850,30 @@ fn write_text(text: &str, out: &mut String) {
 /// point is just as far right, prints in full. A double printed without a
 /// point or an exponent gets `.0`, which is what tells it from an integer.
 fn write_double(value: f64, out: &mut String) {
-    let printed = format!("{value:e}");
+    let mut printed = format!("{value:e}");
+    // MySQL's dtoa chooses the decimal with an even last digit when two
+    // shortest decimals are equally close to the same binary64 value.
+    let exponent_at = printed
+        .find('e')
+        .expect("Rust writes an exponent in this format");
+    let last_digit = exponent_at - 1;
+    let digit = printed.as_bytes()[last_digit];
+    if (digit - b'0') % 2 == 1 {
+        for neighbor in [digit - 1, digit + 1] {
+            if !neighbor.is_ascii_digit() {
+                continue;
+            }
+            let mut candidate = printed.clone().into_bytes();
+            candidate[last_digit] = neighbor;
+            let candidate = String::from_utf8(candidate).expect("only a decimal digit changed");
+            if candidate.parse::<f64>().map(f64::to_bits) == Ok(value.to_bits())
+                && is_decimal_midpoint(value, &printed, neighbor)
+            {
+                printed = candidate;
+                break;
+            }
+        }
+    }
     let (mantissa, exponent) = printed
         .split_once('e')
         .expect("Rust writes an exponent in this format");
@@ -785,6 +917,62 @@ fn write_double(value: f64, out: &mut String) {
     }
 }
 
+fn is_decimal_midpoint(value: f64, printed: &str, neighbor: u8) -> bool {
+    let (mantissa, exponent) = printed
+        .split_once('e')
+        .expect("Rust writes an exponent in this format");
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let Some(significand) = digits.parse::<u128>().ok() else {
+        return false;
+    };
+    let exponent: i32 = exponent.parse().expect("Rust writes a whole exponent");
+    let scale = exponent - digits.len() as i32 + 1;
+    if !(-18..=18).contains(&scale) {
+        return false;
+    }
+    let last = *digits.as_bytes().last().expect("a double has a digit");
+    let midpoint = if neighbor < last {
+        significand * 2 - 1
+    } else {
+        significand * 2 + 1
+    };
+    let power = 10u128.pow(scale.unsigned_abs());
+    let (decimal_numerator, decimal_denominator) = if scale >= 0 {
+        (midpoint * power, 2)
+    } else {
+        (midpoint, 2 * power)
+    };
+
+    let bits = value.abs().to_bits();
+    let stored_exponent = ((bits >> 52) & 0x7ff) as i32;
+    if stored_exponent == 0 {
+        return false;
+    }
+    let binary_significand = u128::from((bits & ((1u64 << 52) - 1)) | (1u64 << 52));
+    let binary_exponent = stored_exponent - 1023 - 52;
+    let (binary_numerator, binary_denominator) = if binary_exponent >= 0 {
+        let Some(power) = 1u128.checked_shl(binary_exponent as u32) else {
+            return false;
+        };
+        let Some(numerator) = binary_significand.checked_mul(power) else {
+            return false;
+        };
+        (numerator, 1)
+    } else {
+        let Some(denominator) = 1u128.checked_shl((-binary_exponent) as u32) else {
+            return false;
+        };
+        (binary_significand, denominator)
+    };
+    matches!(
+        (
+            binary_numerator.checked_mul(decimal_denominator),
+            decimal_numerator.checked_mul(binary_denominator)
+        ),
+        (Some(left), Some(right)) if left == right
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -817,6 +1005,8 @@ mod tests {
             ("1", "1", true),
             ("1", "1.0", true),
             ("1", "2", false),
+            ("1000000000000000.1", "1000000000000000.0", true),
+            ("1000000000000000.3", "1000000000000000.4", true),
             (r#""x""#, r#""x""#, true),
             (r#""x""#, r#""y""#, false),
             ("null", "null", true),
@@ -1076,15 +1266,29 @@ mod tests {
         assert_eq!(normalized("-3.75"), "-3.75");
     }
 
-    /// MySQL reads a JSON number with rapidjson's fast path, which lands on
-    /// the double next to the right one often enough to see: measured on
-    /// 8.4.11, MySQL answers `1000000000000000.1` with `1e15` and `1e-30`
-    /// with `9.999999999999999e-31`. Rust reads both correctly, and nothing
-    /// here reproduces the miss.
     #[test]
-    fn a_number_is_read_more_accurately_than_mysql_reads_it() {
-        assert_eq!(normalized("1000000000000000.1"), "1000000000000000.1");
-        assert_eq!(normalized("1e-30"), "1e-30");
+    fn a_double_uses_mysql_json_number_rounding() {
+        let cases = [
+            ("1000000000000000.1", "1e15"),
+            ("1000000000000000.2", "1000000000000000.2"),
+            ("1000000000000000.3", "1000000000000000.4"),
+            ("1000000000000000.4", "1000000000000000.4"),
+            ("1e-30", "9.999999999999999e-31"),
+            ("2e-30", "1.9999999999999998e-30"),
+            ("3e-30", "3e-30"),
+            ("1e-29", "1.0000000000000001e-29"),
+            ("-1e-30", "-9.999999999999999e-31"),
+            ("0e308", "0.0"),
+            ("0e-309", "0.0"),
+            ("-0e-30", "-0.0"),
+            ("3.0000000000000004", "3.0000000000000004"),
+            ("5e-324", "5e-324"),
+            ("2.2250738585072014e-308", "2.2250738585072014e-308"),
+            ("1.7976931348623157e308", "1.7976931348623157e308"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalized(input), expected, "{input}");
+        }
     }
 
     #[test]
@@ -1208,6 +1412,10 @@ mod tests {
         assert_eq!(
             refusal_text("{\"a\":1e400}"),
             ("Number too big to be stored in double.", 5)
+        );
+        assert_eq!(
+            refusal_text("0e309"),
+            ("Number too big to be stored in double.", 0)
         );
         assert_eq!(
             refusal_text("{\"a\":\"x\u{1f}y\"}"),

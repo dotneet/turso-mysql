@@ -28,6 +28,8 @@ pub enum CollationSeq {
     Binary,
     NoCase,
     Rtrim,
+    MySqlUtf8mb4Bin,
+    MySqlUca9,
     Locale(LocaleCollationId),
     /// Name/id token for a connection-owned callback. The comparison itself
     /// must be resolved through `Connection` at runtime.
@@ -52,6 +54,8 @@ impl CollationSeq {
             "binary" => return Ok(Self::Binary),
             "nocase" => return Ok(Self::NoCase),
             "rtrim" => return Ok(Self::Rtrim),
+            "mysql_utf8mb4_bin" | "utf8mb4_bin" => return Ok(Self::MySqlUtf8mb4Bin),
+            "mysql_uca9_ai_ci" | "utf8mb4_0900_ai_ci" => return Ok(Self::MySqlUca9),
             _ => {}
         }
 
@@ -77,6 +81,8 @@ impl CollationSeq {
             Self::Binary => 1,
             Self::NoCase => 2,
             Self::Rtrim => 3,
+            Self::MySqlUtf8mb4Bin => 4094,
+            Self::MySqlUca9 => 4095,
             Self::Locale(id) => id.to_bits(),
             Self::Custom(_) => 0,
         }
@@ -89,6 +95,8 @@ impl CollationSeq {
             1 => Self::Binary,
             2 => Self::NoCase,
             3 => Self::Rtrim,
+            4094 => Self::MySqlUtf8mb4Bin,
+            4095 => Self::MySqlUca9,
             bits => Self::Locale(LocaleCollationId::from_bits(bits)),
         }
     }
@@ -139,6 +147,8 @@ impl CollationSeq {
             Self::Binary => "Binary".to_string(),
             Self::NoCase => "NoCase".to_string(),
             Self::Rtrim => "RTrim".to_string(),
+            Self::MySqlUtf8mb4Bin => "MYSQL_UTF8MB4_BIN".to_string(),
+            Self::MySqlUca9 => "MYSQL_UCA9_AI_CI".to_string(),
             Self::Locale(id) => LocaleCollationRegistry::global().name(id),
             Self::Custom(id) => CUSTOM_COLLATION_NAMES
                 .lock()
@@ -155,6 +165,8 @@ impl CollationSeq {
             Self::Unset | Self::Binary => Self::binary_cmp(lhs, rhs),
             Self::NoCase => Self::nocase_cmp(lhs, rhs),
             Self::Rtrim => Self::rtrim_cmp(lhs, rhs),
+            Self::MySqlUtf8mb4Bin => Self::rtrim_cmp(lhs, rhs),
+            Self::MySqlUca9 => super::mysql_uca9::compare(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             // Immutable comparison paths have no connection to fetch the external
             // callback from. Runtime VDBE paths dispatch custom collations via
@@ -193,6 +205,8 @@ impl CollationSeq {
             Self::Unset | Self::Binary => text.as_bytes().to_vec(),
             Self::NoCase => text.bytes().map(|b| b.to_ascii_lowercase()).collect(),
             Self::Rtrim => text.trim_end_matches(' ').as_bytes().to_vec(),
+            Self::MySqlUtf8mb4Bin => text.trim_end_matches(' ').as_bytes().to_vec(),
+            Self::MySqlUca9 => super::mysql_uca9::sort_key(text),
             Self::Locale(id) => LocaleCollationRegistry::global().sort_key(*id, text),
             // Hash joins using custom collations are disabled during planning
             // because the callback is connection-owned and may define arbitrary equality.
@@ -228,9 +242,10 @@ pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
     const FIRST_STORAGE_BIT: u16 = 4;
+    const LAST_STORAGE_BIT: u16 = 4093;
 
     fn from_index(index: usize) -> Result<Self> {
-        if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
+        if index > (Self::LAST_STORAGE_BIT - Self::FIRST_STORAGE_BIT) as usize {
             return Err(crate::LimboError::ParseError(
                 "too many locale collation sequences".to_string(),
             ));
@@ -530,6 +545,29 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn mysql_uca9_has_a_stable_storage_id_and_matching_hash_key() {
+        let collation = CollationSeq::new("utf8mb4_0900_ai_ci").unwrap();
+        assert_eq!(collation, CollationSeq::MySqlUca9);
+        assert_eq!(collation.to_bits(), 4095);
+        assert_eq!(CollationSeq::from_storage_bits(4095), collation);
+        assert_eq!(collation.compare_strings("café", "cafe"), Ordering::Equal);
+        assert_eq!(collation.hash_key("café"), collation.hash_key("cafe"));
+    }
+
+    #[test]
+    fn mysql_utf8mb4_bin_has_pad_space_and_a_stable_storage_id() {
+        let collation = CollationSeq::new("utf8mb4_bin").unwrap();
+        assert_eq!(collation, CollationSeq::MySqlUtf8mb4Bin);
+        assert_eq!(collation.to_bits(), 4094);
+        assert_eq!(CollationSeq::from_storage_bits(4094), collation);
+        assert_eq!(collation.compare_strings("a", "a  "), Ordering::Equal);
+        assert_eq!(collation.hash_key("a"), collation.hash_key("a  "));
+        assert_eq!(collation.compare_strings("a", "a\u{a0}"), Ordering::Less);
+        assert_eq!(collation.compare_strings("a", "a\0"), Ordering::Less);
+        assert_eq!(collation.compare_strings("A", "a"), Ordering::Less);
+    }
 
     #[test]
     fn test_locale_collation_names() {

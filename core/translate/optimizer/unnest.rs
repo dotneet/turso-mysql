@@ -1000,6 +1000,7 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
         matches!(
             aggregate.func,
             AggFunc::Avg
+                | AggFunc::MysqlDecimalAvg
                 | AggFunc::Count
                 | AggFunc::Count0
                 | AggFunc::Max
@@ -1036,6 +1037,7 @@ fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
             | AggFunc::Min
             | AggFunc::StringAgg
             | AggFunc::Sum => Some(EmptyInputValue::Null),
+            AggFunc::MysqlDecimalSum => Some(EmptyInputValue::Null),
             _ => None,
         };
     }
@@ -1049,11 +1051,13 @@ fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Agg
             && matches!(
                 aggregate.func,
                 AggFunc::Avg
+                    | AggFunc::MysqlDecimalAvg
                     | AggFunc::GroupConcat
                     | AggFunc::Max
                     | AggFunc::Min
                     | AggFunc::StringAgg
                     | AggFunc::Sum
+                    | AggFunc::MysqlDecimalSum
             )
     }) {
         return true;

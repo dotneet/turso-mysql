@@ -915,6 +915,7 @@ pub struct ProgramState {
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     pub n_mysql_changed_rows: AtomicI64,
+    pub n_mysql_replaced_rows: AtomicI64,
     /// Rows this statement wrote over a row that was already there, rather
     /// than adding one.
     ///
@@ -1002,6 +1003,7 @@ impl ProgramState {
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
             n_mysql_changed_rows: AtomicI64::new(0),
+            n_mysql_replaced_rows: AtomicI64::new(0),
             n_mysql_updated_rows: AtomicI64::new(0),
             mysql_upserted_rowid: AtomicI64::new(0),
             pending_mysql_update_old_record: None,
@@ -1158,6 +1160,7 @@ impl ProgramState {
         self.n_change.store(0, Ordering::SeqCst);
         self.n_total_change.store(0, Ordering::SeqCst);
         self.n_mysql_changed_rows.store(0, Ordering::SeqCst);
+        self.n_mysql_replaced_rows.store(0, Ordering::SeqCst);
         self.n_mysql_updated_rows.store(0, Ordering::SeqCst);
         self.mysql_upserted_rowid.store(0, Ordering::SeqCst);
         self.pending_mysql_update_old_record = None;
@@ -1180,6 +1183,10 @@ impl ProgramState {
 
     pub(crate) fn record_mysql_changed_row(&self) {
         self.n_mysql_changed_rows.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn record_mysql_replaced_row(&self) {
+        self.n_mysql_replaced_rows.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) fn record_mysql_updated_row(&self) {
@@ -2448,6 +2455,9 @@ impl Program {
                 if !self.prepared.is_subprogram {
                     self.connection.set_mysql_changed_rows(
                         program_state.n_mysql_changed_rows.load(Ordering::SeqCst),
+                    );
+                    self.connection.set_mysql_replaced_rows(
+                        program_state.n_mysql_replaced_rows.load(Ordering::SeqCst),
                     );
                     self.connection.set_mysql_updated_rows(
                         program_state.n_mysql_updated_rows.load(Ordering::SeqCst),

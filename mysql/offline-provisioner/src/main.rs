@@ -112,6 +112,10 @@ struct AccountArguments {
     #[arg(long, action = ArgAction::Set, required = true)]
     global_list: bool,
 
+    /// Whether the account may change users and their grants through SQL.
+    #[arg(long, action = ArgAction::Set, default_value_t = false)]
+    global_manage_accounts: bool,
+
     /// Whether the account starts disabled.
     #[arg(long, action = ArgAction::Set, required = true)]
     disabled: bool,
@@ -407,7 +411,8 @@ fn provisioned_account(
         arguments.username,
         ProtectedPassword::new(password.as_mut_slice()),
         !arguments.disabled,
-        GlobalPrivileges::new(arguments.global_connect, arguments.global_list),
+        GlobalPrivileges::new(arguments.global_connect, arguments.global_list)
+            .with_manage_accounts(arguments.global_manage_accounts),
     )
     .map_err(map_provisioning_error)?;
     let database_grants = database_specs
@@ -487,7 +492,11 @@ fn duration_from_millis(milliseconds: u64) -> Result<Duration, CommandError> {
 fn map_provisioning_error(error: OfflineProvisioningError) -> CommandError {
     match error {
         OfflineProvisioningError::InvalidUsername(_)
-        | OfflineProvisioningError::GrantOwnerMismatch => CommandError::Input,
+        | OfflineProvisioningError::GrantOwnerMismatch
+        | OfflineProvisioningError::NotAuthorized
+        | OfflineProvisioningError::AccountAlreadyExists
+        | OfflineProvisioningError::AccountMissing
+        | OfflineProvisioningError::PrivilegeMissing => CommandError::Input,
         OfflineProvisioningError::Store(PersistentAccountStoreError::InvalidGeneration) => {
             CommandError::Input
         }

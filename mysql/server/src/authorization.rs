@@ -23,6 +23,8 @@ pub enum DatabaseAction<'a> {
     Drop { database: &'a str },
     /// List logical databases.
     List,
+    /// Change accounts and their grants.
+    ManageAccounts,
 }
 
 /// A table action that a policy may allow or reject.

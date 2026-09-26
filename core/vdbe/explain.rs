@@ -1641,6 +1641,15 @@ pub fn insn_to_row(
             0,
             "".to_string(),
         ),
+        Insn::CountMysqlReplaceDelete => (
+            "CountMysqlReplaceDelete",
+            0,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            "".to_string(),
+        ),
         Insn::IdxDelete {
             cursor_id,
             start_reg,

@@ -23,9 +23,10 @@ use turso_mysql_checkpoint_authority::{
 };
 #[cfg(unix)]
 use turso_mysql_server::{
-    AccountStoreCheckpointReader, CheckpointAuthorityId, DEFAULT_MAX_PREPARED_STMT_COUNT,
-    RuntimeConfig, RuntimeLimits, RuntimeTcpServer, RuntimeTcpServerRunError, RuntimeTimeouts,
-    RuntimeUnixServer, RuntimeUnixServerRunError, TcpConfig, TlsConfig, UnixSocketConfig,
+    AccountStoreAdminAuthority, AccountStoreCheckpointReader, CheckpointAuthorityId, RuntimeConfig,
+    RuntimeLimits, RuntimeTcpServer, RuntimeTcpServerRunError, RuntimeTimeouts, RuntimeUnixServer,
+    RuntimeUnixServerRunError, TcpConfig, TlsConfig, UnixSocketConfig,
+    DEFAULT_MAX_PREPARED_STMT_COUNT,
 };
 
 #[cfg(unix)]
@@ -282,12 +283,28 @@ fn run(arguments: Arguments) -> Result<(), DaemonError> {
         authority_client,
     } = configuration;
     let authority: Arc<dyn AccountStoreCheckpointReader> = Arc::new(
+        UnixCheckpointAuthorityClient::new(authority_client.clone())
+            .map_err(|_| DaemonError::Authority)?,
+    );
+    let account_authority: Box<dyn AccountStoreAdminAuthority> = Box::new(
         UnixCheckpointAuthorityClient::new(authority_client).map_err(|_| DaemonError::Authority)?,
     );
     if runtime.tcp().is_some() {
-        run_tcp(runtime, authority, stop_requested, shutdown)
+        run_tcp(
+            runtime,
+            authority,
+            account_authority,
+            stop_requested,
+            shutdown,
+        )
     } else {
-        run_unix(runtime, authority, stop_requested, shutdown)
+        run_unix(
+            runtime,
+            authority,
+            account_authority,
+            stop_requested,
+            shutdown,
+        )
     }
 }
 
@@ -295,10 +312,13 @@ fn run(arguments: Arguments) -> Result<(), DaemonError> {
 fn run_unix(
     runtime: RuntimeConfig,
     authority: Arc<dyn AccountStoreCheckpointReader>,
+    account_authority: Box<dyn AccountStoreAdminAuthority>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<OnceLock<RuntimeShutdownHandle>>,
 ) -> Result<(), DaemonError> {
-    let server = RuntimeUnixServer::bind(&runtime, authority).map_err(|_| DaemonError::Bind)?;
+    let server =
+        RuntimeUnixServer::bind_with_account_authority(&runtime, authority, account_authority)
+            .map_err(|_| DaemonError::Bind)?;
     let shutdown_handle = server.shutdown_handle();
     shutdown
         .set(RuntimeShutdownHandle::Unix(shutdown_handle.clone()))
@@ -325,10 +345,13 @@ fn run_unix(
 fn run_tcp(
     runtime: RuntimeConfig,
     authority: Arc<dyn AccountStoreCheckpointReader>,
+    account_authority: Box<dyn AccountStoreAdminAuthority>,
     stop_requested: Arc<AtomicBool>,
     shutdown: Arc<OnceLock<RuntimeShutdownHandle>>,
 ) -> Result<(), DaemonError> {
-    let server = RuntimeTcpServer::bind(&runtime, authority).map_err(|_| DaemonError::Bind)?;
+    let server =
+        RuntimeTcpServer::bind_with_account_authority(&runtime, authority, account_authority)
+            .map_err(|_| DaemonError::Bind)?;
     let shutdown_handle = server.shutdown_handle();
     shutdown
         .set(RuntimeShutdownHandle::Tcp(shutdown_handle.clone()))

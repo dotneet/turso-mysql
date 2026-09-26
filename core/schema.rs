@@ -809,6 +809,7 @@ pub struct Schema {
 
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
+    pub(crate) mysql_decimal_types_enabled: bool,
 
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
@@ -821,7 +822,11 @@ impl Default for Schema {
     }
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
+fn bootstrap_builtin_types(
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+    enable_custom_types: bool,
+    enable_mysql_decimal_types: bool,
+) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
 
@@ -855,8 +860,22 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
+    let mysql_type_sqls: &[&str] = &[
+        "CREATE TYPE mysql_decimal(value any, precision integer, scale integer) BASE blob ENCODE mysql_decimal_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE mysql_decimal_unsigned(value any, precision integer, scale integer) BASE blob ENCODE mysql_unsigned_decimal_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+    ];
 
-    for sql in type_sqls {
+    for sql in type_sqls
+        .iter()
+        .copied()
+        .filter(|_| enable_custom_types)
+        .chain(
+            mysql_type_sqls
+                .iter()
+                .copied()
+                .filter(|_| enable_mysql_decimal_types),
+        )
+    {
         let mut parser = Parser::new(sql.as_bytes());
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
@@ -877,12 +896,19 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         ("int2", "smallint"),
         ("int8", "bigint"),
     ];
-    for (alias, target) in aliases {
-        if let Some(type_def) = registry.get(*target).cloned() {
-            registry.insert(alias.to_string(), type_def);
+    if enable_custom_types {
+        for (alias, target) in aliases {
+            if let Some(type_def) = registry.get(*target).cloned() {
+                registry.insert(alias.to_string(), type_def);
+            }
         }
     }
     Ok(())
+}
+
+pub(crate) fn is_mysql_decimal_type(type_name: &str) -> bool {
+    type_name.eq_ignore_ascii_case("mysql_decimal")
+        || type_name.eq_ignore_ascii_case("mysql_decimal_unsigned")
 }
 
 impl Schema {
@@ -932,9 +958,13 @@ impl Schema {
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
         let incompatible_views = HashSet::default();
         let mut type_registry = HashMap::default();
-        if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry)?;
-        }
+        let mysql_decimal_types_enabled =
+            dialect.database_file_owner() == crate::dialect::DatabaseFileOwner::MySql;
+        bootstrap_builtin_types(
+            &mut type_registry,
+            enable_custom_types,
+            mysql_decimal_types_enabled,
+        )?;
         let mut schema = Self {
             tables,
             table_sql: HashMap::default(),
@@ -954,6 +984,7 @@ impl Schema {
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
+            mysql_decimal_types_enabled,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
         };
@@ -984,10 +1015,9 @@ impl Schema {
     }
 
     /// Look up a custom type definition by name.
-    /// Custom types are only valid on STRICT tables; pass `is_strict` from the
-    /// owning table so that non-STRICT tables never resolve a custom type.
+    /// MySQL DECIMAL uses the custom type pipeline on ordinary MySQL tables.
     pub fn get_type_def(&self, type_name: &str, is_strict: bool) -> Option<&Arc<TypeDef>> {
-        if !is_strict {
+        if !is_strict && !self.is_builtin_mysql_decimal_type(type_name) {
             return None;
         }
         self.type_registry.get(&type_name.to_lowercase())
@@ -1002,16 +1032,25 @@ impl Schema {
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
     /// the base-type chain to the ultimate primitive.
-    /// Returns `Ok(None)` if the type is not registered (or the table isn't strict).
+    /// Returns `Ok(None)` if the type is not registered or is unavailable on this table.
     pub fn resolve_type(
         &self,
         type_name: &str,
         is_strict: bool,
     ) -> crate::Result<Option<ResolvedType>> {
-        if !is_strict {
+        if !is_strict && !self.is_builtin_mysql_decimal_type(type_name) {
             return Ok(None);
         }
         self.resolve_type_unchecked(type_name)
+    }
+
+    pub(crate) fn is_builtin_mysql_decimal_type(&self, type_name: &str) -> bool {
+        self.mysql_decimal_types_enabled
+            && is_mysql_decimal_type(type_name)
+            && self
+                .type_registry
+                .get(&type_name.to_lowercase())
+                .is_some_and(|type_def| type_def.is_builtin)
     }
 
     /// Resolve a custom type fully without a strictness check.
@@ -1115,18 +1154,24 @@ impl Schema {
         Ok(())
     }
 
-    /// Resolve custom type affinities for all STRICT tables in the schema.
+    /// Resolve custom type affinities for STRICT and MySQL DECIMAL tables.
     /// Call this after loading user-defined types from __turso_internal_types
     /// so that columns declared with custom types use the BASE type's affinity.
     pub fn resolve_all_custom_type_affinities(&mut self) -> Result<()> {
         let mut tables: SmallVec<[(String, Arc<Table>); 8]> = SmallVec::with_capacity(8);
         for (name, table) in self.tables.iter().filter(|(_, t)| {
-            t.is_strict()
-                && t.btree().is_some_and(|bt| {
-                    bt.columns
+            t.btree().is_some_and(|bt| {
+                (t.is_strict()
+                    || bt
+                        .columns
                         .iter()
-                        .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
-                })
+                        .any(|col| self.is_builtin_mysql_decimal_type(&col.ty_str)))
+                    && {
+                        bt.columns
+                            .iter()
+                            .any(|c| self.get_type_def_unchecked(&c.ty_str).is_some())
+                    }
+            })
         }) {
             let bt = table.btree().expect("checked btree table");
             let mut modified = (*bt).clone();
@@ -2974,6 +3019,7 @@ impl TryClone for Schema {
             broken_views: self.broken_views.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
+            mysql_decimal_types_enabled: self.mysql_decimal_types_enabled,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
         })
@@ -3609,10 +3655,10 @@ impl BTreeTable {
     /// instead of the custom type name (e.g. "doubled" contains "DOUB"
     /// which would incorrectly map to REAL instead of INTEGER).
     pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
-        if !self.is_strict {
-            return;
-        }
         for col in &mut self.columns {
+            if !self.is_strict && !schema.is_builtin_mysql_decimal_type(&col.ty_str) {
+                continue;
+            }
             if col.is_array() {
                 // Arrays are stored as record-format blobs regardless of element type.
                 col.set_ty(Type::Blob);
@@ -3625,6 +3671,12 @@ impl BTreeTable {
                 col.override_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
+    }
+
+    pub fn has_mysql_decimal_columns(&self) -> bool {
+        self.columns
+            .iter()
+            .any(|col| is_mysql_decimal_type(&col.ty_str) && col.affinity() == Affinity::Blob)
     }
 
     /// Propagate domain NOT NULL and CHECK constraints to table columns.
@@ -3796,6 +3848,8 @@ impl BTreeTable {
                     CollationSeq::Binary => sql.push_str(" COLLATE BINARY"),
                     CollationSeq::NoCase => sql.push_str(" COLLATE NOCASE"),
                     CollationSeq::Rtrim => sql.push_str(" COLLATE RTRIM"),
+                    CollationSeq::MySqlUtf8mb4Bin => sql.push_str(" COLLATE MYSQL_UTF8MB4_BIN"),
+                    CollationSeq::MySqlUca9 => sql.push_str(" COLLATE MYSQL_UCA9_AI_CI"),
                     CollationSeq::Locale(_) => {
                         sql.push_str(" COLLATE ");
                         sql.push_str(&quote_ident(&collation.name()));

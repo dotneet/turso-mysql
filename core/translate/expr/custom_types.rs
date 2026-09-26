@@ -44,7 +44,17 @@ pub(super) fn emit_custom_type_operator(
     // registers (constant optimization), and encoding in-place would clobber
     // that register — breaking subsequent loop iterations.
     let func_start = if let Some(ref encode_info) = resolved.encode_info {
-        if let Some(encode_expr) = encode_info.type_def.encode() {
+        if resolver
+            .schema()
+            .is_builtin_mysql_decimal_type(&encode_info.column.ty_str)
+        {
+            // A DECIMAL literal keeps its own scale during arithmetic and comparison.
+            // Encoding it at the column scale here rounds it too early.
+            let arg_reg = program.alloc_registers(2);
+            translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
+            translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
+            arg_reg
+        } else if let Some(encode_expr) = encode_info.type_def.encode() {
             // Translate operands into temporary registers first.
             let tmp1 = program.alloc_register();
             let tmp2 = program.alloc_register();

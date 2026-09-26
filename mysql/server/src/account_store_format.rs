@@ -11,7 +11,8 @@ use crate::{MAX_CLIENT_USERNAME_LENGTH, SHA256_DIGEST_LENGTH};
 
 const MAGIC: [u8; 8] = *b"TURSAUTH";
 const LEGACY_VERSION: u16 = 1;
-const VERSION: u16 = 2;
+const TABLE_GRANT_VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LENGTH: usize = 68;
 const CHECKSUM_LENGTH: usize = 4;
 const ACCOUNT_FIXED_LENGTH: usize = 2 + 2 + 1 + 1 + 2 + SHA256_DIGEST_LENGTH * 2;
@@ -26,7 +27,9 @@ const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 const ENABLED_FLAG: u8 = 0x01;
 const GLOBAL_CONNECT_FLAG: u8 = 0x02;
 const GLOBAL_LIST_FLAG: u8 = 0x04;
-const ACCOUNT_FLAGS: u8 = ENABLED_FLAG | GLOBAL_CONNECT_FLAG | GLOBAL_LIST_FLAG;
+const GLOBAL_MANAGE_ACCOUNTS_FLAG: u8 = 0x08;
+const ACCOUNT_FLAGS: u8 =
+    ENABLED_FLAG | GLOBAL_CONNECT_FLAG | GLOBAL_LIST_FLAG | GLOBAL_MANAGE_ACCOUNTS_FLAG;
 pub(crate) const DATABASE_GRANT_CONNECT_BIT: u8 = 0x01;
 pub(crate) const DATABASE_GRANT_QUERY_BIT: u8 = 0x02;
 pub(crate) const DATABASE_GRANT_CREATE_BIT: u8 = 0x04;
@@ -56,6 +59,7 @@ pub(crate) struct StoredAccountRecord {
     pub(crate) verifier: Box<[u8; SHA256_DIGEST_LENGTH]>,
     pub(crate) global_connect: bool,
     pub(crate) global_list: bool,
+    pub(crate) global_manage_accounts: bool,
     pub(crate) database_grants: Vec<StoredDatabaseGrant>,
     pub(crate) table_grants: Vec<StoredTableGrant>,
 }
@@ -95,6 +99,7 @@ impl fmt::Debug for StoredAccountRecord {
             .field("verifier", &"<redacted>")
             .field("global_connect", &self.global_connect)
             .field("global_list", &self.global_list)
+            .field("global_manage_accounts", &self.global_manage_accounts)
             .field("database_grants", &self.database_grants)
             .field("table_grants", &self.table_grants)
             .finish()
@@ -370,7 +375,7 @@ impl StoredAuthSnapshot {
             return Err(AccountStoreFormatError::InvalidMagic);
         }
         let version = read_u16(bytes, 8)?;
-        if version != LEGACY_VERSION && version != VERSION {
+        if version != LEGACY_VERSION && version != TABLE_GRANT_VERSION && version != VERSION {
             return Err(AccountStoreFormatError::UnsupportedVersion);
         }
         if read_u16(bytes, 10)? as usize != HEADER_LENGTH {
@@ -612,6 +617,7 @@ fn account_flags(account: &StoredAccountRecord) -> u8 {
     ((account.enabled as u8) * ENABLED_FLAG)
         | ((account.global_connect as u8) * GLOBAL_CONNECT_FLAG)
         | ((account.global_list as u8) * GLOBAL_LIST_FLAG)
+        | ((account.global_manage_accounts as u8) * GLOBAL_MANAGE_ACCOUNTS_FLAG)
 }
 
 fn account_length(
@@ -650,7 +656,9 @@ fn decode_account(
     let username_length = reader.read_u16()? as usize;
     let grant_count = reader.read_u16()? as usize;
     let flags = reader.read_u8()?;
-    if flags & !ACCOUNT_FLAGS != 0 {
+    if flags & !ACCOUNT_FLAGS != 0
+        || (version != VERSION && flags & GLOBAL_MANAGE_ACCOUNTS_FLAG != 0)
+    {
         return Err(AccountStoreFormatError::InvalidFlags);
     }
     if reader.read_u8()? != 0 {
@@ -753,6 +761,7 @@ fn decode_account(
         verifier,
         global_connect: flags & GLOBAL_CONNECT_FLAG != 0,
         global_list: flags & GLOBAL_LIST_FLAG != 0,
+        global_manage_accounts: flags & GLOBAL_MANAGE_ACCOUNTS_FLAG != 0,
         database_grants,
         table_grants,
     })
@@ -905,6 +914,7 @@ mod tests {
             verifier: Box::new([id.wrapping_add(0x80); SHA256_DIGEST_LENGTH]),
             global_connect: id % 2 == 0,
             global_list: id % 3 == 0,
+            global_manage_accounts: false,
             database_grants: database_grants
                 .into_iter()
                 .map(|(database_name, bits)| StoredDatabaseGrant {
@@ -1032,6 +1042,36 @@ mod tests {
     }
 
     #[test]
+    fn account_management_flag_requires_v3_and_round_trips() {
+        let mut value = snapshot();
+        value
+            .accounts
+            .iter_mut()
+            .find(|account| account.username == "alice")
+            .unwrap()
+            .global_manage_accounts = true;
+        let encoded = encode_bytes(&value);
+        let decoded = StoredAuthSnapshot::decode(&encoded).unwrap();
+        assert!(decoded.accounts[0].global_manage_accounts);
+        assert!(!decoded.accounts[1].global_manage_accounts);
+
+        let mut previous_version = encoded;
+        previous_version[8..10].copy_from_slice(&TABLE_GRANT_VERSION.to_be_bytes());
+        assert_eq!(
+            StoredAuthSnapshot::decode(&with_recomputed_checksum(previous_version)),
+            Err(AccountStoreFormatError::InvalidFlags)
+        );
+
+        let mut compatible = encode_bytes(&snapshot());
+        compatible[8..10].copy_from_slice(&TABLE_GRANT_VERSION.to_be_bytes());
+        let decoded = StoredAuthSnapshot::decode(&with_recomputed_checksum(compatible)).unwrap();
+        assert!(decoded
+            .accounts
+            .iter()
+            .all(|account| !account.global_manage_accounts));
+    }
+
+    #[test]
     fn encode_sorts_retired_ids_but_decode_requires_sorted_ids() {
         let mut value = snapshot();
         value.retired_account_ids =
@@ -1145,7 +1185,7 @@ mod tests {
         );
 
         let mut bad_version = encoded.clone();
-        bad_version[8..10].copy_from_slice(&3u16.to_be_bytes());
+        bad_version[8..10].copy_from_slice(&(VERSION + 1).to_be_bytes());
         assert_eq!(
             StoredAuthSnapshot::decode(&bad_version),
             Err(AccountStoreFormatError::UnsupportedVersion)

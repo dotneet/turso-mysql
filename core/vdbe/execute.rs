@@ -223,7 +223,7 @@ pub type InsnFunction = fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> I
 fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     use bigdecimal::BigDecimal;
     use std::str::FromStr;
-    match val {
+    let decimal = match val {
         Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
             .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
@@ -233,7 +233,17 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
         ))),
+    }?;
+    let (_, scale) = decimal.as_bigint_and_exponent();
+    if !(-crate::numeric::decimal::MAX_SCALE_MAGNITUDE
+        ..=crate::numeric::decimal::MAX_SCALE_MAGNITUDE)
+        .contains(&scale)
+    {
+        return Err(LimboError::Constraint(format!(
+            "numeric scale {scale} out of range"
+        )));
     }
+    Ok(decimal)
 }
 
 /// Create a sort comparator closure from a SortComparatorType enum.
@@ -3739,6 +3749,9 @@ pub fn halt(
                     program
                         .connection
                         .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+                    program.connection.set_mysql_replaced_rows(
+                        state.n_mysql_replaced_rows.load(Ordering::SeqCst),
+                    );
                     program
                         .connection
                         .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
@@ -3775,6 +3788,9 @@ pub fn halt(
                 program
                     .connection
                     .set_mysql_changed_rows(state.n_mysql_changed_rows.load(Ordering::SeqCst));
+                program
+                    .connection
+                    .set_mysql_replaced_rows(state.n_mysql_replaced_rows.load(Ordering::SeqCst));
                 program
                     .connection
                     .set_mysql_updated_rows(state.n_mysql_updated_rows.load(Ordering::SeqCst));
@@ -6989,6 +7005,11 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             payload.push(Value::from_f64(0.0));
             payload.push(Value::from_i64(0));
         }
+        AggFunc::MysqlDecimalSum | AggFunc::MysqlDecimalAvg => {
+            payload.push(Value::Null);
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
+        }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
         AggFunc::GroupConcat | AggFunc::StringAgg => {
             // Use Null as sentinel to distinguish "no values yet" from an
@@ -7097,6 +7118,45 @@ fn update_agg_payload(
                 ));
             };
             *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::MysqlDecimalSum | AggFunc::MysqlDecimalAvg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let number = value_to_bigdecimal(arg)?;
+            let (_, input_scale) = number.as_bigint_and_exponent();
+            if !(0..=30).contains(&input_scale) || number.digits() > 65 {
+                return Err(LimboError::Constraint(
+                    "invalid input for MySQL DECIMAL aggregate".to_string(),
+                ));
+            }
+            let [total, count_value, scale_value, ..] = payload.as_mut_slice() else {
+                return Err(LimboError::InternalError(
+                    "DECIMAL aggregate payload too short".to_string(),
+                ));
+            };
+            let Value::Numeric(Numeric::Integer(count)) = count_value else {
+                return Err(LimboError::InternalError(
+                    "DECIMAL aggregate count is not an integer".to_string(),
+                ));
+            };
+            let Value::Numeric(Numeric::Integer(scale)) = scale_value else {
+                return Err(LimboError::InternalError(
+                    "DECIMAL aggregate scale is not an integer".to_string(),
+                ));
+            };
+            let next = match total {
+                Value::Null => number,
+                Value::Blob(blob) => crate::numeric::decimal::blob_to_bigdecimal(blob)? + number,
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "DECIMAL aggregate total is invalid".to_string(),
+                    ))
+                }
+            };
+            *total = Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&next));
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            *scale = (*scale).max(input_scale);
         }
         AggFunc::Avg => {
             if matches!(arg, Value::Null) {
@@ -7442,6 +7502,34 @@ fn update_agg_payload(
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
+        AggFunc::MysqlDecimalSum | AggFunc::MysqlDecimalAvg => {
+            let count = payload[1].as_int().ok_or_else(|| {
+                LimboError::InternalError("DECIMAL aggregate count is invalid".to_string())
+            })?;
+            if count == 0 {
+                Value::Null
+            } else {
+                let Value::Blob(blob) = &payload[0] else {
+                    return Err(LimboError::InternalError(
+                        "DECIMAL aggregate total is invalid".to_string(),
+                    ));
+                };
+                let total = crate::numeric::decimal::blob_to_bigdecimal(blob)?;
+                let scale = payload[2].as_int().ok_or_else(|| {
+                    LimboError::InternalError("DECIMAL aggregate scale is invalid".to_string())
+                })?;
+                let result = if matches!(func, AggFunc::MysqlDecimalAvg) {
+                    crate::numeric::decimal::mysql_decimal_average(
+                        &total,
+                        count,
+                        (scale + 4).min(30),
+                    )
+                } else {
+                    total.with_scale(scale)
+                };
+                Value::build_text(crate::numeric::decimal::format_numeric(&result))
+            }
+        }
         AggFunc::Avg => {
             // Payload: [sum, r_err, count]
             let count = payload[2].as_int().unwrap_or(0);
@@ -8524,6 +8612,8 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
         }
         AggFunc::Min
         | AggFunc::Max
+        | AggFunc::MysqlDecimalSum
+        | AggFunc::MysqlDecimalAvg
         | AggFunc::ArrayAgg
         | AggFunc::Mode
         | AggFunc::PercentileCont
@@ -10650,7 +10740,9 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
-            ScalarFunc::NumericEncode => {
+            ScalarFunc::NumericEncode
+            | ScalarFunc::MysqlDecimalEncode
+            | ScalarFunc::MysqlUnsignedDecimalEncode => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
@@ -10698,8 +10790,17 @@ pub fn op_function(
                                 "invalid input for type numeric: \"{text}\""
                             ))
                         })?;
-                        let validated = validate_precision_scale(&bd, precision, scale)?;
-                        Value::from_blob(bigdecimal_to_blob(&validated))
+                        if matches!(scalar_func, ScalarFunc::NumericEncode) {
+                            let validated = validate_precision_scale(&bd, precision, scale)?;
+                            Value::from_blob(bigdecimal_to_blob(&validated))
+                        } else {
+                            Value::from_blob(crate::numeric::decimal::mysql_decimal_to_blob(
+                                &bd,
+                                precision,
+                                scale,
+                                matches!(scalar_func, ScalarFunc::MysqlUnsignedDecimalEncode),
+                            )?)
+                        }
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10719,6 +10820,82 @@ pub fn op_function(
                         ))
                         .into());
                     }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::MysqlDecimalRound => {
+                check_arg_count!(arg_count, 2);
+                let value = state.registers[*start_reg].get_value();
+                let result = if matches!(value, Value::Null) {
+                    Value::Null
+                } else {
+                    let scale = match state.registers[*start_reg + 1].get_value() {
+                        Value::Numeric(Numeric::Integer(scale @ 0..=30)) => *scale,
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "MySQL DECIMAL scale must be between 0 and 30".to_string(),
+                            )
+                            .into())
+                        }
+                    };
+                    let decimal = value_to_bigdecimal(value)?;
+                    let rounded = decimal.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp);
+                    Value::build_text(crate::numeric::decimal::format_numeric(&rounded))
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::MysqlDecimalTruncate => {
+                check_arg_count!(arg_count, 2);
+                let value = state.registers[*start_reg].get_value();
+                let places_value = state.registers[*start_reg + 1].get_value();
+                let result = if matches!(value, Value::Null) || matches!(places_value, Value::Null)
+                {
+                    Value::Null
+                } else {
+                    let places = match places_value {
+                        Value::Numeric(Numeric::Integer(places)) => *places,
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "MySQL DECIMAL TRUNCATE places must be an integer".to_string(),
+                            )
+                            .into())
+                        }
+                    };
+                    let decimal = value_to_bigdecimal(value)?;
+                    let (_, scale) = decimal.as_bigint_and_exponent();
+                    if !(0..=30).contains(&scale) {
+                        return Err(LimboError::Constraint(
+                            "invalid input for MySQL DECIMAL TRUNCATE".to_string(),
+                        )
+                        .into());
+                    }
+                    let truncated =
+                        crate::numeric::decimal::mysql_decimal_truncate(&decimal, places);
+                    Value::build_text(crate::numeric::decimal::format_numeric(&truncated))
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::MysqlDecimalDivideRounded => {
+                check_arg_count!(arg_count, 3);
+                let lhs = state.registers[*start_reg].get_value();
+                let rhs = state.registers[*start_reg + 1].get_value();
+                let result = if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+                    Value::Null
+                } else {
+                    let scale = match state.registers[*start_reg + 2].get_value() {
+                        Value::Numeric(Numeric::Integer(scale @ 0..=30)) => *scale,
+                        _ => {
+                            return Err(LimboError::Constraint(
+                                "MySQL DECIMAL scale must be between 0 and 30".to_string(),
+                            )
+                            .into())
+                        }
+                    };
+                    let lhs = value_to_bigdecimal(lhs)?;
+                    let rhs = value_to_bigdecimal(rhs)?;
+                    let quotient =
+                        crate::numeric::decimal::mysql_decimal_divide_rounded(&lhs, &rhs, scale)?;
+                    Value::build_text(crate::numeric::decimal::format_numeric(&quotient))
                 };
                 state.registers[*dest].set_value(result);
             }
@@ -12592,6 +12769,18 @@ pub fn op_delete(
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
         state.record_statement_change();
     }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_count_mysql_replace_delete(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    assert!(matches!(insn, Insn::CountMysqlReplaceDelete));
+    state.record_mysql_replaced_row();
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -19494,7 +19683,7 @@ mod tests {
     use crate::translate::collate::CollationSeq;
     use crate::vdbe::BranchOffset;
     use crate::SqliteDialect;
-    use crate::{Database, DatabaseOpts, MemoryIO, IO};
+    use crate::{Database, DatabaseFileOwner, DatabaseOpts, Dialect, MemoryIO, IO};
 
     fn prepare_test_statement() -> Statement {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -20249,6 +20438,222 @@ mod tests {
         .unwrap();
         assert_eq!(payload[0], Value::from_f64(30.0));
         assert_eq!(payload[2], Value::from_i64(2));
+    }
+
+    #[test]
+    fn mysql_decimal_aggregates_keep_exact_digits_and_scale() {
+        let inputs = [
+            "0.100000000000000000000000000001",
+            "0.100000000000000000000000000001",
+            "0.100000000000000000000000000001",
+        ];
+        for (func, expected) in [
+            (AggFunc::MysqlDecimalSum, "0.300000000000000000000000000003"),
+            (AggFunc::MysqlDecimalAvg, "0.100000000000000000000000000001"),
+        ] {
+            let mut payload = crate::alloc::vec![];
+            init_agg_payload(&func, &mut payload).unwrap();
+            for input in inputs {
+                update_agg_payload(
+                    &func,
+                    &Value::build_text(input),
+                    None,
+                    &mut payload,
+                    CollationSeq::Binary,
+                    || Ok(None),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                finalize_agg_payload(&func, &payload).unwrap(),
+                Value::build_text(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_file_with_mysql_decimal_named_column_keeps_numeric_affinity_after_reopen() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let path = "sqlite-mysql-decimal-type-name.db";
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE d(v mysql_decimal(5,2))")
+            .unwrap();
+        conn.execute("INSERT INTO d VALUES ('1.005')").unwrap();
+        drop(conn);
+        drop(db);
+
+        let reopened = Database::open_file_with_flags(
+            io,
+            path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = reopened.connect().unwrap();
+        let table = conn.current_schema().get_table("d").unwrap();
+        assert_eq!(table.columns()[0].affinity(), Affinity::Numeric);
+        let mut row_count = 0;
+        conn.prepare("SELECT typeof(v), v FROM d")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                row_count += 1;
+                assert_eq!(row.get::<String>(0)?, "real");
+                assert_eq!(row.get::<f64>(1)?, 1.005);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn mysql_decimal_column_roundtrips_on_an_ordinary_table() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "mysql-decimal-ordinary-table.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(MysqlDecimalTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE d(v mysql_decimal(5,2))")
+            .unwrap();
+        let schema = conn.current_schema();
+        let table = schema.get_table("d").unwrap();
+        assert_eq!(table.columns()[0].ty_str, "mysql_decimal");
+        assert_eq!(table.columns()[0].affinity(), Affinity::Blob);
+        conn.execute("INSERT INTO d VALUES ('1.005'), ('-1.005'), ('0.00')")
+            .unwrap();
+        conn.execute("CREATE INDEX d_v ON d(v)").unwrap();
+
+        let mut values = Vec::new();
+        conn.prepare("SELECT v FROM d INDEXED BY d_v ORDER BY v")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                values.push(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(values, ["-1.01", "0.00", "1.01"]);
+
+        let mut totals = None;
+        conn.prepare("SELECT mysql_decimal_sum(v), mysql_decimal_avg(v) FROM d")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                totals = Some((row.get::<String>(0)?, row.get::<String>(1)?));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(totals, Some(("0.00".to_string(), "0.000000".to_string())));
+
+        let mut product = None;
+        conn.prepare("SELECT mysql_decimal_round(numeric_mul('0.100000000000000000000000000001', '0.5'), 30)")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                product = Some(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(product.as_deref(), Some("0.050000000000000000000000000001"));
+
+        let mut quotient = None;
+        conn.prepare("SELECT mysql_decimal_div_round('-1.01', '2', 2)")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                quotient = Some(row.get::<String>(0)?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(quotient.as_deref(), Some("-0.51"));
+
+        let mut truncated = None;
+        conn.prepare(
+            "SELECT mysql_decimal_truncate('-12.34', 1), mysql_decimal_truncate('12.34', -1)",
+        )
+        .unwrap()
+        .run_with_row_callback(|row| {
+            truncated = Some((row.get::<String>(0)?, row.get::<String>(1)?));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(truncated, Some(("-12.3".to_string(), "10".to_string())));
+        conn.prepare("SELECT mysql_decimal_truncate('12.34', NULL)")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                assert_eq!(row.get_value(0), &Value::Null);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    struct MysqlDecimalTestDialect;
+
+    impl Dialect for MysqlDecimalTestDialect {
+        fn name(&self) -> &'static str {
+            "mysql_decimal_test"
+        }
+
+        fn database_file_owner(&self) -> DatabaseFileOwner {
+            DatabaseFileOwner::MySql
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            SqliteDialect.parse(sql)
+        }
+
+        fn parse_table_sql(
+            &self,
+            sql: &str,
+            root_page: i64,
+        ) -> crate::Result<crate::schema::BTreeTable> {
+            SqliteDialect.parse_table_sql(sql, root_page)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            SqliteDialect.parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            SqliteDialect.table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            tbl_name: &turso_parser::ast::QualifiedName,
+            body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            SqliteDialect.format_table_sql(input, tbl_name, body)
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            SqliteDialect.register_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> crate::Result<Option<crate::Func>> {
+            SqliteDialect.resolve_function(name, arg_count)
+        }
     }
 
     #[test]

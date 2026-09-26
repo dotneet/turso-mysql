@@ -104,6 +104,19 @@ expect {
     3
 }
 
+test op-literal-encode-user-type-named-mysql-decimal {
+    CREATE TYPE mysql_decimal(value text) BASE text
+        ENCODE string_reverse(value)
+        DECODE string_reverse(value)
+        OPERATOR '=' test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val mysql_decimal);
+    INSERT INTO t1 VALUES (1, '12');
+    SELECT id FROM t1 WHERE val = '12';
+}
+expect {
+    1
+}
+
 @requires strict "uses STRICT tables"
 test op-literal-lt-multi-rows {
     -- Literal comparison with < across multiple rows (no clobbering).

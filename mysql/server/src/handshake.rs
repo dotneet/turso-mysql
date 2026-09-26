@@ -40,6 +40,8 @@ pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 pub const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 /// Capability bit for length-encoded authentication responses.
 pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
+/// Capability bit permitting more than one statement in `COM_QUERY`.
+pub const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
 /// Capability bit for multiple result sets.
 pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 /// Capability bit for prepared-statement multiple result sets.
@@ -131,7 +133,7 @@ impl InitialHandshakeSettings {
 /// The version this server announces, in the handshake and in `@@version`.
 ///
 /// A client compares the two, so they have to be the same string.
-pub const SERVER_VERSION: &str = "8.0.0-turso";
+pub const SERVER_VERSION: &str = "8.0.36-turso";
 
 /// What this server answers for `@@version_comment`.
 ///
@@ -143,7 +145,10 @@ impl Default for InitialHandshakeSettings {
         Self::new(
             SERVER_VERSION,
             0,
-            REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES | CLIENT_FOUND_ROWS,
+            REQUIRED_INITIAL_HANDSHAKE_CAPABILITIES
+                | CLIENT_FOUND_ROWS
+                | CLIENT_MULTI_STATEMENTS
+                | CLIENT_MULTI_RESULTS,
             DEFAULT_UTF8MB4_COLLATION,
             0x0002,
             "caching_sha2_password",
@@ -523,12 +528,13 @@ fn validate_capabilities(capability_flags: u32) -> Result<(), InitialHandshakeEr
             requires: CLIENT_PLUGIN_AUTH,
         });
     }
-    if capability_flags & (CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS) != 0
+    if capability_flags & (CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS)
+        != 0
         && capability_flags & CLIENT_PROTOCOL_41 == 0
     {
         return Err(InitialHandshakeError::IncompatibleCapabilities {
             flags: capability_flags,
-            capability: CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS,
+            capability: CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS | CLIENT_PS_MULTI_RESULTS,
             requires: CLIENT_PROTOCOL_41,
         });
     }

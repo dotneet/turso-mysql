@@ -1,5 +1,8 @@
 //! MySQL frontend for Turso.
 
+mod alter_table_indexes;
+mod catalog_tables;
+mod create_table_as_select;
 #[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_catalog;
@@ -7,9 +10,6 @@ mod database_catalog;
 mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
-mod alter_table_indexes;
-mod catalog_tables;
-mod create_table_as_select;
 mod dialect;
 mod drop_table;
 pub mod schema_sql;
@@ -17,27 +17,25 @@ mod session;
 pub mod show_create_table;
 mod truncate_table;
 
+pub use alter_table_indexes::MySqlAlterTableIndexError;
+pub use create_table_as_select::MySqlCreateTableAsSelectError;
 #[cfg(unix)]
 pub use database_catalog::{
     canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
-pub use alter_table_indexes::MySqlAlterTableIndexError;
-pub use create_table_as_select::MySqlCreateTableAsSelectError;
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{
-    MySqlColumnDefault, MySqlDropViewError, MySqlIndexEntry, MySqlMarkerType,
-    MySqlShowCreateTableError,
-    MySqlShowCreateTableResult, ParameterMarker,
-    MySqlAffectedRowsMode, MySqlColumnKey, MySqlColumnMetadata, MySqlColumnMetadataError,
-    MySqlConnection, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
-    MySqlPreparedResultColumnTypeMetadata,
-    MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementError,
+    MySqlAffectedRowsMode, MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata,
+    MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlIndexEntry,
+    MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
-    MySqlPreparedStatementMetadata, MySqlPreparedValue, MySqlQueryError, MySqlTable,
-    MySqlTableKind, MySqlWriteResult,
-    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
+    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
+    MySqlQueryError, MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlTable,
+    MySqlTableKind, MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT,
+    MAX_PREPARED_STMT_COUNT,
 };
 pub use truncate_table::MySqlTruncateTableError;
 #[cfg(unix)]

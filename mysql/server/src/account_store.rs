@@ -14,9 +14,9 @@ use std::{
 };
 
 use crate::account_store_format::{
-    StoredAccountRecord, StoredAuthSnapshot, StoredDatabaseGrant, DATABASE_GRANT_CONNECT_BIT,
-    DATABASE_GRANT_CREATE_BIT, DATABASE_GRANT_DROP_BIT, DATABASE_GRANT_QUERY_BIT,
-    StoredTableGrant, TABLE_GRANT_SELECT_BIT,
+    StoredAccountRecord, StoredAuthSnapshot, StoredDatabaseGrant, StoredTableGrant,
+    DATABASE_GRANT_CONNECT_BIT, DATABASE_GRANT_CREATE_BIT, DATABASE_GRANT_DROP_BIT,
+    DATABASE_GRANT_QUERY_BIT, TABLE_GRANT_SELECT_BIT,
 };
 use crate::{
     validate_username, AccountId, AuthenticatedPrincipal, AuthorizationError, CredentialProvider,
@@ -67,6 +67,10 @@ impl AccountDefinition {
         self.global_privileges = privileges;
         self
     }
+
+    pub(crate) fn username(&self) -> &str {
+        &self.username
+    }
 }
 
 impl fmt::Debug for AccountDefinition {
@@ -92,12 +96,23 @@ impl Drop for AccountDefinition {
 pub struct GlobalPrivileges {
     connect: bool,
     list: bool,
+    manage_accounts: bool,
 }
 
 impl GlobalPrivileges {
     /// Creates account-wide permissions.
     pub const fn new(connect: bool, list: bool) -> Self {
-        Self { connect, list }
+        Self {
+            connect,
+            list,
+            manage_accounts: false,
+        }
+    }
+
+    /// Allows this account to change users and their grants.
+    pub const fn with_manage_accounts(mut self, manage_accounts: bool) -> Self {
+        self.manage_accounts = manage_accounts;
+        self
     }
 }
 
@@ -200,6 +215,12 @@ impl DatabasePrivileges {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantMutationError {
+    AccountMissing,
+    PrivilegeMissing,
+}
+
 /// A complete replacement generation for accounts and their database grants.
 #[derive(Default)]
 pub struct AccountGenerationBuilder {
@@ -249,6 +270,104 @@ impl AccountGenerationBuilder {
     pub fn with_table_grant(mut self, grant: TableGrant) -> Self {
         self.add_table_grant(grant);
         self
+    }
+
+    pub(crate) fn contains_username(&self, username: &str) -> bool {
+        self.accounts
+            .iter()
+            .any(|account| account.username == username)
+    }
+
+    pub(crate) fn can_manage_accounts(&self, account_id: &AccountId) -> bool {
+        self.accounts.iter().any(|account| {
+            &account.account_id == account_id
+                && account.enabled
+                && account.global_privileges.connect
+                && account.global_privileges.manage_accounts
+        })
+    }
+
+    pub(crate) fn change_database_privileges(
+        &mut self,
+        username: &str,
+        database: &str,
+        privileges: DatabasePrivileges,
+        grant: bool,
+    ) -> Result<(), GrantMutationError> {
+        let account_id = self
+            .accounts
+            .iter()
+            .find(|account| account.username == username)
+            .map(|account| account.account_id.clone())
+            .ok_or(GrantMutationError::AccountMissing)?;
+        let existing = self
+            .grants
+            .iter()
+            .position(|entry| entry.account_id == account_id && entry.database == database);
+        match (existing, grant) {
+            (Some(index), true) => {
+                let current = &mut self.grants[index].privileges;
+                current.connect |= privileges.connect;
+                current.query |= privileges.query;
+                current.create |= privileges.create;
+                current.drop |= privileges.drop;
+            }
+            (None, true) if !privileges.is_empty() => self
+                .grants
+                .push(DatabaseGrant::new(account_id, database, privileges)),
+            (Some(index), false) => {
+                let current = &mut self.grants[index].privileges;
+                if (privileges.connect && !current.connect)
+                    || (privileges.query && !current.query)
+                    || (privileges.create && !current.create)
+                    || (privileges.drop && !current.drop)
+                {
+                    return Err(GrantMutationError::PrivilegeMissing);
+                }
+                current.connect &= !privileges.connect;
+                current.query &= !privileges.query;
+                current.create &= !privileges.create;
+                current.drop &= !privileges.drop;
+                if current.is_empty() {
+                    self.grants.remove(index);
+                }
+            }
+            (None, false) => return Err(GrantMutationError::PrivilegeMissing),
+            (None, true) => return Err(GrantMutationError::PrivilegeMissing),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn change_table_privileges(
+        &mut self,
+        username: &str,
+        database: &str,
+        table: &str,
+        privileges: TablePrivileges,
+        grant: bool,
+    ) -> Result<(), GrantMutationError> {
+        let account_id = self
+            .accounts
+            .iter()
+            .find(|account| account.username == username)
+            .map(|account| account.account_id.clone())
+            .ok_or(GrantMutationError::AccountMissing)?;
+        let existing = self.table_grants.iter().position(|entry| {
+            entry.account_id == account_id && entry.database == database && entry.table == table
+        });
+        match (existing, grant) {
+            (Some(index), true) => self.table_grants[index].privileges.select |= privileges.select,
+            (None, true) if !privileges.is_empty() => self
+                .table_grants
+                .push(TableGrant::new(account_id, database, table, privileges)),
+            (Some(index), false)
+                if privileges.select && self.table_grants[index].privileges.select =>
+            {
+                self.table_grants.remove(index);
+            }
+            _ => return Err(GrantMutationError::PrivilegeMissing),
+        }
+        Ok(())
     }
 
     fn build(self, revision: u64) -> Result<AccountGeneration, AccountStoreConfigError> {
@@ -784,10 +903,10 @@ impl AccountGeneration {
                     account.enabled,
                     *account.verifier,
                 )
-                .with_global_privileges(GlobalPrivileges::new(
-                    account.global_connect,
-                    account.global_list,
-                )),
+                .with_global_privileges(
+                    GlobalPrivileges::new(account.global_connect, account.global_list)
+                        .with_manage_accounts(account.global_manage_accounts),
+                ),
             );
             for grant in &account.database_grants {
                 if grant.bits == 0
@@ -868,6 +987,7 @@ impl AccountGeneration {
                     verifier: Box::new(*account.credential.verifier_material()),
                     global_connect: authorization.global_privileges.connect,
                     global_list: authorization.global_privileges.list,
+                    global_manage_accounts: authorization.global_privileges.manage_accounts,
                     database_grants,
                     table_grants,
                 }
@@ -947,7 +1067,17 @@ impl AccountGeneration {
             DatabaseAction::Connect { database: None } => Ok(()),
             DatabaseAction::Connect {
                 database: Some(database),
-            } => authorization.require_database(database, DatabasePermission::Connect),
+            } => {
+                if authorization
+                    .table_privileges
+                    .get(database)
+                    .is_some_and(|tables| !tables.is_empty())
+                {
+                    Ok(())
+                } else {
+                    authorization.require_database(database, DatabasePermission::Connect)
+                }
+            }
             DatabaseAction::Query { database } => {
                 authorization.require_database(database, DatabasePermission::Query)
             }
@@ -959,6 +1089,10 @@ impl AccountGeneration {
             }
             DatabaseAction::List if authorization.global_privileges.list => Ok(()),
             DatabaseAction::List => Err(AuthorizationError::Denied),
+            DatabaseAction::ManageAccounts if authorization.global_privileges.manage_accounts => {
+                Ok(())
+            }
+            DatabaseAction::ManageAccounts => Err(AuthorizationError::Denied),
         }
     }
 
@@ -1149,6 +1283,122 @@ mod tests {
     }
 
     #[test]
+    fn account_management_requires_a_separate_global_privilege() {
+        let store = AccountStore::new(
+            AccountGenerationBuilder::new()
+                .with_account(account("admin", 1, 0x11).with_global_privileges(
+                    GlobalPrivileges::new(true, true).with_manage_accounts(true),
+                ))
+                .with_account(account("reader", 2, 0x22)),
+        )
+        .unwrap();
+        assert_eq!(
+            store.authorize(&principal(1), DatabaseAction::ManageAccounts),
+            Ok(())
+        );
+        assert_eq!(
+            store.authorize(&principal(2), DatabaseAction::ManageAccounts),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
+    fn grant_mutation_preserves_other_accounts_and_revoke_requires_a_grant() {
+        let mut builder = AccountGenerationBuilder::new()
+            .with_account(account("admin", 1, 0x11))
+            .with_account(account("reader", 2, 0x22));
+        assert_eq!(
+            builder.change_table_privileges(
+                "missing",
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+                true,
+            ),
+            Err(GrantMutationError::AccountMissing)
+        );
+        assert_eq!(
+            builder.change_table_privileges(
+                "reader",
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+                false,
+            ),
+            Err(GrantMutationError::PrivilegeMissing)
+        );
+        builder
+            .change_table_privileges(
+                "reader",
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+                true,
+            )
+            .unwrap();
+        let store = AccountStore::new(builder).unwrap();
+        assert_eq!(
+            store.authorize(
+                &principal(2),
+                DatabaseAction::Connect {
+                    database: Some("reports"),
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            store.authorize_table(
+                &principal(2),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            store.authorize_table(
+                &principal(1),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+        let mut replacement = store.full_generation_builder().unwrap();
+        replacement
+            .change_table_privileges(
+                "reader",
+                "reports",
+                "records",
+                TablePrivileges::new(true),
+                false,
+            )
+            .unwrap();
+        store.replace(0, replacement).unwrap();
+        assert_eq!(
+            store.authorize(
+                &principal(2),
+                DatabaseAction::Connect {
+                    database: Some("reports"),
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+        assert_eq!(
+            store.authorize_table(
+                &principal(2),
+                TableAction::Select {
+                    database: "reports",
+                    table: "records",
+                },
+            ),
+            Err(AuthorizationError::Denied)
+        );
+    }
+
+    #[test]
     fn lookup_and_authorization_share_one_complete_generation() {
         let store = AccountStore::new(
             AccountGenerationBuilder::new()
@@ -1299,7 +1549,7 @@ mod tests {
             ),
             Ok(())
         );
-        // A table grant is checked independently; selecting the database still needs Connect.
+        // A table grant makes its database selectable without granting access to other tables.
         assert_eq!(
             store.authorize(
                 &principal,
@@ -1307,7 +1557,7 @@ mod tests {
                     database: Some("reports"),
                 },
             ),
-            Err(AuthorizationError::Denied)
+            Ok(())
         );
         for action in [
             TableAction::Select {

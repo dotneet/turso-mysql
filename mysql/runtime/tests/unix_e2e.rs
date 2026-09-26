@@ -441,22 +441,16 @@ async fn mysql_async_0_37_1_bootstrap_authenticates_and_serves_prepared_queries_
         ]]
     );
 
-    for (query, description) in [
-        (
-            "SELECT tiny FROM runtime_integer_widths WHERE tiny = 1.5",
-            "floating-point text equality",
-        ),
-        (
-            "SELECT tiny FROM runtime_integer_widths WHERE tiny = '1'",
-            "string text equality",
-        ),
-    ] {
-        let error: Error = connection
-            .query::<Row, _>(query)
-            .await
-            .expect_err(description);
-        assert_mysql_error(error, 1064, "42000");
-    }
+    let fractional_rows: Vec<Row> = connection
+        .query("SELECT tiny FROM runtime_integer_widths WHERE tiny = 1.5")
+        .await
+        .expect("a fractional literal can be compared against an integer column");
+    assert!(fractional_rows.is_empty());
+    let error: Error = connection
+        .query::<Row, _>("SELECT tiny FROM runtime_integer_widths WHERE tiny = '1'")
+        .await
+        .expect_err("string text equality");
+    assert_mysql_error(error, 1235, "42000");
     for (value, description) in [
         (0.5_f64, "floating-point prepared equality"),
         (2.0_f64, "second floating-point prepared equality"),
@@ -720,6 +714,7 @@ fn integer_column_metadata(columns: &[mysql_async::Column]) -> Vec<(ColumnType, 
         .collect()
 }
 
+#[track_caller]
 fn assert_mysql_error(error: Error, code: u16, state: &str) {
     assert!(
         matches!(&error, Error::Server(error) if error.code == code && error.state == state),

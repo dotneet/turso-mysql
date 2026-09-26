@@ -5,8 +5,9 @@ use crate::alloc::TursoVecExt;
 use crate::{LimboError, ValueBlob};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
+const MYSQL_DECIMAL_BLOB_VERSION: u8 = 0x02;
 const FLAG_NEGATIVE: u8 = 0x01;
-const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
+pub(crate) const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 
 /// Serialize a BigDecimal to our portable blob format.
 ///
@@ -60,6 +61,9 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> ValueBlob {
 
 /// Deserialize a BigDecimal from our portable blob format.
 pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
+    if blob.first() == Some(&MYSQL_DECIMAL_BLOB_VERSION) {
+        return mysql_decimal_from_blob(blob);
+    }
     // Minimum size: version(1) + flags(1) + scale(8) + num_limbs(4) = 14
     if blob.len() < 14 {
         return Err(LimboError::Constraint(
@@ -128,6 +132,192 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     let sign = if limbs.is_empty() { Sign::NoSign } else { sign };
     let bigint = BigInt::new(sign, limbs);
     Ok(BigDecimal::new(bigint, scale))
+}
+
+/// Encode a MySQL DECIMAL so that byte ordering also follows numeric ordering
+/// within columns of the same declared precision and scale.
+pub fn mysql_decimal_to_blob(
+    val: &BigDecimal,
+    precision: i64,
+    scale: i64,
+    unsigned: bool,
+) -> crate::Result<ValueBlob> {
+    use bigdecimal::{RoundingMode, Zero};
+
+    if !(1..=65).contains(&precision) || !(0..=30).contains(&scale) || scale > precision {
+        return Err(LimboError::Constraint(format!(
+            "invalid MySQL DECIMAL({precision},{scale})"
+        )));
+    }
+    if unsigned && val < &BigDecimal::zero() {
+        return Err(LimboError::Constraint(
+            "negative value for unsigned DECIMAL".to_string(),
+        ));
+    }
+    let (coefficient, input_scale) = val.as_bigint_and_exponent();
+    let coefficient_digits = coefficient.magnitude().to_string().len() as i128;
+    if coefficient != BigInt::from(0)
+        && coefficient_digits - i128::from(input_scale) > i128::from(precision - scale)
+    {
+        return Err(LimboError::Constraint(format!(
+            "decimal value out of range for DECIMAL({precision},{scale})"
+        )));
+    }
+    let rounded = if coefficient == BigInt::from(0)
+        || i128::from(input_scale) - i128::from(scale) > coefficient_digits
+    {
+        BigDecimal::zero().with_scale_round(scale, RoundingMode::HalfUp)
+    } else {
+        val.with_scale_round(scale, RoundingMode::HalfUp)
+    };
+    let (integer, actual_scale) = rounded.as_bigint_and_exponent();
+    debug_assert_eq!(actual_scale, scale);
+    let digits = integer.magnitude().to_string();
+    if digits.len() > precision as usize {
+        return Err(LimboError::Constraint(format!(
+            "decimal value out of range for DECIMAL({precision},{scale})"
+        )));
+    }
+
+    let negative = integer.sign() == Sign::Minus;
+    let mut blob = <ValueBlob as TursoVecExt<u8>>::with_capacity(3 + precision as usize);
+    blob.push(MYSQL_DECIMAL_BLOB_VERSION);
+    blob.push(scale as u8);
+    blob.push(if negative { 0 } else { 1 });
+    let leading_zeroes = precision as usize - digits.len();
+    blob.extend(std::iter::repeat_n(
+        if negative { b'9' } else { b'0' },
+        leading_zeroes,
+    ));
+    for digit in digits.bytes() {
+        blob.push(if negative {
+            b'9' - (digit - b'0')
+        } else {
+            digit
+        });
+    }
+    Ok(blob)
+}
+
+fn mysql_decimal_from_blob(blob: &[u8]) -> crate::Result<BigDecimal> {
+    if !(4..=68).contains(&blob.len()) || blob[1] > 30 || blob[1] as usize > blob.len() - 3 {
+        return Err(LimboError::Constraint(
+            "invalid MySQL DECIMAL blob".to_string(),
+        ));
+    }
+    let negative = match blob[2] {
+        0 => true,
+        1 => false,
+        _ => {
+            return Err(LimboError::Constraint(
+                "invalid MySQL DECIMAL sign".to_string(),
+            ))
+        }
+    };
+    let mut digits = String::with_capacity(blob.len() - 3);
+    for &digit in &blob[3..] {
+        if !digit.is_ascii_digit() {
+            return Err(LimboError::Constraint(
+                "invalid MySQL DECIMAL digit".to_string(),
+            ));
+        }
+        digits.push(if negative {
+            (b'9' - (digit - b'0')) as char
+        } else {
+            digit as char
+        });
+    }
+    let mut integer = digits
+        .parse::<BigInt>()
+        .map_err(|_| LimboError::Constraint("invalid MySQL DECIMAL integer".to_string()))?;
+    if negative {
+        if integer == BigInt::from(0) {
+            return Err(LimboError::Constraint(
+                "negative zero in MySQL DECIMAL blob".to_string(),
+            ));
+        }
+        integer = -integer;
+    }
+    Ok(BigDecimal::new(integer, blob[1] as i64))
+}
+
+pub fn mysql_decimal_average(total: &BigDecimal, count: i64, output_scale: i64) -> BigDecimal {
+    assert!(count > 0);
+    let (integer, input_scale) = total.as_bigint_and_exponent();
+    assert!(output_scale >= input_scale);
+    let numerator = integer * BigInt::from(10).pow((output_scale - input_scale) as u32);
+    BigDecimal::new(
+        rounded_quotient(&numerator, &BigInt::from(count)),
+        output_scale,
+    )
+}
+
+pub fn mysql_decimal_divide_rounded(
+    lhs: &BigDecimal,
+    rhs: &BigDecimal,
+    output_scale: i64,
+) -> crate::Result<BigDecimal> {
+    use bigdecimal::Zero;
+
+    if rhs.is_zero() {
+        return Err(LimboError::Constraint("division by zero".to_string()));
+    }
+    let (lhs_integer, lhs_scale) = lhs.as_bigint_and_exponent();
+    let (rhs_integer, rhs_scale) = rhs.as_bigint_and_exponent();
+    if !(0..=30).contains(&output_scale)
+        || !(-65..=30).contains(&lhs_scale)
+        || !(-65..=30).contains(&rhs_scale)
+    {
+        return Err(LimboError::Constraint(
+            "invalid MySQL DECIMAL division scale".to_string(),
+        ));
+    }
+    let shift = rhs_scale + output_scale - lhs_scale;
+    let ten = BigInt::from(10);
+    let (numerator, denominator) = if shift >= 0 {
+        (lhs_integer * ten.pow(shift as u32), rhs_integer)
+    } else {
+        (lhs_integer, rhs_integer * ten.pow((-shift) as u32))
+    };
+    Ok(BigDecimal::new(
+        rounded_quotient(&numerator, &denominator),
+        output_scale,
+    ))
+}
+
+pub fn mysql_decimal_truncate(value: &BigDecimal, places: i64) -> BigDecimal {
+    let (_, input_scale) = value.as_bigint_and_exponent();
+    if places >= input_scale {
+        return value.clone();
+    }
+    let integer_digits = value.digits() as i64 - input_scale;
+    if places < 0 && places <= -integer_digits {
+        return BigDecimal::from(0);
+    }
+    let truncated = value.with_scale(places);
+    if places < 0 {
+        truncated.with_scale(0)
+    } else {
+        truncated
+    }
+}
+
+fn rounded_quotient(numerator: &BigInt, denominator: &BigInt) -> BigInt {
+    use num_traits::Signed;
+
+    assert_ne!(denominator, &BigInt::from(0));
+    let unsigned_numerator = numerator.abs();
+    let unsigned_denominator = denominator.abs();
+    let mut quotient = &unsigned_numerator / &unsigned_denominator;
+    let remainder = unsigned_numerator % &unsigned_denominator;
+    if remainder * BigInt::from(2) >= unsigned_denominator {
+        quotient += 1;
+    }
+    if (numerator.sign() == Sign::Minus) != (denominator.sign() == Sign::Minus) {
+        -quotient
+    } else {
+        quotient
+    }
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
@@ -265,6 +455,132 @@ mod tests {
         let val = BigDecimal::from_str("12345.67").unwrap();
         let result = validate_precision_scale(&val, 5, 2);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mysql_decimal_rounds_half_away_from_zero_at_declared_scale() {
+        for (input, expected) in [
+            ("1.005", "1.01"),
+            ("-1.005", "-1.01"),
+            ("1.004", "1.00"),
+            ("0", "0.00"),
+        ] {
+            let value = BigDecimal::from_str(input).unwrap();
+            let blob = mysql_decimal_to_blob(&value, 5, 2, false).unwrap();
+            assert_eq!(
+                format_numeric(&blob_to_bigdecimal(&blob).unwrap()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn mysql_decimal_blob_orders_like_numbers_and_has_canonical_equality() {
+        let values = [
+            "-999.99", "-2.00", "-1.01", "-1.00", "-0.01", "0.00", "0.01", "1.00", "99.99",
+        ];
+        let blobs: Vec<_> = values
+            .iter()
+            .map(|value| {
+                mysql_decimal_to_blob(&BigDecimal::from_str(value).unwrap(), 5, 2, false).unwrap()
+            })
+            .collect();
+        assert!(blobs.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            mysql_decimal_to_blob(&BigDecimal::from_str("1.0").unwrap(), 5, 2, false).unwrap(),
+            mysql_decimal_to_blob(&BigDecimal::from_str("1.00").unwrap(), 5, 2, false).unwrap()
+        );
+        for (value, blob) in values.iter().zip(blobs) {
+            assert_eq!(format_numeric(&blob_to_bigdecimal(&blob).unwrap()), *value);
+        }
+    }
+
+    #[test]
+    fn mysql_decimal_rejects_unsigned_negative_and_rounding_overflow() {
+        assert!(
+            mysql_decimal_to_blob(&BigDecimal::from_str("-0.01").unwrap(), 5, 2, true).is_err()
+        );
+        assert!(
+            mysql_decimal_to_blob(&BigDecimal::from_str("-0.001").unwrap(), 5, 2, true).is_err()
+        );
+        assert!(
+            mysql_decimal_to_blob(&BigDecimal::from_str("999.995").unwrap(), 5, 2, false).is_err()
+        );
+    }
+
+    #[test]
+    fn mysql_decimal_extreme_exponents_do_not_expand() {
+        let enormous = BigDecimal::from_str("1e100000000").unwrap();
+        assert!(mysql_decimal_to_blob(&enormous, 65, 30, false).is_err());
+        let tiny = BigDecimal::from_str("1e-100000000").unwrap();
+        let blob = mysql_decimal_to_blob(&tiny, 65, 30, false).unwrap();
+        assert_eq!(
+            format_numeric(&blob_to_bigdecimal(&blob).unwrap()),
+            format!("0.{}", "0".repeat(30))
+        );
+    }
+
+    #[test]
+    fn mysql_decimal_average_keeps_digits_beyond_bigdecimal_default_precision() {
+        let input = format!("{}.{}", "9".repeat(100), "0".repeat(30));
+        let total = BigDecimal::from_str(&input).unwrap();
+        let average = mysql_decimal_average(&total, 3, 30);
+        assert_eq!(
+            format_numeric(&average),
+            format!("{}.{}", "3".repeat(100), "0".repeat(30))
+        );
+        let negative = BigDecimal::from_str("-1.01").unwrap();
+        assert_eq!(
+            format_numeric(&mysql_decimal_average(&negative, 2, 2)),
+            "-0.51"
+        );
+    }
+
+    #[test]
+    fn mysql_decimal_division_rounds_without_losing_widened_digits() {
+        let lhs = BigDecimal::from_str(&format!("{}.{}", "9".repeat(100), "0".repeat(30))).unwrap();
+        let rhs = BigDecimal::from_str("3").unwrap();
+        let quotient = mysql_decimal_divide_rounded(&lhs, &rhs, 30).unwrap();
+        assert_eq!(
+            format_numeric(&quotient),
+            format!("{}.{}", "3".repeat(100), "0".repeat(30))
+        );
+        let lhs = BigDecimal::from_str("-1.01").unwrap();
+        let rhs = BigDecimal::from_str("2").unwrap();
+        assert_eq!(
+            format_numeric(&mysql_decimal_divide_rounded(&lhs, &rhs, 2).unwrap()),
+            "-0.51"
+        );
+    }
+
+    #[test]
+    fn mysql_decimal_truncate_toward_zero_and_keep_result_scale() {
+        let positive = BigDecimal::from_str("12.34").unwrap();
+        let negative = BigDecimal::from_str("-12.34").unwrap();
+        for (places, expected) in [
+            (5, "12.34"),
+            (2, "12.34"),
+            (1, "12.3"),
+            (0, "12"),
+            (-1, "10"),
+            (-2, "0"),
+            (i64::MIN, "0"),
+        ] {
+            assert_eq!(
+                format_numeric(&mysql_decimal_truncate(&positive, places)),
+                expected
+            );
+        }
+        assert_eq!(
+            format_numeric(&mysql_decimal_truncate(&negative, 1)),
+            "-12.3"
+        );
+        assert_eq!(
+            format_numeric(&mysql_decimal_truncate(&negative, -1)),
+            "-10"
+        );
+        let zero = BigDecimal::from_str("0.00").unwrap();
+        assert_eq!(format_numeric(&mysql_decimal_truncate(&zero, 1)), "0.0");
     }
 
     // ================================================================

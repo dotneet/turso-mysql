@@ -1702,6 +1702,20 @@ fn emit_update_insns<'a>(
                     t_ctx.resolver.schema(),
                 ),
             });
+        } else if btree_table.has_mysql_decimal_columns() {
+            let set_col_indices: ColumnMask = set_clauses
+                .iter()
+                .map(|set_clause| set_clause.column_index)
+                .try_collect()?;
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                &t_ctx.resolver,
+                btree_table.columns(),
+                start,
+                Some(&set_col_indices),
+                table_name,
+                &layout,
+            )?;
         }
 
         if !btree_table.check_constraints.is_empty() {

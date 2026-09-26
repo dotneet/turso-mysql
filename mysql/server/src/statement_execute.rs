@@ -33,7 +33,7 @@ pub const MYSQL_TYPE_BLOB: u8 = 0xfc;
 pub const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 /// MySQL's `MYSQL_TYPE_STRING` parameter type code.
 pub const MYSQL_TYPE_STRING: u8 = 0xfe;
-/// MySQL's `MYSQL_TYPE_NEWDECIMAL` result type code.
+/// MySQL's `MYSQL_TYPE_NEWDECIMAL` parameter and result type code.
 pub const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 /// MySQL's `MYSQL_TYPE_DATETIME` result type code.
 pub const MYSQL_TYPE_DATETIME: u8 = 0x0c;
@@ -197,7 +197,7 @@ fn read_external_long_data(
     bytes: &[u8],
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
     match parameter_type.type_code {
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => {
             let value = str::from_utf8(bytes)
                 .map_err(|_| StatementExecuteDecodeError::InvalidUtf8 { index })?;
             Ok(StatementParameterValue::String(value.to_owned()))
@@ -250,6 +250,7 @@ fn validate_type(
         | MYSQL_TYPE_FLOAT
         | MYSQL_TYPE_DOUBLE
         | MYSQL_TYPE_VARCHAR
+        | MYSQL_TYPE_NEWDECIMAL
         | MYSQL_TYPE_VAR_STRING
         | MYSQL_TYPE_STRING
         | MYSQL_TYPE_TINY_BLOB
@@ -286,7 +287,7 @@ fn read_value(
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         }
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => {
             let bytes = reader.read_lenenc_bytes(index)?;
             let value = str::from_utf8(bytes)
                 .map_err(|_| StatementExecuteDecodeError::InvalidUtf8 { index })?;
@@ -946,7 +947,12 @@ mod tests {
 
     #[test]
     fn decodes_each_string_and_blob_type_code() {
-        for type_code in [MYSQL_TYPE_VARCHAR, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_STRING] {
+        for type_code in [
+            MYSQL_TYPE_VARCHAR,
+            MYSQL_TYPE_VAR_STRING,
+            MYSQL_TYPE_STRING,
+            MYSQL_TYPE_NEWDECIMAL,
+        ] {
             let payload = [0, 1, type_code, 0, 1, b'x'];
             assert_eq!(
                 decode(&payload, 1).unwrap().values,
@@ -965,6 +971,19 @@ mod tests {
                 vec![StatementParameterValue::Bytes(vec![0xff])]
             );
         }
+    }
+
+    #[test]
+    fn newdecimal_parameter_keeps_all_decimal_digits() {
+        let decimal = b"1.234567890123456789012345678901";
+        let mut payload = vec![0, 1, MYSQL_TYPE_NEWDECIMAL, 0, decimal.len() as u8];
+        payload.extend_from_slice(decimal);
+        assert_eq!(
+            decode(&payload, 1).unwrap().values,
+            vec![StatementParameterValue::String(
+                "1.234567890123456789012345678901".to_string()
+            )]
+        );
     }
 
     #[test]
