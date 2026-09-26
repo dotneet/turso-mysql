@@ -228,15 +228,25 @@ length, `DESC`, `COMMENT`, `INVISIBLE` — since none of them could be printed
 back. A key naming a column that does not exist answers 1235 where MySQL
 answers 1072.
 
-One difference goes with the names rather than with the keys. An index name is
-per table in MySQL and database-wide in the engine, so two tables cannot carry
-an index of the same name here — measured, MySQL takes `CREATE TABLE one (id
-INT, KEY (id))` and `CREATE TABLE two (id INT, KEY (id))` both, and the second
-is refused here because `id` is already an index name. It reaches a written name
-as readily as an unnamed one; what unnamed keys change is how easily it is met,
-since a column called `id` or `name` is in many tables. Naming the engine's
-index after the table it belongs to is what this needs, and that is a change to
-what existing databases already store.
+Index names are now scoped to each table as in MySQL. New indexes use a
+unique physical name in the engine and keep the written name in schema
+output. Existing indexes with unqualified physical names remain readable. A
+child foreign key gets a supporting index when no existing key has its columns
+as a left prefix. MySQL's measured rules are followed when an explicit key
+replaces that automatic index and when a drop would leave a foreign key without
+a supporting key.
+
+On reopen, a legacy table with a foreign key but no index covering its child
+columns is rejected with a migration error. Rebuild or re-import it through
+the current MySQL frontend. Column-position changes on a table referenced by
+a foreign key are refused: rewriting that table would retarget the child
+constraint to the temporary table name.
+
+A `JSON` column accepts `DEFAULT NULL`, but a literal default is rejected with
+MySQL error 1101. A direct index on a `JSON` column is rejected with error
+3152. These checks run for `CREATE TABLE` and the supported `ALTER TABLE`
+forms, so accepted DDL does not silently retain a default or index MySQL
+would refuse.
 
 A new MySQL text column uses the engine's fixed `MYSQL_UCA9_AI_CI` collation,
 which follows the primary weights of Unicode 9.0.0 used by MySQL 8.4's
@@ -2278,10 +2288,9 @@ MySQL names one. Measured on 8.4.11: two unnamed keys added one after the other
 read back as `t_ibfk_1` and `t_ibfk_2`, counting the keys the table already
 carries, and this counts them the same way.
 
-What differs is the index. Measured: InnoDB creates a `KEY` beside the
-constraint — `KEY \`fk_b\` (\`b\`)` — and keeps it after the constraint is
-dropped, where nothing here creates one, so `SHOW CREATE TABLE` differs by that
-line.
+InnoDB creates a `KEY` beside the constraint — `KEY \`fk_b\` (\`b\`)` — and
+keeps it after the constraint is dropped. The current frontend creates and
+retains that supporting index as well.
 
 `DROP KEY` is MySQL's other spelling for `DROP INDEX` and drops the same key.
 The parser library reads only the second, so the words are swapped before it
@@ -2915,17 +2924,16 @@ would never have been checked. Measured on 8.4.11: a child row naming a
 parent that is not there answers 1452 and a parent row still named by a child
 answers 1451, both SQLSTATE 23000. The engine reports one failure for both
 directions, so this answers 1452 either way — the direction a client meets
-first. Turning enforcement on took nothing away from a table already stored:
-the constraint was refused until now, so no durable table carries one.
+first. Turning enforcement on took nothing away from a table already stored
+in that earlier slice: the constraint was refused at the time.
 
 `SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
 counted from one in declaration order, with its `ON DELETE` and `ON UPDATE`
-where they were written. Two things differ. A named constraint —
-`CONSTRAINT fk_parent FOREIGN KEY ...` — is refused, the engine dropping the
-name, and printing MySQL's generated one in its place would be a quiet
-substitution. And MySQL's InnoDB creates an index on the child column and
-prints it — measured, `` KEY `a` (`a`) `` — where this creates none, so the
-printed table differs by that one line.
+where they were written. The earlier slice refused a named constraint —
+`CONSTRAINT fk_parent FOREIGN KEY ...` — because the engine dropped the name.
+The current frontend preserves the name. MySQL's InnoDB creates an index on
+the child column and prints it — measured, `` KEY `a` (`a`) `` — and the
+current frontend creates that index too.
 
 An inline `REFERENCES` on a column is read and written nowhere, which is what
 MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`
@@ -3799,7 +3807,24 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Prepared statement quota | n/a | partial | n/a | experimental | partial | [`authority`](frontend/session.rs), [`runtime config`](server/src/runtime_config.rs), [`response`](server/src/response.rs) | The committed authority (`9f073b116`) uses default `16,382`, inclusive range `0..=4,194,304`, and zero to disable new prepares; runtime CLI/listener enforcement is committed in `d8abd505b`. Shared-capability connections count retained statements together; failed prepares release permits, and close, successful connection-level reset, successful close, or drop releases retained permits. `COM_STMT_RESET` keeps the statement and only clears bindings. Exhaustion maps to error `1461` / SQLSTATE `42000`, while statement-ID exhaustion remains separate. Five privileged runtime E2E tests remain ignored; the final recorded privileged Linux gate passed the quota selector. |
 | `COM_RESET_CONNECTION` | n/a | n/a | experimental | n/a | partial | [`connection state`](server/src/connection_state.rs), [`dispatcher`](server/src/dispatcher.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs) | Command `0x1f` accepts an empty body, rolls back before restoring autocommit, clears prepared statements and pending long data, resets `LAST_INSERT_ID()` to zero, keeps the selected database, returns OK, and remains in `Ready`. A rollback failure stops cleanup and leaves the remaining state unchanged. The privileged Linux pool E2E is ignored by default; the final recorded privileged Linux gate passed the pool selector. |
 | TCP/TLS and Unix-socket listeners | n/a | n/a | planned | planned | partial | [`runtime config`](server/src/runtime_config.rs), [`runtime TLS loader`](server/src/runtime_tls.rs), [`runtime Unix listener`](server/src/runtime_unix_listener.rs), [`TCP listener foundation`](server/src/runtime_tcp_listener.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs), [`reload supervisor`](server/src/runtime_account_reload_supervisor.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`Unix server`](server/src/runtime_unix_server.rs), [`Unix socket filesystem`](server/src/unix_socket_fs.rs), [protocol architecture](../docs/mysql-compatibility-mode.md) | The blocking Unix boundary limits a pathname to 103 raw bytes, accepts Linux `SO_PEERCRED` or macOS `getpeereid` peers only when their effective UID matches startup, and rejects other Unix targets. It descriptor-walks from root without following symlinks, requires every ancestor to be root- or effective-UID-owned and not group/other-writable, rejects sticky writable directories, requires final `0700`/effective-UID ownership, holds a `0600` owner lock, rejects every pre-existing endpoint including stale sockets, rechecks the exact checkpoint and catalog before bind, publishes a `0600` endpoint, and removes it only when its retained identity still matches. A post-bind identity failure retries owner/type-checked cleanup; inability to confirm cleanup returns an explicit operator-inspection error. RAII connection/admission limits plus authentication, idle, query, write, checkpoint, and shutdown deadlines apply; degraded account state blocks before and after accept. The listener owns one joinable periodic reload worker. Its first tick waits for the interval and each next tick waits after completion, avoiding overlap and backlog; explicit reload stays available and serializes with it. A failed scheduled tick retains existing-session authorization but blocks new admission until a later exact reload recovers it. Idempotent shutdown wakes blocked accepts and the reload worker or checkpoint wait, stops later handoff registration, signals every handoff that linearized first, performs bounded drain under one shared deadline, reports reload status as `Stopped`, `TimedOut`, or `Failed`, and retries a timed-out reload join later. The reload worker's `Drop` may block to avoid detaching it, and panic fails closed. The owner checks lifecycle before greeting and each decoded frame, preventing a buffered command from starting after shutdown; Core work already started is bounded by query timeout rather than asynchronously cancelled. Pathname bind and checkpoint validation are not one atomic operation; the remaining replacement threat is inside the declared same-effective-UID trust boundary. `RuntimeUnixServer` supplies the blocking run-once accept loop, bounded worker-event queue, and one joinable reaper; completion-before-registration and thread-exit-safe joins are covered. Ordinary worker errors are counted and redacted without stopping accept, while worker panic, account-reload-owner failure, and listener, spawn, or reaper infrastructure failure fail closed. Account-not-ready waits without spinning, and explicit reload plus readiness are forwarded. Shutdown uses one shared deadline, retains timed-out handles for later retries, and `Drop` joins without a time limit. Endpoint cleanup remains identity-safe and the Unix listener remains same-effective-UID. The TLS material loader validates trusted no-follow paths, certificate/key ownership and modes, 1 MiB file bounds, PEM labels, key count, certificate/key pairing, and an explicit rustls TLS 1.2/1.3 server policy. The supervised `RuntimeTcpServer` owns the bounded TCP accept/reaper lifecycle, explicit shutdown/retry, worker panic/error accounting, and lost-reaper worker retention; it routes accepted streams through the mandatory SSLRequest/rustls/authentication owner. The standalone `turso-mysql-server` CLI accepts `--listen IP:PORT` only with both `--tls-cert PATH` and `--tls-key PATH`, and rejects mixing TCP and Unix listener flags. The checked-in privileged TCP `mysql_async` E2E validates a configured client CA and `localhost`, rejects wrong-hostname, missing-CA, and plaintext clients, and checks port release after `SIGTERM`; CI wires the selector, and the final recorded privileged Linux gate passed both driver selectors. Broader certificate/trust deployment policy remains open. |
-| Driver and ORM compatibility | partial | n/a | experimental | partial | partial | [D010/P6 plan](../docs/mysql-compatibility-plan.md), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs), [`mysql_async` TCP E2E](runtime/tests/tcp_e2e.rs), [exact CI selector](../scripts/test-checkpoint-authority-cross-uid.sh) | The experimental external-driver pilot pins `mysql_async = "=0.37.1"`. Its ignored privileged Unix E2E uses default `OptsBuilder` values (no explicit `max_allowed_packet` or `wait_timeout`) and covers authentication, `USE`, text DDL/DML, prepared DML, reads, independent connection state, reconnect, pool reset, and `SIGTERM` cleanup. A separate ignored privileged TCP E2E uses a private CA and `localhost` hostname validation, rejects wrong-hostname, missing-CA, and plaintext clients, and checks `SIGTERM` port release. CI also selects pinned Connector/J 9.6.0 and go-sql-driver/mysql 1.9.3 over verified TLS/TCP, including prepared CRUD, rollback, schema inspection, and two text-query result sets. The privileged Linux gate passed all these pinned driver checks on 2026-09-26; other versions, driver settings, metadata paths, and ORMs remain open. |
+| Driver and ORM compatibility | partial | n/a | experimental | partial | partial | [D010/P6 plan](../docs/mysql-compatibility-plan.md), [`mysql_async` Unix E2E](runtime/tests/unix_e2e.rs), [`mysql_async` TCP E2E](runtime/tests/tcp_e2e.rs), [exact CI selector](../scripts/test-checkpoint-authority-cross-uid.sh) | The experimental external-driver pilot pins `mysql_async = "=0.37.1"`. Its ignored privileged Unix E2E uses default `OptsBuilder` values (no explicit `max_allowed_packet` or `wait_timeout`) and covers authentication, `USE`, text DDL/DML, prepared DML, reads, independent connection state, reconnect, pool reset, and `SIGTERM` cleanup. A separate ignored privileged TCP E2E uses a private CA and `localhost` hostname validation, rejects wrong-hostname, missing-CA, and plaintext clients, and checks `SIGTERM` port release. CI also selects pinned Connector/J 9.6.0 and go-sql-driver/mysql 1.9.3 over verified TLS/TCP, including prepared CRUD, rollback, schema inspection, and two text-query result sets. The privileged Linux gate passed these pinned driver checks on 2026-09-26 and also passed the pinned GORM and Hibernate fixtures described below; other versions, settings, and metadata paths remain open. |
+
+
+Pinned GORM 1.31.2 with `gorm.io/driver/mysql` 1.6.0 and
+`go-sql-driver/mysql` 1.9.3 passed a disposable MySQL 8.4.11 oracle and the
+privileged cross-UID TLS/TCP gate. It exercises `AutoMigrate` on new and
+existing tables, migration up/down, table/index/column/type inspection, CRUD,
+relations, exact `DECIMAL`, NULL, whole-second timestamps, unique and foreign
+key errors, transaction commit/rollback, and pool reopening. Two tables share
+one logical index name. Hibernate ORM 6.6.0.Final with Connector/J 9.6.0
+passed the same oracle and gate. Its `create-only`, `update`, `validate`, and
+`drop` phases inspect schema through JDBC metadata, test relations and values,
+and validate after a server restart. Hibernate uses
+`useInformationSchema=false`; the other Connector/J metadata path and wider
+ORM mappings remain unverified. Both fixtures keep decimal values exact and
+limit timestamps to whole seconds because fractional timestamps are refused.
+The MySQL 8.4.11 comparison was a manual snapshot; CI runs the pinned Turso
+fixtures but does not run a MySQL differential gate.
 
 ## Verification snapshot
 
@@ -3892,7 +3917,7 @@ unnamed explicit column-`NULL` form is implemented in `60f41413b`, with durable
 storage and frontend metadata tested; named or conflicting nullable attributes
 remain rejected. Broader
 `information_schema` providers,
-driver/ORM compatibility, and the P7 release gate remain open. The protocol
+broader driver/ORM compatibility, and the P7 release gate remain open. The protocol
 fuzz target is committed as a fuzz-only decoder and prepared-parameter
 boundary smoke. A historical `cf3cdd744` Darwin sanitizer-none bounded run
 covered 10,000 cases (coverage 806, features 1,484, corpus 126 / 1,310

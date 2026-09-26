@@ -350,6 +350,12 @@ pub enum FrontendErrorKind {
     DuplicateObject,
     /// An `ADD INDEX` named an index the table already carries.
     DuplicateKeyName,
+    /// A JSON column cannot be indexed directly.
+    JsonIndex,
+    /// A JSON column cannot have a literal default.
+    JsonLiteralDefault,
+    /// A child foreign key needs the index being dropped.
+    RequiredForeignKeyIndex,
     /// A `CHANGE COLUMN` renamed a column onto a name the table already has.
     DuplicateColumn,
     /// A `SELECT` read a system variable this server does not have.
@@ -448,6 +454,21 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         }
         // Measured on MySQL 8.4.11.
         FrontendErrorKind::DuplicateKeyName => (1061, *b"42000", b"Duplicate key name".as_slice()),
+        FrontendErrorKind::JsonIndex => (
+            3152,
+            *b"42000",
+            b"JSON column supports indexing only via generated columns".as_slice(),
+        ),
+        FrontendErrorKind::JsonLiteralDefault => (
+            1101,
+            *b"42000",
+            b"BLOB, TEXT, GEOMETRY or JSON column can't have a default value".as_slice(),
+        ),
+        FrontendErrorKind::RequiredForeignKeyIndex => (
+            1553,
+            *b"HY000",
+            b"Cannot drop index: needed in a foreign key constraint".as_slice(),
+        ),
         FrontendErrorKind::CantDropKey => (
             1091,
             *b"42000",
@@ -2328,6 +2349,8 @@ mod tests {
                 *b"42000",
             ),
             (FrontendErrorKind::DuplicateObject, 1050, *b"42S01"),
+            (FrontendErrorKind::JsonIndex, 3152, *b"42000"),
+            (FrontendErrorKind::JsonLiteralDefault, 1101, *b"42000"),
             (FrontendErrorKind::ConstraintViolation, 1062, *b"23000"),
             (FrontendErrorKind::NotNullViolation, 1048, *b"23000"),
             (FrontendErrorKind::MissingRequiredDefault, 1364, *b"HY000"),

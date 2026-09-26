@@ -58,6 +58,162 @@ pub(super) fn information_schema_schemata_column() -> ColumnDefinitionConfig {
     column
 }
 
+pub(super) fn gorm_current_database_result(
+    database: &str,
+    status_flags: u16,
+) -> PreparedStatementExecutionResult {
+    PreparedStatementExecutionResult::ResultSet(BinaryResultSet {
+        columns: vec![information_schema_schemata_column()],
+        rows: vec![vec![BinaryResultValue::Text(database.to_owned())]],
+        warnings: 0,
+        status_flags,
+    })
+}
+
+pub(super) fn gorm_catalog_count_result(
+    count: i64,
+    status_flags: u16,
+) -> PreparedStatementExecutionResult {
+    PreparedStatementExecutionResult::ResultSet(BinaryResultSet {
+        columns: vec![gorm_catalog_count_column()],
+        rows: vec![vec![BinaryResultValue::Integer(count)]],
+        warnings: 0,
+        status_flags,
+    })
+}
+
+pub(super) fn gorm_catalog_count_column() -> ColumnDefinitionConfig {
+    let mut column = column_definition("count(*)".to_owned(), MYSQL_TYPE_LONGLONG);
+    column.column_length = 21;
+    column.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+    column
+}
+
+pub(super) fn gorm_columns_definitions() -> Vec<ColumnDefinitionConfig> {
+    use MySqlInformationSchemaColumnsColumn as Column;
+    let mut columns = information_schema_columns_columns(&[
+        Column::ColumnName,
+        Column::ColumnDefault,
+        Column::DataType,
+        Column::CharacterMaximumLength,
+        Column::ColumnType,
+        Column::ColumnKey,
+        Column::Extra,
+        Column::ColumnComment,
+        Column::NumericPrecision,
+        Column::NumericScale,
+    ]);
+    let mut nullable = ColumnDefinitionConfig::new("is_nullable = 'YES'", MYSQL_TYPE_LONG);
+    nullable.character_set = MYSQL_BINARY_COLLATION;
+    nullable.column_length = 1;
+    nullable.flags = MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG;
+    columns.insert(2, nullable);
+    let mut datetime_precision = information_schema_column_definition(
+        "DATETIME_PRECISION",
+        MYSQL_TYPE_LONG,
+        10,
+        MYSQL_BINARY_COLLATION,
+        true,
+    );
+    datetime_precision.flags = MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG;
+    columns.push(datetime_precision);
+    columns
+}
+
+pub(super) fn gorm_columns_result(
+    columns: Vec<MySqlColumnMetadata>,
+    status_flags: u16,
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    use MySqlInformationSchemaColumnsColumn as Column;
+    let nullable = columns
+        .iter()
+        .map(MySqlColumnMetadata::nullable)
+        .collect::<Vec<_>>();
+    let datetime_precision = columns
+        .iter()
+        .map(|column| {
+            let kind = column.type_name().to_ascii_lowercase();
+            let base = kind.split('(').next().unwrap_or(&kind);
+            if !matches!(base, "time" | "datetime" | "timestamp") {
+                return Ok(None);
+            }
+            let precision = match kind
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix('('))
+            {
+                Some(rest) => rest
+                    .strip_suffix(')')
+                    .ok_or(FrontendErrorKind::Internal)?
+                    .parse::<i64>()
+                    .map_err(|_| FrontendErrorKind::Internal)?,
+                None => 0,
+            };
+            Ok(Some(precision))
+        })
+        .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
+    let result = information_schema_columns_result_to_execution_result(
+        columns,
+        &[
+            Column::ColumnName,
+            Column::ColumnDefault,
+            Column::DataType,
+            Column::CharacterMaximumLength,
+            Column::ColumnType,
+            Column::ColumnKey,
+            Column::Extra,
+            Column::ColumnComment,
+            Column::NumericPrecision,
+            Column::NumericScale,
+        ],
+        status_flags,
+    )?;
+    let CommandExecutionResult::ResultSet(text) = result else {
+        unreachable!("the COLUMNS provider always returns a result set");
+    };
+    let rows = text
+        .rows
+        .into_iter()
+        .zip(nullable)
+        .zip(datetime_precision)
+        .map(|((row, nullable), datetime_precision)| {
+            let mut values = row
+                .into_iter()
+                .enumerate()
+                .map(|(position, value)| match value {
+                    None => Ok(BinaryResultValue::Null),
+                    Some(value) if matches!(position, 3 | 8 | 9) => {
+                        let value = std::str::from_utf8(&value)
+                            .map_err(|_| FrontendErrorKind::Internal)?
+                            .parse::<i64>()
+                            .map_err(|_| FrontendErrorKind::Internal)?;
+                        Ok(BinaryResultValue::Integer(value))
+                    }
+                    Some(value) if matches!(position, 1 | 2 | 4 | 7) => {
+                        Ok(BinaryResultValue::Blob(value))
+                    }
+                    Some(value) => Ok(BinaryResultValue::Text(
+                        String::from_utf8(value).map_err(|_| FrontendErrorKind::Internal)?,
+                    )),
+                })
+                .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
+            values.insert(2, BinaryResultValue::Integer(i64::from(nullable)));
+            values.push(match datetime_precision {
+                Some(precision) => BinaryResultValue::Integer(precision),
+                None => BinaryResultValue::Null,
+            });
+            Ok(values)
+        })
+        .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
+    Ok(PreparedStatementExecutionResult::ResultSet(
+        BinaryResultSet {
+            columns: gorm_columns_definitions(),
+            rows,
+            warnings: 0,
+            status_flags,
+        },
+    ))
+}
+
 pub(super) fn database_list_column() -> ColumnDefinitionConfig {
     let mut column = ColumnDefinitionConfig::new("Database", MYSQL_TYPE_VAR_STRING);
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);

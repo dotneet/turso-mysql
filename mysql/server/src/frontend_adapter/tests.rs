@@ -826,16 +826,23 @@ fn an_inline_key_creates_its_index_or_no_table_at_all() {
         )
     );
 
-    // A divergence recorded in COMPAT.md, and the reason the two tables above
-    // were given different column names: an index name is per table in MySQL
-    // and database-wide in the engine, so two tables cannot carry an index of
-    // the same name here. Measured on MySQL 8.4.11, both of these are taken.
+    // MySQL scopes index names to a table.
     adapter
         .execute_query("CREATE TABLE one (id INT, KEY (id))")
         .unwrap();
-    assert!(adapter
+    adapter
         .execute_query("CREATE TABLE two (id INT, KEY (id))")
-        .is_err());
+        .unwrap();
+    for table in ["one", "two"] {
+        let CommandExecutionResult::ResultSet(indexes) = adapter
+            .execute_query(&format!("SHOW INDEX FROM {table}"))
+            .unwrap()
+        else {
+            panic!("SHOW INDEX must return a result set");
+        };
+        assert_eq!(indexes.rows.len(), 1);
+        assert_eq!(indexes.rows[0][2].as_deref(), Some(b"id".as_slice()));
+    }
 }
 
 #[test]
@@ -2822,6 +2829,46 @@ fn a_set_column_holds_a_subset_of_its_members() {
         String::from_utf8(selected.rows[0][0].clone().unwrap()).unwrap(),
         "read,exec"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_ddl_errors_use_mysql_codes() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([107; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE bad_default (doc JSON DEFAULT '{}')"),
+        Err(FrontendErrorKind::JsonLiteralDefault)
+    );
+    for sql in [
+        "CREATE TABLE bad_key (doc JSON, KEY doc_key (doc))",
+        "CREATE TABLE bad_key (doc JSON PRIMARY KEY)",
+        "CREATE TABLE bad_key (doc JSON UNIQUE)",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::JsonIndex)
+        );
+    }
+
+    adapter
+        .execute_query("CREATE TABLE documents (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE documents ADD COLUMN doc JSON DEFAULT '{}'"),
+        Err(FrontendErrorKind::JsonLiteralDefault)
+    );
+    adapter
+        .execute_query("ALTER TABLE documents ADD COLUMN doc JSON DEFAULT NULL")
+        .unwrap();
 }
 
 /// `JSON_EXTRACT` reads one path out of a document, `JSON_UNQUOTE` takes the
@@ -8614,6 +8661,7 @@ fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
             "  `id` int NOT NULL,\n",
             "  `parent_id` int DEFAULT NULL,\n",
             "  PRIMARY KEY (`id`),\n",
+            "  KEY `parent_id` (`parent_id`),\n",
             "  CONSTRAINT `child_ibfk_1` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)\n",
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )
@@ -18093,6 +18141,74 @@ fn information_schema_tables_requires_selection_and_returns_sorted_user_objects(
 
 #[cfg(unix)]
 #[test]
+fn gorm_has_table_finds_a_table_created_after_connection_open() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([218; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let mut another = AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([218; 32]),
+        ))
+        .unwrap();
+    another.authorize_connection().unwrap();
+    another.execute_init_db("reports").unwrap();
+    let ddl = "CREATE TABLE `gorm_e2e_parents` (`id` bigint AUTO_INCREMENT, `code` varchar(32) NOT NULL, `created_at` datetime NULL, PRIMARY KEY (`id`), UNIQUE INDEX `uk_gorm_parent_code` (`code`), INDEX `idx_gorm_shared_code` (`code`))";
+    adapter.execute_query(ddl).unwrap();
+    adapter.execute_query("CREATE TABLE gorm_e2e_children (id BIGINT AUTO_INCREMENT, parent_id BIGINT NOT NULL, PRIMARY KEY (id), CONSTRAINT fk_gorm_parent FOREIGN KEY (parent_id) REFERENCES gorm_e2e_parents(id))").unwrap();
+    let query = "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'reports' AND table_name = 'gorm_e2e_parents' AND table_type = 'BASE TABLE'";
+    let CommandExecutionResult::ResultSet(result) = another.execute_query(query).unwrap() else {
+        panic!("GORM HasTable must return a result set");
+    };
+    assert_eq!(result.rows, vec![vec![Some(b"1".to_vec())]]);
+
+    for (sql, table, filter) in [
+        ("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", "gorm_e2e_parents", "BASE TABLE"),
+        ("SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?", "gorm_e2e_parents", "code"),
+        ("SELECT count(*) FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? AND index_name = ?", "gorm_e2e_parents", "uk_gorm_parent_code"),
+        ("SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?", "gorm_e2e_parents", "uk_gorm_parent_code"),
+        ("SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?", "gorm_e2e_children", "fk_gorm_parent"),
+    ] {
+        let prepared = another.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(prepared.parameters.len(), 3);
+        assert_eq!(prepared.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+        let payload = gorm_catalog_count_parameters("reports", table, filter);
+        let result = prepared_result_set(
+            another
+                .execute_stmt_execute(prepared.statement_id, &payload)
+                .unwrap(),
+        );
+        assert_eq!(result.rows, vec![vec![BinaryResultValue::Integer(1)]], "{sql}");
+    }
+    let columns = another.execute_stmt_prepare("SELECT column_name, column_default, is_nullable = 'YES', data_type, character_maximum_length, column_type, column_key, extra, column_comment, numeric_precision, numeric_scale , datetime_precision FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION").unwrap();
+    let result = another
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("reports", "gorm_e2e_parents"),
+        )
+        .unwrap();
+    let result = prepared_result_set(result);
+    assert_eq!(result.rows.len(), 3);
+    for row in &result.rows {
+        for (column, value) in result.columns.iter().zip(row) {
+            if column.column_type == MYSQL_TYPE_BLOB && !matches!(value, BinaryResultValue::Null) {
+                assert!(
+                    matches!(value, BinaryResultValue::Blob(_)),
+                    "{}",
+                    column.name
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn show_index_returns_the_fifteen_columns_mysql_returns() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
@@ -19606,6 +19722,446 @@ fn information_schema_columns_denied_table_returns_empty_result() {
             },
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_gorm_catalog_queries_prepare_execute_reset_and_close() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([75; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE gorm_columns (id INT NOT NULL PRIMARY KEY, \
+             amount DECIMAL(20,6) NOT NULL, created_at DATETIME)",
+        )
+        .unwrap();
+
+    let schema = adapter
+        .execute_stmt_prepare(
+            "SELECT SCHEMA_NAME from Information_schema.SCHEMATA where \
+             SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME=? DESC,SCHEMA_NAME limit 1",
+        )
+        .unwrap();
+    assert_eq!(schema.parameters.len(), 2);
+    let schema_result = adapter
+        .execute_stmt_execute(
+            schema.statement_id,
+            &gorm_catalog_parameters("reports%", "reports"),
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(schema_result).rows,
+        [vec![BinaryResultValue::Text("reports".to_owned())]]
+    );
+    adapter.execute_stmt_reset(schema.statement_id).unwrap();
+    adapter.execute_stmt_close(schema.statement_id);
+    assert_eq!(
+        adapter.execute_stmt_execute(
+            schema.statement_id,
+            &gorm_catalog_parameters("reports%", "reports")
+        ),
+        Err(FrontendErrorKind::UnknownPreparedStatement)
+    );
+
+    let columns = adapter
+        .execute_stmt_prepare(
+            "SELECT column_name, column_default, is_nullable = 'YES', \
+             data_type, character_maximum_length, column_type, column_key, extra, \
+             column_comment, numeric_precision, numeric_scale, datetime_precision \
+             FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap();
+    assert_eq!((columns.parameters.len(), columns.columns.len()), (2, 12));
+    assert_eq!(columns.columns[2].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(
+        columns.columns[2].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(columns.columns[2].schema, "");
+    assert_eq!(columns.columns[2].table, "");
+    assert_eq!(columns.columns[2].original_table, "");
+    assert_eq!(columns.columns[2].original_name, "");
+    assert_eq!(columns.columns[11].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(columns.columns[11].column_length, 10);
+    assert_eq!(
+        columns.columns[11].flags,
+        MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(columns.columns[11].original_table, "columns");
+    let result = adapter
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("reports", "gorm_columns"),
+        )
+        .unwrap();
+    let result = prepared_result_set(result);
+    assert_eq!(result.rows.len(), 3);
+    assert_eq!(result.rows[0][0], BinaryResultValue::Text("id".to_owned()));
+    assert_eq!(result.rows[0][2], BinaryResultValue::Integer(0));
+    assert_eq!(
+        result.rows[1][0],
+        BinaryResultValue::Text("amount".to_owned())
+    );
+    assert_eq!(result.rows[1][2], BinaryResultValue::Integer(0));
+    assert_eq!(
+        result.rows[1][3],
+        BinaryResultValue::Blob(b"decimal".to_vec())
+    );
+    assert_eq!(result.rows[1][9], BinaryResultValue::Integer(20));
+    assert_eq!(result.rows[1][10], BinaryResultValue::Integer(6));
+    assert_eq!(result.rows[1][11], BinaryResultValue::Null);
+    assert_eq!(result.rows[2][11], BinaryResultValue::Integer(0));
+    adapter.execute_stmt_reset(columns.statement_id).unwrap();
+    let repeated = adapter
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("reports", "gorm_columns"),
+        )
+        .unwrap();
+    assert_eq!(prepared_result_set(repeated).rows, result.rows);
+    adapter.execute_stmt_close(columns.statement_id);
+}
+
+#[cfg(unix)]
+#[test]
+fn gorm_catalog_queries_use_bound_schema_and_find_views() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    catalog.create("analytics").unwrap();
+    let mut analytics =
+        AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer.clone())
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes([78; 32]),
+            ))
+            .unwrap();
+    analytics.authorize_connection().unwrap();
+    analytics.execute_init_db("analytics").unwrap();
+    analytics
+        .execute_query("CREATE TABLE other_items (id INT NOT NULL, name VARCHAR(32), PRIMARY KEY (id), INDEX idx_name (name))")
+        .unwrap();
+    analytics
+        .execute_query("CREATE VIEW other_view AS SELECT id FROM other_items")
+        .unwrap();
+    drop(analytics);
+
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([78; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+
+    let columns = adapter
+        .execute_stmt_prepare(
+            "SELECT column_name, column_default, is_nullable = 'YES', \
+             data_type, character_maximum_length, column_type, column_key, extra, \
+             column_comment, numeric_precision, numeric_scale, datetime_precision \
+             FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap();
+    let result = adapter
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("analytics", "other_items"),
+        )
+        .unwrap();
+    assert_eq!(prepared_result_set(result).rows.len(), 2);
+
+    for (sql, table, filter) in [
+        ("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", "other_items", "BASE TABLE"),
+        ("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", "other_view", "VIEW"),
+        ("SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?", "other_items", "name"),
+        ("SELECT count(*) FROM information_schema.statistics WHERE table_schema = ? AND table_name = ? AND index_name = ?", "other_items", "idx_name"),
+        ("SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?", "other_items", "PRIMARY"),
+    ] {
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        let result = adapter
+            .execute_stmt_execute(
+                prepared.statement_id,
+                &gorm_catalog_count_parameters("analytics", table, filter),
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_result_set(result).rows,
+            [vec![BinaryResultValue::Integer(1)]],
+            "{sql} with {table} and {filter}"
+        );
+    }
+    assert_eq!(adapter.session.selected_database(), Some("reports"));
+    assert!(authorizer
+        .actions()
+        .contains(&RecordedDatabaseAction::Query("analytics".to_owned())));
+}
+
+#[cfg(unix)]
+#[test]
+fn gorm_catalog_denied_other_schema_does_not_open_database() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_decisions([
+        Ok(()),
+        Ok(()),
+        Ok(()),
+        Ok(()),
+        Err(AuthorizationError::Denied),
+        Err(AuthorizationError::Denied),
+    ]));
+    let (directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let existing_files = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    catalog.create("analytics").unwrap();
+    let analytics_allocator = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| {
+            let name = entry.file_name();
+            !existing_files.contains(&name)
+                && name
+                    .to_string_lossy()
+                    .ends_with(".turso-mysql-auto-increment")
+        })
+        .unwrap()
+        .path();
+    fs::remove_file(analytics_allocator).unwrap();
+    let mut probe = catalog.new_session(binary_context());
+    assert!(probe.select_database("analytics").is_err());
+
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([80; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let count = adapter
+        .execute_stmt_prepare("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?")
+        .unwrap();
+    let columns = adapter
+        .execute_stmt_prepare(
+            "SELECT column_name, column_default, is_nullable = 'YES', \
+             data_type, character_maximum_length, column_type, column_key, extra, \
+             column_comment, numeric_precision, numeric_scale, datetime_precision \
+             FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap();
+    let count = adapter
+        .execute_stmt_execute(
+            count.statement_id,
+            &gorm_catalog_count_parameters("analytics", "hidden", "BASE TABLE"),
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(count).rows,
+        [vec![BinaryResultValue::Integer(0)]]
+    );
+    let columns = adapter
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("analytics", "hidden"),
+        )
+        .unwrap();
+    assert!(prepared_result_set(columns).rows.is_empty());
+    assert!(authorizer
+        .actions()
+        .contains(&RecordedDatabaseAction::TableSelect {
+            database: "analytics".to_owned(),
+            table: "hidden".to_owned(),
+        }));
+}
+
+#[cfg(unix)]
+#[test]
+fn gorm_has_table_counts_a_view_in_selected_database() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([79; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE VIEW records_view AS SELECT id FROM records")
+        .unwrap();
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?")
+        .unwrap();
+    let result = adapter
+        .execute_stmt_execute(
+            prepared.statement_id,
+            &gorm_catalog_count_parameters("reports", "records_view", "VIEW"),
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(result).rows,
+        [vec![BinaryResultValue::Integer(1)]]
+    );
+}
+
+#[cfg(unix)]
+fn gorm_catalog_parameters(first: &str, second: &str) -> Vec<u8> {
+    assert!(first.len() < 251 && second.len() < 251);
+    let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0, MYSQL_TYPE_VAR_STRING, 0];
+    payload.push(first.len() as u8);
+    payload.extend_from_slice(first.as_bytes());
+    payload.push(second.len() as u8);
+    payload.extend_from_slice(second.as_bytes());
+    payload
+}
+
+#[cfg(unix)]
+fn gorm_catalog_count_parameters(schema: &str, table: &str, filter: &str) -> Vec<u8> {
+    assert!([schema, table, filter]
+        .iter()
+        .all(|value| value.len() < 251));
+    let mut payload = vec![0, 1];
+    for _ in 0..3 {
+        payload.extend_from_slice(&[MYSQL_TYPE_VAR_STRING, 0]);
+    }
+    for value in [schema, table, filter] {
+        payload.push(value.len() as u8);
+        payload.extend_from_slice(value.as_bytes());
+    }
+    payload
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_gorm_catalog_queries_work_with_only_a_table_select_grant() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+        [
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Denied),
+        ],
+        [Ok(())],
+    ));
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let mut seed = catalog.new_session(binary_context());
+    seed.select_database("reports").unwrap();
+    seed.connection()
+        .unwrap()
+        .execute("CREATE TABLE gorm_granted (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    drop(seed);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([76; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let schema = adapter
+        .execute_stmt_prepare(
+            "SELECT SCHEMA_NAME from Information_schema.SCHEMATA where \
+             SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME=? DESC,SCHEMA_NAME limit 1",
+        )
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(
+            adapter
+                .execute_stmt_execute(
+                    schema.statement_id,
+                    &gorm_catalog_parameters("reports%", "reports"),
+                )
+                .unwrap()
+        )
+        .rows,
+        [vec![BinaryResultValue::Text("reports".to_owned())]]
+    );
+    let columns = adapter
+        .execute_stmt_prepare(
+            "SELECT column_name, column_default, is_nullable = 'YES', \
+             data_type, character_maximum_length, column_type, column_key, extra, \
+             column_comment, numeric_precision, numeric_scale, datetime_precision \
+             FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+             ORDER BY ORDINAL_POSITION",
+        )
+        .unwrap();
+    let result = adapter
+        .execute_stmt_execute(
+            columns.statement_id,
+            &gorm_catalog_parameters("reports", "gorm_granted"),
+        )
+        .unwrap();
+    assert_eq!(prepared_result_set(result).rows.len(), 1);
+    assert!(!authorizer
+        .actions()
+        .iter()
+        .any(|action| matches!(action, RecordedDatabaseAction::List)));
+    assert!(authorizer
+        .actions()
+        .contains(&RecordedDatabaseAction::TableSelect {
+            database: "reports".to_owned(),
+            table: "gorm_granted".to_owned(),
+        }));
+}
+
+#[cfg(unix)]
+#[test]
+fn pinned_gorm_has_table_rechecks_table_grant_on_execution() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+        [
+            Ok(()),
+            Ok(()),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Denied),
+            Err(AuthorizationError::Denied),
+        ],
+        [Ok(()), Err(AuthorizationError::Denied)],
+    ));
+    let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let mut seed = catalog.new_session(binary_context());
+    seed.select_database("reports").unwrap();
+    seed.connection()
+        .unwrap()
+        .execute("CREATE TABLE gorm_granted (id INT NOT NULL PRIMARY KEY)")
+        .unwrap();
+    drop(seed);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([219; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("reports").unwrap();
+    let prepared = adapter
+        .execute_stmt_prepare("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?")
+        .unwrap();
+    let payload = gorm_catalog_count_parameters("reports", "gorm_granted", "BASE TABLE");
+    let first = adapter
+        .execute_stmt_execute(prepared.statement_id, &payload)
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(first).rows,
+        [vec![BinaryResultValue::Integer(1)]]
+    );
+    let revoked = adapter
+        .execute_stmt_execute(prepared.statement_id, &payload)
+        .unwrap();
+    assert_eq!(
+        prepared_result_set(revoked).rows,
+        [vec![BinaryResultValue::Integer(0)]]
+    );
+    assert!(!authorizer
+        .actions()
+        .iter()
+        .any(|action| matches!(action, RecordedDatabaseAction::List)));
 }
 
 #[cfg(unix)]
@@ -25577,6 +26133,7 @@ fn a_table_writes_its_key_as_a_clause_of_its_own() {
             "  `u` int NOT NULL,\n",
             "  PRIMARY KEY (`id`),\n",
             "  KEY `idx_n` (`n`),\n",
+            "  KEY `fk_u` (`u`),\n",
             "  CONSTRAINT `fk_u` FOREIGN KEY (`u`) REFERENCES `written` (`id`)\n",
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )
@@ -27985,6 +28542,7 @@ fn truncating_a_counted_table_starts_its_numbering_again() {
             "  `owner` int DEFAULT NULL,\n",
             "  PRIMARY KEY (`id`),\n",
             "  KEY `by_n` (`n`),\n",
+            "  KEY `counted_fk` (`owner`),\n",
             "  CONSTRAINT `counted_fk` FOREIGN KEY (`owner`) REFERENCES `parent` (`id`)\n",
             ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )
@@ -28332,6 +28890,7 @@ fn a_counted_table_with_a_foreign_key_reads_after_an_alter() {
             "  `owner` int DEFAULT NULL,\n",
             "  `tail` int DEFAULT NULL,\n",
             "  PRIMARY KEY (`id`),\n",
+            "  KEY `counted_fk` (`owner`),\n",
             "  CONSTRAINT `counted_fk` FOREIGN KEY (`owner`) REFERENCES `parent` (`id`)\n",
             ") ENGINE=InnoDB AUTO_INCREMENT=2 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
         )

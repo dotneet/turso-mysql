@@ -15,6 +15,106 @@ pub(crate) fn tokenize_information_schema_query(
         .map_err(|error| ParseError::Sqlparser(error.to_string()))
 }
 
+/// The fixed prepared catalog queries emitted by GORM 1.31.2 with the MySQL driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GormInformationSchemaPreparedQuery {
+    CurrentDatabase,
+    Columns,
+    HasTable,
+    HasColumn,
+    HasIndex,
+    HasConstraint,
+}
+
+pub fn parse_optional_gorm_information_schema_prepared_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<GormInformationSchemaPreparedQuery>, ParseError> {
+    const CURRENT_DATABASE: &str = "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA \
+        WHERE SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME = ? DESC, SCHEMA_NAME LIMIT 1";
+    const COLUMNS: &str = "SELECT column_name, column_default, is_nullable = 'YES', \
+        data_type, character_maximum_length, column_type, column_key, extra, \
+        column_comment, numeric_precision, numeric_scale, datetime_precision \
+        FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+        ORDER BY ORDINAL_POSITION";
+    const HAS_TABLE: &str = "SELECT count(*) FROM information_schema.tables \
+        WHERE table_schema = ? AND table_name = ? AND table_type = ?";
+    const HAS_COLUMN: &str = "SELECT count(*) FROM information_schema.columns \
+        WHERE table_schema = ? AND table_name = ? AND column_name = ?";
+    const HAS_INDEX: &str = "SELECT count(*) FROM information_schema.statistics \
+        WHERE table_schema = ? AND table_name = ? AND index_name = ?";
+    const HAS_CONSTRAINT: &str = "SELECT count(*) FROM information_schema.table_constraints \
+        WHERE constraint_schema = ? AND table_name = ? AND constraint_name = ?";
+
+    let tokens = tokenize_information_schema_query(sql, mode)?;
+    if tokens.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return Ok(None);
+    }
+    if same_catalog_tokens(
+        &tokens,
+        &tokenize_information_schema_query(CURRENT_DATABASE, mode)?,
+    ) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::CurrentDatabase));
+    }
+    if same_catalog_tokens(&tokens, &tokenize_information_schema_query(COLUMNS, mode)?) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::Columns));
+    }
+    if same_catalog_tokens(
+        &tokens,
+        &tokenize_information_schema_query(HAS_TABLE, mode)?,
+    ) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::HasTable));
+    }
+    if same_catalog_tokens(
+        &tokens,
+        &tokenize_information_schema_query(HAS_COLUMN, mode)?,
+    ) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::HasColumn));
+    }
+    if same_catalog_tokens(
+        &tokens,
+        &tokenize_information_schema_query(HAS_INDEX, mode)?,
+    ) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::HasIndex));
+    }
+    if same_catalog_tokens(
+        &tokens,
+        &tokenize_information_schema_query(HAS_CONSTRAINT, mode)?,
+    ) {
+        return Ok(Some(GormInformationSchemaPreparedQuery::HasConstraint));
+    }
+    Ok(None)
+}
+
+fn same_catalog_tokens(actual: &[Token], expected: &[Token]) -> bool {
+    let actual = actual
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    actual.len() == expected.len()
+        && actual
+            .into_iter()
+            .zip(expected)
+            .all(|(actual, expected)| match (actual, expected) {
+                (Token::Word(actual), Token::Word(expected)) => {
+                    actual.quote_style == expected.quote_style
+                        && actual.value.eq_ignore_ascii_case(&expected.value)
+                }
+                _ => actual == expected,
+            })
+}
+
 pub(crate) fn contains_information_schema_tables(tokens: &[Token]) -> bool {
     contains_information_schema_object(tokens, "TABLES")
 }
@@ -633,4 +733,70 @@ fn is_database_function(expr: &Expr) -> bool {
 /// them the other way round, which this does not do.
 fn an_ordering_these_rows_already_have(options: &sqlparser::ast::OrderByOptions) -> bool {
     options.nulls_first.is_none() && matches!(options.asc, None | Some(true))
+}
+
+#[cfg(test)]
+mod gorm_prepared_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_pinned_gorm_catalog_queries() {
+        let mode = SessionSqlMode::default();
+        let current = "SELECT SCHEMA_NAME from Information_schema.SCHEMATA where \
+            SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME=? DESC,SCHEMA_NAME limit 1";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(current, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::CurrentDatabase)
+        );
+        let columns = "SELECT column_name, column_default, is_nullable = 'YES', \
+            data_type, character_maximum_length, column_type, column_key, extra, \
+            column_comment, numeric_precision, numeric_scale, datetime_precision \
+            FROM information_schema.columns WHERE table_schema = ? AND table_name = ? \
+            ORDER BY ORDINAL_POSITION";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(columns, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::Columns)
+        );
+        let has_table = "SELECT count(*) FROM information_schema.tables WHERE \
+            table_schema = ? AND table_name = ? AND table_type = ?";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(has_table, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::HasTable)
+        );
+        let has_column = "SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE \
+            table_schema = ? AND table_name = ? AND column_name = ?";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(has_column, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::HasColumn)
+        );
+        let has_index = "SELECT count(*) FROM information_schema.statistics WHERE \
+            table_schema = ? AND table_name = ? AND index_name = ?";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(has_index, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::HasIndex)
+        );
+        let has_constraint = "SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE \
+            constraint_schema = ? AND table_name = ? AND constraint_name = ?";
+        assert_eq!(
+            parse_optional_gorm_information_schema_prepared_query(has_constraint, mode).unwrap(),
+            Some(GormInformationSchemaPreparedQuery::HasConstraint)
+        );
+        for sql in [
+            columns.replace("table_name = ?", "table_name = 'users'"),
+            columns.replace("datetime_precision", "bogus_column"),
+            format!("{columns}; DROP TABLE users"),
+            format!("{columns} /* comment */"),
+            has_table.replace("table_type = ?", "table_type = 'BASE TABLE'"),
+            format!("{has_table}; DROP TABLE users"),
+            has_column.replace("column_name = ?", "column_name LIKE ?"),
+            has_index.replace("index_name = ?", "index_name LIKE ?"),
+            has_constraint.replace("constraint_name = ?", "constraint_name LIKE ?"),
+        ] {
+            assert_eq!(
+                parse_optional_gorm_information_schema_prepared_query(&sql, mode).unwrap(),
+                None,
+                "{sql}"
+            );
+        }
+    }
 }

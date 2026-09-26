@@ -172,7 +172,7 @@ boolean literal.
 | `PRIMARY KEY (a, b)` naming a column the statement did not declare `NOT NULL` | refused; measured, MySQL makes every column of a key `NOT NULL` where the engine leaves it as declared, so the two would print different tables |
 | `PRIMARY KEY (a, b)` with an `AUTO_INCREMENT` column inside it | refused; the counted column stands for one rowid, which has no way to spread over a pair |
 | An `AUTO_INCREMENT` column that is not the table's key, or one with no key at all | refused where MySQL answers 1075 |
-| An `AUTO_INCREMENT` column not written `NOT NULL` | refused; MySQL reads the key as saying it, and every schema a migration tool writes says it |
+| An `AUTO_INCREMENT` column not written `NOT NULL` | accepted when its table-level primary key names that column; the stored definition adds `NOT NULL`, as MySQL does. Other forms are refused |
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
 | `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
 | `ALTER TABLE` mixing index and column operations | refused; two kinds of change would have to apply together |
@@ -185,9 +185,9 @@ boolean literal.
 | `CREATE TABLE ... (columns) AS SELECT`, and `IF NOT EXISTS` or `TEMPORARY` beside an `AS SELECT` | refused |
 | `CREATE TEMPORARY TABLE` with `AUTO_INCREMENT` | refused; the allocator is keyed on a durable table |
 | `FOREIGN KEY` | works, and enforced |
-| The index MySQL creates beside a `FOREIGN KEY` | not created; measured, InnoDB adds `` KEY `a` (`a`) `` for the child column and prints it, and this does not, so `SHOW CREATE TABLE` differs by that one line |
+| The index MySQL creates beside a `FOREIGN KEY` | created when no existing key has the child columns as a left prefix; it appears in `SHOW CREATE TABLE` |
 | `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | works; measured, MySQL names it `t_ibfk_N` counting the keys the table already carries, and so does this — two unnamed keys added one after the other read back as `t_ibfk_1` and `t_ibfk_2` |
-| The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | not created, the same as the one a `CREATE TABLE` declares |
+| The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | created or reused by the same rule as `CREATE TABLE` |
 | `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
 | `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
 | Warning 1681 for an integer display width or a floating-point size | not raised; MySQL raises one per column and this raises none, so a client counting warnings after a `CREATE TABLE` sees zero |
@@ -367,7 +367,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `SET` | works |
 | `JSON` | works |
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
-| A `DEFAULT` on a `JSON` column, or one as a key | taken, where MySQL refuses both — measured, a default answers 1101 and a key answers 3152 |
+| A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
 | Fractional seconds — `DATETIME(3)` | refused |
 
@@ -381,6 +381,10 @@ Behaviour that works but does not match MySQL lives in
 - Legacy `DECIMAL` tables that stored binary64 values cannot recover their original
   decimal digits. Re-import them into a new exact `DECIMAL` table; opening an old
   table through the MySQL frontend fails with a migration error
+- Legacy tables with a foreign key but no child index must be rebuilt or
+  re-imported; opening them through the MySQL frontend fails with a migration
+  error. Column-position changes on a referenced table are refused until its
+  foreign key targets can be preserved through a rewrite
 - `TIMESTAMP` uses the MySQL UTC range but supports only UTC sessions; it does
   not convert between session time zones
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
@@ -389,10 +393,6 @@ Behaviour that works but does not match MySQL lives in
 - complex window projections still have conservative source-column metadata
 - `SHOW FULL COLUMNS` derives `Privileges` from database or table grants;
   column-specific grants are not supported
-- an index name is per table in MySQL and database-wide in the engine, so two
-  tables cannot carry an index of the same name here. Naming the engine's index
-  after the table it belongs to is what this needs, and that changes what
-  existing databases already store
 
 ---
 
@@ -402,13 +402,23 @@ The remaining clients below have not been run end to end. The frontend is
 also checked against a pinned MySQL 8.4.11 oracle and its own tests.
 
 - PHP `mysqli`, Python `PyMySQL` / `mysqlclient`
-- ORMs
+- ORM versions and settings beyond the pinned GORM and Hibernate fixtures
 - `mysqldump` and restore, end to end
 
 The pinned MySQL 8.0.46 command-line client passed the privileged Linux
 cross-UID TLS/TCP E2E locally on 2026-09-26. It covers schema creation and
 inspection, writes and reads, rollback, and reconnect. Other CLI commands and
 client versions still need coverage.
+
+Pinned GORM 1.31.2 with `gorm.io/driver/mysql` 1.6.0 and
+`go-sql-driver/mysql` 1.9.3, and Hibernate ORM 6.6.0.Final with Connector/J
+9.6.0, passed the privileged Linux cross-UID TLS/TCP E2E on 2026-09-26.
+Both fixtures passed against a disposable MySQL 8.4.11 oracle first. The
+fixtures cover schema creation and inspection, migration, CRUD, relations,
+NULL, exact `DECIMAL`, whole-second timestamps, unique and foreign-key errors,
+transactions, and reconnect or pool reopening. Hibernate also validates its
+schema after a server restart. The Hibernate fixture uses Connector/J's
+`useInformationSchema=false` metadata path; other settings remain unverified.
 
 Connector/J 9.6.0 and `go-sql-driver/mysql` 1.9.3 passed the same gate with
 verified TLS, prepared inserts, CRUD, rollback, an added column, and schema

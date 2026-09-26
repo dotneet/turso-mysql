@@ -271,18 +271,15 @@ fn checked_index_operation(
 }
 
 fn checked_index_name(name: &str) -> Result<String, ParseError> {
-    let name = MySqlTableName::parse(name)
-        .map_err(|_| ParseError::Unsupported {
-            feature: "index name",
-        })?
-        .as_str()
-        .to_owned();
+    MySqlTableName::parse(name).map_err(|_| ParseError::Unsupported {
+        feature: "index name",
+    })?;
     // MySQL calls the primary key's index `PRIMARY`, and adding or dropping a
     // primary key is a different operation than adding or dropping an index.
-    if name == "primary" {
+    if name.eq_ignore_ascii_case("primary") {
         return unsupported("index named PRIMARY");
     }
-    Ok(name)
+    Ok(name.to_owned())
 }
 
 #[cfg(test)]
@@ -322,6 +319,15 @@ mod tests {
                 name: Some("uniq_cd".to_owned()),
                 unique: true,
                 columns: vec!["c".to_owned(), "d".to_owned()],
+            }]
+        );
+        assert_eq!(
+            parsed("ALTER TABLE records ADD CONSTRAINT UKhgnku1cs6oh0f99ssb6flto0x UNIQUE (name)")
+                .operations(),
+            [MySqlAlterTableIndexOperation::Add {
+                name: Some("UKhgnku1cs6oh0f99ssb6flto0x".to_owned()),
+                unique: true,
+                columns: vec!["name".to_owned()],
             }]
         );
 

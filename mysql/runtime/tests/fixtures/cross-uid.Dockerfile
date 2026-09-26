@@ -5,12 +5,20 @@ COPY go-driver/ ./
 RUN go mod download \
     && CGO_ENABLED=0 go build -trimpath -o /mysql-go-driver-e2e .
 
+WORKDIR /gorm
+COPY gorm-e2e/ ./
+RUN go mod download \
+    && CGO_ENABLED=0 go build -trimpath -o /mysql-gorm-e2e .
+
 FROM maven:3.9.11-eclipse-temurin-21 AS jdbc-driver
 
 RUN mvn -q dependency:get -Dartifact=com.mysql:mysql-connector-j:9.6.0
 COPY JdbcDriver.java /driver/JdbcDriver.java
 RUN javac -cp /root/.m2/repository/com/mysql/mysql-connector-j/9.6.0/mysql-connector-j-9.6.0.jar \
     -d /driver /driver/JdbcDriver.java
+
+COPY hibernate-e2e/ /hibernate-e2e/
+RUN mvn -q -f /hibernate-e2e/pom.xml -DskipTests package
 
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
@@ -22,5 +30,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=go-driver /mysql-go-driver-e2e /usr/local/bin/mysql-go-driver-e2e
+COPY --from=go-driver /mysql-gorm-e2e /usr/local/bin/mysql-gorm-e2e
 COPY --from=jdbc-driver /driver/JdbcDriver.class /opt/mysql-drivers/JdbcDriver.class
 COPY --from=jdbc-driver /root/.m2/repository/com/mysql/mysql-connector-j/9.6.0/mysql-connector-j-9.6.0.jar /opt/mysql-drivers/mysql-connector-j-9.6.0.jar
+COPY --from=jdbc-driver /hibernate-e2e/target/hibernate-e2e-1.0.0.jar /opt/mysql-drivers/hibernate-e2e-1.0.0.jar

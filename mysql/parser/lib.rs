@@ -44,6 +44,9 @@ use information_schema::{
     validate_information_schema_columns_query, validate_information_schema_schemata_query,
     validate_information_schema_tables_query,
 };
+pub use information_schema::{
+    parse_optional_gorm_information_schema_prepared_query, GormInformationSchemaPreparedQuery,
+};
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
@@ -1282,6 +1285,8 @@ pub enum ParseError {
     ExpectedAlterTable,
     ExpectedSelect,
     ExpectedDml,
+    JsonLiteralDefault,
+    JsonIndex,
     Unsupported { feature: &'static str },
 }
 
@@ -1326,6 +1331,8 @@ impl fmt::Display for ParseError {
             Self::ExpectedAlterTable => f.write_str("expected an ALTER TABLE statement"),
             Self::ExpectedSelect => f.write_str("expected a SELECT statement"),
             Self::ExpectedDml => f.write_str("expected an INSERT, UPDATE, or DELETE statement"),
+            Self::JsonLiteralDefault => f.write_str("JSON column cannot have a literal default"),
+            Self::JsonIndex => f.write_str("JSON column cannot be indexed directly"),
             Self::Unsupported { feature } => {
                 write!(f, "unsupported MySQL schema feature: {feature}")
             }
@@ -1911,10 +1918,11 @@ pub fn parse_optional_create_table_with_keys(
     let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
         return Ok(None);
     };
+    reject_json_defaults_and_keys(&table)?;
     if !table.constraints.iter().any(|constraint| {
         matches!(
             constraint,
-            TableConstraint::Index(_) | TableConstraint::Unique(_)
+            TableConstraint::Index(_) | TableConstraint::Unique(_) | TableConstraint::ForeignKey(_)
         )
     }) {
         return Ok(None);
@@ -1973,12 +1981,12 @@ pub fn parse_optional_create_table_with_keys(
         // named before it, in the order the statement wrote them — `KEY (a),
         // KEY a_2 (b), KEY (a)` names the three `a`, `a_2` and `a_3`.
         let name = match written_name {
-            Some(index_name) => MySqlTableName::parse(&index_name.value)
-                .map_err(|_| ParseError::Unsupported {
+            Some(index_name) => {
+                MySqlTableName::parse(&index_name.value).map_err(|_| ParseError::Unsupported {
                     feature: "inline KEY name",
-                })?
-                .as_str()
-                .to_owned(),
+                })?;
+                index_name.value.clone()
+            }
             None => inline_index_name(&indexes, &columns).ok_or(ParseError::Unsupported {
                 feature: "inline KEY name",
             })?,
@@ -3198,8 +3206,8 @@ fn byte_offset_of_location(sql: &str, location: sqlparser::tokenizer::Location) 
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
 ///
 /// This is separate from [`parse_create_table`] while the frontend has no
-/// allocator-backed execution path. It accepts exactly one inline signed `INT`
-/// or `INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY` column in that token order.
+/// allocator-backed execution path. It accepts exactly one signed integer
+/// `AUTO_INCREMENT` column whose primary key makes it non-null.
 pub fn parse_auto_increment_create_table(
     sql: &str,
     mode: SessionSqlMode,
@@ -3245,12 +3253,8 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
         return unsupported("exactly one AUTO_INCREMENT token");
     };
     let position = *position;
-    if position < 2
-        || position + 1 >= tokens.len()
-        || !is_unquoted_word(tokens[position - 2], "NOT")
-        || !is_unquoted_word(tokens[position - 1], "NULL")
-    {
-        return unsupported("AUTO_INCREMENT token order; expected NOT NULL AUTO_INCREMENT");
+    if position < 2 || position + 1 >= tokens.len() {
+        return unsupported("AUTO_INCREMENT token order");
     }
     // The column may declare the key itself, or the table may write it as a
     // clause after the columns — the spelling MySQL prints and every dumped
@@ -3269,9 +3273,7 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
         && ends_the_definition(position + 3);
     let ends_the_column = ends_the_definition(position + 1);
     if !declares_the_key && !ends_the_column {
-        return unsupported(
-            "AUTO_INCREMENT token order; expected NOT NULL AUTO_INCREMENT PRIMARY KEY",
-        );
+        return unsupported("AUTO_INCREMENT token order; expected PRIMARY KEY");
     }
     Ok(())
 }
@@ -4459,6 +4461,7 @@ fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, 
     // `AUTO_INCREMENT=<n>` and prints nothing back for it, so there is nothing
     // here to keep.
     reject_attributes_and_check_options(table)?;
+    reject_json_defaults_and_keys(table)?;
     for column in &table.columns {
         reject_attributes_this_rendering_would_lose(column)?;
     }
@@ -4494,6 +4497,55 @@ fn translate_create_table(table: &CreateTable) -> Result<TranslatedCreateTable, 
     })
 }
 
+pub(crate) fn reject_json_defaults_and_keys(table: &CreateTable) -> Result<(), ParseError> {
+    let json_columns = table
+        .columns
+        .iter()
+        .filter(|column| matches!(column.data_type, DataType::JSON))
+        .collect::<Vec<_>>();
+    if json_columns.is_empty() {
+        return Ok(());
+    }
+    for column in &json_columns {
+        for option in &column.options {
+            match &option.option {
+                ColumnOption::Default(expr) => reject_json_default(expr)?,
+                ColumnOption::PrimaryKey(_) | ColumnOption::Unique(_) => {
+                    return Err(ParseError::JsonIndex);
+                }
+                _ => {}
+            }
+        }
+    }
+    for constraint in &table.constraints {
+        let columns = match constraint {
+            TableConstraint::PrimaryKey(key) => &key.columns,
+            TableConstraint::Unique(key) => &key.columns,
+            TableConstraint::Index(key) => &key.columns,
+            _ => continue,
+        };
+        if columns.iter().any(|indexed| {
+            let Expr::Identifier(name) = &indexed.column.expr else {
+                return false;
+            };
+            json_columns
+                .iter()
+                .any(|column| column.name.value.eq_ignore_ascii_case(&name.value))
+        }) {
+            return Err(ParseError::JsonIndex);
+        }
+    }
+    Ok(())
+}
+
+fn reject_json_default(expr: &Expr) -> Result<(), ParseError> {
+    match expr {
+        Expr::Value(value) if matches!(value.value, Value::Null) => Ok(()),
+        Expr::Value(_) => Err(ParseError::JsonLiteralDefault),
+        _ => unsupported("JSON expression DEFAULT"),
+    }
+}
+
 fn translate_auto_increment_create_table(
     table: &CreateTable,
     mode: SessionSqlMode,
@@ -4504,6 +4556,7 @@ fn translate_auto_increment_create_table(
     if table.name.0.len() != 1 {
         return unsupported("qualified AUTO_INCREMENT table name");
     }
+    reject_json_defaults_and_keys(table)?;
     let starts_the_counter_at = reject_attributes_and_check_options(table)?;
     let table = &table_with_its_key_written_inline(table.clone());
     // A foreign key is the one table-level constraint a counted table takes,
@@ -4661,12 +4714,18 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
     {
         return unsupported("named column COMMENT");
     }
-    let [not_null, auto_increment, primary_key] = rest.as_slice() else {
+    let rest = match rest.as_slice() {
+        [not_null, rest @ ..]
+            if not_null.name.is_none() && matches!(not_null.option, ColumnOption::NotNull) =>
+        {
+            rest
+        }
+        rest => rest,
+    };
+    let [auto_increment, primary_key] = rest else {
         return unsupported("AUTO_INCREMENT column attributes");
     };
-    if not_null.name.is_some()
-        || !matches!(not_null.option, ColumnOption::NotNull)
-        || auto_increment.name.is_some()
+    if auto_increment.name.is_some()
         || !matches!(
             &auto_increment.option,
             ColumnOption::DialectSpecific(tokens) if is_auto_increment_tokens(tokens)
@@ -5984,6 +6043,9 @@ fn render_column_option(
             Ok(Some(format!("{name}UNIQUE")))
         }
         ColumnOption::Default(expr) if option.name.is_none() => {
+            if matches!(data_type, DataType::JSON) {
+                reject_json_default(expr)?;
+            }
             if names_the_moment_a_statement_runs_at(expr) {
                 // MySQL takes this default on a column that holds a moment and
                 // on no other — measured on 8.4.11, `DEFAULT CURRENT_TIMESTAMP`

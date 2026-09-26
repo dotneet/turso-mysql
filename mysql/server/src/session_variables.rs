@@ -366,7 +366,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 27] = [
+const SHOWN_VARIABLES: [&str; 28] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -391,6 +391,7 @@ const SHOWN_VARIABLES: [&str; 27] = [
     "system_time_zone",
     "time_zone",
     "transaction_isolation",
+    "transaction_read_only",
     "version",
     "version_comment",
     "wait_timeout",
@@ -669,6 +670,11 @@ fn counted_system_variable(
     }
     if name.eq_ignore_ascii_case("sql_notes") {
         return Some((u8::from(sql_notes).to_string(), 1, false));
+    }
+    // A READ ONLY transaction leaves MySQL's session default unchanged. This
+    // server does not accept a change to that default, so it remains off.
+    if name.eq_ignore_ascii_case("transaction_read_only") {
+        return Some(("0".to_owned(), 1, false));
     }
     // This server has no performance schema, which is a thing a client can see
     // for itself and act on rather than a claim about how it behaves.
@@ -1435,6 +1441,45 @@ mod tests {
     }
 
     #[test]
+    fn transaction_read_only_reports_the_unchangeable_session_default() {
+        let mut session = MySqlSessionVariables::default();
+        for sql in [
+            "SELECT @@session.transaction_read_only",
+            "SELECT @@global.transaction_read_only",
+            "SELECT @@transaction_read_only",
+        ] {
+            let Some(CommandExecutionResult::ResultSet(result)) = session
+                .execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2,
+                )
+                .unwrap()
+            else {
+                panic!("expected transaction_read_only result for {sql}");
+            };
+            assert_eq!(result.rows, vec![vec![Some(b"0".to_vec())]], "{sql}");
+            let column = &result.columns[0];
+            assert_eq!(column.name, &sql["SELECT ".len()..]);
+            assert_eq!(column.catalog, "def");
+            assert_eq!(column.column_type, MYSQL_TYPE_LONGLONG);
+            assert_eq!(column.character_set, MYSQL_BINARY_COLLATION);
+            assert_eq!(column.column_length, 1);
+            assert_eq!(column.decimals, 0);
+            assert_eq!(column.flags, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+        }
+        assert_eq!(
+            named(&variables(
+                &mut session,
+                "SHOW SESSION VARIABLES LIKE 'transaction_read_only'"
+            )),
+            vec![("transaction_read_only".to_owned(), "OFF".to_owned())]
+        );
+    }
+
+    #[test]
     fn unrelated_lexer_errors_remain_with_the_existing_query_owner() {
         let mut session = MySqlSessionVariables::default();
         assert!(session
@@ -1653,6 +1698,7 @@ mod tests {
                 ("system_time_zone", "UTC"),
                 ("time_zone", "SYSTEM"),
                 ("transaction_isolation", "REPEATABLE-READ"),
+                ("transaction_read_only", "OFF"),
                 ("version", SERVER_VERSION),
                 ("version_comment", SERVER_VERSION_COMMENT),
                 ("wait_timeout", "28800"),

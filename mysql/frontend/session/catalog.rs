@@ -7,6 +7,7 @@
 //! schema cannot produce an unbounded listing.
 
 use super::*;
+use crate::catalog_tables::{foreign_key_name, indexes_beside_the_primary_key};
 
 impl MySqlConnection {
     /// Lists user-visible tables and views from the current database catalog.
@@ -226,11 +227,12 @@ impl MySqlConnection {
         let mut secondary = Vec::new();
         for index in indexes {
             // The engine's own index behind a primary key is already reported.
-            if index
-                .columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .eq(primary.iter().map(|entry| entry.column_name.as_str()))
+            if index.name.starts_with("sqlite_autoindex_")
+                && index
+                    .columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .eq(primary.iter().map(|entry| entry.column_name.as_str()))
             {
                 continue;
             }
@@ -255,6 +257,37 @@ impl MySqlConnection {
         primary.extend(unique);
         primary.extend(secondary);
         Ok(primary)
+    }
+
+    /// Counts the named rows in `information_schema.TABLE_CONSTRAINTS` for one table.
+    pub fn count_constraints(
+        &self,
+        table: &MySqlTableName,
+        name: &str,
+    ) -> std::result::Result<usize, MySqlShowCreateTableError> {
+        match self.stored_object_kind(table)? {
+            None => return Err(MySqlShowCreateTableError::MissingTable),
+            Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
+            Some(MySqlTableKind::BaseTable) => {}
+        }
+        let schema = self.inner.current_schema();
+        let btree = schema
+            .get_table(table.as_str())
+            .and_then(|table| table.btree())
+            .ok_or(MySqlShowCreateTableError::MissingTable)?;
+        let primary = usize::from(
+            !btree.primary_key_columns.is_empty() && name.eq_ignore_ascii_case("PRIMARY"),
+        );
+        let unique = indexes_beside_the_primary_key(&schema, table.as_str(), &btree)
+            .into_iter()
+            .filter(|index| index.unique && mysql_index_name(index).eq_ignore_ascii_case(name))
+            .count();
+        let foreign = btree
+            .foreign_keys
+            .iter()
+            .filter(|key| foreign_key_name(table.as_str(), key).eq_ignore_ascii_case(name))
+            .count();
+        Ok(primary + unique + foreign)
     }
 
     /// Reads whether one name is a stored table or view, hiding internal objects.

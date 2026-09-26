@@ -161,7 +161,13 @@ impl RuntimeProcess {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(
+                if std::env::var("TURSO_MYSQL_RUNTIME_TRACE").as_deref() == Ok("1") {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                },
+            )
             .spawn()
             .expect("TCP runtime executable starts");
         let mut runtime = Self {
@@ -355,6 +361,7 @@ fn go_sql_driver_1_9_3_over_tls_tcp_exercises_prepared_crud_and_migration() {
         &["/usr/local/bin/mysql-go-driver-e2e"],
         runtime.endpoint,
         &roots.ca,
+        "15s",
     );
     runtime.stop_after_sigterm();
 }
@@ -378,6 +385,63 @@ fn connector_j_9_6_0_over_tls_tcp_exercises_prepared_crud_and_migration() {
         ],
         runtime.endpoint,
         &roots.ca,
+        "15s",
+    );
+    runtime.stop_after_sigterm();
+}
+
+#[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with GORM 1.31.2"]
+fn gorm_1_31_2_over_tls_tcp_exercises_schema_migration_and_relations() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_external_driver(
+        &["/usr/local/bin/mysql-gorm-e2e"],
+        runtime.endpoint,
+        &roots.ca,
+        "90s",
+    );
+    runtime.stop_after_sigterm();
+}
+
+#[test]
+#[ignore = "requires the privileged Linux cross-UID fixture with Hibernate 6.6.0.Final"]
+fn hibernate_6_6_0_over_tls_tcp_exercises_schema_migration_and_relations() {
+    let fixture = Fixture::from_environment();
+    let roots = TestRoots::new(&fixture.account_root);
+    let catalog = MySqlDatabaseCatalog::open(&roots.data_root).expect("catalog opens");
+    assert_eq!(catalog.create("reports"), Ok("reports".to_owned()));
+    drop(catalog);
+
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_external_driver(
+        &[
+            "java",
+            "-jar",
+            "/opt/mysql-drivers/hibernate-e2e-1.0.0.jar",
+            "prepare",
+        ],
+        runtime.endpoint,
+        &roots.ca,
+        "90s",
+    );
+    runtime.stop_after_sigterm();
+    let mut runtime = RuntimeProcess::start(&fixture, &roots);
+    run_external_driver(
+        &[
+            "java",
+            "-jar",
+            "/opt/mysql-drivers/hibernate-e2e-1.0.0.jar",
+            "verify",
+        ],
+        runtime.endpoint,
+        &roots.ca,
+        "90s",
     );
     runtime.stop_after_sigterm();
 }
@@ -570,9 +634,9 @@ async fn sql_account_administration_persists_and_reauthorizes_over_tls_tcp() {
     runtime.stop_after_sigterm();
 }
 
-fn run_external_driver(command: &[&str], endpoint: SocketAddr, ca: &Path) {
+fn run_external_driver(command: &[&str], endpoint: SocketAddr, ca: &Path, timeout: &str) {
     let output = Command::new("timeout")
-        .args(["--signal=KILL", "15s"])
+        .args(["--signal=KILL", timeout])
         .args(command)
         .env(
             "TURSO_MYSQL_DRIVER_ENDPOINT",
@@ -584,7 +648,8 @@ fn run_external_driver(command: &[&str], endpoint: SocketAddr, ca: &Path) {
         .expect("external driver starts");
     assert!(
         output.status.success(),
-        "external driver failed: {}",
+        "external driver failed (stdout: {}; stderr: {})",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 }

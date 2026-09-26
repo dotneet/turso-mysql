@@ -1438,11 +1438,23 @@ fn schema_ddl_commits_prior_work_and_returns_idle_after_success() -> Result<()> 
             "DDL left a transaction active: {ddl}"
         );
         assert!(!connection.session_autocommit());
+        let stored_name = if schema_kind == "index" {
+            connection
+                .inner()
+                .current_schema()
+                .get_indices("indexed_notes")
+                .find(|index| mysql_index_name(index) == schema_name)
+                .expect("created index is loaded")
+                .name
+                .clone()
+        } else {
+            schema_name.to_owned()
+        };
         assert_eq!(
             connection
                 .inner()
                 .prepare(format!(
-                    "SELECT type FROM sqlite_schema WHERE name = '{schema_name}'"
+                    "SELECT type FROM sqlite_schema WHERE name = '{stored_name}'"
                 ))?
                 .run_collect_rows()?,
             vec![vec![Value::from_text(schema_kind)]],
@@ -2439,7 +2451,7 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let path = "mysql-session-index-reopen.db";
     let expected_context = binary_context().for_kind(SchemaSqlKind::Index);
-    {
+    let stored_index_name = {
         let db = open_database(io.clone(), path, OpenFlags::Create)?;
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
         connection.execute("CREATE TABLE `users` (`id` INTEGER, `name` TEXT)")?;
@@ -2448,8 +2460,16 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
             .map_err(|error| {
                 LimboError::InternalError(format!("create marked index failed: {error}"))
             })?;
+        let stored_index_name = connection
+            .inner()
+            .current_schema()
+            .get_indices("users")
+            .find(|index| mysql_index_name(index) == "idx_users_name")
+            .expect("created index is loaded")
+            .name
+            .clone();
         assert_eq!(
-            stored_schema_context_for_kind(&connection, "idx_users_name", SchemaSqlKind::Index,)?,
+            stored_schema_context_for_kind(&connection, &stored_index_name, SchemaSqlKind::Index,)?,
             expected_context
         );
 
@@ -2459,7 +2479,7 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
                 LimboError::InternalError(format!("rename marked index column failed: {error}"))
             })?;
         assert_eq!(
-            stored_schema_context_for_kind(&connection, "idx_users_name", SchemaSqlKind::Index,)?,
+            stored_schema_context_for_kind(&connection, &stored_index_name, SchemaSqlKind::Index,)?,
             expected_context
         );
         connection
@@ -2468,11 +2488,12 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
                 LimboError::InternalError(format!("rename marked index table failed: {error}"))
             })?;
         assert_eq!(
-            stored_schema_context_for_kind(&connection, "idx_users_name", SchemaSqlKind::Index,)?,
+            stored_schema_context_for_kind(&connection, &stored_index_name, SchemaSqlKind::Index,)?,
             expected_context
         );
         connection.inner().close()?;
-    }
+        stored_index_name
+    };
 
     {
         let db = open_database(io.clone(), path, OpenFlags::None)?;
@@ -2484,7 +2505,7 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
         assert!(
             plan.iter()
                 .flat_map(|row| row.iter())
-                .any(|value| value.to_string().contains("idx_users_name")),
+                .any(|value| value.to_string().contains(&stored_index_name)),
             "expected index lookup plan, got {plan:?}"
         );
         connection.execute("VACUUM")?;
@@ -2494,7 +2515,7 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
     let db = open_database(io, path, OpenFlags::None)?;
     let connection = MySqlConnection::new(db.connect()?, binary_context())?;
     assert_eq!(
-        stored_schema_context_for_kind(&connection, "idx_users_name", SchemaSqlKind::Index)?,
+        stored_schema_context_for_kind(&connection, &stored_index_name, SchemaSqlKind::Index)?,
         expected_context
     );
     assert_eq!(
@@ -2505,6 +2526,310 @@ fn create_index_preserves_its_marker_through_schema_rewrites_and_vacuum() -> Res
         vec![vec![Value::from_i64(1)]]
     );
     connection.inner().close()?;
+    Ok(())
+}
+
+#[test]
+fn secondary_index_on_primary_key_columns_is_visible_and_droppable() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-secondary-on-primary.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT NOT NULL PRIMARY KEY)")?;
+    connection.execute("CREATE INDEX by_id ON records (id)")?;
+    let table = MySqlTableName::parse("records").unwrap();
+    assert_eq!(
+        connection
+            .list_indexes(&table)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["PRIMARY", "by_id"]
+    );
+
+    let drop = turso_mysql_parser::parse_optional_alter_table_indexes(
+        "ALTER TABLE records DROP INDEX by_id",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .unwrap();
+    connection.execute_alter_table_indexes(&drop).unwrap();
+    assert_eq!(
+        connection
+            .list_indexes(&table)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["PRIMARY"]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn rewriting_a_referenced_table_cannot_change_its_foreign_key_target() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-referenced-rewrite.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")?;
+    connection.execute("INSERT INTO parent (id) VALUES (1)")?;
+    connection.execute(
+        "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+         CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
+    )?;
+
+    assert!(matches!(
+        connection.execute_schema_ddl("ALTER TABLE parent ADD COLUMN first_column INT FIRST"),
+        Err(MySqlQueryError::Unsupported(_))
+    ));
+    let schema = connection.inner().current_schema();
+    let child = schema.get_btree_table("child").unwrap();
+    assert_eq!(child.foreign_keys[0].parent_table, "parent");
+    assert!(schema
+        .get_btree_table("parent")
+        .unwrap()
+        .columns()
+        .iter()
+        .all(|column| column.name.as_deref() != Some("first_column")));
+    drop(schema);
+    connection.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")?;
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn the_same_logical_index_name_on_two_tables_survives_drop_and_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-table-local-index-names.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE left_side (id INT, value INT)")?;
+        connection.execute("CREATE TABLE right_side (id INT, value INT)")?;
+        connection.execute("CREATE INDEX by_value ON left_side (value)")?;
+        connection.execute("CREATE INDEX by_value ON right_side (value)")?;
+        assert!(matches!(
+            connection.execute_schema_ddl("CREATE INDEX by_value ON left_side (id)"),
+            Err(MySqlQueryError::DuplicateIndex)
+        ));
+        let schema = connection.inner().current_schema();
+        let left = schema.get_indices("left_side").next().expect("left index");
+        let right = schema
+            .get_indices("right_side")
+            .next()
+            .expect("right index");
+        assert_ne!(left.name, right.name);
+        assert_eq!(mysql_index_name(left), "by_value");
+        assert_eq!(mysql_index_name(right), "by_value");
+        assert_eq!(
+            connection
+                .list_indexes(&MySqlTableName::parse("right_side").unwrap())
+                .unwrap()
+                .iter()
+                .map(MySqlIndexEntry::key_name)
+                .collect::<Vec<_>>(),
+            vec!["by_value"]
+        );
+
+        let drop = turso_mysql_parser::parse_optional_alter_table_indexes(
+            "ALTER TABLE left_side DROP INDEX by_value",
+            connection.parser_mode(),
+        )
+        .unwrap()
+        .unwrap();
+        connection.execute_alter_table_indexes(&drop).unwrap();
+        assert!(connection
+            .inner()
+            .current_schema()
+            .get_indices("left_side")
+            .next()
+            .is_none());
+        assert_eq!(
+            connection
+                .inner()
+                .current_schema()
+                .get_indices("right_side")
+                .next()
+                .map(|index| mysql_index_name(index)),
+            Some("by_value".to_owned())
+        );
+        connection.close()?;
+    }
+
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert_eq!(
+        connection
+            .list_indexes(&MySqlTableName::parse("right_side").unwrap())
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["by_value"]
+    );
+    assert!(connection
+        .inner()
+        .current_schema()
+        .get_indices("left_side")
+        .next()
+        .is_none());
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn foreign_keys_create_and_reuse_child_indexes() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(
+        io,
+        "mysql-session-foreign-key-indexes.db",
+        OpenFlags::Create,
+    )?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE parent (id INT PRIMARY KEY)")?;
+
+    let child = turso_mysql_parser::parse_optional_create_table_with_keys(
+        "CREATE TABLE child (a INT, b INT, CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES parent(id))",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .expect("FK-only CREATE TABLE uses the atomic index path");
+    connection.execute_create_table_with_keys(&child)?;
+    let child_name = MySqlTableName::parse("child").unwrap();
+    assert_eq!(
+        connection
+            .list_indexes(&child_name)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["fk_a"]
+    );
+    assert!(connection
+        .show_create_table(&child_name)
+        .unwrap()
+        .create_statement
+        .contains("KEY `fk_a` (`a`)"));
+
+    let drop = turso_mysql_parser::parse_optional_alter_table_indexes(
+        "ALTER TABLE child DROP INDEX fk_a",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        connection.execute_alter_table_indexes(&drop),
+        Err(MySqlAlterTableIndexError::RequiredByForeignKey)
+    ));
+    connection.execute_schema_ddl("CREATE INDEX replacement ON child (a, b)")?;
+    assert_eq!(
+        connection
+            .list_indexes(&child_name)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["replacement", "replacement"]
+    );
+    connection.execute_schema_ddl("ALTER TABLE child DROP FOREIGN KEY fk_a")?;
+    assert_eq!(
+        connection
+            .list_indexes(&child_name)
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["replacement", "replacement"]
+    );
+
+    let covered = turso_mysql_parser::parse_optional_create_table_with_keys(
+        "CREATE TABLE covered (a INT, b INT, KEY ix_ab (a, b), CONSTRAINT fk_covered FOREIGN KEY (a) REFERENCES parent(id))",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .unwrap();
+    connection.execute_create_table_with_keys(&covered)?;
+    assert_eq!(
+        connection
+            .list_indexes(&MySqlTableName::parse("covered").unwrap())
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["ix_ab", "ix_ab"]
+    );
+
+    connection.execute("CREATE TABLE altered (a INT)")?;
+    connection.execute_schema_ddl(
+        "ALTER TABLE altered ADD CONSTRAINT fk_altered FOREIGN KEY (a) REFERENCES parent(id)",
+    )?;
+    assert_eq!(
+        connection
+            .list_indexes(&MySqlTableName::parse("altered").unwrap())
+            .unwrap()
+            .iter()
+            .map(MySqlIndexEntry::key_name)
+            .collect::<Vec<_>>(),
+        vec!["fk_altered"]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
+fn legacy_foreign_key_without_child_index_is_rejected_on_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-legacy-foreign-key-index.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")?;
+        connection
+            .prepare("CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id))")?
+            .run_ignore_rows()?;
+        assert!(!connection
+            .inner()
+            .current_schema()
+            .get_indices("child")
+            .any(|index| index_covers_columns(index, &["parent_id".to_owned()])));
+        connection.close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    assert!(matches!(
+        MySqlConnection::new(db.connect()?, binary_context()),
+        Err(LimboError::InvalidArgument(message)) if message.contains("foreign key") && message.contains("child index")
+    ));
+    Ok(())
+}
+
+#[test]
+fn json_columns_cannot_be_indexed_after_table_creation() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-json-indexes.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE documents (id INT, doc JSON)")?;
+    assert!(matches!(
+        connection.execute_schema_ddl("CREATE INDEX doc_key ON documents(doc)"),
+        Err(MySqlQueryError::JsonIndex)
+    ));
+    let added = turso_mysql_parser::parse_optional_alter_table_indexes(
+        "ALTER TABLE documents ADD INDEX doc_key(doc)",
+        connection.parser_mode(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        connection.execute_alter_table_indexes(&added),
+        Err(MySqlAlterTableIndexError::JsonIndex)
+    ));
+    assert!(connection
+        .inner()
+        .current_schema()
+        .get_indices("documents")
+        .next()
+        .is_none());
+    connection.close()?;
     Ok(())
 }
 

@@ -10,7 +10,8 @@ mod catalog_results;
 #[cfg(unix)]
 use catalog_results::{
     admin_result_to_execution_result, analyze_table_result_to_execution_result,
-    check_table_result_to_execution_result, information_schema_columns_result_to_execution_result,
+    check_table_result_to_execution_result, gorm_columns_definitions, gorm_columns_result,
+    gorm_current_database_result, information_schema_columns_result_to_execution_result,
     information_schema_schemata_result_to_execution_result,
     information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
     show_columns_result, show_create_table_error_kind,
@@ -55,15 +56,17 @@ use turso_mysql_parser::{
     parse_optional_analyze_table, parse_optional_check_table,
     parse_optional_create_table_as_select, parse_optional_create_table_with_keys,
     parse_optional_created_table, parse_optional_describe, parse_optional_flush_tables,
+    parse_optional_gorm_information_schema_prepared_query,
     parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
     parse_optional_information_schema_tables, parse_optional_lock_tables,
     parse_optional_show_columns, parse_optional_show_create_table, parse_optional_show_full_tables,
     parse_optional_show_index, parse_optional_show_table_status, parse_optional_show_tables,
     rename_table_spelled_as_alter_table, select_projection_origins, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, MySqlAccountAdminCommand,
-    MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
-    MySqlInformationSchemaTablesColumn, MySqlLockTablesCommand, MySqlSelectProjectionOrigin,
-    MySqlSelectSource, MySqlTableName, ScalarFunction,
+    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, GormInformationSchemaPreparedQuery,
+    MySqlAccountAdminCommand, MySqlCatalogTable, MySqlDatabaseName,
+    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
+    MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
+    ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
@@ -194,6 +197,7 @@ struct DatabasePreparedStatement {
     connection: MySqlConnection,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
+    catalog_query: Option<GormInformationSchemaPreparedQuery>,
 }
 
 #[cfg(unix)]
@@ -519,6 +523,8 @@ where
                 self.schema_context,
                 self.prepared_statement_authority.clone(),
             ),
+            catalog: self.catalog,
+            schema_context: self.schema_context,
             principal,
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
@@ -543,6 +549,8 @@ where
 #[cfg(unix)]
 pub struct AuthorizedDatabaseCommandAdapter<A> {
     session: MySqlDatabaseSession,
+    catalog: Arc<MySqlDatabaseCatalog>,
+    schema_context: turso_mysql::schema_sql::SchemaSqlSessionContext,
     principal: AuthenticatedPrincipal,
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
@@ -886,6 +894,294 @@ where
             .execute_parsed_admin_command(command)
             .map_err(database_error_kind)?;
         admin_result_to_execution_result(result)
+    }
+    fn prepare_gorm_catalog_query(
+        &mut self,
+        query: GormInformationSchemaPreparedQuery,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        match query {
+            GormInformationSchemaPreparedQuery::CurrentDatabase => {
+                self.authorize(DatabaseAction::Connect {
+                    database: Some(&database),
+                })?;
+            }
+            GormInformationSchemaPreparedQuery::Columns
+            | GormInformationSchemaPreparedQuery::HasTable
+            | GormInformationSchemaPreparedQuery::HasColumn
+            | GormInformationSchemaPreparedQuery::HasIndex
+            | GormInformationSchemaPreparedQuery::HasConstraint => {
+                self.authorize_catalog_visibility(&database)?;
+            }
+        }
+        let connection = self
+            .session
+            .connection()
+            .map_err(database_error_kind)?
+            .clone();
+        // The engine-owned statement keeps the same global prepared-statement
+        // quota and lifecycle as any other binary-protocol statement.
+        let (reservation_sql, parameter_count) = match query {
+            GormInformationSchemaPreparedQuery::HasTable
+            | GormInformationSchemaPreparedQuery::HasColumn
+            | GormInformationSchemaPreparedQuery::HasIndex
+            | GormInformationSchemaPreparedQuery::HasConstraint => ("SELECT ?, ?, ?", 3),
+            _ => ("SELECT ?, ?", 2),
+        };
+        let reserved = connection
+            .prepare_checked_statement(reservation_sql)
+            .map_err(prepared_statement_error)?;
+        if reserved.parameter_count != parameter_count {
+            connection.remove_prepared_statement(reserved.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        }
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            connection.remove_prepared_statement(reserved.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        let columns = match query {
+            GormInformationSchemaPreparedQuery::CurrentDatabase => {
+                vec![catalog_results::information_schema_schemata_column()]
+            }
+            GormInformationSchemaPreparedQuery::Columns => gorm_columns_definitions(),
+            GormInformationSchemaPreparedQuery::HasTable
+            | GormInformationSchemaPreparedQuery::HasColumn
+            | GormInformationSchemaPreparedQuery::HasIndex
+            | GormInformationSchemaPreparedQuery::HasConstraint => {
+                vec![catalog_results::gorm_catalog_count_column()]
+            }
+        };
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                database,
+                source_tables: Vec::new(),
+                read_only_select: true,
+                connection,
+                connection_statement_id: reserved.statement_id,
+                parameter_types: None,
+                catalog_query: Some(query),
+            },
+        );
+        Ok(PreparedStatementResult {
+            statement_id,
+            parameters: (1..=parameter_count)
+                .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
+                .collect(),
+            columns,
+            warnings: 0,
+            status_flags: self.status_flags(),
+        })
+    }
+
+    fn execute_gorm_catalog_query(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let statement = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        let query = statement.catalog_query.ok_or(FrontendErrorKind::Internal)?;
+        let database = statement.database.clone();
+        let connection = statement.connection.clone();
+        let cached_types = statement.parameter_types.clone();
+        let long_data = self.pending_long_data.take_statement(statement_id);
+        if let Some(error) = long_data.error {
+            return Err(pending_long_data_error(error));
+        }
+        let long_data = long_data
+            .values
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>();
+        let parameter_count = match query {
+            GormInformationSchemaPreparedQuery::HasTable
+            | GormInformationSchemaPreparedQuery::HasColumn
+            | GormInformationSchemaPreparedQuery::HasIndex
+            | GormInformationSchemaPreparedQuery::HasConstraint => 3,
+            _ => 2,
+        };
+        let decoded = decode_statement_execute_parameters_with_long_data(
+            parameter_payload,
+            parameter_count,
+            cached_types.as_deref(),
+            &long_data,
+        )
+        .map_err(statement_execute_decode_error)?;
+        self.prepared_statements
+            .statements
+            .get_mut(&statement_id)
+            .expect("the prepared catalog statement was already found")
+            .parameter_types = Some(decoded.types);
+        let values = decoded
+            .values
+            .into_iter()
+            .map(|value| match value {
+                StatementParameterValue::String(value) => Ok(value),
+                _ => Err(FrontendErrorKind::Unsupported),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let status_flags = self.status_flags();
+        let mut result = match query {
+            GormInformationSchemaPreparedQuery::CurrentDatabase => {
+                let [first, second] = values.as_slice() else {
+                    return Err(FrontendErrorKind::Internal);
+                };
+                self.authorize(DatabaseAction::Connect {
+                    database: Some(&database),
+                })?;
+                if first.as_str() != format!("{database}%") || second != &database {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                gorm_current_database_result(&database, status_flags)
+            }
+            GormInformationSchemaPreparedQuery::Columns => {
+                let [first, second] = values.as_slice() else {
+                    return Err(FrontendErrorKind::Internal);
+                };
+                let visibility = self.authorize_catalog_visibility(first)?;
+                let table =
+                    MySqlTableName::parse(second).map_err(|_| FrontendErrorKind::Unsupported)?;
+                let columns = if !self.gorm_catalog_table_visible(first, &table, visibility)? {
+                    Vec::new()
+                } else if let Some(connection) =
+                    self.gorm_catalog_connection(first, &database, &connection)?
+                {
+                    list_gorm_catalog_columns(&connection, &table)?
+                } else {
+                    Vec::new()
+                };
+                gorm_columns_result(columns, status_flags)?
+            }
+            GormInformationSchemaPreparedQuery::HasTable
+            | GormInformationSchemaPreparedQuery::HasColumn
+            | GormInformationSchemaPreparedQuery::HasIndex
+            | GormInformationSchemaPreparedQuery::HasConstraint => {
+                let [schema, name, filter] = values.as_slice() else {
+                    return Err(FrontendErrorKind::Internal);
+                };
+                let visibility = self.authorize_catalog_visibility(schema)?;
+                let table =
+                    MySqlTableName::parse(name).map_err(|_| FrontendErrorKind::Unsupported)?;
+                let count = if !self.gorm_catalog_table_visible(schema, &table, visibility)? {
+                    0
+                } else if let Some(connection) =
+                    self.gorm_catalog_connection(schema, &database, &connection)?
+                {
+                    match query {
+                        GormInformationSchemaPreparedQuery::HasTable => connection
+                            .list_tables()
+                            .map_err(|_| FrontendErrorKind::Internal)?
+                            .iter()
+                            .filter(|listed| {
+                                listed.name().eq_ignore_ascii_case(table.as_str())
+                                    && match listed.kind() {
+                                        MySqlTableKind::BaseTable => {
+                                            filter.eq_ignore_ascii_case("BASE TABLE")
+                                        }
+                                        MySqlTableKind::View => filter.eq_ignore_ascii_case("VIEW"),
+                                    }
+                            })
+                            .count(),
+                        GormInformationSchemaPreparedQuery::HasColumn => {
+                            list_gorm_catalog_columns(&connection, &table)?
+                                .iter()
+                                .filter(|column| column.name().eq_ignore_ascii_case(filter))
+                                .count()
+                        }
+                        GormInformationSchemaPreparedQuery::HasIndex => {
+                            match connection.list_indexes(&table) {
+                                Ok(indexes) => indexes
+                                    .iter()
+                                    .filter(|index| index.key_name().eq_ignore_ascii_case(filter))
+                                    .count(),
+                                Err(
+                                    MySqlShowCreateTableError::MissingTable
+                                    | MySqlShowCreateTableError::NotTable,
+                                ) => 0,
+                                Err(error) => return Err(show_create_table_error_kind(error)),
+                            }
+                        }
+                        GormInformationSchemaPreparedQuery::HasConstraint => {
+                            match connection.count_constraints(&table, filter) {
+                                Ok(count) => count,
+                                Err(
+                                    MySqlShowCreateTableError::MissingTable
+                                    | MySqlShowCreateTableError::NotTable,
+                                ) => 0,
+                                Err(error) => return Err(show_create_table_error_kind(error)),
+                            }
+                        }
+                        _ => unreachable!("count query variant was already matched"),
+                    }
+                } else {
+                    0
+                };
+                catalog_results::gorm_catalog_count_result(
+                    i64::try_from(count).map_err(|_| FrontendErrorKind::Internal)?,
+                    status_flags,
+                )
+            }
+        };
+        if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
+            apply_raw_column_collations(
+                &connection,
+                &mut rows.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn gorm_catalog_table_visible(
+        &self,
+        schema: &str,
+        table: &MySqlTableName,
+        visibility: CatalogVisibility,
+    ) -> Result<bool, FrontendErrorKind> {
+        match visibility {
+            CatalogVisibility::All => Ok(true),
+            CatalogVisibility::GrantedTables => match self.authorizer.authorize_table(
+                &self.principal,
+                TableAction::Select {
+                    database: schema,
+                    table: table.as_str(),
+                },
+            ) {
+                Ok(()) => Ok(true),
+                Err(AuthorizationError::Denied) => Ok(false),
+                Err(error) => Err(authorization_frontend_error(error)),
+            },
+        }
+    }
+
+    fn gorm_catalog_connection(
+        &self,
+        schema: &str,
+        selected_database: &str,
+        selected_connection: &MySqlConnection,
+    ) -> Result<Option<MySqlConnection>, FrontendErrorKind> {
+        if schema == selected_database {
+            return Ok(Some(selected_connection.clone()));
+        }
+        let mut session = self.catalog.new_session(self.schema_context);
+        match session.select_database(schema) {
+            Ok(()) => Ok(Some(
+                session.connection().map_err(database_error_kind)?.clone(),
+            )),
+            Err(
+                MySqlDatabaseError::InvalidDatabaseName | MySqlDatabaseError::DatabaseNotFound(_),
+            ) => Ok(None),
+            Err(error) => Err(database_error_kind(error)),
+        }
     }
 }
 
@@ -1427,6 +1723,14 @@ where
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self.prepare_gorm_catalog_query(query);
+        }
         let selected_database = self
             .session
             .selected_database()
@@ -1488,6 +1792,7 @@ where
                 connection,
                 connection_statement_id,
                 parameter_types: None,
+                catalog_query: None,
             },
         );
         result
@@ -1541,6 +1846,15 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        if self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .and_then(|statement| statement.catalog_query)
+            .is_some()
+        {
+            return self.execute_gorm_catalog_query(statement_id, parameter_payload);
+        }
         let (database, source_tables, read_only_select) = self
             .prepared_statements
             .statements
@@ -1580,6 +1894,18 @@ where
             )?;
         }
         Ok(result)
+    }
+}
+
+#[cfg(unix)]
+fn list_gorm_catalog_columns(
+    connection: &MySqlConnection,
+    table: &MySqlTableName,
+) -> Result<Vec<MySqlColumnMetadata>, FrontendErrorKind> {
+    match connection.list_columns(table) {
+        Ok(columns) => Ok(columns),
+        Err(MySqlColumnMetadataError::TableNotFound) => Ok(Vec::new()),
+        Err(error) => Err(column_metadata_error_kind(error)),
     }
 }
 
@@ -1808,7 +2134,13 @@ fn execute_checked_query(
             }));
         }
         if let Some(checked) = parse_optional_create_table_with_keys(sql, connection.parser_mode())
-            .map_err(|_| FrontendErrorKind::Unsupported)?
+            .map_err(|error| match error {
+                turso_mysql_parser::ParseError::JsonLiteralDefault => {
+                    FrontendErrorKind::JsonLiteralDefault
+                }
+                turso_mysql_parser::ParseError::JsonIndex => FrontendErrorKind::JsonIndex,
+                _ => FrontendErrorKind::Unsupported,
+            })?
         {
             connection
                 .execute_create_table_with_keys(&checked)
@@ -1831,6 +2163,10 @@ fn execute_checked_query(
                     MySqlAlterTableIndexError::MissingIndex => FrontendErrorKind::CantDropKey,
                     MySqlAlterTableIndexError::DuplicateIndex => {
                         FrontendErrorKind::DuplicateKeyName
+                    }
+                    MySqlAlterTableIndexError::JsonIndex => FrontendErrorKind::JsonIndex,
+                    MySqlAlterTableIndexError::RequiredByForeignKey => {
+                        FrontendErrorKind::RequiredForeignKeyIndex
                     }
                     MySqlAlterTableIndexError::Engine(error) => frontend_error_kind(error),
                 })?;
@@ -2561,6 +2897,9 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
+        MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
+        MySqlQueryError::JsonIndex => FrontendErrorKind::JsonIndex,
+        MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
@@ -6204,6 +6543,9 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
+        MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
+        MySqlQueryError::JsonIndex => FrontendErrorKind::JsonIndex,
+        MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,

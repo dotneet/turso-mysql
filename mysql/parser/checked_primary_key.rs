@@ -11,10 +11,11 @@
 
 use super::{
     is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
-    reject_attributes_and_check_options, reject_unsupported_mysql_string_escapes, render_column,
-    render_column_option, render_mysql_checked_column, render_mysql_object_name,
-    render_table_constraint, table_with_its_key_written_inline, unsupported, written_comment,
-    ParseError, SessionSqlMode, WORDS_COLLATION,
+    reject_attributes_and_check_options, reject_json_defaults_and_keys,
+    reject_unsupported_mysql_string_escapes, render_column, render_column_option,
+    render_mysql_checked_column, render_mysql_object_name, render_table_constraint,
+    table_with_its_key_written_inline, unsupported, written_comment, ParseError, SessionSqlMode,
+    WORDS_COLLATION,
 };
 use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
@@ -101,6 +102,7 @@ pub fn parse_checked_primary_key_create_table(
 
 fn check_table_shape(table: &CreateTable) -> Result<(), ParseError> {
     reject_attributes_and_check_options(table)?;
+    reject_json_defaults_and_keys(table)?;
     if table.temporary {
         return unsupported("TEMPORARY PRIMARY KEY table");
     }
@@ -533,6 +535,35 @@ mod tests {
                 ]
             ));
         }
+    }
+
+    #[test]
+    fn rejects_hibernate_timestamp_fractional_seconds_until_the_engine_stores_them() {
+        let sql = "create table hibernate_e2e_account (amount decimal(30,18), \
+                   id integer not null, created_at timestamp(6) null, \
+                   name varchar(64) not null, primary key (id)) engine=InnoDB";
+        assert_eq!(
+            parse_checked_primary_key_create_table(sql, SessionSqlMode::default()),
+            Err(ParseError::Unsupported {
+                feature: "column type"
+            })
+        );
+    }
+
+    #[test]
+    fn accepts_hibernate_six_primary_key_table_with_decimal_and_whole_second_timestamp() {
+        let sql = "create table hibernate_e2e_account (amount decimal(30,18), \
+                   id integer not null, created_at timestamp null, \
+                   name varchar(64) not null, primary key (id)) engine=InnoDB";
+        let checked = parse_checked_primary_key_create_table(sql, SessionSqlMode::default())
+            .expect("Hibernate 6.6 whole-second table is supported");
+        assert_eq!(checked.primary_key_column_name, "id");
+        assert_eq!(
+            checked.primary_key_integer_type,
+            Some(CheckedPrimaryKeyIntegerType::Integer)
+        );
+        assert!(checked.normalized_mysql_ddl.contains("DECIMAL(30,18)"));
+        assert!(checked.normalized_mysql_ddl.contains("TIMESTAMP"));
     }
 
     #[test]

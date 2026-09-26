@@ -64,6 +64,11 @@ pub struct MySqlConnection {
     prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
 
+struct StoredIndexStatement {
+    sql: String,
+    implicit: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct AutoIncrementExecutionCapability {
     allocator: DurableRangeAllocator,
@@ -91,6 +96,12 @@ pub enum MySqlQueryError {
     MissingRequiredDefault(String),
     /// A `CHANGE COLUMN` renamed a column onto a name the table already has.
     DuplicateColumn(String),
+    /// An index with this name already exists on the same table.
+    DuplicateIndex,
+    /// A JSON value cannot be indexed directly.
+    JsonIndex,
+    /// A JSON column cannot have a literal default.
+    JsonLiteralDefault,
     /// The MySQL parser or checked translator rejected the query text.
     Syntax(String),
     /// Valid MySQL syntax lies outside the implemented compatibility surface.
@@ -964,6 +975,11 @@ impl fmt::Display for MySqlQueryError {
             Self::DuplicateColumn(column) => {
                 write!(f, "Duplicate column name '{column}'")
             }
+            Self::DuplicateIndex => f.write_str("Duplicate key name"),
+            Self::JsonIndex => {
+                f.write_str("JSON column supports indexing only via generated columns")
+            }
+            Self::JsonLiteralDefault => f.write_str("JSON column cannot have a literal default"),
             Self::ReadOnlyTransaction => {
                 f.write_str("cannot execute statement in a READ ONLY transaction")
             }
@@ -980,6 +996,9 @@ impl Error for MySqlQueryError {
         match self {
             Self::MissingRequiredDefault(_)
             | Self::DuplicateColumn(_)
+            | Self::DuplicateIndex
+            | Self::JsonIndex
+            | Self::JsonLiteralDefault
             | Self::ReadOnlyTransaction
             | Self::NoSuchSavepoint => None,
             Self::Syntax(_) => None,
@@ -995,6 +1014,13 @@ impl From<MySqlQueryError> for LimboError {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
             MySqlQueryError::DuplicateColumn(column) => {
                 Self::ParseError(format!("Duplicate column name '{column}'"))
+            }
+            MySqlQueryError::DuplicateIndex => Self::ParseError("Duplicate key name".to_string()),
+            MySqlQueryError::JsonIndex => {
+                Self::ParseError("JSON column cannot be indexed directly".to_string())
+            }
+            MySqlQueryError::JsonLiteralDefault => {
+                Self::ParseError("JSON column cannot have a literal default".to_string())
             }
             MySqlQueryError::ReadOnlyTransaction => Self::ReadOnly,
             MySqlQueryError::NoSuchSavepoint => Self::TxError("no such savepoint".to_string()),
@@ -1040,7 +1066,7 @@ impl MySqlConnection {
                 "the current MySQL table slice supports only binary character contexts".to_string(),
             ));
         }
-        reject_legacy_decimal_tables(&inner)?;
+        reject_incompatible_legacy_tables(&inner)?;
         // MySQL has no SQLite DQS misfeature. Left on, an identifier that does
         // not resolve becomes a string literal, so `SELECT id, nosuchcolumn
         // FROM t` answers with a fabricated `nosuchcolumn` beside a real value
@@ -2604,11 +2630,15 @@ impl MySqlConnection {
 
     /// Prepare one statement in the supported MySQL subset.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.prepare_with_index_origin(sql, false)
+    }
+
+    fn prepare_with_index_origin(&self, sql: &str, implicit_index: bool) -> Result<Statement> {
         let mode = self.parser_mode();
         if let Ok(checked) = parse_checked_primary_key_create_table(sql, mode) {
             return self.prepare_checked_primary_key_create_table(checked);
         }
-        let stmt = match parse_schema_ddl_ast(sql, mode) {
+        let mut stmt = match parse_schema_ddl_ast(sql, mode) {
             Ok(stmt) => stmt,
             Err(MySqlParseError::Unsupported {
                 feature: "schema statement",
@@ -2625,6 +2655,44 @@ impl MySqlConnection {
         }
         if matches!(stmt, Stmt::CreateTrigger { .. }) {
             self.reject_duplicate_marked_insert_trigger(&stmt)?;
+        }
+        if let Stmt::CreateIndex {
+            idx_name,
+            tbl_name,
+            columns,
+            ..
+        } = &mut stmt
+        {
+            let table = tbl_name.as_str();
+            let logical_name = idx_name.name.as_str();
+            MySqlTableName::parse(logical_name)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?;
+            let indexed_columns = columns
+                .iter()
+                .filter_map(|column| match column.expr.as_ref() {
+                    Expr::Id(name) => Some(name.as_str().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if self.index_targets_json(table, &indexed_columns)? {
+                return Err(LimboError::ParseError(
+                    "JSON column cannot be indexed directly".to_string(),
+                ));
+            }
+            if self
+                .inner
+                .current_schema()
+                .get_indices(table)
+                .any(|index| mysql_index_name(index).eq_ignore_ascii_case(logical_name))
+            {
+                return Err(LimboError::ParseError(format!(
+                    "Duplicate key name '{logical_name}'"
+                )));
+            }
+            idx_name.name = turso_parser::ast::Name::exact(physical_mysql_index_name(
+                logical_name,
+                implicit_index,
+            )?);
         }
         let input = match &stmt {
             Stmt::CreateTable { .. } => render_create_table_mysql_with_mode(&stmt, mode)
@@ -2670,6 +2738,39 @@ impl MySqlConnection {
         if let Some(statements) = self.expanded_alter_table(sql)? {
             return self.execute_expanded_alter_table(&statements);
         }
+        if self.added_foreign_key_table(sql).is_some() {
+            return self.execute_expanded_alter_table(&[sql.to_owned()]);
+        }
+        if let Ok(Stmt::CreateIndex {
+            idx_name,
+            tbl_name,
+            columns,
+            ..
+        }) = parse_schema_ddl_ast(sql, self.parser_mode())
+        {
+            let indexed_columns = columns
+                .iter()
+                .filter_map(|column| match column.expr.as_ref() {
+                    Expr::Id(name) => Some(name.as_str().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if self
+                .index_targets_json(tbl_name.as_str(), &indexed_columns)
+                .map_err(MySqlQueryError::Engine)?
+            {
+                return Err(MySqlQueryError::JsonIndex);
+            }
+            if self
+                .inner
+                .current_schema()
+                .get_indices(tbl_name.as_str())
+                .any(|index| mysql_index_name(index).eq_ignore_ascii_case(idx_name.name.as_str()))
+            {
+                return Err(MySqlQueryError::DuplicateIndex);
+            }
+            return self.execute_expanded_alter_table(&[sql.to_owned()]);
+        }
         let counter_start = self.counter_start_of_a_new_table(sql)?;
 
         let mut statement = match self.prepare(sql) {
@@ -2681,7 +2782,7 @@ impl MySqlConnection {
                         .and_then(|mut statement| statement.run_ignore_rows())
                         .map_err(MySqlQueryError::Engine)?;
                 }
-                return Err(MySqlQueryError::Engine(error));
+                return Err(self.json_schema_prepare_error(sql, error));
             }
         };
         if !self.inner.get_auto_commit() {
@@ -2703,6 +2804,14 @@ impl MySqlConnection {
             self.start_the_counter(&table, start)?;
         }
         Ok(())
+    }
+
+    fn json_schema_prepare_error(&self, sql: &str, error: LimboError) -> MySqlQueryError {
+        match parse_schema_ddl_ast(sql, self.parser_mode()) {
+            Err(MySqlParseError::JsonLiteralDefault) => MySqlQueryError::JsonLiteralDefault,
+            Err(MySqlParseError::JsonIndex) => MySqlQueryError::JsonIndex,
+            _ => MySqlQueryError::Engine(error),
+        }
     }
 
     /// The table a `CREATE TABLE ... AUTO_INCREMENT=<n>` is about to make, and
@@ -2862,7 +2971,8 @@ impl MySqlConnection {
     /// Foreign key checks are off while this runs. Every row is carried across,
     /// so nothing a key names goes missing; what the checks would catch is the
     /// moment between the drop and the copy, which is not a state any statement
-    /// can see.
+    /// can see. A table referenced by a foreign key cannot use this path:
+    /// renaming it would retarget the child constraint to the temporary name.
     fn write_the_table_again_with(
         &self,
         table: &str,
@@ -2872,6 +2982,15 @@ impl MySqlConnection {
         // it, where MySQL leaves one where it stood.
         self.reject_insert_target_triggers(table)
             .map_err(MySqlQueryError::Engine)?;
+        if self
+            .inner
+            .current_schema()
+            .any_resolved_fks_referencing(table)
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "moving a column of a table referenced by a foreign key".to_string(),
+            ));
+        }
         let counter = self
             .counter_of_a_stored_table(table)
             .map_err(MySqlQueryError::Engine)?;
@@ -2942,7 +3061,7 @@ impl MySqlConnection {
         copy: &str,
         drop_aside: &str,
         table: &str,
-        after: &[String],
+        after: &[StoredIndexStatement],
     ) -> std::result::Result<(), MySqlQueryError> {
         // DDL commits what came before it, which is what MySQL does.
         if !self.inner.get_auto_commit() {
@@ -2971,7 +3090,7 @@ impl MySqlConnection {
         copy: &str,
         drop_aside: &str,
         table: &str,
-        after: &[String],
+        after: &[StoredIndexStatement],
     ) -> std::result::Result<(), MySqlQueryError> {
         let run = |statement: &String| -> std::result::Result<(), MySqlQueryError> {
             self.prepare(statement)
@@ -2982,7 +3101,11 @@ impl MySqlConnection {
         before.iter().try_for_each(run)?;
         self.carry_the_rows_across(copy, table)?;
         self.run_internal(drop_aside)?;
-        after.iter().try_for_each(run)
+        after.iter().try_for_each(|index| {
+            self.prepare_with_index_origin(&index.sql, index.implicit)
+                .and_then(|mut prepared| prepared.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)
+        })
     }
 
     /// Moves the rows of the table set aside into the one written again.
@@ -3043,10 +3166,19 @@ impl MySqlConnection {
         }
         self.run_internal("BEGIN")?;
         let applied = statements.iter().try_for_each(|statement| {
-            self.prepare(statement)
-                .and_then(|mut statement| statement.run_ignore_rows())
-                .map(|_| ())
-                .map_err(MySqlQueryError::Engine)
+            let mut prepared = self
+                .prepare(statement)
+                .map_err(|error| self.json_schema_prepare_error(statement, error))?;
+            prepared
+                .run_ignore_rows()
+                .map_err(MySqlQueryError::Engine)?;
+            if let Some(table) = self.added_foreign_key_table(statement) {
+                self.ensure_foreign_key_child_indexes(&table)?;
+            }
+            if let Some(table) = self.created_index_table(statement) {
+                self.remove_replaced_implicit_fk_indexes(&table)?;
+            }
+            Ok(())
         });
         if applied.is_err() {
             // A failed rollback leaves the connection in a state the caller
@@ -3061,6 +3193,31 @@ impl MySqlConnection {
         Ok(())
     }
 
+    fn added_foreign_key_table(&self, sql: &str) -> Option<MySqlTableName> {
+        let Stmt::AlterTable(alter) = parse_schema_ddl_ast(sql, self.parser_mode()).ok()? else {
+            return None;
+        };
+        let AlterTableBody::AddConstraint(named) = &alter.body else {
+            return None;
+        };
+        if !matches!(
+            named.constraint,
+            turso_parser::ast::TableConstraint::ForeignKey { .. }
+        ) {
+            return None;
+        }
+        MySqlTableName::parse(alter.name.name.as_str()).ok()
+    }
+
+    fn created_index_table(&self, sql: &str) -> Option<MySqlTableName> {
+        let Stmt::CreateIndex { tbl_name, .. } =
+            parse_schema_ddl_ast(sql, self.parser_mode()).ok()?
+        else {
+            return None;
+        };
+        MySqlTableName::parse(tbl_name.as_str()).ok()
+    }
+
     /// Runs a `CREATE TABLE` that declares plain indexes inline.
     ///
     /// The engine has no inline non-unique index, so this becomes a
@@ -3071,6 +3228,7 @@ impl MySqlConnection {
         &self,
         checked: &MySqlCreateTableWithKeys,
     ) -> std::result::Result<(), MySqlQueryError> {
+        let counter_start = self.counter_start_of_a_new_table(checked.table_sql())?;
         // DDL commits what came before it, which is what MySQL does.
         if !self.inner.get_auto_commit() {
             self.run_internal("COMMIT")?;
@@ -3086,6 +3244,9 @@ impl MySqlConnection {
         self.run_internal("COMMIT")?;
         if !self.inner.get_auto_commit() {
             self.run_internal("ROLLBACK")?;
+        }
+        if let Some((table, start)) = counter_start {
+            self.start_the_counter(&table, start)?;
         }
         Ok(())
     }
@@ -3260,13 +3421,20 @@ impl MySqlConnection {
             .iter()
             .map(|index| index.key_name().to_owned())
             .collect::<Vec<_>>();
+        names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         for operation in checked.operations() {
-            let sql = match operation {
+            let (sql, stored_drop_name) = match operation {
                 MySqlAlterTableIndexOperation::Add {
                     name,
                     unique,
                     columns,
                 } => {
+                    if self
+                        .index_targets_json(checked.table().as_str(), columns)
+                        .map_err(MySqlAlterTableIndexError::Engine)?
+                    {
+                        return Err(MySqlAlterTableIndexError::JsonIndex);
+                    }
                     let name = match name {
                         Some(name) => {
                             if names.iter().any(|held| held.eq_ignore_ascii_case(name)) {
@@ -3284,10 +3452,13 @@ impl MySqlConnection {
                         .map(|column| format!("`{}`", column.replace('`', "``")))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    format!(
-                        "CREATE {}INDEX `{}` ON `{table}` ({columns})",
-                        if *unique { "UNIQUE " } else { "" },
-                        name.replace('`', "``")
+                    (
+                        format!(
+                            "CREATE {}INDEX `{}` ON `{table}` ({columns})",
+                            if *unique { "UNIQUE " } else { "" },
+                            name.replace('`', "``")
+                        ),
+                        None,
                     )
                 }
                 MySqlAlterTableIndexOperation::Drop { name } => {
@@ -3298,11 +3469,42 @@ impl MySqlConnection {
                         return Err(MySqlAlterTableIndexError::MissingIndex);
                     };
                     names.remove(position);
-                    format!("DROP INDEX `{}`", name.replace('`', "``"))
+                    let stored_name = self
+                        .inner
+                        .current_schema()
+                        .get_indices(checked.table().as_str())
+                        .find(|index| mysql_index_name(index).eq_ignore_ascii_case(name))
+                        .map(|index| index.name.clone())
+                        .ok_or(MySqlAlterTableIndexError::MissingIndex)?;
+                    (
+                        format!("DROP INDEX `{}`", stored_name.replace('`', "``")),
+                        Some(stored_name),
+                    )
                 }
             };
-            self.prepare_alter_table_index_statement(&sql, operation)?;
+            self.prepare_alter_table_index_statement(&sql, operation, stored_drop_name.as_deref())?;
         }
+        let schema = self.inner.current_schema();
+        let btree = schema
+            .get_btree_table(checked.table().as_str())
+            .ok_or(MySqlAlterTableIndexError::MissingTable)?;
+        for foreign_key in &btree.foreign_keys {
+            let primary_covers =
+                primary_key_covers_columns(&btree.primary_key_columns, &foreign_key.child_columns);
+            let index_covers = schema
+                .get_indices(checked.table().as_str())
+                .any(|index| index_covers_columns(index, &foreign_key.child_columns));
+            if !primary_covers && !index_covers {
+                return Err(MySqlAlterTableIndexError::RequiredByForeignKey);
+            }
+        }
+        self.remove_replaced_implicit_fk_indexes(checked.table())
+            .map_err(|error| match error {
+                MySqlQueryError::Engine(error) => MySqlAlterTableIndexError::Engine(error),
+                other => {
+                    MySqlAlterTableIndexError::Engine(LimboError::InternalError(other.to_string()))
+                }
+            })?;
         Ok(())
     }
 
@@ -3310,6 +3512,7 @@ impl MySqlConnection {
         &self,
         sql: &str,
         operation: &MySqlAlterTableIndexOperation,
+        stored_drop_name: Option<&str>,
     ) -> std::result::Result<(), MySqlAlterTableIndexError> {
         match operation {
             MySqlAlterTableIndexOperation::Add { .. } => self
@@ -3320,11 +3523,12 @@ impl MySqlConnection {
             // The engine's `DROP INDEX` names no table, and it leaves no
             // durable DDL behind, so it goes straight to Core rather than
             // through the MySQL schema path.
-            MySqlAlterTableIndexOperation::Drop { name } => {
+            MySqlAlterTableIndexOperation::Drop { .. } => {
+                let stored_name = stored_drop_name.expect("checked DROP INDEX has a stored name");
                 let stmt = Stmt::DropIndex {
                     if_exists: false,
                     idx_name: turso_parser::ast::QualifiedName::single(
-                        turso_parser::ast::Name::exact(name.clone()),
+                        turso_parser::ast::Name::exact(stored_name.to_owned()),
                     ),
                 };
                 self.inner
@@ -3340,10 +3544,33 @@ impl MySqlConnection {
         &self,
         checked: &MySqlCreateTableWithKeys,
     ) -> std::result::Result<(), MySqlQueryError> {
+        let existed = self
+            .names_a_table(checked.table())
+            .map_err(MySqlQueryError::Engine)?;
         self.prepare(checked.table_sql())
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(MySqlQueryError::Engine)?;
+        if existed {
+            return Ok(());
+        }
+        let mut held = self
+            .list_indexes(checked.table())
+            .map_err(|_| {
+                MySqlQueryError::Engine(LimboError::Corrupt(
+                    "created table is absent before its indexes were added".to_string(),
+                ))
+            })?
+            .iter()
+            .map(|index| index.key_name().to_owned())
+            .collect::<Vec<_>>();
         for index in checked.indexes() {
+            if held
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(index.name()))
+            {
+                return Err(MySqlQueryError::DuplicateIndex);
+            }
+            held.push(index.name().to_owned());
             let columns = index
                 .columns()
                 .iter()
@@ -3360,7 +3587,150 @@ impl MySqlConnection {
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
+        self.ensure_foreign_key_child_indexes(checked.table())?;
         Ok(())
+    }
+
+    fn ensure_foreign_key_child_indexes(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let foreign_keys = self
+            .inner
+            .current_schema()
+            .get_btree_table(table.as_str())
+            .ok_or_else(|| {
+                MySqlQueryError::Engine(LimboError::Corrupt(
+                    "foreign key table disappeared before its indexes were created".to_string(),
+                ))
+            })?
+            .foreign_keys
+            .iter()
+            .map(|foreign_key| (foreign_key.name.clone(), foreign_key.child_columns.to_vec()))
+            .collect::<Vec<_>>();
+        for (name, columns) in foreign_keys {
+            let schema = self.inner.current_schema();
+            let btree = schema.get_btree_table(table.as_str()).ok_or_else(|| {
+                MySqlQueryError::Engine(LimboError::Corrupt(
+                    "foreign key table disappeared while its indexes were created".to_string(),
+                ))
+            })?;
+            let primary_covers = primary_key_covers_columns(&btree.primary_key_columns, &columns);
+            let index_covers = schema
+                .get_indices(table.as_str())
+                .any(|index| index_covers_columns(index, &columns));
+            if primary_covers || index_covers {
+                continue;
+            }
+            let held = self
+                .list_indexes(table)
+                .map_err(|_| {
+                    MySqlQueryError::Engine(LimboError::Corrupt(
+                        "foreign key table indexes disappeared".to_string(),
+                    ))
+                })?
+                .iter()
+                .map(|index| index.key_name().to_owned())
+                .collect::<Vec<_>>();
+            let name = match name {
+                Some(name) => {
+                    if held.iter().any(|held| held.eq_ignore_ascii_case(&name)) {
+                        return Err(MySqlQueryError::DuplicateIndex);
+                    }
+                    name
+                }
+                None => unnamed_index_name(&held, &columns).ok_or_else(|| {
+                    MySqlQueryError::Engine(LimboError::Corrupt(
+                        "foreign key has no child columns".to_string(),
+                    ))
+                })?,
+            };
+            let columns = columns
+                .iter()
+                .map(|column| mysql_quoted(column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "CREATE INDEX {} ON {} ({columns})",
+                mysql_quoted(&name),
+                mysql_quoted(table.as_str())
+            );
+            self.prepare_with_index_origin(&sql, true)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        Ok(())
+    }
+
+    fn remove_replaced_implicit_fk_indexes(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        let btree = schema.get_btree_table(table.as_str()).ok_or_else(|| {
+            MySqlQueryError::Engine(LimboError::Corrupt(
+                "indexed table disappeared before redundant indexes were removed".to_string(),
+            ))
+        })?;
+        let redundant = schema
+            .get_indices(table.as_str())
+            .filter(|index| index.name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX))
+            .filter(|candidate| {
+                let using_candidate = btree
+                    .foreign_keys
+                    .iter()
+                    .filter(|foreign_key| {
+                        index_covers_columns(candidate, &foreign_key.child_columns)
+                    })
+                    .collect::<Vec<_>>();
+                !using_candidate.is_empty()
+                    && using_candidate.iter().all(|foreign_key| {
+                        primary_key_covers_columns(
+                            &btree.primary_key_columns,
+                            &foreign_key.child_columns,
+                        ) || schema.get_indices(table.as_str()).any(|other| {
+                            other.name != candidate.name
+                                && !other.name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX)
+                                && index_covers_columns(other, &foreign_key.child_columns)
+                        })
+                    })
+            })
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        for name in redundant {
+            let sql = format!("DROP INDEX {}", mysql_quoted(&name));
+            let stmt = Stmt::DropIndex {
+                if_exists: false,
+                idx_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    name,
+                )),
+            };
+            self.inner
+                .prepare_translated_stmt(stmt, &sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        Ok(())
+    }
+
+    fn index_targets_json(&self, table: &str, indexed_columns: &[String]) -> Result<bool> {
+        let table = MySqlTableName::parse(table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = match self.list_columns(&table) {
+            Ok(columns) => columns,
+            Err(MySqlColumnMetadataError::TableNotFound) => return Ok(false),
+            Err(error) => {
+                return Err(LimboError::ParseError(format!(
+                    "cannot validate indexed column types: {error}"
+                )))
+            }
+        };
+        Ok(indexed_columns.iter().any(|indexed| {
+            columns.iter().any(|column| {
+                column.name().eq_ignore_ascii_case(indexed)
+                    && column.type_name().eq_ignore_ascii_case("json")
+            })
+        }))
     }
 
     /// Writes an `INSERT` out as the form the rest of this path reads.
@@ -3671,10 +4041,11 @@ impl MySqlConnection {
             .prepare_translated_stmt(dropped, &sql)
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(MySqlTruncateTableError::Engine)?;
-        for written in std::iter::once(table.definition.normalized_mysql_ddl.as_str())
-            .chain(indexes.iter().map(String::as_str))
-        {
-            self.prepare(written)
+        self.prepare(&table.definition.normalized_mysql_ddl)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlTruncateTableError::Engine)?;
+        for index in &indexes {
+            self.prepare_with_index_origin(&index.sql, index.implicit)
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlTruncateTableError::Engine)?;
         }
@@ -3683,7 +4054,7 @@ impl MySqlConnection {
 
     /// The MySQL `CREATE INDEX` each of one table's stored indexes was written
     /// as, for the indexes that carry a statement of their own.
-    fn stored_index_statements(&self, table: &str) -> Result<Vec<String>> {
+    fn stored_index_statements(&self, table: &str) -> Result<Vec<StoredIndexStatement>> {
         let rows = self
             .inner
             .prepare(
@@ -3711,7 +4082,25 @@ impl MySqlConnection {
             else {
                 continue;
             };
-            statements.push(decoded.normalized_ddl.to_owned());
+            let mut statement = parse_schema_ddl_ast(decoded.normalized_ddl, self.parser_mode())
+                .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+            let Stmt::CreateIndex { idx_name, .. } = &mut statement else {
+                return Err(LimboError::Corrupt(
+                    "marked index SQL did not describe an index".to_string(),
+                ));
+            };
+            let implicit = idx_name
+                .name
+                .as_str()
+                .starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX);
+            if let Some(logical_name) = logical_mysql_index_name(idx_name.name.as_str()) {
+                idx_name.name = turso_parser::ast::Name::exact(logical_name);
+            }
+            statements.push(StoredIndexStatement {
+                sql: render_create_index_mysql_with_mode(&statement, self.parser_mode())
+                    .map_err(|error| LimboError::Corrupt(error.to_string()))?,
+                implicit,
+            });
         }
         Ok(statements)
     }
@@ -5527,7 +5916,7 @@ impl MySqlConnection {
     }
 }
 
-fn reject_legacy_decimal_tables(connection: &Arc<Connection>) -> Result<()> {
+fn reject_incompatible_legacy_tables(connection: &Arc<Connection>) -> Result<()> {
     let tables = connection
         .prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")?
         .run_collect_rows()?;
@@ -5551,6 +5940,18 @@ fn reject_legacy_decimal_tables(connection: &Arc<Connection>) -> Result<()> {
             return Err(LimboError::InvalidArgument(format!(
                 "table '{name}' has legacy DECIMAL values stored through binary64; re-import this table from the original decimal data"
             )));
+        }
+        for foreign_key in &table.foreign_keys {
+            let primary_covers =
+                primary_key_covers_columns(&table.primary_key_columns, &foreign_key.child_columns);
+            let index_covers = schema
+                .get_indices(name)
+                .any(|index| index_covers_columns(index, &foreign_key.child_columns));
+            if !primary_covers && !index_covers {
+                return Err(LimboError::InvalidArgument(format!(
+                    "table '{name}' has a legacy foreign key without a child index; rebuild or re-import this table with the current MySQL frontend"
+                )));
+            }
         }
     }
     Ok(())
@@ -6868,12 +7269,88 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
 /// An index the engine created for an inline UNIQUE carries a generated
 /// `sqlite_autoindex_` name; MySQL names such an index after its first column.
 pub(crate) fn mysql_index_name(index: &turso_core::schema::Index) -> String {
+    if let Some(name) = logical_mysql_index_name(&index.name) {
+        return name;
+    }
     if index.name.starts_with("sqlite_autoindex_") {
         if let Some(first) = index.columns.first() {
             return first.name.clone();
         }
     }
     index.name.clone()
+}
+
+fn primary_key_covers_columns(
+    primary: &[(String, turso_parser::ast::SortOrder)],
+    columns: &[String],
+) -> bool {
+    primary.len() >= columns.len()
+        && primary
+            .iter()
+            .zip(columns)
+            .all(|((name, _), column)| name.eq_ignore_ascii_case(column))
+}
+
+fn index_covers_columns(index: &turso_core::schema::Index, columns: &[String]) -> bool {
+    index.columns.len() >= columns.len()
+        && index
+            .columns
+            .iter()
+            .zip(columns)
+            .all(|(indexed, column)| indexed.name.eq_ignore_ascii_case(column))
+}
+
+const MYSQL_INDEX_STORAGE_PREFIX: &str = "__turso_mysql_index_namespace_v1__";
+const MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX: &str = "__turso_mysql_implicit_index_namespace_v1__";
+
+fn physical_mysql_index_name(logical_name: &str, implicit: bool) -> Result<String> {
+    let identity = new_allocator_identity()?;
+    let prefix = if implicit {
+        MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX
+    } else {
+        MYSQL_INDEX_STORAGE_PREFIX
+    };
+    let mut name =
+        String::with_capacity(prefix.len() + (identity.len() + logical_name.len()) * 2 + 1);
+    name.push_str(prefix);
+    for byte in identity {
+        push_hex_byte(&mut name, byte);
+    }
+    name.push('_');
+    for byte in logical_name.bytes() {
+        push_hex_byte(&mut name, byte);
+    }
+    Ok(name)
+}
+
+fn logical_mysql_index_name(stored_name: &str) -> Option<String> {
+    let suffix = stored_name
+        .strip_prefix(MYSQL_INDEX_STORAGE_PREFIX)
+        .or_else(|| stored_name.strip_prefix(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX))?;
+    let (identity, logical) = suffix.split_at_checked(32)?;
+    if !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let logical = logical.strip_prefix('_')?;
+    if logical.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = logical
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)? as u8;
+            let low = (pair[1] as char).to_digit(16)? as u8;
+            Some((high << 4) | low)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn push_hex_byte(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(char::from(HEX[usize::from(byte >> 4)]));
+    out.push(char::from(HEX[usize::from(byte & 15)]));
 }
 
 fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>> {
@@ -7047,10 +7524,11 @@ fn no_such_savepoint_error(error: MySqlQueryError) -> MySqlQueryError {
 }
 
 fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
-    if matches!(error, MySqlParseError::Unsupported { .. }) {
-        MySqlQueryError::Unsupported(error.to_string())
-    } else {
-        MySqlQueryError::Syntax(error.to_string())
+    match error {
+        MySqlParseError::JsonLiteralDefault => MySqlQueryError::JsonLiteralDefault,
+        MySqlParseError::JsonIndex => MySqlQueryError::JsonIndex,
+        MySqlParseError::Unsupported { .. } => MySqlQueryError::Unsupported(error.to_string()),
+        _ => MySqlQueryError::Syntax(error.to_string()),
     }
 }
 

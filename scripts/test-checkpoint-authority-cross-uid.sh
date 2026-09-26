@@ -5,6 +5,9 @@ set -euo pipefail
 readonly image="${TURSO_MYSQL_CROSS_UID_IMAGE:-ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517}"
 readonly mysql_cli_required="${TURSO_MYSQL_CLI_REQUIRED:-0}"
 readonly drivers_required="${TURSO_MYSQL_DRIVERS_REQUIRED:-0}"
+readonly orm_required="${TURSO_MYSQL_ORM_REQUIRED:-0}"
+readonly gorm_trace="${TURSO_MYSQL_GORM_TRACE:-0}"
+readonly runtime_trace="${TURSO_MYSQL_RUNTIME_TRACE:-0}"
 artifact_dir="${CROSS_UID_ARTIFACT_DIR:-$(pwd)/target/debug}"
 test_binary="${1:?pass the compiled privileged_cross_uid test binary}"
 runtime_test_binary="${2:?pass the compiled runtime Unix E2E test binary}"
@@ -38,6 +41,8 @@ command -v file >/dev/null || fail "requires file"
   || fail "TURSO_MYSQL_CLI_REQUIRED must be 0 or 1"
 [[ "${drivers_required}" == 0 || "${drivers_required}" == 1 ]] \
   || fail "TURSO_MYSQL_DRIVERS_REQUIRED must be 0 or 1"
+[[ "${orm_required}" == 0 || "${orm_required}" == 1 ]] \
+  || fail "TURSO_MYSQL_ORM_REQUIRED must be 0 or 1"
 
 for artifact in "${authority_binary}" "${provision_binary}" "${runtime_binary}" "${test_binary}" "${runtime_test_binary}" "${tcp_test_binary}"; do
   [[ -f "${artifact}" && -x "${artifact}" ]] || fail "missing executable artifact"
@@ -74,6 +79,9 @@ run_docker run --rm --interactive --user 0:0 --network none --read-only \
   -e "TURSO_MYSQL_TCP_TEST=$(basename "${tcp_test_binary}")" \
   -e "TURSO_MYSQL_CLI_REQUIRED=${mysql_cli_required}" \
   -e "TURSO_MYSQL_DRIVERS_REQUIRED=${drivers_required}" \
+  -e "TURSO_MYSQL_ORM_REQUIRED=${orm_required}" \
+  -e "TURSO_MYSQL_GORM_TRACE=${gorm_trace}" \
+  -e "TURSO_MYSQL_RUNTIME_TRACE=${runtime_trace}" \
   "${image}" bash -s <<'INNER'
 set -euo pipefail
 
@@ -106,6 +114,8 @@ readonly sql_admin_test_name='sql_account_administration_persists_and_reauthoriz
 readonly mysql_cli_test_name='mysql_cli_8_0_46_over_tls_tcp_exercises_schema_data_transactions_and_reconnect'
 readonly go_driver_test_name='go_sql_driver_1_9_3_over_tls_tcp_exercises_prepared_crud_and_migration'
 readonly jdbc_driver_test_name='connector_j_9_6_0_over_tls_tcp_exercises_prepared_crud_and_migration'
+readonly gorm_test_name='gorm_1_31_2_over_tls_tcp_exercises_schema_migration_and_relations'
+readonly hibernate_test_name='hibernate_6_6_0_over_tls_tcp_exercises_schema_migration_and_relations'
 
 fail() {
   printf '%s\n' "checkpoint authority cross-UID fixture: $*" >&2
@@ -215,6 +225,13 @@ if [[ "${TURSO_MYSQL_DRIVERS_REQUIRED}" == 1 ]]; then
     || fail "fixture has no Connector/J E2E"
   assert_runtime_test_name "${go_driver_test_name}" "${tcp_test_binary}"
   assert_runtime_test_name "${jdbc_driver_test_name}" "${tcp_test_binary}"
+fi
+if [[ "${TURSO_MYSQL_ORM_REQUIRED}" == 1 ]]; then
+  [[ -x /usr/local/bin/mysql-gorm-e2e ]] || fail "fixture has no GORM E2E"
+  command -v java >/dev/null || fail "fixture has no Java runtime"
+  [[ -f /opt/mysql-drivers/hibernate-e2e-1.0.0.jar ]] || fail "fixture has no Hibernate E2E"
+  assert_runtime_test_name "${gorm_test_name}" "${tcp_test_binary}"
+  assert_runtime_test_name "${hibernate_test_name}" "${tcp_test_binary}"
 fi
 
 assert_identity "${service_uid}"
@@ -393,6 +410,18 @@ if [[ "${TURSO_MYSQL_DRIVERS_REQUIRED}" == 1 ]]; then
     TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
     TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
       run_runtime_test "${tcp_test_binary}" "${driver_test}"
+  done
+fi
+
+if [[ "${TURSO_MYSQL_ORM_REQUIRED}" == 1 ]]; then
+  for orm_test in "${gorm_test_name}" "${hibernate_test_name}"; do
+    TURSO_MYSQL_CROSS_UID_SOCKET="${socket_path}" \
+    TURSO_MYSQL_CROSS_UID_AUTHORITY="${authority_id}" \
+    TURSO_MYSQL_CROSS_UID_SERVICE_UID="${service_uid}" \
+    TURSO_MYSQL_CROSS_UID_CLIENT_UID="${client_uid}" \
+    TURSO_MYSQL_CROSS_UID_ACCOUNT_STORE_ROOT="${account_root}" \
+    TURSO_MYSQL_CROSS_UID_RUNTIME_BINARY='/artifacts/turso-mysql-server' \
+      run_runtime_test "${tcp_test_binary}" "${orm_test}"
   done
 fi
 

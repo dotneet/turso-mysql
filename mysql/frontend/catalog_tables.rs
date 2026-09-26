@@ -85,7 +85,7 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
 /// That one is already reported under the name `PRIMARY`, read off the table
 /// rather than off the indexes — which is the only place a rowid-alias primary
 /// key, which has no index at all, can be read from.
-fn indexes_beside_the_primary_key<'a>(
+pub(crate) fn indexes_beside_the_primary_key<'a>(
     schema: &'a turso_core::schema::Schema,
     table: &str,
     btree: &turso_core::schema::BTreeTable,
@@ -735,7 +735,7 @@ impl InternalVirtualTable for InformationSchemaTableConstraints {
 /// A key written without a `CONSTRAINT` name is named after the table it is on,
 /// counted from one in declaration order — the same name `SHOW CREATE TABLE`
 /// prints for it.
-fn foreign_key_name(table: &str, key: &turso_core::schema::ForeignKey) -> String {
+pub(crate) fn foreign_key_name(table: &str, key: &turso_core::schema::ForeignKey) -> String {
     match &key.name {
         Some(name) => name.clone(),
         None => format!("{table}_ibfk_{}", key.decl_order + 1),

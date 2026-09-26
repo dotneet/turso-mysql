@@ -195,6 +195,7 @@ jobs:
           TURSO_MYSQL_CROSS_UID_IMAGE="turso-mysql-cross-uid-cli:${GITHUB_RUN_ID}" \
           TURSO_MYSQL_CLI_REQUIRED=1 \
           TURSO_MYSQL_DRIVERS_REQUIRED=1 \
+          TURSO_MYSQL_ORM_REQUIRED=1 \
           CROSS_UID_ARTIFACT_DIR="${CARGO_TARGET_DIR}/debug" \
             scripts/test-checkpoint-authority-cross-uid.sh \
               "${executables[0]}" "${runtime_executables[0]}" "${tcp_executables[0]}"

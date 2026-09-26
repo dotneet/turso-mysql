@@ -7,6 +7,50 @@ use super::*;
 use turso_parser::ast::{AlterTable as TursoAlterTable, AlterTableBody as TursoAlterTableBody};
 
 #[test]
+fn json_columns_reject_defaults_and_indexes_mysql_rejects() {
+    let mode = SessionSqlMode::default();
+    let literal_default = "CREATE TABLE documents (doc JSON DEFAULT '{}')";
+    assert_eq!(
+        parse_create_table(literal_default, mode),
+        Err(ParseError::JsonLiteralDefault)
+    );
+    assert!(matches!(
+        parse_schema_ddl_ast(literal_default, mode),
+        Err(ParseError::JsonLiteralDefault)
+    ));
+    for sql in [
+        "CREATE TABLE documents (doc JSON PRIMARY KEY)",
+        "CREATE TABLE documents (doc JSON UNIQUE)",
+        "CREATE TABLE documents (doc JSON, PRIMARY KEY (doc))",
+        "CREATE TABLE documents (doc JSON, UNIQUE KEY doc_key (doc))",
+    ] {
+        assert_eq!(
+            parse_create_table(sql, mode),
+            Err(ParseError::JsonIndex),
+            "{sql}"
+        );
+    }
+    assert!(parse_create_table("CREATE TABLE documents (doc JSON DEFAULT NULL)", mode).is_ok());
+    assert_eq!(
+        parse_optional_create_table_with_keys(
+            "CREATE TABLE documents (doc JSON, KEY doc_key (doc))",
+            mode,
+        ),
+        Err(ParseError::JsonIndex)
+    );
+    let alter_default = "ALTER TABLE documents ADD COLUMN doc JSON DEFAULT '{}'";
+    assert!(matches!(
+        parse_alter_table_ast(alter_default, mode),
+        Err(ParseError::JsonLiteralDefault)
+    ));
+    assert!(parse_alter_table_ast(
+        "ALTER TABLE documents ADD COLUMN doc JSON DEFAULT NULL",
+        mode,
+    )
+    .is_ok());
+}
+
+#[test]
 fn decimal_ddl_and_values_keep_their_written_digits() {
     let mode = SessionSqlMode::default();
     let table = parse_create_table(
@@ -229,6 +273,27 @@ fn mysql_ddl_renderer_hides_both_current_and_legacy_internal_collations() {
         assert!(shown.contains("`name` TEXT"), "{internal}: {shown}");
         assert!(!shown.contains("COLLATE"), "{internal}: {shown}");
     }
+}
+
+#[test]
+fn foreign_key_only_create_table_uses_the_atomic_index_path() {
+    let checked = parse_optional_create_table_with_keys(
+        "CREATE TABLE child (a INT, CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES parent(id))",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .expect("a foreign key needs an index beside the table");
+    assert_eq!(checked.table().as_str(), "child");
+    assert!(checked.indexes().is_empty());
+    assert!(checked.table_sql().contains("FOREIGN KEY"));
+
+    let named = parse_optional_create_table_with_keys(
+        "CREATE TABLE child2 (a INT, KEY MiXeD(a))",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(named.indexes()[0].name(), "MiXeD");
 }
 
 #[test]
@@ -4953,15 +5018,34 @@ fn a_counted_table_reads_a_key_written_as_a_clause() {
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT NOT NULL, PRIMARY KEY (id, n))",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT, PRIMARY KEY (n))",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT, n INT)",
-        // The counted column still has to say NOT NULL, which every schema a
-        // migration tool writes does.
-        "CREATE TABLE t (id INT AUTO_INCREMENT, PRIMARY KEY (id))",
     ] {
         assert!(
             parse_auto_increment_create_table(sql, SessionSqlMode::default()).is_err(),
             "{sql}"
         );
     }
+    let implicit_not_null = parse_auto_increment_create_table(
+        "CREATE TABLE t (id INT AUTO_INCREMENT, PRIMARY KEY (id))",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(implicit_not_null
+        .normalized_mysql_ddl
+        .contains("`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY"));
+}
+
+#[test]
+fn gorm_counted_table_uses_the_primary_key_to_make_id_not_null() {
+    let sql = "CREATE TABLE `gorm_e2e_parents` (`id` bigint AUTO_INCREMENT, `code` varchar(32) NOT NULL, `created_at` datetime NULL, PRIMARY KEY (`id`), UNIQUE INDEX `uk_gorm_parent_code` (`code`), INDEX `idx_gorm_shared_code` (`code`))";
+    let split = parse_optional_create_table_with_keys(sql, SessionSqlMode::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(split.indexes().len(), 2);
+    let counted =
+        parse_auto_increment_create_table(split.table_sql(), SessionSqlMode::default()).unwrap();
+    assert!(counted
+        .normalized_mysql_ddl
+        .contains("`id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY"));
 }
 
 /// MySQL prints `ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
