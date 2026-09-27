@@ -1370,7 +1370,13 @@ precision by 22 and keeps its scale, so over `TINYINT` it reports length 26,
 `SMALLINT` 28, `MEDIUMINT` 31, `INT` 33, `BIGINT` 42, and `DECIMAL(10,2)` 34
 with 2 decimals. `AVG` widens precision by 4 and scale by 4, so over `TINYINT`
 it reports 9, over `INT` 16, and over `DECIMAL(10,2)` 16 with 6 decimals. Over a
-`DOUBLE` both answer `DOUBLE` with length 23 and 31 decimals. `GROUP_CONCAT`
+`DOUBLE` both answer `DOUBLE` with length 23 and 31 decimals. Over an unsigned whole
+number, measured on 8.4.11, `MIN` and `MAX` answer the column's own type and carry its
+unsigned flag — `MAX(id)` over a `BIGINT UNSIGNED` a `LONGLONG` of 20, unsigned, which is
+what a client decoding the binary protocol reads the value by — and `SUM` and `AVG` count
+its digits the way they count a signed one's, 3 for a `TINYINT UNSIGNED`, 10 for an `INT
+UNSIGNED` and 20 for a `BIGINT UNSIGNED`, so `SUM` over the last answers 43, and answer a
+signed decimal. `GROUP_CONCAT`
 answers `MYSQL_TYPE_BLOB` (252) of length 65536 and 31 decimals, flags 0,
 skipping NULL values and defaulting to comma `,` separator.
 
@@ -1404,8 +1410,7 @@ the column's and rounds that half away from zero, so the engine's exact
 `mysql_decimal_avg` and `mysql_decimal_sum` answer it rather than its float
 `AVG` — over -2 and -3, `ROUND(AVG(n))` is -3. Refused: rounding left of the
 point, which the engine's decimal rounding stops short of; `MIN`, `MAX` and
-`COUNT` inside, which answer shapes of their own; and a float or an unsigned
-column.
+`COUNT` inside, which answer shapes of their own; and a float column.
 
 A `WITH` clause names a subquery so the statement can read it as a table.
 Measured on 8.4.11: a column that comes through a CTE names the CTE as its table

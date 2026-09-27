@@ -507,3 +507,85 @@ fn a_column_compared_against_the_average_finds_the_rows_mysql_finds() {
         );
     }
 }
+
+/// A largest or smallest of an unsigned column is unsigned too, which a
+/// client decoding the binary protocol reads the value by; a total and an
+/// average of one widen its digits and answer a signed decimal.
+#[test]
+fn aggregates_over_unsigned_columns_answer_the_shapes_mysql_answers() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE un (id INT PRIMARY KEY, a INT UNSIGNED, b BIGINT UNSIGNED, t TINYINT UNSIGNED, d DECIMAL(6,2) UNSIGNED)",
+        "INSERT INTO un VALUES (1, 4000000000, 18446744073709551615, 250, 1.50), (2, 3, 5, 1, 2.25)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let numeric = |column_type, length, decimals, unsigned: bool| {
+        (
+            column_type,
+            length,
+            decimals,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 },
+        )
+    };
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT MAX(a), MIN(a), MAX(b), MIN(b), MAX(t), SUM(a), SUM(b), AVG(a), AVG(b), SUM(t), AVG(t), MAX(d), SUM(d), AVG(d) FROM un",
+    );
+    assert_eq!(
+        shapes,
+        [
+            numeric(MYSQL_TYPE_LONG, 10, 0, true),
+            numeric(MYSQL_TYPE_LONG, 10, 0, true),
+            numeric(MYSQL_TYPE_LONGLONG, 20, 0, true),
+            numeric(MYSQL_TYPE_LONGLONG, 20, 0, true),
+            numeric(MYSQL_TYPE_TINY, 3, 0, true),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 33, 0, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 43, 0, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 16, 4, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 26, 4, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 26, 0, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 9, 4, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 7, 2, true),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 30, 2, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 12, 6, false),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[&[
+            Some("4000000000"),
+            Some("3"),
+            Some("18446744073709551615"),
+            Some("5"),
+            Some("250"),
+            Some("4000000003"),
+            Some("18446744073709551620"),
+            Some("2000000001.5000"),
+            Some("9223372036854775810.0000"),
+            Some("251"),
+            Some("125.5000"),
+            Some("2.25"),
+            Some("3.75"),
+            Some("1.875000"),
+        ]])
+    );
+    // Rounded, over the users' BIGINT UNSIGNED ids 1 to 4.
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT ROUND(AVG(id), 2), ROUND(SUM(id), 2), ROUND(SUM(id)), ROUND(AVG(id)) FROM users",
+    );
+    assert_eq!(
+        shapes,
+        [
+            numeric(MYSQL_TYPE_NEWDECIMAL, 25, 2, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 43, 0, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 44, 0, false),
+            numeric(MYSQL_TYPE_NEWDECIMAL, 22, 0, false),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[&[Some("2.50"), Some("10"), Some("10"), Some("3")]])
+    );
+}

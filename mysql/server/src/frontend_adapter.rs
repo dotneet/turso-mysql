@@ -5374,9 +5374,13 @@ impl TableResultMetadata {
             // at all, losing even the BINARY a temporal column carries.
             // GROUP_CONCAT answers a BLOB with no flags at all.
             0
-        } else {
+        } else if kind == ColumnAggregateKind::MinMax {
             // Measured: a numeric aggregate answers with the binary collation
-            // where the plain column does not.
+            // where the plain column does not, and a largest or smallest of an
+            // unsigned column is unsigned too — `MAX(id)` over a BIGINT
+            // UNSIGNED reports both.
+            MYSQL_BINARY_FLAG | (definition.flags & MYSQL_UNSIGNED_FLAG)
+        } else {
             MYSQL_BINARY_FLAG
         };
         set_column_flags(&mut definition, aggregate_flags);
@@ -5413,7 +5417,7 @@ impl TableResultMetadata {
             .get(ordinal)
             .ok_or(FrontendErrorKind::Unsupported)?;
         let (column_precision, column_scale) =
-            decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+            summed_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
         let (precision, scale) = match kind {
             ColumnAggregateKind::Sum => (column_precision + 22, column_scale),
             ColumnAggregateKind::Avg => (
@@ -6113,7 +6117,7 @@ fn apply_summing_aggregate_metadata(
     }
     // MySQL sums a text or temporal column by coercing it, which this has not
     // measured, so those are refused rather than given a decimal's metadata.
-    let (precision, scale) = decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+    let (precision, scale) = summed_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
     let (precision, scale) = match kind {
         ColumnAggregateKind::Sum => (precision + 22, scale),
         ColumnAggregateKind::Avg => (precision + 4, (scale + 4).min(MYSQL_MAX_DECIMAL_SCALE)),
@@ -6190,6 +6194,30 @@ fn decimal_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
         },
         0,
     ))
+}
+
+/// The precision and scale a `SUM` or an `AVG` widens, which counts an
+/// unsigned whole number's digits too.
+///
+/// Measured on MySQL 8.4.11 through the lengths the two answer: a `TINYINT
+/// UNSIGNED` counts 3 digits, an `INT UNSIGNED` 10 and a `BIGINT UNSIGNED` 20
+/// — `SUM` over one answers 43 — and the answer is signed whatever the column
+/// was.
+#[cfg(unix)]
+fn summed_shape_of(source: &MySqlColumnMetadata) -> Option<(u32, u32)> {
+    decimal_shape_of(source).or_else(|| {
+        Some((
+            match source.type_name() {
+                "TINYINT UNSIGNED" => 3,
+                "SMALLINT UNSIGNED" => 5,
+                "MEDIUMINT UNSIGNED" => 8,
+                "INT UNSIGNED" | "INTEGER UNSIGNED" => 10,
+                "BIGINT UNSIGNED" => 20,
+                _ => return None,
+            },
+            0,
+        ))
+    })
 }
 
 /// Reports whether a column counts in whole numbers.
