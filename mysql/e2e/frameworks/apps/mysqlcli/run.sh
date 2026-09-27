@@ -49,6 +49,13 @@ step alter sql --force "${db}" -e "ALTER TABLE posts ADD COLUMN slug VARCHAR(200
   CREATE INDEX posts_slug_index ON posts (slug); ALTER TABLE posts DROP INDEX posts_slug_index;
   ALTER TABLE posts MODIFY views BIGINT NOT NULL DEFAULT 0; ALTER TABLE posts RENAME COLUMN slug TO handle;
   ALTER TABLE posts DROP COLUMN handle"
+# A 20 kB post body: bigger than one 16 kB packet, far below MySQL's default
+# 64 MB max_allowed_packet.
+large_value() {
+  big="$(printf '%020000d' 0)"
+  sql "${db}" -e "UPDATE posts SET body = '${big}' WHERE id = 1; SELECT LENGTH(body) FROM posts WHERE id = 1"
+}
+step large-value large_value
 step information-schema sql "${db}" -e "SELECT TABLE_NAME, TABLE_TYPE, ENGINE FROM information_schema.TABLES
   WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME;
   SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS

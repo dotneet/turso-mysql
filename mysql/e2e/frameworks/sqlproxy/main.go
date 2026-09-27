@@ -187,6 +187,7 @@ func relay(id int64, client net.Conn, upstream string, serverTLS, clientTLS *tls
 	client.Close()
 	server.Close()
 	<-errc
+	st.noteUnanswered()
 	return err
 }
 
@@ -326,6 +327,17 @@ func greetingCapabilities(payload []byte) uint32 {
 		caps |= uint32(binary.LittleEndian.Uint16(payload[i:i+2])) << 16
 	}
 	return caps
+}
+
+// noteUnanswered records a command the server never answered, which is how a
+// dropped connection shows up (for example a packet over the server's limit).
+func (st *connState) noteUnanswered() {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if w := st.waiting; w != nil {
+		st.waiting = nil
+		st.out.write(entry{Conn: st.id, Command: w.command, SQL: w.sql, Message: "connection closed before the server answered"})
+	}
 }
 
 func parseErr(payload []byte) (int, string, string) {

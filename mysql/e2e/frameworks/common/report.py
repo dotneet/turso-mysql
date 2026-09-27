@@ -23,16 +23,16 @@ def main() -> None:
         runs = {t: load_run(root / app / t) for t in TARGETS}
         summary["apps"][app] = app_summary(runs)
         mysql_failed = {
-            normalize(e["sql"]) for e in runs["mysql"]["wire"] if not e["ok"]
+            shape(e.get("sql", "")) for e in runs["mysql"]["wire"] if not e["ok"]
         }
         for e in runs["turso"]["wire"]:
-            if e["ok"] or normalize(e.get("sql", "")) in mysql_failed:
+            if e["ok"] or shape(e.get("sql", "")) in mysql_failed:
                 continue
-            key = normalize(e.get("sql", "")) or f"<{e['command']}>"
+            key = shape(e.get("sql", "")) or f"<{e['command']}>"
             item = refused.setdefault(
                 key,
                 {
-                    "sql": key,
+                    "sql": normalize(e.get("sql", "")) or key,
                     "command": e["command"],
                     "code": e.get("code"),
                     "sqlstate": e.get("sqlstate"),
@@ -101,6 +101,16 @@ def app_summary(runs: dict) -> dict:
 
 def normalize(sql: str) -> str:
     return re.sub(r"\s+", " ", sql or "").strip()
+
+
+def shape(sql: str) -> str:
+    """The statement with literals replaced, so one query with different
+    values or IN-list lengths counts once."""
+    text = normalize(sql)
+    text = re.sub(r"'(?:[^'\\]|\\.|'')*'", "?", text)
+    text = re.sub(r"\b\d+(?:\.\d+)?\b", "?", text)
+    text = re.sub(r"\(\s*\?(?:\s*,\s*\?)*\s*\)", "(?)", text)
+    return text
 
 
 def mark(value) -> str:
