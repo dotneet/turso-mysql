@@ -3461,6 +3461,17 @@ fn render_update_assignment_value(
             render_update_assignment_value(left, written, assigned, render_context)?,
             render_dml_expr(right)?
         )),
+        // `SET expires_at = NOW() + INTERVAL 1 HOUR` is the operator spelling
+        // of a `DATE_ADD`, and is written the way the call is.
+        Expr::BinaryOp { .. }
+            if static_select_metadata::interval_shift_as_call(value).is_some() =>
+        {
+            let call = Expr::Function(
+                static_select_metadata::interval_shift_as_call(value)
+                    .expect("the guard read the operator as a shift"),
+            );
+            render_update_assignment_value(&call, written, assigned, render_context)
+        }
         Expr::BinaryOp { left, op, right }
             if matches!(
                 op,
@@ -3719,6 +3730,11 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
         // can record a moment that is not this one.
         Expr::Function(function) if render_shifted_clock_reading(function).is_some() => {
             Ok(render_shifted_clock_reading(function)
+                .expect("the guard requires a shift of a clock reading")
+                .0)
+        }
+        Expr::BinaryOp { .. } if shifted_clock_reading_operator(expr).is_some() => {
+            Ok(shifted_clock_reading_operator(expr)
                 .expect("the guard requires a shift of a clock reading")
                 .0)
         }
@@ -4105,6 +4121,17 @@ fn render_select_item(
                 render_select_expr(expr, render_context)?
             ))
         }
+        SelectItem::UnnamedExpr(expr) if names_an_interval_shift(expr) => {
+            let name = source_text(render_context.source, expr)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT interval shift whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
         SelectItem::UnnamedExpr(expr)
             if matches!(
                 static_select_metadata::classify_static_select_expr(expr),
@@ -4142,6 +4169,16 @@ fn render_select_item(
             Ok(format!("{}.*", render_ident(source)))
         }
         _ => unsupported("SELECT projection"),
+    }
+}
+
+/// Reports whether an expression is `x + INTERVAL n unit` or `x - INTERVAL n
+/// unit`, in parentheses or not, over something a shift takes.
+fn names_an_interval_shift(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => names_an_interval_shift(inner),
+        _ => static_select_metadata::interval_shift_as_call(expr)
+            .is_some_and(|call| static_select_metadata::scalar_call(&call).is_some()),
     }
 }
 
@@ -4649,6 +4686,16 @@ fn render_select_expr(
                 return Ok(format!("{left} ->> {right}"));
             }
             Ok(format!("mysql_json_document({left} -> {right})"))
+        }
+        // `created_at + INTERVAL 1 DAY` is the operator spelling of a
+        // `DATE_ADD`, and is written out as one.
+        Expr::BinaryOp { .. }
+            if static_select_metadata::interval_shift_as_call(expr)
+                .is_some_and(|call| static_select_metadata::scalar_call(&call).is_some()) =>
+        {
+            let call = static_select_metadata::interval_shift_as_call(expr)
+                .expect("the guard read the operator as a shift");
+            render_scalar_call(&call, render_context)
         }
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
@@ -5260,6 +5307,16 @@ fn render_scalar_call(
         // ask is known here rather than worked out from what is stored.
         if let Some((rendered, _)) = render_shifted_clock_reading(function) {
             return Ok(rendered);
+        }
+        if let Expr::Value(value) = shifted {
+            let (Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)) =
+                &value.value
+            else {
+                unreachable!("a checked shift was checked to take a written moment");
+            };
+            let written = crate::temporal_value::written_moment_to_shift(written)
+                .expect("a checked shift was checked to take a written moment");
+            return Ok(render_shifted_moment(&format!("'{written}'"), count));
         }
         let Expr::Identifier(column) = shifted else {
             unreachable!("a checked shift was checked to take a column or a reading");
@@ -6026,6 +6083,20 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
     }
     let (mut start, mut end) = (start, end);
     let bytes = source.as_bytes();
+    // An interval's span covers its count alone, and MySQL's name for the
+    // column carries the `INTERVAL` before the count and the unit after it.
+    let mut unnested = expr;
+    while let Expr::Nested(inner) = unnested {
+        unnested = inner;
+    }
+    if let Expr::BinaryOp { left, right, .. } = unnested {
+        if matches!(right.as_ref(), Expr::Interval(_)) {
+            end = end_of_the_unit_after(source, end)?;
+        }
+        if matches!(left.as_ref(), Expr::Interval(_)) {
+            start = start_of_the_interval_keyword_before(source, start)?;
+        }
+    }
     // A call's span covers its name and arguments but not its closing
     // parenthesis, and a CASE's stops before its END; MySQL's own name for the
     // column includes both.
@@ -6107,6 +6178,28 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         depth -= 1;
     }
     source.get(start..end).map(str::to_owned)
+}
+
+/// Where the unit word written after an interval's count ends.
+fn end_of_the_unit_after(source: &str, count_end: usize) -> Option<usize> {
+    let rest = source.get(count_end..)?;
+    let unit_start = count_end + (rest.len() - rest.trim_start().len());
+    let unit_length = source
+        .get(unit_start..)?
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        .count();
+    (unit_length > 0).then_some(unit_start + unit_length)
+}
+
+/// Where the `INTERVAL` written before an interval's count starts.
+fn start_of_the_interval_keyword_before(source: &str, count_start: usize) -> Option<usize> {
+    let keyword_end = source.get(..count_start)?.trim_end().len();
+    let keyword_start = keyword_end.checked_sub("INTERVAL".len())?;
+    source
+        .get(keyword_start..keyword_end)?
+        .eq_ignore_ascii_case("INTERVAL")
+        .then_some(keyword_start)
 }
 
 fn nested_depth(expr: &Expr) -> usize {
@@ -7296,6 +7389,12 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
                 .expect("the guard requires a shift of a clock reading");
             Ok((rendered, CheckedSelectComparisonRhs::Now(answers)))
         }
+        // `NOW() - INTERVAL 1 DAY` is the same shift, spelled as an operator.
+        Expr::BinaryOp { .. } if shifted_clock_reading_operator(expr).is_some() => {
+            let (rendered, answers) = shifted_clock_reading_operator(expr)
+                .expect("the guard requires a shift of a clock reading");
+            Ok((rendered, CheckedSelectComparisonRhs::Now(answers)))
+        }
         Expr::UnaryOp { op, expr }
             if matches!(op, UnaryOperator::Minus | UnaryOperator::Plus)
                 && matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) =>
@@ -7483,6 +7582,12 @@ fn render_shifted_clock_reading(
         return Some((rendered, CheckedComparisonNow::Day));
     }
     Some((rendered, CheckedComparisonNow::Moment))
+}
+
+/// Renders `NOW() - INTERVAL 1 DAY` as the `DATE_SUB(NOW(), INTERVAL 1 DAY)`
+/// it is, and says what the shift answers.
+fn shifted_clock_reading_operator(expr: &Expr) -> Option<(String, CheckedComparisonNow)> {
+    render_shifted_clock_reading(&static_select_metadata::interval_shift_as_call(expr)?)
 }
 
 /// Writes a column out the way one of the four cast targets answers it.

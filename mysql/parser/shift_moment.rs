@@ -8,7 +8,7 @@
 //! day rather than a missing feature, so the arithmetic is done here instead
 //! and the rendered SQL calls it.
 
-use crate::temporal_value::{days_in_month, read_moment, Moment};
+use crate::temporal_value::{days_in_month, read_moment_to_the_microsecond, Moment};
 
 /// The unit a shift counts in, as the rendered SQL spells it.
 ///
@@ -37,10 +37,21 @@ const SECOND: &str = "second";
 /// A day alone stays a day when the shift is by whole days, and becomes a
 /// moment at midnight when it is not — measured, a `DATE` an hour on answers
 /// `2026-01-31 01:00:00`.
+///
+/// A fraction of a second is carried over as it was written, none of the
+/// units counting in less than a second: measured, a `DATETIME(3)` holding
+/// `2024-01-31 10:20:30.250` a day on answers `2024-02-01 10:20:30.250`.
 pub fn shifted_moment(written: &str, count: i64, unit: &str) -> Option<String> {
     let trimmed = written.trim_matches(|character: char| character.is_ascii_whitespace());
     let day_alone = trimmed.len() == 10;
-    let moment = read_moment(trimmed)?;
+    let fraction = trimmed.get(19..).filter(|fraction| {
+        fraction.len() > 1
+            && fraction.starts_with('.')
+            && fraction[1..].bytes().all(|byte| byte.is_ascii_digit())
+    });
+    // Read to the microsecond, so a fraction of a half or more is not rounded
+    // into the next second.
+    let (moment, _) = read_moment_to_the_microsecond(trimmed)?;
     let months = match unit {
         YEAR => count.checked_mul(12)?,
         MONTH => count,
@@ -63,8 +74,14 @@ pub fn shifted_moment(written: &str, count: i64, unit: &str) -> Option<String> {
         format!("{:04}-{:02}-{:02}", moment.year, moment.month, moment.day)
     } else {
         format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}{}",
+            moment.year,
+            moment.month,
+            moment.day,
+            moment.hour,
+            moment.minute,
+            moment.second,
+            fraction.unwrap_or("")
         )
     })
 }

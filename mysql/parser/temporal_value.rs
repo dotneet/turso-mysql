@@ -132,6 +132,60 @@ pub(crate) fn read_moment_to_the_microsecond(written: &str) -> Option<(Moment, u
     read_moment_with_precision(written, 6)
 }
 
+/// Writes a moment a `DATE_ADD` shifts out in the form MySQL shifts it in.
+///
+/// Measured on MySQL 8.4.11: a day written alone is shifted as a day —
+/// `'2026-1-1' + INTERVAL 1 DAY` is `2026-01-02` — and a written fraction of a
+/// second comes back with all six of its places, `.5` as `.500000`. Only the
+/// spelling with dashes, a space and colons is taken; MySQL reads a great many
+/// others, and which of them it reads as a day alone has not been measured.
+pub(crate) fn written_moment_to_shift(written: &str) -> Option<String> {
+    let (day, time) = match written.split_once(' ') {
+        Some((day, time)) => (day, Some(time)),
+        None => (written, None),
+    };
+    let is_numbers_between = |text: &str, separator: char, widths: &[usize]| {
+        let parts = text.split(separator).collect::<Vec<_>>();
+        parts.len() == 3
+            && parts.iter().zip(widths).all(|(part, widest)| {
+                !part.is_empty()
+                    && part.len() <= *widest
+                    && part.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    if !is_numbers_between(day, '-', &[4, 2, 2]) {
+        return None;
+    }
+    let (clock, fraction) = match time {
+        Some(time) => match time.split_once('.') {
+            Some((clock, fraction)) => (Some(clock), Some(fraction)),
+            None => (Some(time), None),
+        },
+        None => (None, None),
+    };
+    if clock.is_some_and(|clock| !is_numbers_between(clock, ':', &[2, 2, 2]))
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 6
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return None;
+    }
+    let (moment, microseconds) = read_moment_to_the_microsecond(written)?;
+    let mut rendered = format!("{:04}-{:02}-{:02}", moment.year, moment.month, moment.day);
+    if clock.is_some() {
+        rendered.push_str(&format!(
+            " {:02}:{:02}:{:02}",
+            moment.hour, moment.minute, moment.second
+        ));
+    }
+    if fraction.is_some() {
+        rendered.push_str(&format!(".{microseconds:06}"));
+    }
+    Some(rendered)
+}
+
 fn read_moment_with_precision(written: &str, precision: u8) -> Option<(Moment, u32)> {
     if precision > 6 {
         return None;

@@ -489,6 +489,30 @@ alone stays a day when the shift is by whole days and becomes a moment at midnig
 not, which is what MySQL answers. A shift counts a written number and nothing else: a count
 worked out from a row cannot be multiplied for a week or a quarter.
 
+A fraction of a second is carried through a shift: measured, a `DATETIME(3)` holding
+`2024-01-31 10:20:30.250` a day on answers `2024-02-01 10:20:30.250`, and the shift reports
+the column's own decimals — a `DATETIME` of 23 with 3 decimals, from a `DATETIME(3)` and a
+`TIMESTAMP(3)` alike. Before, the fraction was dropped, or rounded into the next second when it
+was a half or more, and the shift reported 19 with none.
+
+`created_at + INTERVAL 1 DAY`, `INTERVAL 1 DAY + created_at` and `created_at - INTERVAL 1
+HOUR` are MySQL's operator spellings of `DATE_ADD` and `DATE_SUB`, and each is read as the call
+it is, wherever the call is read: in a projection, on the right of a comparison —
+`WHERE created_at > NOW() - INTERVAL 1 DAY` — and as a value an `INSERT` or an `UPDATE`
+writes, `SET expires_at = NOW() + INTERVAL 30 MINUTE`. Measured on 8.4.11, the two spellings
+answer the same moment and the same shape, and MySQL names an unaliased column after the
+whole of the operator form, `INTERVAL` and unit included. Two shifts in a row — `created_at +
+INTERVAL 1 DAY + INTERVAL 1 HOUR` — are a shift of something other than a moment, and are
+refused.
+
+A moment written out as a word is shifted too: `'2026-01-31' + INTERVAL 1 MONTH` is
+`2026-02-28`. Measured, MySQL answers a word here rather than a moment — a `STRING` of 116 in
+utf8mb4 with no flags — keeps a day written alone a day, `'2026-1-1' + INTERVAL 1 DAY` being
+`2026-01-02`, and writes a written fraction out to six places, `.5` as `.500000`. Only the
+spelling with dashes, a space and colons is taken: MySQL reads many others, and which of them
+it takes for a day alone has not been measured. A word naming no moment is refused, MySQL
+answering NULL for it.
+
 `CONCAT(name, '-', id)` is how a query builds a label out of a row, so the call takes a number
 as readily as a word. Its answer is as wide as its arguments laid end to end, measured on
 8.4.11, and a number spells as many characters as its type does rather than as many as its
@@ -2843,11 +2867,11 @@ measured, `2024-01-15 10:00:00` to `2024-02-15 09:59:59` is 31 days where
 8.4.11: an interval of whole days, months or years keeps the column's own kind
 — a `DATE` stays a `DATE` of length 10 and a `DATETIME` keeps its time — while
 an interval carrying an hour, a minute or a second answers a `DATETIME` of
-length 19 either way. Which of the engine's two readers to ask therefore
-depends on the column, and the rendering layer does not know column types, so
-the stored text says it instead: a `DATE` is exactly the ten characters of
-`YYYY-MM-DD`. Weeks and quarters are refused, the engine having no modifier for
-either, and a `TIME` column is refused for holding no date to shift.
+length 19 either way, or wider by the fraction of a second the column holds.
+Which kind the shift answers therefore depends on the column, and the
+rendering layer does not know column types, so the stored text says it
+instead: a `DATE` is exactly the ten characters of `YYYY-MM-DD`. A `TIME`
+column is refused for holding no date to shift.
 
 A user variable is the connection's own. `SET @x = 1` holds a value and
 `SELECT @x` reads it back; another connection never sees it, and
@@ -4090,6 +4114,8 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `(a, b) IN ((1, 'x'), ...)` | partial | partial | n/a | n/a | partial | [`row list renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-row-in.json), [P0 manifest](conformance/Makefile) | Written out as the question it means — each row's columns joined by `AND`, the rows joined by `OR` — so every column is held to its own type, a word is read under the collation, and a row holding NULL is left out of the `NOT IN` as well as the `IN`. A member that is not a row, or one of a different width, is refused. Every answer is pinned to the 8.4.11 golden. |
 | A call on the left of a comparison — `WHERE LOWER(email) = 'a'` | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`answer of a call`](parser/static_select_metadata.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-call-comparison.json), [P0 manifest](conformance/Makefile) | The call says what it answers and the value it meets is held to that. A word is compared without regard to case, the way MySQL compares one after the call answers; a number meets a number; a day and a moment are held to the form one is stored in. The calls answering a real number are left out, and a `?` meets none of them. Every answer is pinned to the 8.4.11 golden. |
 | `CAST(col AS CHAR / SIGNED / DATE / DATETIME)` | partial | partial | n/a | n/a | partial | [`cast classifier`](parser/static_select_metadata.rs), [`cast renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-cast.json), [P0 manifest](conformance/Makefile) | The four targets the engine answers exactly what MySQL answers. `CHAR` writes a whole-number or temporal column out, as wide as the column's display width in utf8mb4 bytes. `SIGNED` rounds away from zero before it casts, because MySQL rounds and the engine's cast cuts. `DATE` and `DATETIME` read the day and the moment out. `UNSIGNED`, `DECIMAL`, `CHAR(n)`, a real or `DECIMAL` column written out, and a word read as a number or a day are each refused for a measured reason. `CONVERT(col, <type>)` is read as the same thing; `CONVERT(col USING <charset>)` and the T-SQL spellings are refused. |
+| `x + INTERVAL n unit`, `x - INTERVAL n unit` | partial | partial | n/a | n/a | partial | [`operator reader`](parser/static_select_metadata.rs), [`shift renderer`](parser/translate.rs), [adapter tests](server/src/frontend_adapter/tests/date_arithmetic.rs) | Read as the `DATE_ADD` or `DATE_SUB` it is, in a projection, on the right of a comparison and as a value to write, named after the whole operator form. Two shifts in a row are refused. |
+| `DATE_ADD` / `DATE_SUB` over a written moment | partial | partial | n/a | n/a | partial | [`call metadata`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs) | Measured: a `STRING` of 116 whatever the interval, a day written alone staying a day. Only the `YYYY-MM-DD hh:mm:ss.ffffff` spelling is taken, and a word naming no moment is refused. |
 | `DATE_ADD` / `DATE_SUB` over a reading of the moment | partial | partial | n/a | n/a | partial | [`shift renderer`](parser/translate.rs), [`call metadata`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-shifted-moment.json), [P0 manifest](conformance/Makefile) | Read in a projection, as a value to write, and on the right of a comparison. Measured: shifting `NOW()` answers a nullable `DATETIME` of 19 whatever the interval, and shifting `CURDATE()` a nullable `DATE` of 10 for whole days, months or years and a `DATETIME` otherwise. A shifted day meets a `DATE` column and a shifted moment a `DATETIME` or `TIMESTAMP`. `CURTIME()` is not shifted: a span is not a moment. Which rows each comparison finds is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against `CURDATE()` / `NOW()` / `CURTIME()` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/lib.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-now-comparison.json), [P0 manifest](conformance/Makefile) | Each is rendered as the engine call answering the same value in the same form — `date('now')`, `datetime('now')`, `time('now')` — and meets the column whose form it answers in: a day meets a `DATE`, a moment a `DATETIME` or `TIMESTAMP`, and a time of day a `TIME`, for sameness only. Both spellings of each, with and without parentheses, are read. Any other call on the right of a comparison is still refused. Every answer is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against a number written with a fraction — `money > 9.99` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-decimal-literal-comparison.json), [P0 manifest](conformance/Makefile) | Read as the number it names and carried into the rendered SQL as it was written, so the engine reads the same number. It meets any column that holds a number, whole or not; a text column is refused, the mirror of a string against an integer column. A direct comparison against a known exact `DECIMAL` column accepts whole numbers beyond `i64` up to 65 written digits; `IN` with those literals remains refused. A `HAVING` still takes only a whole number, being counted against a count. Every answer is pinned to the 8.4.11 golden. |

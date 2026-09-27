@@ -307,3 +307,277 @@ fn the_counts_take_a_reading_of_the_clock_or_a_written_moment() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+fn moments_to_shift(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) {
+    run(
+        adapter,
+        "CREATE TABLE items (id INT NOT NULL PRIMARY KEY, created_at DATETIME, d DATE, f DATETIME(3), ts TIMESTAMP(3) NULL, label VARCHAR(8), n INT)",
+    );
+    run(
+        adapter,
+        concat!(
+            "INSERT INTO items (id, created_at, d, f, ts, n) VALUES ",
+            "(1, '2024-01-31 10:20:30', '2024-01-31', '2024-01-31 10:20:30.250', '2024-01-31 10:20:30.250', 2), ",
+            "(2, '2023-12-31 00:00:00', '2024-02-29', '2023-12-31 00:00:00', NULL, NULL), ",
+            "(3, NULL, NULL, '2024-03-31 12:00:00.5', '2024-03-31 12:00:00.5', -3)"
+        ),
+    );
+}
+
+/// `created_at + INTERVAL 1 DAY` is the operator spelling of `DATE_ADD`, and
+/// `created_at - INTERVAL 1 HOUR` of `DATE_SUB`. Measured, each answers the
+/// moment and the shape the call answers, and MySQL names the column after
+/// the whole of it, `INTERVAL` and unit included. A moment keeps its fraction
+/// of a second, and its column's decimals with it.
+#[test]
+fn an_interval_added_or_taken_away_is_the_shift_the_call_makes() {
+    let (_directory, mut adapter) = adapter();
+    moments_to_shift(&mut adapter);
+    let sql = concat!(
+        "SELECT created_at + INTERVAL 1 DAY, created_at - INTERVAL 1 HOUR, d + INTERVAL 1 DAY, ",
+        "d + INTERVAL 1 HOUR, INTERVAL 1 DAY + d, d - INTERVAL 1 MONTH, f + INTERVAL 1 DAY, ",
+        "f - INTERVAL 1 MONTH, ts + INTERVAL 1 HOUR, DATE_ADD(f, INTERVAL 1 WEEK) FROM items ORDER BY id"
+    );
+    let result = selected(&mut adapter, sql);
+    assert_eq!(
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "created_at + INTERVAL 1 DAY",
+            "created_at - INTERVAL 1 HOUR",
+            "d + INTERVAL 1 DAY",
+            "d + INTERVAL 1 HOUR",
+            "INTERVAL 1 DAY + d",
+            "d - INTERVAL 1 MONTH",
+            "f + INTERVAL 1 DAY",
+            "f - INTERVAL 1 MONTH",
+            "ts + INTERVAL 1 HOUR",
+            "DATE_ADD(f, INTERVAL 1 WEEK)",
+        ]
+    );
+    assert_eq!(
+        rows(&mut adapter, sql),
+        [
+            [
+                "2024-02-01 10:20:30",
+                "2024-01-31 09:20:30",
+                "2024-02-01",
+                "2024-01-31 01:00:00",
+                "2024-02-01",
+                "2023-12-31",
+                "2024-02-01 10:20:30.250",
+                "2023-12-31 10:20:30.250",
+                "2024-01-31 11:20:30.250",
+                "2024-02-07 10:20:30.250",
+            ]
+            .map(|value| Some(value.to_owned()))
+            .to_vec(),
+            [
+                Some("2024-01-01 00:00:00"),
+                Some("2023-12-30 23:00:00"),
+                Some("2024-03-01"),
+                Some("2024-02-29 01:00:00"),
+                Some("2024-03-01"),
+                Some("2024-01-29"),
+                Some("2024-01-01 00:00:00.000"),
+                Some("2023-11-30 00:00:00.000"),
+                None,
+                Some("2024-01-07 00:00:00.000"),
+            ]
+            .map(|value| value.map(str::to_owned))
+            .to_vec(),
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("2024-04-01 12:00:00.500"),
+                Some("2024-02-29 12:00:00.500"),
+                Some("2024-03-31 13:00:00.500"),
+                Some("2024-04-07 12:00:00.500"),
+            ]
+            .map(|value| value.map(str::to_owned))
+            .to_vec(),
+        ]
+    );
+    let moment = (MYSQL_TYPE_DATETIME, 19, 0, MYSQL_BINARY_FLAG);
+    let day = (MYSQL_TYPE_DATE, 10, 0, MYSQL_BINARY_FLAG);
+    let moment_to_the_millisecond = (MYSQL_TYPE_DATETIME, 23, 3, MYSQL_BINARY_FLAG);
+    assert_eq!(
+        shapes(&mut adapter, sql),
+        [
+            moment,
+            moment,
+            day,
+            moment,
+            day,
+            day,
+            moment_to_the_millisecond,
+            moment_to_the_millisecond,
+            moment_to_the_millisecond,
+            moment_to_the_millisecond,
+        ]
+    );
+
+    // A reading of the clock shifted by an operator answers what the call
+    // over it answers: a moment for `NOW()`, and a day for `CURDATE()`
+    // shifted by whole days.
+    assert_eq!(
+        shapes(
+            &mut adapter,
+            "SELECT NOW() - INTERVAL 1 DAY, CURDATE() - INTERVAL 1 DAY, CURDATE() + INTERVAL 1 HOUR FROM items"
+        ),
+        [moment, day, moment]
+    );
+
+    // The binary protocol sends the kept fraction as microseconds.
+    let (_, binary) = prepared_rows(
+        &mut adapter,
+        "SELECT f + INTERVAL 1 DAY FROM items WHERE id = ?",
+        &one_number(3),
+    );
+    assert_eq!(
+        binary,
+        [[BinaryResultValue::DateTimeMicros {
+            year: 2024,
+            month: 4,
+            day: 1,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            microseconds: 500_000,
+        }]]
+    );
+
+    // A count read from a row is multiplied for a week or a quarter, which has
+    // not been taught; a word is a coercion; and two shifts in a row are a
+    // shift of something other than a moment.
+    for sql in [
+        "SELECT created_at + INTERVAL n DAY FROM items",
+        "SELECT label + INTERVAL 1 DAY FROM items",
+        "SELECT created_at + INTERVAL 1 DAY + INTERVAL 1 HOUR FROM items",
+        "SELECT created_at + INTERVAL ? DAY FROM items",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// `WHERE created_at > NOW() - INTERVAL 1 DAY` is how a suite asks for the
+/// rows of the last day, and `NOW() + INTERVAL 1 HOUR` how a row records when
+/// it runs out. Each is read the way the `DATE_SUB` and `DATE_ADD` spellings
+/// already are.
+#[test]
+fn a_shifted_clock_reading_is_compared_against_and_written() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE sessions (id INT NOT NULL PRIMARY KEY, created_at DATETIME NOT NULL, expires_at DATETIME, day DATE)",
+    );
+    run(
+        &mut adapter,
+        concat!(
+            "INSERT INTO sessions (id, created_at, expires_at, day) VALUES ",
+            "(1, NOW() - INTERVAL 2 HOUR, NOW() + INTERVAL 1 HOUR, CURDATE() - INTERVAL 1 DAY), ",
+            "(2, NOW() - INTERVAL 3 DAY, NOW() - INTERVAL 2 DAY, CURDATE() - INTERVAL 7 DAY)"
+        ),
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM sessions WHERE created_at > NOW() - INTERVAL 1 DAY ORDER BY id"
+        ),
+        ["1"]
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM sessions WHERE expires_at < NOW() ORDER BY id"
+        ),
+        ["2"]
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM sessions WHERE day >= CURDATE() - INTERVAL 2 DAY ORDER BY id"
+        ),
+        ["1"]
+    );
+    run(
+        &mut adapter,
+        "UPDATE sessions SET expires_at = NOW() + INTERVAL 30 MINUTE WHERE id = 1",
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM sessions WHERE expires_at BETWEEN NOW() AND NOW() + INTERVAL 31 MINUTE"
+        ),
+        ["1"]
+    );
+    run(
+        &mut adapter,
+        "DELETE FROM sessions WHERE created_at < NOW() - INTERVAL 2 DAY",
+    );
+    assert_eq!(column(&mut adapter, "SELECT id FROM sessions"), ["1"]);
+}
+
+/// A moment written out as a word is shifted as well. Measured, MySQL answers
+/// a word rather than a moment — a STRING of 116 with no flags — reads the
+/// word the way it reads any, keeps a day written alone a day, and writes a
+/// fraction of a second out to six places.
+#[test]
+fn a_written_moment_is_shifted_into_a_word() {
+    let (_directory, mut adapter) = adapter();
+    moments_to_shift(&mut adapter);
+    let sql = concat!(
+        "SELECT '2026-01-01' + INTERVAL 1 HOUR, '2026-1-1' + INTERVAL 1 DAY, ",
+        "'2026-01-01 10:00:00.5' + INTERVAL 1 DAY, '2026-01-31' - INTERVAL 1 MONTH, ",
+        "DATE_ADD('2026-01-31', INTERVAL 1 MONTH) FROM items WHERE id = 1"
+    );
+    assert_eq!(
+        rows(&mut adapter, sql),
+        [[
+            "2026-01-01 01:00:00",
+            "2026-01-02",
+            "2026-01-02 10:00:00.500000",
+            "2025-12-31",
+            "2026-02-28",
+        ]
+        .map(|value| Some(value.to_owned()))]
+    );
+    let result = selected(&mut adapter, sql);
+    for column in &result.columns {
+        assert_eq!(
+            (
+                column.column_type,
+                column.column_length,
+                column.decimals,
+                column.flags,
+                column.character_set
+            ),
+            (
+                MYSQL_TYPE_STRING,
+                116,
+                NOT_FIXED_DECIMALS,
+                0,
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            ),
+            "{}",
+            column.name
+        );
+    }
+
+    // A word that names no moment answers NULL in MySQL, and one written any
+    // other way is read by rules this has not measured.
+    for sql in [
+        "SELECT '2026-02-30' + INTERVAL 1 DAY FROM items",
+        "SELECT '20260101' + INTERVAL 1 DAY FROM items",
+        "SELECT '2026/01/01' + INTERVAL 1 DAY FROM items",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

@@ -72,7 +72,9 @@ literal branches. What is left:
 | `GROUP_CONCAT` with an `ORDER BY`, or with `DISTINCT` beside a `SEPARATOR` | refused; MySQL orders the parts it joins and the engine's `group_concat` has no way to say in what order, and the engine takes `DISTINCT` only over a single argument, which the separator occupies |
 | `STDDEV`, `STD`, `STDDEV_POP`, `VAR_POP`, `VAR_SAMP`, `VARIANCE` | refused; the engine has one deviation aggregate and it is the sample form, so `STDDEV_SAMP` is taken and the population ones would answer a different number — measured over 2,4,4,4,5,5,7,9 the sample form is 2.138089935299395 and the population one is 2. A variance is the square of a deviation, and squaring a rounded square root would answer different last digits than MySQL's own |
 | `DATE_ADD` / `DATE_SUB` counting a number worked out from a row — `INTERVAL n DAY` | refused; a week and a quarter are counted in the unit each is made of, which only a written number can be multiplied for |
-| `DATE_ADD` / `DATE_SUB` over a written moment — `DATE_ADD('2026-01-01', INTERVAL 1 DAY)` | refused; the two arguments taken are a column and a clock reading |
+| `DATE_ADD` / `DATE_SUB` over a moment written any way but `YYYY-MM-DD hh:mm:ss` — `'20260101' + INTERVAL 1 DAY` | refused; MySQL reads each of those, and which it takes for a day alone, and so answers as one, has not been measured |
+| `DATE_ADD` / `DATE_SUB` counting a bound number — `NOW() - INTERVAL ? DAY` | refused; MySQL reads the bound value by the type the client sent it as, which has not been measured |
+| Two shifts in a row — `created_at + INTERVAL 1 DAY + INTERVAL 1 HOUR` | refused; the second shifts a call rather than a column or a clock reading |
 | A shift landing before the year zero | answers NULL, where MySQL answers `0000-00-00` — a value `NO_ZERO_DATE` would not store |
 
 ### Not looked at
@@ -337,7 +339,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A call other than `CURDATE()`, `NOW()` or `CURTIME()` on the right of a comparison — `n = ABS(-1)` | refused; the three that are read answer a value in the form a column holds and take no argument, and rendering a call with arguments there is the projection renderer's work rather than the comparison reader's |
 | `DATE_ADD` / `DATE_SUB` over a reading of the moment | works, in a projection, as a value to write, and on the right of a comparison — see COMPAT.md |
 | `DATE_ADD` / `DATE_SUB` over `CURTIME()` | refused; a `TIME` holds a span rather than a moment, and shifting a span by a month names nothing |
-| A shift of anything but a column or a clock reading — `DATE_SUB(MAKEDATE(2024, 1), INTERVAL 1 DAY)` | refused; the thing shifted has to say what kind it is |
+| A shift of anything but a column, a clock reading or a written moment — `DATE_SUB(MAKEDATE(2024, 1), INTERVAL 1 DAY)` | refused; the thing shifted has to say what kind it is |
 | A call answering a real number on the left of a comparison — `ABS(ratio) = 1` | refused; what a `DOUBLE` compares equal to is a rule of its own and it has not been measured |
 | `TIME(col)` | refused; a `TIME` holds a span running past a day and the engine's reader answers NULL for one, so the two would not agree. `DATE(col)` is taken, being the other spelling of `CAST(col AS DATE)` |
 | A call on both sides of a comparison, or one beside a column — `LOWER(a) = LOWER(b)`, `LOWER(a) = b` | refused; one side has to be a value the comparison reader takes |

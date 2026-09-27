@@ -5320,6 +5320,17 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured: a shift of a moment written out as a word answers a word — a
+    // STRING of 116 in utf8mb4 with the not-fixed decimals value — whatever
+    // the interval named.
+    if function == ScalarFunction::ShiftsAWrittenMoment {
+        let mut definition = column_definition(name, MYSQL_TYPE_STRING);
+        definition.column_length = 116;
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        definition.decimals = NOT_FIXED_DECIMALS;
+        set_column_flags(&mut definition, 0);
+        return Ok(definition);
+    }
     // Measured: `UNIX_TIMESTAMP()` with nothing to read answers a LONGLONG of
     // 21 reporting NOT NULL, and `FROM_UNIXTIME` a DATETIME of 19 that does
     // not — a count it cannot read answers no moment at all.
@@ -5784,7 +5795,9 @@ fn scalar_call_column_definition(
     }
     // Measured on MySQL 8.4.11: shifting a DATE by whole days, months or years
     // answers a DATE, and every other shift — a time interval, or any shift
-    // of a DATETIME — answers a DATETIME. A TIME holds no date to shift.
+    // of a DATETIME — answers a DATETIME. A TIME holds no date to shift. A
+    // moment keeps its fraction of a second: a `DATETIME(3)` shifted answers
+    // a DATETIME of 23 with 3 decimals, and so does a `TIMESTAMP(3)`.
     if matches!(
         function,
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime
@@ -5802,7 +5815,17 @@ fn scalar_call_column_definition(
                 MYSQL_TYPE_DATETIME
             },
         );
-        definition.column_length = if keeps_the_day { 10 } else { 19 };
+        let precision = if keeps_the_day {
+            0
+        } else {
+            source.temporal_precision().unwrap_or(0)
+        };
+        definition.column_length = match (keeps_the_day, precision) {
+            (true, _) => 10,
+            (false, 0) => 19,
+            (false, precision) => 20 + u32::from(precision),
+        };
+        definition.decimals = precision;
         set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
@@ -6186,8 +6209,10 @@ fn scalar_call_column_definition(
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
             unreachable!("the shifts were answered above")
         }
-        ScalarFunction::ShiftsTheMoment | ScalarFunction::ShiftsTheDay => {
-            unreachable!("the shifts of a clock reading were answered above")
+        ScalarFunction::ShiftsTheMoment
+        | ScalarFunction::ShiftsTheDay
+        | ScalarFunction::ShiftsAWrittenMoment => {
+            unreachable!("the shifts of a clock reading or a written moment were answered above")
         }
         ScalarFunction::CastsToText
         | ScalarFunction::CastsToWholeNumber

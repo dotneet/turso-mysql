@@ -202,6 +202,9 @@ pub enum ScalarFunction {
     /// `DATE_ADD` and `DATE_SUB` over a reading of today by an interval of
     /// whole days, months or years, which read no column and answer a day.
     ShiftsTheDay,
+    /// `DATE_ADD` and `DATE_SUB` over a moment written out as a word, which
+    /// answer a word rather than a moment.
+    ShiftsAWrittenMoment,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
     /// `ROUND` with one argument, which answers a whole number however wide
@@ -397,6 +400,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Floor { expr, field } => classify_floor_ceil(expr, field),
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
+            .or_else(|| interval_shift_as_call(expr).and_then(|call| scalar_call(&call)))
             .or_else(|| classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic)),
         Expr::Subquery(query) => classify_scalar_subquery(query),
         Expr::Exists { .. } => Some(StaticSelectMetadata::Exists),
@@ -440,6 +444,53 @@ fn classify_json_arrow(expr: &Expr) -> Option<StaticSelectMetadata> {
         columns: vec![column.value.clone()],
         literal_characters: 0,
         not_null: false,
+    })
+}
+
+/// Reads `x + INTERVAL n unit`, `INTERVAL n unit + x` and `x - INTERVAL n
+/// unit` as the `DATE_ADD` or `DATE_SUB` each is.
+///
+/// Measured on MySQL 8.4.11, the operator and the call answer the same moment
+/// and the same shape — `created_at + INTERVAL 1 DAY` and `DATE_ADD(created_at,
+/// INTERVAL 1 DAY)` are both a `DATETIME` of 19 — so everything the call is
+/// read for, the operator is read for as well.
+pub(super) fn interval_shift_as_call(expr: &Expr) -> Option<sqlparser::ast::Function> {
+    use sqlparser::ast::{
+        BinaryOperator, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
+        Ident, ObjectName, ObjectNamePart,
+    };
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let (name, shifted, interval) = match (left.as_ref(), op, right.as_ref()) {
+        (Expr::Interval(_), _, Expr::Interval(_)) => return None,
+        (shifted, BinaryOperator::Plus, Expr::Interval(interval)) => {
+            ("DATE_ADD", shifted, interval)
+        }
+        (Expr::Interval(interval), BinaryOperator::Plus, shifted) => {
+            ("DATE_ADD", shifted, interval)
+        }
+        (shifted, BinaryOperator::Minus, Expr::Interval(interval)) => {
+            ("DATE_SUB", shifted, interval)
+        }
+        _ => return None,
+    };
+    Some(sqlparser::ast::Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(shifted.clone())),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Interval(interval.clone()))),
+            ],
+            clauses: Vec::new(),
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: Vec::new(),
     })
 }
 
@@ -1857,6 +1908,25 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
                     } else {
                         ScalarFunction::ShiftsTheMoment
                     },
+                    columns: Vec::new(),
+                    literal_characters: 0,
+                    not_null: false,
+                });
+            }
+            // A moment written out as a word is shifted too, and measured,
+            // MySQL answers the shift as a word of its own whatever the
+            // interval named.
+            if let Expr::Value(value) = shifted {
+                let (Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)) =
+                    &value.value
+                else {
+                    return None;
+                };
+                crate::temporal_value::written_moment_to_shift(written)?;
+                checked_interval_unit(interval)?;
+                checked_interval_count(interval)?;
+                return Some(StaticSelectMetadata::ScalarCall {
+                    function: ScalarFunction::ShiftsAWrittenMoment,
                     columns: Vec::new(),
                     literal_characters: 0,
                     not_null: false,
