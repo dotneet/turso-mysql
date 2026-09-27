@@ -17916,10 +17916,10 @@ fn show_columns_encodes_primary_and_auto_increment_metadata() {
             status_flags: SERVER_STATUS_AUTOCOMMIT,
         }))
     );
-    assert_eq!(show_column_extra(""), Ok(b"".as_slice()));
+    assert_eq!(show_column_extra(""), Ok(Vec::new()));
     assert_eq!(
         show_column_extra("AUTO_INCREMENT"),
-        Ok(b"auto_increment".as_slice())
+        Ok(b"auto_increment".to_vec())
     );
     assert_eq!(
         show_column_extra("unexpected"),
@@ -30590,3 +30590,6 @@ mod framework_catalog_reads;
 
 #[cfg(unix)]
 mod prepared_everything;
+
+#[cfg(unix)]
+mod fractional_moments;

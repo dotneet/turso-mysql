@@ -610,10 +610,11 @@ impl MySqlConnection {
                 .iter_mut()
                 .find(|column| column.name().eq_ignore_ascii_case(name))
                 .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            let moment = crate::show_create_table::the_moment(column.temporal_precision);
             if column.extra.is_empty() {
-                "on update CURRENT_TIMESTAMP".clone_into(&mut column.extra);
+                column.extra = format!("on update {moment}");
             } else if column.extra == "DEFAULT_GENERATED" {
-                "DEFAULT_GENERATED on update CURRENT_TIMESTAMP".clone_into(&mut column.extra);
+                column.extra = format!("DEFAULT_GENERATED on update {moment}");
             } else {
                 return Err(MySqlColumnMetadataError::CorruptDefinition);
             }

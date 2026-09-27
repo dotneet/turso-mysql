@@ -2722,14 +2722,18 @@ fn moments_the_update_rewrites(
     render_context
         .rewritten_on_update
         .iter()
-        .filter(|column| {
+        .filter(|(column, _)| {
             !assigned
                 .iter()
                 .any(|written| written.eq_ignore_ascii_case(column))
         })
-        .map(|column| {
+        .map(|(column, digits)| {
             let name = render_ident_str(column);
-            format!("{name} = CASE WHEN {changes} THEN CURRENT_TIMESTAMP ELSE {name} END")
+            let moment = match digits {
+                0 => "CURRENT_TIMESTAMP".to_owned(),
+                digits => super::moment_with_fraction_sql(*digits),
+            };
+            format!("{name} = CASE WHEN {changes} THEN {moment} ELSE {name} END")
         })
         .collect()
 }
@@ -3851,7 +3855,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// The columns the caller knows an `UPDATE` rewrites to the moment it runs
     /// at. The engine has no such attribute, so what it means is written into
     /// the statement here.
-    rewritten_on_update: &'a [String],
+    rewritten_on_update: &'a [(String, u8)],
     /// The columns the caller knows hold a moment — a `DATETIME` or a
     /// `TIMESTAMP` — when it knows. MySQL reads a written day against one of
     /// these as that day's midnight, which changes what the comparison
@@ -3885,7 +3889,7 @@ impl<'a> SelectRenderContext<'a> {
         member_columns: &'a [(String, Vec<String>)],
         set_columns: &'a [(String, Vec<String>)],
         moment_columns: &'a [String],
-        rewritten_on_update: &'a [String],
+        rewritten_on_update: &'a [(String, u8)],
     ) -> Self {
         Self {
             no_backslash_escapes: mode.no_backslash_escapes,

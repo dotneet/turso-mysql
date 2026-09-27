@@ -1922,7 +1922,7 @@ pub(super) fn show_columns_result(
                 MySqlColumnKey::Primary => b"PRI".to_vec(),
             }),
             show_column_default_value(&column)?,
-            Some(show_column_extra(column.extra())?.to_vec()),
+            Some(show_column_extra(column.extra())?),
         ]);
         if full {
             row.push(Some(privileges.to_vec()));
@@ -2034,19 +2034,27 @@ fn show_column_type_name(column: &MySqlColumnMetadata) -> Result<Vec<u8>, Fronte
         .ok_or(FrontendErrorKind::Internal)
 }
 
-pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendErrorKind> {
+pub(super) fn show_column_extra(extra: &str) -> Result<Vec<u8>, FrontendErrorKind> {
     match extra {
-        "" => Ok(b""),
-        "AUTO_INCREMENT" => Ok(b"auto_increment"),
+        "" => Ok(Vec::new()),
+        "AUTO_INCREMENT" => Ok(b"auto_increment".to_vec()),
         // Measured on MySQL 8.4.11: a column defaulting to the moment it is
         // written reports this, in capitals where `auto_increment` is not.
-        "DEFAULT_GENERATED" => Ok(b"DEFAULT_GENERATED"),
+        "DEFAULT_GENERATED" => Ok(b"DEFAULT_GENERATED".to_vec()),
         // Measured: the words are reported in lower case where
-        // `DEFAULT_GENERATED` is in capitals, and the two run together where
-        // the column carries both.
-        "on update CURRENT_TIMESTAMP" => Ok(b"on update CURRENT_TIMESTAMP"),
-        "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" => {
-            Ok(b"DEFAULT_GENERATED on update CURRENT_TIMESTAMP")
+        // `DEFAULT_GENERATED` is in capitals, the two run together where the
+        // column carries both, and a column holding fractional seconds names
+        // its digits — `on update CURRENT_TIMESTAMP(6)`.
+        extra
+            if extra
+                .strip_prefix("DEFAULT_GENERATED ")
+                .unwrap_or(extra)
+                .strip_prefix("on update CURRENT_TIMESTAMP")
+                .is_some_and(|digits| {
+                    digits.is_empty() || matches!(digits.as_bytes(), [b'(', b'1'..=b'6', b')'])
+                }) =>
+        {
+            Ok(extra.as_bytes().to_vec())
         }
         _ => Err(FrontendErrorKind::Internal),
     }
@@ -2055,6 +2063,13 @@ pub(super) fn show_column_extra(extra: &str) -> Result<&'static [u8], FrontendEr
 pub(super) fn show_column_default_value(
     column: &MySqlColumnMetadata,
 ) -> Result<Option<Vec<u8>>, FrontendErrorKind> {
+    // Measured on MySQL 8.4.11: a column holding fractional seconds names
+    // its digits, `CURRENT_TIMESTAMP(3)`.
+    if matches!(column.default_value(), Some(MySqlColumnDefault::Moment)) {
+        return Ok(Some(
+            turso_mysql::show_create_table::the_moment(column.temporal_precision()).into_bytes(),
+        ));
+    }
     show_default_at_scale(column.default_value(), column.decimal_size())
 }
 

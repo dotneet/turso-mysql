@@ -158,8 +158,15 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
         "DEFAULT_GENERATED" => {}
         // Measured: the words are printed after the DEFAULT clause, and the
         // `DEFAULT_GENERATED` half of the extra is not printed at all.
-        "on update CURRENT_TIMESTAMP" | "DEFAULT_GENERATED on update CURRENT_TIMESTAMP" => {
-            rendered.push_str(" ON UPDATE CURRENT_TIMESTAMP");
+        extra
+            if extra
+                .strip_prefix("DEFAULT_GENERATED ")
+                .unwrap_or(extra)
+                .strip_prefix("on update ")
+                == Some(the_moment(column.temporal_precision()).as_str()) =>
+        {
+            rendered.push_str(" ON UPDATE ");
+            rendered.push_str(&the_moment(column.temporal_precision()));
         }
         _ => return None,
     }
@@ -172,6 +179,17 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
         ));
     }
     Some(rendered)
+}
+
+/// The words naming the moment a statement runs at, as a column holding
+/// `digits` fractional-second digits reads it. Measured on MySQL 8.4.11: a
+/// `datetime(3)` reads `CURRENT_TIMESTAMP(3)` in `SHOW CREATE TABLE`, `SHOW
+/// COLUMNS` and `information_schema.COLUMNS` alike.
+pub fn the_moment(digits: Option<u8>) -> String {
+    match digits {
+        None | Some(0) => "CURRENT_TIMESTAMP".to_owned(),
+        Some(digits) => format!("CURRENT_TIMESTAMP({digits})"),
+    }
 }
 
 /// Returns the DEFAULT clause, empty when the column has none, or `None` when
@@ -214,7 +232,9 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
         }
         // MySQL prints this one without quotes, it naming a moment rather than
         // holding a value.
-        MySqlColumnDefault::Moment => " DEFAULT CURRENT_TIMESTAMP".to_owned(),
+        MySqlColumnDefault::Moment => {
+            format!(" DEFAULT {}", the_moment(column.temporal_precision()))
+        }
         // Measured on MySQL 8.4.11, and it is the rule a column's comment is
         // written by: a quote is doubled, a backslash written twice, and a
         // newline, a carriage return and a zero byte each named. A `DEFAULT`

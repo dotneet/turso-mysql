@@ -1091,7 +1091,7 @@ impl From<MySqlQueryError> for LimboError {
 
 type CheckedDmlTranslation = (
     TranslatedDml,
-    Vec<String>,
+    Vec<(String, u8)>,
     Vec<(String, u32)>,
     Vec<String>,
     Option<(String, String)>,
@@ -1464,7 +1464,12 @@ impl MySqlConnection {
             columns
                 .iter()
                 .filter(|column| column.extra().contains("on update CURRENT_TIMESTAMP"))
-                .map(|column| column.name().to_owned())
+                .map(|column| {
+                    (
+                        column.name().to_owned(),
+                        column.temporal_precision().unwrap_or(0),
+                    )
+                })
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1662,7 +1667,7 @@ impl MySqlConnection {
     fn frozen_dml_parser(
         &self,
         mode: SessionSqlMode,
-        rewritten_on_update: Vec<String>,
+        rewritten_on_update: Vec<(String, u8)>,
         decimal_columns: Vec<(String, u32)>,
         integer_columns: Vec<String>,
         table_definition: Option<(String, String)>,
@@ -7216,10 +7221,17 @@ pub(crate) fn without_on_update_attributes(sql: &str, mode: SessionSqlMode) -> S
         turso_mysql_parser::ON_UPDATE_MOMENT,
         mode.no_backslash_escapes,
     ) {
-        remaining.replace_range(
-            start..start + turso_mysql_parser::ON_UPDATE_MOMENT.len(),
-            "",
-        );
+        let mut end = start + turso_mysql_parser::ON_UPDATE_MOMENT.len();
+        // A column holding fractional seconds carries its digits after the
+        // words, `(3)`, and they go with them.
+        let digits = remaining.as_bytes()[end..]
+            .strip_prefix(b"(")
+            .and_then(|rest| {
+                let count = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+                (count > 0 && rest.get(count) == Some(&b')')).then_some(count + 2)
+            });
+        end += digits.unwrap_or(0);
+        remaining.replace_range(start..end, "");
     }
     remaining
 }
@@ -8387,6 +8399,17 @@ fn mysql_column_default(
         Expr::Literal(Literal::CurrentTimestamp) => {
             Ok(("CURRENT_TIMESTAMP".to_string(), MySqlColumnDefault::Moment))
         }
+        // A column holding fractional seconds reads the moment to as many
+        // digits, which is written into the engine's definition as a reading
+        // of its clock and printed back the way MySQL prints it.
+        expression if turso_mysql_parser::moment_with_fraction_digits(expression).is_some() => {
+            let digits = turso_mysql_parser::moment_with_fraction_digits(expression)
+                .expect("the guard read the digits");
+            Ok((
+                format!("CURRENT_TIMESTAMP({digits})"),
+                MySqlColumnDefault::Moment,
+            ))
+        }
         Expr::Unary(operator, expression) => {
             let Expr::Literal(Literal::Numeric(value)) = expression.as_ref() else {
                 return Err(MySqlColumnMetadataError::UnsupportedDefinition);
@@ -8456,7 +8479,7 @@ struct FrozenDmlParser {
     mode: SessionSqlMode,
     /// The columns an `UPDATE` rewrites, read when the statement was prepared.
     /// A reprepare has no connection to read them again from.
-    rewritten_on_update: Vec<String>,
+    rewritten_on_update: Vec<(String, u8)>,
     decimal_columns: Vec<(String, u32)>,
     integer_columns: Vec<String>,
     table_definition: Option<(String, String)>,
@@ -8827,7 +8850,12 @@ fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option
         }
         // MySQL prints this one without quotes, it naming a moment rather
         // than holding a value.
-        Some(MySqlColumnDefault::Moment) => rendered.push_str(" DEFAULT CURRENT_TIMESTAMP"),
+        Some(MySqlColumnDefault::Moment) => {
+            rendered.push_str(" DEFAULT ");
+            rendered.push_str(&crate::show_create_table::the_moment(
+                column.temporal_precision(),
+            ));
+        }
         Some(MySqlColumnDefault::Text(_)) => return None,
     }
     Some(rendered)

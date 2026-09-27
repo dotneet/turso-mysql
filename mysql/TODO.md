@@ -376,7 +376,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
 | A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
-| A temporal precision above 6, or a fractional `DEFAULT CURRENT_TIMESTAMP` / `ON UPDATE CURRENT_TIMESTAMP` | refused; precision 0 through 6 is supported for stored values and protocol results, while the engine clock defaults do not provide fractional precision |
+| A temporal precision above 6 | refused; precision 0 through 6 is supported for stored values, protocol results, and `DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP(n)` at the column's own precision |
 | Non-UTC TIMESTAMP queries beyond direct projection from one unfiltered base table | refused; joins, filters, ordering and expressions need conversion before the engine evaluates them |
 | Non-UTC `UPDATE` or `DELETE` on a table with TIMESTAMP, or TIMESTAMP `INSERT ... SELECT` | refused; these paths cannot yet convert every value safely |
 | Non-UTC `INSERT` into a table with `DATETIME DEFAULT CURRENT_TIMESTAMP`, or `UPDATE` on a table with `DATETIME ON UPDATE CURRENT_TIMESTAMP` | refused; the engine clock would store UTC rather than the session's wall time |
@@ -402,6 +402,8 @@ Behaviour that works but does not match MySQL lives in
 - A `REPEATABLE READ` transaction that writes after another session committed
   since its first read is rolled back with 1213, where MySQL writes and keeps
   reading the old snapshot for the rows it did not touch
+- `CURRENT_TIMESTAMP(n)` as a default or on update reads the engine's clock,
+  which stops at the millisecond, so digits past the third are zeros
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
 - complex compound projections still have conservative nullable metadata

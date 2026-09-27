@@ -3843,7 +3843,7 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
 pub fn parse_dml_rewriting_on_update(
     sql: &str,
     mode: SessionSqlMode,
-    rewritten_on_update: &[String],
+    rewritten_on_update: &[(String, u8)],
 ) -> Result<TranslatedDml, ParseError> {
     parse_dml_knowing_decimal_columns(sql, mode, rewritten_on_update, &[])
 }
@@ -3851,7 +3851,7 @@ pub fn parse_dml_rewriting_on_update(
 pub fn parse_dml_knowing_decimal_columns(
     sql: &str,
     mode: SessionSqlMode,
-    rewritten_on_update: &[String],
+    rewritten_on_update: &[(String, u8)],
     decimal_columns: &[(String, u32)],
 ) -> Result<TranslatedDml, ParseError> {
     parse_dml_knowing_numeric_columns(sql, mode, rewritten_on_update, decimal_columns, &[])
@@ -3860,7 +3860,7 @@ pub fn parse_dml_knowing_decimal_columns(
 pub fn parse_dml_knowing_numeric_columns(
     sql: &str,
     mode: SessionSqlMode,
-    rewritten_on_update: &[String],
+    rewritten_on_update: &[(String, u8)],
     decimal_columns: &[(String, u32)],
     integer_columns: &[String],
 ) -> Result<TranslatedDml, ParseError> {
@@ -5339,9 +5339,12 @@ fn render_mysql_checked_column(
     // source column can still be seen, in the order MySQL prints them.
     let rest = render_mysql_checked_column_without_its_own_words(column, mode)?;
     let on_update = if column_is_rewritten_on_update(column) {
-        ON_UPDATE_MOMENT
+        match declared_fraction_digits(&column.data_type) {
+            0 => ON_UPDATE_MOMENT.to_owned(),
+            digits => format!("{ON_UPDATE_MOMENT}({digits})"),
+        }
     } else {
-        ""
+        String::new()
     };
     Ok(format!("{rest}{on_update}{}", written_comment(column)))
 }
@@ -6519,23 +6522,111 @@ fn reject_duplicate_nullable_column_options(
 /// the same moment in the same form, this server running in UTC, so it is what
 /// the default is written as.
 pub(crate) fn names_the_moment_a_statement_runs_at(expr: &Expr) -> bool {
+    moment_precision(expr).is_some()
+}
+
+/// The fractional-second digits a call naming the moment asks for, or `None`
+/// for anything that is not such a call. `CURRENT_TIMESTAMP` and
+/// `CURRENT_TIMESTAMP()` ask for none; `CURRENT_TIMESTAMP(3)` for three.
+pub(crate) fn moment_precision(expr: &Expr) -> Option<u64> {
     let Expr::Function(function) = expr else {
-        return false;
+        return None;
     };
     let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
-        return false;
+        return None;
     };
-    let takes_nothing = match &function.args {
-        FunctionArguments::None => true,
-        FunctionArguments::List(arguments) => arguments.args.is_empty(),
-        FunctionArguments::Subquery(_) => false,
-    };
-    if !takes_nothing || function.over.is_some() {
-        return false;
+    if function.over.is_some()
+        || !["CURRENT_TIMESTAMP", "NOW", "LOCALTIME", "LOCALTIMESTAMP"]
+            .iter()
+            .any(|spelling| name.value.eq_ignore_ascii_case(spelling))
+    {
+        return None;
     }
-    ["CURRENT_TIMESTAMP", "NOW", "LOCALTIME", "LOCALTIMESTAMP"]
-        .iter()
-        .any(|spelling| name.value.eq_ignore_ascii_case(spelling))
+    match &function.args {
+        FunctionArguments::None => Some(0),
+        FunctionArguments::List(arguments) => match arguments.args.as_slice() {
+            [] => Some(0),
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Value(value),
+            ))] => match &value.value {
+                Value::Number(digits, false) => digits.parse().ok().filter(|digits| *digits <= 6),
+                _ => None,
+            },
+            _ => None,
+        },
+        FunctionArguments::Subquery(_) => None,
+    }
+}
+
+/// The fractional-second digits a `DATETIME` or `TIMESTAMP` declares.
+fn declared_fraction_digits(data_type: &DataType) -> u64 {
+    match data_type {
+        DataType::Timestamp(Some(digits), _) | DataType::Datetime(Some(digits)) => *digits,
+        _ => 0,
+    }
+}
+
+/// The engine's reading of the moment with `digits` fractional-second digits,
+/// the default a `DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)` stores.
+///
+/// The engine's clock reads to the millisecond, so a fourth digit and beyond
+/// are zeros; fewer digits are cut off rather than rounded, since rounding a
+/// clock reading up names a moment that has not come yet. The length the text
+/// is cut at is `20 + digits`, which is how the digits are read back out of a
+/// stored definition.
+pub fn moment_with_fraction_sql(digits: u8) -> String {
+    format!(
+        "substr(strftime('%Y-%m-%d %H:%M:%f', 'now') || '000', 1, {})",
+        20 + u32::from(digits)
+    )
+}
+
+/// Reads back the digits of a reading [`moment_with_fraction_sql`] wrote, or
+/// `None` for any other expression.
+pub fn moment_with_fraction_digits(expr: &TursoExpr) -> Option<u8> {
+    let expr = match expr {
+        TursoExpr::Parenthesized(inner) => match inner.as_slice() {
+            [inner] => inner.as_ref(),
+            _ => return None,
+        },
+        expr => expr,
+    };
+    let TursoExpr::FunctionCall { name, args, .. } = expr else {
+        return None;
+    };
+    let [text, start, length] = args.as_slice() else {
+        return None;
+    };
+    if !name.as_str().eq_ignore_ascii_case("substr")
+        || !matches!(start.as_ref(), TursoExpr::Literal(TursoLiteral::Numeric(one)) if one == "1")
+    {
+        return None;
+    }
+    let TursoExpr::Literal(TursoLiteral::Numeric(length)) = length.as_ref() else {
+        return None;
+    };
+    let TursoExpr::Binary(clock, turso_parser::ast::Operator::Concat, zeros) = text.as_ref() else {
+        return None;
+    };
+    if !matches!(zeros.as_ref(), TursoExpr::Literal(TursoLiteral::String(zeros)) if zeros == "'000'")
+    {
+        return None;
+    }
+    let TursoExpr::FunctionCall { name, args, .. } = clock.as_ref() else {
+        return None;
+    };
+    let reads_the_clock = name.as_str().eq_ignore_ascii_case("strftime")
+        && matches!(args.as_slice(), [format, now]
+            if matches!(format.as_ref(), TursoExpr::Literal(TursoLiteral::String(format)) if format == "'%Y-%m-%d %H:%M:%f'")
+                && matches!(now.as_ref(), TursoExpr::Literal(TursoLiteral::String(now)) if now == "'now'"));
+    if !reads_the_clock {
+        return None;
+    }
+    length
+        .parse::<u8>()
+        .ok()
+        .and_then(|length| length.checked_sub(20))
+        .filter(|digits| (1..=6).contains(digits))
 }
 
 fn render_column_option(
@@ -6555,7 +6646,7 @@ fn render_column_option(
             if matches!(data_type, DataType::JSON) {
                 reject_json_default(expr)?;
             }
-            if names_the_moment_a_statement_runs_at(expr) {
+            if let Some(digits) = moment_precision(expr) {
                 // MySQL takes this default on a column that holds a moment and
                 // on no other — measured on 8.4.11, `DEFAULT CURRENT_TIMESTAMP`
                 // on an `INT` answers 1067.
@@ -6564,13 +6655,18 @@ fn render_column_option(
                         "DEFAULT CURRENT_TIMESTAMP on a column that holds no moment",
                     );
                 }
-                if matches!(
-                    data_type,
-                    DataType::Timestamp(Some(1..=6), _) | DataType::Datetime(Some(1..=6))
-                ) {
-                    return unsupported("fractional CURRENT_TIMESTAMP default");
+                // Measured on 8.4.11: the default reads the moment to exactly
+                // the digits the column holds, and any other count is 1067.
+                if digits != declared_fraction_digits(data_type) {
+                    return unsupported("CURRENT_TIMESTAMP default at another precision");
                 }
-                return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
+                if digits == 0 {
+                    return Ok(Some("DEFAULT CURRENT_TIMESTAMP".to_owned()));
+                }
+                return Ok(Some(format!(
+                    "DEFAULT ({})",
+                    moment_with_fraction_sql(digits as u8)
+                )));
             }
             if matches!(data_type, DataType::BigIntUnsigned(_)) {
                 if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
@@ -6640,17 +6736,16 @@ fn render_column_option(
         // is done by the statement renderer, which is the only place that can
         // see both the table and the assignment list.
         ColumnOption::OnUpdate(expr) if option.name.is_none() => {
-            if !names_the_moment_a_statement_runs_at(expr) {
+            let Some(digits) = moment_precision(expr) else {
                 return unsupported("ON UPDATE expression");
-            }
+            };
             if !matches!(data_type, DataType::Timestamp(_, _) | DataType::Datetime(_)) {
                 return unsupported("ON UPDATE CURRENT_TIMESTAMP on a column that holds no moment");
             }
-            if matches!(
-                data_type,
-                DataType::Timestamp(Some(1..=6), _) | DataType::Datetime(Some(1..=6))
-            ) {
-                return unsupported("fractional ON UPDATE CURRENT_TIMESTAMP");
+            // Measured on 8.4.11: another count of digits than the column
+            // holds is 1294.
+            if digits != declared_fraction_digits(data_type) {
+                return unsupported("ON UPDATE CURRENT_TIMESTAMP at another precision");
             }
             Ok(None)
         }

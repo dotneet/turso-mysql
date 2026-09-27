@@ -3543,6 +3543,19 @@ stores that many fractional digits. Input rounds to microseconds first and then
 to the column's precision, matching MySQL 8.4.11 at boundaries such as
 `.1249995` in `DATETIME(2)` becoming `.13`.
 
+A column holding fractional seconds may default to, and be rewritten on update
+to, the moment at its own precision — `DATETIME(3) DEFAULT
+CURRENT_TIMESTAMP(3)`, which Prisma writes for every `@default(now())`, and
+TypeORM's `datetime(6) ... DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE
+CURRENT_TIMESTAMP(6)`. Measured on 8.4.11 and matched: another count of digits
+than the column holds is 1067 for the default and 1294 for `ON UPDATE`; and
+`SHOW CREATE TABLE`, `SHOW COLUMNS` and `information_schema.COLUMNS` name the
+digits — `CURRENT_TIMESTAMP(3)`, `on update CURRENT_TIMESTAMP(6)`. One thing
+differs: the engine's clock reads to the millisecond, so a fourth digit and
+beyond are zeros where MySQL's clock fills them, and fewer digits are cut off
+rather than rounded, since rounding a clock reading up names a moment that has
+not come yet.
+
 Which of MySQL's two readings applies turns on the character right after the
 leading run of digits, which is worth knowing because it changes what the year
 is. A run that ends the value or is followed by a point is read as if the whole

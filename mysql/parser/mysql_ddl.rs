@@ -893,6 +893,9 @@ fn render_mysql_ref_action(action: RefAct) -> &'static str {
 }
 
 fn render_mysql_default(expr: &TursoExpr, mode: SessionSqlMode) -> Result<String, ParseError> {
+    if let Some(digits) = super::moment_with_fraction_digits(expr) {
+        return Ok(format!("CURRENT_TIMESTAMP({digits})"));
+    }
     match expr {
         TursoExpr::Literal(literal) => render_mysql_literal(literal, mode),
         TursoExpr::Unary(operator, expression) => {
