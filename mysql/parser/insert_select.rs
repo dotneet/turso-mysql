@@ -245,6 +245,70 @@ pub fn parse_optional_insert_select_without_columns(
     }))
 }
 
+/// One `INSERT INTO t (a, b) <SELECT>`, the statement Laravel's `insertUsing`
+/// and a data migration write to copy rows into a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlInsertSelect {
+    table: MySqlTableName,
+    columns: Vec<String>,
+}
+
+impl MySqlInsertSelect {
+    /// Returns the table the statement writes.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Returns the columns the statement names, in the order it names them.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
+/// Reads an `INSERT INTO t (a, b) <SELECT>`.
+///
+/// Returns `None` for anything else, so every other `INSERT` keeps its own
+/// path. `IGNORE`, `REPLACE` and an upsert clause are refused: each decides
+/// what a colliding row does, which has not been measured beside a `SELECT`.
+pub fn parse_optional_insert_select(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlInsertSelect>, ParseError> {
+    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+        return Ok(None);
+    };
+    if insert.columns.is_empty() || !insert.assignments.is_empty() {
+        return Ok(None);
+    }
+    let Some(source) = insert.source.as_deref() else {
+        return Ok(None);
+    };
+    if matches!(source.body.as_ref(), SetExpr::Values(_)) {
+        return Ok(None);
+    }
+    if insert.ignore || insert.replace_into || insert.on.is_some() {
+        return unsupported("INSERT SELECT option");
+    }
+    let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
+        return unsupported("INSERT target");
+    };
+    let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
+        return unsupported("schema-qualified INSERT target");
+    };
+    let table = MySqlTableName::parse(&table.value).map_err(|_| ParseError::Unsupported {
+        feature: "INSERT target name",
+    })?;
+    let columns = insert
+        .columns
+        .iter()
+        .map(|column| match column.0.as_slice() {
+            [ObjectNamePart::Identifier(column)] => Ok(column.value.clone()),
+            _ => unsupported("qualified INSERT column"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(MySqlInsertSelect { table, columns }))
+}
+
 /// One `INSERT INTO t VALUES (...)` written with no column list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInsertValuesWithoutColumns {
@@ -480,6 +544,39 @@ mod tests {
             "INSERT INTO dst (v) SELECT v FROM src ORDER BY v",
         ] {
             assert_eq!(direct_insert_select_projection(sql, mode), None, "{sql}");
+        }
+    }
+
+    #[test]
+    fn an_insert_select_names_its_table_and_columns() {
+        let mode = SessionSqlMode::default();
+        let copy = parse_optional_insert_select(
+            "insert into `users` (`name`, `Email`) select `name`, `email` from `users` where `id` = 1",
+            mode,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(copy.table().as_str(), "users");
+        assert_eq!(copy.columns(), ["name", "Email"]);
+        for sql in [
+            "INSERT INTO t (a) VALUES (1)",
+            "INSERT INTO t SELECT a FROM src",
+            "INSERT INTO t SET a = 1",
+            "UPDATE t SET a = 1",
+        ] {
+            assert_eq!(
+                parse_optional_insert_select(sql, mode).unwrap(),
+                None,
+                "{sql}"
+            );
+        }
+        for sql in [
+            "INSERT IGNORE INTO t (a) SELECT a FROM src",
+            "REPLACE INTO t (a) SELECT a FROM src",
+            "INSERT INTO t (a) SELECT a FROM src ON DUPLICATE KEY UPDATE a = 1",
+            "INSERT INTO db.t (a) SELECT a FROM src",
+        ] {
+            assert!(parse_optional_insert_select(sql, mode).is_err(), "{sql}");
         }
     }
 

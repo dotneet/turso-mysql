@@ -223,3 +223,329 @@ fn a_prepared_counted_row_takes_the_clock_beside_bound_values() {
         ]
     );
 }
+
+fn eight_words(adapter: &mut Adapter) {
+    run(adapter, "CREATE TABLE src (n INT, name VARCHAR(20))");
+    run(
+        adapter,
+        "INSERT INTO src (n, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e'), (6, 'f'), (7, 'g'), (8, 'h')",
+    );
+}
+
+/// MySQL cannot know how many rows a `SELECT` answers, so it takes numbers in
+/// batches of 1, 2, 4 and on, and spends what the last batch leaves unused.
+#[test]
+fn a_select_copies_rows_into_a_counted_table_and_spends_numbers_in_batches() {
+    let (_directory, mut adapter) = adapter();
+    eight_words(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+    );
+    for (sql, reported, counted_to) in [
+        (
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n <= 1",
+            (1, 1),
+            "2",
+        ),
+        (
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n <= 3",
+            (3, 2),
+            "5",
+        ),
+        (
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n <= 4",
+            (4, 5),
+            "12",
+        ),
+        (
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n <= 7",
+            (7, 12),
+            "19",
+        ),
+        (
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n <= 8",
+            (8, 19),
+            "34",
+        ),
+    ] {
+        assert_eq!(written(&mut adapter, sql), reported, "{sql}");
+        assert_eq!(
+            one(&mut adapter, "SELECT LAST_INSERT_ID()"),
+            reported.1.to_string()
+        );
+        assert_eq!(counter(&mut adapter, "t1").as_deref(), Some(counted_to));
+    }
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t1 (name) VALUES ('after')"),
+        (1, 34)
+    );
+    // The rows take their numbers in the order the SELECT answers them.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n >= 6"
+        ),
+        (3, 35)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, name FROM t1 WHERE id >= 35 ORDER BY id"
+        ),
+        vec![
+            vec![Some("35".to_owned()), Some("f".to_owned())],
+            vec![Some("36".to_owned()), Some("g".to_owned())],
+            vec![Some("37".to_owned()), Some("h".to_owned())],
+        ]
+    );
+
+    // A SELECT answering no rows writes none, reports no id and leaves the
+    // counter and LAST_INSERT_ID() where they stood.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t1 (name) SELECT name FROM src WHERE n > 100"
+        ),
+        (0, 0)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "35");
+    assert_eq!(counter(&mut adapter, "t1").as_deref(), Some("38"));
+}
+
+/// A SELECT reading the table it writes sees only the rows that stood before
+/// the statement.
+#[test]
+fn a_select_reading_the_counted_table_it_writes_copies_what_stood() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE a1 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO a1 (name) VALUES ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('g'), ('h'), ('i'), ('j'), ('k')",
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO a1 (name) SELECT name FROM a1"),
+        (11, 12)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*), MAX(id) FROM a1"),
+        vec![vec![Some("22".to_owned()), Some("22".to_owned())]]
+    );
+    assert_eq!(counter(&mut adapter, "a1").as_deref(), Some("27"));
+}
+
+/// Laravel's `insertUsing`, copying a row into a table Laravel counts.
+#[test]
+fn laravels_insert_using_copies_into_a_counted_table() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, LARAVEL_USERS);
+    run(
+        &mut adapter,
+        "INSERT INTO users (name, email) VALUES ('Fi', 'fi@x.com')",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `users` (`name`, `email`) select `name`, `email` from `users` where `id` = 1"
+        ),
+        (1, 2)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, name, email FROM users ORDER BY id"
+        ),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("Fi".to_owned()),
+                Some("fi@x.com".to_owned())
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("Fi".to_owned()),
+                Some("fi@x.com".to_owned())
+            ],
+        ]
+    );
+    assert_eq!(counter(&mut adapter, "users").as_deref(), Some("3"));
+}
+
+/// The ids a SELECT answers for the counted column itself.
+#[test]
+fn a_select_writing_the_counted_column_follows_the_values_rules() {
+    let (_directory, mut adapter) = adapter();
+    eight_words(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE TABLE t2 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+    );
+    // Its own ids raise the counter past the highest, report the last row's
+    // and leave LAST_INSERT_ID() alone.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t2 (id, name) SELECT n + 100, name FROM src WHERE n <= 3"
+        ),
+        (3, 103)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "0");
+    assert_eq!(counter(&mut adapter, "t2").as_deref(), Some("104"));
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t2 (id, name) SELECT 200 - n, name FROM src WHERE n <= 3"
+        ),
+        (3, 197)
+    );
+    assert_eq!(counter(&mut adapter, "t2").as_deref(), Some("200"));
+    // NULL and 0 ask for the next number, in batches.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t2 (id, name) SELECT NULL, name FROM src WHERE n <= 3"
+        ),
+        (3, 200)
+    );
+    assert_eq!(counter(&mut adapter, "t2").as_deref(), Some("203"));
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t2 (id, name) SELECT 0, name FROM src WHERE n <= 2"
+        ),
+        (2, 203)
+    );
+    assert_eq!(counter(&mut adapter, "t2").as_deref(), Some("206"));
+    // Every column of the table, the id among them, when no list is written.
+    run(
+        &mut adapter,
+        "CREATE TABLE t3 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO t3 SELECT * FROM t2 WHERE id < 150"
+        ),
+        (3, 103)
+    );
+    assert_eq!(counter(&mut adapter, "t3").as_deref(), Some("104"));
+
+    // A copy colliding with a row already there writes none of its rows.
+    assert!(adapter
+        .execute_query("INSERT INTO t2 (id, name) SELECT n + 99, name FROM src WHERE n <= 3")
+        .is_err());
+    assert_eq!(
+        one(&mut adapter, "SELECT COUNT(*) FROM t2 WHERE id = 100"),
+        "0"
+    );
+
+    // A row naming its own id beside one asking for the next is refused.
+    run(&mut adapter, "CREATE TABLE ids (n INT)");
+    run(&mut adapter, "INSERT INTO ids (n) VALUES (NULL), (500)");
+    assert_eq!(
+        adapter.execute_query("INSERT INTO t2 (id, name) SELECT n, 'x' FROM ids"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(counter(&mut adapter, "t2").as_deref(), Some("206"));
+}
+
+/// A column the table needs and the copy leaves out, and the clauses that
+/// decide what a colliding row does.
+#[test]
+fn a_counted_copy_is_held_to_the_rules_of_an_ordinary_insert() {
+    let (_directory, mut adapter) = adapter();
+    eight_words(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE TABLE r1 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), must INT NOT NULL)",
+    );
+    // Measured, no row means no complaint; a row means 1364, before a number
+    // is spent.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO r1 (name) SELECT name FROM src WHERE n > 100"
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO r1 (name) SELECT name FROM src WHERE n = 1"),
+        Err(FrontendErrorKind::MissingRequiredDefault)
+    );
+    assert_eq!(counter(&mut adapter, "r1"), None);
+    for sql in [
+        "INSERT IGNORE INTO r1 (name, must) SELECT name, n FROM src",
+        "REPLACE INTO r1 (name, must) SELECT name, n FROM src",
+        "INSERT INTO r1 (name, must) SELECT name, n FROM src ON DUPLICATE KEY UPDATE must = 0",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    assert_eq!(one(&mut adapter, "SELECT COUNT(*) FROM r1"), "0");
+}
+
+/// Ids past the engine's signed range, and a `DECIMAL` carried across.
+#[test]
+fn a_copy_between_wide_counted_tables_keeps_every_digit() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE w1 (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), price DECIMAL(10,2)) AUTO_INCREMENT=18446744073709551000",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE w2 (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20), price DECIMAL(10,2))",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO w1 (name, price) VALUES ('a', 1.25), ('b', 2.50)"
+        ),
+        (2, 18446744073709551000)
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO w2 SELECT * FROM w1"),
+        (2, 18446744073709551001)
+    );
+    assert_eq!(
+        one(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        "18446744073709551000"
+    );
+    assert_eq!(
+        counter(&mut adapter, "w2").as_deref(),
+        Some("18446744073709551002")
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO w1 (name, price) SELECT name, price FROM w2"
+        ),
+        (2, 18446744073709551002)
+    );
+    assert_eq!(
+        counter(&mut adapter, "w1").as_deref(),
+        Some("18446744073709551005")
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name, price FROM w1 ORDER BY id"),
+        vec![
+            some(&["18446744073709551000", "a", "1.25"]),
+            some(&["18446744073709551001", "b", "2.50"]),
+            some(&["18446744073709551002", "a", "1.25"]),
+            some(&["18446744073709551003", "b", "2.50"]),
+        ]
+    );
+}
+
+fn some(values: &[&str]) -> Vec<Option<String>> {
+    values
+        .iter()
+        .map(|value| Some((*value).to_owned()))
+        .collect()
+}

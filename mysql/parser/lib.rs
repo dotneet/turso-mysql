@@ -99,9 +99,10 @@ pub use dump_ddl::{
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
     direct_insert_select_projection, filtered_insert_select_projection,
-    parse_optional_insert_select_without_columns, parse_optional_insert_set_as_values,
-    parse_optional_insert_values_without_columns, MySqlDirectInsertSelectProjection,
-    MySqlInsertSelectWithoutColumns, MySqlInsertValuesWithoutColumns,
+    parse_optional_insert_select, parse_optional_insert_select_without_columns,
+    parse_optional_insert_set_as_values, parse_optional_insert_values_without_columns,
+    MySqlDirectInsertSelectProjection, MySqlInsertSelect, MySqlInsertSelectWithoutColumns,
+    MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
     is_a_json_path_this_reads, json_compare_integer, json_compare_string, json_contains,

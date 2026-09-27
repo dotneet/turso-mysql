@@ -249,6 +249,11 @@ boolean literal.
 | `INSERT IGNORE` writing NULL | supported for an `AUTO_INCREMENT` column, where NULL asks for the next id; other NULL coercions remain refused |
 | `INSERT IGNORE` over several rows on an `AUTO_INCREMENT` table | supported when every row generates an id. A skipped row consumes a reserved slot, and later successful rows reuse the next number MySQL assigns. Explicit ids in this form remain refused |
 | A reading of the clock in a counted `INSERT` whose rows are written one at a time — several rows with `IGNORE` or `ON DUPLICATE KEY UPDATE`, or rows asking for the next id beside one naming its own id past the counter | refused; MySQL reads the clock once for the statement, and each of these rows is written by a statement of its own |
+| `INSERT ... SELECT` into an `AUTO_INCREMENT` table mixing rows that name their own id with rows asking for the next | refused; measured, MySQL takes a new batch of numbers whenever a written id passes the batch it holds — `NULL`, `100`, `NULL` into a table counting at 37 writes 37, 100 and 101 and leaves `AUTO_INCREMENT=103` — which the copy path does not repeat |
+| `INSERT IGNORE ... SELECT`, `REPLACE ... SELECT` and `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` into an `AUTO_INCREMENT` table | refused; what a colliding row spends and reports beside a `SELECT` has not been measured |
+| A prepared `INSERT ... SELECT` into an `AUTO_INCREMENT` table, which is how Laravel's `insertUsing` arrives with its bindings | refused; the copy path reads the `SELECT` with no bound values |
+| `INSERT ... SELECT` into an `AUTO_INCREMENT` table in a session whose time zone is not UTC | refused; the copy path does not shift `TIMESTAMP` values between zones |
+| `INSERT ... SELECT` into an `AUTO_INCREMENT` table whose batch of numbers would pass the column's highest | refused; measured, MySQL cuts the last batch short there and writes the rows that fit |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |

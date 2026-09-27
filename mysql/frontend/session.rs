@@ -6577,12 +6577,25 @@ impl MySqlConnection {
                 if let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
                     .map_err(mysql_query_parse_error)?
                 {
-                    if self
+                    if let Some(table) = self
                         .load_auto_increment_table(&target)
                         .map_err(MySqlQueryError::Engine)?
-                        .is_some()
                     {
                         self.check_write_deadline(deadline)?;
+                        if let Some(copy) = turso_mysql_parser::parse_optional_insert_select(
+                            sql,
+                            self.parser_mode(),
+                        )
+                        .map_err(mysql_query_parse_error)?
+                        {
+                            return self.execute_counted_insert_select(
+                                sql,
+                                &copy,
+                                table,
+                                deadline,
+                                affected_rows_mode,
+                            );
+                        }
                         return Err(MySqlQueryError::Unsupported(
                             "AUTO_INCREMENT INSERT supports only an explicit column list and direct literal VALUES rows".to_string(),
                         ));
@@ -6708,6 +6721,312 @@ impl MySqlConnection {
             affected_rows: self.affected_rows(is_update, affected_rows_mode)?,
             last_insert_id: 0,
         })
+    }
+
+    /// Copies the rows a `SELECT` answers into a table that counts its own ids.
+    ///
+    /// Measured on MySQL 8.4.11: the rows take the next numbers in the order
+    /// the `SELECT` answers them, the statement reports the first and
+    /// `LAST_INSERT_ID()` answers it, and a `SELECT` reading the table being
+    /// written sees only the rows that stood before the statement — which is
+    /// why every row is read before any is written. A `SELECT` answering no
+    /// rows writes none, reports no id and leaves the counter where it stood.
+    ///
+    /// Rows naming their own ids raise the counter past the highest and report
+    /// the last row's, as a `VALUES` statement's do. Rows asking for the next
+    /// number beside rows naming their own are refused: measured, MySQL takes a
+    /// new batch of numbers whenever a written id passes the batch it holds,
+    /// which this does not repeat.
+    fn execute_counted_insert_select(
+        &self,
+        sql: &str,
+        copy: &turso_mysql_parser::MySqlInsertSelect,
+        table: AutoIncrementTable,
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        if self.time_zone_offset_seconds() != 0 {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT into an AUTO_INCREMENT table in a non-UTC time zone".to_string(),
+            ));
+        }
+        self.reject_insert_target_triggers(&table.name)
+            .map_err(MySqlQueryError::Engine)?;
+        let mode = self.parser_mode();
+        let (translated, ..) = self
+            .parse_checked_dml_translation(sql, mode)
+            .map_err(mysql_query_parse_error)?;
+        self.validate_dml_comparison_columns(&translated)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.validate_dml_ordered_columns(translated.source_table(), translated.ordered_columns())
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        let Stmt::Insert {
+            with: None,
+            or_conflict: None,
+            body: InsertBody::Select(source, None),
+            returning,
+            ..
+        } = translated
+            .parse_ast()
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?
+        else {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
+            ));
+        };
+        if !returning.is_empty() || matches!(source.body.select, OneSelect::Values(_)) {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
+            ));
+        }
+        let rows = self.read_rows_to_copy(sql, source, copy.columns().len(), deadline)?;
+        if rows.is_empty() {
+            return Ok(MySqlWriteResult {
+                affected_rows: 0,
+                last_insert_id: 0,
+            });
+        }
+
+        let allocator_column = &table.definition.allocator_column_name;
+        let named_at = copy
+            .columns()
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(allocator_column));
+        let mut columns = copy
+            .columns()
+            .iter()
+            .map(|column| mysql_quoted(column))
+            .collect::<Vec<_>>();
+        if named_at.is_none() {
+            columns.insert(0, mysql_quoted(allocator_column));
+        }
+        let one_row = format!(
+            "INSERT INTO {} ({}) VALUES ({})",
+            mysql_quoted(&table.name),
+            columns.join(", "),
+            vec!["?"; columns.len()].join(", ")
+        );
+        let statement = parse_prepared_auto_increment_insert(&one_row, mode)
+            .and_then(|insert| {
+                insert.bind_allocator_table_with(&table.definition, self.written_zero())
+            })
+            .and_then(|bound| bound.inject_row_ids(&[None]))
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        let target = checked_insert_target(&statement)
+            .map_err(MySqlQueryError::Engine)?
+            .ok_or_else(|| {
+                MySqlQueryError::Engine(LimboError::InternalError(
+                    "a counted copy's INSERT has no target".to_string(),
+                ))
+            })?;
+        if let Some(column) = self
+            .missing_required_insert_column(&target, &[])
+            .map_err(MySqlQueryError::Engine)?
+        {
+            return Err(MySqlQueryError::MissingRequiredDefault(column));
+        }
+
+        let written_ids = match named_at {
+            None => vec![None; rows.len()],
+            Some(at) => rows
+                .iter()
+                .map(|row| self.id_a_copied_row_writes(&row[at], &table))
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        };
+        let (ids, first_generated, reported_id) = if written_ids.iter().all(Option::is_none) {
+            let first = self.reserve_ids_for_copied_rows(&table, rows.len(), deadline)?;
+            let ids = (0..rows.len() as u64)
+                .map(|offset| counted_id_value(&table, first + offset))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            (ids, Some(first), first)
+        } else if written_ids.iter().all(Option::is_some) {
+            let written_ids = written_ids.into_iter().flatten().collect::<Vec<_>>();
+            let highest = written_ids.iter().copied().max().unwrap_or(0);
+            if highest > 0 {
+                self.advance_auto_increment_past(&table, highest as u64, deadline)?;
+            }
+            let at = named_at.expect("a row names its own id only through a listed column");
+            let ids = rows.iter().map(|row| row[at].clone()).collect();
+            let last = *written_ids.last().expect("a copy has at least one row");
+            (ids, None, last as u64)
+        } else {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT mixing written AUTO_INCREMENT ids with ones it asks for".to_string(),
+            ));
+        };
+
+        let options = injected_auto_increment_prepare_options(&table, statement.clone());
+        let mut writing = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)
+            .map_err(MySqlQueryError::Engine)?;
+        const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+        self.run_internal(&format!("SAVEPOINT {SAVEPOINT}"))?;
+        let written = (|| -> Result<u64> {
+            let mut affected_rows = 0_u64;
+            for (mut row, id) in rows.into_iter().zip(ids) {
+                self.check_write_deadline(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                match named_at {
+                    Some(at) => row[at] = id,
+                    None => row.insert(0, id),
+                }
+                bind_prepared_values(&mut writing, &row)?;
+                let timeout = self
+                    .remaining_write_timeout(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                let run = run_checked_write_statement(&mut writing, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                });
+                writing.reset()?;
+                run?;
+                affected_rows = affected_rows
+                    .checked_add(
+                        self.affected_rows(false, affected_rows_mode)
+                            .map_err(Into::<LimboError>::into)?,
+                    )
+                    .ok_or(LimboError::IntegerOverflow)?;
+            }
+            Ok(affected_rows)
+        })();
+        match written {
+            Ok(affected_rows) => {
+                self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+                if let Some(first) = first_generated {
+                    self.inner.set_mysql_last_insert_id(first);
+                }
+                Ok(MySqlWriteResult {
+                    affected_rows,
+                    last_insert_id: reported_id,
+                })
+            }
+            Err(error) => {
+                self.run_internal(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?;
+                self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+                Err(MySqlQueryError::Engine(error))
+            }
+        }
+    }
+
+    /// Reads every row an `INSERT ... SELECT` copies before any is written.
+    fn read_rows_to_copy(
+        &self,
+        sql: &str,
+        source: turso_parser::ast::Select,
+        width: usize,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<Vec<Vec<Value>>, MySqlQueryError> {
+        let statement = Stmt::Select(source);
+        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(
+            FrozenInjectedAutoIncrementInsertParser {
+                statement: statement.clone(),
+            },
+        ));
+        let mut reading = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)
+            .map_err(MySqlQueryError::Engine)?;
+        if reading.num_columns() != width {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT answering a different number of columns than it names".to_string(),
+            ));
+        }
+        if let Some(timeout) = self.remaining_write_timeout(deadline)? {
+            reading.set_query_timeout_override(Some(Some(timeout)));
+        }
+        reading.run_collect_rows().map_err(MySqlQueryError::Engine)
+    }
+
+    /// The id one copied row writes itself, or `None` where it asks the
+    /// counter for the next one — a NULL, and a 0 unless the session's
+    /// `sql_mode` names `NO_AUTO_VALUE_ON_ZERO`.
+    fn id_a_copied_row_writes(
+        &self,
+        value: &Value,
+        table: &AutoIncrementTable,
+    ) -> std::result::Result<Option<i128>, MySqlQueryError> {
+        let written = match value {
+            Value::Null => return Ok(None),
+            Value::Text(text)
+                if table.definition.allocator_column_type
+                    == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned =>
+            {
+                text.as_str().parse::<u64>().ok().map(i128::from)
+            }
+            value => value.as_int().map(i128::from),
+        };
+        match written {
+            Some(0) if self.written_zero() == WrittenZero::AsksForTheNextNumber => Ok(None),
+            Some(id) => Ok(Some(id)),
+            None => Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT writing an AUTO_INCREMENT id that is not a whole number".to_string(),
+            )),
+        }
+    }
+
+    /// Reserves the numbers MySQL spends on `rows` copied rows and answers the
+    /// first of them.
+    ///
+    /// MySQL cannot know how many rows a `SELECT` answers, so it takes numbers
+    /// in batches of 1, 2, 4 and on up, and the ones the last batch leaves
+    /// unused are spent: measured on 8.4.11, 1 row moves the counter on by 1,
+    /// 3 rows by 3, 4 rows by 7, 8 rows by 15, and 9 rows into an empty table
+    /// leave it at `AUTO_INCREMENT=16`.
+    fn reserve_ids_for_copied_rows(
+        &self,
+        table: &AutoIncrementTable,
+        rows: usize,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<u64, MySqlQueryError> {
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            MySqlQueryError::Unsupported(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let spent = numbers_spent_on_copied_rows(rows as u64);
+        let ceiling = if table.definition.allocator_column_type
+            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+        {
+            u64::MAX - 2
+        } else {
+            auto_increment_ceiling(table)
+        };
+        // Measured, MySQL cuts the last batch short at the column's highest
+        // number and still writes the rows that fit, which this does not
+        // repeat.
+        let mut peek = capability
+            .allocator
+            .peek_high_water(table.key)
+            .map_err(MySqlQueryError::Engine)?;
+        let high_water = capability
+            .io
+            .block(|| peek.step())
+            .map_err(MySqlQueryError::Engine)?;
+        if high_water
+            .checked_add(spent)
+            .is_none_or(|last| last > ceiling)
+        {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT SELECT whose batch of AUTO_INCREMENT numbers passes the column's type"
+                    .to_string(),
+            ));
+        }
+        self.check_write_deadline(deadline)?;
+        let mut reservation = capability
+            .allocator
+            .reserve(table.key, spent)
+            .map_err(MySqlQueryError::Engine)?;
+        let range = capability
+            .io
+            .block(|| reservation.step())
+            .map_err(MySqlQueryError::Engine)?;
+        if range.last() > ceiling {
+            return Err(MySqlQueryError::Engine(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
+            )));
+        }
+        self.check_write_deadline(deadline)?;
+        Ok(range.first())
     }
 
     fn map_unsigned_decimal_write_error(
@@ -9433,6 +9752,39 @@ struct AutoIncrementTable {
 fn auto_increment_ceiling(table: &AutoIncrementTable) -> u64 {
     let (_, max) = table.definition.allocator_column_type.bounds();
     max as u64
+}
+
+/// How many numbers MySQL takes for `rows` rows copied by one
+/// `INSERT ... SELECT`: batches of 1, 2, 4 and on, each twice the one before,
+/// until one reaches 65535, which is where they stay.
+fn numbers_spent_on_copied_rows(rows: u64) -> u64 {
+    let (mut spent, mut batch) = (0_u64, 1_u64);
+    while spent < rows {
+        spent = spent.saturating_add(batch);
+        batch = (batch * 2).min(65535);
+    }
+    spent
+}
+
+/// One number the counter handed out, as the value bound into its column.
+///
+/// The engine's integers stop at `i64::MAX`, so a `BIGINT UNSIGNED` number
+/// past it is bound as the text that column reads.
+fn counted_id_value(
+    table: &AutoIncrementTable,
+    id: u64,
+) -> std::result::Result<Value, MySqlQueryError> {
+    if table.definition.allocator_column_type
+        == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+        && id > i64::MAX as u64
+    {
+        return Ok(Value::from_text(id.to_string()));
+    }
+    i64::try_from(id).map(Value::from_i64).map_err(|_| {
+        MySqlQueryError::Engine(LimboError::Constraint(
+            "AUTO_INCREMENT value is outside engine integer range".to_string(),
+        ))
+    })
 }
 
 fn injected_auto_increment_prepare_options(
