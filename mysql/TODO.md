@@ -220,6 +220,8 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | Form | State |
 |---|---|
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / `ENGINE=InnoDB` / `AUTO_INCREMENT = n` / `ADD CHECK` / `DROP CHECK` / the index operations, `RENAME INDEX` among them | refused |
+| `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 [COLLATE c]` | refused; measured on 8.4.11, every text, `ENUM` and `SET` column takes the new collation (a unique key that then holds two equal values is 1062 and the table stays as it was), but `SHOW CREATE TABLE` afterwards prints `CHARACTER SET utf8mb4` on the columns first written with a character set or collation of their own and not on the others, a mark this server does not keep |
+| `ALTER TABLE ... ADD PRIMARY KEY` / `DROP PRIMARY KEY` | refused; not measured, and each writes the table again under a different key |
 | `ENGINE=InnoDB` or `AUTO_INCREMENT = n` beside any other operation in one `ALTER TABLE`, or naming a view | refused; each is read by its own words and only on its own. Measured, MySQL answers 1347 for a view |
 | `RENAME INDEX` or a table `COMMENT` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` reads neither, so each is read by its own words and only on its own. Measured, MySQL takes both beside anything else |
 | `ALTER TABLE t COMMENT = '...'` while the database holds a view or a trigger | refused; the comment is written by an engine `ALTER TABLE`, which is refused then as every other `ALTER TABLE` is |
