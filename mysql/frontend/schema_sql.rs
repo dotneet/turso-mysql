@@ -9,8 +9,7 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_table_ast, render_counted_create_table_mysql_with_mode,
     render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
-    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, table_options_of,
-    SessionSqlMode,
+    render_create_trigger_mysql_with_mode, table_options_of, SessionSqlMode,
 };
 
 const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
@@ -394,7 +393,7 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
                     ansi_quotes: self.sql_mode.ansi_quotes,
                     no_backslash_escapes: self.sql_mode.no_backslash_escapes,
                 };
-                render_create_view_mysql_with_mode(stmt, mode)
+                turso_mysql_parser::mysql_create_view_ddl(stmt, input, mode)
             }
             SchemaSqlKind::Trigger => {
                 let mode = SessionSqlMode {
@@ -475,7 +474,9 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             }
             SchemaSqlKind::Table => render_create_table_mysql_with_mode(stmt, mode),
             SchemaSqlKind::Index => render_create_index_mysql_with_mode(stmt, mode),
-            SchemaSqlKind::View => render_create_view_mysql_with_mode(stmt, mode),
+            SchemaSqlKind::View => {
+                turso_mysql_parser::mysql_create_view_ddl(stmt, decoded.normalized_ddl, mode)
+            }
             _ => unreachable!("checked supported MySQL schema kind"),
         }
         // The engine's table has no collation of its own, so the one the

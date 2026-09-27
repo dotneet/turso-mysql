@@ -36,6 +36,7 @@ mod table_collation;
 mod temporal_value;
 mod translate;
 mod truncate_table;
+mod view_definition;
 mod written_number;
 mod written_bytes;
 mod written_value;
@@ -174,6 +175,10 @@ pub use temporal_value::{
 };
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
+pub use view_definition::{
+    mysql_create_view_ddl, render_show_create_written_view_mysql, translated_view_has_a_condition,
+    view_written_as_mysql_prints_it, written_view_select,
+};
 pub use written_number::{read_written_number, WrittenNumber};
 pub use written_bytes::{
     base64_length, crc32, first_byte, first_character_code, quoted_for_sql, to_base64,
@@ -5094,7 +5099,7 @@ pub fn parse_create_view_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Pa
     let Statement::CreateView(view) = statement else {
         return Err(ParseError::ExpectedCreateView);
     };
-    let normalized = translate_create_view(&view)?;
+    let normalized = translate_create_view(&view, mode)?;
     parse_normalized_create_view(&normalized)
 }
 
@@ -5128,7 +5133,7 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
             parse_normalized_create_index(&normalized)
         }
         Statement::CreateView(view) => {
-            let normalized = translate_create_view(&view)?;
+            let normalized = translate_create_view(&view, mode)?;
             parse_normalized_create_view(&normalized)
         }
         Statement::CreateTrigger(trigger) => {
@@ -5872,7 +5877,22 @@ fn translate_create_index(index: &CreateIndex) -> Result<String, ParseError> {
     ))
 }
 
-fn translate_create_view(view: &CreateView) -> Result<String, ParseError> {
+fn translate_create_view(view: &CreateView, mode: SessionSqlMode) -> Result<String, ParseError> {
+    refuse_view_options(view)?;
+    let view_name = render_unqualified_name(&view.name)?;
+    // A `SELECT` with a condition is translated the way a `SELECT` written on
+    // its own is, which is what holds each comparison to MySQL's rules; the
+    // frontend holds its values to the columns' types before the view is made.
+    let query = if view_definition::has_a_condition(&view.query) {
+        let body = view_definition::view_body(&view.query, mode, None)?;
+        parse_select(&body, mode)?.as_sql().to_owned()
+    } else {
+        render_simple_view_query(&view.query)?
+    };
+    Ok(format!("CREATE VIEW {view_name} AS {query}"))
+}
+
+pub(crate) fn refuse_view_options(view: &CreateView) -> Result<(), ParseError> {
     if view.or_alter
         || view.or_replace
         || view.materialized
@@ -5891,9 +5911,7 @@ fn translate_create_view(view: &CreateView) -> Result<String, ParseError> {
     {
         return unsupported("CREATE VIEW option");
     }
-    let view_name = render_unqualified_name(&view.name)?;
-    let query = render_simple_view_query(&view.query)?;
-    Ok(format!("CREATE VIEW {view_name} AS {query}"))
+    Ok(())
 }
 
 fn translate_create_trigger(trigger: &CreateTrigger) -> Result<String, ParseError> {

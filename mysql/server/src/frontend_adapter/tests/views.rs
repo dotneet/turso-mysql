@@ -29,6 +29,26 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
     (directory, adapter)
 }
 
+/// A new session over the same files, the catalog opened again from disk
+/// once the session before it has let go of it.
+fn reopened(directory: &tempfile::TempDir, adapter: Adapter) -> Adapter {
+    drop(adapter);
+    let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+    let factory = AuthorizedDatabaseAdapterFactory::new(
+        catalog,
+        binary_context(),
+        Arc::new(RecordingAuthorizer::with_schema_creator("root")),
+    );
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([152; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("probe").unwrap();
+    adapter
+}
+
 fn run(adapter: &mut Adapter, sql: &str) -> CommandOkResult {
     match adapter.execute_query(sql) {
         Ok(CommandExecutionResult::Ok(result)) => result,
@@ -233,4 +253,97 @@ fn a_view_reports_its_columns_the_way_its_table_does() {
     let counted = columns(&mut adapter, "SELECT COUNT(*) FROM v1");
     assert_eq!(counted[0].table, "");
     assert_eq!(counted[0].column_type, MYSQL_TYPE_LONGLONG);
+}
+
+/// MySQL keeps a view with a condition as the text it prints back, every
+/// column qualified by its table as the table declares it and each comparison
+/// and each run of `AND` or `OR` in parentheses; the view is made from that
+/// text here and kept as it. The host and the collation printed differ as they
+/// do for every view.
+#[test]
+fn a_view_with_a_condition_is_kept_the_way_mysql_prints_it() {
+    let (directory, mut adapter) = adapter();
+    let shown = |adapter: &mut Adapter, view: &str| {
+        rows(adapter, &format!("SHOW CREATE VIEW {view}"))[0]
+            .split('|')
+            .nth(1)
+            .unwrap()
+            .to_owned()
+    };
+    let prefix = |view: &str| {
+        format!(
+            "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `{view}` AS "
+        )
+    };
+    for (sql, view, select, expected_rows) in [
+        (
+            "CREATE VIEW v3 AS SELECT id, title FROM posts WHERE n > 1",
+            "v3",
+            "select `posts`.`id` AS `id`,`posts`.`title` AS `title` from `posts` where (`posts`.`n` > 1)",
+            &["1|a", "2|b"][..],
+        ),
+        (
+            "CREATE VIEW y1 AS SELECT ID, Title AS T, posts.N FROM posts WHERE N > 1 AND TITLE = 'A'",
+            "y1",
+            "select `posts`.`id` AS `ID`,`posts`.`title` AS `T`,`posts`.`n` AS `N` from `posts` where ((`posts`.`n` > 1) and (`posts`.`title` = 'A'))",
+            &["1|a|5"],
+        ),
+        (
+            "CREATE VIEW x1 AS SELECT id FROM posts WHERE (n > 1 AND (n < 50 AND title = 'a')) OR (user_id = 2 OR user_id IS NULL)",
+            "x1",
+            "select `posts`.`id` AS `id` from `posts` where (((`posts`.`n` > 1) and (`posts`.`n` < 50) and (`posts`.`title` = 'a')) or (`posts`.`user_id` = 2) or (`posts`.`user_id` is null))",
+            &["1", "3"],
+        ),
+        (
+            "CREATE VIEW x2 AS SELECT id AS pid FROM posts WHERE n <> user_id AND title <> 'it''s'",
+            "x2",
+            "select `posts`.`id` AS `pid` from `posts` where ((`posts`.`n` <> `posts`.`user_id`) and (`posts`.`title` <> 'it\\'s'))",
+            &["1", "2", "3"],
+        ),
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(shown(&mut adapter, view), format!("{}{select}", prefix(view)), "{sql}");
+        let ordered = format!("SELECT * FROM {view} ORDER BY 1");
+        assert_eq!(rows(&mut adapter, &ordered), expected_rows, "{sql}");
+    }
+
+    let view = columns(&mut adapter, "SELECT * FROM y1");
+    let table = columns(&mut adapter, "SELECT id, title, n FROM posts");
+    for (view, (table, name)) in view.iter().zip(table.iter().zip(["ID", "T", "N"])) {
+        assert_eq!(
+            (
+                view.name.as_str(),
+                view.table.as_str(),
+                view.original_table.as_str()
+            ),
+            (name, "y1", "y1")
+        );
+        assert_eq!(
+            (view.column_type, view.column_length, view.flags),
+            (table.column_type, table.column_length, table.flags)
+        );
+    }
+
+    // A value that is not the column's kind is refused as the same SELECT
+    // is, and so is a condition whose printing has not been measured.
+    for sql in [
+        "CREATE VIEW bad AS SELECT id FROM posts WHERE n = 'x'",
+        "CREATE VIEW bad AS SELECT id FROM posts WHERE title LIKE 'a%'",
+        "CREATE VIEW bad AS SELECT id FROM posts WHERE n IN (1, 2)",
+        "CREATE VIEW bad AS SELECT id FROM posts WHERE n = -1",
+        "CREATE VIEW bad AS SELECT id FROM posts p WHERE p.n > 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert_eq!(views(&mut adapter).len(), 4);
+
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(
+        shown(&mut adapter, "y1"),
+        format!(
+            "{}select `posts`.`id` AS `ID`,`posts`.`title` AS `T`,`posts`.`n` AS `N` from `posts` where ((`posts`.`n` > 1) and (`posts`.`title` = 'A'))",
+            prefix("y1")
+        )
+    );
+    assert_eq!(rows(&mut adapter, "SELECT T FROM y1"), ["a"]);
 }

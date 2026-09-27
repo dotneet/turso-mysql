@@ -3291,6 +3291,21 @@ impl MySqlConnection {
                 Err(_) => return Err(LimboError::ParseError(error.to_string())),
             },
         };
+        if matches!(stmt, Stmt::CreateView { .. }) {
+            if let Some(written) =
+                turso_mysql_parser::view_written_as_mysql_prints_it(sql, mode, &|table| {
+                    self.declared_column_names(table)
+                })
+                .map_err(|error| LimboError::ParseError(error.to_string()))?
+            {
+                // The view is made from, and kept as, the text MySQL prints,
+                // so what `SHOW CREATE VIEW` prints is what was stored.
+                if written != sql {
+                    return self.prepare_schema_with_creator(&written, implicit_index, creator);
+                }
+                self.check_view_select(&written)?;
+            }
+        }
         if let Stmt::AlterTable(alter) = &stmt {
             self.reject_alter_with_marked_trigger()?;
             self.reject_alter_with_marked_view(&alter.body)?;
@@ -3349,6 +3364,11 @@ impl MySqlConnection {
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
             Stmt::CreateIndex { .. } => render_create_index_mysql_with_mode(&stmt, mode)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            Stmt::CreateView { .. }
+                if turso_mysql_parser::translated_view_has_a_condition(&stmt) =>
+            {
+                sql.to_string()
+            }
             Stmt::CreateView { .. } => render_create_view_mysql_with_mode(&stmt, mode)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
             Stmt::CreateTrigger { .. } => render_create_trigger_mysql_with_mode(&stmt, mode)
@@ -3372,6 +3392,37 @@ impl MySqlConnection {
             .with_schema_sql_formatter(formatter);
         self.inner
             .prepare_translated_stmt_with_options(stmt, &input, &options)
+    }
+
+    /// Holds a view's `SELECT` to every rule the same `SELECT` written on its
+    /// own is held to.
+    ///
+    /// The view is translated without its columns' types, as it is each time
+    /// the database is opened, so a `SELECT` that renders differently once
+    /// they are known — a written day against a moment, a word against a
+    /// `JSON` column — is refused rather than kept in its untyped form.
+    fn check_view_select(&self, written: &str) -> Result<()> {
+        let select = turso_mysql_parser::written_view_select(written, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let (translated, rendered_differently) = self.parse_select_knowing_column_types(&select)?;
+        if rendered_differently {
+            return Err(LimboError::ParseError(
+                "a view whose SELECT reads differently once its columns' types are known"
+                    .to_string(),
+            ));
+        }
+        Self::reject_internal_catalog_select(&translated)?;
+        self.reject_binary_scalar_collation(&translated)?;
+        self.refuse_select_json_readings_of_other_columns(&translated)?;
+        Self::reject_raw_select_comparisons(&translated)?;
+        self.validate_select_comparison_columns(
+            translated.source_tables(),
+            translated.checked_comparisons(),
+        )?;
+        self.validate_subquery_comparison_columns(
+            translated.source_table(),
+            translated.checked_subquery_comparisons(),
+        )
     }
 
     /// Creates a view or trigger while retaining the authenticated creator.

@@ -242,7 +242,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
 | `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
 | `ALTER TABLE` mixing supported index and column operations | accepted as one transaction; a later failure rolls back every earlier operation, and foreign-key child-index coverage is checked after the full statement so an index can be replaced atomically |
-| `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
+| `` ALTER TABLE ... ADD/DROP INDEX `PRIMARY` `` | refused; adding or dropping a primary key is a different operation |
 | `DROP INDEX name` with no table after it | refused; MySQL requires the table, and the engine's own spelling names none |
 | `RENAME TABLE` naming a database — `RENAME TABLE db.a TO db.b` — or a view, or any `RENAME TABLE` while the database holds a view | refused; MySQL takes all three. The last is the rule every `ALTER TABLE ... RENAME TO` already keeps |
 | `ALTER TABLE a RENAME TO b` onto a name already taken, or of a table that is not there | refused, where MySQL answers 1050 and 1146; the `RENAME TABLE` spelling answers both |
@@ -271,6 +271,10 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `SHOW CREATE TABLE` for a column that named its table's own non-default collation itself | prints ` COLLATE <name>` where MySQL prints ` CHARACTER SET utf8mb4 COLLATE <name>`; which columns named it themselves is not remembered |
 | Generated columns | refused |
 | Partitioning | refused, and out of scope — see what this frontend is for |
+| A view grouping its rows or aggregating them — `CREATE VIEW v AS SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id` | refused. Measured on 8.4.11, MySQL prints it `` select `posts`.`user_id` AS `user_id`,count(0) AS `c` from `posts` group by `posts`.`user_id` ``, names an unaliased aggregate after its text (`` count(0) AS `COUNT(*)` ``), and a `SELECT` from it reports the grouped column with the base table as its original table and its key flags dropped, and each aggregate with the view as its original table: `COUNT` a NOT NULL `LONGLONG` of 21 without the binary flag, `SUM` of an `INT` a `NEWDECIMAL` of 33, `AVG` one of 16 with 4 decimals, `MIN`/`MAX` the column's own shape. The view would have to be kept in that text, and its columns read through the aggregate shapes |
+| A view reading more than one table — `CREATE VIEW v AS SELECT p.id, u.name FROM posts p JOIN plain u ON p.user_id = u.id` | refused. Measured, MySQL prints `` from (`posts` `p` join `plain` `u` on((`p`.`user_id` = `u`.`id`))) ``, and what a `SELECT` from it reports depends on the `SELECT`: `SELECT *` reports the view as each column's original table with its keys, and `SELECT * ... ORDER BY id` reports the base tables without them |
+| A view condition beyond comparisons of a column with a column or a written whole number, word, `TRUE`, `FALSE` or `NULL`, `IS [NOT] NULL`, `AND` and `OR` | refused. Measured, MySQL prints `IN`, `LIKE` and `BETWEEN` as `(c in ('a','b'))`, `(c like 'a%')`, `(c between 1 and 10)` and their negations as `(c not in (1,2))`, `(not((c like 'a%')))`, `(c not between 1 and 2)`, prints `-1` as `-(1)`, and rewrites `NOT (n < 0)` into `(n >= 0)` |
+| A view with a table alias, `SELECT *`, `DISTINCT`, `ORDER BY`, `LIMIT`, a column list or an expression column | refused; measured, an alias is printed `` from `posts` `p` `` with each column `` `p`.`c` ``, and the rest have not been measured |
 
 ### DML
 

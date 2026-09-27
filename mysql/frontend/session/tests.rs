@@ -4794,7 +4794,7 @@ fn column_metadata_distinguishes_corrupt_and_unsupported_ddl() {
     ));
 
     let unsupported = parse_create_view_ast(
-        "CREATE VIEW records_view AS SELECT id FROM records WHERE id > 1",
+        "CREATE VIEW records_view AS SELECT id FROM records WHERE id IN (1, 2)",
         SessionSqlMode::default(),
     )
     .unwrap_err();

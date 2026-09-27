@@ -193,9 +193,16 @@ impl MySqlConnection {
         };
         let statement = parse_schema_ddl_ast(decoded.normalized_ddl, mode)
             .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-        let create_statement =
+        let create_statement = if turso_mysql_parser::translated_view_has_a_condition(&statement) {
+            turso_mysql_parser::render_show_create_written_view_mysql(
+                decoded.normalized_ddl,
+                mode,
+                &creator.username,
+            )
+        } else {
             turso_mysql_parser::render_show_create_view_mysql(&statement, &creator.username)
-                .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+        }
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
         Ok(Some(MySqlViewMetadata {
             name: view.name.clone(),
             create_statement,
@@ -861,8 +868,21 @@ impl MySqlConnection {
         };
         let statement = parse_create_view_ast(decoded.normalized_ddl, mode)
             .map_err(mysql_metadata_parse_error)?;
-        let canonical = render_create_view_mysql_with_mode(&statement, mode)
-            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
+        // A view with a condition is kept in the text MySQL prints, which
+        // reads back as itself; any other in the text the engine's statement
+        // renders.
+        let canonical = if turso_mysql_parser::translated_view_has_a_condition(&statement) {
+            turso_mysql_parser::view_written_as_mysql_prints_it(
+                decoded.normalized_ddl,
+                mode,
+                &|table| self.declared_column_names(table),
+            )
+            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?
+            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?
+        } else {
+            render_create_view_mysql_with_mode(&statement, mode)
+                .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?
+        };
         if canonical != decoded.normalized_ddl {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
@@ -915,7 +935,7 @@ impl MySqlConnection {
                 MySqlColumnMetadataError::Engine(error) => MySqlColumnMetadataError::Engine(error),
             })?;
         let mut metadata = Vec::with_capacity(projected_columns.len());
-        for projected_name in projected_columns {
+        for (projected_name, source_name) in projected_columns {
             if metadata.iter().any(|column: &MySqlColumnMetadata| {
                 column.name.eq_ignore_ascii_case(&projected_name)
             }) {
@@ -923,7 +943,7 @@ impl MySqlConnection {
             }
             let source = source_columns
                 .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&projected_name))
+                .find(|column| column.name.eq_ignore_ascii_case(&source_name))
                 .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
             let mut column = source.clone();
             column.name = projected_name;
@@ -942,31 +962,45 @@ impl MySqlConnection {
         Ok(metadata)
     }
 
+    /// The names a base table declares its columns under, or nothing for any
+    /// other name.
+    pub(super) fn declared_column_names(&self, table: &MySqlTableName) -> Option<Vec<String>> {
+        self.inner
+            .current_schema()
+            .get_btree_table(table.as_str())?;
+        self.list_columns(table).ok().map(|columns| {
+            columns
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect()
+        })
+    }
+
+    /// Reads which table a view projects and, for each of its columns, the
+    /// name it answers under and the table column it reads.
     pub(super) fn view_projection(
         select: &turso_parser::ast::Select,
-    ) -> std::result::Result<(MySqlTableName, Vec<String>), MySqlColumnMetadataError> {
+    ) -> std::result::Result<(MySqlTableName, Vec<(String, String)>), MySqlColumnMetadataError>
+    {
         if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
         if !select.body.compounds.is_empty() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
+        // A condition narrows the rows and leaves the columns as they are.
         let OneSelect::Select {
             distinctness,
             columns,
             from,
-            where_clause,
+            where_clause: _,
             group_by,
             window_clause,
         } = &select.body.select
         else {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         };
-        if distinctness.is_some()
-            || where_clause.is_some()
-            || group_by.is_some()
-            || !window_clause.is_empty()
-        {
+        if distinctness.is_some() || group_by.is_some() || !window_clause.is_empty() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
         let Some(from) = from else {
@@ -992,14 +1026,21 @@ impl MySqlConnection {
             let ResultColumn::Expr(expr, alias) = column else {
                 return Err(MySqlColumnMetadataError::UnsupportedDefinition);
             };
-            if alias.as_ref().is_some_and(|alias| alias.is_explicit()) {
-                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
-            }
-            let projected_name = match expr.as_ref() {
-                Expr::Name(name) | Expr::Id(name) => name.as_str().to_owned(),
+            let explicit_alias = alias.as_ref().filter(|alias| alias.is_explicit());
+            let projected = match (expr.as_ref(), explicit_alias) {
+                (Expr::Name(name) | Expr::Id(name), None) => {
+                    (name.as_str().to_owned(), name.as_str().to_owned())
+                }
+                // A view kept in the text MySQL prints names every column
+                // `table`.`column` AS `name`.
+                (Expr::Qualified(table, name), Some(alias))
+                    if table.as_str().eq_ignore_ascii_case(source_table.as_str()) =>
+                {
+                    (alias.name().as_str().to_owned(), name.as_str().to_owned())
+                }
                 _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
             };
-            projected_columns.push(projected_name);
+            projected_columns.push(projected);
         }
         if projected_columns.is_empty() {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
