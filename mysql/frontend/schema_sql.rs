@@ -753,6 +753,21 @@ pub fn stored_table_options(
     .map_err(|_| SchemaSqlError::MalformedTableDefinition)
 }
 
+/// The `CHECK` constraints one stored table carries, each under the name
+/// MySQL gives it.
+pub fn stored_table_checks(
+    stored: &str,
+) -> Result<Vec<turso_mysql_parser::MySqlCheckConstraint>, SchemaSqlError> {
+    let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, stored)? else {
+        return Ok(Vec::new());
+    };
+    turso_mysql_parser::check_constraints_of(
+        decoded.normalized_ddl,
+        parser_sql_mode(decoded.context.sql_mode),
+    )
+    .map_err(|_| SchemaSqlError::MalformedTableDefinition)
+}
+
 /// Decode a stored schema row without imposing the sqlite_schema object kind.
 ///
 /// This is used only by the generic dialect parser, which does not receive the

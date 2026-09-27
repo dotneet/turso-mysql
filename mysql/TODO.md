@@ -219,7 +219,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 
 | Form | State |
 |---|---|
-| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / `ENGINE=InnoDB` / `AUTO_INCREMENT = n` / the index operations, `RENAME INDEX` among them | refused |
+| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / `ENGINE=InnoDB` / `AUTO_INCREMENT = n` / `ADD CHECK` / `DROP CHECK` / the index operations, `RENAME INDEX` among them | refused |
 | `ENGINE=InnoDB` or `AUTO_INCREMENT = n` beside any other operation in one `ALTER TABLE`, or naming a view | refused; each is read by its own words and only on its own. Measured, MySQL answers 1347 for a view |
 | `RENAME INDEX` or a table `COMMENT` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` reads neither, so each is read by its own words and only on its own. Measured, MySQL takes both beside anything else |
 | `ALTER TABLE t COMMENT = '...'` while the database holds a view or a trigger | refused; the comment is written by an engine `ALTER TABLE`, which is refused then as every other `ALTER TABLE` is |
@@ -374,8 +374,13 @@ speaks; anything measured here from now on has to pass that flag.
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` beyond the narrow account slice | `CREATE USER 'name'@'%' IDENTIFIED BY 'password'` and table-scoped `GRANT` / `REVOKE SELECT ON db.table TO` / `FROM 'name'@'%'` use a dedicated account-management privilege, the crash-safe journal, external checkpoint CAS, and runtime reload. Other hosts, database/global grants in SQL, multiple privileges, and account alteration/drop remain refused. The offline provisioner may bootstrap an administrator with `--global-manage-accounts true` |
 | Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
-| `information_schema` beyond `TABLES`, `VIEWS`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS` and `ROUTINES` | not started; what is left is `CHECK_CONSTRAINTS`, `COLLATION_CHARACTER_SET_APPLICABILITY` and the server-status tables |
-| A `CHECK` constraint in `information_schema.TABLE_CONSTRAINTS` | no row; the engine keeps a `CHECK` in the stored DDL rather than in the schema these tables read, and reading it would mean decoding the schema envelope inside a scan |
+| `information_schema` beyond `TABLES`, `VIEWS`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS`, `CHECK_CONSTRAINTS` and `ROUTINES` | not started; what is left is `COLLATION_CHARACTER_SET_APPLICABILITY` and the server-status tables |
+| `information_schema.CHECK_CONSTRAINTS.CHECK_CLAUSE` for an expression beyond a comparison, `IS [NOT] NULL`, `AND`, `OR`, `+`, `-` and `*` over columns, numbers and words | refused when read; how MySQL writes the rest back has not been measured |
+| A `CREATE TABLE` giving a `CHECK` a name another table's `CHECK` already has | taken, where MySQL answers 3822, a name being the database's; `ALTER TABLE ... ADD CONSTRAINT` answers 3822 as MySQL does |
+| A `CREATE TABLE` writing an unnamed table-level `CHECK` before a column carrying an unnamed `CHECK` of its own | refused; MySQL numbers the two in the order written and the table is stored with its columns first |
+| A row a `CHECK` or `NOT NULL` refuses in a table that counts its own ids | uses up the id it was given; measured, MySQL's `CHECK` refusal leaves the counter where it stood |
+| `ALTER TABLE ... ADD`/`DROP` a `CHECK` beside any other operation, on a table another table's foreign key names, or on one carrying a trigger | refused; each is a rewrite of the table, which those rule out |
+| A `CHECK` written `NOT ENFORCED` | refused; MySQL keeps it without checking, and the engine checks every one it keeps |
 | `SELECT *` over `information_schema.TABLES` or `VIEWS` | refused; each answers only some of MySQL's columns — `TABLES` has storage statistics and times this server does not keep, and `VIEWS` a `VIEW_DEFINITION` MySQL rewrites the query into |
 | A prepared statement over an `information_schema` table executed after a schema change | refused; the statement is prepared again and that path does not carry the catalog source through |
 | A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |

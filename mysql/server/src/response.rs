@@ -342,6 +342,12 @@ pub enum FrontendErrorKind {
     UnknownTable,
     UnknownView,
     NotView,
+    /// A row broke a `CHECK` constraint of its table.
+    CheckConstraintViolated,
+    /// An `ALTER TABLE` named a `CHECK` its table has not got.
+    NoSuchCheck,
+    /// A `CHECK` was given a name another constraint already has.
+    DuplicateCheckName,
     /// A prepared-statement command referenced no statement on this connection.
     UnknownPreparedStatement,
     /// The configured prepared-statement quota rejected a new statement.
@@ -492,6 +498,21 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::UnknownTable => (1051, *b"42S02", b"unknown table".as_slice()),
         FrontendErrorKind::UnknownView => (1051, *b"42S02", b"unknown view".as_slice()),
         FrontendErrorKind::NotView => (1347, *b"HY000", b"object is not a view".as_slice()),
+        FrontendErrorKind::CheckConstraintViolated => (
+            3819,
+            *b"HY000",
+            b"check constraint is violated".as_slice(),
+        ),
+        FrontendErrorKind::NoSuchCheck => (
+            3821,
+            *b"HY000",
+            b"check constraint is not found in the table".as_slice(),
+        ),
+        FrontendErrorKind::DuplicateCheckName => (
+            3822,
+            *b"HY000",
+            b"duplicate check constraint name".as_slice(),
+        ),
         FrontendErrorKind::UnknownPreparedStatement => {
             (1243, *b"HY000", b"unknown prepared statement".as_slice())
         }
@@ -2507,6 +2528,9 @@ mod tests {
             (FrontendErrorKind::UnknownTable, 1051, *b"42S02"),
             (FrontendErrorKind::UnknownView, 1051, *b"42S02"),
             (FrontendErrorKind::NotView, 1347, *b"HY000"),
+            (FrontendErrorKind::CheckConstraintViolated, 3819, *b"HY000"),
+            (FrontendErrorKind::NoSuchCheck, 3821, *b"HY000"),
+            (FrontendErrorKind::DuplicateCheckName, 3822, *b"HY000"),
             (FrontendErrorKind::UnknownPreparedStatement, 1243, *b"HY000"),
             (
                 FrontendErrorKind::PreparedStatementLimitReached,

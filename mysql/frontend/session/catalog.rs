@@ -421,7 +421,17 @@ impl MySqlConnection {
             .iter()
             .filter(|key| foreign_key_name(table.as_str(), key).eq_ignore_ascii_case(name))
             .count();
-        Ok(primary + unique + foreign)
+        let checks = match schema.table_sql(table.as_str()) {
+            Some(stored) => crate::schema_sql::stored_table_checks(stored)
+                .map_err(|error| {
+                    MySqlShowCreateTableError::Engine(LimboError::Corrupt(error.to_string()))
+                })?
+                .iter()
+                .filter(|check| check.name().eq_ignore_ascii_case(name))
+                .count(),
+            None => 0,
+        };
+        Ok(primary + unique + foreign + checks)
     }
 
     /// Reads whether one name is a stored table or view, hiding internal objects.

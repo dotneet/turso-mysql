@@ -212,6 +212,10 @@ pub enum MySqlQueryError {
     Syntax(String),
     /// Valid MySQL syntax lies outside the implemented compatibility surface.
     Unsupported(String),
+    /// An `ALTER TABLE` named a `CHECK` its table has not got.
+    NoSuchCheck(String),
+    /// A `CHECK` was given a name another constraint already has.
+    DuplicateCheckName(String),
     /// The checked Turso AST reached core, which then failed to prepare it.
     Engine(LimboError),
 }
@@ -1199,6 +1203,12 @@ impl fmt::Display for MySqlQueryError {
                 f.write_str("cannot execute statement in a READ ONLY transaction")
             }
             Self::NoSuchSavepoint => f.write_str("savepoint does not exist"),
+            Self::NoSuchCheck(name) => {
+                write!(f, "Check constraint '{name}' is not found in the table")
+            }
+            Self::DuplicateCheckName(name) => {
+                write!(f, "Duplicate check constraint name '{name}'")
+            }
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -1218,7 +1228,9 @@ impl Error for MySqlQueryError {
             | Self::JsonIndex
             | Self::JsonLiteralDefault
             | Self::ReadOnlyTransaction
-            | Self::NoSuchSavepoint => None,
+            | Self::NoSuchSavepoint
+            | Self::NoSuchCheck(_)
+            | Self::DuplicateCheckName(_) => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -1247,6 +1259,12 @@ impl From<MySqlQueryError> for LimboError {
             }
             MySqlQueryError::ReadOnlyTransaction => Self::ReadOnly,
             MySqlQueryError::NoSuchSavepoint => Self::TxError("no such savepoint".to_string()),
+            MySqlQueryError::NoSuchCheck(name) => Self::ParseError(format!(
+                "Check constraint '{name}' is not found in the table"
+            )),
+            MySqlQueryError::DuplicateCheckName(name) => {
+                Self::ParseError(format!("Duplicate check constraint name '{name}'"))
+            }
             MySqlQueryError::Syntax(error) => Self::ParseError(error),
             MySqlQueryError::Unsupported(error) => Self::ParseError(error),
             MySqlQueryError::Engine(error) => error,
@@ -3598,6 +3616,19 @@ impl MySqlConnection {
             }
             None => {}
         }
+        if let Some((table, change)) = self.check_an_alter_changes(sql)? {
+            return match change {
+                turso_mysql_parser::MySqlCheckChange::TableWrittenAgain(rewrite) => {
+                    self.write_the_table_again_with(&table, &rewrite)
+                }
+                turso_mysql_parser::MySqlCheckChange::NoSuchCheck(name) => {
+                    Err(MySqlQueryError::NoSuchCheck(name))
+                }
+                turso_mysql_parser::MySqlCheckChange::DuplicateName(name) => {
+                    Err(MySqlQueryError::DuplicateCheckName(name))
+                }
+            };
+        }
         if let Some(statements) = self.expanded_alter_table(sql)? {
             return self.execute_expanded_alter_table(&statements);
         }
@@ -3848,6 +3879,61 @@ impl MySqlConnection {
         };
         turso_mysql_parser::table_with_a_column_placed(&stored, sql, mode)
             .map_err(mysql_query_parse_error)
+    }
+
+    /// The table an `ALTER TABLE` that adds or drops a `CHECK` changes, and
+    /// what it does to it. Answers `None` for every other statement.
+    fn check_an_alter_changes(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<(String, turso_mysql_parser::MySqlCheckChange)>, MySqlQueryError>
+    {
+        if !sql
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+        {
+            return Ok(None);
+        }
+        let mode = self.parser_mode();
+        let Some(target) = turso_mysql_parser::table_a_check_is_dropped_from(sql, mode)
+            .or_else(|| turso_mysql_parser::alter_table_target(sql, mode))
+        else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .stored_table_statement(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        // A name is the database's rather than the table's, so a new one is
+        // held against every other table's too.
+        let mut other_names = Vec::new();
+        for table in self.list_tables().map_err(MySqlQueryError::Engine)? {
+            if table.kind() != MySqlTableKind::BaseTable
+                || table.name().eq_ignore_ascii_case(&target)
+            {
+                continue;
+            }
+            let Some(other) = self
+                .stored_table_statement(table.name())
+                .map_err(MySqlQueryError::Engine)?
+            else {
+                continue;
+            };
+            other_names.extend(
+                turso_mysql_parser::check_constraints_of(&other, mode)
+                    .map_err(mysql_query_parse_error)?
+                    .into_iter()
+                    .map(|check| check.name().to_owned()),
+            );
+        }
+        Ok(
+            turso_mysql_parser::table_with_a_check_changed(&stored, sql, &other_names, mode)
+                .map_err(mysql_query_parse_error)?
+                .map(|change| (target, change)),
+        )
     }
 
     /// The MySQL `CREATE TABLE` one stored table was written as.

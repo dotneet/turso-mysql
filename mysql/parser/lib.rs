@@ -4,6 +4,7 @@ mod account_admin;
 mod admin_command;
 mod alter_table_indexes;
 mod analyze_table;
+mod check_constraints;
 mod checked_primary_key;
 mod create_table_as_select;
 mod current_database;
@@ -86,6 +87,10 @@ pub use alter_table_indexes::{
 pub use analyze_table::{
     parse_analyze_table, parse_check_table, parse_optional_analyze_table,
     parse_optional_check_table, MySqlAnalyzeTableCommand, MySqlCheckTableCommand,
+};
+pub use check_constraints::{
+    check_constraints_of, refuse_checks_numbered_out_of_order, table_a_check_is_dropped_from,
+    table_with_a_check_changed, MySqlCheckChange, MySqlCheckConstraint,
 };
 pub use checked_primary_key::{
     parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
@@ -3602,17 +3607,25 @@ pub fn table_with_a_column_placed(
         }
     };
     table.columns.insert(at, column_def);
-    let counted = table.columns.iter().position(column_has_auto_increment);
-    let create_sql = match counted {
-        Some(ordinal) => render_auto_increment_mysql_ddl(&table, ordinal, mode)?,
-        None => checked_primary_key::render_mysql_create_table(&table, mode)?,
-    };
     Ok(Some(MySqlColumnPlacement::TableWrittenAgain(
         MySqlTableRewrite {
-            create_sql,
+            create_sql: render_table_written_again(&table, mode)?,
             carried_columns,
         },
     )))
+}
+
+/// The `CREATE TABLE` a stored table is written again as, once a statement
+/// has changed it: a table that counts its own ids keeps the column it counts
+/// on counting.
+pub(crate) fn render_table_written_again(
+    table: &CreateTable,
+    mode: SessionSqlMode,
+) -> Result<String, ParseError> {
+    match table.columns.iter().position(column_has_auto_increment) {
+        Some(ordinal) => render_auto_increment_mysql_ddl(table, ordinal, mode),
+        None => checked_primary_key::render_mysql_create_table(table, mode),
+    }
 }
 
 /// What an `ALTER TABLE ... ALTER COLUMN c SET DEFAULT` or `DROP DEFAULT`
@@ -5488,15 +5501,16 @@ fn translate_auto_increment_create_table(
     reject_json_defaults_and_keys(table)?;
     let starts_the_counter_at = reject_attributes_and_check_options(table)?.starts_the_counter_at;
     let table = &table_with_its_key_written_inline(table.clone());
-    // A foreign key is the one table-level constraint a counted table takes,
-    // the same as an ordinary one: both renderings below write whatever
-    // constraints the table carries, and a table with a counted id is exactly
-    // the table a child row points at.
-    if table
-        .constraints
-        .iter()
-        .any(|constraint| !matches!(constraint, TableConstraint::ForeignKey(_)))
-    {
+    // A foreign key and a `CHECK` are the table-level constraints a counted
+    // table takes, the same as an ordinary one: both renderings below write
+    // whatever constraints the table carries, and a table with a counted id is
+    // exactly the table a child row points at.
+    if table.constraints.iter().any(|constraint| {
+        !matches!(
+            constraint,
+            TableConstraint::ForeignKey(_) | TableConstraint::Check(_)
+        )
+    }) {
         return unsupported("table-level constraint in AUTO_INCREMENT table");
     }
     for (index, column) in table.columns.iter().enumerate() {
@@ -5519,6 +5533,15 @@ fn translate_auto_increment_create_table(
         return unsupported("AUTO_INCREMENT column");
     };
     validate_auto_increment_column(&table.columns[allocator_column_ordinal])?;
+    // Measured on MySQL 8.4.11: a `CHECK` naming the counted column is 3818,
+    // the number being given only once the check has run.
+    let counted_name = &table.columns[allocator_column_ordinal].name.value;
+    if table.constraints.iter().any(|constraint| {
+        matches!(constraint, TableConstraint::Check(check)
+            if check_may_name_the_column(&check.expr, counted_name))
+    }) {
+        return unsupported("CHECK naming the AUTO_INCREMENT column");
+    }
     let allocator_column_type = match table.columns[allocator_column_ordinal].data_type {
         DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => MySqlIntegerType::IntUnsigned,
         DataType::BigInt(_) => MySqlIntegerType::BigInt,
@@ -5594,6 +5617,26 @@ fn translate_auto_increment_create_table(
         )?,
         sqlite_statement,
     })
+}
+
+/// Reports whether a `CHECK` expression may read one column: an expression
+/// of any form but the plain ones a `CHECK` here is written with is taken to.
+fn check_may_name_the_column(expr: &Expr, column: &str) -> bool {
+    match expr {
+        Expr::Identifier(name) => name.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .is_none_or(|name| name.value.eq_ignore_ascii_case(column)),
+        Expr::Value(_) => false,
+        Expr::Nested(inner) | Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            check_may_name_the_column(inner, column)
+        }
+        Expr::UnaryOp { expr, .. } => check_may_name_the_column(expr, column),
+        Expr::BinaryOp { left, right, .. } => {
+            check_may_name_the_column(left, column) || check_may_name_the_column(right, column)
+        }
+        _ => true,
+    }
 }
 
 fn column_has_auto_increment(column: &ColumnDef) -> bool {

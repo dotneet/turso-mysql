@@ -3322,6 +3322,8 @@ fn execute_checked_query(
         }));
     }
     if is_schema_statement(sql) {
+        turso_mysql_parser::refuse_checks_numbered_out_of_order(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?;
         // MySQL answers a name that is already there before it looks at
         // anything else, so the name is looked up before anything runs:
         // measured, 1050 as an error without `IF NOT EXISTS` and as a note
@@ -4396,6 +4398,8 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
+        MySqlQueryError::NoSuchCheck(_) => FrontendErrorKind::NoSuchCheck,
+        MySqlQueryError::DuplicateCheckName(_) => FrontendErrorKind::DuplicateCheckName,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
@@ -8737,6 +8741,9 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
         MySqlCatalogTable::Routines => catalog_results::information_schema_routines_columns(),
         MySqlCatalogTable::Columns => catalog_results::information_schema_columns_every_column(),
         MySqlCatalogTable::Schemata => catalog_results::information_schema_schemata_columns(),
+        MySqlCatalogTable::CheckConstraints => {
+            catalog_results::information_schema_check_constraints_columns()
+        }
     }
 }
 
@@ -10297,6 +10304,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::BusySnapshot => FrontendErrorKind::SerializationFailure,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
+        // Measured on MySQL 8.4.11: a row breaking a `CHECK` is 3819, where one
+        // breaking a key is 1062.
+        LimboError::Constraint(message) if message.starts_with("CHECK constraint failed") => {
+            FrontendErrorKind::CheckConstraintViolated
+        }
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {
             FrontendErrorKind::ConstraintViolation
         }
@@ -10316,6 +10328,8 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::JsonLiteralDefault => FrontendErrorKind::JsonLiteralDefault,
         MySqlQueryError::ReadOnlyTransaction => FrontendErrorKind::ReadOnlyTransaction,
         MySqlQueryError::NoSuchSavepoint => FrontendErrorKind::NoSuchSavepoint,
+        MySqlQueryError::NoSuchCheck(_) => FrontendErrorKind::NoSuchCheck,
+        MySqlQueryError::DuplicateCheckName(_) => FrontendErrorKind::DuplicateCheckName,
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),

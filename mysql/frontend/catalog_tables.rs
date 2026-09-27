@@ -47,6 +47,10 @@ pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
 /// The name the engine knows `information_schema.ROUTINES` by.
 pub(crate) const INFORMATION_SCHEMA_ROUTINES: &str = "mysql_information_schema_routines";
 
+/// The name the engine knows `information_schema.CHECK_CONSTRAINTS` by.
+pub(crate) const INFORMATION_SCHEMA_CHECK_CONSTRAINTS: &str =
+    "mysql_information_schema_check_constraints";
+
 /// The name the engine knows `information_schema.COLUMNS` by.
 pub(crate) const INFORMATION_SCHEMA_COLUMNS: &str = "mysql_information_schema_columns";
 
@@ -93,6 +97,11 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
     }
     if !database.has_table(INFORMATION_SCHEMA_ROUTINES) {
         database.register_internal_vtab(InformationSchemaRoutines)?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_CHECK_CONSTRAINTS) {
+        database.register_internal_vtab(InformationSchemaCheckConstraints {
+            database: name.to_owned(),
+        })?;
     }
     if !database.has_table(INFORMATION_SCHEMA_COLUMNS) {
         database.register_internal_vtab(SessionCatalogTable {
@@ -922,6 +931,13 @@ impl InternalVirtualTable for InformationSchemaTableConstraints {
                     kind: "FOREIGN KEY",
                 });
             }
+            for check in stored_checks(&schema, name)? {
+                rows.push(TableConstraintRow {
+                    constraint: check.name().to_owned(),
+                    table: name.clone(),
+                    kind: "CHECK",
+                });
+            }
         }
         rows.sort_by(|left, right| {
             (&left.table, &left.constraint).cmp(&(&right.table, &right.constraint))
@@ -941,6 +957,18 @@ impl InternalVirtualTable for InformationSchemaTableConstraints {
         _order_by: &[turso_ext::OrderByInfo],
     ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
         catalog_best_index(constraints)
+    }
+}
+
+/// The `CHECK` constraints one stored table carries.
+fn stored_checks(
+    schema: &turso_core::schema::Schema,
+    table: &str,
+) -> Result<Vec<turso_mysql_parser::MySqlCheckConstraint>> {
+    match schema.table_sql(table) {
+        Some(stored) => crate::schema_sql::stored_table_checks(stored)
+            .map_err(|error| LimboError::Corrupt(error.to_string())),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -989,7 +1017,7 @@ impl InternalVirtualTableCursor for InformationSchemaTableConstraintsCursor {
             4 => Value::build_text(row.table.clone()),
             5 => Value::build_text(row.kind),
             // Measured on MySQL 8.4.11: every constraint but an unenforced
-            // CHECK reports YES, and a CHECK has no row here at all.
+            // CHECK reports YES, and one cannot be unenforced here.
             6 => Value::build_text("YES"),
             _ => {
                 return Err(LimboError::InternalError(format!(
@@ -1186,6 +1214,118 @@ impl InternalVirtualTableCursor for InformationSchemaReferentialConstraintsCurso
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.REFERENTIAL_CONSTRAINTS has no column {column}"
+                )))
+            }
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
+}
+
+/// `information_schema.CHECK_CONSTRAINTS`, one row per `CHECK` of every table
+/// the session may see.
+///
+/// Measured on MySQL 8.4.11: `CHECK_CLAUSE` is the expression as MySQL writes
+/// it back. A clause this does not know how MySQL writes is refused when it is
+/// read, while its constraint's name is still answered.
+#[derive(Debug)]
+struct InformationSchemaCheckConstraints {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaCheckConstraints {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_CHECK_CONSTRAINTS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_CHECK_CONSTRAINTS} \
+             (CONSTRAINT_CATALOG TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             CONSTRAINT_SCHEMA TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             CONSTRAINT_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             CHECK_CLAUSE TEXT COLLATE MYSQL_UCA9_AI_CI)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let schema = connection.current_schema();
+        let mut rows = Vec::new();
+        for (name, table) in &schema.tables {
+            if table.btree().is_none()
+                || is_system_table(name)
+                || is_internal_table(name)
+                || !connection.mysql_table_is_visible(name)
+            {
+                continue;
+            }
+            rows.extend(stored_checks(&schema, name)?);
+        }
+        rows.sort_by(|left, right| left.name().cmp(right.name()));
+        Ok(Arc::new(RwLock::new(
+            InformationSchemaCheckConstraintsCursor {
+                database: self.database.clone(),
+                rows,
+                position: -1,
+            },
+        )))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+struct InformationSchemaCheckConstraintsCursor {
+    database: String,
+    rows: Vec<turso_mysql_parser::MySqlCheckConstraint>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaCheckConstraintsCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let row = &self.rows[self.position as usize];
+        Ok(match column {
+            0 => Value::build_text("def"),
+            1 => Value::build_text(self.database.clone()),
+            2 => Value::build_text(row.name().to_owned()),
+            3 => Value::build_text(
+                row.clause()
+                    .ok_or_else(|| {
+                        LimboError::ParseError(format!(
+                            "how MySQL writes the CHECK named {} has not been measured",
+                            row.name()
+                        ))
+                    })?
+                    .to_owned(),
+            ),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.CHECK_CONSTRAINTS has no column {column}"
                 )))
             }
         })

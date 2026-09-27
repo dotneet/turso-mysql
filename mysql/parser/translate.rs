@@ -51,10 +51,11 @@ pub enum MySqlCatalogTable {
     Routines,
     Columns,
     Schemata,
+    CheckConstraints,
 }
 
 impl MySqlCatalogTable {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Tables,
         Self::Views,
         Self::Statistics,
@@ -64,6 +65,7 @@ impl MySqlCatalogTable {
         Self::Routines,
         Self::Columns,
         Self::Schemata,
+        Self::CheckConstraints,
     ];
 
     /// The name the engine knows this table by, which has no qualifier.
@@ -78,6 +80,7 @@ impl MySqlCatalogTable {
             Self::Routines => "mysql_information_schema_routines",
             Self::Columns => "mysql_information_schema_columns",
             Self::Schemata => "mysql_information_schema_schemata",
+            Self::CheckConstraints => "mysql_information_schema_check_constraints",
         }
     }
 
@@ -235,6 +238,12 @@ impl MySqlCatalogTable {
                 ("GENERATION_EXPRESSION", "TEXT"),
                 ("SRS_ID", "INT UNSIGNED"),
             ],
+            Self::CheckConstraints => &[
+                ("CONSTRAINT_CATALOG", "TEXT"),
+                ("CONSTRAINT_SCHEMA", "TEXT"),
+                ("CONSTRAINT_NAME", "TEXT"),
+                ("CHECK_CLAUSE", "TEXT"),
+            ],
             Self::Schemata => &[
                 ("CATALOG_NAME", "TEXT"),
                 ("SCHEMA_NAME", "TEXT"),
@@ -285,6 +294,7 @@ impl MySqlCatalogTable {
             Self::Routines => "ROUTINES",
             Self::Columns => "COLUMNS",
             Self::Schemata => "SCHEMATA",
+            Self::CheckConstraints => "CHECK_CONSTRAINTS",
         }
     }
 }

@@ -784,6 +784,48 @@ pub(super) fn information_schema_referential_constraints_columns() -> Vec<Column
     )
 }
 
+/// The shapes MySQL reports for the `information_schema.CHECK_CONSTRAINTS`
+/// columns, in the order MySQL declares them.
+///
+/// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
+/// every other table here is pinned to.
+pub(super) fn information_schema_check_constraints_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    catalog_text_columns(
+        "CHECK_CONSTRAINTS",
+        &[
+            (
+                "CONSTRAINT_CATALOG",
+                "catalogs",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "CONSTRAINT_SCHEMA",
+                "schemata",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            (
+                "CONSTRAINT_NAME",
+                "check_constraints",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            ),
+            (
+                "CHECK_CLAUSE",
+                "check_constraints",
+                MYSQL_TYPE_BLOB,
+                u32::MAX,
+                named | MYSQL_BLOB_FLAG,
+            ),
+        ],
+    )
+}
+
 /// The shapes MySQL reports for the `information_schema.ROUTINES` columns, in
 /// the order MySQL declares them.
 ///

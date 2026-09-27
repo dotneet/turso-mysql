@@ -30740,3 +30740,6 @@ mod information_schema_wildcards;
 
 #[cfg(unix)]
 mod character_set_listings;
+
+#[cfg(unix)]
+mod check_constraints;
