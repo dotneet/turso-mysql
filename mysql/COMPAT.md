@@ -2549,6 +2549,20 @@ Laravel's `insertUsing` arrives, its bindings in the `SELECT`'s `WHERE` — is t
 reserved when it is prepared, and when it runs its `SELECT` binds the values it was given and
 is read before a number is taken, exactly as the text statement is.
 
+A row found wrong while it is filled takes no number. Measured on 8.4.11: a broken `CHECK`,
+a NULL for a `NOT NULL` column, and a value too long, out of range or of the wrong kind each fail
+the row before it takes its number, so the next row takes the number the failed one would have;
+a duplicate key and a missing parent row fail once the row is written, having spent it; and of
+several rows, one failing after the first spends the statement's whole batch while a failing
+first row spends nothing. A `VALUES` insert whose every row leaves its id to the counter, into a
+table carrying no trigger, now matches all of it. The counter hands out a number once and never
+takes one back, so the rows are written first, inside a savepoint, with the numbers the counter
+would hand out next, and the numbers are taken afterwards — never, when the first row failed to
+fill. Should another session take those numbers in between, the statement is undone and written
+again with the numbers it was actually handed, so no row is ever written with a number the
+counter did not hand this statement. The other counted paths reserve before they write, and still
+spend a number on such a failure; see TODO.md.
+
 A table that counts its own ids may carry a trigger, and a trigger may write into one — a
 restored `mysqldump` of a blog carries exactly that, each new post writing a row into an audit
 table numbered the same way. The statement's own rows are numbered as always, and the trigger

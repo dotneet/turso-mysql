@@ -1253,3 +1253,153 @@ fn a_trigger_writing_a_counted_tables_id_itself_is_refused() {
         vec![some(&["0"])]
     );
 }
+
+/// A row found wrong while it is filled takes no number, and one found wrong
+/// once it is written keeps the number it took.
+///
+/// Measured on MySQL 8.4.11: a broken `CHECK`, a NULL for a `NOT NULL`
+/// column, a value too long or out of range fail before the row takes its
+/// number; a duplicate key and a missing parent row fail after. Of several
+/// rows, one failing after the first spends the statement's whole batch.
+#[test]
+fn a_row_that_fails_before_it_is_written_spends_no_number() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE parent (id INT PRIMARY KEY)",
+        "INSERT INTO parent (id) VALUES (1)",
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT NOT NULL, u INT UNIQUE, p INT, s VARCHAR(3), CHECK (n > 0), FOREIGN KEY (p) REFERENCES parent (id))",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let refused = |adapter: &mut Adapter, sql: &str| {
+        adapter.execute_query(sql).expect_err("the row is refused")
+    };
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (1)"),
+        (1, 1)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n) VALUES (-1)"),
+        FrontendErrorKind::CheckConstraintViolated
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (2)"),
+        (1, 2)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n) VALUES (NULL)"),
+        FrontendErrorKind::NotNullViolation
+    );
+    // A written value too long or too large is refused before the statement
+    // runs; a bound one is found as the row is filled.
+    let mut prepared_refusal = |sql: &str, values: &[&str]| {
+        let statement = adapter.execute_stmt_prepare(sql).unwrap();
+        let answer = adapter.execute_stmt_execute(statement.statement_id, &words(values));
+        adapter.execute_stmt_close(statement.statement_id);
+        answer.expect_err("the row is refused")
+    };
+    assert_eq!(
+        prepared_refusal("INSERT INTO t (n, s) VALUES (?, ?)", &["3", "toolong"]),
+        FrontendErrorKind::DataTooLong
+    );
+    assert_eq!(
+        prepared_refusal("INSERT INTO t (n) VALUES (?)", &["99999999999"]),
+        FrontendErrorKind::OutOfRange
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (4)"),
+        (1, 3)
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n, u) VALUES (5, 1)"),
+        (1, 4)
+    );
+    refused(&mut adapter, "INSERT INTO t (n, u) VALUES (6, 1)");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (7)"),
+        (1, 6)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n, p) VALUES (8, 99)"),
+        FrontendErrorKind::ForeignKeyViolation
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (9)"),
+        (1, 8)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n) VALUES (10), (-10)"),
+        FrontendErrorKind::CheckConstraintViolated
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (11)"),
+        (1, 11)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n) VALUES (NULL), (12)"),
+        FrontendErrorKind::NotNullViolation
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (13)"),
+        (1, 12)
+    );
+    let statement = adapter
+        .execute_stmt_prepare("INSERT INTO t (n) VALUES (?)")
+        .unwrap();
+    assert!(adapter
+        .execute_stmt_execute(statement.statement_id, &words(&["-14"]))
+        .is_err());
+    adapter.execute_stmt_close(statement.statement_id);
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (15)"),
+        (1, 13)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "13");
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, n FROM t ORDER BY id"),
+        vec![
+            some(&["1", "1"]),
+            some(&["2", "2"]),
+            some(&["3", "4"]),
+            some(&["4", "5"]),
+            some(&["6", "7"]),
+            some(&["8", "9"]),
+            some(&["11", "11"]),
+            some(&["12", "13"]),
+            some(&["13", "15"]),
+        ]
+    );
+    // MySQL then prints `AUTO_INCREMENT=14`.
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (16)"),
+        (1, 14)
+    );
+
+    // Inside a transaction a refused row ends only its own statement, and
+    // the numbers the transaction took stay spent once it is rolled back.
+    run(&mut adapter, "BEGIN");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (17)"),
+        (1, 15)
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO t (n) VALUES (-18)"),
+        FrontendErrorKind::CheckConstraintViolated
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (19)"),
+        (1, 16)
+    );
+    run(&mut adapter, "ROLLBACK");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (n) VALUES (20)"),
+        (1, 17)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, n FROM t WHERE id > 13 ORDER BY id"
+        ),
+        vec![some(&["14", "16"]), some(&["17", "20"])]
+    );
+}

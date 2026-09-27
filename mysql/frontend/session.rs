@@ -3053,33 +3053,38 @@ impl MySqlConnection {
         )? {
             return Ok(MySqlPreparedExecutionResult::Write(result));
         }
-        let reserved = self.reserve_insert_row_ids(&bound, &table, values, deadline)?;
-        self.check_write_deadline(deadline)?;
-        let statement = bound
-            .inject_row_ids(&reserved.ids)
-            .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let options = injected_auto_increment_prepare_options(&table, statement.clone());
-        let mut statement =
-            self.inner
-                .prepare_translated_stmt_with_options(statement, &insert.sql, &options)?;
-        if statement.parameters_count() != insert.parameter_count {
-            return Err(LimboError::InternalError(
-                "prepared AUTO_INCREMENT INSERT changed its parameter count".to_string(),
-            ));
-        }
-        bind_prepared_values(&mut statement, &reserved.bound_values)?;
-        let result = (|| -> Result<()> {
-            let timeout = self
-                .remaining_write_timeout(deadline)
-                .map_err(Into::<LimboError>::into)?;
-            run_checked_write_statement(&mut statement, timeout)
-                .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))
-        })();
-        let reset_result = statement.reset();
-        match (result, reset_result) {
-            (_, Err(error)) => Err(error),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(())) => {
+        let reserved =
+            self.write_counted_rows(&insert.sql, &bound, &table, values, deadline, |reserved| {
+                self.check_write_deadline(deadline)?;
+                let statement = bound
+                    .inject_row_ids(&reserved.ids)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                let options = injected_auto_increment_prepare_options(&table, statement.clone());
+                let mut statement = self.inner.prepare_translated_stmt_with_options(
+                    statement,
+                    &insert.sql,
+                    &options,
+                )?;
+                if statement.parameters_count() != insert.parameter_count {
+                    return Err(LimboError::InternalError(
+                        "prepared AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+                    ));
+                }
+                bind_prepared_values(&mut statement, &reserved.bound_values)?;
+                let result = (|| -> Result<()> {
+                    let timeout = self
+                        .remaining_write_timeout(deadline)
+                        .map_err(Into::<LimboError>::into)?;
+                    run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                        self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                    })
+                })();
+                let reset_result = statement.reset();
+                result.and(reset_result)
+            });
+        match reserved {
+            Err(error) => Err(error),
+            Ok(reserved) => {
                 let upserted = self.inner.mysql_upserted_rowid();
                 let inserted = self.inner.changes() != 0 && upserted == 0;
                 if inserted {
@@ -8398,21 +8403,22 @@ impl MySqlConnection {
         let bound = insert
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let reserved = self.reserve_insert_row_ids(&bound, &table, &[], deadline)?;
-        self.check_write_deadline(deadline)
-            .map_err(Into::<LimboError>::into)?;
-        let statement = bound
-            .inject_row_ids(&reserved.ids)
-            .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let options = injected_auto_increment_prepare_options(&table, statement.clone());
-        let mut statement = self
-            .inner
-            .prepare_translated_stmt_with_options(statement, sql, &options)?;
-        let timeout = self
-            .remaining_write_timeout(deadline)
-            .map_err(Into::<LimboError>::into)?;
-        run_checked_write_statement(&mut statement, timeout)
-            .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))?;
+        let reserved = self.write_counted_rows(sql, &bound, &table, &[], deadline, |reserved| {
+            self.check_write_deadline(deadline)
+                .map_err(Into::<LimboError>::into)?;
+            let statement = bound
+                .inject_row_ids(&reserved.ids)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?;
+            let options = injected_auto_increment_prepare_options(&table, statement.clone());
+            let mut statement = self
+                .inner
+                .prepare_translated_stmt_with_options(statement, sql, &options)?;
+            let timeout = self
+                .remaining_write_timeout(deadline)
+                .map_err(Into::<LimboError>::into)?;
+            run_checked_write_statement(&mut statement, timeout)
+                .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))
+        })?;
         // Measured on MySQL 8.4.11: an upsert that changed a row reports that
         // row's own id back to the client and leaves `LAST_INSERT_ID()` where
         // it stood, one that left the row as it stood reports no id at all,
@@ -8793,6 +8799,184 @@ impl MySqlConnection {
         result.map(Some)
     }
 
+    /// Writes a counted `VALUES` insert whose ids are all asked for, taking
+    /// its numbers when MySQL takes them.
+    ///
+    /// Measured on MySQL 8.4.11: a row found wrong while it is filled — a
+    /// value too long, out of range or of the wrong kind, a NULL for a
+    /// `NOT NULL` column, a broken `CHECK` — fails before the row takes a
+    /// number, so a statement whose first row fails that way spends none. One
+    /// failing on a later row spends the statement's whole batch, and so does
+    /// one failing on a key or a foreign key, which is found once the row is
+    /// written.
+    ///
+    /// The counter hands out a number only once and never takes one back, so
+    /// the rows are written first, inside a savepoint, with the numbers it
+    /// would hand out next, and the numbers are taken afterwards — or never,
+    /// when the first row failed to fill. A statement whose numbers were
+    /// taken by another session in between is undone and written again with
+    /// the numbers actually taken, so no number is ever written that the
+    /// counter did not hand to this statement. A table carrying a trigger is
+    /// written the old way, reserving first: a trigger's own failure is found
+    /// after the row is written, and a trigger's rows would take numbers of
+    /// their own twice if the statement had to be written again.
+    ///
+    /// The engine ends the whole transaction, savepoint and all, on a value
+    /// the assignment check refuses, where it ends only the statement on a
+    /// broken constraint; the savepoint stands exactly while a transaction is
+    /// open, so each step checks that first.
+    fn write_counted_rows(
+        &self,
+        sql: &str,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        deadline: Option<turso_core::MonotonicInstant>,
+        write: impl Fn(&ReservedAutoIncrementRows) -> Result<()>,
+    ) -> Result<ReservedAutoIncrementRows> {
+        let Some(predicted) = self.numbers_the_counter_would_hand_out(bound, table, values)? else {
+            let reserved = self.reserve_insert_row_ids(bound, table, values, deadline)?;
+            write(&reserved)?;
+            return Ok(reserved);
+        };
+        self.run_internal(&format!("SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+        let rollback = || self.roll_back_to_the_counted_rows_savepoint();
+        let written = (|| -> Result<std::result::Result<ReservedAutoIncrementRows, LimboError>> {
+            let failure = match write(&predicted) {
+                Ok(()) => None,
+                Err(error) => {
+                    rollback()?;
+                    if found_before_a_number_is_taken(&error)
+                        && (bound.row_count().get() == 1
+                            || self
+                                .first_row_fails_to_fill(sql, bound, table, values, &predicted)?)
+                    {
+                        return Ok(Err(error));
+                    }
+                    Some(error)
+                }
+            };
+            let taken = self.reserve_insert_row_ids(bound, table, values, deadline)?;
+            if taken.ids == predicted.ids {
+                return Ok(match failure {
+                    None => Ok(taken),
+                    Some(error) => Err(error),
+                });
+            }
+            if failure.is_none() {
+                rollback()?;
+            }
+            write(&taken)?;
+            Ok(Ok(taken))
+        })();
+        if written.is_err() {
+            rollback()?;
+        }
+        if !self.inner.get_auto_commit() {
+            self.run_internal(&format!("RELEASE SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+        }
+        written?
+    }
+
+    fn roll_back_to_the_counted_rows_savepoint(&self) -> Result<()> {
+        if !self.inner.get_auto_commit() {
+            self.run_internal(&format!("ROLLBACK TO SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+        }
+        Ok(())
+    }
+
+    /// The ids the counter would hand a `VALUES` insert next, when every row
+    /// leaves its id to the counter and the table carries no trigger, or
+    /// `None` when the numbers have to be reserved before the rows are
+    /// written.
+    fn numbers_the_counter_would_hand_out(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+    ) -> Result<Option<ReservedAutoIncrementRows>> {
+        if bound.rowwise_conflicts()
+            || bound
+                .row_values()
+                .iter()
+                .any(|value| *value != AutoIncrementRowValue::Generated)
+            || self
+                .inner
+                .current_schema()
+                .get_triggers_for_table(&table.name)
+                .next()
+                .is_some()
+        {
+            return Ok(None);
+        }
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let mut peek = capability.allocator.peek_high_water(table.key)?;
+        // Another statement reserving at this moment holds the counter's
+        // file; the numbers are then reserved first, as they always were.
+        let high_water = match capability.io.block(|| peek.step()) {
+            Ok(high_water) => high_water,
+            Err(LimboError::Busy) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let rows = bound.row_count().get() as u64;
+        // Numbers past the column's highest are answered by the reserving
+        // path, which is where that refusal is made.
+        if high_water
+            .checked_add(rows)
+            .is_none_or(|last| last > auto_increment_ceiling(table) || last > i64::MAX as u64)
+        {
+            return Ok(None);
+        }
+        let row_values = self.auto_increment_row_values(bound, table, values)?;
+        self.row_ids_after(bound, table, values, row_values, high_water)
+            .map(Some)
+    }
+
+    /// Whether the first row of a counted insert that failed while a row was
+    /// filled is the row that failed, which is what decides whether MySQL
+    /// took the statement's numbers.
+    fn first_row_fails_to_fill(
+        &self,
+        sql: &str,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        predicted: &ReservedAutoIncrementRows,
+    ) -> Result<bool> {
+        // With the transaction gone there is nowhere to try the row alone,
+        // and taking the numbers is what MySQL does for any row but the
+        // first.
+        if self.inner.get_auto_commit() {
+            return Ok(false);
+        }
+        let first = predicted.first_generated.ok_or_else(|| {
+            LimboError::InternalError("a counted insert asking for ids predicted none".to_string())
+        })?;
+        let statement = bound
+            .inject_one_row(0, first)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let options = injected_auto_increment_prepare_options(table, statement.clone());
+        let mut statement = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)?;
+        let parameter_count = statement.parameters_count();
+        let bound_values = values.get(..parameter_count).ok_or_else(|| {
+            LimboError::InternalError(
+                "a counted insert's first row changed its parameter count".to_string(),
+            )
+        })?;
+        bind_prepared_values(&mut statement, bound_values)?;
+        let written = run_checked_write_statement(&mut statement, None)
+            .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)));
+        statement.reset()?;
+        self.roll_back_to_the_counted_rows_savepoint()?;
+        Ok(written.is_err_and(|error| found_before_a_number_is_taken(&error)))
+    }
+
     fn reserve_insert_row_ids(
         &self,
         bound: &BoundAutoIncrementInsert,
@@ -8862,6 +9046,20 @@ impl MySqlConnection {
         };
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
+        self.row_ids_after(bound, table, values, row_values, high_water_before)
+    }
+
+    /// The ids a `VALUES` insert's rows take when the counter stands at
+    /// `high_water_before`, and the bound values with each id asked for by a
+    /// `?` put in its place.
+    fn row_ids_after(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        row_values: Vec<InsertAutoIncrementValue>,
+        high_water_before: u64,
+    ) -> Result<ReservedAutoIncrementRows> {
         let mut current = high_water_before;
         let mut ids = Vec::with_capacity(row_values.len());
         let mut first_generated = None;
@@ -11298,6 +11496,20 @@ fn injected_auto_increment_prepare_options(
             table_sql: table.stored_sql.clone(),
             allocator_column_ordinal: table.definition.allocator_column_ordinal,
         }))
+}
+
+const COUNTED_ROWS_SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+
+/// Whether MySQL finds `error` while it fills a row, before the row takes a
+/// number: a value it cannot hold, a NULL for a `NOT NULL` column, a broken
+/// `CHECK`. Anything else — a key, a foreign key — it finds once the row is
+/// written, having taken the number.
+fn found_before_a_number_is_taken(error: &LimboError) -> bool {
+    match error {
+        LimboError::NotNullConstraint { .. } | LimboError::Assignment(_) => true,
+        LimboError::Constraint(message) => message.starts_with("CHECK constraint failed"),
+        _ => false,
+    }
 }
 
 /// One counted table and the id an INSERT that wrote its own reports.
