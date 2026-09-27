@@ -30743,3 +30743,6 @@ mod character_set_listings;
 
 #[cfg(unix)]
 mod check_constraints;
+
+#[cfg(unix)]
+mod database_collation;

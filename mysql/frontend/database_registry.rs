@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use turso_mysql_parser::MySqlTableCollation;
 
 #[cfg(unix)]
 #[path = "filesystem_backend.rs"]
@@ -238,6 +239,36 @@ pub(crate) enum DatabaseState {
 pub(crate) struct RegistryEntry {
     pub(crate) file_key: OpaqueFileKey,
     pub(crate) state: DatabaseState,
+    /// The collation every table made in the database takes when it names
+    /// none. It is left out for `utf8mb4_0900_ai_ci`, so an entry written
+    /// before databases had a collation reads as that one, which is what every
+    /// table made in it was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collation: Option<StoredDatabaseCollation>,
+}
+
+/// A database collation other than `utf8mb4_0900_ai_ci`, as the registry
+/// writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum StoredDatabaseCollation {
+    #[serde(rename = "utf8mb4_unicode_ci")]
+    Utf8mb4UnicodeCi,
+}
+
+impl StoredDatabaseCollation {
+    fn stored(collation: MySqlTableCollation) -> Option<Self> {
+        match collation {
+            MySqlTableCollation::Utf8mb40900AiCi => None,
+            MySqlTableCollation::Utf8mb4UnicodeCi => Some(Self::Utf8mb4UnicodeCi),
+        }
+    }
+
+    fn read(stored: Option<Self>) -> MySqlTableCollation {
+        match stored {
+            None => MySqlTableCollation::Utf8mb40900AiCi,
+            Some(Self::Utf8mb4UnicodeCi) => MySqlTableCollation::Utf8mb4UnicodeCi,
+        }
+    }
 }
 
 /// Durable registry state written atomically by the root backend.
@@ -488,10 +519,14 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
 
     #[cfg(test)]
     fn create(&mut self, requested_name: &str) -> Result<DatabaseName, RegistryError> {
-        self.create_with_initializer(requested_name, |_, _, lifetime| {
-            drop(lifetime);
-            Ok(())
-        })
+        self.create_with_initializer(
+            requested_name,
+            MySqlTableCollation::default(),
+            |_, _, lifetime| {
+                drop(lifetime);
+                Ok(())
+            },
+        )
         .map(|(name, ())| name)
     }
 
@@ -502,6 +537,7 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
     pub(crate) fn create_with_initializer<F, T>(
         &mut self,
         requested_name: &str,
+        collation: MySqlTableCollation,
         initializer: F,
     ) -> Result<(DatabaseName, T), RegistryError>
     where
@@ -535,6 +571,7 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
         let entry = RegistryEntry {
             file_key,
             state: DatabaseState::Creating,
+            collation: StoredDatabaseCollation::stored(collation),
         };
         self.snapshot.entries.insert(name.clone(), entry);
         self.persist_snapshot()?;
@@ -678,6 +715,49 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
         self.poison_on_backend_error(unlink)?;
         self.snapshot.entries.remove(&name);
         self.persist_snapshot()
+    }
+
+    /// The collation a ready database gives the tables made in it.
+    pub(crate) fn collation(
+        &self,
+        requested_name: &str,
+    ) -> Result<MySqlTableCollation, RegistryError> {
+        self.ensure_active()?;
+        let name = DatabaseName::parse(requested_name)?;
+        let entry = self.ready_entry(&name)?;
+        Ok(StoredDatabaseCollation::read(entry.collation))
+    }
+
+    /// Durably changes the collation a ready database gives the tables made in
+    /// it from now on. The tables already there keep theirs.
+    pub(crate) fn set_collation(
+        &mut self,
+        requested_name: &str,
+        collation: MySqlTableCollation,
+    ) -> Result<DatabaseName, RegistryError> {
+        self.ensure_active()?;
+        let name = DatabaseName::parse(requested_name)?;
+        self.ready_entry(&name)?;
+        let entry = self
+            .snapshot
+            .entries
+            .get_mut(&name)
+            .ok_or(RegistryError::InvalidRegistryState)?;
+        entry.collation = StoredDatabaseCollation::stored(collation);
+        self.persist_snapshot()?;
+        Ok(name)
+    }
+
+    fn ready_entry(&self, name: &DatabaseName) -> Result<&RegistryEntry, RegistryError> {
+        let entry = self
+            .snapshot
+            .entries
+            .get(name)
+            .ok_or_else(|| RegistryError::DatabaseNotFound(name.clone()))?;
+        if entry.state != DatabaseState::Ready {
+            return Err(RegistryError::DatabaseNotReady(name.clone()));
+        }
+        Ok(entry)
     }
 
     pub(crate) fn contains(&self, requested_name: &str) -> Result<bool, RegistryError> {
@@ -1123,12 +1203,16 @@ mod tests {
         events.borrow_mut().clear();
 
         let (name, value) = registry
-            .create_with_initializer("ordered", |stage, expected, lifetime| {
-                assert_eq!(stage.file.identity, *expected.file_key());
-                stage.events.borrow_mut().push("initializer");
-                drop(lifetime);
-                Ok(7u8)
-            })
+            .create_with_initializer(
+                "ordered",
+                turso_mysql_parser::MySqlTableCollation::default(),
+                |stage, expected, lifetime| {
+                    assert_eq!(stage.file.identity, *expected.file_key());
+                    stage.events.borrow_mut().push("initializer");
+                    drop(lifetime);
+                    Ok(7u8)
+                },
+            )
             .unwrap();
 
         assert_eq!(name.as_str(), "ordered");
@@ -1152,7 +1236,11 @@ mod tests {
     fn initializer_result_can_retain_lifetime_lease_until_database_drop() {
         let mut registry = DatabaseRegistry::open_or_create(FakeRoot::default()).unwrap();
         let (name, lifetime) = registry
-            .create_with_initializer("guarded", |_, _, lifetime| Ok(Some(lifetime)))
+            .create_with_initializer(
+                "guarded",
+                turso_mysql_parser::MySqlTableCollation::default(),
+                |_, _, lifetime| Ok(Some(lifetime)),
+            )
             .unwrap();
 
         assert_eq!(
@@ -1169,6 +1257,7 @@ mod tests {
 
         let result = registry.create_with_initializer(
             "initializer_guard_error",
+            turso_mysql_parser::MySqlTableCollation::default(),
             |_,
              _,
              lifetime|
@@ -1192,6 +1281,7 @@ mod tests {
 
         let result = registry.create_with_initializer(
             "partial_publish_guard",
+            turso_mysql_parser::MySqlTableCollation::default(),
             |_,
              _,
              lifetime|
@@ -1211,6 +1301,7 @@ mod tests {
 
         let result = registry.create_with_initializer(
             "ready_persist_guard",
+            turso_mysql_parser::MySqlTableCollation::default(),
             |_,
              _,
              lifetime|
@@ -1233,6 +1324,7 @@ mod tests {
         assert_eq!(
             registry.create_with_initializer(
                 "initializer_failure",
+                turso_mysql_parser::MySqlTableCollation::default(),
                 |stage, _, lifetime| -> Result<(), RegistryError> {
                     stage.events.borrow_mut().push("initializer");
                     drop(lifetime);
@@ -1417,6 +1509,68 @@ mod tests {
         );
     }
 
+    /// A registry written before databases had a collation has no
+    /// `collation` field, and each of its databases gave its tables
+    /// `utf8mb4_0900_ai_ci`, so that is what the missing field reads as.
+    #[test]
+    fn a_database_collation_is_written_only_when_it_is_not_the_default() {
+        const KEY: &str = "db_00000000000000000000000000000031";
+        let written_before = format!(r#"{{"file_key":"{KEY}","state":"Ready"}}"#);
+        let entry: RegistryEntry = serde_json::from_str(&written_before).unwrap();
+        assert_eq!(entry.collation, None);
+        assert_eq!(
+            StoredDatabaseCollation::read(entry.collation),
+            MySqlTableCollation::Utf8mb40900AiCi
+        );
+        assert_eq!(serde_json::to_string(&entry).unwrap(), written_before);
+
+        let unicode = RegistryEntry {
+            collation: StoredDatabaseCollation::stored(MySqlTableCollation::Utf8mb4UnicodeCi),
+            ..entry
+        };
+        let written = serde_json::to_string(&unicode).unwrap();
+        assert_eq!(
+            written,
+            format!(r#"{{"file_key":"{KEY}","state":"Ready","collation":"utf8mb4_unicode_ci"}}"#)
+        );
+        assert_eq!(
+            serde_json::from_str::<RegistryEntry>(&written).unwrap(),
+            unicode
+        );
+        for unknown in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "latin1_swedish_ci"] {
+            assert!(serde_json::from_str::<RegistryEntry>(&format!(
+                r#"{{"file_key":"{KEY}","state":"Ready","collation":"{unknown}"}}"#
+            ))
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn a_collation_is_changed_only_on_a_ready_database() {
+        let mut registry = DatabaseRegistry::open_or_create(FakeRoot::default()).unwrap();
+        registry.create("ready").unwrap();
+        assert_eq!(
+            registry.collation("READY"),
+            Ok(MySqlTableCollation::Utf8mb40900AiCi)
+        );
+        registry
+            .set_collation("ready", MySqlTableCollation::Utf8mb4UnicodeCi)
+            .unwrap();
+        assert_eq!(
+            registry.collation("ready"),
+            Ok(MySqlTableCollation::Utf8mb4UnicodeCi)
+        );
+        let missing = DatabaseName::parse("missing").unwrap();
+        assert_eq!(
+            registry.set_collation("missing", MySqlTableCollation::Utf8mb4UnicodeCi),
+            Err(RegistryError::DatabaseNotFound(missing.clone()))
+        );
+        assert_eq!(
+            registry.collation("missing"),
+            Err(RegistryError::DatabaseNotFound(missing))
+        );
+    }
+
     #[test]
     fn opaque_file_key_rejects_the_reserved_zero_database_identity() {
         assert_eq!(
@@ -1566,6 +1720,7 @@ mod tests {
             RegistryEntry {
                 file_key: key.clone(),
                 state: DatabaseState::Ready,
+                collation: None,
             },
         );
         other_root.files.insert(
@@ -1596,6 +1751,7 @@ mod tests {
             RegistryEntry {
                 file_key: key,
                 state: DatabaseState::Ready,
+                collation: None,
             },
         );
         assert!(matches!(
@@ -1619,6 +1775,7 @@ mod tests {
                 RegistryEntry {
                     file_key: key.clone(),
                     state: DatabaseState::Ready,
+                    collation: None,
                 },
             );
         }
@@ -1756,6 +1913,7 @@ mod tests {
             RegistryEntry {
                 file_key: creating_key,
                 state: DatabaseState::Creating,
+                collation: None,
             },
         );
         let registry = DatabaseRegistry::open_or_create(root).unwrap();
@@ -1809,6 +1967,7 @@ mod tests {
             RegistryEntry {
                 file_key: key.clone(),
                 state: DatabaseState::Ready,
+                collation: None,
             },
         );
         root.files.insert(

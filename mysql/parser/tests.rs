@@ -6835,6 +6835,7 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
         MySqlAdminCommand::CreateDatabase {
             name: MySqlDatabaseName::parse("reports").unwrap(),
             only_if_missing: false,
+            collation: MySqlTableCollation::Utf8mb40900AiCi,
         }
     );
     assert_eq!(
@@ -7858,45 +7859,100 @@ fn rejects_comments_options_qualified_names_and_trailing_junk() {
 /// 8.4.11: each option may start with `DEFAULT`, take an `=`, come in any
 /// order, and name its value bare, in backticks or as a string.
 #[test]
-fn reads_create_database_with_the_options_every_database_here_has() {
+fn reads_the_collation_create_database_gives_its_database() {
     let mode = SessionSqlMode::default();
-    for (sql, name, only_if_missing) in [
+    let unicode = MySqlTableCollation::Utf8mb4UnicodeCi;
+    let uca9 = MySqlTableCollation::Utf8mb40900AiCi;
+    for (sql, name, only_if_missing, collation) in [
         (
             "CREATE DATABASE /*!32312 IF NOT EXISTS*/ `probe` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */",
             "probe",
             true,
+            uca9,
         ),
-        ("CREATE DATABASE IF NOT EXISTS other", "other", true),
+        ("CREATE DATABASE IF NOT EXISTS other", "other", true, uca9),
         (
-            "create database `laravel` default character set `utf8mb4` default collate `utf8mb4_0900_ai_ci`",
+            "create database `laravel` default character set `utf8mb4` default collate `utf8mb4_unicode_ci`",
             "laravel",
             false,
+            unicode,
+        ),
+        (
+            "CREATE DATABASE prisma CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+            "prisma",
+            false,
+            unicode,
         ),
         (
             "CREATE DATABASE o3 CHARSET = 'utf8mb4' COLLATE = 'utf8mb4_0900_ai_ci' ENCRYPTION 'N';",
             "o3",
             false,
+            uca9,
         ),
         (
-            "/*!40000 CREATE DATABASE o4 COLLATE utf8mb4_0900_ai_ci CHARACTER SET utf8mb4 */",
+            "/*!40000 CREATE DATABASE o4 COLLATE utf8mb4_unicode_ci CHARACTER SET utf8mb4 */",
             "o4",
             false,
+            unicode,
         ),
+        ("CREATE SCHEMA o5 COLLATE \"UTF8MB4_UNICODE_CI\"", "o5", false, unicode),
+        (
+            "CREATE DATABASE o6 COLLATE utf8mb4_bin COLLATE utf8mb4_unicode_ci",
+            "o6",
+            false,
+            unicode,
+        ),
+        ("CREATE DATABASE o7 CHARSET utf8mb4", "o7", false, uca9),
     ] {
         assert_eq!(
             parse_admin_command(sql, mode),
             Ok(MySqlAdminCommand::CreateDatabase {
                 name: MySqlDatabaseName::parse(name).unwrap(),
                 only_if_missing,
+                collation,
             }),
             "{sql}"
         );
     }
+    for (sql, error) in [
+        (
+            "CREATE DATABASE e1 COLLATE nope",
+            ParseError::UnknownCollation,
+        ),
+        (
+            "CREATE DATABASE e2 CHARACTER SET nope",
+            ParseError::UnknownCharacterSet,
+        ),
+        (
+            "CREATE DATABASE e3 CHARACTER SET latin1 COLLATE utf8mb4_bin",
+            ParseError::CollationOfAnotherCharacterSet,
+        ),
+        (
+            "CREATE DATABASE e4 CHARACTER SET utf8 COLLATE utf8mb4_bin",
+            ParseError::CollationOfAnotherCharacterSet,
+        ),
+        (
+            "CREATE DATABASE e5 COLLATE latin1_swedish_ci CHARACTER SET utf8mb4",
+            ParseError::ConflictingCharacterSets,
+        ),
+        (
+            "CREATE DATABASE e6 CHARACTER SET utf8mb4 CHARSET utf8",
+            ParseError::ConflictingCharacterSets,
+        ),
+        (
+            "CREATE DATABASE e7 ENCRYPTION 'Y' COLLATE nope",
+            ParseError::UnknownCollation,
+        ),
+    ] {
+        assert_eq!(parse_admin_command(sql, mode), Err(error), "{sql}");
+    }
     for sql in [
-        "CREATE DATABASE prisma CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-        "create database `l` default character set `utf8mb4` default collate `utf8mb4_unicode_ci`",
         "CREATE DATABASE l1 CHARACTER SET latin1",
         "CREATE DATABASE l2 CHARSET utf8",
+        "CREATE DATABASE l3 COLLATE utf8_general_ci",
+        "CREATE DATABASE l4 COLLATE utf8mb4_bin",
+        "CREATE DATABASE l5 COLLATE utf8mb4_general_ci",
+        "CREATE DATABASE l6 COLLATE binary",
         "CREATE DATABASE e1 ENCRYPTION 'Y'",
     ] {
         assert!(
@@ -7912,9 +7968,86 @@ fn reads_create_database_with_the_options_every_database_here_has() {
         "CREATE DATABASE /*!32312 IF NOT EXISTS future",
         "CREATE DATABASE c CHARACTER utf8mb4",
         "CREATE DATABASE c CHARACTER SET + utf8mb4",
+        "CREATE DATABASE c CHARACTER SET = DEFAULT",
         "CREATE DATABASE IF EXISTS c",
     ] {
         assert!(parse_admin_command(sql, mode).is_err(), "{sql}");
+    }
+}
+
+/// Measured on MySQL 8.4.11: the name may be left out for the selected
+/// database, an `ALTER DATABASE` naming no option is 1064, and `READ ONLY`
+/// is an option of its own.
+#[test]
+fn reads_alter_database_and_show_create_database() {
+    let mode = SessionSqlMode::default();
+    for (sql, name, collation) in [
+        (
+            "ALTER DATABASE App COLLATE utf8mb4_unicode_ci",
+            Some("app"),
+            Some(MySqlTableCollation::Utf8mb4UnicodeCi),
+        ),
+        (
+            "ALTER SCHEMA DEFAULT CHARACTER SET = utf8mb4;",
+            None,
+            Some(MySqlTableCollation::Utf8mb40900AiCi),
+        ),
+        (
+            "ALTER DATABASE /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci */",
+            None,
+            Some(MySqlTableCollation::Utf8mb4UnicodeCi),
+        ),
+        ("ALTER DATABASE `app` ENCRYPTION 'N'", Some("app"), None),
+    ] {
+        assert_eq!(
+            parse_admin_command(sql, mode),
+            Ok(MySqlAdminCommand::AlterDatabase {
+                name: name.map(|name| MySqlDatabaseName::parse(name).unwrap()),
+                collation,
+            }),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "ALTER DATABASE app",
+        "ALTER DATABASE",
+        "ALTER DATABASE app garbage",
+    ] {
+        assert!(
+            matches!(
+                parse_admin_command(sql, mode),
+                Err(ParseError::ExpectedAdminCommand | ParseError::TrailingAdminCommandTokens)
+            ),
+            "{sql}"
+        );
+    }
+    assert!(matches!(
+        parse_admin_command("ALTER DATABASE app READ ONLY = 1", mode),
+        Err(ParseError::Unsupported { .. })
+    ));
+    assert_eq!(
+        parse_optional_admin_command("ALTER TABLE t ADD COLUMN c INT", mode),
+        Ok(None)
+    );
+
+    assert_eq!(
+        parse_admin_command("SHOW CREATE SCHEMA IF NOT EXISTS `MixedDb`", mode),
+        Ok(MySqlAdminCommand::ShowCreateDatabase {
+            name: MySqlDatabaseName::parse("mixeddb").unwrap(),
+            written_name: "MixedDb".to_owned(),
+            only_if_missing: true,
+        })
+    );
+    assert_eq!(
+        parse_admin_command("SHOW CREATE DATABASE app;", mode),
+        Ok(MySqlAdminCommand::ShowCreateDatabase {
+            name: MySqlDatabaseName::parse("app").unwrap(),
+            written_name: "app".to_owned(),
+            only_if_missing: false,
+        })
+    );
+    for sql in ["SHOW CREATE TABLE app", "SHOW CREATE VIEW app"] {
+        assert_eq!(parse_optional_admin_command(sql, mode), Ok(None), "{sql}");
     }
 }
 
@@ -7923,8 +8056,6 @@ fn rejects_non_database_commands_and_incomplete_commands() {
     for sql in [
         "",
         "SELECT 1",
-        "CREATE SCHEMA reports",
-        "DROP SCHEMA reports",
         "CREATE DATABASE",
         "DROP DATABASE",
         "USE",
@@ -7951,6 +8082,7 @@ fn optionally_parses_only_the_network_admin_surface() {
         Ok(Some(MySqlAdminCommand::CreateDatabase {
             name: MySqlDatabaseName::parse("reports").unwrap(),
             only_if_missing: false,
+            collation: MySqlTableCollation::Utf8mb40900AiCi,
         }))
     );
     assert_eq!(

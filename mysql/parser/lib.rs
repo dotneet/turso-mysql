@@ -9,6 +9,7 @@ mod checked_primary_key;
 mod create_table_as_select;
 mod create_table_like;
 mod current_database;
+mod database_options;
 mod date_format;
 mod drop_table;
 mod drop_view;
@@ -178,9 +179,9 @@ pub use static_select_metadata::{
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column,
-    create_table_with_its_collation_on_each_text_column, table_collation_of, table_comment_change,
-    table_counter_change, table_engine_restated, table_options_of, MySqlTableCollation,
-    MySqlTableOptions,
+    create_table_with_its_collation_on_each_text_column, create_table_with_the_database_collation,
+    table_collation_of, table_comment_change, table_counter_change, table_engine_restated,
+    table_options_of, MySqlTableCollation, MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
@@ -1692,17 +1693,27 @@ impl TranslatedSelect {
 pub enum ParseError {
     Sqlparser(String),
     TursoParser(String),
-    ExpectedOneStatement { actual: usize },
+    ExpectedOneStatement {
+        actual: usize,
+    },
     ExpectedAdminCommand,
     ExpectedAccountAdminCommand,
     ExpectedTransactionCommand,
     TrailingAdminCommandTokens,
     TrailingAccountAdminCommandTokens,
-    InvalidAccountUsername { reason: &'static str },
+    InvalidAccountUsername {
+        reason: &'static str,
+    },
     UnsupportedAccountHost,
-    InvalidDatabaseName { reason: &'static str },
-    InvalidTableName { reason: &'static str },
-    InvalidSavepointName { reason: &'static str },
+    InvalidDatabaseName {
+        reason: &'static str,
+    },
+    InvalidTableName {
+        reason: &'static str,
+    },
+    InvalidSavepointName {
+        reason: &'static str,
+    },
     ExpectedCreateTable,
     ExpectedCreateIndex,
     ExpectedCreateView,
@@ -1712,7 +1723,19 @@ pub enum ParseError {
     ExpectedDml,
     JsonLiteralDefault,
     JsonIndex,
-    Unsupported { feature: &'static str },
+    /// A collation MySQL does not have, which MySQL answers with 1273.
+    UnknownCollation,
+    /// A character set MySQL does not have, which MySQL answers with 1115.
+    UnknownCharacterSet,
+    /// A collation beside another character set than its own, which MySQL
+    /// answers with 1253.
+    CollationOfAnotherCharacterSet,
+    /// Two different character sets named for one thing, which MySQL answers
+    /// with 1302.
+    ConflictingCharacterSets,
+    Unsupported {
+        feature: &'static str,
+    },
 }
 
 impl fmt::Display for ParseError {
@@ -1758,6 +1781,12 @@ impl fmt::Display for ParseError {
             Self::ExpectedDml => f.write_str("expected an INSERT, UPDATE, or DELETE statement"),
             Self::JsonLiteralDefault => f.write_str("JSON column cannot have a literal default"),
             Self::JsonIndex => f.write_str("JSON column cannot be indexed directly"),
+            Self::UnknownCollation => f.write_str("unknown collation"),
+            Self::UnknownCharacterSet => f.write_str("unknown character set"),
+            Self::CollationOfAnotherCharacterSet => {
+                f.write_str("collation is not valid for the character set")
+            }
+            Self::ConflictingCharacterSets => f.write_str("conflicting character sets"),
             Self::Unsupported { feature } => {
                 write!(f, "unsupported MySQL schema feature: {feature}")
             }
@@ -1918,9 +1947,26 @@ pub enum MySqlAdminCommand {
     CreateDatabase {
         name: MySqlDatabaseName,
         only_if_missing: bool,
+        /// What every table made in it takes when it names no collation.
+        collation: MySqlTableCollation,
+    },
+    /// Change the collation a database gives the tables made in it from now
+    /// on; `None` names the selected database.
+    AlterDatabase {
+        name: Option<MySqlDatabaseName>,
+        /// `None` when the statement names neither a character set nor a
+        /// collation, which leaves the database as it is.
+        collation: Option<MySqlTableCollation>,
     },
     /// Drop one logical database.
     DropDatabase { name: MySqlDatabaseName },
+    /// Print the `CREATE DATABASE` that makes a database as it is now.
+    ShowCreateDatabase {
+        name: MySqlDatabaseName,
+        /// The name as the statement wrote it, which MySQL prints.
+        written_name: String,
+        only_if_missing: bool,
+    },
     /// Select one logical database for the current session.
     Use { name: MySqlDatabaseName },
     /// List the logical databases visible to this session.
@@ -1933,7 +1979,9 @@ impl MySqlAdminCommand {
         match self {
             Self::CreateDatabase { name, .. }
             | Self::DropDatabase { name }
+            | Self::ShowCreateDatabase { name, .. }
             | Self::Use { name } => Some(name),
+            Self::AlterDatabase { name, .. } => name.as_ref(),
             Self::ListDatabases => None,
         }
     }

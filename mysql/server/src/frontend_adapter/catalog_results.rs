@@ -13,10 +13,23 @@ pub(super) fn admin_result_to_execution_result(
     match result {
         MySqlAdminCommandResult::Created { .. }
         | MySqlAdminCommandResult::AlreadyExists { .. }
+        | MySqlAdminCommandResult::Altered { .. }
         | MySqlAdminCommandResult::Dropped { .. }
         | MySqlAdminCommandResult::Selected { .. } => {
             Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
         }
+        MySqlAdminCommandResult::CreateStatement {
+            database,
+            statement,
+        } => Ok(CommandExecutionResult::ResultSet(TextResultSet {
+            columns: show_create_database_columns(),
+            rows: vec![vec![
+                Some(database.into_bytes()),
+                Some(statement.into_bytes()),
+            ]],
+            warnings: 0,
+            status_flags: 0x0002,
+        })),
         MySqlAdminCommandResult::Listed { databases } => {
             if databases.len() > MAX_DISPATCH_RESULT_ROWS {
                 return Err(FrontendErrorKind::Internal);
@@ -33,6 +46,23 @@ pub(super) fn admin_result_to_execution_result(
             }))
         }
     }
+}
+
+/// Measured on MySQL 8.4.11: both columns are `VAR_STRING` with 31 decimals
+/// and only the not-null flag, and `Create Database` is 4096 long whatever the
+/// statement's length.
+fn show_create_database_columns() -> Vec<ColumnDefinitionConfig> {
+    [("Database", 256u32), ("Create Database", 4096)]
+        .into_iter()
+        .map(|(name, column_length)| {
+            let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.column_length = column_length;
+            column.decimals = 31;
+            column.flags = MYSQL_NOT_NULL_FLAG;
+            column
+        })
+        .collect()
 }
 
 pub(super) fn information_schema_schemata_result_to_execution_result(
@@ -1805,25 +1835,21 @@ pub(super) fn information_schema_schemata_columns() -> Vec<ColumnDefinitionConfi
     columns
 }
 
-/// The rows `information_schema.SCHEMATA` answers, one for each database the
-/// session may list.
+/// The row `information_schema.SCHEMATA` answers for one database.
 ///
-/// Every database here is made with MySQL's default character set and
-/// collation, and none is encrypted.
-pub(super) fn information_schema_schemata_rows(databases: Vec<String>) -> Vec<Vec<Value>> {
-    databases
-        .into_iter()
-        .map(|database| {
-            vec![
-                Value::build_text("def"),
-                Value::build_text(database),
-                Value::build_text("utf8mb4"),
-                Value::build_text("utf8mb4_0900_ai_ci"),
-                Value::Null,
-                Value::build_text("NO"),
-            ]
-        })
-        .collect()
+/// Every database here is `utf8mb4`, and none is encrypted.
+pub(super) fn information_schema_schemata_row(
+    database: String,
+    collation: turso_mysql_parser::MySqlTableCollation,
+) -> Vec<Value> {
+    vec![
+        Value::build_text("def"),
+        Value::build_text(database),
+        Value::build_text("utf8mb4"),
+        Value::build_text(collation.name()),
+        Value::Null,
+        Value::build_text("NO"),
+    ]
 }
 
 fn information_schema_column_definition(

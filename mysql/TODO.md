@@ -235,7 +235,11 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
 | A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
-| `CREATE DATABASE` naming a character set, collation or encryption but `utf8mb4`, `utf8mb4_0900_ai_ci` and `'N'` — Prisma's and Laravel's `utf8mb4_unicode_ci` among them | refused; MySQL gives every table made in such a database that collation, and a database here keeps none of its own to give |
+| `CREATE DATABASE` or `ALTER DATABASE` naming a character set but `utf8mb4`, a collation but `utf8mb4_0900_ai_ci` and `utf8mb4_unicode_ci` — `utf8mb4_bin` and `utf8mb4_general_ci` among them — or an encryption but `'N'` | refused; MySQL gives every table made in the database that collation, and a table here can take only those two as its own |
+| `CREATE DATABASE IF NOT EXISTS` over a database already there, naming a character set or collation that would be refused | refused; measured, MySQL answers OK with note 1007 and leaves the database as it is |
+| `ALTER DATABASE ... READ ONLY` | refused; measured, MySQL then refuses every write to the database |
+| `CREATE TABLE ... SELECT` in a database whose collation is not `utf8mb4_0900_ai_ci` | refused; measured, MySQL gives the table the database's collation and each column its source column's, spelled out, which the column copy here does not write |
+| `SHOW CREATE DATABASE` of `information_schema` and the other system databases | refused; measured, MySQL prints `information_schema` as `utf8mb3`, and this server lists none of them |
 | `ALTER TABLE v DISABLE KEYS` / `ENABLE KEYS` over a view | refused, where MySQL answers 1347 |
 | A view over more than one table, or with a `WHERE` — what a dump of a view over a join writes | refused; a view here reads one table's columns as they stand |
 | A trigger whose values are anything but a `NEW` column or a literal — `CONCAT('post ', NEW.title)` | refused |

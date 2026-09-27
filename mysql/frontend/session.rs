@@ -76,6 +76,10 @@ pub struct MySqlConnection {
     /// The catalog's WAL keeper and this connection's database, when the
     /// connection belongs to a catalog.
     wal_keeper: Option<(WalKeeperHandle, std::sync::Weak<turso_core::Database>)>,
+    /// The collation this connection's database gives a new table that names
+    /// none, shared with every other connection to it so that an `ALTER
+    /// DATABASE` one of them runs reaches the next `CREATE TABLE` of all.
+    database_collation: Option<SharedDatabaseCollation>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -159,6 +163,31 @@ impl Drop for CloseOnLastDrop {
         // A drop has nowhere to report a failure to. A closing checkpoint that
         // fails leaves the WAL for the next open, which recovers it.
         let _ = self.0.close();
+    }
+}
+
+/// A database's collation, held once by the catalog and shared with every
+/// connection to the database.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SharedDatabaseCollation(Arc<Mutex<turso_mysql_parser::MySqlTableCollation>>);
+
+impl SharedDatabaseCollation {
+    pub(crate) fn new(collation: turso_mysql_parser::MySqlTableCollation) -> Self {
+        Self(Arc::new(Mutex::new(collation)))
+    }
+
+    pub(crate) fn get(&self) -> turso_mysql_parser::MySqlTableCollation {
+        *self
+            .0
+            .lock()
+            .expect("MySQL database collation mutex poisoned")
+    }
+
+    pub(crate) fn set(&self, collation: turso_mysql_parser::MySqlTableCollation) {
+        *self
+            .0
+            .lock()
+            .expect("MySQL database collation mutex poisoned") = collation;
     }
 }
 
@@ -1343,6 +1372,7 @@ impl MySqlConnection {
             prepared_statement_authority,
             schema_readings: Arc::default(),
             wal_keeper: None,
+            database_collation: None,
         })
     }
 
@@ -1429,6 +1459,22 @@ impl MySqlConnection {
     ) -> Self {
         self.wal_keeper = Some((keeper, database));
         self
+    }
+
+    /// Gives this connection its database's collation, which a catalog keeps.
+    pub(crate) fn with_database_collation(mut self, collation: SharedDatabaseCollation) -> Self {
+        self.database_collation = Some(collation);
+        self
+    }
+
+    /// The collation a table made through this connection takes when it names
+    /// neither a character set nor a collation: its database's, and
+    /// `utf8mb4_0900_ai_ci` for a connection that belongs to no catalog.
+    pub fn database_collation(&self) -> turso_mysql_parser::MySqlTableCollation {
+        self.database_collation
+            .as_ref()
+            .map(SharedDatabaseCollation::get)
+            .unwrap_or_default()
     }
 
     pub(crate) fn truncate_the_wal_past(&self, frames: u64) -> Result<()> {
@@ -3584,6 +3630,9 @@ impl MySqlConnection {
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
     pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        if let Some(written) = self.with_the_database_collation(sql)? {
+            return self.execute_schema_ddl(&written);
+        }
         match self.column_default_an_alter_changes(sql)? {
             Some(turso_mysql_parser::MySqlColumnDefaultChange::Restated(restated)) => {
                 return self.execute_schema_ddl(&restated);
@@ -3783,6 +3832,22 @@ impl MySqlConnection {
         };
         turso_mysql_parser::alter_column_default_restated(&stored, sql, mode)
             .map_err(mysql_query_parse_error)
+    }
+
+    /// A `CREATE TABLE` naming neither a character set nor a collation, with
+    /// its database's collation written on as the table's own, where that is
+    /// not the default collation. MySQL gives such a table its database's
+    /// collation, so the table is then made exactly as MySQL makes it.
+    pub fn with_the_database_collation(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        turso_mysql_parser::create_table_with_the_database_collation(
+            sql,
+            self.parser_mode(),
+            self.database_collation(),
+        )
+        .map_err(mysql_query_parse_error)
     }
 
     /// A `CREATE TABLE` or `ALTER TABLE` with the collation of its table
@@ -4967,7 +5032,12 @@ impl MySqlConnection {
         let existed = self
             .names_a_table(checked.table())
             .map_err(MySqlQueryError::Engine)?;
-        self.prepare(checked.table_sql())
+        let collated = turso_mysql_parser::create_table_with_its_collation_on_each_text_column(
+            checked.table_sql(),
+            self.parser_mode(),
+        )
+        .map_err(mysql_query_parse_error)?;
+        self.prepare(collated.as_deref().unwrap_or_else(|| checked.table_sql()))
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(MySqlQueryError::Engine)?;
         if existed {

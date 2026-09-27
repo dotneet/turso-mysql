@@ -250,6 +250,71 @@ fn one_table_option(
     Some((table, option.value, value))
 }
 
+/// Writes a database's collation at the end of a `CREATE TABLE` that names
+/// neither a character set nor a collation, as the table's own.
+///
+/// Measured on MySQL 8.4.11: such a table in a database made `COLLATE
+/// utf8mb4_unicode_ci` is exactly the table written `COLLATE=utf8mb4_unicode_ci`
+/// — `SHOW CREATE TABLE` and `information_schema` print the same — while one
+/// naming only `CHARSET=utf8mb4` takes that character set's own default,
+/// `utf8mb4_0900_ai_ci`, and `CREATE TABLE ... LIKE` takes its source's.
+/// `CREATE TABLE ... SELECT` gives the new table the database's collation
+/// but each column its source column's, which the rewrite here would lose,
+/// so it is refused. Answers `None` where there is nothing to write.
+pub fn create_table_with_the_database_collation(
+    sql: &str,
+    mode: SessionSqlMode,
+    database_collation: MySqlTableCollation,
+) -> Result<Option<String>, ParseError> {
+    if database_collation == MySqlTableCollation::default() {
+        return Ok(None);
+    }
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+        return Ok(None);
+    };
+    if table.like.is_some() || table.clone.is_some() {
+        return Ok(None);
+    }
+    if table.query.is_some() {
+        return unsupported(
+            "CREATE TABLE ... SELECT in a database whose collation is not the default",
+        );
+    }
+    let names_its_own = match &table.table_options {
+        CreateTableOptions::None => false,
+        CreateTableOptions::Plain(options) => options.iter().any(|option| {
+            matches!(option, SqlOption::KeyValue { key, .. }
+                if super::names_a_collation(key) || super::names_a_character_set(key))
+        }),
+        // Refused where the options are read.
+        _ => return Ok(None),
+    };
+    if names_its_own {
+        return Ok(None);
+    }
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let Some(last) = tokens.iter().rev().find(|token| {
+        !matches!(
+            token.token,
+            Token::Whitespace(_) | Token::SemiColon | Token::EOF
+        )
+    }) else {
+        return Ok(None);
+    };
+    let Some(end) = byte_offset_of_location(sql, last.span.end) else {
+        return unsupported("CREATE TABLE whose end is unknown");
+    };
+    Ok(Some(format!(
+        "{} COLLATE={}{}",
+        &sql[..end],
+        database_collation.name(),
+        &sql[end..]
+    )))
+}
+
 /// Writes the collation a new table declares onto each of its text columns
 /// that names neither a character set nor a collation.
 ///
@@ -500,6 +565,55 @@ mod tests {
             )
             .unwrap(),
             "CREATE TABLE _prisma_migrations (\n    id VARCHAR(36) PRIMARY KEY NOT NULL COLLATE utf8mb4_unicode_ci,\n    logs TEXT COLLATE utf8mb4_unicode_ci\n) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        );
+    }
+
+    #[test]
+    fn a_table_naming_no_collation_is_given_its_databases() {
+        let given = |sql: &str, collation| {
+            create_table_with_the_database_collation(sql, SessionSqlMode::default(), collation)
+        };
+        let unicode = MySqlTableCollation::Utf8mb4UnicodeCi;
+        assert_eq!(
+            given("CREATE TABLE t (a VARCHAR(5)) ENGINE=InnoDB; -- made by hand\n", unicode),
+            Ok(Some(
+                "CREATE TABLE t (a VARCHAR(5)) ENGINE=InnoDB COLLATE=utf8mb4_unicode_ci; -- made by hand\n"
+                    .to_owned()
+            ))
+        );
+        assert_eq!(
+            given("create temporary table t (a text)", unicode),
+            Ok(Some(
+                "create temporary table t (a text) COLLATE=utf8mb4_unicode_ci".to_owned()
+            ))
+        );
+        for sql in [
+            "CREATE TABLE t (a VARCHAR(5)) DEFAULT CHARSET=utf8mb4",
+            "CREATE TABLE t (a VARCHAR(5)) CHARACTER SET = utf8mb4",
+            "CREATE TABLE t (a VARCHAR(5)) COLLATE utf8mb4_0900_ai_ci",
+            "CREATE TABLE t LIKE u",
+            "ALTER TABLE t ADD COLUMN b TEXT",
+            "SELECT 1",
+        ] {
+            assert_eq!(given(sql, unicode), Ok(None), "{sql}");
+        }
+        assert_eq!(
+            given(
+                "CREATE TABLE t (a TEXT)",
+                MySqlTableCollation::Utf8mb40900AiCi
+            ),
+            Ok(None)
+        );
+        assert!(matches!(
+            given("CREATE TABLE t AS SELECT a FROM u", unicode),
+            Err(ParseError::Unsupported { .. })
+        ));
+        assert_eq!(
+            given(
+                "CREATE TABLE t AS SELECT a FROM u",
+                MySqlTableCollation::Utf8mb40900AiCi
+            ),
+            Ok(None)
         );
     }
 

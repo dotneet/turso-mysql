@@ -298,9 +298,8 @@ fn warnings(adapter: &mut Adapter) -> Vec<Vec<Option<String>>> {
     rows(adapter, "SHOW WARNINGS")
 }
 
-/// Measured on MySQL 8.4.11. Prisma and Laravel create their database under
-/// `utf8mb4_unicode_ci`, which MySQL then gives every table made there; a
-/// database here keeps no collation of its own, so that is refused.
+/// Measured on MySQL 8.4.11. A character set and encryption a database here
+/// cannot keep are refused.
 #[test]
 fn create_database_takes_the_options_every_database_here_has() {
     let (_directory, mut adapter) = restoring_session();
@@ -343,8 +342,6 @@ fn create_database_takes_the_options_every_database_here_has() {
     assert!(warnings(&mut adapter).is_empty());
 
     for sql in [
-        "CREATE DATABASE prisma CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-        "create database `laravel2` default character set `utf8mb4` default collate `utf8mb4_unicode_ci`",
         "CREATE DATABASE l1 CHARACTER SET latin1",
         "CREATE DATABASE e1 ENCRYPTION 'Y'",
         "CREATE DATABASE /*!99999 IF NOT EXISTS*/ future",
@@ -352,7 +349,7 @@ fn create_database_takes_the_options_every_database_here_has() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
     let listed = rows(&mut adapter, "SHOW DATABASES");
-    for name in ["prisma", "laravel2", "l1", "e1", "future"] {
+    for name in ["l1", "e1", "future"] {
         assert!(!listed.contains(&row(&[Some(name)])), "{name}: {listed:?}");
     }
 }

@@ -897,6 +897,29 @@ where
         &mut self,
         selected_database: &str,
     ) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
+        let databases = self.schemata_databases(selected_database)?;
+        let mut rows = Vec::with_capacity(databases.len());
+        for database in databases {
+            // A database dropped since it was listed is not answered.
+            let collation = match self.catalog.collation(&database) {
+                Ok(collation) => collation,
+                Err(MySqlDatabaseError::DatabaseNotFound(_)) => continue,
+                Err(error) => return Err(database_error_kind(error)),
+            };
+            rows.push(catalog_results::information_schema_schemata_row(
+                database, collation,
+            ));
+        }
+        Ok(rows)
+    }
+
+    /// The databases `information_schema.SCHEMATA` answers: every one the
+    /// session may list, or the one it is in when it may list none.
+    #[cfg(unix)]
+    fn schemata_databases(
+        &mut self,
+        selected_database: &str,
+    ) -> Result<Vec<String>, FrontendErrorKind> {
         let databases = match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::List)
@@ -914,7 +937,7 @@ where
             Err(AuthorizationError::Denied) => vec![selected_database.to_owned()],
             Err(error) => return Err(authorization_frontend_error(error)),
         };
-        Ok(catalog_results::information_schema_schemata_rows(databases))
+        Ok(databases)
     }
 
     fn authorize_catalog_visibility(
@@ -1085,11 +1108,39 @@ where
                 })?;
                 self.raised_warnings.clear();
             }
+            MySqlAdminCommand::AlterDatabase { name, .. } => {
+                let canonical_name = match name {
+                    Some(name) => {
+                        canonicalize_database_name(name.as_str()).map_err(database_error_kind)?
+                    }
+                    None => self
+                        .session
+                        .selected_database()
+                        .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                        .to_owned(),
+                };
+                // Changing what a database gives the tables made in it is a
+                // schema change within it, which the grant to query it covers
+                // here as it covers `ALTER TABLE`.
+                self.authorize(DatabaseAction::Query {
+                    database: &canonical_name,
+                })?;
+            }
             MySqlAdminCommand::DropDatabase { name } => {
                 let canonical_name =
                     canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
                 self.authorize(DatabaseAction::Drop {
                     database: &canonical_name,
+                })?;
+            }
+            // Measured on MySQL 8.4.11: any privilege in the database lets a
+            // session print its `CREATE DATABASE`, a grant on one table of it
+            // among them, as any lets it select the database.
+            MySqlAdminCommand::ShowCreateDatabase { name, .. } => {
+                let canonical_name =
+                    canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
+                self.authorize(DatabaseAction::Connect {
+                    database: Some(&canonical_name),
                 })?;
             }
             MySqlAdminCommand::Use { name } => {
@@ -1118,10 +1169,16 @@ where
             }
         }
 
-        let result = self
-            .session
-            .execute_parsed_admin_command(command)
-            .map_err(database_error_kind)?;
+        let alters = matches!(command, MySqlAdminCommand::AlterDatabase { .. });
+        let result =
+            self.session
+                .execute_parsed_admin_command(command)
+                .map_err(|error| match error {
+                    MySqlDatabaseError::DatabaseNotFound(_) if alters => {
+                        FrontendErrorKind::NoDatabaseToAlter
+                    }
+                    error => database_error_kind(error),
+                })?;
         if matches!(result, MySqlAdminCommandResult::Selected { .. }) {
             self.carry_the_session_onto_its_connection()?;
         }
@@ -1876,6 +1933,8 @@ where
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
+        self.session_variables
+            .set_database_collation(self.session.selected_database_collation());
         let connection = self.session.connection().ok().cloned();
         if let Some(connection) = &connection {
             prepare_for_client_statement(connection, &self.session_variables)?;
@@ -1914,6 +1973,8 @@ where
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        self.session_variables
+            .set_database_collation(self.session.selected_database_collation());
         if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
             sql,
             self.session.session_sql_mode(),
@@ -1991,6 +2052,8 @@ where
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        self.session_variables
+            .set_database_collation(self.session.selected_database_collation());
         let connection = self
             .prepared_statements
             .statements
@@ -3364,6 +3427,24 @@ fn execute_checked_query(
         );
     }
     if is_schema_statement(sql) {
+        if let Some(written) = connection
+            .with_the_database_collation(sql)
+            .map_err(frontend_query_error)?
+        {
+            return execute_checked_query(
+                connection,
+                &written,
+                selected_database,
+                source_tables,
+                CheckedQueryOptions {
+                    query_timeout,
+                    select_time_limit,
+                    affected_rows_mode,
+                    sql_notes,
+                    raised,
+                },
+            );
+        }
         turso_mysql_parser::refuse_checks_numbered_out_of_order(sql, connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Unsupported)?;
         // MySQL answers a name that is already there before it looks at
@@ -10382,6 +10463,15 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
 fn admin_error_kind(error: MySqlAdminCommandError) -> FrontendErrorKind {
     match error {
         MySqlAdminCommandError::Syntax => FrontendErrorKind::Syntax,
+        MySqlAdminCommandError::Unsupported => FrontendErrorKind::Unsupported,
+        MySqlAdminCommandError::UnknownCollation => FrontendErrorKind::UnknownCollation,
+        MySqlAdminCommandError::UnknownCharacterSet => FrontendErrorKind::UnknownCharacterSet,
+        MySqlAdminCommandError::CollationOfAnotherCharacterSet => {
+            FrontendErrorKind::CollationOfAnotherCharacterSet
+        }
+        MySqlAdminCommandError::ConflictingCharacterSets => {
+            FrontendErrorKind::ConflictingCharacterSets
+        }
         MySqlAdminCommandError::Database(error) => database_error_kind(error),
     }
 }

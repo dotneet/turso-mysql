@@ -317,6 +317,17 @@ pub enum FrontendErrorKind {
     NoDatabaseSelected,
     /// A logical database already exists.
     DuplicateDatabase,
+    /// An `ALTER DATABASE` named a database that is not there.
+    NoDatabaseToAlter,
+    /// A statement named a collation MySQL does not have.
+    UnknownCollation,
+    /// A statement named a character set MySQL does not have.
+    UnknownCharacterSet,
+    /// A statement named a collation beside another character set than its
+    /// own.
+    CollationOfAnotherCharacterSet,
+    /// A statement named two different character sets for one thing.
+    ConflictingCharacterSets,
     /// A logical database cannot be changed while another session retains it.
     DatabaseBusy,
     /// A catalog or storage failure whose details must not reach the client.
@@ -425,6 +436,27 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::DuplicateDatabase => {
             (1007, *b"HY000", b"database already exists".as_slice())
         }
+        // Measured on MySQL 8.4.11: `ALTER DATABASE nope COLLATE ...` is 3503,
+        // SQLSTATE 42Y07, where `USE nope` is 1049. MySQL's messages name the
+        // database, collation or character set, where these stay fixed as
+        // every other one does.
+        FrontendErrorKind::NoDatabaseToAlter => {
+            (3503, *b"42Y07", b"Database doesn't exist".as_slice())
+        }
+        FrontendErrorKind::UnknownCollation => (1273, *b"HY000", b"Unknown collation".as_slice()),
+        FrontendErrorKind::UnknownCharacterSet => {
+            (1115, *b"42000", b"Unknown character set".as_slice())
+        }
+        FrontendErrorKind::CollationOfAnotherCharacterSet => (
+            1253,
+            *b"42000",
+            b"COLLATION is not valid for CHARACTER SET".as_slice(),
+        ),
+        FrontendErrorKind::ConflictingCharacterSets => (
+            1302,
+            *b"HY000",
+            b"Conflicting declarations: CHARACTER SET".as_slice(),
+        ),
         FrontendErrorKind::DatabaseBusy => (1205, *b"HY000", b"database is busy".as_slice()),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),

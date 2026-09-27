@@ -155,6 +155,10 @@ pub(crate) struct MySqlSessionVariables {
     max_execution_time: u64,
     /// The collation the session runs its connection on.
     connection_collation: ConnectionCollation,
+    /// The collation of the selected database as it was when the session
+    /// selected it, `None` with no database selected. The caller keeps this
+    /// up to date before every statement.
+    database_collation: Option<turso_mysql_parser::MySqlTableCollation>,
 }
 
 /// The `sql_mode` flags a session may turn on or off.
@@ -211,11 +215,19 @@ impl Default for MySqlSessionVariables {
             wait_timeout: None,
             max_execution_time: 0,
             connection_collation: ConnectionCollation::default(),
+            database_collation: None,
         }
     }
 }
 
 impl MySqlSessionVariables {
+    pub(crate) fn set_database_collation(
+        &mut self,
+        collation: Option<turso_mysql_parser::MySqlTableCollation>,
+    ) {
+        self.database_collation = collation;
+    }
+
     pub(crate) const fn sql_notes(&self) -> bool {
         self.sql_notes
     }
@@ -1294,14 +1306,21 @@ fn worded_system_variable(
     }
     // The connection runs on the collation the handshake sends, 45, until the
     // session names another, while a table this server writes is declared
-    // with the collation MySQL declares one with unless it names its own.
+    // with the collation MySQL declares one with unless it or its database
+    // names its own.
     if name.eq_ignore_ascii_case("collation_connection") {
         return Some(session_variables.connection_collation.name().to_owned());
     }
-    if name.eq_ignore_ascii_case("collation_server")
-        || name.eq_ignore_ascii_case("collation_database")
-    {
+    if name.eq_ignore_ascii_case("collation_server") {
         return Some(SERVER_DECLARED_COLLATION.to_owned());
+    }
+    // Measured on MySQL 8.4.11: with no database selected this reads the
+    // server's collation.
+    if name.eq_ignore_ascii_case("collation_database") {
+        return Some(match session_variables.database_collation {
+            Some(collation) => collation.name().to_owned(),
+            None => SERVER_DECLARED_COLLATION.to_owned(),
+        });
     }
     // Nothing here converts a moment between zones, which is the same as
     // running in UTC, and every zone a client may name means UTC.

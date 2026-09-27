@@ -4,6 +4,7 @@
 //! not SQL that sqlparser handles the way MySQL does, so they are read straight
 //! from the text instead.
 
+use super::database_options::consume_database_options;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,11 +210,13 @@ fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
 /// Parses one strict MySQL database-management command.
 ///
 /// The accepted grammar is exactly one of `CREATE DATABASE [IF NOT EXISTS]
-/// name [options]`, `DROP DATABASE name`, `USE name`, or `SHOW DATABASES`,
-/// followed by an optional semicolon. A versioned comment MySQL runs is read
-/// as the text it holds, which is how `mysqldump` writes its `CREATE
-/// DATABASE`. Database options naming anything but what every database here
-/// already is, `IF EXISTS` clauses, other comments, qualified names, and all
+/// name [options]`, `ALTER DATABASE [name] options`, `DROP DATABASE name`,
+/// `SHOW CREATE DATABASE [IF NOT EXISTS] name`, `USE name`, or `SHOW
+/// DATABASES`, `SCHEMA` standing for `DATABASE` in each, followed by an
+/// optional semicolon. A versioned comment MySQL runs is read as the text it
+/// holds, which is how `mysqldump` writes its `CREATE DATABASE`. Database
+/// options naming a character set, collation or encryption a database here
+/// cannot keep, `IF EXISTS` clauses, other comments, qualified names, and all
 /// trailing tokens are rejected. Names are checked and returned in canonical
 /// ASCII-lowercase form.
 pub fn parse_admin_command(
@@ -255,15 +258,63 @@ pub fn parse_optional_admin_command(
                 return Err(ParseError::ExpectedAdminCommand);
             }
             let name = consume_admin_database_name(&tokens, &mut cursor)?;
-            consume_database_options(&tokens, &mut cursor)?;
+            let collation = consume_database_options(&tokens, &mut cursor)?;
             MySqlAdminCommand::CreateDatabase {
                 name,
                 only_if_missing,
+                collation: collation.unwrap_or_default(),
             }
+        }
+        AdminStatementKind::AlterDatabase => {
+            let name = match tokens.get(cursor) {
+                Some(AdminToken::Word(word)) if !starts_a_database_option(word) => {
+                    Some(consume_admin_database_name(&tokens, &mut cursor)?)
+                }
+                Some(AdminToken::QuotedIdentifier(_)) => {
+                    Some(consume_admin_database_name(&tokens, &mut cursor)?)
+                }
+                _ => None,
+            };
+            let options_start = cursor;
+            let collation = consume_database_options(&tokens, &mut cursor)?;
+            // Measured on MySQL 8.4.11: `READ ONLY = 1` makes every table of
+            // the database refuse writes, which this server does not do.
+            if consume_admin_word(&tokens, &mut cursor, "READ") {
+                return Err(ParseError::Unsupported {
+                    feature: "ALTER DATABASE READ ONLY",
+                });
+            }
+            // Measured on MySQL 8.4.11: an `ALTER DATABASE` naming no option
+            // at all is 1064.
+            if cursor == options_start {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            MySqlAdminCommand::AlterDatabase { name, collation }
         }
         AdminStatementKind::DropDatabase => MySqlAdminCommand::DropDatabase {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
         },
+        AdminStatementKind::ShowCreateDatabase => {
+            let only_if_missing = consume_admin_word(&tokens, &mut cursor, "IF");
+            if only_if_missing
+                && !(consume_admin_word(&tokens, &mut cursor, "NOT")
+                    && consume_admin_word(&tokens, &mut cursor, "EXISTS"))
+            {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            // Measured on MySQL 8.4.11 with `lower_case_table_names=1`, the
+            // rule this server follows: `SHOW CREATE DATABASE MIXEDDB` finds
+            // `mixeddb` and prints the name as it was written.
+            let written_name = match tokens.get(cursor) {
+                Some(AdminToken::Word(name) | AdminToken::QuotedIdentifier(name)) => name.clone(),
+                _ => return Err(ParseError::ExpectedAdminCommand),
+            };
+            MySqlAdminCommand::ShowCreateDatabase {
+                name: consume_admin_database_name(&tokens, &mut cursor)?,
+                written_name,
+                only_if_missing,
+            }
+        }
         AdminStatementKind::Use => MySqlAdminCommand::Use {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
         },
@@ -277,56 +328,6 @@ pub fn parse_optional_admin_command(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(command))
-}
-
-/// Reads the options of a `CREATE DATABASE`, taking only the ones that name
-/// what every database here already is.
-///
-/// Measured on MySQL 8.4.11: each may start with `DEFAULT`, take an `=`, be
-/// written in any order and more than once, and a name may be bare, quoted
-/// with backticks or a string; `SHOW CREATE DATABASE` then prints `DEFAULT
-/// CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci` and `DEFAULT
-/// ENCRYPTION='N'`. A database here keeps no character set, collation or
-/// encryption of its own: a table made in it without a collation of its own
-/// is `utf8mb4_0900_ai_ci`, as a table made in such a MySQL database is, so
-/// that is the one database collation that can be kept. Prisma and Laravel
-/// create theirs under `utf8mb4_unicode_ci`, and MySQL then gives every
-/// table made there that collation, which this refuses rather than breaks.
-fn consume_database_options(tokens: &[AdminToken], cursor: &mut usize) -> Result<(), ParseError> {
-    loop {
-        let _ = consume_admin_word(tokens, cursor, "DEFAULT");
-        let named = if consume_admin_word(tokens, cursor, "CHARACTER") {
-            if !consume_admin_word(tokens, cursor, "SET") {
-                return Err(ParseError::ExpectedAdminCommand);
-            }
-            "utf8mb4"
-        } else if consume_admin_word(tokens, cursor, "CHARSET") {
-            "utf8mb4"
-        } else if consume_admin_word(tokens, cursor, "COLLATE") {
-            "utf8mb4_0900_ai_ci"
-        } else if consume_admin_word(tokens, cursor, "ENCRYPTION") {
-            "N"
-        } else {
-            return Ok(());
-        };
-        if matches!(tokens.get(*cursor), Some(AdminToken::Equals)) {
-            *cursor += 1;
-        }
-        let value = match tokens.get(*cursor) {
-            Some(
-                AdminToken::Word(value)
-                | AdminToken::QuotedIdentifier(value)
-                | AdminToken::StringLiteral(value),
-            ) => value,
-            _ => return Err(ParseError::ExpectedAdminCommand),
-        };
-        if !value.eq_ignore_ascii_case(named) {
-            return Err(ParseError::Unsupported {
-                feature: "database character set, collation or encryption this server cannot keep",
-            });
-        }
-        *cursor += 1;
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,7 +353,9 @@ pub(crate) enum AdminToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminStatementKind {
     CreateDatabase,
+    AlterDatabase,
     DropDatabase,
+    ShowCreateDatabase,
     Use,
     ListDatabases,
 }
@@ -651,6 +654,9 @@ fn admin_statement_kind(
     if consume_admin_word(tokens, cursor, "CREATE") {
         return admin_database_statement_kind(tokens, cursor, AdminStatementKind::CreateDatabase);
     }
+    if consume_admin_word(tokens, cursor, "ALTER") {
+        return admin_database_statement_kind(tokens, cursor, AdminStatementKind::AlterDatabase);
+    }
     if consume_admin_word(tokens, cursor, "DROP") {
         return admin_database_statement_kind(tokens, cursor, AdminStatementKind::DropDatabase);
     }
@@ -658,6 +664,16 @@ fn admin_statement_kind(
         return Ok(Some(AdminStatementKind::Use));
     }
     if consume_admin_word(tokens, cursor, "SHOW") {
+        let after_show = *cursor;
+        if consume_admin_word(tokens, cursor, "CREATE") {
+            if consume_admin_word(tokens, cursor, "DATABASE")
+                || consume_admin_word(tokens, cursor, "SCHEMA")
+            {
+                return Ok(Some(AdminStatementKind::ShowCreateDatabase));
+            }
+            *cursor = after_show;
+            return Ok(None);
+        }
         return admin_database_statement_kind(tokens, cursor, AdminStatementKind::ListDatabases);
     }
     Ok(None)
@@ -668,12 +684,19 @@ fn admin_database_statement_kind(
     cursor: &mut usize,
     kind: AdminStatementKind,
 ) -> Result<Option<AdminStatementKind>, ParseError> {
-    let expected = match kind {
-        AdminStatementKind::CreateDatabase | AdminStatementKind::DropDatabase => "DATABASE",
-        AdminStatementKind::ListDatabases => "DATABASES",
-        AdminStatementKind::Use => unreachable!("USE does not have a second keyword"),
+    let expected: &[&str] = match kind {
+        AdminStatementKind::CreateDatabase
+        | AdminStatementKind::AlterDatabase
+        | AdminStatementKind::DropDatabase => &["DATABASE", "SCHEMA"],
+        AdminStatementKind::ListDatabases => &["DATABASES"],
+        AdminStatementKind::Use | AdminStatementKind::ShowCreateDatabase => {
+            unreachable!("USE and SHOW CREATE read their own keywords")
+        }
     };
-    if consume_admin_word(tokens, cursor, expected) {
+    if expected
+        .iter()
+        .any(|expected| consume_admin_word(tokens, cursor, expected))
+    {
         return Ok(Some(kind));
     }
     match tokens.get(*cursor) {
@@ -760,6 +783,21 @@ pub(crate) fn consume_admin_qualified_table_name(
     *cursor += 1;
     let table = consume_admin_table_name(tokens, cursor)?;
     Ok((Some(MySqlDatabaseName::parse(first.as_str())?), table))
+}
+
+/// Whether an `ALTER DATABASE` naming no database goes straight on to its
+/// options with this word.
+fn starts_a_database_option(word: &str) -> bool {
+    [
+        "DEFAULT",
+        "CHARACTER",
+        "CHARSET",
+        "COLLATE",
+        "ENCRYPTION",
+        "READ",
+    ]
+    .iter()
+    .any(|option| word.eq_ignore_ascii_case(option))
 }
 
 fn is_admin_keyword(word: &str) -> bool {

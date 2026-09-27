@@ -1,6 +1,7 @@
 //! Pathless Core attachment through the trusted MySQL database registry.
 
 use crate::named_locks::MySqlNamedLocks;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -11,11 +12,15 @@ use turso_core::storage::auto_increment::{
     AllocatorDatabaseIdentity, AllocatorOpenMode, DurableRangeAllocator,
 };
 use turso_core::{Database, IOExt as _, PlatformIO, PreopenedDatabaseIdentity, IO};
-use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, SessionSqlMode};
+use turso_mysql_parser::{
+    parse_optional_admin_command, MySqlAdminCommand, MySqlTableCollation, ParseError,
+    SessionSqlMode,
+};
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
 use crate::schema_sql::SchemaSqlSessionContext;
+use crate::session::SharedDatabaseCollation;
 use crate::wal_keeper::WalKeeper;
 use crate::{MySqlConnection, MySqlPreparedStatementAuthority, MySqlQueryError};
 
@@ -79,8 +84,14 @@ pub enum MySqlAdminCommandResult {
     /// `CREATE DATABASE IF NOT EXISTS` found the database already there and
     /// left it as it stands.
     AlreadyExists { database: String },
+    /// A logical database was given a new collation for the tables made in
+    /// it from now on, or had its options restated.
+    Altered { database: String },
     /// A logical database was dropped.
     Dropped { database: String },
+    /// The `CREATE DATABASE` that makes a database as it is now, beside the
+    /// name it was asked for by.
+    CreateStatement { database: String, statement: String },
     /// A session now selects the named logical database.
     Selected { database: String },
     /// The catalog's ready logical databases in canonical order.
@@ -96,6 +107,17 @@ pub enum MySqlAdminCommandResult {
 pub enum MySqlAdminCommandError {
     /// The input was not one strict single-statement admin command.
     Syntax,
+    /// The command is one MySQL takes and this server refuses.
+    Unsupported,
+    /// The command named a collation MySQL does not have.
+    UnknownCollation,
+    /// The command named a character set MySQL does not have.
+    UnknownCharacterSet,
+    /// The command named a collation beside another character set than its
+    /// own.
+    CollationOfAnotherCharacterSet,
+    /// The command named two different character sets.
+    ConflictingCharacterSets,
     /// The catalog rejected a valid command.
     Database(MySqlDatabaseError),
 }
@@ -104,6 +126,13 @@ impl fmt::Display for MySqlAdminCommandError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Syntax => f.write_str("syntax error"),
+            Self::Unsupported => f.write_str("not supported"),
+            Self::UnknownCollation => f.write_str("unknown collation"),
+            Self::UnknownCharacterSet => f.write_str("unknown character set"),
+            Self::CollationOfAnotherCharacterSet => {
+                f.write_str("collation is not valid for the character set")
+            }
+            Self::ConflictingCharacterSets => f.write_str("conflicting character sets"),
             Self::Database(error) => error.fmt(f),
         }
     }
@@ -112,8 +141,8 @@ impl fmt::Display for MySqlAdminCommandError {
 impl Error for MySqlAdminCommandError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Syntax => None,
             Self::Database(error) => Some(error),
+            _ => None,
         }
     }
 }
@@ -121,6 +150,19 @@ impl Error for MySqlAdminCommandError {
 impl From<MySqlDatabaseError> for MySqlAdminCommandError {
     fn from(error: MySqlDatabaseError) -> Self {
         Self::Database(error)
+    }
+}
+
+impl From<ParseError> for MySqlAdminCommandError {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::Unsupported { .. } => Self::Unsupported,
+            ParseError::UnknownCollation => Self::UnknownCollation,
+            ParseError::UnknownCharacterSet => Self::UnknownCharacterSet,
+            ParseError::CollationOfAnotherCharacterSet => Self::CollationOfAnotherCharacterSet,
+            ParseError::ConflictingCharacterSets => Self::ConflictingCharacterSets,
+            _ => Self::Syntax,
+        }
     }
 }
 
@@ -202,12 +244,44 @@ impl MySqlDatabaseCatalog {
 
     /// Create and publish an empty logical database, returning its canonical name.
     pub fn create(&self, requested_name: &str) -> Result<String, MySqlDatabaseError> {
+        self.create_with_collation(requested_name, MySqlTableCollation::default())
+    }
+
+    /// Create and publish an empty logical database whose tables take
+    /// `collation` when they name none, returning its canonical name.
+    pub fn create_with_collation(
+        &self,
+        requested_name: &str,
+        collation: MySqlTableCollation,
+    ) -> Result<String, MySqlDatabaseError> {
         let mut catalog = self.lock()?;
         let (name, database) = catalog
-            .create(requested_name)
+            .create_with_collation(requested_name, collation)
             .map_err(MySqlDatabaseError::from)?;
         drop(database);
         Ok(name.as_str().to_owned())
+    }
+
+    /// The collation a database gives the tables made in it that name none.
+    pub fn collation(
+        &self,
+        requested_name: &str,
+    ) -> Result<MySqlTableCollation, MySqlDatabaseError> {
+        self.lock()?
+            .collation(requested_name)
+            .map_err(MySqlDatabaseError::from)
+    }
+
+    /// Durably changes the collation a database gives the tables made in it
+    /// from now on, for every session. The tables already there keep theirs.
+    pub fn set_collation(
+        &self,
+        requested_name: &str,
+        collation: MySqlTableCollation,
+    ) -> Result<(), MySqlDatabaseError> {
+        self.lock()?
+            .set_collation(requested_name, collation)
+            .map_err(MySqlDatabaseError::from)
     }
 
     /// Drop a logical database once no session still selects it.
@@ -274,6 +348,11 @@ pub struct MySqlDatabaseSession {
 struct SelectedDatabase {
     name: String,
     connection: MySqlConnection,
+    /// The database's collation when it was selected, which is what
+    /// `@@collation_database` reads: measured on MySQL 8.4.11, an `ALTER
+    /// DATABASE` another session runs reaches this session's next `CREATE
+    /// TABLE` but not this reading until the database is selected again.
+    collation_when_selected: MySqlTableCollation,
 }
 
 impl MySqlDatabaseSession {
@@ -286,8 +365,7 @@ impl MySqlDatabaseSession {
         &self,
         sql: &str,
     ) -> Result<Option<MySqlAdminCommand>, MySqlAdminCommandError> {
-        parse_optional_admin_command(sql, self.parser_mode())
-            .map_err(|_| MySqlAdminCommandError::Syntax)
+        parse_optional_admin_command(sql, self.parser_mode()).map_err(MySqlAdminCommandError::from)
     }
 
     /// Executes one strict database-management command in this trusted
@@ -318,13 +396,39 @@ impl MySqlDatabaseSession {
             MySqlAdminCommand::CreateDatabase {
                 name,
                 only_if_missing,
-            } => match self.catalog.create(name.as_str()) {
+                collation,
+            } => match self.catalog.create_with_collation(name.as_str(), collation) {
                 Ok(database) => Ok(MySqlAdminCommandResult::Created { database }),
                 Err(MySqlDatabaseError::DatabaseAlreadyExists(database)) if only_if_missing => {
                     Ok(MySqlAdminCommandResult::AlreadyExists { database })
                 }
                 Err(error) => Err(error),
             },
+            MySqlAdminCommand::AlterDatabase { name, collation } => {
+                let database = match name {
+                    Some(name) => name.into_string(),
+                    None => self
+                        .selected_database()
+                        .ok_or(MySqlDatabaseError::NoDatabaseSelected)?
+                        .to_owned(),
+                };
+                let Some(collation) = collation else {
+                    self.catalog.collation(&database)?;
+                    return Ok(MySqlAdminCommandResult::Altered { database });
+                };
+                self.catalog.set_collation(&database, collation)?;
+                // Measured on MySQL 8.4.11: the session that alters the
+                // database it is in reads the new collation back straight
+                // away.
+                if let Some(selected) = self
+                    .selected
+                    .as_mut()
+                    .filter(|selected| selected.name == database)
+                {
+                    selected.collation_when_selected = collation;
+                }
+                Ok(MySqlAdminCommandResult::Altered { database })
+            }
             MySqlAdminCommand::DropDatabase { name } => {
                 let database = name.into_string();
                 if self.selected_database() == Some(database.as_str()) {
@@ -332,6 +436,17 @@ impl MySqlDatabaseSession {
                 }
                 self.catalog.drop_database(&database)?;
                 Ok(MySqlAdminCommandResult::Dropped { database })
+            }
+            MySqlAdminCommand::ShowCreateDatabase {
+                name,
+                written_name,
+                only_if_missing,
+            } => {
+                let collation = self.catalog.collation(name.as_str())?;
+                Ok(MySqlAdminCommandResult::CreateStatement {
+                    statement: create_database_statement(&written_name, collation, only_if_missing),
+                    database: written_name,
+                })
             }
             MySqlAdminCommand::Use { name } => {
                 let database = name.into_string();
@@ -353,6 +468,9 @@ impl MySqlDatabaseSession {
                 .acquire_with_allocator(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
             let io = Arc::clone(&catalog.io);
+            let collation = catalog
+                .shared_collation(&canonical_name)
+                .map_err(MySqlDatabaseError::from)?;
             let connection = database
                 .connect()
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
@@ -365,11 +483,13 @@ impl MySqlDatabaseSession {
                     self.prepared_statement_authority.clone(),
                 )
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?
-                .with_wal_keeper(self.catalog.wal_keeper.handle(), Arc::downgrade(&database));
+                .with_wal_keeper(self.catalog.wal_keeper.handle(), Arc::downgrade(&database))
+                .with_database_collation(collation.clone());
             connection.set_last_insert_id(self.last_insert_id);
             SelectedDatabase {
                 name: canonical_name,
                 connection,
+                collation_when_selected: collation.get(),
             }
         };
 
@@ -389,6 +509,14 @@ impl MySqlDatabaseSession {
         self.selected
             .as_ref()
             .map(|selected| selected.name.as_str())
+    }
+
+    /// The collation `@@collation_database` reads: the selected database's as
+    /// it was when it was selected, or `None` with no database selected.
+    pub fn selected_database_collation(&self) -> Option<MySqlTableCollation> {
+        self.selected
+            .as_ref()
+            .map(|selected| selected.collation_when_selected)
     }
 
     /// Return the selected connection for checked MySQL statement execution.
@@ -427,11 +555,35 @@ impl MySqlDatabaseSession {
     }
 }
 
+/// What `SHOW CREATE DATABASE` prints for a database of this collation.
+///
+/// Measured on MySQL 8.4.11: the name is printed as the statement wrote it,
+/// and every database here is `utf8mb4` and unencrypted.
+fn create_database_statement(
+    written_name: &str,
+    collation: MySqlTableCollation,
+    only_if_missing: bool,
+) -> String {
+    format!(
+        "CREATE DATABASE {}`{}` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE {} */ /*!80016 DEFAULT ENCRYPTION='N' */",
+        if only_if_missing {
+            "/*!32312 IF NOT EXISTS*/ "
+        } else {
+            ""
+        },
+        written_name.replace('`', "``"),
+        collation.name()
+    )
+}
+
 /// Owns the trusted root capability and opens registered MySQL databases
 /// without exposing a filesystem path to Core or to logical-database callers.
 pub(crate) struct DatabaseCatalog {
     registry: OsDatabaseRegistry,
     io: Arc<dyn IO>,
+    /// The collation of each database a session has selected, shared with
+    /// that session's connection.
+    shared_collations: BTreeMap<DatabaseName, SharedDatabaseCollation>,
 }
 
 impl DatabaseCatalog {
@@ -440,13 +592,27 @@ impl DatabaseCatalog {
         let root = OsDataRoot::open(root_path.as_ref())?;
         let registry = DatabaseRegistry::open_or_create(root)?;
         let io = Arc::new(PlatformIO::new().map_err(|_| RegistryError::Backend)?);
-        Ok(Self { registry, io })
+        Ok(Self {
+            registry,
+            io,
+            shared_collations: BTreeMap::new(),
+        })
     }
 
     /// Creates, initializes, publishes, and opens one logical database.
     pub(crate) fn create(
         &mut self,
         requested_name: &str,
+    ) -> Result<(DatabaseName, Arc<Database>), RegistryError> {
+        self.create_with_collation(requested_name, MySqlTableCollation::default())
+    }
+
+    /// Creates, initializes, publishes, and opens one logical database whose
+    /// tables take `collation` when they name none.
+    pub(crate) fn create_with_collation(
+        &mut self,
+        requested_name: &str,
+        collation: MySqlTableCollation,
     ) -> Result<(DatabaseName, Arc<Database>), RegistryError> {
         let io = Arc::clone(&self.io);
         // The registry canonicalizes the name it was given, and the tables the
@@ -455,8 +621,10 @@ impl DatabaseCatalog {
             .map_err(|_| RegistryError::Backend)?
             .as_str()
             .to_owned();
-        self.registry
-            .create_with_initializer(requested_name, move |stage, expected, lifetime| {
+        self.registry.create_with_initializer(
+            requested_name,
+            collation,
+            move |stage, expected, lifetime| {
                 let identity = PreopenedDatabaseIdentity::new(expected.file_key().as_str())
                     .map_err(|_| RegistryError::Backend)?;
                 let durable_identity = expected.file_key().to_database_identity()?;
@@ -481,7 +649,8 @@ impl DatabaseCatalog {
                     },
                 )
                 .map_err(|_| RegistryError::Backend)
-            })
+            },
+        )
     }
 
     /// Acquires and opens one ready logical database by its canonical name.
@@ -535,9 +704,48 @@ impl DatabaseCatalog {
         Ok((database, allocator))
     }
 
+    /// The collation a ready database gives the tables made in it.
+    pub(crate) fn collation(
+        &self,
+        requested_name: &str,
+    ) -> Result<MySqlTableCollation, RegistryError> {
+        self.registry.collation(requested_name)
+    }
+
+    /// Durably changes a ready database's collation, then hands the new one to
+    /// every connection to it.
+    pub(crate) fn set_collation(
+        &mut self,
+        requested_name: &str,
+        collation: MySqlTableCollation,
+    ) -> Result<(), RegistryError> {
+        let name = self.registry.set_collation(requested_name, collation)?;
+        if let Some(shared) = self.shared_collations.get(&name) {
+            shared.set(collation);
+        }
+        Ok(())
+    }
+
+    /// The collation every connection to a ready database shares.
+    fn shared_collation(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<SharedDatabaseCollation, RegistryError> {
+        let name = DatabaseName::parse(requested_name)?;
+        if let Some(shared) = self.shared_collations.get(&name) {
+            return Ok(shared.clone());
+        }
+        let shared = SharedDatabaseCollation::new(self.registry.collation(name.as_str())?);
+        self.shared_collations.insert(name, shared.clone());
+        Ok(shared)
+    }
+
     /// Drops a ready logical database after all Core references release it.
     pub(crate) fn drop_database(&mut self, requested_name: &str) -> Result<(), RegistryError> {
-        self.registry.drop_database(requested_name)
+        self.registry.drop_database(requested_name)?;
+        self.shared_collations
+            .remove(&DatabaseName::parse(requested_name)?);
+        Ok(())
     }
 
     /// Lists ready logical databases in canonical order.
@@ -1449,7 +1657,6 @@ mod tests {
         for sql in [
             "CREATE DATABASE one; DROP DATABASE two",
             "CREATE DATABASE one -- comment",
-            "CREATE DATABASE one CHARACTER SET latin1",
             "DROP DATABASE IF EXISTS one",
             "USE one /* comment */",
         ] {
@@ -1458,8 +1665,64 @@ mod tests {
             assert_eq!(error.to_string(), "syntax error");
             assert!(!error.to_string().contains(&root_path));
         }
+        assert_eq!(
+            session.execute_admin_command("CREATE DATABASE one CHARACTER SET latin1"),
+            Err(MySqlAdminCommandError::Unsupported)
+        );
         assert!(catalog.list().unwrap().is_empty());
         assert_eq!(session.selected_database(), None);
+    }
+
+    /// The collation lives in the registry, which is written whole to a new
+    /// file and renamed over the old one, so it is there after a restart and
+    /// never half written.
+    #[test]
+    fn a_database_collation_survives_reopening_the_catalog() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        for sql in [
+            "CREATE DATABASE made COLLATE utf8mb4_unicode_ci",
+            "CREATE DATABASE altered",
+            "ALTER DATABASE altered COLLATE utf8mb4_unicode_ci",
+            "CREATE DATABASE plain",
+        ] {
+            session.execute_admin_command(sql).unwrap();
+        }
+        session.execute_admin_command("USE altered").unwrap();
+        assert_eq!(
+            session.selected_database_collation(),
+            Some(MySqlTableCollation::Utf8mb4UnicodeCi)
+        );
+        assert_eq!(
+            session.connection().unwrap().database_collation(),
+            MySqlTableCollation::Utf8mb4UnicodeCi
+        );
+        drop(session);
+        drop(catalog);
+
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        for (database, collation) in [
+            ("made", MySqlTableCollation::Utf8mb4UnicodeCi),
+            ("altered", MySqlTableCollation::Utf8mb4UnicodeCi),
+            ("plain", MySqlTableCollation::Utf8mb40900AiCi),
+        ] {
+            assert_eq!(catalog.collation(database), Ok(collation), "{database}");
+        }
+        let mut session = catalog.new_session(binary_context());
+        assert_eq!(session.selected_database_collation(), None);
+        session.execute_admin_command("USE made").unwrap();
+        assert_eq!(
+            session.connection().unwrap().database_collation(),
+            MySqlTableCollation::Utf8mb4UnicodeCi
+        );
+        assert_eq!(
+            session.execute_admin_command("SHOW CREATE DATABASE Made"),
+            Ok(MySqlAdminCommandResult::CreateStatement {
+                database: "Made".to_owned(),
+                statement: "CREATE DATABASE `Made` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci */ /*!80016 DEFAULT ENCRYPTION='N' */".to_owned(),
+            })
+        );
     }
 
     #[test]

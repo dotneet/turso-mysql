@@ -324,11 +324,15 @@ mod five_artifact_tests {
         let mut registry = DatabaseRegistry::open_or_create(root).unwrap();
 
         assert_eq!(
-            registry.create_with_initializer("sidecar_sync_failure", |stage, _, lifetime| {
-                initialize_main(stage)?;
-                drop(lifetime);
-                Ok(())
-            }),
+            registry.create_with_initializer(
+                "sidecar_sync_failure",
+                turso_mysql_parser::MySqlTableCollation::default(),
+                |stage, _, lifetime| {
+                    initialize_main(stage)?;
+                    drop(lifetime);
+                    Ok(())
+                }
+            ),
             Err(RegistryError::Backend)
         );
 
@@ -413,11 +417,15 @@ mod five_artifact_tests {
                 });
 
             assert_eq!(
-                registry.create_with_initializer("publish_failure", |stage, _, lifetime| {
-                    initialize_main(stage)?;
-                    drop(lifetime);
-                    Ok(())
-                }),
+                registry.create_with_initializer(
+                    "publish_failure",
+                    turso_mysql_parser::MySqlTableCollation::default(),
+                    |stage, _, lifetime| {
+                        initialize_main(stage)?;
+                        drop(lifetime);
+                        Ok(())
+                    }
+                ),
                 Err(RegistryError::Backend),
                 "{operation:?} attempt {fail_at_attempt}"
             );
@@ -468,11 +476,15 @@ mod five_artifact_tests {
                 DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap())
                     .unwrap();
             registry
-                .create_with_initializer("drop_failure", |stage, _, lifetime| {
-                    initialize_main(stage)?;
-                    drop(lifetime);
-                    Ok(())
-                })
+                .create_with_initializer(
+                    "drop_failure",
+                    turso_mysql_parser::MySqlTableCollation::default(),
+                    |stage, _, lifetime| {
+                        initialize_main(stage)?;
+                        drop(lifetime);
+                        Ok(())
+                    },
+                )
                 .unwrap();
             let name = DatabaseName::parse("drop_failure").unwrap();
             let entry = expected(registry.snapshot.entries[&name].file_key.as_str());
@@ -576,11 +588,15 @@ mod five_artifact_tests {
         let mut registry =
             DatabaseRegistry::open_or_create(OsDataRoot::open(directory.path()).unwrap()).unwrap();
         registry
-            .create_with_initializer("orders", |stage, _, lifetime| {
-                initialize_main(stage)?;
-                drop(lifetime);
-                Ok(())
-            })
+            .create_with_initializer(
+                "orders",
+                turso_mysql_parser::MySqlTableCollation::default(),
+                |stage, _, lifetime| {
+                    initialize_main(stage)?;
+                    drop(lifetime);
+                    Ok(())
+                },
+            )
             .unwrap();
         let lease = registry.acquire("orders").unwrap();
         let entry = expected(lease.database_file_key().as_str());
@@ -1016,6 +1032,7 @@ mod five_artifact_tests {
                 RegistryEntry {
                     file_key: entry.file_key().clone(),
                     state: DatabaseState::Dropping,
+                    collation: None,
                 },
             )]),
         })
