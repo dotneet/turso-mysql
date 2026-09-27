@@ -1028,6 +1028,24 @@ over a `TEXT` stays as wide as its count. Over a `MEDIUMTEXT` or a `LONGTEXT`
 the answer is a `LONG_BLOB`, which is refused. The binary protocol sends a
 `MEDIUM_BLOB` as length-encoded bytes.
 
+`POSITION(x IN col)` is `LOCATE(x, col)` written with a keyword and answers
+what it answers. `ASCII`, `ORD`, `CRC32`, `QUOTE` and `TO_BASE64` read the
+bytes of a value, which the engine has no calls for, so the dialect answers
+each. Measured on 8.4.11: `ASCII` answers the first byte — 195 for `Ünï` — as
+a `LONGLONG` of 3, `ORD` the bytes of the first character as one number —
+50076 — as one of 21, and `CRC32` the zlib checksum as an unsigned one of 10,
+each NOT NULL over a NOT NULL column. `QUOTE` writes the value in quotes with a
+backslash before a backslash and a quote, `\0` for a NUL and `\Z` for a
+Ctrl-Z, answers the word `NULL` for a NULL, and reserves two characters for
+each the value can spell and two more — 88 over a `VARCHAR(10)`. `TO_BASE64`
+puts a newline after every 76 characters and reserves what the base64 of the
+value's bytes runs to, newlines counted — 324 over a `VARCHAR(15)`, 1732 over
+a `VARCHAR(80)`. Both answer a nullable `VAR_STRING` with no flags. `CRC32`,
+`QUOTE` and `TO_BASE64` write a number or a moment out first, one byte to the
+character. `QUOTE` and `TO_BASE64` over a `TEXT` answer a `MEDIUM_BLOB` by a
+width rule not measured, and are refused; so are `CHARSET` and `COLLATION`,
+whose answer is the column's collation, which the statement does not carry.
+
 `LPAD`, `RPAD`, `LEFT`, `RIGHT` and `CONCAT` write a number or a moment out
 before they pad, cut or join it, as MySQL does — `LPAD(id, 5, '0')` over a
 `BIGINT UNSIGNED` is `00001` and `LPAD(n, 4, '0')` over -5 is `00-5` — for

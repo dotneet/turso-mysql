@@ -4237,6 +4237,7 @@ fn render_select_item(
             | Expr::Extract { .. }
             | Expr::Cast { .. }
             | Expr::Convert { .. }
+            | Expr::Position { .. }
             | Expr::Subquery(_)),
         ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let name = source_text(render_context.source, expr)
@@ -4850,6 +4851,22 @@ fn render_select_expr(
                 }
                 None => Ok(format!("{name}({target})")),
             }
+        }
+        Expr::Position { expr: needle, r#in }
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            let Expr::Identifier(column) = r#in.as_ref() else {
+                unreachable!("a checked POSITION was checked to look in a column");
+            };
+            render_context
+                .collation_sensitive_call_columns
+                .push(column.value.clone());
+            render_context.checks_type_sensitive_expression = true;
+            Ok(format!(
+                "mysql_locate({}, {})",
+                render_select_expr(needle, render_context)?,
+                render_ident(column)
+            ))
         }
         Expr::Floor { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
@@ -5635,6 +5652,19 @@ fn render_scalar_call(
         return Ok(format!(
             "mysql_week({}, {mode})",
             moment_argument(function, render_context)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("ASCII")
+        || name.value.eq_ignore_ascii_case("ORD")
+        || name.value.eq_ignore_ascii_case("CRC32")
+        || name.value.eq_ignore_ascii_case("QUOTE")
+        || name.value.eq_ignore_ascii_case("TO_BASE64")
+    {
+        // The engine has none of these, so each is answered by the dialect
+        // over the value's bytes.
+        return Ok(format!(
+            "mysql_{}({})",
+            name.value.to_ascii_lowercase(),
+            single_column_argument(function)
         ));
     } else if name.value.eq_ignore_ascii_case("ADDDATE")
         || name.value.eq_ignore_ascii_case("SUBDATE")
@@ -6987,6 +7017,7 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
             | Expr::Extract { .. }
             | Expr::Cast { .. }
             | Expr::Convert { .. }
+            | Expr::Position { .. }
     ) {
         let open_paren = bytes[..start].iter().rposition(|byte| *byte == b'(')?;
         let name_end = bytes[..open_paren]
@@ -7035,7 +7066,8 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         | Expr::Ceil { .. }
         | Expr::Extract { .. }
         | Expr::Cast { .. }
-        | Expr::Convert { .. } => true,
+        | Expr::Convert { .. }
+        | Expr::Position { .. } => true,
         _ => false,
     };
     if closes_with_a_paren {

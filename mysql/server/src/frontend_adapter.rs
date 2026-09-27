@@ -6650,6 +6650,11 @@ fn scalar_call_column_definition(
             | ScalarFunction::ReadsAMoment
             | ScalarFunction::FindsThePlace
             | ScalarFunction::DefaultedText
+            | ScalarFunction::ReadsTheFirstByte
+            | ScalarFunction::ReadsTheFirstCharacter
+            | ScalarFunction::ChecksTheBytes
+            | ScalarFunction::QuotesForSql
+            | ScalarFunction::EncodesInBase64
     );
     // Measured on MySQL 8.4.11, `YEAR` over a TIME column answers the current
     // year, which is a coercion rather than a reading, so the readings are
@@ -6726,8 +6731,13 @@ fn scalar_call_column_definition(
     // pads it, `00001`, and `LEFT` cuts it the same way, which the engine
     // does for every kind it spells the way MySQL does. A `DOUBLE` or a
     // `DECIMAL` with places is spelled by a rule of its own.
-    let cuts_or_pads_a_spelled_value =
-        function == ScalarFunction::TakesCharacters && spelled_characters(source).is_some();
+    let cuts_or_pads_a_spelled_value = matches!(
+        function,
+        ScalarFunction::TakesCharacters
+            | ScalarFunction::ChecksTheBytes
+            | ScalarFunction::QuotesForSql
+            | ScalarFunction::EncodesInBase64
+    ) && spelled_characters(source).is_some();
     if wants_text != is_text_column(source)
         && function != ScalarFunction::NullsOnMatch
         && !cuts_or_pads_a_spelled_value
@@ -6774,6 +6784,33 @@ fn scalar_call_column_definition(
         ));
     }
     // Measured: as wide as the count it was asked for, whatever the column is.
+    // Measured on MySQL 8.4.11: `QUOTE` reserves two characters for each one
+    // the value can spell and two for the quotes — 88 over a VARCHAR(10), 96
+    // over an INT — and `TO_BASE64` what the base64 of the value's bytes runs
+    // to, a newline after every 76 characters counted — 324 over a
+    // VARCHAR(15), whose 60 bytes answer 81 — a number or a moment spelling
+    // one byte to the character. Both are nullable with no flags.
+    if matches!(
+        function,
+        ScalarFunction::QuotesForSql | ScalarFunction::EncodesInBase64
+    ) {
+        let characters = spelled_characters(source).ok_or(FrontendErrorKind::Unsupported)?;
+        let written = if function == ScalarFunction::QuotesForSql {
+            u64::from(characters) * 2 + 2
+        } else {
+            let bytes_per_character = if is_text_column(source) {
+                UTF8MB4_MAX_BYTES_PER_CHARACTER
+            } else {
+                1
+            };
+            turso_mysql_parser::base64_length(
+                u64::from(characters) * u64::from(bytes_per_character),
+            )
+        };
+        let width = u32::try_from(written * u64::from(UTF8MB4_MAX_BYTES_PER_CHARACTER))
+            .map_err(|_| FrontendErrorKind::Unsupported)?;
+        return Ok(text_call_definition(name, width, false));
+    }
     if function == ScalarFunction::TakesCharacters {
         return Ok(text_call_definition(
             name,
@@ -7004,6 +7041,23 @@ fn scalar_call_column_definition(
             definition.column_length = 11;
             definition.decimals = 0;
             definition
+        }
+        // Measured on MySQL 8.4.11: `ASCII` answers a LONGLONG of 3, `ORD`
+        // one of 21 and `CRC32` an unsigned one of 10.
+        ScalarFunction::ReadsTheFirstByte
+        | ScalarFunction::ReadsTheFirstCharacter
+        | ScalarFunction::ChecksTheBytes => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = match function {
+                ScalarFunction::ReadsTheFirstByte => 3,
+                ScalarFunction::ReadsTheFirstCharacter => 21,
+                _ => 10,
+            };
+            definition.decimals = 0;
+            definition
+        }
+        ScalarFunction::QuotesForSql | ScalarFunction::EncodesInBase64 => {
+            unreachable!("QUOTE and TO_BASE64 were answered above")
         }
         // Measured: ABS over an INT answers a LONGLONG of the INT's own length
         // 11, and over a DECIMAL(10,2) a NEWDECIMAL of 12 with its scale — the
@@ -7251,15 +7305,21 @@ fn scalar_call_column_definition(
                     | ScalarFunction::Negates
                     | ScalarFunction::CountsText
                     | ScalarFunction::Locates
+                    | ScalarFunction::ReadsTheFirstByte
+                    | ScalarFunction::ReadsTheFirstCharacter
+                    | ScalarFunction::ChecksTheBytes
             ));
     set_column_flags(
         &mut definition,
         binary | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
-    if function == ScalarFunction::ReadsTheYear {
-        // Measured: the reading is unsigned where the column it reads is
-        // unsigned and zerofilled, so the sign is put back after the flags
-        // every call shares.
+    if matches!(
+        function,
+        ScalarFunction::ReadsTheYear | ScalarFunction::ChecksTheBytes
+    ) {
+        // Measured: a year reading is unsigned where the column it reads is
+        // unsigned and zerofilled, and a checksum is never negative, so the
+        // sign is put back after the flags every call shares.
         definition.flags |= MYSQL_UNSIGNED_FLAG;
     }
     Ok(definition)

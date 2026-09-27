@@ -467,6 +467,13 @@ impl Dialect for MySqlDialect {
             return Ok(Some(Func::Dialect(MYSQL_TO_DAYS.to_string())));
         }
         if arg_count == 1
+            && MYSQL_BYTE_READINGS
+                .iter()
+                .any(|reading| name.eq_ignore_ascii_case(reading))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count == 1
             && (name.eq_ignore_ascii_case(MYSQL_MD5) || name.eq_ignore_ascii_case(MYSQL_SHA1))
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
@@ -1136,6 +1143,15 @@ impl Dialect for MySqlDialect {
                 },
             );
         }
+        if MYSQL_BYTE_READINGS
+            .iter()
+            .any(|reading| name.eq_ignore_ascii_case(reading))
+        {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            return byte_reading(name, value);
+        }
         if name.eq_ignore_ascii_case(MYSQL_YEARWEEK) {
             let [moment, mode] = args else {
                 return Err(LimboError::ParseError(format!(
@@ -1245,6 +1261,47 @@ pub(crate) const MYSQL_WEEK: &str = "mysql_week";
 /// counts them; the engine has neither.
 pub(crate) const MYSQL_YEARWEEK: &str = "mysql_yearweek";
 pub(crate) const MYSQL_TO_DAYS: &str = "mysql_to_days";
+/// Reads the bytes of a value the way `ASCII`, `ORD`, `CRC32`, `QUOTE` and
+/// `TO_BASE64` do; the engine has none of them.
+pub(crate) const MYSQL_BYTE_READINGS: [&str; 5] = [
+    "mysql_ascii",
+    "mysql_ord",
+    "mysql_crc32",
+    "mysql_quote",
+    "mysql_to_base64",
+];
+
+/// Answers one of `MYSQL_BYTE_READINGS` over a value, which reaches it as a
+/// word, or as a whole number MySQL would write out before reading its bytes.
+fn byte_reading(name: &str, value: &Value) -> Result<Value> {
+    let written = match value {
+        Value::Null => {
+            return Ok(if name.eq_ignore_ascii_case("mysql_quote") {
+                Value::build_text(turso_mysql_parser::quoted_for_sql(None))
+            } else {
+                Value::Null
+            });
+        }
+        Value::Text(text) => text.as_str().to_owned(),
+        Value::Numeric(Numeric::Integer(number)) => number.to_string(),
+        _ => {
+            return Err(LimboError::ParseError(format!(
+                "{name} takes a word or a whole number"
+            )))
+        }
+    };
+    Ok(if name.eq_ignore_ascii_case("mysql_ascii") {
+        Value::from_i64(turso_mysql_parser::first_byte(written.as_bytes()))
+    } else if name.eq_ignore_ascii_case("mysql_ord") {
+        Value::from_i64(turso_mysql_parser::first_character_code(&written))
+    } else if name.eq_ignore_ascii_case("mysql_crc32") {
+        Value::from_i64(i64::from(turso_mysql_parser::crc32(written.as_bytes())))
+    } else if name.eq_ignore_ascii_case("mysql_quote") {
+        Value::build_text(turso_mysql_parser::quoted_for_sql(Some(&written)))
+    } else {
+        Value::build_text(turso_mysql_parser::to_base64(written.as_bytes()))
+    })
+}
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";

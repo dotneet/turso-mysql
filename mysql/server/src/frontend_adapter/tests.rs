@@ -30660,3 +30660,6 @@ mod day_counts;
 
 #[cfg(unix)]
 mod binary_comparisons;
+
+#[cfg(unix)]
+mod byte_readings;

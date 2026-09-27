@@ -294,6 +294,17 @@ pub enum ScalarFunction {
     Locates,
     /// `HEX`, whose answer is as wide as its column's character length times 8.
     Hexadecimal,
+    /// `ASCII`, which answers the first byte of a word.
+    ReadsTheFirstByte,
+    /// `ORD`, which answers the bytes of a word's first character as one
+    /// number.
+    ReadsTheFirstCharacter,
+    /// `CRC32`, which answers the checksum of the value written out.
+    ChecksTheBytes,
+    /// `QUOTE`, which writes the value out as a quoted SQL word.
+    QuotesForSql,
+    /// `TO_BASE64`, which writes the value out in base64.
+    EncodesInBase64,
     /// `JSON_EXTRACT` over one path, which answers the JSON value it found —
     /// a string comes back with its quotes.
     ReadsAJsonValue,
@@ -504,6 +515,24 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             substring_for,
             ..
         } => classify_substring(expr, substring_from.as_deref(), substring_for.as_deref()),
+        // `POSITION(substr IN str)` is `LOCATE(substr, str)` written with a
+        // keyword, and measured on MySQL 8.4.11 answers what it answers.
+        Expr::Position { expr: needle, r#in } => {
+            let Expr::Identifier(column) = r#in.as_ref() else {
+                return None;
+            };
+            if !matches!(needle.as_ref(), Expr::Value(value)
+                if matches!(&value.value, Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)))
+            {
+                return None;
+            }
+            Some(StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::Locates,
+                columns: vec![column.value.clone()],
+                literal_characters: 0,
+                not_null: false,
+            })
+        }
         Expr::Trim {
             trim_where,
             trim_what,
@@ -2868,6 +2897,16 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::KeepsTextShape
     } else if named(&["HEX"]) {
         ScalarFunction::Hexadecimal
+    } else if named(&["ASCII"]) {
+        ScalarFunction::ReadsTheFirstByte
+    } else if named(&["ORD"]) {
+        ScalarFunction::ReadsTheFirstCharacter
+    } else if named(&["CRC32"]) {
+        ScalarFunction::ChecksTheBytes
+    } else if named(&["QUOTE"]) {
+        ScalarFunction::QuotesForSql
+    } else if named(&["TO_BASE64"]) {
+        ScalarFunction::EncodesInBase64
     } else if named(&["JSON_VALID"]) {
         ScalarFunction::ChecksJson
     } else if named(&["JSON_QUOTE"]) {
