@@ -5467,7 +5467,10 @@ fn scalar_call_column_definition(
     // what was read. Neither reads a column, so both are answered before
     // anything asks which column they read.
     if columns.is_empty() {
-        if function == ScalarFunction::WritesAMoment {
+        if matches!(
+            function,
+            ScalarFunction::WritesAMoment | ScalarFunction::WritesAnEpochMoment
+        ) {
             return Ok(written_moment_definition(name, literal_characters));
         }
         if matches!(
@@ -5970,6 +5973,15 @@ fn scalar_call_column_definition(
         }
         return Ok(written_moment_definition(name, literal_characters));
     }
+    // A count of seconds is a whole number: MySQL carries a fraction into the
+    // moment and reads a word as the number it begins with, neither of which
+    // has been measured here.
+    if function == ScalarFunction::WritesAnEpochMoment {
+        if !is_whole_number_column(source.type_name()) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        return Ok(written_moment_definition(name, literal_characters));
+    }
     // Measured on MySQL 8.4.11: JSON_QUOTE answers a VAR_STRING as wide as the
     // six characters each of its column's could need plus its two quotes, and
     // carries the text collation with the binary flag.
@@ -6068,7 +6080,8 @@ fn scalar_call_column_definition(
         | ScalarFunction::SearchesJson
         | ScalarFunction::SharesJson
         | ScalarFunction::CountsEpochSeconds
-        | ScalarFunction::ReadsFromEpoch => {
+        | ScalarFunction::ReadsFromEpoch
+        | ScalarFunction::WritesAnEpochMoment => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
         ScalarFunction::KeepsTextShape => {

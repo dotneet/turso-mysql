@@ -3040,14 +3040,22 @@ this frontend accepts these calls only in UTC sessions. Measured on 8.4.11 with
 `time_zone = '+00:00'`: a `DATE` reads as its midnight, a moment before the
 epoch counts 0 rather than a negative, where the engine counts backwards, and a
 negative count reads no moment at all, where the engine reads one before the
-epoch. The count is a LONGLONG of 21 with the binary and numeric flags —
+epoch, and so does a count past 32536771199, `3001-01-18 23:59:59`, the last
+moment MySQL reads, where the engine reads on. The count is a LONGLONG of 21
+with the binary and numeric flags —
 NOT NULL for `UNIX_TIMESTAMP()`, which reads now and so has nothing that could
 be null — and the moment a DATETIME of 19 with the binary flag alone.
 
 The count is read out of a `DATE`, a `DATETIME` or a `TIMESTAMP` and the moment
 out of a whole number; MySQL reads either by coercing the other, which this has
-not measured. `FROM_UNIXTIME(n, format)` is refused, its width being a rule of
-its own.
+not measured.
+
+`FROM_UNIXTIME(n, format)` writes the moment out the way `DATE_FORMAT` does,
+which is how a report shows a moment an application stored as seconds. Its
+width looked like a rule of its own and is not: measured on 8.4.11, it reports
+exactly the `VAR_STRING` `DATE_FORMAT` reports for the same format — 40 for
+`'%Y-%m-%d'`, 516 for `'%W %M'`. The count is a whole-number column or a written
+whole number, and the format a written word.
 
 `TRUNCATE` cuts a number off at a count of places, rounding nothing. Measured
 on 8.4.11: `TRUNCATE(1.999, 2)` is `1.99`, and a negative count zeroes digits

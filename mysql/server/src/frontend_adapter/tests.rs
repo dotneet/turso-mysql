@@ -9635,14 +9635,14 @@ fn the_epoch_readings_count_what_mysql_counts() {
 
     // The count is read out of a moment and nothing else, and the moment out
     // of a number: MySQL reads either by coercing the other, which this has
-    // not measured. A second argument to FROM_UNIXTIME is a format, which is
-    // not read here.
+    // not measured. `FROM_UNIXTIME` with a format is pinned in
+    // `tests/date_arithmetic.rs`.
     for sql in [
         "SELECT UNIX_TIMESTAMP(n) FROM e",
         "SELECT UNIX_TIMESTAMP(name) FROM e",
         "SELECT FROM_UNIXTIME(d) FROM e",
         "SELECT FROM_UNIXTIME(name) FROM e",
-        "SELECT FROM_UNIXTIME(n, '%Y') FROM e",
+        "SELECT FROM_UNIXTIME(d, '%Y') FROM e",
         "SELECT FROM_UNIXTIME() FROM e",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");

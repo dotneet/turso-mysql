@@ -87,7 +87,8 @@ name or built on one, a windowed aggregate over anything but one plain column,
 and a `LAG` or `LEAD` carrying an offset or a default.
 Numbers: a seeded `RAND(n)` is refused: the engine has no seeded random, so
 answering one would answer a different sequence.
-Temporal: `FROM_UNIXTIME(n, format)`, whose width is a rule of its own.
+Temporal: `FROM_UNIXTIME` over a fraction or a word, which MySQL carries into
+the moment or reads as the number it begins with.
 JSON: `JSON_SEARCH` with a path to search inside. `JSON_SET`,
 `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` take a path naming one member
 of the top-level object and refuse a wider one, which is the range the engine
@@ -291,7 +292,9 @@ speaks; anything measured here from now on has to pass that flag.
 | `information_schema.STATISTICS.CARDINALITY` | refused; it is an estimate of distinct values and the engine keeps no equivalent, so a made-up number would be worse than none |
 | `SELECT *` over an `information_schema` table | refused; it asks for MySQL's columns and this answers a few of them. `KEY_COLUMN_USAGE` answers all of them and is refused anyway, because one rule for all of these tables is worth more than the wildcard |
 | A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |
-| `DATABASE()` outside an `information_schema` query's `FROM`, or in a query reading only user tables | refused; the call is written in as the selected database only where a framework filters `information_schema` on it |
+| `DATABASE()` outside an `information_schema` query's `FROM`, or in a query reading only user tables — `SELECT DATABASE() FROM t` | refused; the call is written in as the selected database only where a framework filters `information_schema` on it. The answer lives in the session and the renderer has no way to carry it into a statement, and a prepared one would keep the old name across a `USE`. Measured: a `VAR_STRING` of 256, nullable |
+| `VERSION()` beside a `FROM` — `SELECT VERSION() FROM t` | refused; the version string lives in the server crate, out of the renderer's reach. `SELECT VERSION()` alone works. Measured: a `VAR_STRING` of 24, NOT NULL |
+| `CONNECTION_ID()`, `USER()`, `CURRENT_USER()`, `SESSION_USER()`, `SYSTEM_USER()`, `ROW_COUNT()`, `FOUND_ROWS()` | refused, alone or beside a `FROM`; each answers session state — the connection's ID, the account, the last statement's counts — that is not handed to the statement renderer. Measured: `CONNECTION_ID()` a NOT NULL unsigned `LONGLONG` of 21, `ROW_COUNT()` and `FOUND_ROWS()` a NOT NULL `LONGLONG` of 21, and the user calls a nullable `VAR_STRING` of 1152 |
 | `information_schema` columns beyond the eight of `TABLES`, thirteen of `COLUMNS`, seventeen of `STATISTICS`, and all of `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
 | An `information_schema.COLUMNS` or `SCHEMATA` `WHERE` beyond the one shape each takes | refused; those two are the last recognized by written shape, and moving them to a table the engine scans is the work that retires the recognizer |
 | Multi-statement `COM_QUERY` beyond the bounded slice | negotiates `CLIENT_MULTI_STATEMENTS` and returns sequential results with `SERVER_MORE_RESULTS_EXISTS`. More than 32 statements and SQL whose delimiter changes under the session's backslash mode are refused before execution. An assembled response beyond 512 frames or 1 MiB closes the connection after execution, so preceding side effects may remain. A later statement can fail after earlier statements have run, as in MySQL. The runtime's configured write queue can impose a tighter limit |

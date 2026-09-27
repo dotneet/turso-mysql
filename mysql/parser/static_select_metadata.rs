@@ -267,6 +267,9 @@ pub enum ScalarFunction {
     CountsEpochSeconds,
     /// `FROM_UNIXTIME`, which reads a moment back out of those seconds.
     ReadsFromEpoch,
+    /// `FROM_UNIXTIME` with a format, which writes that moment out the way
+    /// `DATE_FORMAT` does.
+    WritesAnEpochMoment,
     /// `DATE_FORMAT` over a literal format, whose answer is as wide as the
     /// format could make it.
     WritesAMoment,
@@ -1544,6 +1547,34 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // moment to the moment it is given. `FROM_UNIXTIME(n)` reads one back.
     // Nothing here converts between zones, which is the same as running in
     // UTC, and UTC is the only zone this session takes.
+    // `FROM_UNIXTIME(n, 'fmt')` writes the moment out the way `DATE_FORMAT`
+    // does, and measured on MySQL 8.4.11 reserves the width `DATE_FORMAT`
+    // reserves for the same format. The count is a whole-number column or a
+    // written whole number: a fraction is carried into the moment by rules of
+    // MySQL's own.
+    if named(&["FROM_UNIXTIME"]) && arguments.args.len() == 2 {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(seconds)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(format),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let (Value::SingleQuotedString(format) | Value::DoubleQuotedString(format)) = &format.value
+        else {
+            return None;
+        };
+        let columns = match seconds {
+            Expr::Identifier(column) => vec![column.value.clone()],
+            _ if crate::translate::direct_signed_integer(seconds).is_some() => Vec::new(),
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::WritesAnEpochMoment,
+            columns,
+            literal_characters: crate::format_width(format),
+            not_null: false,
+        });
+    }
     if named(&["UNIX_TIMESTAMP", "FROM_UNIXTIME"]) {
         let counts = named(&["UNIX_TIMESTAMP"]);
         if arguments.args.len() > 1 || (!counts && arguments.args.is_empty()) {

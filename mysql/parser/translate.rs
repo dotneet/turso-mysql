@@ -5614,10 +5614,23 @@ fn render_scalar_call(
         ));
     } else if name.value.eq_ignore_ascii_case("FROM_UNIXTIME") {
         // Measured: a negative count answers no moment at all, where the
-        // engine reads one before the epoch.
+        // engine reads one before the epoch, and so does a count past
+        // 32536771199, `3001-01-18 23:59:59`, the last moment MySQL reads.
         let seconds = scalar_argument(function, 0)?;
+        let moment = format!("datetime({seconds}, 'unixepoch')");
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let written = if arguments.args.len() == 2 {
+            format!(
+                "mysql_date_format({moment}, {})",
+                scalar_argument(function, 1)?
+            )
+        } else {
+            moment
+        };
         return Ok(format!(
-            "CASE WHEN {seconds} < 0 THEN NULL ELSE datetime({seconds}, 'unixepoch') END"
+            "CASE WHEN {seconds} < 0 OR {seconds} > 32536771199 THEN NULL ELSE {written} END"
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_SEARCH") {
         let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {

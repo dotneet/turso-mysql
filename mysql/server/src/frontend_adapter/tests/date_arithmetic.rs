@@ -771,3 +771,79 @@ fn the_utc_readings_and_sysdate_read_the_clock_like_now() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// `FROM_UNIXTIME(n, 'fmt')` is how a report writes out a moment an
+/// application stored as seconds from the epoch. Measured on MySQL 8.4.11 in a
+/// UTC session, it writes the moment the way `DATE_FORMAT` does and reports
+/// the width `DATE_FORMAT` reports for the same format, and a count before the
+/// epoch or past `3001-01-18 23:59:59` answers no moment at all — with or
+/// without a format.
+#[test]
+fn from_unixtime_writes_the_moment_out_by_a_format() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE epochs (id INT NOT NULL PRIMARY KEY, n BIGINT, label VARCHAR(8))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO epochs (id, n) VALUES (1, 0), (2, 1700000000), (3, -1), (4, NULL), (5, 32536771199), (6, 32536771200)",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT FROM_UNIXTIME(n, '%Y-%m-%d %H:%i:%s'), FROM_UNIXTIME(n, '%W %M'), FROM_UNIXTIME(n) FROM epochs ORDER BY id"
+        ),
+        [
+            [
+                Some("1970-01-01 00:00:00"),
+                Some("Thursday January"),
+                Some("1970-01-01 00:00:00")
+            ],
+            [
+                Some("2023-11-14 22:13:20"),
+                Some("Tuesday November"),
+                Some("2023-11-14 22:13:20")
+            ],
+            [None, None, None],
+            [None, None, None],
+            [
+                Some("3001-01-18 23:59:59"),
+                Some("Sunday January"),
+                Some("3001-01-18 23:59:59")
+            ],
+            [None, None, None],
+        ]
+        .map(|row| row.map(|value| value.map(str::to_owned)).to_vec())
+    );
+    assert_eq!(
+        shapes(
+            &mut adapter,
+            "SELECT FROM_UNIXTIME(n, '%Y-%m-%d'), FROM_UNIXTIME(n, '%W %M'), FROM_UNIXTIME(1700000000, '%Y') FROM epochs"
+        ),
+        [
+            (MYSQL_TYPE_VAR_STRING, 40, NOT_FIXED_DECIMALS, 0),
+            (MYSQL_TYPE_VAR_STRING, 516, NOT_FIXED_DECIMALS, 0),
+            (MYSQL_TYPE_VAR_STRING, 16, NOT_FIXED_DECIMALS, 0),
+        ]
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT FROM_UNIXTIME(1700000000, '%Y') FROM epochs WHERE id = 1"
+        ),
+        ["2023"]
+    );
+
+    // A fraction is carried into the moment and a word read as the number it
+    // begins with, by rules not measured here; a bound count is read by the
+    // type the client sent.
+    for sql in [
+        "SELECT FROM_UNIXTIME(label, '%Y') FROM epochs",
+        "SELECT FROM_UNIXTIME(1.5, '%Y') FROM epochs",
+        "SELECT FROM_UNIXTIME(?, '%Y') FROM epochs",
+        "SELECT FROM_UNIXTIME(n, ?) FROM epochs",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
