@@ -298,6 +298,12 @@ impl Dialect for SessionMySqlDialect {
         !self.mode.no_backslash_escapes
     }
 
+    /// MySQL writes `GROUP BY a WITH ROLLUP`. It is read here, and taken or
+    /// refused where the statement is rendered.
+    fn supports_group_by_with_modifier(&self) -> bool {
+        true
+    }
+
     delegate_mysql_bool!(supports_string_literal_concatenation);
     delegate_mysql_bool!(ignores_wildcard_escapes);
     delegate_mysql_bool!(supports_numeric_prefix);

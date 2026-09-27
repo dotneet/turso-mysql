@@ -120,6 +120,12 @@ pub enum StaticSelectMetadata {
         column: String,
         length: u32,
     },
+    /// A grouping key of a statement grouping `WITH ROLLUP`, which answers the
+    /// column's own shape as MySQL reports a rolled-up key: naming no table,
+    /// and nullable, since a super total answers it as NULL.
+    RolledUpKey { column_name: String },
+    /// An aggregate of a statement grouping `WITH ROLLUP`.
+    FromARollup(Box<StaticSelectMetadata>),
     /// An answer of a statement grouping by an expression, which MySQL groups
     /// in a temporary table and reports the table's column for rather than the
     /// answer's own shape.
@@ -148,7 +154,8 @@ impl StaticSelectMetadata {
     /// Returns the answer itself, whatever table it is read out of.
     pub fn answer(&self) -> &StaticSelectMetadata {
         match self {
-            StaticSelectMetadata::FromTheGroupingTable { answer, .. } => answer,
+            StaticSelectMetadata::FromTheGroupingTable { answer, .. }
+            | StaticSelectMetadata::FromARollup(answer) => answer,
             answer => answer,
         }
     }

@@ -4417,7 +4417,13 @@ fn execute_checked_select_with_timeout(
     let source_references = if windowed {
         Vec::new()
     } else {
+        // A column whose shape the statement fixes is not looked up through
+        // its source, which may be a table the statement made up for itself.
         (0..statement.num_columns())
+            .filter(|index| {
+                static_result_metadata.len() != column_count
+                    || static_result_metadata[*index].is_none()
+            })
             .filter_map(|index| {
                 statement
                     .get_column_source_reference(index)
@@ -5267,6 +5273,50 @@ impl TableResultMetadata {
             // all, which every other temporal column has.
             definition.flags |= MYSQL_UNSIGNED_FLAG | MYSQL_ZEROFILL_FLAG | MYSQL_NUM_FLAG;
         }
+        Ok(definition)
+    }
+
+    /// Builds the result column a key of a statement grouping `WITH ROLLUP`
+    /// reports.
+    ///
+    /// Measured on MySQL 8.4.11: the column's own type and length, naming no
+    /// table and no column, nullable whatever the column is — a super total
+    /// answers it as NULL — and with none of its keys. A whole number and a
+    /// `DECIMAL` carry the binary flag and keep their unsigned one, a
+    /// `TINYINT(1)` reporting a `TINYINT`'s 4; a `VARCHAR` and a `CHAR` carry
+    /// no flags and 31 decimals. Any other column has not been measured there
+    /// and is refused.
+    fn rolled_up_key_definition(
+        &self,
+        name: String,
+        column_name: &str,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let (table, ordinal) = self.column_named(column_name)?;
+        let source = table
+            .columns
+            .get(ordinal)
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let mut definition = self.table_column_definition(table, ordinal, name, None)?;
+        definition.schema.clear();
+        definition.table.clear();
+        definition.original_table.clear();
+        definition.original_name.clear();
+        let flags = if is_whole_number_column(source.type_name())
+            || matches!(source.type_name(), "DECIMAL" | "DECIMAL UNSIGNED")
+        {
+            if source.type_name() == "BOOLEAN" {
+                definition.column_length = 4;
+            }
+            MYSQL_BINARY_FLAG | (definition.flags & MYSQL_UNSIGNED_FLAG)
+        } else if matches!(source.type_name(), "VARCHAR" | "CHAR")
+            && definition.character_set != MYSQL_BINARY_COLLATION
+        {
+            definition.decimals = NOT_FIXED_DECIMALS;
+            0
+        } else {
+            return Err(FrontendErrorKind::Unsupported);
+        };
+        set_column_flags(&mut definition, flags);
         Ok(definition)
     }
 
@@ -7979,7 +8029,9 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::RoundedAggregate { .. }
+        | turso_mysql_parser::StaticSelectMetadata::RolledUpKey { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
+        turso_mysql_parser::StaticSelectMetadata::FromARollup(inner) => needs_source_columns(inner),
         turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
         | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner)
         | turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable {
@@ -8091,6 +8143,36 @@ fn aggregate_column_definition(
             definition.table.clone_from(table);
             definition.original_name.clone_from(column);
             set_column_flags(&mut definition, 0);
+            Ok(definition)
+        }
+        turso_mysql_parser::StaticSelectMetadata::RolledUpKey { column_name } => source_metadata
+            .ok_or(FrontendErrorKind::Unsupported)?
+            .rolled_up_key_definition(name, column_name),
+        // Measured on MySQL 8.4.11: an aggregate of a statement grouping `WITH
+        // ROLLUP` answers the shape it answers without one, apart from a
+        // largest or smallest moment, which answers words of 76 there.
+        turso_mysql_parser::StaticSelectMetadata::FromARollup(answer) => {
+            let mut definition = match static_column_definition(name.clone(), answer) {
+                Some(definition) => definition,
+                None => aggregate_column_definition(source_metadata, name, answer)?,
+            };
+            if matches!(
+                definition.column_type,
+                MYSQL_TYPE_DATE
+                    | MYSQL_TYPE_DATETIME
+                    | MYSQL_TYPE_TIMESTAMP
+                    | MYSQL_TYPE_TIME
+                    | MYSQL_TYPE_YEAR
+            ) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            // Words carry the 31 decimals a call's words do.
+            if matches!(
+                definition.column_type,
+                MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING
+            ) {
+                definition.decimals = NOT_FIXED_DECIMALS;
+            }
             Ok(definition)
         }
         turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable { answer, key } => {
@@ -8374,7 +8456,7 @@ fn prepared_table_result_metadata(
             .any(needs_source_columns);
     let source_references = type_metadata
         .iter()
-        .filter(|_| !windowed)
+        .filter(|metadata| !windowed && metadata.static_metadata().is_none())
         .filter_map(|metadata| {
             metadata
                 .source_reference()

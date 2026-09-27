@@ -16,6 +16,7 @@ mod derived;
 mod grouping;
 mod json_condition;
 mod recursive;
+mod rollup;
 
 pub use derived::MySqlDerivedColumns;
 
@@ -357,7 +358,13 @@ pub(crate) fn translate_select_query(
     let (mut normalized, mut source_tables) = match query.body.as_ref() {
         SetExpr::Select(select) => {
             render_context.renders_the_outer_projection = true;
-            render_select_body(select, &mut render_context)?
+            match rollup::render_rollup(select, &mut render_context)? {
+                Some(_) if query.order_by.is_some() => {
+                    return unsupported("WITH ROLLUP with an ORDER BY");
+                }
+                Some(rendered) => rendered,
+                None => render_select_body(select, &mut render_context)?,
+            }
         }
         SetExpr::SetOperation {
             left,
@@ -1556,11 +1563,43 @@ pub(crate) fn select_static_result_metadata(
     if let Some(counted) = recursive::counted_projection(query, select) {
         return counted;
     }
+    let rolled_up_keys = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(keys, modifiers)
+            if matches!(
+                modifiers.as_slice(),
+                [sqlparser::ast::GroupByWithModifier::Rollup]
+            ) =>
+        {
+            Some(keys.as_slice())
+        }
+        _ => None,
+    };
     select
         .projection
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let Some(keys) = rolled_up_keys {
+                    return match rollup::rolled_up_key(expr, keys) {
+                        Some(_) => StaticSelectProjectionMetadata::Literal(
+                            StaticSelectMetadata::RolledUpKey {
+                                column_name: match expr {
+                                    Expr::CompoundIdentifier(parts) => parts[1].value.clone(),
+                                    Expr::Identifier(column) => column.value.clone(),
+                                    _ => unreachable!("a rolled-up key is a whole column"),
+                                },
+                            },
+                        ),
+                        None => classify_static_select_expr(expr).map_or(
+                            StaticSelectProjectionMetadata::Other,
+                            |answer| {
+                                StaticSelectProjectionMetadata::Literal(
+                                    StaticSelectMetadata::FromARollup(Box::new(answer)),
+                                )
+                            },
+                        ),
+                    };
+                }
                 let answer = crate::written_value::read_written_value(expr)
                     .map(|(shape, _)| StaticSelectMetadata::WrittenValue(shape))
                     .or_else(|| classify_static_select_expr(expr));

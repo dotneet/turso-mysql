@@ -3215,6 +3215,24 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         translated.as_sql(),
         "SELECT \"team\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY \"team\""
     );
+    // A rollup is each level's grouped statement, joined, ordered by each key
+    // after whether that level rolled it up.
+    let translated = parse_select(
+        "SELECT team, COUNT(*) FROM users GROUP BY team WITH ROLLUP",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "SELECT \"team\", \"COUNT(*)\" FROM (",
+            "SELECT \"team\" AS \"team\", COUNT(*) AS \"COUNT(*)\", 0 AS \"__rollup_level_0\", ",
+            "\"team\" AS \"__rollup_key_0\" FROM \"users\" GROUP BY \"team\" UNION ALL ",
+            "SELECT NULL AS \"team\", COUNT(*) AS \"COUNT(*)\", 1 AS \"__rollup_level_0\", ",
+            "NULL AS \"__rollup_key_0\" FROM \"users\" HAVING (COUNT(*) > 0)",
+            ") AS \"__rollup\" ORDER BY \"__rollup_level_0\", \"__rollup_key_0\""
+        )
+    );
     // A key that is a call is rendered the way the projection renders it, so
     // the engine groups on the value the client reads back.
     let translated = parse_select(
@@ -3242,8 +3260,13 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         "SELECT team FROM users GROUP BY team ORDER BY score",
         "SELECT id FROM users GROUP BY id HAVING score > 1",
         "SELECT DATE(joined) FROM users GROUP BY DATE(joined) HAVING DATE(joined) > '2026-01-01'",
-        // The modifiers change what a group is.
-        "SELECT team FROM users GROUP BY team WITH ROLLUP",
+        // A rollup over an expression, a rollup read again for each level's
+        // parameter, and one ordered, whose shapes MySQL answers otherwise.
+        "SELECT UPPER(team), COUNT(*) FROM users GROUP BY UPPER(team) WITH ROLLUP",
+        "SELECT team, COUNT(*) FROM users WHERE id > ? GROUP BY team WITH ROLLUP",
+        "SELECT team, COUNT(*) FROM users GROUP BY team WITH ROLLUP ORDER BY team",
+        "SELECT team, COUNT(*) FROM users GROUP BY team WITH ROLLUP HAVING team = 'a'",
+        "SELECT team, COUNT(*) FROM users GROUP BY a, b, c, d WITH ROLLUP",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),

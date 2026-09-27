@@ -135,7 +135,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | A comparison as a result column over anything but a column against a written number or word, or a `COUNT` against a written whole number — `SELECT a > b`, `SELECT n > ?`, `SELECT SUM(n) > 0` | refused; a column against a column and a bound value raise the coercion question a `WHERE` raises, and an aggregate other than a count may be NULL by rules not measured here |
 | `NOT`, `IS TRUE`, `IS FALSE`, `IS NOT TRUE` and `IS NOT FALSE` over a word, a `DECIMAL`, or anything but a column in a projection | refused; measured, MySQL reads a word as the number it begins with — `NOT 'apple'` is 1 — and the engine does not. In a `WHERE` they take whatever the `WHERE` reader takes |
-| `WITH ROLLUP` | refused |
+| `WITH ROLLUP` beside an `ORDER BY`, with `GROUPING()`, over an expression, a moment, `TEXT` or more than three keys, or with a `?` | refused; measured, an `ORDER BY` makes MySQL answer the rollup through a temporary table whose shapes differ, and the other shapes have not been measured |
 | `BINARY col = ?`, `x = BINARY col`, `BINARY col LIKE ...` | refused; only `BINARY` before a column compared with a written word is taken |
 | A hexadecimal literal compared with a column — `email = X'616E6E'` | refused; measured, MySQL compares it as a word under a text column's collation and as a number against a number column |
 | A word with the `_utf8mb4` introducer in an `INSERT`, an `UPDATE` or a `DELETE` | refused; only a `SELECT` reads it without the introducer |

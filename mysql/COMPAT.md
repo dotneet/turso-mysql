@@ -2253,10 +2253,36 @@ here, being a source name that has to be resolved across databases first.
 
 A grouping key may be qualified or not, and matches a projection either way,
 which is what MySQL does whenever the bare name is unambiguous; the engine
-answers the ambiguous case itself. Two forms are refused: a grouping key that is
-not a whole column, and the `WITH ROLLUP` modifier, which changes what a group
-is. A text column carries its stored UCA9 collation into the grouping key, so
-`abc`, `ABC` and accent variants share a group as in MySQL.
+answers the ambiguous case itself. A grouping key that is an expression is
+taken for the calls the `GROUP BY` paragraphs above list. A text column carries
+its stored UCA9 collation into the grouping key, so `abc`, `ABC` and accent
+variants share a group as in MySQL.
+
+`WITH ROLLUP` is taken over one to three keys that are whole columns: `SELECT
+status, COUNT(*) FROM users GROUP BY status WITH ROLLUP` answers each group and
+then a total of every row with `status` answered as NULL. The engine has no
+`ROLLUP`, so the statement is written out as what it means — one grouped
+`SELECT` for each level, the rolled-up keys answered as NULL, joined with
+`UNION ALL` — and ordered the way MySQL answers it. Measured on MySQL 8.4.11:
+
+- The rows come sorted by the keys in the order the `GROUP BY` names them, NULL
+  first, and each super total follows the groups it totals, the grand total
+  last. A group whose key is NULL sorts among the groups and a super total after
+  them, which is how the two NULLs are told apart. Words sort and group the way
+  MySQL compares them — `active` and `Active` are one group, before `Bob`.
+- A key reports its column's type and length, names no table and no column, and
+  is nullable whatever the column is: a whole number and a `DECIMAL` carry the
+  binary flag and their unsigned one, a `TINYINT(1)` reporting a `TINYINT`'s 4;
+  a `VARCHAR` and a `CHAR` carry no flags and 31 decimals. An aggregate reports
+  the shape it reports without the rollup, words with 31 decimals.
+- A `HAVING` filters the totals as well as the groups, a `LIMIT` counts them,
+  and over no rows there is no grand total either.
+
+Refused: an `ORDER BY` beside the rollup, which MySQL answers through a
+temporary table with shapes of its own; `GROUPING()`; a key that is an
+expression; a key of any other type, and a largest or smallest moment, which
+answers words of 76 under a rollup; a `HAVING` naming a key; a `?`, which each
+level would read again; and more than three keys.
 
 `DISTINCT` is taken, and `DISTINCTROW` with it, since that is MySQL's own
 synonym. It drops repeats among the projected values and leaves the result

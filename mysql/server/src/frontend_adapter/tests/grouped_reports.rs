@@ -589,3 +589,229 @@ fn aggregates_over_unsigned_columns_answer_the_shapes_mysql_answers() {
         rows(&[&[Some("2.50"), Some("10"), Some("10"), Some("3")]])
     );
 }
+
+/// `GROUP BY status WITH ROLLUP` answers a total for each group and one for
+/// every row, the rolled-up key answered as NULL. Measured on MySQL 8.4.11,
+/// the rows come sorted by the keys, NULL first, each super total after the
+/// groups it totals.
+#[test]
+fn a_rollup_answers_each_total_where_mysql_does() {
+    let (_directory, mut adapter) = adapter();
+    let count = (
+        MYSQL_TYPE_LONGLONG,
+        21,
+        0,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+    );
+    // A key names no table and carries no flags of its column's: a word 31
+    // decimals and none, a number the binary flag and its sign.
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT status, COUNT(*), SUM(balance), AVG(age), MIN(name), MAX(age) FROM users GROUP BY status WITH ROLLUP",
+    );
+    assert_eq!(
+        shapes,
+        [
+            (MYSQL_TYPE_VAR_STRING, 80, 31, 0),
+            count,
+            (
+                MYSQL_TYPE_NEWDECIMAL,
+                34,
+                2,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                MYSQL_TYPE_NEWDECIMAL,
+                16,
+                4,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (MYSQL_TYPE_VAR_STRING, 400, 31, 0),
+            (MYSQL_TYPE_LONG, 11, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[
+                None,
+                Some("1"),
+                None,
+                Some("25.0000"),
+                Some("dee"),
+                Some("25")
+            ],
+            &[
+                Some("active"),
+                Some("2"),
+                Some("110.49"),
+                Some("35.5000"),
+                Some("ann"),
+                Some("41"),
+            ],
+            &[
+                Some("inactive"),
+                Some("1"),
+                Some("0.00"),
+                None,
+                Some("bob"),
+                None
+            ],
+            &[
+                None,
+                Some("4"),
+                Some("110.49"),
+                Some("32.0000"),
+                Some("ann"),
+                Some("41")
+            ],
+        ])
+    );
+
+    // Two keys: each user's groups, then that user's total, then the total.
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT user_id, published, COUNT(*), SUM(views) FROM posts GROUP BY user_id, published WITH ROLLUP",
+    );
+    assert_eq!(
+        shapes[..2],
+        [
+            (
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (MYSQL_TYPE_TINY, 4, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[None, Some("1"), Some("1"), Some("5")],
+            &[None, None, Some("1"), Some("5")],
+            &[Some("1"), Some("0"), Some("1"), Some("3")],
+            &[Some("1"), Some("1"), Some("1"), Some("10")],
+            &[Some("1"), None, Some("2"), Some("13")],
+            &[Some("2"), Some("1"), Some("1"), Some("7")],
+            &[Some("2"), None, Some("1"), Some("7")],
+            &[Some("3"), None, Some("1"), Some("0")],
+            &[Some("3"), None, Some("1"), Some("0")],
+            &[None, None, Some("5"), Some("25")],
+        ])
+    );
+
+    for (sql, expected) in [
+        (
+            "SELECT status AS s, COUNT(*) AS c FROM users WHERE age > 20 GROUP BY status WITH ROLLUP",
+            rows(&[
+                &[None, Some("1")],
+                &[Some("active"), Some("2")],
+                &[None, Some("3")],
+            ]),
+        ),
+        // The HAVING filters the totals too.
+        (
+            "SELECT status, COUNT(*) FROM users GROUP BY status WITH ROLLUP HAVING COUNT(*) > 1",
+            rows(&[&[Some("active"), Some("2")], &[None, Some("4")]]),
+        ),
+        (
+            "SELECT status, COUNT(*) FROM users GROUP BY status WITH ROLLUP LIMIT 2",
+            rows(&[&[None, Some("1")], &[Some("active"), Some("2")]]),
+        ),
+        // Over no rows there is no grand total either.
+        (
+            "SELECT status, COUNT(*) FROM users WHERE id > 100 GROUP BY status WITH ROLLUP",
+            rows(&[]),
+        ),
+        (
+            "SELECT status FROM users GROUP BY status WITH ROLLUP",
+            rows(&[&[None], &[Some("active")], &[Some("inactive")], &[None]]),
+        ),
+    ] {
+        let (_, answered) = report(&mut adapter, sql);
+        assert_eq!(answered, expected, "{sql}");
+    }
+
+    // Words are ordered and grouped the way MySQL compares them.
+    adapter
+        .execute_query("CREATE TABLE kt (id INT PRIMARY KEY, b BIGINT NOT NULL, s SMALLINT, c CHAR(3), w VARCHAR(10) NOT NULL, d DECIMAL(5,2))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO kt VALUES (1, 5, 1, 'x', 'Bob', 1.50), (2, 5, 2, 'y', 'active', 2.50), (3, 6, 1, 'x', 'carl', 1.50), (4, 6, 2, 'y', 'Active', 2.50)")
+        .unwrap();
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT w, COUNT(*) FROM kt GROUP BY w WITH ROLLUP",
+    );
+    assert_eq!(shapes[0], (MYSQL_TYPE_VAR_STRING, 40, 31, 0));
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("active"), Some("2")],
+            &[Some("Bob"), Some("1")],
+            &[Some("carl"), Some("1")],
+            &[None, Some("4")],
+        ])
+    );
+    let (shapes, _) = report(
+        &mut adapter,
+        "SELECT c, d, b, COUNT(*) FROM kt GROUP BY c, d, b WITH ROLLUP",
+    );
+    assert_eq!(
+        shapes[..3],
+        [
+            (MYSQL_TYPE_STRING, 12, 31, 0),
+            (
+                MYSQL_TYPE_NEWDECIMAL,
+                7,
+                2,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+        ]
+    );
+    // A key left out of the projection still orders the rows.
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT s, b, SUM(id) FROM kt GROUP BY b, s WITH ROLLUP",
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("1"), Some("5"), Some("1")],
+            &[Some("2"), Some("5"), Some("2")],
+            &[None, Some("5"), Some("3")],
+            &[Some("1"), Some("6"), Some("3")],
+            &[Some("2"), Some("6"), Some("4")],
+            &[None, Some("6"), Some("7")],
+            &[None, None, Some("10")],
+        ])
+    );
+
+    for sql in [
+        // MySQL answers an ORDER BY over a rollup with shapes of its own.
+        "SELECT status, COUNT(*) FROM users GROUP BY status WITH ROLLUP ORDER BY status DESC",
+        // A largest moment answers words of 76 under a rollup.
+        "SELECT status, MAX(created_at) FROM users GROUP BY status WITH ROLLUP",
+        // A HAVING naming a key, GROUPING(), a key that is an expression.
+        "SELECT status, COUNT(*) FROM users GROUP BY status WITH ROLLUP HAVING status = 'active'",
+        "SELECT status, GROUPING(status), COUNT(*) FROM users GROUP BY status WITH ROLLUP",
+        "SELECT DATE(created_at), COUNT(*) FROM posts GROUP BY DATE(created_at) WITH ROLLUP",
+        // A `?`, which each level would read again.
+        "SELECT status, COUNT(*) FROM users WHERE age > ? GROUP BY status WITH ROLLUP",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}
