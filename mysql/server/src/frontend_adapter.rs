@@ -6,6 +6,9 @@
 
 #[cfg(unix)]
 mod catalog_results;
+mod named_lock_results;
+
+use turso_mysql::named_locks::{MySqlNamedLockSession, MySqlNamedLocks};
 #[cfg(unix)]
 mod reserved_keywords_84;
 
@@ -56,6 +59,7 @@ use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
 #[cfg(unix)]
+use turso_mysql_parser::parse_optional_named_lock_query;
 use turso_mysql_parser::{
     is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
     parse_connector_j_foreign_keys, parse_optional_account_admin_command,
@@ -177,6 +181,9 @@ pub struct MySqlCommandAdapter {
     raised_warnings: Vec<MySqlWarning>,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
     pending_long_data: PendingLongData,
+    /// The named locks this session holds. A directly supplied connection has
+    /// no server around it, so it has a lock table of its own.
+    named_locks: MySqlNamedLockSession,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +241,7 @@ impl MySqlCommandAdapter {
             raised_warnings: Vec::new(),
             prepared_types: HashMap::new(),
             pending_long_data: PendingLongData::default(),
+            named_locks: Arc::new(MySqlNamedLocks::default()).session(),
         }
     }
 
@@ -285,6 +293,8 @@ impl CommandExecutor for MySqlCommandAdapter {
             .reset_connection()
             .map_err(frontend_query_error)?;
         self.prepared_types.clear();
+        // MySQL's reset lets go of every named lock the session holds.
+        self.named_locks.release_all();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
         self.connection.set_time_zone_offset_seconds(0);
         self.raised_warnings.clear();
@@ -369,6 +379,11 @@ impl MySqlCommandAdapter {
             self.connection
                 .set_time_zone_offset_seconds(self.session_variables.time_zone_offset_seconds());
             return Ok(result);
+        }
+        if let Some(query) = parse_optional_named_lock_query(sql, self.connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return named_lock_results::named_lock_result(&query, &self.named_locks, status_flags);
         }
         refuse_an_unknown_system_variable(sql)?;
         if is_internal_catalog_select(sql) {
@@ -557,6 +572,7 @@ where
         principal: AuthenticatedPrincipal,
         command_options: CommandExecutionOptions,
     ) -> Result<Self::Executor, AuthorizationError> {
+        let named_locks = self.catalog.named_locks().session();
         Ok(AuthorizedDatabaseCommandAdapter {
             session: self.catalog.new_session_with_prepared_statement_authority(
                 self.schema_context,
@@ -574,6 +590,7 @@ where
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
             pending_long_data: PendingLongData::default(),
+            named_locks,
         })
     }
 }
@@ -601,6 +618,9 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     command_options: CommandExecutionOptions,
     prepared_statements: DatabasePreparedStatementRegistry,
     pending_long_data: PendingLongData,
+    /// The named locks this session holds, in the table every session of the
+    /// server shares.
+    named_locks: MySqlNamedLockSession,
 }
 
 #[cfg(unix)]
@@ -1705,6 +1725,8 @@ where
             statement.connection.clear_prepared_statements();
         }
         self.prepared_statements.statements.clear();
+        // MySQL's reset lets go of every named lock the session holds.
+        self.named_locks.release_all();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
         if let Ok(connection) = self.session.connection() {
             connection.set_time_zone_offset_seconds(0);
@@ -1905,6 +1927,11 @@ where
                 }
             }
             return Ok(result);
+        }
+        if let Some(query) = parse_optional_named_lock_query(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return named_lock_results::named_lock_result(&query, &self.named_locks, status_flags);
         }
         refuse_an_unknown_system_variable(sql)?;
         if is_account_admin_statement(sql) {

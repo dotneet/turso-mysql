@@ -30583,3 +30583,6 @@ mod transaction_isolation;
 
 #[cfg(unix)]
 mod connection_settings;
+
+#[cfg(unix)]
+mod named_locks;

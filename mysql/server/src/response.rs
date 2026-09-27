@@ -381,6 +381,12 @@ pub enum FrontendErrorKind {
     SerializationFailure,
     /// A level for the next transaction was set inside a transaction.
     TransactionCharacteristicsInProgress,
+    /// A named lock was named with nothing, or with `NULL`.
+    IncorrectUserLockName,
+    /// A named lock was named with more than 64 characters.
+    UserLockNameTooLong,
+    /// Waiting for a named lock would never end.
+    UserLockDeadlock,
     /// A `ROLLBACK TO` or `RELEASE SAVEPOINT` named a savepoint that is not
     /// there.
     NoSuchSavepoint,
@@ -434,6 +440,25 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1568,
             *b"25001",
             b"Transaction characteristics can't be changed while a transaction is in progress"
+                .as_slice(),
+        ),
+        // Measured on MySQL 8.4.11. MySQL's messages name the lock, where these
+        // stay fixed as every other one does.
+        FrontendErrorKind::IncorrectUserLockName => (
+            3057,
+            *b"42000",
+            b"Incorrect user-level lock name. The name is empty, NULL, or can not be expressed in the current character-set."
+                .as_slice(),
+        ),
+        FrontendErrorKind::UserLockNameTooLong => (
+            4163,
+            *b"42000",
+            b"User-level lock name should not exceed 64 characters.".as_slice(),
+        ),
+        FrontendErrorKind::UserLockDeadlock => (
+            3058,
+            *b"HY000",
+            b"Deadlock found when trying to get user-level lock; try rolling back transaction/releasing locks and restarting lock acquisition."
                 .as_slice(),
         ),
         // Measured on MySQL 8.4.11: 1305, SQLSTATE 42000, for a savepoint that
@@ -2452,6 +2477,9 @@ mod tests {
             (FrontendErrorKind::DuplicateDatabase, 1007, *b"HY000"),
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
             (FrontendErrorKind::SerializationFailure, 1213, *b"40001"),
+            (FrontendErrorKind::IncorrectUserLockName, 3057, *b"42000"),
+            (FrontendErrorKind::UserLockNameTooLong, 4163, *b"42000"),
+            (FrontendErrorKind::UserLockDeadlock, 3058, *b"HY000"),
             (
                 FrontendErrorKind::TransactionCharacteristicsInProgress,
                 1568,

@@ -117,9 +117,11 @@ pub use mysql_ddl::{
 pub use number_format::{format_number, truncate_number};
 pub use select_projection_origins::{select_projection_origins, MySqlSelectProjectionOrigin};
 pub use session_queries::{
-    parse_optional_select_database, parse_optional_system_variable_query,
-    parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSystemVariableQuery,
-    MySqlSystemVariableRead, MySqlUserVariableQuery, MySqlUserVariableRead,
+    parse_optional_named_lock_query, parse_optional_select_database,
+    parse_optional_system_variable_query, parse_optional_user_variable_query, MySqlNamedLockCall,
+    MySqlNamedLockFunction, MySqlNamedLockQuery, MySqlSelectDatabaseQuery,
+    MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableQuery,
+    MySqlUserVariableRead,
 };
 pub use session_settings::{
     parse_optional_session_settings, parse_optional_user_variable_assignment, MySqlSessionSetting,

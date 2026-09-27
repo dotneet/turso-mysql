@@ -313,6 +313,162 @@ pub fn parse_optional_user_variable_query(
     Ok(Some(MySqlUserVariableQuery { reads }))
 }
 
+/// A `SELECT` of calls on MySQL's named locks, which the server answers from
+/// what every session holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlNamedLockQuery {
+    calls: Vec<MySqlNamedLockCall>,
+}
+
+impl MySqlNamedLockQuery {
+    /// Returns the calls the statement makes, in projection order, which is
+    /// the order MySQL makes them in.
+    pub fn calls(&self) -> &[MySqlNamedLockCall] {
+        &self.calls
+    }
+}
+
+/// One call on a named lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlNamedLockCall {
+    function: MySqlNamedLockFunction,
+    column_name: String,
+}
+
+impl MySqlNamedLockCall {
+    pub fn function(&self) -> &MySqlNamedLockFunction {
+        &self.function
+    }
+
+    /// Returns the name MySQL gives the result column: the call as the client
+    /// wrote it, or its alias.
+    pub fn column_name(&self) -> &str {
+        &self.column_name
+    }
+}
+
+/// What one call asks of a named lock. A name of `None` was written `NULL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlNamedLockFunction {
+    /// `GET_LOCK(name, timeout)`, with the timeout in whole seconds. Measured
+    /// on MySQL 8.4.11: a `NULL` timeout waits no time at all, and a negative
+    /// one waits without end.
+    Get {
+        name: Option<String>,
+        timeout_seconds: i64,
+    },
+    Release {
+        name: Option<String>,
+    },
+    IsFree {
+        name: Option<String>,
+    },
+    IsUsed {
+        name: Option<String>,
+    },
+    ReleaseAll,
+}
+
+/// Parses a `SELECT` whose every term is a call on a named lock — how Rails,
+/// Prisma and Flyway take one around a migration.
+///
+/// Anything else returns `None`, so the ordinary `SELECT` path keeps it. A
+/// timeout written as anything but a whole number or `NULL` is left to that
+/// path too: MySQL reads a fraction as whole seconds by a rule of its own.
+pub fn parse_optional_named_lock_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlNamedLockQuery>, ParseError> {
+    let mut scanner = Scanner::new(sql, mode);
+    scanner.skip_gaps();
+    if !scanner.take_keyword("SELECT") {
+        return Ok(None);
+    }
+    let mut calls = Vec::new();
+    loop {
+        scanner.skip_gaps();
+        let start = scanner.cursor;
+        let Some(function) = take_named_lock_function(&mut scanner) else {
+            return Ok(None);
+        };
+        let expression = sql[start..scanner.cursor].to_owned();
+        scanner.skip_gaps();
+        let alias = scanner.take_alias()?;
+        calls.push(MySqlNamedLockCall {
+            function,
+            column_name: alias.unwrap_or(expression),
+        });
+        scanner.skip_gaps();
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    if !scanner.at_end() {
+        return Ok(None);
+    }
+    Ok(Some(MySqlNamedLockQuery { calls }))
+}
+
+fn take_named_lock_function(scanner: &mut Scanner) -> Option<MySqlNamedLockFunction> {
+    let function = if scanner.take_keyword("GET_LOCK") {
+        NamedLockName::Get
+    } else if scanner.take_keyword("RELEASE_LOCK") {
+        NamedLockName::Release
+    } else if scanner.take_keyword("IS_FREE_LOCK") {
+        NamedLockName::IsFree
+    } else if scanner.take_keyword("IS_USED_LOCK") {
+        NamedLockName::IsUsed
+    } else if scanner.take_keyword("RELEASE_ALL_LOCKS") {
+        NamedLockName::ReleaseAll
+    } else {
+        return None;
+    };
+    scanner.skip_gaps();
+    if !scanner.take_byte(b'(') {
+        return None;
+    }
+    scanner.skip_gaps();
+    if function == NamedLockName::ReleaseAll {
+        return scanner
+            .take_byte(b')')
+            .then_some(MySqlNamedLockFunction::ReleaseAll);
+    }
+    let name = scanner.take_nullable_string()?;
+    scanner.skip_gaps();
+    let function = match function {
+        NamedLockName::Get => {
+            if !scanner.take_byte(b',') {
+                return None;
+            }
+            scanner.skip_gaps();
+            let timeout_seconds = if scanner.take_keyword("NULL") {
+                0
+            } else {
+                scanner.take_whole_number()?
+            };
+            scanner.skip_gaps();
+            MySqlNamedLockFunction::Get {
+                name,
+                timeout_seconds,
+            }
+        }
+        NamedLockName::Release => MySqlNamedLockFunction::Release { name },
+        NamedLockName::IsFree => MySqlNamedLockFunction::IsFree { name },
+        NamedLockName::IsUsed => MySqlNamedLockFunction::IsUsed { name },
+        NamedLockName::ReleaseAll => unreachable!("RELEASE_ALL_LOCKS takes no argument"),
+    };
+    scanner.take_byte(b')').then_some(function)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedLockName {
+    Get,
+    Release,
+    IsFree,
+    IsUsed,
+    ReleaseAll,
+}
+
 /// Reads the statement from its own bytes, so that the column name keeps the
 /// spelling the client sent.
 struct Scanner<'a> {
@@ -425,6 +581,58 @@ impl<'a> Scanner<'a> {
         (self.cursor > start).then(|| self.sql[start..self.cursor].to_owned())
     }
 
+    /// Reads a quoted string, or `NULL` as `None`.
+    ///
+    /// A backslash is left to the ordinary path when it escapes, since what it
+    /// escapes to is that path's to work out.
+    fn take_nullable_string(&mut self) -> Option<Option<String>> {
+        if self.take_keyword("NULL") {
+            return Some(None);
+        }
+        let quote = match self.bytes.get(self.cursor) {
+            Some(b'\'') => b'\'',
+            Some(b'"') if !self.mode.ansi_quotes => b'"',
+            _ => return None,
+        };
+        let mut value = String::new();
+        let mut cursor = self.cursor + 1;
+        while let Some(byte) = self.bytes.get(cursor) {
+            if *byte == quote {
+                if self.bytes.get(cursor + 1) == Some(&quote) {
+                    value.push(char::from(quote));
+                    cursor += 2;
+                    continue;
+                }
+                self.cursor = cursor + 1;
+                return Some(Some(value));
+            }
+            if *byte == b'\\' && !self.mode.no_backslash_escapes {
+                return None;
+            }
+            let end = next_character_end(self.sql, cursor);
+            value.push_str(&self.sql[cursor..end]);
+            cursor = end;
+        }
+        None
+    }
+
+    /// Reads a whole number, with a minus sign if it has one.
+    fn take_whole_number(&mut self) -> Option<i64> {
+        let start = self.cursor;
+        let _ = self.take_byte(b'-');
+        let digits = self.word_end();
+        if digits == self.cursor
+            || !self.sql[self.cursor..digits]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+        {
+            self.cursor = start;
+            return None;
+        }
+        self.cursor = digits;
+        self.sql[start..digits].parse().ok()
+    }
+
     fn take_alias_name(&mut self) -> Option<String> {
         if let Some(quote) = self.opening_quote() {
             let mut name = String::new();
@@ -485,6 +693,80 @@ fn next_character_end(sql: &str, cursor: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// The lock calls Rails, Prisma and Flyway make around a migration, each
+    /// named after the call as written unless given an alias.
+    #[test]
+    fn reads_calls_on_named_locks() {
+        let read =
+            |sql: &str| parse_optional_named_lock_query(sql, SessionSqlMode::default()).unwrap();
+
+        let query = read("SELECT GET_LOCK('7458657555131878620', 0)").unwrap();
+        assert_eq!(
+            query.calls()[0].function(),
+            &MySqlNamedLockFunction::Get {
+                name: Some("7458657555131878620".to_owned()),
+                timeout_seconds: 0,
+            }
+        );
+        assert_eq!(
+            query.calls()[0].column_name(),
+            "GET_LOCK('7458657555131878620', 0)"
+        );
+
+        let query = read(
+            "select get_lock('a', -1) as got, RELEASE_LOCK(NULL), IS_FREE_LOCK('b'), RELEASE_ALL_LOCKS();",
+        )
+        .unwrap();
+        assert_eq!(
+            query
+                .calls()
+                .iter()
+                .map(|call| (call.function().clone(), call.column_name()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    MySqlNamedLockFunction::Get {
+                        name: Some("a".to_owned()),
+                        timeout_seconds: -1,
+                    },
+                    "got"
+                ),
+                (
+                    MySqlNamedLockFunction::Release { name: None },
+                    "RELEASE_LOCK(NULL)"
+                ),
+                (
+                    MySqlNamedLockFunction::IsFree {
+                        name: Some("b".to_owned())
+                    },
+                    "IS_FREE_LOCK('b')"
+                ),
+                (MySqlNamedLockFunction::ReleaseAll, "RELEASE_ALL_LOCKS()"),
+            ]
+        );
+        assert_eq!(
+            read("SELECT GET_LOCK('n', NULL)").unwrap().calls()[0].function(),
+            &MySqlNamedLockFunction::Get {
+                name: Some("n".to_owned()),
+                timeout_seconds: 0,
+            }
+        );
+
+        // A fraction, a word, a bound name, an escape, and a call beside
+        // anything else all belong to the ordinary path.
+        for sql in [
+            "SELECT GET_LOCK('n', 1.5)",
+            "SELECT GET_LOCK('n', '2')",
+            "SELECT GET_LOCK(?, 10)",
+            "SELECT GET_LOCK('a\\b', 0)",
+            "SELECT GET_LOCK('n', 0), 1",
+            "SELECT GET_LOCK('n', 0) FROM t",
+            "SELECT 1",
+        ] {
+            assert_eq!(read(sql), None, "{sql}");
+        }
+    }
+
     /// A user variable is read with one `@`, where a system variable has two.
     /// Measured on MySQL 8.4.11: the column is named after the variable as the
     /// client wrote it, so `@X` and `@x` name different columns even though

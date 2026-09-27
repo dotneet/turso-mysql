@@ -12,6 +12,7 @@ mod database_open;
 mod database_registry;
 mod dialect;
 mod drop_table;
+pub mod named_locks;
 pub mod schema_sql;
 mod session;
 pub mod show_create_table;

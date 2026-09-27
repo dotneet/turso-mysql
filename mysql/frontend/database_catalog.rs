@@ -1,5 +1,6 @@
 //! Pathless Core attachment through the trusted MySQL database registry.
 
+use crate::named_locks::MySqlNamedLocks;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -172,6 +173,8 @@ pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlD
 /// registry entries, or database descriptors.
 pub struct MySqlDatabaseCatalog {
     inner: Mutex<DatabaseCatalog>,
+    /// The named locks every session of this server shares.
+    named_locks: Arc<MySqlNamedLocks>,
 }
 
 impl MySqlDatabaseCatalog {
@@ -180,7 +183,13 @@ impl MySqlDatabaseCatalog {
         let catalog = DatabaseCatalog::open(root_path).map_err(MySqlDatabaseError::from)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(catalog),
+            named_locks: Arc::default(),
         }))
+    }
+
+    /// The named locks every session of this server shares.
+    pub fn named_locks(&self) -> &Arc<MySqlNamedLocks> {
+        &self.named_locks
     }
 
     /// Create and publish an empty logical database, returning its canonical name.

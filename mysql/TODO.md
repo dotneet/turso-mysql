@@ -241,7 +241,9 @@ boolean literal.
 | `FOR UPDATE NOWAIT`, `SKIP LOCKED`, `OF <table>` | refused; each asks what to do about a lock on some rows, and there is one lock over the whole database |
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
 | `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
-| `GET_LOCK` / `RELEASE_LOCK` | not started |
+| `GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK`, `RELEASE_ALL_LOCKS` | works, in a `SELECT` of those calls alone with a written name and a whole-number or `NULL` timeout |
+| `IS_USED_LOCK` | refused; it answers the holder's connection ID, which this server does not hand out |
+| A named-lock call beside anything else, with a bound name, or with a fractional or quoted timeout | refused; MySQL reads a fraction as whole seconds by a rule of its own |
 | `XA` transactions | refused, and out of scope — see what this frontend is for |
 
 ---

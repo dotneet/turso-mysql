@@ -2073,6 +2073,19 @@ there is nothing to hold. `NOWAIT`, `SKIP LOCKED` and `OF <table>` are refused: 
 something one lock over one database cannot answer. `LOCK IN SHARE MODE`, MySQL's older
 spelling of `FOR SHARE`, is not read by the parser yet.
 
+`GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK` and `RELEASE_ALL_LOCKS` work on MySQL's named
+locks, the ones Rails, Prisma and Flyway each take around a migration. They belong to no
+database and no transaction: every session of the server shares one table of them, a
+rollback leaves a lock held, and a session lets go of all it holds when it resets or ends.
+Measured on 8.4.11 and matched: names are matched whatever their case; a session may take a
+lock it holds again and must let it go as many times, which `RELEASE_ALL_LOCKS` counts; a
+`NULL` timeout waits no time and a negative one waits without end; `RELEASE_LOCK` answers 0
+for a lock another session holds and NULL for one no session does; an empty or `NULL` name is
+3057 and one past 64 characters 4163; and a session that would wait for a lock held by a
+session already waiting on it is told 3058 at once and keeps the locks it has. The calls are
+answered in a `SELECT` of them alone, with the result columns MySQL reports. `IS_USED_LOCK`
+is refused, since it answers the holder's connection ID and this server hands none out.
+
 `LOCK TABLES` takes a lock and holds it until `UNLOCK TABLES`, which is what the statement
 asks to be true. It was refused while there was no way to hold one; there is now, and it is
 the same one `SELECT ... FOR UPDATE` takes — the engine's write lock, held for as long as the
