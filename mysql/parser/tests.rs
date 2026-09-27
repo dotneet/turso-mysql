@@ -2895,11 +2895,31 @@ fn a_comparison_renders_a_subquery_that_answers_one_value() {
     assert_eq!(pair.inner_table(), "teams");
     assert_eq!(pair.inner_column_name(), "points");
 
+    // MySQL rounds AVG to four places and compares the column against that
+    // decimal, so the engine's exact decimal average is compared as a number.
+    let translated = parse_select(
+        "SELECT id FROM users WHERE score > (SELECT AVG(score) FROM users)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE numeric_lt((SELECT mysql_decimal_avg(\"score\") AS \"AVG(score)\" FROM \"users\"), \"score\")"
+    );
+    assert_eq!(
+        translated
+            .checked_comparisons()
+            .iter()
+            .map(|comparison| (comparison.qualifier(), comparison.column_name()))
+            .collect::<Vec<_>>(),
+        [(None, "score"), (Some("users"), "score")]
+    );
+
     for sql in [
         // 1242 in MySQL: a plain column can answer more than one row.
         "SELECT id FROM users WHERE id = (SELECT owner_id FROM teams)",
-        // MySQL rounds AVG to four places; the engine keeps the fraction.
-        "SELECT id FROM users WHERE score > (SELECT AVG(score) FROM users)",
+        // A total has not been measured against a column.
+        "SELECT id FROM users WHERE score > (SELECT SUM(score) FROM users)",
         // A grouped subquery answers a row per group.
         "SELECT id FROM users WHERE score = (SELECT MAX(score) FROM users GROUP BY team)",
         // A COUNT meets a whole number and nothing else.

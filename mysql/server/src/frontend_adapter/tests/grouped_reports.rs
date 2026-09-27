@@ -428,3 +428,82 @@ fn a_rounded_total_or_average_answers_the_decimal_mysql_answers() {
         );
     }
 }
+
+/// `WHERE views > (SELECT AVG(views) FROM posts)` asks for the rows above
+/// average. MySQL compares the column against the average as a decimal
+/// rounded to four places.
+#[test]
+fn a_column_compared_against_the_average_finds_the_rows_mysql_finds() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("CREATE TABLE thirds (n INT)")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO thirds VALUES (1), (1), (2)")
+        .unwrap();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM posts WHERE views > (SELECT AVG(views) FROM posts) ORDER BY id",
+            &[Some("1"), Some("3")][..],
+        ),
+        (
+            "SELECT id FROM posts WHERE views >= (SELECT AVG(views) FROM posts) ORDER BY id",
+            &[Some("1"), Some("3"), Some("5")],
+        ),
+        (
+            "SELECT id FROM posts WHERE views = (SELECT AVG(views) FROM posts) ORDER BY id",
+            &[Some("5")],
+        ),
+        (
+            "SELECT id FROM posts WHERE views <> (SELECT AVG(views) FROM posts) ORDER BY id",
+            &[Some("1"), Some("2"), Some("3"), Some("4")],
+        ),
+        (
+            "SELECT id FROM posts WHERE (SELECT AVG(views) FROM posts) < views ORDER BY id",
+            &[Some("1"), Some("3")],
+        ),
+        (
+            "SELECT id FROM posts WHERE views <= (SELECT AVG(views) FROM posts) ORDER BY id",
+            &[Some("2"), Some("4"), Some("5")],
+        ),
+        // An average over no rows is NULL, which no row compares true against.
+        (
+            "SELECT id FROM posts WHERE views <= (SELECT AVG(views) FROM posts WHERE id > 100) ORDER BY id",
+            &[],
+        ),
+        (
+            "SELECT n FROM thirds WHERE n > (SELECT AVG(n) FROM thirds)",
+            &[Some("2")],
+        ),
+    ] {
+        let (_, answered) = report(&mut adapter, sql);
+        assert_eq!(
+            answered,
+            expected
+                .iter()
+                .map(|value| vec![value.map(str::to_owned)])
+                .collect::<Rows>(),
+            "{sql}"
+        );
+    }
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT * FROM posts WHERE views > (SELECT AVG(views) FROM posts) ORDER BY id",
+    );
+    assert_eq!(answered.len(), 2);
+
+    for sql in [
+        // Words compared against a number, which MySQL coerces.
+        "SELECT id FROM posts WHERE title > (SELECT AVG(views) FROM posts)",
+        // A total, which has not been measured against a column.
+        "SELECT id FROM posts WHERE views > (SELECT SUM(views) FROM posts)",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

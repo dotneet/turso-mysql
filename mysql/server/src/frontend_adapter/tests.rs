@@ -6484,6 +6484,11 @@ fn a_comparison_takes_a_subquery_that_answers_one_value() {
             "SELECT id FROM parent WHERE id = (SELECT MAX(id) FROM child WHERE parent_id = 1) ORDER BY id",
             &vec![vec![Some(b"1".to_vec())]],
         ),
+        // MySQL compares against the average rounded to four places, 5.6667.
+        (
+            "SELECT id FROM parent WHERE n > (SELECT AVG(n) FROM parent) ORDER BY id",
+            &vec![vec![Some(b"3".to_vec())]],
+        ),
     ] {
         let CommandExecutionResult::ResultSet(set) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must return a result set");
@@ -6516,8 +6521,8 @@ fn a_comparison_takes_a_subquery_that_answers_one_value() {
     for sql in [
         // 1242 in MySQL, a row of its own choosing in the engine.
         "SELECT id FROM parent WHERE id = (SELECT parent_id FROM child)",
-        // MySQL rounds AVG to four places and the engine keeps the fraction.
-        "SELECT id FROM parent WHERE n > (SELECT AVG(n) FROM parent)",
+        // A total has not been measured against a column.
+        "SELECT id FROM parent WHERE n > (SELECT SUM(n) FROM parent)",
         // A word against a number: MySQL coerces it and warns 1292.
         "SELECT id FROM parent WHERE name = (SELECT MAX(parent_id) FROM child)",
         // 1093: the subquery reads the table the statement changes.

@@ -2038,9 +2038,24 @@ and held to the rule `column IN (SELECT column ...)` holds its pair to — a wor
 column against a number aggregate is refused, which is the comparison MySQL
 answers by coercion, with a 1292 warning per row. A `COUNT` answers a whole
 number whatever it counts, so it meets a whole number written out and nothing
-else. `SUM` and `AVG` are left out: MySQL answers `AVG` as a decimal rounded to
-four places where the engine keeps the whole fraction, so a comparison against
-one can land on either side of a row.
+else. `SUM` is left out, not having been measured against a column.
+
+An `AVG` is taken against a column, which is how a statement asks for the rows
+above average — `WHERE views > (SELECT AVG(views) FROM posts)`, written either
+way round, with `=`, `<>`, `<`, `<=`, `>` or `>=`. MySQL answers the average of
+whole numbers as a decimal rounded to four places and compares the column
+against that decimal, where the engine's own `AVG` keeps the whole fraction as a
+float, so a row could land on the other side of it. So the average is taken as
+the engine's exact `mysql_decimal_avg`, which answers MySQL's decimal, and the
+two sides are compared with `numeric_lt` and `numeric_eq`, which compare exact
+numbers and answer NULL where either side is NULL — an average over no rows
+keeps no row, as in MySQL. Measured on 8.4.11 over views 10, 3, 7, 0 and 5 and
+over 1, 1 and 2, the engine keeps the rows MySQL keeps for each operator. Both
+columns are held to whole numbers; a `DECIMAL`, a float or a word on either
+side is refused, and so is a correlated average, whose qualified argument the
+aggregate reader does not take. A statement whose tables hold a `DECIMAL` and
+that needs its columns' types for another reason — an `ORDER BY` a bare column
+— is refused as any such statement with a subquery is.
 
 A comparison naming no column is taken when both sides are whole numbers, and
 so is a bare whole number standing as the whole predicate. That is the opening
@@ -4863,7 +4878,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `UTC_DATE()`, `UTC_TIMESTAMP()`, `UTC_TIME()`, `SYSDATE()` | partial | partial | n/a | n/a | partial | [`clock reader`](parser/lib.rs), [adapter tests](server/src/frontend_adapter/tests/date_arithmetic.rs) | Read wherever `CURDATE()`, `NOW()` and `CURTIME()` are, with their measured shapes. Refused in a session of another zone, as `NOW()` is. |
 | `QUARTER`, `WEEKDAY`, `DAYOFWEEK`, `DAYOFYEAR`, `DAYOFMONTH`, `LAST_DAY`, `EXTRACT` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-calendar-readings.json), [P0 manifest](conformance/Makefile) | The engine has none of these by name, so each is counted off what it does have. Every value and every reported shape is pinned to the 8.4.11 golden, `EXTRACT(YEAR FROM ...)` included, which reports a whole number of length 5 where `YEAR` reports a YEAR of length 4. |
 | `LIKE CONCAT('%', ?, '%')` — a pattern written in pieces | partial | partial | n/a | n/a | partial | [`LIKE renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-like-concat-pattern.json), [P0 manifest](conformance/Makefile) | The pieces spell one pattern, and written ones are joined into it. A bound piece stays a piece and the join is left to the engine. A piece naming a column and a second bound piece are refused. Backslash escapes are read by the dedicated UCA9 LIKE matcher. |
-| `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. `SUM` and `AVG` are refused for their rounding. |
+| `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. An `AVG` of whole numbers against a whole-number column is compared as MySQL's four-place decimal. `SUM` is refused. |
 | `WHERE 1 = 1 AND ...` — a comparison naming no column | partial | partial | n/a | n/a | partial | [`predicate renderers`](parser/translate.rs), [oracle case](conformance/cases/p0/select-constant-predicate.json), [P0 manifest](conformance/Makefile) | Two whole numbers compared, and a bare whole number as the predicate, which is the opening a statement built up in pieces uses. It holds in a `SELECT`, an `UPDATE` and a `DELETE`. A word against a word and a number against a word stay refused, MySQL reading those without regard to case and by coercion. |
 | `IFNULL(SUM(n), 0)` / `COALESCE(MAX(n), 0)` — an aggregate with a fallback | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-defaulted-aggregate.json), [P0 manifest](conformance/Makefile) | The shape the aggregate answers on its own, plus NOT_NULL, with any whole number widened to a BIGINT and the length left alone. Over no rows the answer is the fallback rather than NULL. The fallback has to be a whole number, the rule the plain-column form already follows. |
 | `ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)` — a counter stepped | partial | partial | n/a | n/a | partial | [`upsert renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-upsert-counter.json), [P0 manifest](conformance/Makefile) | A bare column is the row already there and `VALUES(col)` the one offered, which the engine calls `excluded.col`; arithmetic joins the two. A name put on the offered row — MySQL 8.0.19's replacement for `VALUES()` — names the same thing, and once it is there a bare column is 1052 and refused. |

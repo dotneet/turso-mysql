@@ -4024,6 +4024,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// `number_a_written_word_names` says when it matters.
     pub(crate) compares_a_written_number: bool,
     compares_a_large_decimal_integer: bool,
+    /// Whether an `AVG` is being rendered as MySQL's exact decimal rather than
+    /// the engine's float, which a comparison against one asks for.
+    averages_exactly: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
@@ -4069,6 +4072,7 @@ impl<'a> SelectRenderContext<'a> {
             compares_a_written_day: false,
             compares_a_written_number: false,
             compares_a_large_decimal_integer: false,
+            averages_exactly: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
@@ -4337,7 +4341,11 @@ fn render_aggregate_call(
         "stddev".to_owned()
     } else if let Some((kind, column)) = static_select_metadata::column_aggregate_argument(function)
     {
-        if render_context
+        if kind == static_select_metadata::ColumnAggregateKind::Avg
+            && render_context.averages_exactly
+        {
+            "mysql_decimal_avg".to_owned()
+        } else if render_context
             .decimal_columns
             .iter()
             .any(|(known, _)| known.eq_ignore_ascii_case(&column.value))
@@ -8541,6 +8549,16 @@ fn render_comparison_over_a_scalar_subquery(
     let Some(answered) = subquery_answering_one_value(select) else {
         return Ok(None);
     };
+    if let ScalarSubqueryAnswer::AnExactAverage(inner_column_name) = &answered {
+        return render_comparison_against_an_average(
+            left,
+            op,
+            query,
+            other,
+            inner_column_name,
+            render_context,
+        );
+    }
     let rendered_other = match (&answered, other) {
         // MIN and MAX answer the column's own kind, so the two columns are
         // held to the rule `column IN (SELECT column ...)` holds them to.
@@ -8581,20 +8599,98 @@ fn render_comparison_over_a_scalar_subquery(
     )))
 }
 
+/// Renders a column compared against `(SELECT AVG(col) FROM ...)`, which is
+/// how a statement asks for the rows above average.
+///
+/// MySQL answers `AVG` over a whole number as a decimal rounded to four
+/// places, and compares the column against that decimal. The engine's float
+/// average keeps the whole fraction, so a row could land on the other side of
+/// it; the engine's `mysql_decimal_avg` answers MySQL's decimal, and
+/// `numeric_lt` and `numeric_eq` compare the two as the exact numbers they
+/// are, answering NULL where either is NULL. Both columns are held to whole
+/// numbers, which is all this has measured.
+fn render_comparison_against_an_average(
+    left: &Expr,
+    op: &BinaryOperator,
+    query: &sqlparser::ast::Query,
+    other: &Expr,
+    inner_column_name: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let (qualifier, column) = match other {
+        Expr::Identifier(column) => (None, column),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            (Some(parts[0].value.clone()), &parts[1])
+        }
+        _ => return Ok(None),
+    };
+    let Some(inner_table) = subquery_source_table(match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        _ => return Ok(None),
+    }) else {
+        return Ok(None);
+    };
+    let averages_exactly = std::mem::replace(&mut render_context.averages_exactly, true);
+    let rendered = render_subquery(query, render_context);
+    render_context.averages_exactly = averages_exactly;
+    let (rendered_subquery, _) = rendered?;
+    let inner_reference = render_context
+        .subquery_tables
+        .iter()
+        .rev()
+        .find(|source| source.table == inner_table)
+        .map(|source| source.reference.clone())
+        .ok_or(ParseError::Unsupported {
+            feature: "SELECT comparison against an average of an unknown table",
+        })?;
+    let whole_number = |qualifier, column_name: &str| CheckedSelectComparison {
+        qualifier,
+        inner_source: None,
+        column_name: column_name.to_owned(),
+        operator: CheckedSelectComparisonOperator::Equal,
+        rhs: CheckedSelectComparisonRhs::SignedInteger(1),
+        collated: false,
+        answers: None,
+    };
+    render_context
+        .checked_comparisons
+        .push(whole_number(qualifier, &column.value));
+    render_context
+        .checked_comparisons
+        .push(whole_number(Some(inner_reference), inner_column_name));
+    let rendered_column = render_select_expr(other, render_context)?;
+    let average = format!("({rendered_subquery})");
+    // The operator reads left to right, whichever side the subquery is on.
+    let (lhs, rhs) = if matches!(left, Expr::Subquery(_)) {
+        (average, rendered_column)
+    } else {
+        (rendered_column, average)
+    };
+    Ok(Some(match op {
+        BinaryOperator::Lt => format!("numeric_lt({lhs}, {rhs})"),
+        BinaryOperator::Gt => format!("numeric_lt({rhs}, {lhs})"),
+        BinaryOperator::LtEq => format!("(NOT numeric_lt({rhs}, {lhs}))"),
+        BinaryOperator::GtEq => format!("(NOT numeric_lt({lhs}, {rhs}))"),
+        BinaryOperator::Eq => format!("numeric_eq({lhs}, {rhs})"),
+        BinaryOperator::NotEq => format!("(NOT numeric_eq({lhs}, {rhs}))"),
+        _ => return unsupported("SELECT comparison against an average with this operator"),
+    }))
+}
+
 /// What a subquery standing where a value stands answers.
 enum ScalarSubqueryAnswer {
     /// `MIN(c)` or `MAX(c)`, which answer `c`'s own kind.
     TheColumnsOwnKind(String),
     /// `COUNT(...)`, which answers a whole number whatever it counts.
     AWholeNumber,
+    /// `AVG(c)`, which MySQL answers as a decimal four places past `c`'s own.
+    AnExactAverage(String),
 }
 
 /// Reads what a subquery answers, when it answers exactly one value.
 ///
-/// Only an aggregate over one implicit group does. `SUM` and `AVG` are left
-/// out: MySQL answers `AVG` as a decimal rounded to four places where the
-/// engine keeps the whole fraction, so a comparison against one can land on
-/// either side of a row.
+/// Only an aggregate over one implicit group does. `SUM` is left out: it has
+/// not been measured against a column.
 fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<ScalarSubqueryAnswer> {
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         return None;
@@ -8609,8 +8705,15 @@ fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<Scala
         return Some(ScalarSubqueryAnswer::AWholeNumber);
     }
     let (kind, column) = static_select_metadata::column_aggregate_argument(function)?;
-    matches!(kind, ColumnAggregateKind::MinMax)
-        .then(|| ScalarSubqueryAnswer::TheColumnsOwnKind(column.value.clone()))
+    match kind {
+        ColumnAggregateKind::MinMax => Some(ScalarSubqueryAnswer::TheColumnsOwnKind(
+            column.value.clone(),
+        )),
+        ColumnAggregateKind::Avg => {
+            Some(ScalarSubqueryAnswer::AnExactAverage(column.value.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Names the one table a subquery reads.
