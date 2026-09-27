@@ -186,11 +186,7 @@ pub fn parse_optional_connector_j_information_schema_query(
     // sends passes through here, so one that never names it is not read
     // against the templates: tokenizing all six of them was measured at over
     // 40% of a primary-key `SELECT`.
-    if !sql
-        .as_bytes()
-        .windows(INFORMATION_SCHEMA.len())
-        .any(|window| window.eq_ignore_ascii_case(INFORMATION_SCHEMA))
-    {
+    if !names_information_schema(sql) {
         return Ok(None);
     }
     let actual = tokenize_information_schema_query(sql, mode)?;
@@ -344,6 +340,9 @@ pub fn parse_optional_connector_j_schemata_listing_query(
     const CATALOGS: &str =
         "SELECT SCHEMA_NAME AS TABLE_CAT FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY TABLE_CAT";
     const SCHEMAS: &str = "SELECT SCHEMA_NAME AS TABLE_SCHEM, CATALOG_NAME AS TABLE_CATALOG FROM INFORMATION_SCHEMA.SCHEMATA WHERE FALSE ORDER BY TABLE_CATALOG, TABLE_SCHEM";
+    if !names_information_schema(sql) {
+        return Ok(None);
+    }
     let actual = tokenize_information_schema_query(sql, mode)?;
     if actual.iter().any(|token| {
         matches!(
@@ -364,6 +363,14 @@ pub fn parse_optional_connector_j_schemata_listing_query(
         }
     }
     Ok(None)
+}
+
+/// Whether a statement names `INFORMATION_SCHEMA` anywhere, which every
+/// Connector/J catalog query does.
+fn names_information_schema(sql: &str) -> bool {
+    sql.as_bytes()
+        .windows(INFORMATION_SCHEMA.len())
+        .any(|window| window.eq_ignore_ascii_case(INFORMATION_SCHEMA))
 }
 
 fn connector_j_template_captures(
@@ -458,6 +465,10 @@ mod connector_j_tests {
         let mode = SessionSqlMode::default();
         assert_eq!(
             parse_optional_connector_j_information_schema_query("SELECT 'unterminated", mode),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_optional_connector_j_schemata_listing_query("SELECT 'unterminated", mode),
             Ok(None)
         );
         assert!(parse_optional_connector_j_information_schema_query(

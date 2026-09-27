@@ -853,8 +853,6 @@ where
         sql: &str,
     ) -> Result<(Vec<MySqlSelectSource>, CatalogVisibility), FrontendErrorKind> {
         let source_tables = parsed_source_tables(sql);
-        let read_only_select = parse_select(sql, self.session.session_sql_mode())
-            .is_ok_and(|select| !select.locks_rows());
         match self
             .authorizer
             .authorize(&self.principal, DatabaseAction::Query { database })
@@ -866,6 +864,10 @@ where
                 Ok((source_tables, CatalogVisibility::All))
             }
             Err(AuthorizationError::Denied) => {
+                // Only a session without the database-wide grant needs to know
+                // this, and reading it parses the statement again.
+                let read_only_select = parse_select(sql, self.session.session_sql_mode())
+                    .is_ok_and(|select| !select.locks_rows());
                 if !read_only_select {
                     return Err(FrontendErrorKind::AccessDenied);
                 }
