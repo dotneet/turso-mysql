@@ -1283,7 +1283,8 @@ already had.
 Plain source columns in a windowed statement retain their table name and
 nullability in protocol metadata. Computed projections are still reported
 conservatively. MySQL does not report primary-key flags for the plain columns
-of a windowed result either.
+of a windowed result either. Executing a prepared statement answers the same
+columns preparing it announced, for a window and for a `UNION` alike.
 
 `TRIM` is written as the engine's three names — `trim`, `ltrim` and `rtrim` —
 because MySQL says with a side word what the engine says with a name. What to

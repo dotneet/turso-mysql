@@ -218,6 +218,9 @@ struct DatabasePreparedStatement {
     /// A statement with no parameters and no rows that the checked prepared
     /// path does not take, run through the text path when it is executed.
     runs_as_text: Option<String>,
+    /// The checked statement's own text, which a window or a `UNION` reads its
+    /// result columns' origins from each time it is executed.
+    sql: Option<String>,
 }
 
 #[cfg(unix)]
@@ -1085,6 +1088,7 @@ where
                 parameter_types: None,
                 catalog_query: Some(query),
                 runs_as_text: None,
+                sql: None,
             },
         );
         Ok(PreparedStatementResult {
@@ -2699,6 +2703,7 @@ where
                 parameter_types: None,
                 catalog_query: None,
                 runs_as_text: None,
+                sql: Some(sql.to_owned()),
             },
         );
         result
@@ -2743,6 +2748,7 @@ where
                 parameter_types: None,
                 catalog_query: None,
                 runs_as_text: Some(sql.to_owned()),
+                sql: None,
             },
         );
         Ok(PreparedStatementResult {
@@ -3315,6 +3321,7 @@ fn execute_prepared_statement(
         timeout,
         affected_rows_mode,
         None,
+        None,
         &[],
     )
 }
@@ -3358,22 +3365,25 @@ fn execute_database_prepared_statement(
         values,
         timeout,
         affected_rows_mode,
+        statement.sql.as_deref(),
         Some(statement.database.as_str()),
         &statement.source_tables,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_prepared_values(
     connection: &MySqlConnection,
     statement_id: u32,
     values: Vec<MySqlPreparedValue>,
     timeout: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
+    sql: Option<&str>,
     selected_database: Option<&str>,
     source_tables: &[MySqlSelectSource],
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     #[cfg(not(unix))]
-    let _ = (selected_database, source_tables);
+    let _ = (sql, selected_database, source_tables);
     let mut retained_bytes = 0usize;
     let mut row_count = 0usize;
     let result = connection
@@ -3434,12 +3444,16 @@ fn execute_prepared_values(
     }
     let column_types = binary_result_column_types(&metadata, &type_metadata, &rows)?;
     #[cfg(unix)]
+    let result_column_count = metadata.result_columns.len();
+    #[cfg(unix)]
     let source_metadata = prepared_table_result_metadata(
         connection,
         &type_metadata,
         selected_database,
         source_tables,
     )?;
+    #[cfg(unix)]
+    let projection = ProjectionOrigins::read(connection, &type_metadata, sql, source_tables)?;
     let columns = metadata
         .result_columns
         .into_iter()
@@ -3471,6 +3485,15 @@ fn execute_prepared_values(
             }
             #[cfg(unix)]
             if let Some(source_metadata) = source_metadata.as_ref() {
+                if let Some(definition) = projection.windowed_column_definition(
+                    source_metadata,
+                    result_column_count,
+                    index,
+                    &column.name,
+                    *column_type,
+                )? {
+                    return Ok(definition);
+                }
                 return source_metadata.column_definition_for_reference(
                     type_metadata[index]
                         .source_reference()
@@ -3482,6 +3505,8 @@ fn execute_prepared_values(
             Ok(column_definition(column.name, *column_type))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    #[cfg(unix)]
+    let columns = projection.shape_compound_columns(columns, source_metadata.as_ref())?;
     let rows = rows
         .into_iter()
         .map(|row| {
@@ -3968,27 +3993,7 @@ fn prepared_statement_result(
         source_tables,
     )?;
     #[cfg(unix)]
-    let windowed = type_metadata
-        .iter()
-        .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
-        .any(is_window_call);
-    #[cfg(unix)]
-    let compound = source_tables.iter().any(|source| source.branch() > 0);
-    #[cfg(unix)]
-    let projection_origins = if windowed || compound {
-        sql.map(|sql| select_projection_origins(sql, connection.parser_mode()))
-            .transpose()
-            .map_err(|_| FrontendErrorKind::Unsupported)?
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    #[cfg(unix)]
-    let drops_repeated_rows = match (compound, sql) {
-        (true, Some(sql)) => compound_drops_repeated_rows(sql, connection.parser_mode())
-            .map_err(|_| FrontendErrorKind::Unsupported)?,
-        _ => false,
-    };
+    let projection = ProjectionOrigins::read(connection, type_metadata, sql, source_tables)?;
     let columns = metadata
         .result_columns
         .into_iter()
@@ -4024,31 +4029,14 @@ fn prepared_statement_result(
                 mysql_type_for_prepared_column(&column, type_metadata).unwrap_or(MYSQL_TYPE_NULL);
             #[cfg(unix)]
             if let Some(source_metadata) = source_metadata.as_ref() {
-                if windowed
-                    && projection_origins.len() == 1
-                    && projection_origins[0].len() == result_column_count
-                {
-                    if let MySqlSelectProjectionOrigin::Column {
-                        table,
-                        column: source,
-                    } = &projection_origins[0][index]
-                    {
-                        if let Some((table, ordinal)) =
-                            source_metadata.projection_source(0, table.as_deref(), source)
-                        {
-                            let mut definition = source_metadata.table_column_definition(
-                                table,
-                                ordinal,
-                                column.name,
-                                Some(column_type),
-                            )?;
-                            definition.flags &= !(MYSQL_PRI_KEY_FLAG
-                                | MYSQL_PART_KEY_FLAG
-                                | MYSQL_UNIQUE_KEY_FLAG
-                                | MYSQL_AUTO_INCREMENT_FLAG);
-                            return Ok(definition);
-                        }
-                    }
+                if let Some(definition) = projection.windowed_column_definition(
+                    source_metadata,
+                    result_column_count,
+                    index,
+                    &column.name,
+                    column_type,
+                )? {
+                    return Ok(definition);
                 }
                 return source_metadata.column_definition_for_reference(
                     type_metadata
@@ -4062,16 +4050,7 @@ fn prepared_statement_result(
         })
         .collect::<Result<Vec<_>, _>>()?;
     #[cfg(unix)]
-    let mut columns = columns;
-    #[cfg(unix)]
-    if compound {
-        apply_compound_shape(
-            &mut columns,
-            &projection_origins,
-            source_metadata.as_ref(),
-            drops_repeated_rows,
-        )?;
-    }
+    let columns = projection.shape_compound_columns(columns, source_metadata.as_ref())?;
     Ok(PreparedStatementResult {
         statement_id: metadata.statement_id,
         parameters,
@@ -4079,6 +4058,110 @@ fn prepared_statement_result(
         warnings: 0,
         status_flags: connection_status_flags(connection),
     })
+}
+
+/// Where each result column of a window or a `UNION` comes from, read off the
+/// statement's text.
+///
+/// The engine answers every column of a window out of its own sorter and every
+/// column of a `UNION` out of the compound, so neither says which table column
+/// it reads. Preparing and executing a statement both read it here, so the
+/// columns executing answers are the ones preparing announced.
+#[cfg(unix)]
+struct ProjectionOrigins {
+    windowed: bool,
+    compound: bool,
+    origins: Vec<Vec<MySqlSelectProjectionOrigin>>,
+    drops_repeated_rows: bool,
+}
+
+#[cfg(unix)]
+impl ProjectionOrigins {
+    fn read(
+        connection: &MySqlConnection,
+        type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
+        sql: Option<&str>,
+        source_tables: &[MySqlSelectSource],
+    ) -> Result<Self, FrontendErrorKind> {
+        let windowed = type_metadata
+            .iter()
+            .filter_map(MySqlPreparedResultColumnTypeMetadata::static_metadata)
+            .any(is_window_call);
+        let compound = source_tables.iter().any(|source| source.branch() > 0);
+        let origins = if windowed || compound {
+            sql.map(|sql| select_projection_origins(sql, connection.parser_mode()))
+                .transpose()
+                .map_err(|_| FrontendErrorKind::Unsupported)?
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let drops_repeated_rows = match (compound, sql) {
+            (true, Some(sql)) => compound_drops_repeated_rows(sql, connection.parser_mode())
+                .map_err(|_| FrontendErrorKind::Unsupported)?,
+            _ => false,
+        };
+        Ok(Self {
+            windowed,
+            compound,
+            origins,
+            drops_repeated_rows,
+        })
+    }
+
+    /// The column a window's result column reads, without the key flags the
+    /// sorter does not carry.
+    fn windowed_column_definition(
+        &self,
+        source_metadata: &TableResultMetadata,
+        result_column_count: usize,
+        index: usize,
+        name: &str,
+        column_type: u8,
+    ) -> Result<Option<ColumnDefinitionConfig>, FrontendErrorKind> {
+        if !self.windowed || self.origins.len() != 1 || self.origins[0].len() != result_column_count
+        {
+            return Ok(None);
+        }
+        let MySqlSelectProjectionOrigin::Column {
+            table,
+            column: source,
+        } = &self.origins[0][index]
+        else {
+            return Ok(None);
+        };
+        let Some((table, ordinal)) = source_metadata.projection_source(0, table.as_deref(), source)
+        else {
+            return Ok(None);
+        };
+        let mut definition = source_metadata.table_column_definition(
+            table,
+            ordinal,
+            name.to_owned(),
+            Some(column_type),
+        )?;
+        definition.flags &= !(MYSQL_PRI_KEY_FLAG
+            | MYSQL_PART_KEY_FLAG
+            | MYSQL_UNIQUE_KEY_FLAG
+            | MYSQL_AUTO_INCREMENT_FLAG);
+        Ok(Some(definition))
+    }
+
+    fn shape_compound_columns(
+        &self,
+        mut columns: Vec<ColumnDefinitionConfig>,
+        source_metadata: Option<&TableResultMetadata>,
+    ) -> Result<Vec<ColumnDefinitionConfig>, FrontendErrorKind> {
+        if self.compound {
+            apply_compound_shape(
+                &mut columns,
+                &self.origins,
+                source_metadata,
+                self.drops_repeated_rows,
+            )?;
+        }
+        Ok(columns)
+    }
 }
 
 fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {

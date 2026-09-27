@@ -171,6 +171,14 @@ fn a_union_column_takes_the_shape_mysql_gives_both_branches() {
         assert_eq!(column.table, "", "{sql}");
         let prepared = adapter.execute_stmt_prepare(sql).unwrap();
         assert_eq!(prepared.columns, text.columns, "{sql}");
+        // Executing reads the column's shape again, and has to answer the one
+        // preparing announced.
+        let executed = prepared_result_set(
+            adapter
+                .execute_stmt_execute(prepared.statement_id, &[])
+                .unwrap_or_else(|error| panic!("execute {sql}: {error:?}")),
+        );
+        assert_eq!(executed.columns, text.columns, "{sql}");
         adapter.execute_stmt_close(prepared.statement_id);
     }
     assert_eq!(

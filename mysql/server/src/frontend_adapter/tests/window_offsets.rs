@@ -64,6 +64,15 @@ fn shapes(
     let text = result(adapter, sql);
     let prepared = adapter.execute_stmt_prepare(sql).unwrap();
     assert_eq!(prepared.columns, text.columns, "{sql}");
+    // The engine answers a window's columns out of its sorter, so executing
+    // reads where each comes from again, and has to answer what preparing
+    // announced.
+    let executed = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap_or_else(|error| panic!("execute {sql}: {error:?}")),
+    );
+    assert_eq!(executed.columns, text.columns, "{sql}");
     adapter.execute_stmt_close(prepared.statement_id);
     text.columns
         .iter()
@@ -148,5 +157,19 @@ fn a_default_of_another_kind_or_an_offset_read_from_the_row_is_refused() {
         "SELECT LAG(n, id) OVER (ORDER BY id) FROM w",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// A column read beside a window comes out of the engine's sorter rather than
+/// its table, which executing a prepared statement has to trace back the way
+/// preparing it does.
+#[test]
+fn a_column_beside_a_window_executes_as_it_was_prepared() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM w ORDER BY id",
+        "SELECT id, s, LAG(n, 1, 0) OVER (ORDER BY id) FROM w ORDER BY id",
+    ] {
+        shapes(&mut adapter, sql);
     }
 }
