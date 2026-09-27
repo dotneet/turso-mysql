@@ -30628,3 +30628,6 @@ mod union_shapes;
 
 #[cfg(unix)]
 mod migration_ddl;
+
+#[cfg(unix)]
+mod counted_inserts;

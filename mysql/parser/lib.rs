@@ -64,9 +64,9 @@ use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
     columns_given_their_default, delete_source_table, direct_signed_integer,
-    names_the_columns_default, render_simple_view_query, select_static_result_metadata,
-    translate_delete, translate_insert, translate_select_query, translate_update, RenderedSelect,
-    SelectRenderContext,
+    is_clock_reading_value, names_the_columns_default, render_simple_view_query,
+    select_static_result_metadata, translate_delete, translate_insert, translate_select_query,
+    translate_update, RenderedSelect, SelectRenderContext,
 };
 
 pub use account_admin::{
@@ -400,6 +400,7 @@ pub struct CheckedAutoIncrementInsert {
     ignored_null_columns: Vec<usize>,
     rowwise_conflicts: bool,
     upsert_columns: Vec<String>,
+    reads_the_clock: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -448,6 +449,11 @@ impl CheckedAutoIncrementInsert {
         self.rowwise_conflicts
     }
 
+    /// Whether a row writes a reading of the clock, such as `NOW()`.
+    pub fn reads_the_clock(&self) -> bool {
+        self.reads_the_clock
+    }
+
     /// Returns the checked SQLite AST before allocator range injection.
     pub fn sqlite_statement(&self) -> &Stmt {
         &self.sqlite_statement
@@ -475,6 +481,12 @@ impl CheckedAutoIncrementInsert {
             .eq_ignore_ascii_case(&table.table_name)
         {
             return unsupported("AUTO_INCREMENT INSERT table does not match its definition");
+        }
+        // MySQL reads the clock once for the whole statement. Each of these
+        // rows is written by a statement of its own, which would read it once
+        // for each row instead.
+        if self.reads_the_clock && self.rowwise_conflicts {
+            return unsupported("a clock reading in a multirow IGNORE or ON DUPLICATE KEY UPDATE");
         }
         if table.allocator_column_type == MySqlIntegerType::BigIntUnsigned
             && !self.upsert_columns.is_empty()
@@ -699,6 +711,11 @@ impl BoundAutoIncrementInsert {
 
     pub fn rowwise_conflicts(&self) -> bool {
         self.insert.rowwise_conflicts
+    }
+
+    /// Whether a row writes a reading of the clock, such as `NOW()`.
+    pub fn reads_the_clock(&self) -> bool {
+        self.insert.reads_the_clock
     }
 
     pub fn inject_one_row(&self, row_number: usize, id: u64) -> Result<Stmt, ParseError> {
@@ -4165,7 +4182,8 @@ pub fn parse_dml_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError
 ///
 /// This accepts one unqualified table, an explicit unique column list, and a
 /// statically known nonempty `VALUES` batch whose expressions are direct
-/// literals. The allocator column is checked separately by
+/// literals or the readings of the clock an ordinary `INSERT` writes. The
+/// allocator column is checked separately by
 /// [`CheckedAutoIncrementInsert::bind_allocator_table`] because only the
 /// frontend has the durable table definition.
 pub fn parse_auto_increment_insert(
@@ -4305,14 +4323,14 @@ fn parse_checked_auto_increment_insert(
     // statement, so the allocator sees the list the engine will run.
     let names = columns.iter().map(TursoName::as_str).collect::<Vec<_>>();
     let defaulted = columns_given_their_default(&names, normalized_values)?;
+    let mut reads_the_clock = false;
     for row in &normalized_values.rows {
-        if !row
-            .iter()
-            .enumerate()
-            .filter(|(at, _)| !defaulted[*at])
-            .all(|(_, value)| accepts_value(value))
-        {
-            return unsupported("INSERT VALUES expression");
+        for (_, value) in row.iter().enumerate().filter(|(at, _)| !defaulted[*at]) {
+            if is_clock_reading_value(value) {
+                reads_the_clock = true;
+            } else if !accepts_value(value) {
+                return unsupported("INSERT VALUES expression");
+            }
         }
     }
     let mut ordinal = 0;
@@ -4373,6 +4391,7 @@ fn parse_checked_auto_increment_insert(
         ignored_null_columns,
         rowwise_conflicts,
         upsert_columns,
+        reads_the_clock,
     })
 }
 

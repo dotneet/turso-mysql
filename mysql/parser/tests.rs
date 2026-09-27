@@ -5931,6 +5931,61 @@ fn accepts_only_direct_literal_values_for_typed_auto_increment_inserts() {
 }
 
 #[test]
+fn a_counted_insert_takes_the_clock_readings_an_ordinary_insert_takes() {
+    let mode = SessionSqlMode::default();
+    for sql in [
+        "INSERT INTO users (name, created_at) VALUES ('a', NOW())",
+        "INSERT INTO users (name, created_at) VALUES ('a', CURDATE()), ('b', CURRENT_TIMESTAMP)",
+        "INSERT INTO users (name, created_at) VALUES ('a', NOW() + INTERVAL 1 DAY)",
+        "INSERT INTO users (name, created_at) VALUES ('a', DATE_SUB(NOW(), INTERVAL 30 DAY))",
+    ] {
+        let checked = parse_auto_increment_insert(sql, mode).unwrap();
+        assert!(checked.reads_the_clock(), "{sql}");
+    }
+    assert!(parse_prepared_auto_increment_insert(
+        "INSERT INTO users (name, created_at) VALUES (?, NOW()), (?, CURTIME())",
+        mode
+    )
+    .unwrap()
+    .reads_the_clock());
+    assert!(
+        !parse_auto_increment_insert("INSERT INTO users (name) VALUES ('a')", mode)
+            .unwrap()
+            .reads_the_clock()
+    );
+    // A call the ordinary path does not write stays refused here too.
+    for sql in [
+        "INSERT INTO users (name, created_at) VALUES ('a', NOW(6))",
+        "INSERT INTO users (name) VALUES (CONCAT('a', 'b'))",
+        "INSERT INTO users (id, name) VALUES (NOW(), 'a')",
+    ] {
+        let refused = parse_auto_increment_insert(sql, mode).and_then(|checked| {
+            checked.bind_allocator_table(
+                &parse_auto_increment_create_table(
+                    "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT, created_at DATETIME)",
+                    mode,
+                )
+                .unwrap(),
+            )
+        });
+        assert!(refused.is_err(), "{sql}");
+    }
+    // Written one row at a time, the rows would each read the clock again.
+    let table = parse_auto_increment_create_table(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT UNIQUE, created_at DATETIME)",
+        mode,
+    )
+    .unwrap();
+    assert!(parse_auto_increment_insert(
+        "INSERT IGNORE INTO users (name, created_at) VALUES ('a', NOW()), ('b', NOW())",
+        mode
+    )
+    .unwrap()
+    .bind_allocator_table(&table)
+    .is_err());
+}
+
+#[test]
 fn prepared_auto_increment_insert_accepts_bare_markers_and_preserves_their_order() {
     let sql = "INSERT INTO users (name, value) VALUES (?, ?), (?, ?)";
     assert!(parse_auto_increment_insert(sql, SessionSqlMode::default()).is_err());

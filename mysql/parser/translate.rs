@@ -3742,6 +3742,20 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
     }
 }
 
+/// Whether one written value is a reading of the clock that
+/// [`render_dml_expr`] writes as the engine's own call — `NOW()`, `CURDATE()`,
+/// `CURTIME()`, their other spellings, or one of them shifted by an interval.
+pub(crate) fn is_clock_reading_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Function(function) => {
+            CheckedComparisonNow::read(function).is_some()
+                || render_shifted_clock_reading(function).is_some()
+        }
+        Expr::BinaryOp { .. } => shifted_clock_reading_operator(expr).is_some(),
+        _ => false,
+    }
+}
+
 /// Renders a numeric literal a DML statement may carry.
 ///
 /// An integer is normalized through `i64` so that `007` reads back as `7`. A

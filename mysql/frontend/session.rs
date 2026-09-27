@@ -6422,6 +6422,12 @@ impl MySqlConnection {
 
     pub fn execute(&self, sql: &str) -> Result<()> {
         match parse_auto_increment_insert(sql, self.parser_mode()) {
+            Ok(insert) if insert.reads_the_clock() && self.time_zone_offset_seconds() != 0 => {
+                Err(LimboError::ParseError(
+                    "session-local clock functions in a non-UTC time zone are unsupported"
+                        .to_string(),
+                ))
+            }
             Ok(insert) => match self.load_auto_increment_table(insert.table_name().as_str())? {
                 Some(table) if insert.rowwise_conflicts() => {
                     self.execute_auto_increment_conflict_rows(
@@ -7229,6 +7235,14 @@ impl MySqlConnection {
         {
             return Err(LimboError::ParseError(
                 "mixed AUTO_INCREMENT INSERT with negative explicit ids is unsupported".to_string(),
+            ));
+        }
+        // MySQL reads the clock once for the whole statement, and each row
+        // below is written by a statement of its own.
+        if bound.reads_the_clock() {
+            return Err(LimboError::ParseError(
+                "a clock reading beside a new explicit AUTO_INCREMENT high-water mark is unsupported"
+                    .to_string(),
             ));
         }
         if highest_explicit > auto_increment_ceiling(table) {
