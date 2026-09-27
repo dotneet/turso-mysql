@@ -4941,6 +4941,22 @@ impl MySqlConnection {
     /// Returns whether one column holds signed integers or text, refusing the
     /// types this has no comparison rule for.
     fn column_kind(&self, table: &str, column_name: &str) -> Result<ColumnKind> {
+        // An `information_schema` table declares its columns itself rather
+        // than in stored DDL.
+        if let Some(catalog) = turso_mysql_parser::MySqlCatalogTable::from_engine_name(table) {
+            let type_name = catalog
+                .column_type(column_name)
+                .ok_or(LimboError::SchemaUpdated)?;
+            return if is_integer_type(type_name) {
+                Ok(ColumnKind::Integer)
+            } else if is_text_type(type_name) {
+                Ok(ColumnKind::Text)
+            } else {
+                Err(LimboError::InvalidArgument(format!(
+                    "SELECT IN requires a signed integer or text column, found {type_name}"
+                )))
+            };
+        }
         let table = MySqlTableName::parse(table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let columns = self.list_columns(&table).map_err(|error| match error {

@@ -311,22 +311,27 @@ pub(super) fn information_schema_tables_result_to_execution_result(
             MySqlTableKind::BaseTable => b"BASE TABLE".as_slice(),
             MySqlTableKind::View => b"VIEW".as_slice(),
         };
+        let base_table = table.kind() == MySqlTableKind::BaseTable;
+        // Measured on MySQL 8.4.11: a view has no engine, collation or
+        // storage, and its comment is `VIEW`.
         let whole = [
             Some(database.as_bytes().to_vec()),
             Some(table.name().as_bytes().to_vec()),
             Some(table_type.to_vec()),
+            base_table.then(|| b"InnoDB".to_vec()),
+            None,
+            None,
+            base_table.then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+            Some(if base_table {
+                Vec::new()
+            } else {
+                b"VIEW".to_vec()
+            }),
         ];
         // The row holds what the query named, in the order it named it.
         let row = projected
             .iter()
-            .map(|column| {
-                whole[match column {
-                    MySqlInformationSchemaTablesColumn::TableSchema => 0,
-                    MySqlInformationSchemaTablesColumn::TableName => 1,
-                    MySqlInformationSchemaTablesColumn::TableType => 2,
-                }]
-                .clone()
-            })
+            .map(|column| whole[information_schema_tables_ordinal(*column)].clone())
             .collect::<Vec<_>>();
         if row
             .iter()
@@ -393,26 +398,72 @@ pub(super) fn information_schema_tables_columns(
             44,
             MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
         ),
+        // The rest were measured against the pinned MySQL 8.4.11 oracle.
+        ("ENGINE", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        (
+            "DATA_LENGTH",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "INDEX_LENGTH",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "TABLE_COLLATION",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "TABLE_COMMENT",
+            "",
+            MYSQL_TYPE_BLOB,
+            24_576,
+            MYSQL_BLOB_FLAG,
+        ),
     ];
     projected
         .iter()
         .map(|column| {
-            let (name, original_table, column_type, column_length, flags) = whole[match column {
-                MySqlInformationSchemaTablesColumn::TableSchema => 0,
-                MySqlInformationSchemaTablesColumn::TableName => 1,
-                MySqlInformationSchemaTablesColumn::TableType => 2,
-            }];
+            let (name, original_table, column_type, column_length, flags) =
+                whole[information_schema_tables_ordinal(*column)];
             let mut column = ColumnDefinitionConfig::new(name, column_type);
             "information_schema".clone_into(&mut column.schema);
             "TABLES".clone_into(&mut column.table);
             original_table.clone_into(&mut column.original_table);
             name.clone_into(&mut column.original_name);
-            column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            column.character_set = if column_type == MYSQL_TYPE_LONGLONG {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
             column.column_length = column_length;
             column.flags = flags;
             column
         })
         .collect()
+}
+
+/// Where one `information_schema.TABLES` column sits among the ones this
+/// answers, which is the order MySQL declares them in.
+fn information_schema_tables_ordinal(column: MySqlInformationSchemaTablesColumn) -> usize {
+    match column {
+        MySqlInformationSchemaTablesColumn::TableSchema => 0,
+        MySqlInformationSchemaTablesColumn::TableName => 1,
+        MySqlInformationSchemaTablesColumn::TableType => 2,
+        MySqlInformationSchemaTablesColumn::Engine => 3,
+        MySqlInformationSchemaTablesColumn::DataLength => 4,
+        MySqlInformationSchemaTablesColumn::IndexLength => 5,
+        MySqlInformationSchemaTablesColumn::TableCollation => 6,
+        MySqlInformationSchemaTablesColumn::TableComment => 7,
+    }
 }
 
 /// The shapes MySQL reports for the `information_schema.STATISTICS` columns

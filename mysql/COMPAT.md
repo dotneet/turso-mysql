@@ -2275,12 +2275,21 @@ left on the connection for the table to read, because the table is registered
 on the database rather than on one session.
 
 A wildcard is refused: it asks for MySQL's twenty-one columns and this answers
-three, so a row of a different width would come back. So is a call over one of
+eight, so a row of a different width would come back. So is a call over one of
 these columns, whose shape has not been measured; counting them works, since a
-count does not depend on what a column holds. The one written shape this
-recognized before still answers, because it carries a `WHERE TABLE_SCHEMA =
-DATABASE()` that the checked `SELECT` surface does not read yet — a query
-written without that predicate goes the general way.
+count does not depend on what a column holds. The sum of the two storage
+counters — Laravel lists tables with `(data_length + index_length) as size` — is
+answered with the shape measured on 8.4.11, an unsigned `LONGLONG` of length 22
+without the binary flag; every other arithmetic over these columns is refused.
+
+`DATABASE()` and `SCHEMA()` after the `FROM` of a query reading
+`information_schema` are the selected database's name, or NULL when none is
+selected, which is what they answer; this is how Rails, Django and Laravel
+each filter on the database they are in. `EXISTS (subquery)` is answered as a
+result column too — Laravel's `hasTable` asks exactly that — with the shape
+measured on 8.4.11, a NOT NULL `LONGLONG` of length 1 carrying the binary and
+numeric flags; and `table_name IN (SELECT table_name FROM
+information_schema.tables ...)`, which Rails writes, compares text with text.
 
 `information_schema.STATISTICS` is the second such table, and the first this
 frontend has ever answered. It reports one row per column of every index of
@@ -2322,15 +2331,19 @@ the stored DDL rather than in the schema these tables read, and a table
 carrying one is already refused by `SHOW CREATE TABLE` for the same reason.
 
 An `information_schema` query names the columns it wants, in the order it wants
-them, and is answered that way. The catalog answers three of MySQL's twenty-one
-`TABLES` columns — `TABLE_SCHEMA`, `TABLE_NAME`, `TABLE_TYPE` — and seven of its
-twenty-two `COLUMNS` ones. Which of those a query names, and in what order, is
-up to the query. A column outside the set is refused rather than answered with a
-value that would be made up: `TABLE_ROWS` and the rest of the table's statistics
-are numbers this server does not keep. The same column named twice is refused
-too, where MySQL answers it twice — what a row holds is never wider than the
-whole row, which is what the result's size is measured against. `ORDER BY` may
-be left off: the rows come back in table-name order, and a table's columns in
+them, and is answered that way. The catalog answers eight of MySQL's twenty-one
+`TABLES` columns — `TABLE_SCHEMA`, `TABLE_NAME`, `TABLE_TYPE`, `ENGINE`,
+`DATA_LENGTH`, `INDEX_LENGTH`, `TABLE_COLLATION` and `TABLE_COMMENT` — and seven
+of its twenty-two `COLUMNS` ones. Measured on 8.4.11, a view has no engine,
+collation or storage and its comment is `VIEW`; a table's engine is `InnoDB`,
+its collation `utf8mb4_0900_ai_ci` and its comment empty. `DATA_LENGTH` and
+`INDEX_LENGTH` are figures InnoDB keeps and this server does not, so they are
+NULL, as `SHOW TABLE STATUS` answers them. Which of those a query names, and in
+what order, is up to the query, and the same column named twice is answered
+twice, as MySQL answers it. A column outside the set is refused rather than
+answered with a value that would be made up: `TABLE_ROWS` and the rest of the
+table's statistics are numbers this server does not keep. `ORDER BY` may be
+left off: the rows come back in table-name order, and a table's columns in
 declaration order, whether or not the query asks for it.
 
 `ALTER TABLE` adds a foreign key to a table that already exists and takes one
@@ -3872,7 +3885,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | MySQL-owned file marker | partial | experimental | n/a | n/a | partial | [`core dialect`](../core/dialect/mod.rs), [`fresh-process tests`](../core/multiprocess_tests.rs) | New MySQL files use and enforce format-v2 marker `0x54520224` (`lower_case_table_names=1`). PostgreSQL v1 remains valid; legacy MySQL v1 and unknown/mismatched policy bits fail closed. Offline legacy migration and policy `0` are not implemented. |
 | Logical databases | partial | experimental | experimental | planned | partial | [`database registry`](frontend/database_registry.rs), [`DatabaseCatalog`](frontend/database_catalog.rs), [`Unix capability backend`](frontend/filesystem_backend.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`persistent account store`](server/src/persistent_account_store.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`Unix server`](server/src/runtime_unix_server.rs), [`Unix runtime`](runtime/src/main.rs), [`core capability`](../core/database.rs), [D007 plan](../docs/mysql-compatibility-plan.md) | The strict admin parser accepts only plain `CREATE DATABASE`, `DROP DATABASE`, `USE`, and `SHOW DATABASES`; trusted embedded sessions and the authorized `COM_QUERY` adapter execute them through the same typed catalog operations. The registry owns main, WAL, two inode-bound metadata sidecars, and one durable AUTO_INCREMENT allocator sidecar per database. Creation initializes and syncs the allocator identity header before sidecar-first publication; acquire, recovery, and drop verify it through retained descriptors. Real-backend failure and replacement-race tests keep recovery fail closed. Registry-selected embedded sessions retain the allocator and execute the narrow generated-ID INSERT slice. The public Unix catalog shares one root across independent sessions without exposing paths or descriptors. Each session owns at most one selected connection; successful switches release the old lease and failed switches preserve it. Names are canonicalized and authorized before catalog access; denied or unavailable policy returns 1045 without revealing existence, while only authorized missing names return 1049. Create/drop authorization receives the target name, use shares the connect action, list is global and all-or-nothing, and selected-database queries are reauthorized on every command. The same-UID Unix worker supplies the persistent policy and catalog to a real protocol stream; the standalone runtime owns the `RuntimeUnixServer` accept loop and worker reaper. The CI cross-UID external-driver E2E covers `USE`, ordinary writes, prepared writes, and reads through this path. Preopened `VACUUM`, physical restore without re-key/regenerated sidecars, and shared-WAL/MVCC authority remain unsupported; the current protocol surface is the documented conservative DML subset. |
 | `SHOW TABLES` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`table/view listing`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | Accepts plain `SHOW TABLES` and confirmed `SHOW FULL TABLES`, each with an optional single semicolon. `SHOW FULL TABLES FROM/IN` may explicitly repeat the selected database, as Connector/J does; another database is refused. A database must already be selected, and the selected database must pass `DatabaseAction::Query` authorization before catalog access. Returns user-visible base tables and views in name order, excluding SQLite/Turso internal tables; when database-wide `Query` is denied, the result is filtered to tables granted through the table `Select` action. The catalog scan uses a 4,097-row sentinel and the protocol result is bounded to 4,096 rows, per-value size, and total retained result memory. A `LIKE 'pattern'` filters the list and puts the pattern in the column name, so `SHOW TABLES LIKE 'alpha%'` answers a column called `Tables_in_probe (alpha%)`; measured on MySQL 8.4.11 the pattern matches a table name by case, unlike every other `SHOW ... LIKE`, which matches whatever the case. Plain `SHOW TABLES FROM/IN` and `WHERE` remain unsupported. |
-| Narrow `information_schema.TABLES` query | partial | n/a | experimental | n/a | partial | [`checked parser`](parser/lib.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-tables.json), [P0 manifest](conformance/Makefile) | Accepts only the checked `TABLE_SCHEMA`/`TABLE_NAME`/`TABLE_TYPE` projection with `TABLE_SCHEMA = DATABASE()` and name ordering. Selected-database `Query` authorization runs before catalog access; when database-wide `Query` is denied, the result is filtered through table `Select` grants. The result is bounded and lists user tables and views. The checked MySQL oracle case/golden is a reference contract and is listed in the P0 manifest, but it is not a Turso execution gate. Other `information_schema` providers and cross-database coverage remain incomplete. |
+| `information_schema.TABLES` query | partial | n/a | experimental | n/a | partial | [`catalog tables`](frontend/catalog_tables.rs), [`checked parser`](parser/lib.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-tables.json), [P0 manifest](conformance/Makefile) | A table the engine scans, answered by the ordinary `SELECT` path over eight of MySQL's columns, with `DATABASE()` and `SCHEMA()` read as the selected database after the `FROM`. Selected-database `Query` authorization runs before catalog access; when database-wide `Query` is denied, the result is filtered through table `Select` grants. The result is bounded and lists user tables and views. The checked MySQL oracle case/golden is a reference contract and is listed in the P0 manifest, but it is not a Turso execution gate. Other `information_schema` providers and cross-database coverage remain incomplete. |
 | `information_schema.STATISTICS` query | partial | n/a | experimental | n/a | partial | [`catalog tables`](frontend/catalog_tables.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-statistics.json), [P0 manifest](conformance/Makefile) | A table the engine scans, so the ordinary `SELECT` path answers it: any projection of the seventeen columns this reports, any `WHERE` over them and any `ORDER BY`. One row per column of every index of every table the session may see, the primary key first as `PRIMARY`. `CARDINALITY` is the one MySQL column left out — it is an estimate of distinct values the engine keeps no equivalent of. Every reported shape is pinned to the MySQL 8.4.11 golden. A wildcard is refused, because it asks for eighteen columns and this answers seventeen; so is a call over one of these columns, whose shape has not been measured. What a session may see is filtered exactly as for `TABLES`. |
 | `information_schema.KEY_COLUMN_USAGE` query | partial | n/a | experimental | n/a | partial | [`catalog tables`](frontend/catalog_tables.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-key-column-usage.json), [P0 manifest](conformance/Makefile) | A table the engine scans, answered by the ordinary `SELECT` path. One row per column of every primary key, unique key and foreign key of every table the session may see; a plain index constrains nothing and has no row. All twelve of MySQL's columns are answered, every shape pinned to the 8.4.11 golden. A foreign key reports its parent table and column and its position in the key it references; a primary or unique key leaves those NULL. A key written without a name is reported as `t_ibfk_N`, matching `SHOW CREATE TABLE`. A wildcard is refused, the same as for every one of these tables. What a session may see is filtered exactly as for `TABLES`. |
 | `information_schema.TABLE_CONSTRAINTS` / `REFERENTIAL_CONSTRAINTS` queries | partial | n/a | experimental | n/a | partial | [`catalog tables`](frontend/catalog_tables.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/information-schema-table-constraints.json), [P0 manifest](conformance/Makefile) | Tables the engine scans, answered by the ordinary `SELECT` path. `TABLE_CONSTRAINTS` reports one row per primary key, unique key and foreign key of every table the session may see; `REFERENTIAL_CONSTRAINTS` reports one row per foreign key with the key it references, its `MATCH_OPTION`, and the `UPDATE_RULE` and `DELETE_RULE` it was written with — measured, a key written with no rule reads back as `NO ACTION` and `RESTRICT` reads back as written. Both answer all of MySQL's columns, every shape pinned to the 8.4.11 golden. A `CHECK` constraint has no row: it lives in stored DDL rather than in the schema these read. A wildcard is refused, the same as for every one of these tables. What a session may see is filtered exactly as for `TABLES`. |

@@ -9848,11 +9848,17 @@ fn an_information_schema_query_is_answered_in_the_order_it_asked() {
         ]
     );
 
-    // A column MySQL has and this does not answer is refused, and so is the
-    // same column named twice — which MySQL answers twice.
+    // The same column named twice is answered twice, as MySQL answers it.
+    let Ok(CommandExecutionResult::ResultSet(twice)) = adapter.execute_query(
+        "SELECT TABLE_NAME, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+    ) else {
+        panic!("a column named twice must be answered");
+    };
+    assert_eq!(twice.columns.len(), 2);
+
+    // A column MySQL has and this does not answer is refused.
     for sql in [
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
-        "SELECT TABLE_NAME, TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'",
     ] {
@@ -19140,20 +19146,12 @@ fn information_schema_tables_refuses_what_it_cannot_answer_and_reads_the_rest() 
         );
     }
 
-    // An ordering the recognized shape does not carry is refused while it
-    // still carries the `WHERE TABLE_SCHEMA = DATABASE()`: the checked
-    // `SELECT` surface, which would sort by any column it is given, does not
-    // read `DATABASE()` in a `WHERE` yet.
+    // `DATABASE()` in the `WHERE` is the selected database's name, so an
+    // ordering beside it is answered by the ordinary `SELECT` path, and so is
+    // the same ordering written without it.
     for query in [
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_SCHEMA",
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME DESC",
-    ] {
-        assert!(adapter.execute_query(query).is_err(), "{query}");
-    }
-
-    // Written without that predicate, the same orderings are answered by the
-    // ordinary `SELECT` path.
-    for query in [
         "SELECT TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_SCHEMA",
         "SELECT TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_NAME DESC",
     ] {
@@ -30586,3 +30584,6 @@ mod connection_settings;
 
 #[cfg(unix)]
 mod named_locks;
+
+#[cfg(unix)]
+mod framework_catalog_reads;

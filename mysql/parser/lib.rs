@@ -6,6 +6,7 @@ mod alter_table_indexes;
 mod analyze_table;
 mod checked_primary_key;
 mod create_table_as_select;
+mod current_database;
 mod date_format;
 mod drop_table;
 mod drop_view;
@@ -86,6 +87,7 @@ pub use create_table_as_select::{
     parse_optional_create_table_as_select, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
+pub use current_database::write_the_current_database_in;
 pub use date_format::{format_moment, format_width};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
@@ -1771,14 +1773,22 @@ impl MySqlShowCommand {
 
 /// One column of `information_schema.TABLES` this answers.
 ///
-/// MySQL's table has twenty-one and these are the three whose values this
-/// server holds. A query naming any other column is refused rather than
-/// answered with a value that would be made up.
+/// MySQL's table has twenty-one and these are the ones whose values this
+/// server holds, or knows it does not keep. A query naming any other column is
+/// refused rather than answered with a value that would be made up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlInformationSchemaTablesColumn {
     TableSchema,
     TableName,
     TableType,
+    Engine,
+    /// How many bytes the rows take, which InnoDB keeps and this does not, so
+    /// it is NULL as `SHOW TABLE STATUS` answers it.
+    DataLength,
+    /// How many bytes the indexes take, NULL for the same reason.
+    IndexLength,
+    TableCollation,
+    TableComment,
 }
 
 impl MySqlInformationSchemaTablesColumn {
@@ -1788,6 +1798,11 @@ impl MySqlInformationSchemaTablesColumn {
             () if name.eq_ignore_ascii_case("TABLE_SCHEMA") => Self::TableSchema,
             () if name.eq_ignore_ascii_case("TABLE_NAME") => Self::TableName,
             () if name.eq_ignore_ascii_case("TABLE_TYPE") => Self::TableType,
+            () if name.eq_ignore_ascii_case("ENGINE") => Self::Engine,
+            () if name.eq_ignore_ascii_case("DATA_LENGTH") => Self::DataLength,
+            () if name.eq_ignore_ascii_case("INDEX_LENGTH") => Self::IndexLength,
+            () if name.eq_ignore_ascii_case("TABLE_COLLATION") => Self::TableCollation,
+            () if name.eq_ignore_ascii_case("TABLE_COMMENT") => Self::TableComment,
             () => return None,
         })
     }

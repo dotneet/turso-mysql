@@ -101,7 +101,7 @@ boolean literal.
 | Form | State |
 |---|---|
 | Scalar subquery in a projection answering a column rather than an aggregate — `SELECT (SELECT n FROM t)` | refused; measured, MySQL answers 1242 for a subquery returning more than one row where the engine answers the first row it finds. Taking it needs the inner statement to prove it answers at most one row — an `ORDER BY ... LIMIT 1`, which the subquery reader refuses today |
-| Subquery anywhere but a `WHERE` | not started |
+| Subquery anywhere but a `WHERE`, apart from `EXISTS` and an aggregate's scalar subquery in a projection | not started |
 | `ORDER BY` an ordinal over a mixed wildcard projection — `SELECT t.*, id FROM t ORDER BY 2` | refused; requires expanding each wildcard to count through |
 | A comparison as a result column beside anything else — `SELECT id, name, updated_at > '2025-01-01' FROM t` | refused; a projection of comparisons alone is read, and one beside a plain column is not. What MySQL answers for the mixture — the width and type of the comparison's own column — has been measured for the first shape and not this one |
 | `WITH ROLLUP` | refused |
@@ -284,8 +284,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `information_schema.STATISTICS.CARDINALITY` | refused; it is an estimate of distinct values and the engine keeps no equivalent, so a made-up number would be worse than none |
 | `SELECT *` over an `information_schema` table | refused; it asks for MySQL's columns and this answers a few of them. `KEY_COLUMN_USAGE` answers all of them and is refused anyway, because one rule for all of these tables is worth more than the wildcard |
 | A call over an `information_schema` column | refused; its shape has not been measured. A count is taken, since a count does not depend on what the column holds |
-| `WHERE TABLE_SCHEMA = DATABASE()` outside the one recognized shape | refused; the checked `SELECT` surface does not read `DATABASE()` in a `WHERE` yet, so that predicate is carried only by the shape this recognized before |
-| `information_schema` columns beyond the three of `TABLES`, thirteen of `COLUMNS`, seventeen of `STATISTICS`, and all of `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
+| `DATABASE()` outside an `information_schema` query's `FROM`, or in a query reading only user tables | refused; the call is written in as the selected database only where a framework filters `information_schema` on it |
+| `information_schema` columns beyond the eight of `TABLES`, thirteen of `COLUMNS`, seventeen of `STATISTICS`, and all of `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS` and `REFERENTIAL_CONSTRAINTS` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
 | An `information_schema.COLUMNS` or `SCHEMATA` `WHERE` beyond the one shape each takes | refused; those two are the last recognized by written shape, and moving them to a table the engine scans is the work that retires the recognizer |
 | Multi-statement `COM_QUERY` beyond the bounded slice | negotiates `CLIENT_MULTI_STATEMENTS` and returns sequential results with `SERVER_MORE_RESULTS_EXISTS`. More than 32 statements and SQL whose delimiter changes under the session's backslash mode are refused before execution. An assembled response beyond 512 frames or 1 MiB closes the connection after execution, so preceding side effects may remain. A later statement can fail after earlier statements have run, as in MySQL. The runtime's configured write queue can impose a tighter limit |
 

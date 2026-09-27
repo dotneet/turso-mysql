@@ -147,7 +147,7 @@ fn catalog_best_index(
     })
 }
 
-/// `information_schema.TABLES`, holding the three columns this answers.
+/// `information_schema.TABLES`, holding the columns this answers.
 #[derive(Debug)]
 struct InformationSchemaTables {
     database: String,
@@ -163,7 +163,12 @@ impl InternalVirtualTable for InformationSchemaTables {
             "CREATE TABLE {INFORMATION_SCHEMA_TABLES} \
              (TABLE_SCHEMA TEXT COLLATE MYSQL_UCA9_AI_CI, \
              TABLE_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
-             TABLE_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI)"
+             TABLE_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             ENGINE TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             DATA_LENGTH INTEGER, \
+             INDEX_LENGTH INTEGER, \
+             TABLE_COLLATION TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             TABLE_COMMENT TEXT COLLATE MYSQL_UCA9_AI_CI)"
         )
     }
 
@@ -356,10 +361,18 @@ impl InternalVirtualTableCursor for InformationSchemaTablesCursor {
 
     fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
         let (name, kind) = &self.rows[self.position as usize];
+        let base_table = *kind == "BASE TABLE";
+        // Measured on MySQL 8.4.11: a view has no engine, collation or
+        // storage, and its comment is `VIEW`. The storage figures are ones
+        // InnoDB keeps and this server does not, so a table has none either.
         Ok(match column {
             0 => Value::build_text(self.database.clone()),
             1 => Value::build_text(name.clone()),
             2 => Value::build_text((*kind).to_owned()),
+            3 if base_table => Value::build_text("InnoDB"),
+            6 if base_table => Value::build_text("utf8mb4_0900_ai_ci"),
+            3..=6 => Value::Null,
+            7 => Value::build_text(if base_table { "" } else { "VIEW" }),
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.TABLES has no column {column}"

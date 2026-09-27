@@ -30,6 +30,9 @@ pub enum StaticSelectMetadata {
     },
     /// A SQL boolean literal.
     Boolean(bool),
+    /// `EXISTS (subquery)`, which answers 1 or 0 and never NULL — measured on
+    /// MySQL 8.4.11, the same shape a boolean literal answers.
+    Exists,
     /// A SQL NULL literal.
     Null,
     /// A `COUNT`, whose result metadata is the same whatever it counts.
@@ -396,6 +399,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
             .or_else(|| classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic)),
         Expr::Subquery(query) => classify_scalar_subquery(query),
+        Expr::Exists { .. } => Some(StaticSelectMetadata::Exists),
         Expr::Function(function) if function.over.is_some() => classify_window_call(function),
         Expr::Function(function) if is_count_call(function) => Some(StaticSelectMetadata::Count),
         Expr::Function(function) => column_aggregate_argument(function)

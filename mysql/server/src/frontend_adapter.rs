@@ -58,8 +58,6 @@ use turso_mysql::{
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
-#[cfg(unix)]
-use turso_mysql_parser::parse_optional_named_lock_query;
 use turso_mysql_parser::{
     is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
     parse_connector_j_foreign_keys, parse_optional_account_admin_command,
@@ -85,6 +83,8 @@ use turso_mysql_parser::{
     parse_optional_show_errors, parse_optional_show_warnings, parse_optional_truncate_table,
     parse_select, SessionSqlMode,
 };
+#[cfg(unix)]
+use turso_mysql_parser::{parse_optional_named_lock_query, write_the_current_database_in};
 
 use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
 #[cfg(unix)]
@@ -1895,6 +1895,13 @@ where
         &mut self,
         sql: &str,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let written = write_the_current_database_in(
+            sql,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = written.as_deref().unwrap_or(sql);
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,
@@ -4671,6 +4678,9 @@ impl TableResultMetadata {
         name: String,
         shape: &ArithmeticShape,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        if let Some(definition) = Self::catalog_counter_sum(source_metadata, &name, shape)? {
+            return Ok(definition);
+        }
         let left = Self::arithmetic_operand_shape(source_metadata, &shape.left)?;
         let right = Self::arithmetic_operand_shape(source_metadata, &shape.right)?;
         let ArithmeticOperandShape {
@@ -4714,6 +4724,46 @@ impl TableResultMetadata {
             MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
         );
         Ok(definition)
+    }
+
+    /// Finishes the sum of two unsigned `information_schema` counters, which
+    /// is how Laravel lists tables: `(data_length + index_length) as size`.
+    ///
+    /// Measured on MySQL 8.4.11: a `LONGLONG` one digit wider than the wider
+    /// counter, unsigned and numeric but without the binary flag the counters
+    /// themselves also lack, and nullable. Every other arithmetic over one of
+    /// these tables' columns has not been measured and is refused.
+    fn catalog_counter_sum(
+        source_metadata: Option<&Self>,
+        name: &str,
+        shape: &ArithmeticShape,
+    ) -> Result<Option<ColumnDefinitionConfig>, FrontendErrorKind> {
+        let counter = |operand: &ArithmeticOperand| -> Result<Option<u32>, FrontendErrorKind> {
+            let ArithmeticOperand::Column { column_name } = operand else {
+                return Ok(None);
+            };
+            let Some(source_metadata) = source_metadata else {
+                return Ok(None);
+            };
+            let (table, ordinal) = source_metadata.column_named(column_name)?;
+            let Some(column) = table.catalog_columns.get(ordinal) else {
+                return Ok(None);
+            };
+            Ok((column.column_type == MYSQL_TYPE_LONGLONG
+                && column.flags & MYSQL_UNSIGNED_FLAG != 0)
+                .then_some(column.column_length))
+        };
+        if shape.operator != ArithmeticOperator::Add {
+            return Ok(None);
+        }
+        let (Some(left), Some(right)) = (counter(&shape.left)?, counter(&shape.right)?) else {
+            return Ok(None);
+        };
+        let mut definition = column_definition(name.to_owned(), MYSQL_TYPE_LONGLONG);
+        definition.column_length = left.max(right) + 1;
+        definition.decimals = 0;
+        set_column_flags(&mut definition, MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG);
+        Ok(Some(definition))
     }
 
     /// Finishes a `CASE` or `IF` whose every branch is a whole number.
@@ -6308,6 +6358,11 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
             MySqlInformationSchemaTablesColumn::TableSchema,
             MySqlInformationSchemaTablesColumn::TableName,
             MySqlInformationSchemaTablesColumn::TableType,
+            MySqlInformationSchemaTablesColumn::Engine,
+            MySqlInformationSchemaTablesColumn::DataLength,
+            MySqlInformationSchemaTablesColumn::IndexLength,
+            MySqlInformationSchemaTablesColumn::TableCollation,
+            MySqlInformationSchemaTablesColumn::TableComment,
         ]),
         MySqlCatalogTable::Views => catalog_results::information_schema_views_columns(),
         MySqlCatalogTable::Statistics => catalog_results::information_schema_statistics_columns(),

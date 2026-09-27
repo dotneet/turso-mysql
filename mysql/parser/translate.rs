@@ -61,6 +61,11 @@ impl MySqlCatalogTable {
                 ("TABLE_SCHEMA", "TEXT"),
                 ("TABLE_NAME", "TEXT"),
                 ("TABLE_TYPE", "TEXT"),
+                ("ENGINE", "TEXT"),
+                ("DATA_LENGTH", "BIGINT UNSIGNED"),
+                ("INDEX_LENGTH", "BIGINT UNSIGNED"),
+                ("TABLE_COLLATION", "TEXT"),
+                ("TABLE_COMMENT", "TEXT"),
             ],
             Self::Views => &[
                 ("TABLE_SCHEMA", "TEXT"),
@@ -127,6 +132,20 @@ impl MySqlCatalogTable {
                 ("REFERENCED_TABLE_NAME", "TEXT"),
             ],
         }
+    }
+
+    /// Reads a table back from the name the engine knows it by.
+    pub fn from_engine_name(name: &str) -> Option<Self> {
+        [
+            Self::Tables,
+            Self::Views,
+            Self::Statistics,
+            Self::KeyColumnUsage,
+            Self::TableConstraints,
+            Self::ReferentialConstraints,
+        ]
+        .into_iter()
+        .find(|table| table.engine_name().eq_ignore_ascii_case(name))
     }
 
     /// Returns the type a value compared against one of these columns has to
@@ -4707,6 +4726,16 @@ fn render_select_expr(
         {
             let (rendered, _) = render_subquery(query, render_context)?;
             Ok(format!("({rendered})"))
+        }
+        // Laravel asks whether a table is there with `SELECT EXISTS (SELECT 1
+        // FROM information_schema.tables ...)`, which reads the subquery the
+        // way a `WHERE EXISTS` does.
+        Expr::Exists { subquery, negated } => {
+            let (rendered, _) = render_subquery(subquery, render_context)?;
+            Ok(format!(
+                "({}EXISTS ({rendered}))",
+                if *negated { "NOT " } else { "" }
+            ))
         }
         Expr::Function(function) if static_select_metadata::scalar_call(function).is_some() => {
             render_scalar_call(function, render_context)
