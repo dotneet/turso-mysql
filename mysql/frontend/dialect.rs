@@ -2137,6 +2137,21 @@ pub(crate) fn check_mysql_assignment(
         allocator_column,
     } = rules.as_ref();
     let allocator_column = *allocator_column;
+    // A trigger's row numbered by the session's counter is the row an
+    // injected id would have written, the number living in the key.
+    let (operation, injected_counted_column_ordinal) = match operation {
+        AssignmentOperation::InsertWithSuppliedRowid => match allocator_column {
+            Some((ordinal, false)) if injected_counted_column_ordinal.is_none() => {
+                (AssignmentOperation::Insert, Some(ordinal))
+            }
+            _ => {
+                return Err(LimboError::Corrupt(format!(
+                    "a row number was supplied for {table_name}, whose key is not its counter"
+                )));
+            }
+        },
+        operation => (operation, injected_counted_column_ordinal),
+    };
     if *counted
         && operation == AssignmentOperation::Insert
         && injected_counted_column_ordinal.is_none()

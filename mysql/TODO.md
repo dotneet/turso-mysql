@@ -315,7 +315,11 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` | refused; the copy is rendered with no upsert clause, and what a colliding copied row updates and reports has not been measured |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
-| An `INSERT` into a counted table carrying a trigger, or into a table whose trigger writes into a counted table | refused; a restored dump's counted table with a trigger takes no new row. The rows the dump wrote before making its trigger are taken |
+| A trigger naming the id it writes into a counted table, or writing a `BIGINT UNSIGNED` counted table | refused; the engine lets the counter choose only a trigger row's row number, and a `BIGINT UNSIGNED` id is a column of its own. MySQL takes the first and moves the counter past the written id |
+| A statement whose triggers would write a table it writes or reads — a trigger writing its own table, an `INSERT ... SELECT` reading a table a trigger down the line writes | refused before anything is written, where MySQL answers 1442 — measured on 8.4.11, only once the trigger runs, so it has spent the statement's first number and set `LAST_INSERT_ID()` to it by then |
+| A row a trigger writes into a counted table that breaks `NOT NULL` or a `CHECK` | the statement fails as in MySQL, but the row has spent that table's next number; measured on 8.4.11, MySQL checks the row before it takes one, while the engine numbers a row before it checks it |
+| Rows asking for the next id beside one naming its own id past the counter, into a table whose trigger writes a counted table | refused; that statement holds the counter's file while it writes its rows one at a time, so the trigger could not take a number |
+| A `BEFORE INSERT` trigger | refused by `CREATE TRIGGER`, which takes only `AFTER INSERT`; measured on 8.4.11, one reads 0 for `NEW.id` of a row asking for the next number, the number not being taken yet |
 | `TRUNCATE TABLE` on a counted table carrying a trigger | refused; that table is written again to restart its counter and a trigger is not the table's own row, where MySQL leaves one where it stood. A table with no counter is emptied in place and keeps its triggers |
 | `SET foreign_key_checks` to a value that is neither 0, 1, `OFF` nor `ON` | refused as a syntax error where MySQL answers 1231 |
 

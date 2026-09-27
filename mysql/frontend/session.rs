@@ -13,7 +13,8 @@ use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator, InsertAutoIncrementValue},
     AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
     LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
-    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, Value, IO,
+    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, TriggerRowidSupplier,
+    Value, IO,
 };
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -1009,6 +1010,9 @@ enum PreparedExecutionPlan {
         is_update: bool,
         insert_target: Option<CheckedInsertTarget>,
         written_table: Option<String>,
+        /// The tables the statement reads, which a trigger it sets off may
+        /// not write.
+        read_tables: Vec<String>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
 }
@@ -1388,6 +1392,16 @@ impl MySqlConnection {
             schema_context,
             prepared_statement_authority,
         )?;
+        connection
+            .inner
+            .set_trigger_rowid_supplier(Some(Arc::new(CountedTriggerRowSupplier {
+                allocator: allocator.clone(),
+                io: Arc::clone(&io),
+                database_identity: connection
+                    .inner
+                    .schema_catalog_validation_context()
+                    .map(|context| *context.database_identity()),
+            })));
         connection.auto_increment = Some(AutoIncrementExecutionCapability { allocator, io });
         Ok(connection)
     }
@@ -2102,6 +2116,7 @@ impl MySqlConnection {
                 is_update,
                 insert_target,
                 written_table,
+                read_tables: read_table_names(&translated),
             },
         ))
     }
@@ -2721,8 +2736,15 @@ impl MySqlConnection {
             PreparedExecutionPlan::OrdinaryWrite {
                 is_update,
                 written_table,
-                ..
+                insert_target,
+                read_tables,
             } => {
+                if let Some(target) = insert_target {
+                    self.check_the_triggers_an_insert_sets_off(
+                        target.table().as_str(),
+                        read_tables,
+                    )?;
+                }
                 let deadline = self.write_deadline(timeout);
                 self.check_write_deadline(deadline)?;
                 self.begin_implicit_transaction_for_write()?;
@@ -2771,7 +2793,7 @@ impl MySqlConnection {
         {
             return Err(LimboError::SchemaUpdated);
         }
-        self.reject_insert_target_triggers(&table.name)?;
+        self.check_the_triggers_an_insert_sets_off(&table.name, &[])?;
         let bound = insert
             .insert
             .clone()
@@ -7419,6 +7441,13 @@ impl MySqlConnection {
         let shifted_timestamp_insert = self.shift_timestamp_insert_literals(&mut statement)?;
         let is_update = matches!(statement, Stmt::Update(_));
         let insert_target = checked_insert_target(&statement).map_err(MySqlQueryError::Engine)?;
+        if let Some(target) = &insert_target {
+            self.check_the_triggers_an_insert_sets_off(
+                target.table().as_str(),
+                &read_table_names(&translated),
+            )
+            .map_err(MySqlQueryError::Engine)?;
+        }
         let mut frozen = self.frozen_dml_parser(
             mode,
             rewritten_on_update,
@@ -7498,8 +7527,6 @@ impl MySqlConnection {
                 "INSERT SELECT into an AUTO_INCREMENT table in a non-UTC time zone".to_string(),
             ));
         }
-        self.reject_insert_target_triggers(&table.name)
-            .map_err(MySqlQueryError::Engine)?;
         let mode = self.parser_mode();
         let (translated, ..) = self
             .parse_checked_dml_translation(sql, mode)
@@ -7508,6 +7535,8 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         self.validate_dml_ordered_columns(translated.source_table(), translated.ordered_columns())
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.check_the_triggers_an_insert_sets_off(&table.name, &read_table_names(&translated))
+            .map_err(MySqlQueryError::Engine)?;
         let Stmt::Insert {
             with: None,
             or_conflict: None,
@@ -8121,7 +8150,7 @@ impl MySqlConnection {
         table: AutoIncrementTable,
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> Result<u64> {
-        self.reject_insert_target_triggers(&table.name)?;
+        self.check_the_triggers_an_insert_sets_off(&table.name, &[])?;
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
         let bound = insert
@@ -8177,7 +8206,7 @@ impl MySqlConnection {
         deadline: Option<turso_core::MonotonicInstant>,
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> Result<MySqlWriteResult> {
-        self.reject_insert_target_triggers(&table.name)?;
+        self.check_the_triggers_an_insert_sets_off(&table.name, &[])?;
         let bound = insert
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -8392,7 +8421,14 @@ impl MySqlConnection {
                 "AUTO_INCREMENT value is outside the column's type".to_string(),
             ));
         }
-        self.reject_insert_target_triggers(&table.name)?;
+        // The lease holds the counter's file for the whole statement, so a
+        // trigger numbering a row from it could not take a number.
+        if self.check_the_triggers_an_insert_sets_off(&table.name, &[])? {
+            return Err(LimboError::ParseError(
+                "rows asking for the next id beside one naming its own id past the counter, with a trigger writing a counted table, are unsupported"
+                    .to_string(),
+            ));
+        }
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
         let mut lease = capability.allocator.lease_high_water(table.key)?;
@@ -8704,60 +8740,101 @@ impl MySqlConnection {
                 continue;
             }
             let sql = sql.to_string();
-            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, &sql)
-                .map_err(|error| LimboError::Corrupt(error.to_string()))?
-            else {
-                return Ok(None);
-            };
-            let Some(metadata) = decoded.v2_metadata() else {
-                return Ok(None);
-            };
-            let expected_database_identity = self
+            let identity = self
                 .inner
                 .schema_catalog_validation_context()
-                .ok_or_else(|| {
-                    LimboError::Corrupt(
-                        "AUTO_INCREMENT table has no durable database identity".to_string(),
-                    )
-                })?
-                .database_identity();
-            if metadata.database_id.into_bytes() != *expected_database_identity {
-                return Err(LimboError::Corrupt(
-                    "AUTO_INCREMENT table belongs to a different durable database".to_string(),
-                ));
+                .map(|context| *context.database_identity());
+            let mut table = counted_table_from_stored_sql(&sql, identity)?;
+            if let Some(table) = &mut table {
+                if !table.name.eq_ignore_ascii_case(&name)
+                    || !table.name.eq_ignore_ascii_case(target)
+                {
+                    return Err(LimboError::Corrupt(
+                        "AUTO_INCREMENT table definition does not match its catalog name"
+                            .to_string(),
+                    ));
+                }
+                table.name = name;
             }
-            let definition = parse_auto_increment_create_table(
-                decoded.normalized_ddl,
-                SessionSqlMode {
-                    ansi_quotes: decoded.context.sql_mode.ansi_quotes,
-                    no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
-                },
-            )
-            .map_err(|_| {
-                LimboError::Corrupt(
-                    "AUTO_INCREMENT table has an invalid durable definition".to_string(),
-                )
-            })?;
-            if !definition.table_name.eq_ignore_ascii_case(&name)
-                || !definition.table_name.eq_ignore_ascii_case(target)
-            {
-                return Err(LimboError::Corrupt(
-                    "AUTO_INCREMENT table definition does not match its catalog name".to_string(),
-                ));
-            }
-            let key = AutoIncrementKey::new(metadata.allocator_id.into_bytes()).map_err(|_| {
-                LimboError::Corrupt(
-                    "AUTO_INCREMENT table has an invalid allocator identity".to_string(),
-                )
-            })?;
-            return Ok(Some(AutoIncrementTable {
-                name,
-                definition,
-                key,
-                stored_sql: sql,
-            }));
+            return Ok(table);
         }
         Ok(None)
+    }
+
+    /// Follows the triggers an `INSERT` into `target` sets off and answers
+    /// whether any of them writes a table that counts its own ids.
+    ///
+    /// Only an `AFTER INSERT` trigger whose body is one `INSERT` can be made
+    /// here, so what a trigger writes is the table its `INSERT` names, which
+    /// may set off that table's own trigger in turn. Measured on MySQL 8.4.11,
+    /// a trigger writing a table its statement writes or reads — the target,
+    /// or the table an `INSERT ... SELECT` copies from — is answered 1442, so
+    /// that is refused here. A counted table a trigger writes is numbered by
+    /// its own counter when the row is written, which needs the counted column
+    /// left for the counter to fill and the row number to be the id.
+    fn check_the_triggers_an_insert_sets_off(
+        &self,
+        target: &str,
+        read_tables: &[String],
+    ) -> Result<bool> {
+        let schema = self.inner.current_schema();
+        let mut written = vec![target.to_owned()];
+        let mut writes_a_counted_table = false;
+        let mut next = 0;
+        while let Some(table) = written.get(next).cloned() {
+            next += 1;
+            for trigger in schema.get_triggers_for_table(&table) {
+                if trigger.time != turso_parser::ast::TriggerTime::After
+                    || trigger.event != turso_parser::ast::TriggerEvent::Insert
+                    || !trigger.for_each_row
+                    || trigger.when_clause.is_some()
+                {
+                    return Err(LimboError::ParseError(
+                        "an INSERT setting off a trigger other than AFTER INSERT FOR EACH ROW is unsupported"
+                            .to_string(),
+                    ));
+                }
+                for command in &trigger.commands {
+                    let turso_parser::ast::TriggerCmd::Insert {
+                        tbl_name,
+                        col_names,
+                        ..
+                    } = command
+                    else {
+                        return Err(LimboError::ParseError(
+                            "a trigger doing anything but an INSERT is unsupported".to_string(),
+                        ));
+                    };
+                    let into = tbl_name.as_str();
+                    if written
+                        .iter()
+                        .chain(read_tables)
+                        .any(|table| table.eq_ignore_ascii_case(into))
+                    {
+                        return Err(LimboError::ParseError(format!(
+                            "a trigger writing {into}, which the statement setting it off already uses, is refused"
+                        )));
+                    }
+                    if let Some(counted) = self.load_auto_increment_table(into)? {
+                        if counted.definition.allocator_column_type
+                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+                            || col_names.iter().any(|column| {
+                                column
+                                    .as_str()
+                                    .eq_ignore_ascii_case(&counted.definition.allocator_column_name)
+                            })
+                        {
+                            return Err(LimboError::ParseError(format!(
+                                "a trigger writing {into} is unsupported unless the counter numbers its rows"
+                            )));
+                        }
+                        writes_a_counted_table = true;
+                    }
+                    written.push(into.to_owned());
+                }
+            }
+        }
+        Ok(writes_a_counted_table)
     }
 
     fn reject_insert_target_triggers(&self, target: &str) -> Result<()> {
@@ -10874,6 +10951,57 @@ fn auto_increment_ceiling(table: &AutoIncrementTable) -> u64 {
     max as u64
 }
 
+fn read_table_names(translated: &TranslatedDml) -> Vec<String> {
+    translated
+        .read_tables()
+        .iter()
+        .map(|source| source.table().as_str().to_owned())
+        .collect()
+}
+
+/// The counted table a stored `CREATE TABLE` describes, or `None` for a table
+/// that counts nothing.
+fn counted_table_from_stored_sql(
+    sql: &str,
+    database_identity: Option<[u8; 16]>,
+) -> Result<Option<AutoIncrementTable>> {
+    let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, sql)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let Some(metadata) = decoded.v2_metadata() else {
+        return Ok(None);
+    };
+    let expected_database_identity = database_identity.ok_or_else(|| {
+        LimboError::Corrupt("AUTO_INCREMENT table has no durable database identity".to_string())
+    })?;
+    if metadata.database_id.into_bytes() != expected_database_identity {
+        return Err(LimboError::Corrupt(
+            "AUTO_INCREMENT table belongs to a different durable database".to_string(),
+        ));
+    }
+    let definition = parse_auto_increment_create_table(
+        decoded.normalized_ddl,
+        SessionSqlMode {
+            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+        },
+    )
+    .map_err(|_| {
+        LimboError::Corrupt("AUTO_INCREMENT table has an invalid durable definition".to_string())
+    })?;
+    let key = AutoIncrementKey::new(metadata.allocator_id.into_bytes()).map_err(|_| {
+        LimboError::Corrupt("AUTO_INCREMENT table has an invalid allocator identity".to_string())
+    })?;
+    Ok(Some(AutoIncrementTable {
+        name: definition.table_name.clone(),
+        definition,
+        key,
+        stored_sql: sql.to_owned(),
+    }))
+}
+
 /// How many numbers MySQL takes for `rows` rows copied by one
 /// `INSERT ... SELECT`: batches of 1, 2, 4 and on, each twice the one before,
 /// until one reaches 65535, which is where they stay.
@@ -10970,6 +11098,50 @@ impl AssignmentValidator for CountedTableAssignmentValidator {
             values,
             Some(self.allocator_column_ordinal),
         )
+    }
+}
+
+/// Numbers each row a trigger writes into a counted table from that table's
+/// own counter, one number at a time.
+///
+/// Measured on MySQL 8.4.11: a trigger's `INSERT` into a counted table takes
+/// the next number when it runs, so a row an upsert changes or `IGNORE` skips
+/// spends nothing there, and the number is never the one the statement
+/// reports or `LAST_INSERT_ID()` answers.
+struct CountedTriggerRowSupplier {
+    allocator: DurableRangeAllocator,
+    io: Arc<dyn IO>,
+    database_identity: Option<[u8; 16]>,
+}
+
+impl TriggerRowidSupplier for CountedTriggerRowSupplier {
+    fn next_rowid(&self, _table_name: &str, table_sql: Option<&str>) -> Result<Option<i64>> {
+        let Some(table_sql) = table_sql else {
+            return Ok(None);
+        };
+        let Some(table) = counted_table_from_stored_sql(table_sql, self.database_identity)? else {
+            return Ok(None);
+        };
+        // The id of a `BIGINT UNSIGNED` counted table is a column of its own
+        // rather than the row number, which is all the engine lets this choose.
+        if table.definition.allocator_column_type
+            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+        {
+            return Err(LimboError::ParseError(
+                "a trigger writing a BIGINT UNSIGNED AUTO_INCREMENT table is unsupported"
+                    .to_string(),
+            ));
+        }
+        let mut reservation = self.allocator.reserve(table.key, 1)?;
+        let range = self.io.block(|| reservation.step())?;
+        if range.first() > auto_increment_ceiling(&table) {
+            return Err(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
+            ));
+        }
+        i64::try_from(range.first())
+            .map(Some)
+            .map_err(|_| LimboError::IntegerOverflow)
     }
 }
 

@@ -1291,23 +1291,36 @@ fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_clo
     Ok(())
 }
 
+/// A counted row a trigger writes takes its number from the table's durable
+/// counter, never from the rows the table holds, so a number the counter
+/// already handed out is not handed out again.
 #[test]
-fn auto_increment_insert_with_a_target_trigger_fails_before_reservation() -> Result<()> {
+fn a_counted_row_a_trigger_writes_takes_the_counters_next_number() -> Result<()> {
     let (connection, allocator, io) =
         open_allocator_connection("mysql-session-auto-increment-trigger.db", [0x55; 16])?;
     connection
         .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
-    connection.execute("CREATE TABLE audit (name TEXT)")?;
+    connection
+        .execute("CREATE TABLE audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
     connection.execute(
         "CREATE TRIGGER copy_user AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
     )?;
 
-    assert!(matches!(
-        connection.execute("INSERT INTO users (name) VALUES ('Ada')"),
-        Err(LimboError::ParseError(_))
-    ));
+    connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+    let mut reservation = allocator.reserve(auto_increment_key(&connection, "audit")?, 2)?;
+    assert_eq!(io.block(|| reservation.step())?.first(), 2);
+    connection.execute("INSERT INTO users (name) VALUES ('Grace')")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, name FROM audit ORDER BY id")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1), Value::from_text("Ada")],
+            vec![Value::from_i64(4), Value::from_text("Grace")],
+        ]
+    );
     let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 1)?;
-    assert_eq!(io.block(|| reservation.step())?.first(), 1);
+    assert_eq!(io.block(|| reservation.step())?.first(), 3);
     connection.close()?;
     Ok(())
 }

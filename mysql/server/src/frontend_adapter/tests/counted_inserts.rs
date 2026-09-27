@@ -776,3 +776,322 @@ fn a_prepared_upsert_of_several_rows_reports_what_the_text_one_does() {
         ]
     );
 }
+
+/// A counted table whose trigger writes into a table that counts nothing.
+///
+/// Measured on MySQL 8.4.11: the trigger sees the id the row took, and the
+/// statement counts and reports only its own rows. A statement reading the
+/// table its trigger writes is answered 1442.
+#[test]
+fn a_counted_table_carrying_a_trigger_takes_new_rows() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20) NOT NULL)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE post_log (post_id INT, note VARCHAR(20))",
+    );
+    run(&mut adapter, "CREATE TABLE drafts (title VARCHAR(20))");
+    run(&mut adapter, "INSERT INTO drafts (title) VALUES ('e')");
+    run(
+        &mut adapter,
+        "CREATE TRIGGER posts_log AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO post_log (post_id, note) VALUES (NEW.id, NEW.title); END",
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO posts (title) VALUES ('a')"),
+        (1, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title) VALUES ('b'), ('c')"
+        ),
+        (2, 2)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "2");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO posts (title) VALUES (?)",
+            &words(&["d"])
+        ),
+        (1, 4)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title) SELECT title FROM drafts"
+        ),
+        (1, 5)
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO posts (title) SELECT note FROM post_log WHERE post_id = 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (id, title) VALUES (NULL, 'f'), (100, 'g')"
+        ),
+        (2, 6)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "6");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT post_id, note FROM post_log ORDER BY post_id"
+        ),
+        vec![
+            some(&["1", "a"]),
+            some(&["2", "b"]),
+            some(&["3", "c"]),
+            some(&["4", "d"]),
+            some(&["5", "e"]),
+            some(&["6", "f"]),
+            some(&["100", "g"]),
+        ]
+    );
+    assert_eq!(counter(&mut adapter, "posts").as_deref(), Some("101"));
+}
+
+/// The trigger a `mysqldump` of a blog carries: every new post writes a row
+/// into an audit table that counts its own ids too.
+///
+/// Measured on MySQL 8.4.11: each row the trigger writes takes the audit
+/// table's next number, one at a time, and neither the statement's reported
+/// id nor `LAST_INSERT_ID()` ever answers one of them. A row an upsert
+/// changes, or one `IGNORE` skips, fires no trigger and spends nothing in the
+/// audit table.
+#[test]
+fn a_trigger_writes_into_a_counted_table_with_that_tables_next_numbers() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20) NOT NULL, slug INT UNIQUE)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, note VARCHAR(20) NOT NULL, post_id INT) AUTO_INCREMENT=100",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE drafts (k INT PRIMARY KEY, title VARCHAR(20))",
+    );
+    run(
+        &mut adapter,
+        "CREATE TRIGGER posts_audit AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO audit (note, post_id) VALUES (NEW.title, NEW.id); END",
+    );
+    run(
+        &mut adapter,
+        "CREATE TRIGGER drafts_audit AFTER INSERT ON drafts FOR EACH ROW BEGIN INSERT INTO audit (note, post_id) VALUES (NEW.title, NEW.k); END",
+    );
+
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO drafts (k, title) VALUES (7, 'p')"
+        ),
+        (1, 0)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "0");
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title, slug) VALUES ('a', 1)"
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title) VALUES ('b'), ('c')"
+        ),
+        (2, 2)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO drafts (k, title) VALUES (8, 'q')"
+        ),
+        (1, 0)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "2");
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title, slug) VALUES ('z', 1) ON DUPLICATE KEY UPDATE title = 'z'"
+        ),
+        (2, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO posts (title, slug) VALUES ('i', 1), ('j', 3)"
+        ),
+        (1, 5)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO posts (title) VALUES (?)",
+            &words(&["d"])
+        ),
+        (1, 7)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (id, title) VALUES (50, 'x')"
+        ),
+        (1, 50)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO posts (title) SELECT title FROM drafts"
+        ),
+        (2, 51)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "51");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, note, post_id FROM audit ORDER BY id"
+        ),
+        vec![
+            some(&["100", "p", "7"]),
+            some(&["101", "a", "1"]),
+            some(&["102", "b", "2"]),
+            some(&["103", "c", "3"]),
+            some(&["104", "q", "8"]),
+            some(&["105", "j", "5"]),
+            some(&["106", "d", "7"]),
+            some(&["107", "x", "50"]),
+            some(&["108", "p", "51"]),
+            some(&["109", "q", "52"]),
+        ]
+    );
+    assert_eq!(counter(&mut adapter, "audit").as_deref(), Some("110"));
+    assert_eq!(counter(&mut adapter, "posts").as_deref(), Some("54"));
+}
+
+/// A trigger's row sets off the trigger of the table it writes, each counted
+/// table taking its own next number.
+///
+/// Measured on MySQL 8.4.11: a statement whose triggers would write a table it
+/// writes or reads is answered 1442 — a trigger writing its own table, or an
+/// `INSERT ... SELECT` reading a table a trigger down the line writes.
+#[test]
+fn triggers_one_after_another_number_each_counted_table_they_write() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TABLE audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, note VARCHAR(20) NOT NULL, post_id INT) AUTO_INCREMENT=100",
+        "CREATE TABLE audit2 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, note VARCHAR(20)) AUTO_INCREMENT=1000",
+        "CREATE TABLE drafts (k INT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TRIGGER posts_audit AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO audit (note, post_id) VALUES (NEW.title, NEW.id); END",
+        "CREATE TRIGGER audit_audit AFTER INSERT ON audit FOR EACH ROW BEGIN INSERT INTO audit2 (note) VALUES (NEW.note); END",
+        "CREATE TRIGGER drafts_audit AFTER INSERT ON drafts FOR EACH ROW BEGIN INSERT INTO audit (note, post_id) VALUES (NEW.title, NEW.k); END",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO posts (title) VALUES ('a')"),
+        (1, 1)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO posts (title) VALUES (?)",
+            &words(&["b"])
+        ),
+        (1, 2)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO drafts (k, title) VALUES (5, ?)",
+            &words(&["d"])
+        ),
+        (1, 0)
+    );
+    for sql in [
+        "INSERT INTO drafts (k, title) SELECT id, note FROM audit",
+        "INSERT INTO drafts (k, title) SELECT id, note FROM audit2",
+        "INSERT INTO posts (title) SELECT note FROM audit2",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    // Written one row at a time while the counter's file is held, which a
+    // trigger taking a number from that counter cannot wait for.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO posts (id, title) VALUES (NULL, 'm'), (500, 'n')"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "2");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, note, post_id FROM audit ORDER BY id"
+        ),
+        vec![
+            some(&["100", "a", "1"]),
+            some(&["101", "b", "2"]),
+            some(&["102", "d", "5"]),
+        ]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, note FROM audit2 ORDER BY id"),
+        vec![
+            some(&["1000", "a"]),
+            some(&["1001", "b"]),
+            some(&["1002", "d"]),
+        ]
+    );
+
+    run(
+        &mut adapter,
+        "CREATE TABLE selfish (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TRIGGER selfish_again AFTER INSERT ON selfish FOR EACH ROW BEGIN INSERT INTO selfish (n) VALUES (NEW.n); END",
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO selfish (n) VALUES (1)"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM selfish"),
+        vec![some(&["0"])]
+    );
+}
+
+/// A trigger naming the id it writes into a counted table would have to move
+/// that table's counter from inside the engine, which is refused.
+#[test]
+fn a_trigger_writing_a_counted_tables_id_itself_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TABLE mirror (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TRIGGER posts_mirror AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO mirror (id, title) VALUES (NEW.id, NEW.title); END",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        adapter.execute_query("INSERT INTO posts (title) VALUES ('a')"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM mirror"),
+        vec![some(&["0"])]
+    );
+}

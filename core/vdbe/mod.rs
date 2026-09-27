@@ -805,6 +805,9 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     /// The schema opened for each write cursor, if it belongs to a database.
     cursor_database_ids: Vec<Option<usize>>,
+    /// The cursors whose next insert takes a rowid a trigger rowid supplier
+    /// chose, which is what that insert's record is validated as.
+    pub(crate) supplied_rowid_cursors: Vec<CursorID>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[Register]>>,
@@ -966,6 +969,7 @@ impl ProgramState {
             index_methods_finalized: false,
             cursor_seqs,
             cursor_database_ids: vec![None; max_cursors],
+            supplied_rowid_cursors: Vec::new(),
             registers,
             pre_op_registers: None,
             result_row: None,
@@ -1104,6 +1108,7 @@ impl ProgramState {
             *context = None;
         }
         self.cursor_database_ids.fill(None);
+        self.supplied_rowid_cursors.clear();
         for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
             cursor.close(&context);
         }

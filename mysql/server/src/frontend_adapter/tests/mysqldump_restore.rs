@@ -280,10 +280,14 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
         row(&[Some("posts_audit"), Some("INSERT"), Some("posts")])
     );
     // MySQL writes a new post and its audit row, numbered 4 in both tables.
-    // A counted table carrying a trigger takes no new row here; see TODO.md.
+    let new_post = ok(
+        &mut adapter,
+        "INSERT INTO posts (user_id, title) VALUES (2, 'New')",
+    );
+    assert_eq!((new_post.affected_rows, new_post.last_insert_id), (1, 4));
     assert_eq!(
-        adapter.execute_query("INSERT INTO posts (user_id, title) VALUES (2, 'New')"),
-        Err(FrontendErrorKind::Unsupported)
+        rows(&mut adapter, "SELECT id, note FROM audit WHERE id > 3"),
+        [row(&[Some("4"), Some("New")])]
     );
 }
 

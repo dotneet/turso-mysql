@@ -219,7 +219,24 @@ pub trait AssignmentValidator: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssignmentOperation {
     Insert,
+    /// An insert a trigger made, whose rowid a [`TriggerRowidSupplier`] chose.
+    InsertWithSuppliedRowid,
     Update,
+}
+
+/// Chooses the rowid of a row a trigger inserts without naming one.
+///
+/// A frontend that hands out a table's ids from a counter of its own writes
+/// them into the statements it runs, but a trigger's `INSERT` is compiled from
+/// the stored schema and the engine would otherwise number its row by the
+/// highest rowid in the table. The engine asks this before it picks a rowid
+/// for such a row, and refuses the insert if the answered rowid is already
+/// taken. The record is then validated as
+/// [`AssignmentOperation::InsertWithSuppliedRowid`].
+pub trait TriggerRowidSupplier: Send + Sync + 'static {
+    /// The rowid for the next row a trigger inserts into `table_name`, or
+    /// `None` to let the engine number it.
+    fn next_rowid(&self, table_name: &str, table_sql: Option<&str>) -> Result<Option<i64>>;
 }
 
 /// Immutable engine state available while a frontend rebuilds its core AST.
@@ -558,6 +575,7 @@ pub struct Connection {
     /// the session leaves the rows here before a statement that scans one
     /// runs. Nothing in the engine reads it.
     pub(super) mysql_catalog_rows: parking_lot::RwLock<HashMap<String, Arc<Vec<Vec<Value>>>>>,
+    pub(super) trigger_rowid_supplier: parking_lot::RwLock<Option<Arc<dyn TriggerRowidSupplier>>>,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2924,6 +2942,15 @@ impl Connection {
         self.mysql_catalog_rows
             .write()
             .insert(table.to_owned(), Arc::new(rows));
+    }
+
+    /// Lets `supplier` number the rows this connection's triggers insert.
+    pub fn set_trigger_rowid_supplier(&self, supplier: Option<Arc<dyn TriggerRowidSupplier>>) {
+        *self.trigger_rowid_supplier.write() = supplier;
+    }
+
+    pub(crate) fn trigger_rowid_supplier(&self) -> Option<Arc<dyn TriggerRowidSupplier>> {
+        self.trigger_rowid_supplier.read().clone()
     }
 
     pub fn mysql_changed_rows(&self) -> i64 {
@@ -5953,6 +5980,65 @@ mod tests {
                 .collect();
             Ok((shouted != values).then_some(shouted))
         }
+    }
+
+    /// Numbers the rows inserted into `log` from a counter of its own.
+    struct NumberLogRows(AtomicI64);
+
+    impl TriggerRowidSupplier for NumberLogRows {
+        fn next_rowid(&self, table_name: &str, _table_sql: Option<&str>) -> Result<Option<i64>> {
+            if !table_name.eq_ignore_ascii_case("log") {
+                return Ok(None);
+            }
+            Ok(Some(self.0.fetch_add(1, Ordering::SeqCst)))
+        }
+    }
+
+    #[test]
+    fn a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("trigger-rowid-supplier.db"));
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER t_log AFTER INSERT ON t BEGIN INSERT INTO log(v) VALUES (NEW.v); END",
+        )
+        .unwrap();
+        let supplier = Arc::new(NumberLogRows(AtomicI64::new(100)));
+        conn.set_trigger_rowid_supplier(Some(supplier.clone()));
+
+        conn.execute("INSERT INTO t(v) VALUES ('a'), ('b')")
+            .unwrap();
+        // A statement's own row is numbered by the engine, as it always is.
+        conn.execute("INSERT INTO log(v) VALUES ('direct')")
+            .unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT max(id) FROM t"), 2);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT id FROM log WHERE v = 'a'"),
+            100
+        );
+        assert_eq!(
+            query_single_i64(&conn, "SELECT id FROM log WHERE v = 'b'"),
+            101
+        );
+        assert_eq!(
+            query_single_i64(&conn, "SELECT id FROM log WHERE v = 'direct'"),
+            102
+        );
+
+        // A supplied rowid a row already holds is refused, never written over.
+        supplier.0.store(101, Ordering::SeqCst);
+        assert!(matches!(
+            conn.execute("INSERT INTO t(v) VALUES ('c')"),
+            Err(LimboError::Corrupt(_))
+        ));
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 2);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT id FROM log WHERE v = 'b'"),
+            101
+        );
     }
 
     #[test]
