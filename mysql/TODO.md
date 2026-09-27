@@ -139,6 +139,11 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `BINARY col = ?`, `x = BINARY col`, `BINARY col LIKE ...` | refused; only `BINARY` before a column compared with a written word is taken |
 | A hexadecimal literal compared with a column — `email = X'616E6E'` | refused; measured, MySQL compares it as a word under a text column's collation and as a number against a number column |
 | A word with the `_utf8mb4` introducer in an `INSERT`, an `UPDATE` or a `DELETE` | refused; only a `SELECT` reads it without the introducer |
+| `GROUP BY` an ordinal — `GROUP BY 1` | refused; measured, MySQL groups by the projected column it names |
+| `GROUP BY` a call over words the client wrote — `GROUP BY UPPER(title)` | refused; MySQL groups words under the column's collation and the engine groups the call's answer by its bytes |
+| A column a primary-key grouping decides — `SELECT id, name ... GROUP BY id` | refused; MySQL lets it through as functionally dependent, which is not worked out here |
+| A scalar subquery in a grouped projection | refused; the outer columns it names are not held to the grouping |
+| A statement grouping by a call, over any answer but a key call, `COUNT`, `SUM`, `MIN`, `MAX` over a number or words, and `AVG` | refused; MySQL reports the temporary table's column for it, whose shape has not been measured |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
 | A `CASE` or `IF` branch written as a number with a point — `THEN 1.5 ELSE 0` | refused; MySQL answers a NEWDECIMAL there by a rule of its own. A `DECIMAL` column branch is taken |
 | A `CASE` or `IF` mixing a word branch and a number branch | refused; that is a coercion, and what MySQL answers for it has not been measured |

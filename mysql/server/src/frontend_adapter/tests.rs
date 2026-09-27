@@ -30678,3 +30678,6 @@ mod column_comparisons;
 
 #[cfg(unix)]
 mod views;
+
+#[cfg(unix)]
+mod grouped_reports;

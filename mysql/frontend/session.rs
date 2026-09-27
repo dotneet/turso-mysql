@@ -5946,16 +5946,19 @@ impl MySqlConnection {
         if has_decimal_source && translated.source_tables().len() > 1
             && (translated.checks_type_sensitive_expression()
                 || translated.static_result_metadata().iter().any(|projection| {
-                matches!(projection,
-                    StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::Arithmetic(shape)) if shape.names_a_column())
-                    || matches!(projection,
-                        StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ColumnAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. })
-                        | StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::WindowAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. }))
-                    || matches!(projection,
-                        StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::ScalarCall {
+                let StaticSelectProjectionMetadata::Literal(metadata) = projection else {
+                    return false;
+                };
+                let answer = metadata.answer();
+                matches!(answer, StaticSelectMetadata::Arithmetic(shape) if shape.names_a_column())
+                    || matches!(answer,
+                        StaticSelectMetadata::ColumnAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. }
+                        | StaticSelectMetadata::WindowAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. })
+                    || matches!(answer,
+                        StaticSelectMetadata::ScalarCall {
                             columns,
                             ..
-                        }) if !columns.is_empty())
+                        } if !columns.is_empty())
             }))
         {
             for source in translated.source_tables() {

@@ -1578,14 +1578,62 @@ it, so only a column *declared* `TEXT` reports `BLOB`.
 Measured, a `MIN` or `MAX` over a `TEXT` column reports length 1048560, which
 the protocol metadata now preserves.
 
-`GROUP BY` is taken over whole columns, and is held to `ONLY_FULL_GROUP_BY`.
-That mode is in MySQL 8.4's default `sql_mode` and this server takes a client's
-`SET sql_mode` naming it, so the rule is enforced rather than assumed: every
-projection that is not an aggregate or a literal has to be one of the grouping
-columns, and one that is not is refused where MySQL answers 1055. A wildcard
-projection is refused for the same reason, since the columns it names cannot be
-checked against the grouping. The grouping columns keep their own result
-metadata and the aggregates keep theirs, exactly as they do without a `GROUP BY`.
+`GROUP BY` is taken over whole columns and over the calls a report groups by —
+`DATE`, `YEAR`, `MONTH`, `DAY`, the other readings of a moment's part,
+`LAST_DAY`, `DAYNAME`, `MONTHNAME` and `DATE_FORMAT` over a column — and is held
+to `ONLY_FULL_GROUP_BY`. That mode is in MySQL 8.4's default `sql_mode` and this
+server takes a client's `SET sql_mode` naming it, so the rule is enforced rather
+than assumed. Measured on MySQL 8.4.11:
+
+- A projected or ordered expression answers 1055 unless it is a grouping key as
+  written, or every column it names outside an aggregate is a key that is a
+  whole column. `UPPER(title)` passes under `GROUP BY title`; `created_at`,
+  `YEAR(created_at)` and even `UPPER(DATE(created_at))` do not pass under
+  `GROUP BY DATE(created_at)` — MySQL matches a whole key, not a key inside a
+  larger expression. A key written with its function name in another case, or
+  its column with the table's name, is the same key.
+- A `HAVING` answers 1054 for a column that is not a whole-column key, even one
+  inside a key — `HAVING DATE(created_at) > ...` under `GROUP BY
+  DATE(created_at)` — and even one a primary key decides. It may name the
+  projection's aliases, `HAVING d > ...` included.
+
+Each of those is refused here where MySQL answers its error. So are a wildcard
+projection, whose columns cannot be checked against the grouping, a scalar
+subquery in a grouped projection, whose outer columns are not worked out, and
+the column MySQL lets through because the key it depends on is a primary key —
+`SELECT id, name ... GROUP BY id` — which is not worked out either. A call over
+words the client wrote itself is not taken as a key — `GROUP BY UPPER(title)` —
+because MySQL groups words under the column's collation, where `a` and `A` are
+one group, and the engine groups the call's answer by its bytes; `DATE_FORMAT`
+and the day and month names answer words too, but only words one format
+writes, none two of which differ in case or accent alone. A key is rendered the
+way the projection renders the same call, so the engine groups on the value the
+client reads back.
+
+A statement grouping by whole columns keeps each column's result metadata and
+each aggregate's, exactly as without a `GROUP BY`. One grouping by a call
+reports different shapes, because MySQL groups it in a temporary table and
+reports each answer that table stores as the table's column — measured, over
+`GROUP BY DATE(created_at)`, `COUNT(*)` loses its binary flag. A whole number is
+stored as a `LONG` when it is eleven characters or fewer, so `YEAR(created_at)`
+answers a `LONG` of 4 there where it answers a `YEAR` on its own, and `MONTH` a
+`LONG` of 3 where it answers a `LONGLONG`. `SUM`, `MIN` and `MAX` lose the
+binary flag the same way; words lose the 31 decimals a call's words carry; a day
+keeps its shape; and an `AVG`, worked out afterwards from a sum and a count,
+keeps its own. A grouping key carries the group flag, 32768 — the bit MySQL also
+sends as the numeric flag, so a client reads a `DATE` or a `DATE_FORMAT` key as
+flagged numeric. What the temporary table does to any other answer has not been
+measured and is refused: a `GROUP_CONCAT`, a `MIN` over a moment, a literal, a
+call over an aggregate. MySQL uses the same table for a statement grouping by a
+column no index covers, and reports the same shapes there; this keeps the
+shapes MySQL reports when an index answers the grouping instead — measured,
+`SELECT user_id, COUNT(*) ... GROUP BY user_id` reports the count's binary flag
+over an indexed `user_id` and not over an unindexed one — because which one
+MySQL takes is its planner's choice.
+
+Rows come back in the order the engine groups them, sorted by key, where MySQL
+answers a statement grouping in a temporary table in the order it met each
+group. Neither is promised without an `ORDER BY`.
 
 `HAVING` comes with it, over the aggregates and the grouping columns. A
 comparison on a grouping column goes through the same checked path a `WHERE`

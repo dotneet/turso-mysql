@@ -7848,9 +7848,10 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
-        | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner) => {
-            needs_source_columns(inner)
-        }
+        | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner)
+        | turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable {
+            answer: inner, ..
+        } => needs_source_columns(inner),
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
         turso_mysql_parser::StaticSelectMetadata::Branches { branches, .. } => branches
             .iter()
@@ -7935,6 +7936,17 @@ fn aggregate_column_definition(
             set_column_flags(&mut definition, flags);
             Ok(definition)
         }
+        turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable { answer, key } => {
+            let mut definition = match static_column_definition(name.clone(), answer) {
+                Some(definition) => definition,
+                None => aggregate_column_definition(source_metadata, name, answer)?,
+            };
+            read_out_of_the_grouping_table(&mut definition, answer)?;
+            if *key {
+                definition.flags |= MYSQL_GROUP_FLAG;
+            }
+            Ok(definition)
+        }
         // Measured: the same shape a plain COUNT answers, without the binary
         // flag.
         turso_mysql_parser::StaticSelectMetadata::WindowCount => {
@@ -7982,6 +7994,78 @@ fn aggregate_column_definition(
         ),
         _ => Err(FrontendErrorKind::Internal),
     }
+}
+
+/// Gives an answer the shape MySQL reports for it once it has been read out of
+/// the temporary table a statement grouping by an expression groups in.
+///
+/// Measured on MySQL 8.4.11. That table stores each grouping key, each call
+/// over the grouped columns, and each `COUNT`, `SUM`, `MIN` and `MAX`, and a
+/// stored answer reports the table's column. A whole number is stored as a
+/// `LONG` when it is eleven characters or fewer, so `YEAR(created_at)` answers
+/// a `LONG` of 4 where on its own it answers a `YEAR`, and `MONTH` a `LONG` of
+/// 3 where on its own it answers a `LONGLONG`. A stored number loses the
+/// binary flag, a `COUNT` included. Words lose their 31 decimals, which is
+/// what MySQL writes for a call's words on their own. A day keeps its shape.
+/// An `AVG` is worked out after the grouping from a sum and a count and keeps
+/// the shape it has on its own.
+///
+/// Anything else has not been measured there and is refused.
+#[cfg(unix)]
+fn read_out_of_the_grouping_table(
+    definition: &mut ColumnDefinitionConfig,
+    answer: &turso_mysql_parser::StaticSelectMetadata,
+) -> Result<(), FrontendErrorKind> {
+    use turso_mysql_parser::StaticSelectMetadata;
+    let stored = match answer {
+        StaticSelectMetadata::Count => true,
+        StaticSelectMetadata::ColumnAggregate { kind, .. } => match kind {
+            ColumnAggregateKind::MinMax | ColumnAggregateKind::Sum => true,
+            ColumnAggregateKind::Avg => false,
+            ColumnAggregateKind::Concatenated
+            | ColumnAggregateKind::DeviatesBySample
+            | ColumnAggregateKind::CollectsIntoJson => return Err(FrontendErrorKind::Unsupported),
+        },
+        StaticSelectMetadata::ScalarCall {
+            function:
+                ScalarFunction::CastsToDay
+                | ScalarFunction::ReadsTheYear
+                | ScalarFunction::ReadsAMonthOrDay
+                | ScalarFunction::ReadsTheHour
+                | ScalarFunction::ReadsAMinuteOrSecond
+                | ScalarFunction::ReadsTheQuarter
+                | ScalarFunction::ReadsADayOfTheWeek
+                | ScalarFunction::ReadsTheDayOfTheYear
+                | ScalarFunction::ReadsTheLastDay
+                | ScalarFunction::ReadsTheYearAsANumber
+                | ScalarFunction::NamesTheDayOrMonth
+                | ScalarFunction::WritesAMoment
+                | ScalarFunction::KeepsTextShape,
+            ..
+        } => true,
+        _ => return Err(FrontendErrorKind::Unsupported),
+    };
+    if !stored {
+        return Ok(());
+    }
+    match definition.column_type {
+        MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+        | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_YEAR => {
+            if definition.column_length <= 11 {
+                definition.column_type = MYSQL_TYPE_LONG;
+            }
+            let flags = definition.flags & (MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG);
+            set_column_flags(definition, flags);
+        }
+        MYSQL_TYPE_NEWDECIMAL => {
+            let flags = definition.flags & !MYSQL_BINARY_FLAG;
+            set_column_flags(definition, flags);
+        }
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => definition.decimals = 0,
+        MYSQL_TYPE_DATE => {}
+        _ => return Err(FrontendErrorKind::Unsupported),
+    }
+    Ok(())
 }
 
 /// The columns one `information_schema` table reports.
@@ -8375,6 +8459,10 @@ const MYSQL_BLOB_FLAG: u16 = 16;
 pub(crate) const MYSQL_UNSIGNED_FLAG: u16 = 32;
 const MYSQL_ZEROFILL_FLAG: u16 = 64;
 pub(crate) const MYSQL_NUM_FLAG: u16 = 32_768;
+/// MySQL marks a grouping key with the bit it also sends as the numeric flag,
+/// so a client reads a word that is a key as flagged numeric.
+#[cfg(unix)]
+const MYSQL_GROUP_FLAG: u16 = 32_768;
 pub(crate) const MYSQL_BINARY_FLAG: u16 = 128;
 const MYSQL_ENUM_FLAG: u16 = 256;
 const MYSQL_SET_FLAG: u16 = 2048;

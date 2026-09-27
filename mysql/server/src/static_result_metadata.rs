@@ -84,7 +84,8 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::Arithmetic(_)
         | StaticSelectMetadata::Branches { .. }
         | StaticSelectMetadata::AggregateOverBranches { .. }
-        | StaticSelectMetadata::ScalarCall { .. } => return None,
+        | StaticSelectMetadata::ScalarCall { .. }
+        | StaticSelectMetadata::FromTheGroupingTable { .. } => return None,
     })
 }
 

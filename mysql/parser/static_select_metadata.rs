@@ -100,6 +100,17 @@ pub enum StaticSelectMetadata {
     /// A value written out in full, whose shape is fixed by how it is
     /// written.
     WrittenValue(crate::WrittenValue),
+    /// An answer of a statement grouping by an expression, which MySQL groups
+    /// in a temporary table and reports the table's column for rather than the
+    /// answer's own shape.
+    ///
+    /// The server finishes it from the answer's own shape.
+    FromTheGroupingTable {
+        answer: Box<StaticSelectMetadata>,
+        /// Whether the answer is one of the grouping keys, which carry a flag
+        /// of their own in that table.
+        key: bool,
+    },
 }
 
 /// One thing a `CASE`, `IF`, `IFNULL` or `COALESCE` can answer.
@@ -111,6 +122,16 @@ pub enum Branch {
     Word { characters: u32 },
     /// A column, whose type lives in the table.
     Column { column_name: String },
+}
+
+impl StaticSelectMetadata {
+    /// Returns the answer itself, whatever table it is read out of.
+    pub fn answer(&self) -> &StaticSelectMetadata {
+        match self {
+            StaticSelectMetadata::FromTheGroupingTable { answer, .. } => answer,
+            answer => answer,
+        }
+    }
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its

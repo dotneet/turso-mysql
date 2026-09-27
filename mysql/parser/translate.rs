@@ -12,6 +12,7 @@
 
 use super::*;
 
+mod grouping;
 mod json_condition;
 
 /// One table a `SELECT` reads, with the name the engine reports for it.
@@ -424,6 +425,9 @@ pub(crate) fn translate_select_query(
         _ => None,
     };
     if let Some(order_by) = &query.order_by {
+        if let SetExpr::Select(select) = query.body.as_ref() {
+            grouping::hold_the_grouped_order_by(order_by, select)?;
+        }
         normalized.push_str(" ORDER BY ");
         normalized.push_str(&render_select_order_by(
             order_by,
@@ -635,6 +639,9 @@ fn render_select_body(
     // column, so the names are resolved before the clause is read at all —
     // what a name stands for decides whether the clause filters rows or
     // groups.
+    if let (Some(having), false) = (&select.having, group_by.is_empty()) {
+        grouping::hold_the_grouped_having(having, &select.projection, group_by)?;
+    }
     let having = select
         .having
         .as_ref()
@@ -654,7 +661,11 @@ fn render_select_body(
     }
     if !group_by.is_empty() {
         normalized.push_str(" GROUP BY ");
-        normalized.push_str(&render_select_group_by(group_by, &select.projection)?);
+        normalized.push_str(&grouping::render_select_group_by(
+            group_by,
+            &select.projection,
+            render_context,
+        )?);
     }
     // A statement that aggregates and groups nothing has put every row it read
     // into one answer, so a bare column has no single row to come from. MySQL
@@ -1500,82 +1511,6 @@ fn render_having_predicate(
     }
 }
 
-/// Renders a `GROUP BY` over plain columns and holds the projection to
-/// MySQL's `ONLY_FULL_GROUP_BY`.
-///
-/// That mode is in MySQL 8.4's default `sql_mode`, and this server takes a
-/// client's `SET sql_mode` naming it, so the rule has to be real here: every
-/// projection that is not an aggregate or a literal has to be one of the
-/// grouping columns, or the row it lands in is one of several and MySQL
-/// answers 1055.
-fn render_select_group_by(
-    group_by: &[Expr],
-    projection: &[SelectItem],
-) -> Result<String, ParseError> {
-    let mut columns = Vec::with_capacity(group_by.len());
-    for expr in group_by {
-        let Some(column) = grouped_column(expr) else {
-            return unsupported("GROUP BY requires a whole column");
-        };
-        columns.push(column);
-    }
-    for item in projection {
-        let expr = match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
-            // A wildcard names columns this cannot see, so it cannot be held to
-            // the rule and is refused rather than let through.
-            _ => return unsupported("GROUP BY with a wildcard projection"),
-        };
-        if static_select_metadata::classify_static_select_expr(expr).is_some() {
-            continue;
-        }
-        let Some(projected) = grouped_column(expr) else {
-            return unsupported("GROUP BY with an unchecked projection");
-        };
-        if !columns
-            .iter()
-            .any(|column| names_same_column(*column, projected))
-        {
-            return unsupported("GROUP BY leaves a projected column out of the grouping");
-        }
-    }
-    Ok(columns
-        .into_iter()
-        .map(|(table, column)| match table {
-            Some(table) => format!("{}.{}", render_ident(table), render_ident(column)),
-            None => render_ident(column),
-        })
-        .collect::<Vec<_>>()
-        .join(", "))
-}
-
-/// Reads a whole column, qualified or not, from a `GROUP BY` key or a
-/// projection.
-type GroupedColumn<'a> = (Option<&'a Ident>, &'a Ident);
-
-fn grouped_column(expr: &Expr) -> Option<GroupedColumn<'_>> {
-    match expr {
-        Expr::Identifier(column) => Some((None, column)),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((Some(&parts[0]), &parts[1])),
-        _ => None,
-    }
-}
-
-/// Reports whether a grouping key and a projected column name the same column.
-///
-/// A client may qualify one and not the other, which MySQL takes whenever the
-/// bare name is unambiguous. The engine answers the ambiguous case itself, so
-/// matching on the column name is enough here.
-fn names_same_column(key: GroupedColumn<'_>, projected: GroupedColumn<'_>) -> bool {
-    if !key.1.value.eq_ignore_ascii_case(&projected.1.value) {
-        return false;
-    }
-    match (key.0, projected.0) {
-        (Some(key), Some(projected)) => key.value.eq_ignore_ascii_case(&projected.value),
-        _ => true,
-    }
-}
-
 pub(crate) fn select_static_result_metadata(
     query: &sqlparser::ast::Query,
 ) -> Vec<StaticSelectProjectionMetadata> {
@@ -1590,20 +1525,25 @@ pub(crate) fn select_static_result_metadata(
         Ok(resolved) if !select.named_window.is_empty() => resolved,
         _ => select,
     };
+    let grouped_by_an_expression = grouping::expression_grouping_keys(select);
     select
         .projection
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                if let Some((shape, _)) = crate::written_value::read_written_value(expr) {
-                    return StaticSelectProjectionMetadata::Literal(
-                        StaticSelectMetadata::WrittenValue(shape),
-                    );
+                let answer = crate::written_value::read_written_value(expr)
+                    .map(|(shape, _)| StaticSelectMetadata::WrittenValue(shape))
+                    .or_else(|| classify_static_select_expr(expr));
+                match (answer, grouped_by_an_expression) {
+                    (None, _) => StaticSelectProjectionMetadata::Other,
+                    (Some(answer), None) => StaticSelectProjectionMetadata::Literal(answer),
+                    (Some(answer), Some(group_by)) => StaticSelectProjectionMetadata::Literal(
+                        StaticSelectMetadata::FromTheGroupingTable {
+                            answer: Box::new(answer),
+                            key: grouping::is_named_by_a_key(item, group_by),
+                        },
+                    ),
                 }
-                classify_static_select_expr(expr).map_or(
-                    StaticSelectProjectionMetadata::Other,
-                    StaticSelectProjectionMetadata::Literal,
-                )
             }
             SelectItem::ExprWithAliases { .. } => StaticSelectProjectionMetadata::Other,
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {

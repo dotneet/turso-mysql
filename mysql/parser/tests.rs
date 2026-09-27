@@ -3103,14 +3103,33 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         translated.as_sql(),
         "SELECT \"team\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY \"team\""
     );
+    // A key that is a call is rendered the way the projection renders it, so
+    // the engine groups on the value the client reads back.
+    let translated = parse_select(
+        "SELECT date(joined) AS d, COUNT(*) FROM users GROUP BY DATE(joined) HAVING d > '2026-01-01' ORDER BY d",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT date(\"joined\") AS \"d\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY date(\"joined\") HAVING (date(\"joined\") > '2026-01-01') ORDER BY \"d\" ASC"
+    );
 
     for sql in [
         // Each projection here lands in one row of several, which MySQL
         // answers 1055 for under its own default sql_mode.
         "SELECT team, score FROM users GROUP BY team",
         "SELECT * FROM users GROUP BY team",
-        // The grouping key has to be a whole column.
+        // A key that is an expression has to be one the engine groups the
+        // way MySQL does.
         "SELECT team FROM users GROUP BY team + 1",
+        "SELECT UPPER(team), COUNT(*) FROM users GROUP BY UPPER(team)",
+        // A key inside a larger expression is not the key: 1055.
+        "SELECT UPPER(DATE(joined)) FROM users GROUP BY DATE(joined)",
+        // 1055 for an ordered column, 1054 for a HAVING column.
+        "SELECT team FROM users GROUP BY team ORDER BY score",
+        "SELECT id FROM users GROUP BY id HAVING score > 1",
+        "SELECT DATE(joined) FROM users GROUP BY DATE(joined) HAVING DATE(joined) > '2026-01-01'",
         // The modifiers change what a group is.
         "SELECT team FROM users GROUP BY team WITH ROLLUP",
     ] {

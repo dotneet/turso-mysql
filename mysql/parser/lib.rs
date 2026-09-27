@@ -1573,41 +1573,47 @@ impl TranslatedSelect {
                     CheckedSelectComparisonOperator::In | CheckedSelectComparisonOperator::NotIn
                 )
             })
-            || self.static_result_metadata.iter().any(|projection| {
-                matches!(projection,
-                    StaticSelectProjectionMetadata::Literal(
-                        StaticSelectMetadata::ScalarCall { columns, .. }
-                    ) if !columns.is_empty())
+            || self.static_answers().any(|answer| {
+                matches!(answer, StaticSelectMetadata::ScalarCall { columns, .. } if !columns.is_empty())
             })
-            || self.static_result_metadata.iter().any(|projection| {
+            || self.static_answers().any(|answer| {
                 matches!(
-                    projection,
-                    StaticSelectProjectionMetadata::Literal(
-                        StaticSelectMetadata::ColumnAggregate {
-                            kind: ColumnAggregateKind::Sum | ColumnAggregateKind::Avg,
-                            ..
-                        } | StaticSelectMetadata::ScalarCall {
-                            function: ScalarFunction::CutsDigits
-                                | ScalarFunction::KeepsNumericShape
-                                | ScalarFunction::Truncates
-                                | ScalarFunction::RoundsToPlaces { .. }
-                                | ScalarFunction::RoundsToWhole
-                                | ScalarFunction::Negates
-                                | ScalarFunction::DividesWhole
-                                | ScalarFunction::NegatesTruth
-                                | ScalarFunction::TestsTruth
-                                | ScalarFunction::Modulo
-                                | ScalarFunction::Widest
-                                | ScalarFunction::Hexadecimal
-                                | ScalarFunction::GroupsDigits
-                                | ScalarFunction::NullsOnMatch
-                                | ScalarFunction::WritesInAnotherRadix
-                                | ScalarFunction::FindsThePlace
-                                | ScalarFunction::ReadsThePlace,
-                            ..
-                        } | StaticSelectMetadata::Arithmetic(_)
-                    )
+                    answer,
+                    StaticSelectMetadata::ColumnAggregate {
+                        kind: ColumnAggregateKind::Sum | ColumnAggregateKind::Avg,
+                        ..
+                    } | StaticSelectMetadata::ScalarCall {
+                        function: ScalarFunction::CutsDigits
+                            | ScalarFunction::KeepsNumericShape
+                            | ScalarFunction::Truncates
+                            | ScalarFunction::RoundsToPlaces { .. }
+                            | ScalarFunction::RoundsToWhole
+                            | ScalarFunction::Negates
+                            | ScalarFunction::DividesWhole
+                            | ScalarFunction::NegatesTruth
+                            | ScalarFunction::TestsTruth
+                            | ScalarFunction::Modulo
+                            | ScalarFunction::Widest
+                            | ScalarFunction::Hexadecimal
+                            | ScalarFunction::GroupsDigits
+                            | ScalarFunction::NullsOnMatch
+                            | ScalarFunction::WritesInAnotherRadix
+                            | ScalarFunction::FindsThePlace
+                            | ScalarFunction::ReadsThePlace,
+                        ..
+                    } | StaticSelectMetadata::Arithmetic(_)
                 )
+            })
+    }
+
+    /// Returns each projection's answer whose shape this statement fixes,
+    /// whatever table it is read out of.
+    fn static_answers(&self) -> impl Iterator<Item = &StaticSelectMetadata> {
+        self.static_result_metadata
+            .iter()
+            .filter_map(|projection| match projection {
+                StaticSelectProjectionMetadata::Literal(metadata) => Some(metadata.answer()),
+                _ => None,
             })
     }
 
