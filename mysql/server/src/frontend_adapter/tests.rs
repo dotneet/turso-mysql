@@ -30615,6 +30615,8 @@ mod numeric_operators;
 #[cfg(unix)]
 mod string_functions;
 #[cfg(unix)]
+mod truth_values;
+#[cfg(unix)]
 mod unicode_collation;
 
 #[cfg(unix)]

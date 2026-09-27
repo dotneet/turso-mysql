@@ -4142,7 +4142,12 @@ fn render_select_item(
                     static_select_metadata::classify_static_select_expr(expr)
                 ),
                 (
-                    Expr::UnaryOp { .. } | Expr::BinaryOp { .. },
+                    Expr::UnaryOp { .. }
+                        | Expr::BinaryOp { .. }
+                        | Expr::IsTrue(_)
+                        | Expr::IsFalse(_)
+                        | Expr::IsNotTrue(_)
+                        | Expr::IsNotFalse(_),
                     Some(StaticSelectMetadata::ScalarCall { .. })
                 )
             ) =>
@@ -4739,6 +4744,54 @@ fn render_select_expr(
                 .expect("the guard read the operator as a shift");
             render_scalar_call(&call, render_context)
         }
+        // `NOT col` and `col IS TRUE` and its three kin over a column of
+        // numbers, which the frontend checks it is. The engine reads a number
+        // as true where it is not zero, as MySQL does.
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: negated,
+        } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            render_context.checks_type_sensitive_expression = true;
+            Ok(format!(
+                "(NOT {})",
+                render_select_expr(negated, render_context)?
+            ))
+        }
+        Expr::IsTrue(tested)
+        | Expr::IsFalse(tested)
+        | Expr::IsNotTrue(tested)
+        | Expr::IsNotFalse(tested)
+            if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+        {
+            render_context.checks_type_sensitive_expression = true;
+            let tested = render_select_expr(tested, render_context)?;
+            Ok(render_truth_test(expr, &tested))
+        }
+        // A comparison standing as a result column is written the way a
+        // `WHERE` writes it, so a column is held to its type and a word is
+        // compared under the column's collation. MySQL answers it as 1, 0 or
+        // NULL, and so does the engine.
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                static_select_metadata::classify_static_select_expr(expr),
+                Some(StaticSelectMetadata::ScalarCall {
+                    function: static_select_metadata::ScalarFunction::Compares,
+                    ..
+                })
+            ) =>
+        {
+            render_context.checks_type_sensitive_expression = true;
+            let counted = |expr: &Expr| matches!(expr, Expr::Function(function) if static_select_metadata::is_count_call(function));
+            if counted(left) || counted(right) {
+                return Ok(format!(
+                    "({} {} {})",
+                    render_select_expr(left, render_context)?,
+                    checked_select_comparison_sql_operator(op),
+                    render_select_expr(right, render_context)?
+                ));
+            }
+            render_checked_select_comparison(left, op, right, render_context)
+        }
         // `col % n` and `col DIV n` over a whole number, which the engine's
         // `%` and `/` answer the same way: both keep the dividend's sign and
         // cut toward zero, and both answer NULL for a zero divisor.
@@ -4921,6 +4974,21 @@ fn render_select_expr(
             Ok("last_insert_id()".to_string())
         }
         _ => unsupported("SELECT expression"),
+    }
+}
+
+/// Writes `IS TRUE`, `IS FALSE`, `IS NOT TRUE` or `IS NOT FALSE` over what
+/// has already been written for the thing tested.
+///
+/// Measured on MySQL 8.4.11: each answers 1 or 0 and never NULL, a NULL being
+/// neither true nor false, so `NULL IS NOT TRUE` is 1.
+fn render_truth_test(test: &Expr, tested: &str) -> String {
+    match test {
+        Expr::IsTrue(_) => format!("COALESCE(({tested}) <> 0, 0)"),
+        Expr::IsFalse(_) => format!("COALESCE(({tested}) = 0, 0)"),
+        Expr::IsNotTrue(_) => format!("COALESCE(({tested}) = 0, 1)"),
+        Expr::IsNotFalse(_) => format!("COALESCE(({tested}) <> 0, 1)"),
+        _ => unreachable!("a truth test was checked to be one of the four"),
     }
 }
 
@@ -6284,20 +6352,30 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
             .map_or(0, |pos| pos + 1);
         start = name_start;
     }
-    // A negation's span covers what it negates and not its sign.
+    // A negation's span covers what it negates and not its sign or its NOT,
+    // and a truth test's covers what it tests and not the words after it.
+    if let Expr::UnaryOp { op, .. } = expr {
+        let operator = match op {
+            sqlparser::ast::UnaryOperator::Minus => "-",
+            sqlparser::ast::UnaryOperator::Not => "NOT",
+            _ => "",
+        };
+        let before = source.get(..start)?.trim_end();
+        let operator_start = before.len().checked_sub(operator.len());
+        if let Some(operator_start) = operator_start.filter(|_| !operator.is_empty()) {
+            if before
+                .get(operator_start..)
+                .is_some_and(|written| written.eq_ignore_ascii_case(operator))
+            {
+                start = operator_start;
+            }
+        }
+    }
     if matches!(
         expr,
-        Expr::UnaryOp {
-            op: sqlparser::ast::UnaryOperator::Minus,
-            ..
-        }
+        Expr::IsTrue(_) | Expr::IsFalse(_) | Expr::IsNotTrue(_) | Expr::IsNotFalse(_)
     ) {
-        let sign = bytes[..start]
-            .iter()
-            .rposition(|byte| !byte.is_ascii_whitespace())?;
-        if bytes[sign] == b'-' {
-            start = sign;
-        }
+        end += truth_test_words_len(source.get(end..)?)?;
     }
     // A bare `CURRENT_DATE` is a call with no parentheses at all, so there is
     // no closing one to reach for and its span is already the whole name.
@@ -6381,6 +6459,35 @@ fn start_of_the_interval_keyword_before(source: &str, count_start: usize) -> Opt
         .get(keyword_start..keyword_end)?
         .eq_ignore_ascii_case("INTERVAL")
         .then_some(keyword_start)
+}
+
+/// Counts the bytes of `IS TRUE`, `IS FALSE`, `IS NOT TRUE` or `IS NOT FALSE`
+/// at the front of `tail`, whitespace before each word included.
+fn truth_test_words_len(tail: &str) -> Option<usize> {
+    let mut read = 0;
+    for words in [
+        &["IS"][..],
+        &["NOT", "TRUE", "FALSE"][..],
+        &["TRUE", "FALSE"][..],
+    ] {
+        let rest = &tail[read..];
+        let skipped = rest.len() - rest.trim_start().len();
+        let word = words.iter().find(|word| {
+            rest[skipped..]
+                .get(..word.len())
+                .is_some_and(|written| written.eq_ignore_ascii_case(word))
+        });
+        match word {
+            Some(word) => {
+                read += skipped + word.len();
+                if *word != "NOT" && *word != "IS" {
+                    return Some(read);
+                }
+            }
+            None => return None,
+        }
+    }
+    Some(read)
 }
 
 fn nested_depth(expr: &Expr) -> usize {
@@ -6515,6 +6622,13 @@ fn render_select_predicate(
             "(NOT {})",
             render_select_predicate(expr, render_context)?
         )),
+        Expr::IsTrue(tested)
+        | Expr::IsFalse(tested)
+        | Expr::IsNotTrue(tested)
+        | Expr::IsNotFalse(tested) => {
+            let tested = render_select_predicate(tested, render_context)?;
+            Ok(render_truth_test(expr, &tested))
+        }
         Expr::Nested(expr) => Ok(format!(
             "({})",
             render_select_predicate(expr, render_context)?

@@ -224,6 +224,13 @@ pub enum ScalarFunction {
     Negates,
     /// `col DIV n`, which answers the whole number of times it goes in.
     DividesWhole,
+    /// A comparison, which answers 1, 0 or NULL.
+    Compares,
+    /// `NOT col`, which answers 1, 0 or NULL.
+    NegatesTruth,
+    /// `col IS TRUE`, `IS FALSE`, `IS NOT TRUE` and `IS NOT FALSE`, which
+    /// answer 1 or 0 and never NULL.
+    TestsTruth,
     /// `IFNULL` and `COALESCE`, which answer the column's shape and cannot be
     /// null when a later argument cannot.
     Defaulted,
@@ -381,6 +388,34 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
                 not_null: false,
             })
         }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: negated,
+        } => {
+            let Expr::Identifier(column) = negated.as_ref() else {
+                return None;
+            };
+            Some(StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::NegatesTruth,
+                columns: vec![column.value.clone()],
+                literal_characters: 0,
+                not_null: false,
+            })
+        }
+        Expr::IsTrue(tested)
+        | Expr::IsFalse(tested)
+        | Expr::IsNotTrue(tested)
+        | Expr::IsNotFalse(tested) => {
+            let Expr::Identifier(column) = tested.as_ref() else {
+                return None;
+            };
+            Some(StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::TestsTruth,
+                columns: vec![column.value.clone()],
+                literal_characters: 0,
+                not_null: true,
+            })
+        }
         Expr::UnaryOp { op, expr } => {
             let sign = match op {
                 UnaryOperator::Plus => StaticIntegerSign::Positive,
@@ -440,6 +475,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
             .or_else(|| interval_shift_as_call(expr).and_then(|call| scalar_call(&call)))
+            .or_else(|| classify_comparison(expr))
             .or_else(|| classify_whole_division(expr))
             .or_else(|| classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic)),
         Expr::Subquery(query) => classify_scalar_subquery(query),
@@ -531,6 +567,59 @@ pub(super) fn interval_shift_as_call(expr: &Expr) -> Option<sqlparser::ast::Func
         null_treatment: None,
         over: None,
         within_group: Vec::new(),
+    })
+}
+
+/// Classifies a comparison standing as a result column.
+///
+/// Two shapes are taken: a column against a written number or word, which the
+/// `WHERE` comparison reader holds to the column's type, and a `COUNT` against
+/// a written whole number, which never answers NULL.
+fn classify_comparison(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    if !matches!(
+        op,
+        sqlparser::ast::BinaryOperator::Eq
+            | sqlparser::ast::BinaryOperator::NotEq
+            | sqlparser::ast::BinaryOperator::Lt
+            | sqlparser::ast::BinaryOperator::LtEq
+            | sqlparser::ast::BinaryOperator::Gt
+            | sqlparser::ast::BinaryOperator::GtEq
+    ) {
+        return None;
+    }
+    let written = |expr: &Expr| match expr {
+        Expr::Value(value) => matches!(
+            value.value,
+            Value::Number(_, false) | Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+        ),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } => {
+            matches!(expr.as_ref(), Expr::Value(value) if matches!(value.value, Value::Number(_, false)))
+        }
+        _ => false,
+    };
+    let counted = |expr: &Expr| matches!(expr, Expr::Function(function) if is_count_call(function));
+    let (columns, not_null) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), other) | (other, Expr::Identifier(column)) if written(other) => {
+            (vec![column.value.clone()], false)
+        }
+        (count, other) | (other, count)
+            if counted(count) && crate::translate::direct_signed_integer(other).is_some() =>
+        {
+            (Vec::new(), true)
+        }
+        _ => return None,
+    };
+    Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::Compares,
+        columns,
+        literal_characters: 0,
+        not_null,
     })
 }
 

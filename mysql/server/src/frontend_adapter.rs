@@ -5715,6 +5715,46 @@ fn scalar_call_column_definition(
     {
         return Ok(calendar_name_or_week_definition(name, function));
     }
+    // Measured on MySQL 8.4.11: a comparison, `NOT col` and `col IS TRUE`
+    // each answer a LONGLONG of length 1. A comparison or a negation is NOT
+    // NULL where what it reads cannot be null — `id > 1` and `NOT id` over a
+    // key, `COUNT(*) > 0` always — and the truth tests always are.
+    if matches!(
+        function,
+        ScalarFunction::Compares | ScalarFunction::NegatesTruth | ScalarFunction::TestsTruth
+    ) {
+        let mut reads_nothing_null = true;
+        for column_name in columns {
+            let (table, ordinal) = source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .column_named(column_name)?;
+            let source = table
+                .columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            // MySQL reads a word or a DECIMAL as a truth by a rule of its own
+            // — `NOT 'apple'` is 1 — which the engine does not share.
+            if function != ScalarFunction::Compares
+                && !is_signed_whole_number_column(source.type_name())
+                && source.type_name() != "DOUBLE"
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            reads_nothing_null &= !source.nullable() && !table.outer;
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 1;
+        set_column_flags(
+            &mut definition,
+            MYSQL_BINARY_FLAG
+                | if not_null || reads_nothing_null {
+                    MYSQL_NOT_NULL_FLAG
+                } else {
+                    0
+                },
+        );
+        return Ok(definition);
+    }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
@@ -6549,6 +6589,9 @@ fn scalar_call_column_definition(
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),
         ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
             unreachable!("the window calls were answered above")
+        }
+        ScalarFunction::Compares | ScalarFunction::NegatesTruth | ScalarFunction::TestsTruth => {
+            unreachable!("the truth answers were answered above")
         }
         ScalarFunction::Concatenates
         | ScalarFunction::TakesCharacters

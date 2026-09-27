@@ -1499,6 +1499,8 @@ impl TranslatedSelect {
                                 | ScalarFunction::RoundsToWhole
                                 | ScalarFunction::Negates
                                 | ScalarFunction::DividesWhole
+                                | ScalarFunction::NegatesTruth
+                                | ScalarFunction::TestsTruth
                                 | ScalarFunction::Modulo
                                 | ScalarFunction::Widest
                                 | ScalarFunction::Hexadecimal

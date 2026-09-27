@@ -2982,6 +2982,22 @@ stored in a `DOUBLE` column. Every `DOUBLE` used to be written without the sign
 of a zero; a written `-0.0` is a `DECIMAL`, which stores a zero with no sign in
 both engines, so what is stored reads back `0` as it did.
 
+A comparison, `NOT col` and `col IS TRUE` — with `IS FALSE`, `IS NOT TRUE` and
+`IS NOT FALSE` — stand as result columns. Measured on 8.4.11, each answers a
+`LONGLONG` of length 1, 1, 0 or NULL, named as written; a comparison or a
+`NOT` is NOT NULL only where nothing it reads can be null (`id > 1` and `NOT id`
+over a key, `COUNT(*) > 0` always), and a truth test always is, NULL being
+neither true nor false. The same shape stands beside other columns. A
+comparison is a column against a written number or word, written the way a
+`WHERE` writes it — so a word is compared under the column's collation and
+`name = 'APPLE'` is 1 over `apple` — or a `COUNT` against a written whole
+number. `NOT` and the truth tests read a column of whole numbers or a `DOUBLE`,
+each read as true where it is not zero; a word is refused, MySQL reading it as
+the number it begins with (`NOT 'apple'` is 1), and so is a `DECIMAL`. In a
+`WHERE`, `flag IS TRUE` and its kin test whatever the `WHERE` reader takes, so
+`WHERE (qty > 0) IS FALSE` keeps a row whose `qty` is not above zero and drops
+one where it is NULL.
+
 `RAND()` answers a double between zero and one, NOT NULL, as MySQL's does. A
 seeded `RAND(n)` is refused: the engine has no seeded random, so answering one
 would answer a different sequence. `UUID()` answers a thirty-six character
