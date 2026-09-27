@@ -60,6 +60,36 @@ pub fn days_from_the_year_zero(written: &str) -> Option<i64> {
     Some(day_number(moment.year, moment.month, moment.day))
 }
 
+/// The day `MAKEDATE(year, day)` names, counting days on from the first of
+/// January into the years after, or nothing for a day before the first or
+/// past the year 9999.
+pub(crate) fn day_of_year_written_out(year: u32, day: u32) -> Option<String> {
+    if day == 0 || year > 9999 {
+        return None;
+    }
+    let first = day_number(year, 1, 1);
+    day_counted_from_the_year_zero(first + i64::from(day) - 1)
+}
+
+/// The day `FROM_DAYS(days)` names, the other way round from `TO_DAYS`, or
+/// nothing outside the first of January of the year one through the last day
+/// of 9999, where MySQL answers the zero day or NULL.
+pub(crate) fn day_counted_from_the_year_zero(days: i64) -> Option<String> {
+    if !(day_number(1, 1, 1)..=day_number(9999, 12, 31)).contains(&days) {
+        return None;
+    }
+    let mut year = u32::try_from(days / 366).ok()?.max(1);
+    while day_number(year + 1, 1, 1) <= days {
+        year += 1;
+    }
+    let mut month = 1;
+    while month < 12 && day_number(year, month + 1, 1) <= days {
+        month += 1;
+    }
+    let day = days - day_number(year, month, 1) + 1;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
 /// How many characters MySQL reserves in a result column for one specifier.
 ///
 /// Measured on 8.4.11 by reading the column width back one specifier at a

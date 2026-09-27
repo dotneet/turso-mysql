@@ -35,8 +35,12 @@ pub enum WrittenValue {
     /// as it holds. Measured: the hexadecimal spellings carry the unsigned
     /// flag and the bit spelling does not.
     Bytes { length: u32, unsigned: bool },
-    /// A cast of a written day to `DATE`.
-    Day,
+    /// A cast of a written day to `DATE`, or a day `MAKEDATE` or
+    /// `FROM_DAYS` works out. Measured: `FROM_DAYS` is the one reported NOT
+    /// NULL.
+    Day { not_null: bool },
+    /// A time of day `MAKETIME` works out.
+    Time,
     /// A cast of a written moment to `DATETIME`.
     Moment,
     /// A cast of a written document to `JSON`.
@@ -254,6 +258,101 @@ fn written_call(function: &sqlparser::ast::Function) -> Option<(WrittenValue, St
         let places = crate::translate::direct_signed_integer(places)?;
         return written_truncation(number, places);
     }
+    written_calendar_call(&name.value, &values)
+}
+
+/// Reads `MAKEDATE`, `FROM_DAYS`, `MAKETIME`, `PERIOD_DIFF` and `GET_FORMAT`
+/// over written values. Measured on MySQL 8.4.11: `MAKEDATE(2026, 32)` is
+/// 2026-02-01, a year under seventy read in this century and one under a
+/// hundred in the last; `FROM_DAYS(739000)` is 2023-04-25; `MAKETIME(-1, 2, 3)`
+/// is `-01:02:03`; `PERIOD_DIFF(7001, 6912)` is -1199, a two-digit year read
+/// the way `MAKEDATE` reads one; and `GET_FORMAT(DATE, 'ISO')` is `%Y-%m-%d`.
+/// A value MySQL answers NULL for, a zero day, or an error — `PERIOD_DIFF(0, 0)`
+/// is 1210 — is refused.
+fn written_calendar_call(name: &str, values: &[&Expr]) -> Option<(WrittenValue, String)> {
+    let named = |candidate: &str| name.eq_ignore_ascii_case(candidate);
+    let number = |expr: &Expr| crate::translate::direct_signed_integer(expr);
+    if named("MAKEDATE") {
+        let [year, day] = values else {
+            return None;
+        };
+        let year = u32::try_from(number(year)?).ok()?;
+        let year = match year {
+            0..=69 => year + 2000,
+            70..=99 => year + 1900,
+            _ => year,
+        };
+        let day = u32::try_from(number(day)?).ok()?;
+        let written = crate::date_format::day_of_year_written_out(year, day)?;
+        return Some((WrittenValue::Day { not_null: false }, quoted(&written)));
+    }
+    if named("FROM_DAYS") {
+        let [days] = values else {
+            return None;
+        };
+        let written = crate::date_format::day_counted_from_the_year_zero(number(days)?)?;
+        return Some((WrittenValue::Day { not_null: true }, quoted(&written)));
+    }
+    if named("MAKETIME") {
+        let [hours, minutes, seconds] = values else {
+            return None;
+        };
+        let (hours, minutes, seconds) = (number(hours)?, number(minutes)?, number(seconds)?);
+        if hours.abs() > 838 || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+            return None;
+        }
+        let sign = if hours < 0 { "-" } else { "" };
+        let written = format!("{sign}{:02}:{minutes:02}:{seconds:02}", hours.abs());
+        return Some((WrittenValue::Time, quoted(&written)));
+    }
+    if named("PERIOD_DIFF") {
+        let [later, earlier] = values else {
+            return None;
+        };
+        let months = |period: &Expr| -> Option<i64> {
+            let period = number(period)?;
+            let (year, month) = (period / 100, period % 100);
+            if period <= 0 || !(1..=12).contains(&month) {
+                return None;
+            }
+            let year = match year {
+                0..=69 => year + 2000,
+                70..=99 => year + 1900,
+                _ => year,
+            };
+            Some(year * 12 + month)
+        };
+        let difference = months(later)? - months(earlier)?;
+        return Some((
+            WrittenValue::WholeNumber { length: 21 },
+            difference.to_string(),
+        ));
+    }
+    if named("GET_FORMAT") {
+        let [Expr::Identifier(kind), standard] = values else {
+            return None;
+        };
+        if kind.quote_style.is_some() {
+            return None;
+        }
+        let standard = written_word(standard)?.to_ascii_uppercase();
+        let kind = kind.value.to_ascii_uppercase();
+        let format = match (kind.as_str(), standard.as_str()) {
+            ("DATE", "USA") => "%m.%d.%Y",
+            ("DATE", "JIS" | "ISO") => "%Y-%m-%d",
+            ("DATE", "EUR") => "%d.%m.%Y",
+            ("DATE", "INTERNAL") => "%Y%m%d",
+            ("DATETIME" | "TIMESTAMP", "USA" | "EUR") => "%Y-%m-%d %H.%i.%s",
+            ("DATETIME" | "TIMESTAMP", "JIS" | "ISO") => "%Y-%m-%d %H:%i:%s",
+            ("DATETIME" | "TIMESTAMP", "INTERNAL") => "%Y%m%d%H%i%s",
+            ("TIME", "USA") => "%h:%i:%s %p",
+            ("TIME", "JIS" | "ISO") => "%H:%i:%s",
+            ("TIME", "EUR") => "%H.%i.%s",
+            ("TIME", "INTERNAL") => "%H%i%s",
+            _ => return None,
+        };
+        return Some((WrittenValue::Text { characters: 17 }, quoted(format)));
+    }
     None
 }
 
@@ -466,9 +565,12 @@ fn written_cast(cast: &Expr, data_type: &DataType) -> Option<(WrittenValue, Stri
         // naming a day is taken.
         DataType::Date => {
             if null {
-                return Some((WrittenValue::Day, "NULL".to_owned()));
+                return Some((WrittenValue::Day { not_null: false }, "NULL".to_owned()));
             }
-            Some((WrittenValue::Day, quoted(&normalize_date(word?)?)))
+            Some((
+                WrittenValue::Day { not_null: false },
+                quoted(&normalize_date(word?)?),
+            ))
         }
         DataType::Datetime(None) => {
             if null {

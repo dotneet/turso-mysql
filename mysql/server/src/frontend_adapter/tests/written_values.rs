@@ -587,9 +587,76 @@ fn a_call_over_written_values_alone_is_worked_out_in_full() {
         ]
     );
 
+    // A two-digit year is read in this century under seventy and in the last
+    // from there, the way MySQL reads one.
+    let sql = "SELECT MAKEDATE(2026, 32), MAKEDATE(2024, 366), MAKEDATE(69, 1), MAKEDATE(70, 1), FROM_DAYS(739000), FROM_DAYS(366), MAKETIME(-1, 2, 3), MAKETIME(838, 59, 59), PERIOD_DIFF(202603, 202512), PERIOD_DIFF(7001, 6912), GET_FORMAT(DATE, 'usa'), GET_FORMAT(TIME, 'USA')";
+    assert_eq!(
+        row(&mut adapter, sql),
+        [
+            "2026-02-01",
+            "2024-12-31",
+            "2069-01-01",
+            "1970-01-01",
+            "2023-04-25",
+            "0001-01-01",
+            "-01:02:03",
+            "838:59:59",
+            "3",
+            "-1199",
+            "%m.%d.%Y",
+            "%h:%i:%s %p"
+        ]
+    );
+    let kinds: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(_, column_type, length, _, flags, _)| (column_type, length, flags))
+        .collect();
+    let day = (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG);
+    let counted_day = (MYSQL_TYPE_DATE, 10, MYSQL_BINARY_FLAG | MYSQL_NOT_NULL_FLAG);
+    let time = (MYSQL_TYPE_TIME, 10, MYSQL_BINARY_FLAG);
+    let months = (MYSQL_TYPE_LONGLONG, 21, whole);
+    let format = (MYSQL_TYPE_VAR_STRING, 68, 0);
+    assert_eq!(
+        kinds,
+        [
+            day,
+            day,
+            day,
+            day,
+            counted_day,
+            counted_day,
+            time,
+            time,
+            months,
+            months,
+            format,
+            format
+        ]
+    );
+    assert_eq!(
+        binary_row(&mut adapter, "SELECT MAKETIME(-1, 2, 3)"),
+        [BinaryResultValue::Time {
+            negative: true,
+            days: 0,
+            hour: 1,
+            minute: 2,
+            second: 3
+        }]
+    );
+
     // A word outside ASCII compares by weights of the collation's own, and
-    // `CONV` reads digits by rules not followed here.
-    for sql in ["SELECT FIELD('é', 'e')", "SELECT CONV(255, 10, 16)"] {
+    // `CONV` reads digits by rules not followed here. A value MySQL answers
+    // NULL or the zero day for, or refuses with 1210, is refused.
+    for sql in [
+        "SELECT FIELD('é', 'e')",
+        "SELECT CONV(255, 10, 16)",
+        "SELECT MAKEDATE(2026, 0)",
+        "SELECT MAKEDATE(9999, 366)",
+        "SELECT FROM_DAYS(365)",
+        "SELECT MAKETIME(12, 60, 0)",
+        "SELECT PERIOD_DIFF(0, 0)",
+        "SELECT GET_FORMAT(DATE, 'nope')",
+    ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }

@@ -6,6 +6,7 @@ const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 const MYSQL_TYPE_DATE: u8 = 0x0a;
+const MYSQL_TYPE_TIME: u8 = 0x0b;
 const MYSQL_TYPE_DATETIME: u8 = 0x0c;
 const MYSQL_TYPE_JSON: u8 = 0xf5;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
@@ -124,8 +125,15 @@ fn written_value_metadata(written: WrittenValue) -> StaticResultColumnMetadata {
         },
         // A cast to a day, a moment or a document is nullable whatever it
         // was given, a word naming none answering NULL.
-        WrittenValue::Day => StaticResultColumnMetadata {
+        WrittenValue::Day { not_null } => StaticResultColumnMetadata {
             column_type: MYSQL_TYPE_DATE,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: 10,
+            flags: MYSQL_BINARY_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+            decimals: 0,
+        },
+        WrittenValue::Time => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_TIME,
             character_set: MYSQL_BINARY_COLLATION,
             column_length: 10,
             flags: MYSQL_BINARY_FLAG,

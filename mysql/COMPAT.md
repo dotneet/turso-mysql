@@ -889,6 +889,15 @@ answers a different one. Measured on 8.4.11:
   is a `NEWDECIMAL` 1.56 of 5 — and a whole number left of the point, a
   `LONGLONG` of 21. `FIELD` over a word outside ASCII, which compares by the
   collation's own weights, and `CONV` are refused.
+- The calendar calls over written values: `MAKEDATE(2026, 32)` is 2026-02-01
+  and `FROM_DAYS(739000)` 2023-04-25, each a `DATE` of 10 and `FROM_DAYS` NOT
+  NULL; `MAKETIME(-1, 2, 3)` is `-01:02:03`, a `TIME` of 10;
+  `PERIOD_DIFF(7001, 6912)` is -1199, a NOT NULL `LONGLONG` of 21; and
+  `GET_FORMAT(DATE, 'ISO')` is `%Y-%m-%d`, a `VAR_STRING` of 68. A two-digit
+  year is read in this century under seventy and in the last from there. A
+  value MySQL answers NULL or the zero day for — `MAKEDATE(2026, 0)`,
+  `FROM_DAYS(365)`, `MAKETIME(12, 60, 0)` — or refuses with 1210, as it does
+  `PERIOD_DIFF(0, 0)`, is refused. Over a column none of them is taken.
 
 Each of these, and each cast of `NULL` to the same types, is taken only where it stands in
 the statement's own result. In a subquery, a derived table or a branch of a `UNION` it is
@@ -1854,8 +1863,8 @@ column. The seconds are counted in a `TIME`, `DATETIME` or `DATE` column or a
 written time, and a time is written out of a whole-number column or a written
 whole number. A `TIMESTAMP`, read in the session's zone, a word column and a
 written value MySQL warns about — a word naming no time, a count past the
-widest time — are refused. `ADDTIME`, `TIME_FORMAT`, `MAKETIME` and
-`MAKEDATE` are not taken.
+widest time — are refused. `ADDTIME` and `TIME_FORMAT` are not taken, and
+`MAKETIME` and `MAKEDATE` are taken over written values only.
 
 `ADDDATE` and `SUBDATE` are `DATE_ADD` and `DATE_SUB` under other names, and
 a bare count is a count of days: `ADDDATE(d, 1)` is `DATE_ADD(d, INTERVAL 1
