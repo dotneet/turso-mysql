@@ -1092,7 +1092,7 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT SUBSTRING(v, 1, 2) FROM s",
-            "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
+            "SELECT mysql_substring(\"v\", 1, 2) AS \"SUBSTRING(v, 1, 2)\" FROM \"s\"",
         ),
         // Both engines spell the ranking calls the same way, so only the
         // window is rewritten.
@@ -1204,9 +1204,26 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             "SELECT TRIM('x' FROM v) FROM s",
             "SELECT trim(\"v\", 'x') AS \"TRIM('x' FROM v)\" FROM \"s\"",
         ),
+        // `SUBSTR` is `SUBSTRING`, and the count can be left out.
+        (
+            "SELECT SUBSTR(v, -2) FROM s",
+            "SELECT mysql_substring(\"v\", (-2)) AS \"SUBSTR(v, -2)\" FROM \"s\"",
+        ),
+        (
+            "SELECT SUBSTRING_INDEX(v, '@', -1) FROM s",
+            "SELECT mysql_substring_index(\"v\", '@', -1) AS \"SUBSTRING_INDEX(v, '@', -1)\" FROM \"s\"",
+        ),
+        (
+            "SELECT CONCAT_WS('-', v, 'x', n) FROM s",
+            "SELECT concat_ws('-', \"v\", 'x', \"n\") AS \"CONCAT_WS('-', v, 'x', n)\" FROM \"s\"",
+        ),
+        (
+            "SELECT SHA2(v, 256) FROM s",
+            "SELECT mysql_sha2(\"v\", 256) AS \"SHA2(v, 256)\" FROM \"s\"",
+        ),
         (
             "SELECT SUBSTRING(v FROM 1 FOR 2) FROM s",
-            "SELECT substr(\"v\", 1, 2) AS \"SUBSTRING(v FROM 1 FOR 2)\" FROM \"s\"",
+            "SELECT mysql_substring(\"v\", 1, 2) AS \"SUBSTRING(v FROM 1 FOR 2)\" FROM \"s\"",
         ),
         (
             "SELECT FLOOR(n) FROM s",
@@ -1238,7 +1255,11 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         // A count this cannot read leaves no width to answer with.
         "SELECT LEFT(v, n) FROM s",
         "SELECT SUBSTRING(v, 1, n) FROM s",
-        "SELECT SUBSTRING(v, 1) FROM s",
+        "SELECT SUBSTRING(v, n) FROM s",
+        "SELECT SUBSTRING_INDEX(v, '@', n) FROM s",
+        // MySQL answers NULL for a size SHA2 does not have, with a warning.
+        "SELECT SHA2(v, 1) FROM s",
+        "SELECT CONCAT_WS(NULL, v) FROM s",
         // MySQL removes whole copies of what TRIM was given where the engine
         // removes any of its characters, and they only agree on one.
         "SELECT TRIM(LEADING 'ax' FROM v) FROM s",

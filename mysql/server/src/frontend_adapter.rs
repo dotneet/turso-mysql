@@ -5595,11 +5595,10 @@ fn scalar_call_column_definition(
         return Ok(definition);
     }
     // Measured: `RAND()` answers a double reporting NOT NULL, and `UUID()` a
-    // VAR_STRING of 144 — the thirty-six characters it writes — and `MD5` one
-    // of 128, its thirty-two.
+    // VAR_STRING of 144 — the thirty-six characters it writes.
     if matches!(
         function,
-        ScalarFunction::Randomises | ScalarFunction::Identifies | ScalarFunction::Digests
+        ScalarFunction::Randomises | ScalarFunction::Identifies
     ) {
         if function == ScalarFunction::Randomises {
             let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
@@ -5611,13 +5610,8 @@ fn scalar_call_column_definition(
             );
             return Ok(definition);
         }
-        let width = if function == ScalarFunction::Identifies {
-            144
-        } else {
-            128
-        };
         let mut definition = column_definition(name, MYSQL_TYPE_VAR_STRING);
-        definition.column_length = width;
+        definition.column_length = 144;
         definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         definition.decimals = NOT_FIXED_DECIMALS;
         set_column_flags(&mut definition, 0);
@@ -6027,6 +6021,9 @@ fn scalar_call_column_definition(
         ScalarFunction::KeepsTextShape
             | ScalarFunction::CountsText
             | ScalarFunction::TakesCharacters
+            | ScalarFunction::TakesASubstring { .. }
+            | ScalarFunction::SplitsOnADelimiter
+            | ScalarFunction::Digests
             | ScalarFunction::Repeats
             | ScalarFunction::Locates
             | ScalarFunction::QuotesAsJson
@@ -6109,6 +6106,45 @@ fn scalar_call_column_definition(
     }
     if wants_text != is_text_column(source) && function != ScalarFunction::NullsOnMatch {
         return Err(FrontendErrorKind::Unsupported);
+    }
+    // Measured on MySQL 8.4.11: `MD5`, `SHA1` and `SHA2` each answer a
+    // VAR_STRING as wide as the hexadecimal characters of the digest, four
+    // bytes to the character — 128, 160, and 224 to 512 — whatever the column
+    // was. A number is refused above: MySQL writes it out before it digests
+    // it, and the engine would digest nothing.
+    if function == ScalarFunction::Digests {
+        return Ok(text_call_definition(
+            name,
+            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            not_null,
+        ));
+    }
+    // Measured on MySQL 8.4.11: `SUBSTRING_INDEX` answers a VAR_STRING as wide
+    // as its column — a `CHAR(8)` reports 32 — however the column is cut.
+    if function == ScalarFunction::SplitsOnADelimiter {
+        let length = source
+            .character_length()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        return Ok(text_call_definition(
+            name,
+            length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            not_null,
+        ));
+    }
+    // Measured on MySQL 8.4.11 over a `VARCHAR(100)`: what is left of the
+    // column after the place, held to the count — `SUBSTR(name, 2)` reports
+    // 396, `SUBSTR(name, -10)` 40, `SUBSTR(name, 99, 5)` 8, and a place of 0, a
+    // place reaching back past the start or a count below one report 0.
+    if let ScalarFunction::TakesASubstring { from, count } = function {
+        let length = source
+            .character_length()
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        return Ok(text_call_definition(
+            name,
+            substring_characters(length, from, count)
+                .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            not_null,
+        ));
     }
     // Measured: as wide as the count it was asked for, whatever the column is.
     if function == ScalarFunction::TakesCharacters {
@@ -6492,6 +6528,8 @@ fn scalar_call_column_definition(
         }
         ScalarFunction::Concatenates
         | ScalarFunction::TakesCharacters
+        | ScalarFunction::TakesASubstring { .. }
+        | ScalarFunction::SplitsOnADelimiter
         | ScalarFunction::Branches
         | ScalarFunction::Repeats
         | ScalarFunction::Hexadecimal
@@ -6609,6 +6647,26 @@ fn text_call_definition(name: String, width: u32, not_null: bool) -> ColumnDefin
         if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
     definition
+}
+
+/// The characters `SUBSTRING` can answer out of a column of `length` of them.
+#[cfg(unix)]
+fn substring_characters(length: u32, from: i32, count: Option<i32>) -> u32 {
+    let left = if from < 0 {
+        let back = from.unsigned_abs();
+        if back > length {
+            0
+        } else {
+            back
+        }
+    } else {
+        length.saturating_sub(from.unsigned_abs().wrapping_sub(1).min(length))
+    };
+    match count {
+        Some(count) if count <= 0 => 0,
+        Some(count) => left.min(count.unsigned_abs()),
+        None => left,
+    }
 }
 
 /// The result column a `STR_TO_DATE` reports, which its format names.

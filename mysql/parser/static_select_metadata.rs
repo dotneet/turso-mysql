@@ -225,6 +225,13 @@ pub enum ScalarFunction {
     /// `LEFT` and `RIGHT`, whose answer is as wide as the count they were
     /// asked for.
     TakesCharacters,
+    /// `SUBSTRING` and `SUBSTR`, whose answer is as wide as what is left of
+    /// the column after the place it starts from, held to the count it was
+    /// asked for.
+    TakesASubstring { from: i32, count: Option<i32> },
+    /// `SUBSTRING_INDEX`, which answers the part of the column before or
+    /// after a delimiter, and is as wide as the column.
+    SplitsOnADelimiter,
     /// A `CASE` or `IF`, whose answer is as wide as its widest branch.
     Branches,
     /// `REPEAT`, whose answer is as wide as its column's character length times the repeat count.
@@ -283,7 +290,8 @@ pub enum ScalarFunction {
     Randomises,
     /// `UUID`, which answers a new identifier and reads no column.
     Identifies,
-    /// `MD5`, whose answer is thirty-two hexadecimal characters.
+    /// `MD5`, `SHA1` and `SHA2`, whose answer is as many hexadecimal
+    /// characters as the digest has.
     Digests,
     /// `ROW_NUMBER`, `RANK`, `DENSE_RANK` and `NTILE` over a window, which
     /// answer an unsigned 64-bit row count.
@@ -1040,6 +1048,11 @@ pub(crate) fn trim_single_character(trim_what: &Expr) -> Option<&str> {
 /// Measured on MySQL 8.4.11: `SUBSTRING(v, 1, 2)` over a `VARCHAR(8)` answers
 /// a `VAR_STRING` of length 8 — the count asked for, four bytes a character —
 /// like `LEFT` and `RIGHT` already do.
+/// Classifies `SUBSTRING(col, from [, count])` and its `SUBSTR` spelling.
+///
+/// Both places have to be written whole numbers, because the answer's width is
+/// worked out from them. Each is held to a signed 32-bit number: MySQL reads a
+/// place past that as naming nothing, a rule this does not repeat.
 fn classify_substring(
     expr: &Expr,
     substring_from: Option<&Expr>,
@@ -1048,22 +1061,15 @@ fn classify_substring(
     let Expr::Identifier(column) = expr else {
         return None;
     };
-    let from_expr = substring_from?;
-    if !is_numeric_literal_or_signed(from_expr) {
-        return None;
-    }
-    let for_expr = substring_for?;
-    let Expr::Value(value) = for_expr else {
-        return None;
+    let from = i32::try_from(crate::translate::direct_signed_integer(substring_from?)?).ok()?;
+    let count = match substring_for {
+        Some(count) => Some(i32::try_from(crate::translate::direct_signed_integer(count)?).ok()?),
+        None => None,
     };
-    let Value::Number(digits, false) = &value.value else {
-        return None;
-    };
-    let count: u32 = digits.parse().ok()?;
     Some(StaticSelectMetadata::ScalarCall {
-        function: ScalarFunction::TakesCharacters,
+        function: ScalarFunction::TakesASubstring { from, count },
         columns: vec![column.value.clone()],
-        literal_characters: count,
+        literal_characters: 0,
         not_null: false,
     })
 }
@@ -1087,19 +1093,6 @@ fn classify_floor_ceil(
         literal_characters: 0,
         not_null: false,
     })
-}
-
-fn is_numeric_literal_or_signed(expr: &Expr) -> bool {
-    match expr {
-        Expr::Value(value) => matches!(&value.value, Value::Number(_, false)),
-        Expr::UnaryOp {
-            op: UnaryOperator::Minus | UnaryOperator::Plus,
-            expr,
-        } => {
-            matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false)))
-        }
-        _ => false,
-    }
 }
 
 fn is_scalar_literal(expr: &Expr) -> bool {
@@ -1329,6 +1322,103 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             function: ScalarFunction::Concatenates,
             columns,
             literal_characters,
+            not_null: false,
+        });
+    }
+    // `CONCAT_WS(separator, ...)` is as wide as its arguments laid end to end
+    // with the separator between each two, so the separator counts once for
+    // each gap.
+    if named(&["CONCAT_WS"]) {
+        let [separator, parts @ ..] = arguments.args.as_slice() else {
+            return None;
+        };
+        if parts.is_empty() {
+            return None;
+        }
+        let separator_characters = written_word(separator)?.chars().count() as u32;
+        let mut columns = Vec::new();
+        let mut literal_characters =
+            separator_characters.checked_mul(u32::try_from(parts.len() - 1).ok()?)?;
+        for part in parts {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                part
+            else {
+                return None;
+            };
+            match expr {
+                Expr::Identifier(column) => columns.push(column.value.clone()),
+                _ => {
+                    literal_characters = literal_characters
+                        .checked_add(written_word(part)?.chars().count() as u32)?;
+                }
+            }
+        }
+        if columns.is_empty() {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Concatenates,
+            columns,
+            literal_characters,
+            not_null: false,
+        });
+    }
+    // `SUBSTRING_INDEX(col, delimiter, count)` answers part of the column. The
+    // count is written, and the delimiter is written or bound.
+    if named(&["SUBSTRING_INDEX"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), delimiter, sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let bound = matches!(
+            delimiter,
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(value)))
+                if matches!(&value.value, Value::Placeholder(marker) if marker == "?")
+        );
+        if !bound {
+            written_word(delimiter)?;
+        }
+        crate::translate::direct_signed_integer(count)?;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::SplitsOnADelimiter,
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `MD5`, `SHA1` and `SHA2` answer a digest written in hexadecimal, as many
+    // characters as the digest has. `SHA2` names its size, and 0 means 256;
+    // measured, any other size answers NULL with a warning this does not
+    // raise, so it is refused.
+    if named(&["MD5", "SHA1", "SHA", "SHA2"]) {
+        let (column, characters) = match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            ))] if named(&["MD5"]) => (column, 32),
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            ))] if named(&["SHA1", "SHA"]) => (column, 40),
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(bits))]
+                if named(&["SHA2"]) =>
+            {
+                let bits = match crate::translate::direct_signed_integer(bits)? {
+                    0 => 256,
+                    bits @ (224 | 256 | 384 | 512) => bits,
+                    _ => return None,
+                };
+                (column, u32::try_from(bits / 4).ok()?)
+            }
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Digests,
+            columns: vec![column.value.clone()],
+            literal_characters: characters,
             not_null: false,
         });
     }
@@ -1777,7 +1867,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         }
         let mut columns = Vec::new();
         json_argument_column(document, &mut columns)?;
-        let keyword = json_written_argument(keyword)?;
+        let keyword = written_word(keyword)?;
         if !keyword.eq_ignore_ascii_case("one") && !keyword.eq_ignore_ascii_case("all") {
             return None;
         }
@@ -1832,12 +1922,12 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         }
         let mut columns = Vec::new();
         json_argument_column(document, &mut columns)?;
-        let keyword = json_written_argument(keyword)?;
+        let keyword = written_word(keyword)?;
         if !keyword.eq_ignore_ascii_case("one") && !keyword.eq_ignore_ascii_case("all") {
             return None;
         }
         for path in paths {
-            if !names_a_plain_json_path(json_written_argument(path)?) {
+            if !names_a_plain_json_path(written_word(path)?) {
                 return None;
             }
         }
@@ -1860,7 +1950,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         json_argument_column(document, &mut columns)?;
         json_argument_column(candidate, &mut columns)?;
         if let Some(path) = path {
-            if !names_a_plain_json_path(json_written_argument(path)?) {
+            if !names_a_plain_json_path(written_word(path)?) {
                 return None;
             }
         }
@@ -2260,8 +2350,6 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::KeepsTextShape
     } else if named(&["HEX"]) {
         ScalarFunction::Hexadecimal
-    } else if named(&["MD5"]) {
-        ScalarFunction::Digests
     } else if named(&["JSON_VALID"]) {
         ScalarFunction::ChecksJson
     } else if named(&["JSON_QUOTE"]) {
@@ -2509,8 +2597,9 @@ fn json_argument_column(
     Some(())
 }
 
-/// Reads an argument written out as text, which a keyword or a path has to be.
-fn json_written_argument(argument: &sqlparser::ast::FunctionArg) -> Option<&str> {
+/// Reads an argument written out as text, which a keyword, a path, a
+/// separator or a delimiter has to be.
+fn written_word(argument: &sqlparser::ast::FunctionArg) -> Option<&str> {
     let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
         value,
     ))) = argument
@@ -2739,7 +2828,9 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
     Some(match function {
         ScalarFunction::KeepsTextShape
         | ScalarFunction::CastsToText
-        | ScalarFunction::NamesTheDayOrMonth => CheckedComparisonAnswer::Text,
+        | ScalarFunction::NamesTheDayOrMonth
+        | ScalarFunction::TakesASubstring { .. }
+        | ScalarFunction::SplitsOnADelimiter => CheckedComparisonAnswer::Text,
         ScalarFunction::CountsText
         | ScalarFunction::ReadsTheYear
         | ScalarFunction::ReadsAMonthOrDay

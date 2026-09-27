@@ -460,8 +460,19 @@ impl Dialect for MySqlDialect {
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_WEEK) {
             return Ok(Some(Func::Dialect(MYSQL_WEEK.to_string())));
         }
-        if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
-            return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
+        if arg_count == 1
+            && (name.eq_ignore_ascii_case(MYSQL_MD5) || name.eq_ignore_ascii_case(MYSQL_SHA1))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_SHA2) {
+            return Ok(Some(Func::Dialect(MYSQL_SHA2.to_string())));
+        }
+        if (arg_count == 2 || arg_count == 3) && name.eq_ignore_ascii_case(MYSQL_SUBSTRING) {
+            return Ok(Some(Func::Dialect(MYSQL_SUBSTRING.to_string())));
+        }
+        if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_SUBSTRING_INDEX) {
+            return Ok(Some(Func::Dialect(MYSQL_SUBSTRING_INDEX.to_string())));
         }
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_REGEXP) {
             return Ok(Some(Func::Dialect(MYSQL_REGEXP.to_string())));
@@ -708,6 +719,78 @@ impl Dialect for MySqlDialect {
             return Ok(Value::build_text(format!(
                 "{:x}",
                 md5::compute(text.as_str().as_bytes())
+            )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_SHA1) || name.eq_ignore_ascii_case(MYSQL_SHA2) {
+            let (value, bits) = match args {
+                [value] => (value, Some(160)),
+                [value, Value::Numeric(Numeric::Integer(bits))] => (value, Some(*bits)),
+                [value, _] => (value, None),
+                _ => {
+                    return Err(LimboError::ParseError(format!(
+                        "{name} takes one or two arguments"
+                    )))
+                }
+            };
+            let (Value::Text(text), Some(bits)) = (value, bits) else {
+                return Ok(Value::Null);
+            };
+            return Ok(match written_digest(text.as_str().as_bytes(), bits) {
+                Some(digest) => Value::build_text(digest),
+                None => Value::Null,
+            });
+        }
+        if name.eq_ignore_ascii_case(MYSQL_SUBSTRING) {
+            let (value, from, count) = match args {
+                [value, from] => (value, from, None),
+                [value, from, count] => (value, from, Some(count)),
+                _ => {
+                    return Err(LimboError::ParseError(format!(
+                        "{name} takes two or three arguments"
+                    )))
+                }
+            };
+            let Value::Text(text) = value else {
+                return Ok(Value::Null);
+            };
+            let Value::Numeric(Numeric::Integer(from)) = from else {
+                return Ok(Value::Null);
+            };
+            let count = match count {
+                None => None,
+                Some(Value::Numeric(Numeric::Integer(count))) => Some(*count),
+                Some(_) => return Ok(Value::Null),
+            };
+            return Ok(Value::build_text(mysql_substring(
+                text.as_str(),
+                *from,
+                count,
+            )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_SUBSTRING_INDEX) {
+            let [value, delimiter, count] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes three arguments"
+                )));
+            };
+            if args.iter().any(|arg| matches!(arg, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let (
+                Value::Text(text),
+                Value::Text(delimiter),
+                Value::Numeric(Numeric::Integer(count)),
+            ) = (value, delimiter, count)
+            else {
+                return Err(LimboError::InvalidArgument(
+                    "MySQL SUBSTRING_INDEX requires text, a text delimiter and a whole count"
+                        .to_string(),
+                ));
+            };
+            return Ok(Value::build_text(mysql_substring_index(
+                text.as_str(),
+                delimiter.as_str(),
+                *count,
             )));
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS_INTEGER) {
@@ -1084,6 +1167,94 @@ pub(crate) const MYSQL_WEEK: &str = "mysql_week";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";
+/// Write the forty hexadecimal characters `SHA1` answers, and the ones `SHA2`
+/// answers for each size it takes. Neither is in the engine.
+pub(crate) const MYSQL_SHA1: &str = "mysql_sha1";
+pub(crate) const MYSQL_SHA2: &str = "mysql_sha2";
+
+/// Writes a digest of the bytes in lower-case hexadecimal, the way `SHA1` and
+/// `SHA2` answer it. A size `SHA2` does not have answers nothing: measured on
+/// MySQL 8.4.11, `SHA2('abc', 1)` is NULL, and 0 means 256.
+fn written_digest(bytes: &[u8], bits: i64) -> Option<String> {
+    use sha2::Digest;
+    let digest = match bits {
+        160 => sha1::Sha1::digest(bytes).to_vec(),
+        224 => sha2::Sha224::digest(bytes).to_vec(),
+        0 | 256 => sha2::Sha256::digest(bytes).to_vec(),
+        384 => sha2::Sha384::digest(bytes).to_vec(),
+        512 => sha2::Sha512::digest(bytes).to_vec(),
+        _ => return None,
+    };
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Reads part of a word the way `SUBSTRING` does, counting characters.
+///
+/// Measured on MySQL 8.4.11: a place of 0 answers nothing, a negative place
+/// counts back from the end and answers nothing when it reaches past the start,
+/// a place past the end answers nothing, and a count at or below zero answers
+/// nothing — `SUBSTR('apple', 0, 3)`, `SUBSTR('apple', -6)`, `SUBSTR('apple', 6)`
+/// and `SUBSTR('apple', 2, 0)` are all empty — where the engine's `substr`
+/// reads the first two as the start.
+pub(crate) const MYSQL_SUBSTRING: &str = "mysql_substring";
+
+fn mysql_substring(text: &str, from: i64, count: Option<i64>) -> String {
+    if from == 0 || count.is_some_and(|count| count <= 0) {
+        return String::new();
+    }
+    let characters = text.chars().count() as i64;
+    let start = if from < 0 {
+        characters + from
+    } else {
+        from - 1
+    };
+    if start < 0 || start >= characters {
+        return String::new();
+    }
+    let taken = count.unwrap_or(characters).min(characters - start);
+    text.chars()
+        .skip(start as usize)
+        .take(taken as usize)
+        .collect()
+}
+
+/// Reads the part of a word before the count-th delimiter, or after it
+/// counting from the end, the way `SUBSTRING_INDEX` does.
+///
+/// Measured on MySQL 8.4.11: the delimiter is matched by its bytes, so case
+/// counts — `SUBSTRING_INDEX('aXbxcXd', 'x', 1)` is `aXb` — and copies of it are
+/// found from the left without overlapping, whichever way the count runs:
+/// `SUBSTRING_INDEX('aaaaa', 'aa', -2)` is `aaa`, the part after the first of
+/// the two copies found from the left. A count of 0 or an empty delimiter
+/// answers nothing, and a count past the copies there are answers the whole
+/// word.
+pub(crate) const MYSQL_SUBSTRING_INDEX: &str = "mysql_substring_index";
+
+fn mysql_substring_index(text: &str, delimiter: &str, count: i64) -> String {
+    if count == 0 || delimiter.is_empty() {
+        return String::new();
+    }
+    let found = text
+        .match_indices(delimiter)
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    if count > 0 {
+        return match usize::try_from(count - 1).ok().and_then(|at| found.get(at)) {
+            Some(&at) => text[..at].to_owned(),
+            None => text.to_owned(),
+        };
+    }
+    let from_the_end = count.unsigned_abs();
+    match u64::try_from(found.len())
+        .ok()
+        .and_then(|copies| copies.checked_sub(from_the_end))
+        .and_then(|at| found.get(usize::try_from(at).ok()?))
+    {
+        Some(&at) => text[at + delimiter.len()..].to_owned(),
+        None => text.to_owned(),
+    }
+}
+
 /// Writes a whole number in binary or in octal, the way `BIN` and `OCT` do.
 ///
 /// Measured on MySQL 8.4.11: `OCT(-3)` answers 1777777777777777777775, the

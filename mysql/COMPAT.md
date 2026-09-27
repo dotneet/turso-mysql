@@ -846,7 +846,8 @@ The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
 `LENGTH`, `CHAR_LENGTH` (and its `CHARACTER_LENGTH` spelling), `NOW()` with
 `CURRENT_TIMESTAMP`, `ABS`, `SIGN`, `SQRT`, `POW` (with `POWER`), `MOD`, `ROUND` over one argument,
 `GREATEST`, `LEAST`, `NULLIF`,
-`IFNULL` with `COALESCE`, `CONCAT`, and `LEFT` with `RIGHT`. A `CASE` and its call spelling `IF` are taken
+`IFNULL` with `COALESCE`, `CONCAT`, `CONCAT_WS`, `SUBSTRING` (with `SUBSTR`),
+`SUBSTRING_INDEX`, `MD5`, `SHA1` (with `SHA`), `SHA2`, and `LEFT` with `RIGHT`. A `CASE` and its call spelling `IF` are taken
 alongside them. Each answers a shape measured on 8.4.11.
 
 Over a `VARCHAR(8)`, which reports length 32: `LOWER`, `UPPER`, `REVERSE`,
@@ -867,9 +868,9 @@ engine's case-sensitivity; and `LENGTH` and `CHAR_LENGTH` a `LONGLONG` of length
 and `IFNULL` keeps the width.
 `NOW()` answers a `DATETIME` of length 19. `CONCAT` is as wide as its arguments
 laid end to end, a string literal counting the characters it spells, so
-`CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`,
-`RIGHT`, and `SUBSTRING` (or `SUBSTR`) are as wide as the count they were asked for, so `LEFT(v, 2)`
-and `SUBSTRING(v, 1, 2)` report 8. A `CASE` is as wide as its widest branch:
+`CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`
+and `RIGHT` are as wide as the count they were asked for, so `LEFT(v, 2)`
+reports 8. A `CASE` is as wide as its widest branch:
 `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
 `IF(n > 1, 'y', 'n')` reports the same, measured identically.
 
@@ -2885,12 +2886,57 @@ either answers correctly. Measured: a fractional number is rounded first, so
 holds, so `HEX(-1)` is `FFFFFFFFFFFFFFFF`. Over a column holding a number the
 result reports 64 whatever the number's width is.
 
+`CONCAT_WS(separator, ...)` is as wide as its parts laid end to end with the
+separator in each gap: measured over a `VARCHAR(20)` and a `VARCHAR(30)`,
+`CONCAT_WS('-', a, b)` reports 204 and `CONCAT_WS(', ', a, 'lit', b)` 228, and a
+number counts its own width, 11 for an `INT`. It skips a NULL part and keeps an
+empty one, so two empty words answer `-` and a row whose every part is NULL
+answers an empty word rather than NULL; it is nullable all the same. The
+engine's `concat_ws` does each of those. The separator has to be a written
+word — a NULL one makes every row NULL — and every part a column of words or of
+whole numbers, or a written word.
+
+`SUBSTRING(col, from [, count])` and its `SUBSTR` spelling read characters. The
+place and the count have to be written numbers, because the width is worked out
+from them. Measured over a `VARCHAR(100)`: what is left of the column after the
+place, held to the count — `SUBSTR(name, 2)` reports 396, `SUBSTR(name, -10)`
+40, `SUBSTRING(name, 99, 5)` 8 and `SUBSTR(name, 2, 3)` 12. A place of 0, a place
+reaching back past the start, a place past the end and a count below one each
+answer an empty word, and report 0 when the column says so: `SUBSTR('apple', 0,
+3)`, `SUBSTR('apple', -6)`, `SUBSTR('apple', 6)` and `SUBSTR('apple', 2, 0)` are
+all empty. The engine's `substr` reads the first two as the start, so the call
+is answered by the dialect instead.
+
+`SUBSTRING_INDEX(col, delimiter, count)` answers the part before the count-th
+delimiter, or after it counting from the end. It reports a `VAR_STRING` as wide
+as its column (a `CHAR(8)` reports 32), nullable even over a NOT NULL column.
+Measured on 8.4.11: the delimiter is matched by its bytes, so case counts —
+`SUBSTRING_INDEX('aXbxcXd', 'x', 1)` is `aXb` — and copies of it are found from
+the left without overlapping whichever way the count runs, so
+`SUBSTRING_INDEX('aaaaa', 'aa', -2)` is `aaa`. A count of 0 or an empty
+delimiter answers an empty word, a count past the copies there are answers the
+whole word, and a NULL argument answers NULL. The count has to be written; the
+delimiter can be written or bound. In a `WHERE` or an `ORDER BY` it compares the
+way its column compares, so `SUBSTRING_INDEX(email, '@', -1) = 'X.COM'` finds
+`a@x.com`.
+
+`MD5`, `SHA1` (and `SHA`) and `SHA2` answer the digest of a column of words in
+lower-case hexadecimal: a `VAR_STRING` of 128, 160, and for `SHA2` 224, 256, 384
+or 512 as it names 224, 256 (or 0), 384 or 512 bits. A column of numbers is
+refused, because MySQL digests the number written out and the engine would
+answer NULL, and so is any other `SHA2` size, which MySQL answers NULL with a
+warning for.
+
+Refused beside these: each over a `TEXT`, which MySQL answers as a
+`MEDIUM_BLOB` of 1048560; each over a `DECIMAL` or a real column; a place, a
+count or a `SHA2` size read from the row; and a call compared against a `?`,
+which carries no kind until it binds.
+
 `RAND()` answers a double between zero and one, NOT NULL, as MySQL's does. A
 seeded `RAND(n)` is refused: the engine has no seeded random, so answering one
 would answer a different sequence. `UUID()` answers a thirty-six character
 identifier — the engine's is a random one where MySQL's is time-based, so the
-two differ in kind while both are identifiers. `MD5` answers the same
-thirty-two hexadecimal characters MySQL answers.
+two differ in kind while both are identifiers.
 
 `STR_TO_DATE(column, 'format')` reads that back, and what it answers is the
 format's doing rather than the text's: measured, a format naming only day parts

@@ -4596,10 +4596,13 @@ fn render_select_expr(
             rendered.push_str(" END");
             Ok(rendered)
         }
+        // The engine's `substr` reads a place of 0, or one before the start,
+        // as the start, where MySQL answers nothing: measured on 8.4.11,
+        // `SUBSTR('apple', 0, 3)` and `SUBSTR('apple', -6)` are both empty.
         Expr::Substring {
             expr: target,
             substring_from: Some(substring_from),
-            substring_for: Some(substring_for),
+            substring_for,
             ..
         } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             if contains_decimal_operand(expr, render_context.decimal_columns) {
@@ -4607,8 +4610,13 @@ fn render_select_expr(
             }
             let target = render_select_expr(target, render_context)?;
             let from = render_select_expr(substring_from, render_context)?;
-            let for_len = render_select_expr(substring_for, render_context)?;
-            Ok(format!("substr({target}, {from}, {for_len})"))
+            match substring_for {
+                Some(count) => Ok(format!(
+                    "mysql_substring({target}, {from}, {})",
+                    render_select_expr(count, render_context)?
+                )),
+                None => Ok(format!("mysql_substring({target}, {from})")),
+            }
         }
         // The engine's three names are what MySQL's one name with a side is.
         // What to trim is one character, which is the only width where
@@ -5750,6 +5758,38 @@ fn render_scalar_call(
         ));
     } else if name.value.eq_ignore_ascii_case("MD5") {
         return Ok(format!("mysql_md5({})", scalar_argument(function, 0)?));
+    } else if name.value.eq_ignore_ascii_case("SHA1") || name.value.eq_ignore_ascii_case("SHA") {
+        return Ok(format!("mysql_sha1({})", scalar_argument(function, 0)?));
+    } else if name.value.eq_ignore_ascii_case("SHA2") {
+        return Ok(format!(
+            "mysql_sha2({}, {})",
+            scalar_argument(function, 0)?,
+            scalar_argument(function, 1)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("CONCAT_WS") {
+        // The engine's `concat_ws` skips a NULL part and answers NULL for a
+        // NULL separator, as MySQL does, and writes a whole number the way
+        // MySQL does.
+        return Ok(format!(
+            "concat_ws({})",
+            render_scalar_arguments(function, render_context)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("SUBSTRING_INDEX") {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            delimiter,
+        ))) = arguments.args.get(1)
+        else {
+            unreachable!("a checked SUBSTRING_INDEX was checked to take a delimiter");
+        };
+        return Ok(format!(
+            "mysql_substring_index({}, {}, {})",
+            scalar_argument(function, 0)?,
+            render_select_expr(delimiter, render_context)?,
+            scalar_argument(function, 2)?
+        ));
     } else if name.value.eq_ignore_ascii_case("REPLACE") {
         return Ok(format!(
             "replace({}, {}, {})",

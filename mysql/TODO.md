@@ -126,6 +126,12 @@ boolean literal.
 | `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2`, `LOG10` | refused; measured, `ATAN(10)` and `TAN(10)` differ from MySQL in the last place, and the rest come from the same maths library, so agreeing at the points tried is not a promise |
 | `BIN` or `OCT` over a word — `BIN(name)` | refused; MySQL reads the word as the number it names, which is 0 for a word that names none |
 | `CONCAT` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; the generic text conversion of exact decimal blobs and floating values has not been verified against MySQL's numeric formatting |
+| `SUBSTRING`, `SUBSTRING_INDEX` and `CONCAT_WS` over a `TEXT` | refused; measured, MySQL answers a `MEDIUM_BLOB` of 1048560 for each, a shape this does not write |
+| `SUBSTRING_INDEX`, `SUBSTRING`, `MD5`, `SHA1` and `SHA2` over a number | refused; MySQL writes the number out first, and the engine would answer NULL or cut something else |
+| `CONCAT_WS` with a `NULL` or bound separator, or a `NULL` or bound part | refused; the width of each has not been measured |
+| `SHA2` naming a size it does not have — `SHA2(col, 1)` | refused; measured, MySQL answers NULL with a warning this does not raise |
+| `MID` | refused; not measured, though it is MySQL's other spelling of `SUBSTRING` |
+| A text-answering call compared against a `?` — `SUBSTRING_INDEX(email, '@', -1) = ?`, `LOWER(name) = ?` | refused; a parameter carries no kind until it binds, and MySQL would read a bound number against a word by a rule of its own |
 | Pinning a `DOUBLE` result to a golden | the conformance harness reads one back a bit narrower on verify than on record — `RADIANS(7)` records as ...309 and verifies as ...307 — so a double's value is held in a Rust test instead |
 | A `REGEXP` pattern looking ahead or naming a group again — `a(?=b)`, `(a)\\1` | refused; MySQL reads those through ICU and the matching here does not |
 | A `REGEXP` whose subject or pattern contains non-ASCII text | refused; MySQL ICU expands some characters during case folding, such as `ß` to `ss`, which Rust regex does not |
