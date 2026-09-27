@@ -1436,10 +1436,16 @@ pub(crate) fn check_mysql_assignment(
     let Some(table_sql) = table_sql else {
         return Ok(None);
     };
-    let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
+    let Some(rules) = assignment_rules(table_sql)? else {
         return Ok(None);
     };
-    if decoded.v2_metadata().is_some()
+    let AssignmentRules {
+        spec,
+        counted,
+        allocator_column,
+    } = rules.as_ref();
+    let allocator_column = *allocator_column;
+    if *counted
         && operation == AssignmentOperation::Insert
         && injected_counted_column_ordinal.is_none()
     {
@@ -1447,26 +1453,6 @@ pub(crate) fn check_mysql_assignment(
             "MySQL AUTO_INCREMENT inserts are not enabled".to_string(),
         ));
     }
-    let mode = SessionSqlMode {
-        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
-        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
-    };
-    let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
-        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-    let allocator_column = decoded
-        .v2_metadata()
-        .map(|_| {
-            parse_auto_increment_create_table(decoded.normalized_ddl, mode)
-                .map(|table| {
-                    (
-                        table.allocator_column_ordinal,
-                        table.allocator_column_type
-                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned,
-                    )
-                })
-                .map_err(|error| LimboError::Corrupt(error.to_string()))
-        })
-        .transpose()?;
     if operation == AssignmentOperation::Insert
         && allocator_column.is_some()
         && allocator_column.map(|(ordinal, _)| ordinal) != injected_counted_column_ordinal
@@ -1623,6 +1609,80 @@ pub(crate) fn check_mysql_assignment(
         }
     }
     Ok(rewritten)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread read a table's rules from its DDL.
+    static RULE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// What a stored table's DDL says about checking a row written to it.
+struct AssignmentRules {
+    spec: turso_mysql_parser::MySqlNumericSpec,
+    /// Whether the table counts its own ids.
+    counted: bool,
+    /// The counted column and whether it is a `BIGINT UNSIGNED` kept in the
+    /// row rather than as the rowid.
+    allocator_column: Option<(usize, bool)>,
+}
+
+/// Reads the rules for rows written to a table from its stored DDL, once for
+/// each DDL text.
+///
+/// Every row a statement writes is checked against them, and reading them
+/// parses the whole DDL: measured, that was 95% of an `UPDATE` of every row.
+/// The rules follow from the text alone, so the text is what they are kept
+/// under, and a table changed by any means has a different one.
+fn assignment_rules(table_sql: &str) -> Result<Option<Arc<AssignmentRules>>> {
+    /// A few hundred tables' rules, kept per thread so that no row waits on
+    /// another session's.
+    const MOST_KEPT: usize = 256;
+    thread_local! {
+        static KEPT: std::cell::RefCell<std::collections::HashMap<String, Arc<AssignmentRules>>> =
+            std::cell::RefCell::default();
+    }
+    if let Some(rules) = KEPT.with(|kept| kept.borrow().get(table_sql).cloned()) {
+        return Ok(Some(rules));
+    }
+    let Some(decoded) = decode_persisted_schema_sql(SchemaSqlKind::Table, table_sql)? else {
+        return Ok(None);
+    };
+    let mode = SessionSqlMode {
+        ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+        no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+    };
+    #[cfg(test)]
+    RULE_READS.with(|reads| reads.set(reads.get() + 1));
+    let spec = parse_mysql_numeric_spec(decoded.normalized_ddl, mode)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let allocator_column = decoded
+        .v2_metadata()
+        .map(|_| {
+            parse_auto_increment_create_table(decoded.normalized_ddl, mode)
+                .map(|table| {
+                    (
+                        table.allocator_column_ordinal,
+                        table.allocator_column_type
+                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned,
+                    )
+                })
+                .map_err(|error| LimboError::Corrupt(error.to_string()))
+        })
+        .transpose()?;
+    let rules = Arc::new(AssignmentRules {
+        spec,
+        counted: decoded.v2_metadata().is_some(),
+        allocator_column,
+    });
+    KEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.len() >= MOST_KEPT {
+            kept.clear();
+        }
+        kept.insert(table_sql.to_owned(), Arc::clone(&rules));
+    });
+    Ok(Some(rules))
 }
 
 /// A FLOAT is rounded when stored, so later comparisons and aggregates read
@@ -2486,6 +2546,45 @@ mod tests {
             Err(LimboError::ParseError(message))
                 if message.contains("SchemaSqlSessionContext")
         ));
+    }
+
+    /// Every row a statement writes is checked, so a table's rules are read
+    /// from its DDL once rather than once a row.
+    #[test]
+    fn a_tables_rules_are_read_once_for_each_ddl() {
+        let reads = || RULE_READS.with(std::cell::Cell::get);
+        let before = reads();
+        let stored = stored_table("CREATE TABLE `numbers` (`value` TINYINT)");
+        for value in [1, 2, 3] {
+            MySqlIntegerValidator
+                .check_assignment(
+                    "numbers",
+                    Some(&stored),
+                    AssignmentOperation::Insert,
+                    &[Value::from_i64(value)],
+                )
+                .unwrap();
+        }
+        assert_eq!(reads(), before + 1);
+
+        let altered = stored_table("CREATE TABLE `numbers` (`value` SMALLINT)");
+        MySqlIntegerValidator
+            .check_assignment(
+                "numbers",
+                Some(&altered),
+                AssignmentOperation::Insert,
+                &[Value::from_i64(1_000)],
+            )
+            .unwrap();
+        assert_eq!(reads(), before + 2);
+        assert!(MySqlIntegerValidator
+            .check_assignment(
+                "numbers",
+                Some(&stored),
+                AssignmentOperation::Insert,
+                &[Value::from_i64(1_000)],
+            )
+            .is_err());
     }
 
     #[test]
