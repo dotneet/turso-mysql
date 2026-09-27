@@ -1,4 +1,5 @@
 mod catalog;
+mod transaction_isolation;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -45,6 +46,8 @@ use crate::schema_sql::{
     SchemaSqlCreator, SchemaSqlSessionContext, SchemaSqlV2Metadata,
 };
 use crate::truncate_table::MySqlTruncateTableError;
+use transaction_isolation::TransactionIsolation;
+pub use transaction_isolation::{MySqlIsolationLevel, MySqlTransactionOutcome};
 
 /// MySQL statement entry for one connection and immutable schema parsing context.
 #[derive(Clone)]
@@ -61,6 +64,7 @@ pub struct MySqlConnection {
     /// Set while this session holds the lock `LOCK TABLES` took, which is
     /// the write transaction it opened.
     tables_locked: Arc<Mutex<bool>>,
+    transaction_isolation: Arc<Mutex<TransactionIsolation>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
@@ -1145,6 +1149,7 @@ impl MySqlConnection {
             session_time_zone_offset: Arc::new(Mutex::new(0)),
             read_only_transaction: Arc::new(Mutex::new(false)),
             tables_locked: Arc::new(Mutex::new(false)),
+            transaction_isolation: Arc::new(Mutex::new(TransactionIsolation::default())),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
         })
@@ -2674,7 +2679,7 @@ impl MySqlConnection {
     pub fn execute_transaction_command(
         &self,
         sql: &str,
-    ) -> std::result::Result<(), MySqlQueryError> {
+    ) -> std::result::Result<MySqlTransactionOutcome, MySqlQueryError> {
         let command =
             parse_transaction_command(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
         // The lock `LOCK TABLES` took is held by the transaction it opened, so
@@ -2690,10 +2695,13 @@ impl MySqlConnection {
         | MySqlTransactionCommand::RollbackToSavepoint(_)
         | MySqlTransactionCommand::ReleaseSavepoint(_) = &command
         {
-            return self.execute_savepoint_command(&command, sql);
+            self.execute_savepoint_command(&command, sql)?;
+            return Ok(MySqlTransactionOutcome::default());
         }
         match command {
-            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly
+            MySqlTransactionCommand::Begin
+            | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginWithConsistentSnapshot
                 if !self.inner.get_auto_commit() =>
             {
                 self.inner
@@ -2704,7 +2712,7 @@ impl MySqlConnection {
             MySqlTransactionCommand::Commit | MySqlTransactionCommand::Rollback
                 if self.inner.get_auto_commit() =>
             {
-                return Ok(());
+                return Ok(MySqlTransactionOutcome::default());
             }
             // The chaining forms end a transaction and begin another at once.
             // Measured on MySQL 8.4.11: they leave the session in a transaction
@@ -2713,13 +2721,15 @@ impl MySqlConnection {
             MySqlTransactionCommand::CommitAndChain | MySqlTransactionCommand::RollbackAndChain
                 if self.inner.get_auto_commit() =>
             {
-                return self.run_transaction_statement(
+                self.begin_transaction_isolation();
+                self.run_transaction_statement(
                     Stmt::Begin {
                         typ: None,
                         name: None,
                     },
                     sql,
-                );
+                )?;
+                return Ok(MySqlTransactionOutcome::default());
             }
             _ => {}
         }
@@ -2728,7 +2738,10 @@ impl MySqlConnection {
         *self.read_only_transaction.lock().unwrap() =
             matches!(command, MySqlTransactionCommand::BeginReadOnly);
         let statement = match command {
-            MySqlTransactionCommand::Begin | MySqlTransactionCommand::BeginReadOnly => {
+            MySqlTransactionCommand::Begin
+            | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginWithConsistentSnapshot => {
+                self.begin_transaction_isolation();
                 Stmt::Begin {
                     typ: None,
                     name: None,
@@ -2755,15 +2768,20 @@ impl MySqlConnection {
         );
         if chains {
             self.run_transaction_statement(statement, sql)?;
-            return self.run_transaction_statement(
+            self.run_transaction_statement(
                 Stmt::Begin {
                     typ: None,
                     name: None,
                 },
                 sql,
-            );
+            )?;
+            return Ok(MySqlTransactionOutcome::default());
         }
-        self.run_transaction_statement(statement, sql)
+        self.run_transaction_statement(statement, sql)?;
+        if command == MySqlTransactionCommand::BeginWithConsistentSnapshot {
+            return self.begin_consistent_snapshot();
+        }
+        Ok(MySqlTransactionOutcome::default())
     }
 
     /// Runs one of the three savepoint statements.
@@ -2899,7 +2917,15 @@ impl MySqlConnection {
     }
 
     fn begin_implicit_transaction_for_write(&self) -> std::result::Result<(), MySqlQueryError> {
-        if self.session_autocommit() || !self.inner.get_auto_commit() {
+        if !self.inner.get_auto_commit() {
+            return Ok(());
+        }
+        // With autocommit on the statement is a transaction of its own, which
+        // uses up a level set for the next transaction just as a `BEGIN`
+        // does. Measured on MySQL 8.4.11: a statement reading a table uses it
+        // up, while `SELECT 1` and a statement that fails first do not.
+        self.begin_transaction_isolation();
+        if self.session_autocommit() {
             return Ok(());
         }
         self.inner

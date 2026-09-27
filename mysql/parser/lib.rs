@@ -2848,6 +2848,9 @@ pub enum MySqlTransactionCommand {
     Begin,
     /// `START TRANSACTION READ ONLY`. MySQL answers 1792 to a write inside one.
     BeginReadOnly,
+    /// `START TRANSACTION WITH CONSISTENT SNAPSHOT`, which takes the read
+    /// snapshot at the statement rather than at the first read.
+    BeginWithConsistentSnapshot,
     Commit,
     Rollback,
     /// `COMMIT AND CHAIN`, which commits and begins another transaction at
@@ -2970,11 +2973,8 @@ pub fn parse_optional_transaction_command(
         return unsupported("transaction options");
     }
     // sqlparser cannot parse this one, so the token check is where it is read.
-    // It begins a transaction, which is what the engine does with it; MySQL
-    // takes the read view at the statement and the engine takes it at the
-    // first read, which COMPAT.md records.
     if token_kind == TransactionTokenKind::ConsistentSnapshot {
-        return Ok(Some(MySqlTransactionCommand::Begin));
+        return Ok(Some(MySqlTransactionCommand::BeginWithConsistentSnapshot));
     }
     let statement = parse_one_statement(sql, mode)?;
     let command = match statement {

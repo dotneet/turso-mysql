@@ -216,6 +216,90 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     }
 }
 
+// A released snapshot is what lets a transaction that read before another
+// connection committed write afterwards: without the release this is the
+// BusySnapshot of the test above.
+#[turso_macros::test]
+fn test_released_read_snapshot_sees_later_commits_and_can_write(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE test (value INTEGER)").unwrap();
+    conn1.execute("INSERT INTO test VALUES (1)").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+    conn2.execute("INSERT INTO test VALUES (2)").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+
+    conn1.release_read_snapshot().unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
+
+    conn2.execute("INSERT INTO test VALUES (3)").unwrap();
+    conn1.release_read_snapshot().unwrap();
+    conn1.execute("INSERT INTO test VALUES (4)").unwrap();
+    conn1.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(4,)]);
+}
+
+#[turso_macros::test]
+fn test_releasing_the_snapshot_of_a_writing_transaction_keeps_its_writes(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE test (value INTEGER)").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("INSERT INTO test VALUES (1)").unwrap();
+    conn1.release_read_snapshot().unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(0,)]);
+    conn1.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+#[turso_macros::test]
+fn test_read_snapshot_begun_early_hides_rows_committed_before_the_first_read(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE test (value INTEGER)").unwrap();
+    conn1.execute("INSERT INTO test VALUES (1)").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    conn1.begin_read_snapshot().unwrap();
+    conn2.execute("INSERT INTO test VALUES (2)").unwrap();
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+    conn1.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
+}
+
+#[turso_macros::test]
+fn test_read_snapshot_cannot_move_outside_a_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    assert!(matches!(
+        conn.release_read_snapshot(),
+        Err(LimboError::TxError(_))
+    ));
+    assert!(matches!(
+        conn.begin_read_snapshot(),
+        Err(LimboError::TxError(_))
+    ));
+}
+
 #[turso_macros::test(init_sql = "create table t (x);")]
 fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     let conn = tmp_db.connect_limbo();

@@ -270,6 +270,90 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let connection = self.connection.clone();
+        prepare_for_client_statement(&connection, &self.session_variables)?;
+        let result = self.execute_query_statement(sql);
+        finish_client_statement(&connection, &mut self.session_variables, result)
+    }
+
+    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+        self.connection
+            .reset_connection()
+            .map_err(frontend_query_error)?;
+        self.prepared_types.clear();
+        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        self.connection.set_time_zone_offset_seconds(0);
+        self.raised_warnings.clear();
+        self.pending_long_data = PendingLongData::default();
+        Ok(())
+    }
+
+    fn execute_stmt_prepare(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        if is_internal_catalog_select(sql) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut result = prepare_checked_statement(&self.connection, sql)?;
+        if let Err(error) = apply_raw_column_collations(
+            &self.connection,
+            &mut result.columns,
+            self.session_variables.raw_character_set_results(),
+        ) {
+            self.connection
+                .remove_prepared_statement(result.statement_id);
+            return Err(error);
+        }
+        Ok(result)
+    }
+
+    fn execute_stmt_close(&mut self, statement_id: u32) {
+        self.connection.remove_prepared_statement(statement_id);
+        self.prepared_types.remove(&statement_id);
+        self.pending_long_data.clear_statement(statement_id);
+    }
+
+    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        let result = self
+            .connection
+            .reset_prepared_statement(statement_id)
+            .map_err(prepared_statement_error);
+        if result.is_ok() {
+            self.pending_long_data.clear_statement(statement_id);
+        }
+        result
+    }
+
+    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
+        let Some(parameter_count) = self
+            .connection
+            .prepared_statement_metadata(statement_id)
+            .map(|metadata| metadata.parameter_count)
+        else {
+            return;
+        };
+        self.pending_long_data
+            .append(statement_id, parameter_id, data, parameter_count);
+    }
+
+    fn execute_stmt_execute(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let connection = self.connection.clone();
+        prepare_for_client_statement(&connection, &self.session_variables)?;
+        let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
+        finish_client_statement(&connection, &mut self.session_variables, result)
+    }
+}
+
+impl MySqlCommandAdapter {
+    fn execute_query_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,
@@ -350,68 +434,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         Ok(result)
     }
 
-    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
-        self.connection
-            .reset_connection()
-            .map_err(frontend_query_error)?;
-        self.prepared_types.clear();
-        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
-        self.connection.set_time_zone_offset_seconds(0);
-        self.raised_warnings.clear();
-        self.pending_long_data = PendingLongData::default();
-        Ok(())
-    }
-
-    fn execute_stmt_prepare(
-        &mut self,
-        sql: &str,
-    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
-        if is_internal_catalog_select(sql) {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        let mut result = prepare_checked_statement(&self.connection, sql)?;
-        if let Err(error) = apply_raw_column_collations(
-            &self.connection,
-            &mut result.columns,
-            self.session_variables.raw_character_set_results(),
-        ) {
-            self.connection
-                .remove_prepared_statement(result.statement_id);
-            return Err(error);
-        }
-        Ok(result)
-    }
-
-    fn execute_stmt_close(&mut self, statement_id: u32) {
-        self.connection.remove_prepared_statement(statement_id);
-        self.prepared_types.remove(&statement_id);
-        self.pending_long_data.clear_statement(statement_id);
-    }
-
-    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
-        let result = self
-            .connection
-            .reset_prepared_statement(statement_id)
-            .map_err(prepared_statement_error);
-        if result.is_ok() {
-            self.pending_long_data.clear_statement(statement_id);
-        }
-        result
-    }
-
-    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
-        let Some(parameter_count) = self
-            .connection
-            .prepared_statement_metadata(statement_id)
-            .map(|metadata| metadata.parameter_count)
-        else {
-            return;
-        };
-        self.pending_long_data
-            .append(statement_id, parameter_id, data, parameter_count);
-    }
-
-    fn execute_stmt_execute(
+    fn execute_prepared_statement_command(
         &mut self,
         statement_id: u32,
         parameter_payload: &[u8],
@@ -1653,6 +1676,195 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let connection = self.session.connection().ok().cloned();
+        if let Some(connection) = &connection {
+            prepare_for_client_statement(connection, &self.session_variables)?;
+        }
+        let result = self.execute_query_statement(sql);
+        match &connection {
+            Some(connection) => {
+                finish_client_statement(connection, &mut self.session_variables, result)
+            }
+            None => result,
+        }
+    }
+
+    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
+        self.session
+            .reset_connection()
+            .map_err(frontend_query_error)?;
+        for statement in self.prepared_statements.statements.values() {
+            statement.connection.clear_prepared_statements();
+        }
+        self.prepared_statements.statements.clear();
+        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        if let Ok(connection) = self.session.connection() {
+            connection.set_time_zone_offset_seconds(0);
+        }
+        self.raised_warnings.clear();
+        self.pending_long_data = PendingLongData::default();
+        Ok(())
+    }
+
+    fn execute_stmt_prepare(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self.prepare_gorm_catalog_query(query);
+        }
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
+        if matches!(visibility, CatalogVisibility::GrantedTables)
+            && source_tables
+                .iter()
+                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
+        {
+            return Err(FrontendErrorKind::AccessDenied);
+        }
+        let connection = self
+            .session
+            .connection()
+            .map_err(database_error_kind)?
+            .clone();
+        let metadata = connection
+            .prepare_checked_statement(sql)
+            .map_err(prepared_statement_error)?;
+        let Some(type_metadata) =
+            connection.prepared_statement_result_column_type_metadata(metadata.statement_id)
+        else {
+            connection.remove_prepared_statement(metadata.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        let connection_statement_id = metadata.statement_id;
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            connection.remove_prepared_statement(connection_statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        let result = prepared_statement_result(
+            &connection,
+            MySqlPreparedStatementMetadata {
+                statement_id,
+                ..metadata
+            },
+            &type_metadata,
+            Some(sql),
+            Some(&selected_database),
+            &source_tables,
+        )
+        .and_then(|mut result| {
+            apply_raw_column_collations(
+                &connection,
+                &mut result.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+            Ok(result)
+        });
+        if result.is_err() {
+            connection.remove_prepared_statement(connection_statement_id);
+            return result;
+        }
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                database: selected_database,
+                source_tables,
+                read_only_select: parse_select(sql, self.session.session_sql_mode())
+                    .is_ok_and(|select| !select.locks_rows()),
+                connection,
+                connection_statement_id,
+                parameter_types: None,
+                catalog_query: None,
+            },
+        );
+        result
+    }
+
+    fn execute_stmt_close(&mut self, statement_id: u32) {
+        if let Some(statement) = self.prepared_statements.statements.remove(&statement_id) {
+            statement
+                .connection
+                .remove_prepared_statement(statement.connection_statement_id);
+        }
+        self.pending_long_data.clear_statement(statement_id);
+    }
+
+    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        let statement = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        let result = statement
+            .connection
+            .reset_prepared_statement(statement.connection_statement_id)
+            .map_err(prepared_statement_error);
+        if result.is_ok() {
+            self.pending_long_data.clear_statement(statement_id);
+        }
+        result
+    }
+
+    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
+        let Some(parameter_count) = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .and_then(|statement| {
+                statement
+                    .connection
+                    .prepared_statement_metadata(statement.connection_statement_id)
+            })
+            .map(|metadata| metadata.parameter_count)
+        else {
+            return;
+        };
+        self.pending_long_data
+            .append(statement_id, parameter_id, data, parameter_count);
+    }
+
+    fn execute_stmt_execute(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let connection = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .map(|statement| statement.connection.clone());
+        if let Some(connection) = &connection {
+            prepare_for_client_statement(connection, &self.session_variables)?;
+        }
+        let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
+        match &connection {
+            Some(connection) => {
+                finish_client_statement(connection, &mut self.session_variables, result)
+            }
+            None => result,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl<A> AuthorizedDatabaseCommandAdapter<A>
+where
+    A: DatabaseAuthorizer,
+{
+    fn execute_query_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,
@@ -2292,151 +2504,7 @@ where
         Ok(result)
     }
 
-    fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
-        self.session
-            .reset_connection()
-            .map_err(frontend_query_error)?;
-        for statement in self.prepared_statements.statements.values() {
-            statement.connection.clear_prepared_statements();
-        }
-        self.prepared_statements.statements.clear();
-        self.session_variables = crate::session_variables::MySqlSessionVariables::default();
-        if let Ok(connection) = self.session.connection() {
-            connection.set_time_zone_offset_seconds(0);
-        }
-        self.raised_warnings.clear();
-        self.pending_long_data = PendingLongData::default();
-        Ok(())
-    }
-
-    fn execute_stmt_prepare(
-        &mut self,
-        sql: &str,
-    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
-        if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
-            sql,
-            self.session.session_sql_mode(),
-        )
-        .map_err(|_| FrontendErrorKind::Syntax)?
-        {
-            return self.prepare_gorm_catalog_query(query);
-        }
-        let selected_database = self
-            .session
-            .selected_database()
-            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
-            .to_owned();
-        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
-        if matches!(visibility, CatalogVisibility::GrantedTables)
-            && source_tables
-                .iter()
-                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
-        {
-            return Err(FrontendErrorKind::AccessDenied);
-        }
-        let connection = self
-            .session
-            .connection()
-            .map_err(database_error_kind)?
-            .clone();
-        let metadata = connection
-            .prepare_checked_statement(sql)
-            .map_err(prepared_statement_error)?;
-        let Some(type_metadata) =
-            connection.prepared_statement_result_column_type_metadata(metadata.statement_id)
-        else {
-            connection.remove_prepared_statement(metadata.statement_id);
-            return Err(FrontendErrorKind::Internal);
-        };
-        let connection_statement_id = metadata.statement_id;
-        let Some(statement_id) = self.prepared_statements.next_statement_id else {
-            connection.remove_prepared_statement(connection_statement_id);
-            return Err(FrontendErrorKind::Internal);
-        };
-        let result = prepared_statement_result(
-            &connection,
-            MySqlPreparedStatementMetadata {
-                statement_id,
-                ..metadata
-            },
-            &type_metadata,
-            Some(sql),
-            Some(&selected_database),
-            &source_tables,
-        )
-        .and_then(|mut result| {
-            apply_raw_column_collations(
-                &connection,
-                &mut result.columns,
-                self.session_variables.raw_character_set_results(),
-            )?;
-            Ok(result)
-        });
-        if result.is_err() {
-            connection.remove_prepared_statement(connection_statement_id);
-            return result;
-        }
-        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
-        self.prepared_statements.statements.insert(
-            statement_id,
-            DatabasePreparedStatement {
-                database: selected_database,
-                source_tables,
-                read_only_select: parse_select(sql, self.session.session_sql_mode())
-                    .is_ok_and(|select| !select.locks_rows()),
-                connection,
-                connection_statement_id,
-                parameter_types: None,
-                catalog_query: None,
-            },
-        );
-        result
-    }
-
-    fn execute_stmt_close(&mut self, statement_id: u32) {
-        if let Some(statement) = self.prepared_statements.statements.remove(&statement_id) {
-            statement
-                .connection
-                .remove_prepared_statement(statement.connection_statement_id);
-        }
-        self.pending_long_data.clear_statement(statement_id);
-    }
-
-    fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
-        let statement = self
-            .prepared_statements
-            .statements
-            .get(&statement_id)
-            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
-        let result = statement
-            .connection
-            .reset_prepared_statement(statement.connection_statement_id)
-            .map_err(prepared_statement_error);
-        if result.is_ok() {
-            self.pending_long_data.clear_statement(statement_id);
-        }
-        result
-    }
-
-    fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
-        let Some(parameter_count) = self
-            .prepared_statements
-            .statements
-            .get(&statement_id)
-            .and_then(|statement| {
-                statement
-                    .connection
-                    .prepared_statement_metadata(statement.connection_statement_id)
-            })
-            .map(|metadata| metadata.parameter_count)
-        else {
-            return;
-        };
-        self.pending_long_data
-            .append(statement_id, parameter_id, data, parameter_count);
-    }
-
-    fn execute_stmt_execute(
+    fn execute_prepared_statement_command(
         &mut self,
         statement_id: u32,
         parameter_payload: &[u8],
@@ -2686,11 +2754,15 @@ fn execute_checked_query(
     }
     match connection.is_transaction_command(sql) {
         Ok(true) => {
-            connection
+            let outcome = connection
                 .execute_transaction_command(sql)
                 .map_err(frontend_query_error)?;
+            if outcome.consistent_snapshot_ignored {
+                raised.push(MySqlWarning::consistent_snapshot_ignored());
+            }
             return Ok(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags: connection_status_flags(connection),
+                warnings: u16::from(outcome.consistent_snapshot_ignored),
                 ..CommandOkResult::default()
             }));
         }
@@ -3661,6 +3733,44 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
     }
+}
+
+/// Readies a connection for one statement from the client.
+///
+/// A `READ COMMITTED` transaction reads what is committed as each statement
+/// starts, and a transaction the statement begins takes the level the session
+/// asked for, so both are settled here rather than by each statement.
+fn prepare_for_client_statement(
+    connection: &MySqlConnection,
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+) -> Result<(), FrontendErrorKind> {
+    connection
+        .prepare_for_client_statement(session_variables.isolation_for_next_transaction())
+        .map_err(frontend_query_error)
+}
+
+/// Settles what one statement from the client left behind.
+///
+/// A level set for the next transaction alone is used up once one begins, and
+/// a transaction that could not finish is rolled back the way MySQL rolls one
+/// back before answering 1213.
+fn finish_client_statement<T>(
+    connection: &MySqlConnection,
+    session_variables: &mut crate::session_variables::MySqlSessionVariables,
+    result: Result<T, FrontendErrorKind>,
+) -> Result<T, FrontendErrorKind> {
+    match &result {
+        Ok(_) if connection.began_transaction() => {
+            session_variables.use_up_next_transaction_isolation();
+        }
+        Err(FrontendErrorKind::SerializationFailure) => {
+            connection
+                .roll_back_after_serialization_failure()
+                .map_err(frontend_query_error)?;
+        }
+        _ => {}
+    }
+    result
 }
 
 fn connection_status_flags(connection: &MySqlConnection) -> u16 {
@@ -6845,6 +6955,17 @@ impl MySqlWarning {
         }
     }
 
+    /// The warning MySQL raises for `WITH CONSISTENT SNAPSHOT` at a level
+    /// that keeps no snapshot. Measured on MySQL 8.4.11 under `READ
+    /// COMMITTED`: `Warning`, code 138, and this message.
+    fn consistent_snapshot_ignored() -> Self {
+        Self {
+            level: "Warning",
+            code: 138,
+            message: "InnoDB: WITH CONSISTENT SNAPSHOT was ignored because this phrase can only be used with REPEATABLE READ isolation level.".to_owned(),
+        }
+    }
+
     fn unknown_table(database: Option<&str>, table: &str) -> Self {
         let qualified = match database {
             Some(database) => format!("{database}.{table}"),
@@ -7321,7 +7442,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         // The engine holds one write lock over the database, so a session that
         // cannot take it is a session waiting on a lock. MySQL answers 1205
         // for that, which is what this reports.
-        LimboError::Busy | LimboError::BusySnapshot => FrontendErrorKind::DatabaseBusy,
+        LimboError::Busy => FrontendErrorKind::DatabaseBusy,
+        // A transaction whose snapshot went stale can never write, however
+        // long it waits. The caller rolls it back and answers what MySQL
+        // answers for a transaction it has to give up on.
+        LimboError::BusySnapshot => FrontendErrorKind::SerializationFailure,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {

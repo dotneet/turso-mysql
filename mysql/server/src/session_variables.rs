@@ -10,8 +10,10 @@ use turso_mysql_parser::{
     MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
 };
 
+use turso_mysql::MySqlIsolationLevel;
+
 use crate::{
-    dispatcher::SERVER_STATUS_AUTOCOMMIT,
+    dispatcher::{SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS},
     frontend_adapter::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
         MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
@@ -42,9 +44,6 @@ const SERVER_SYSTEM_TIME_ZONE: &str = "UTC";
 /// system's — UTC.
 const SERVER_TIME_ZONE_AT_THE_START: &str = "SYSTEM";
 
-/// The level every session here runs at, and the only one it takes.
-const SERVER_TRANSACTION_ISOLATION: &str = "REPEATABLE-READ";
-
 /// The licence this repository carries. MySQL's own answer is `GPL`.
 const SERVER_LICENSE: &str = "MIT";
 
@@ -70,6 +69,10 @@ pub(crate) struct MySqlSessionVariables {
     ///
     /// Fixed offsets affect TIMESTAMP values in the current session.
     time_zone: String,
+    /// The level this session's transactions run at.
+    transaction_isolation: MySqlIsolationLevel,
+    /// A level the client set for the next transaction alone.
+    next_transaction_isolation: Option<MySqlIsolationLevel>,
 }
 
 impl Default for MySqlSessionVariables {
@@ -83,6 +86,8 @@ impl Default for MySqlSessionVariables {
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
             time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
+            transaction_isolation: MySqlIsolationLevel::default(),
+            next_transaction_isolation: None,
         }
     }
 }
@@ -98,6 +103,17 @@ impl MySqlSessionVariables {
 
     pub(crate) const fn binary_character_set_results(&self) -> bool {
         self.binary_character_set_results
+    }
+
+    /// The level a transaction beginning now would run at.
+    pub(crate) fn isolation_for_next_transaction(&self) -> MySqlIsolationLevel {
+        self.next_transaction_isolation
+            .unwrap_or(self.transaction_isolation)
+    }
+
+    /// Forgets a level set for the next transaction alone, once one began.
+    pub(crate) fn use_up_next_transaction_isolation(&mut self) {
+        self.next_transaction_isolation = None;
     }
 
     pub(crate) fn time_zone_offset_seconds(&self) -> i32 {
@@ -158,6 +174,23 @@ impl MySqlSessionVariables {
                 MySqlSessionSetting::TimeZone(zone) => {
                     self.time_zone = the_zone_read_back(&zone);
                 }
+                MySqlSessionSetting::TransactionIsolationLevel {
+                    level,
+                    next_transaction_only,
+                } => {
+                    let level = MySqlIsolationLevel::from_name(&level)
+                        .expect("an accepted isolation level has a name this server keeps");
+                    if !next_transaction_only {
+                        self.transaction_isolation = level;
+                    } else if status_flags & SERVER_STATUS_IN_TRANS != 0 {
+                        // Measured on MySQL 8.4.11: 1568 for the next-transaction
+                        // form inside a transaction, while the SESSION form is
+                        // taken there and holds from the next transaction on.
+                        return Err(FrontendErrorKind::TransactionCharacteristicsInProgress);
+                    } else {
+                        self.next_transaction_isolation = Some(level);
+                    }
+                }
                 _ => {}
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
@@ -186,7 +219,7 @@ impl MySqlSessionVariables {
                         MySqlUserVariableValue::Text("binary".to_owned())
                     } else {
                         MySqlUserVariableValue::Text(
-                            worded_system_variable(name, session_sql_mode, &self.time_zone)
+                            worded_system_variable(name, session_sql_mode, self)
                                 .ok_or(FrontendErrorKind::UnknownSystemVariable)?,
                         )
                     }
@@ -400,23 +433,15 @@ impl MySqlSessionVariables {
     ) -> CommandExecutionResult {
         // Nothing can change a global value on this server, so the global scope
         // reports the values a new session would start from.
-        let (session_sql_mode, status_flags_read, foreign_key_checks, sql_notes, time_zone) =
-            match command.scope() {
-                MySqlVariableScope::Session => (
-                    session_sql_mode,
-                    status_flags,
-                    self.foreign_key_checks,
-                    self.sql_notes,
-                    self.time_zone.as_str(),
-                ),
-                MySqlVariableScope::Global => (
-                    SessionSqlMode::default(),
-                    SERVER_STATUS_AUTOCOMMIT,
-                    Self::default().foreign_key_checks,
-                    Self::default().sql_notes,
-                    SERVER_TIME_ZONE_AT_THE_START,
-                ),
-            };
+        let at_the_start = Self::default();
+        let (session_sql_mode, status_flags_read, read_from) = match command.scope() {
+            MySqlVariableScope::Session => (session_sql_mode, status_flags, self),
+            MySqlVariableScope::Global => (
+                SessionSqlMode::default(),
+                SERVER_STATUS_AUTOCOMMIT,
+                &at_the_start,
+            ),
+        };
         let rows = SHOWN_VARIABLES
             .iter()
             .filter(|name| command.selects(name))
@@ -426,9 +451,7 @@ impl MySqlSessionVariables {
                     session_sql_mode,
                     settings,
                     status_flags_read,
-                    foreign_key_checks,
-                    sql_notes,
-                    time_zone,
+                    read_from,
                 )
                 .map(|value| {
                     let value = if command.scope() == MySqlVariableScope::Session
@@ -503,19 +526,17 @@ fn shown_variable_value(
     session_sql_mode: SessionSqlMode,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
-    foreign_key_checks: bool,
-    sql_notes: bool,
-    time_zone: &str,
+    session_variables: &MySqlSessionVariables,
 ) -> Option<String> {
     if let Some((value, width, _)) =
-        counted_system_variable(name, settings, status_flags, foreign_key_checks, sql_notes)
+        counted_system_variable(name, settings, status_flags, session_variables)
     {
         if width == 1 {
             return Some(switch_value(value == "1").to_owned());
         }
         return Some(value);
     }
-    worded_system_variable(name, session_sql_mode, time_zone)
+    worded_system_variable(name, session_sql_mode, session_variables)
 }
 
 /// Takes a session setting only when the server can keep the state it asks for.
@@ -600,14 +621,12 @@ fn accept_session_setting(
                 Some(_) => Err(FrontendErrorKind::Unsupported),
             }
         }
-        // Measured on MySQL 8.4.11: `REPEATABLE-READ` is the default, and it is
-        // the level this server's sessions run at. A client naming it is
-        // describing where it already is. Any other level is refused rather
-        // than accepted and ignored, because a client that asked for
-        // `SERIALIZABLE` and was told yes would be reasoning about a guarantee
-        // it does not have.
-        MySqlSessionSetting::TransactionIsolationLevel(level) => {
-            if level.eq_ignore_ascii_case("REPEATABLE READ") {
+        // `READ COMMITTED` and `REPEATABLE READ` are the two levels this
+        // server keeps. The other two are refused rather than accepted and
+        // ignored, because a client that asked for `SERIALIZABLE` and was told
+        // yes would be reasoning about a guarantee it does not have.
+        MySqlSessionSetting::TransactionIsolationLevel { level, .. } => {
+            if MySqlIsolationLevel::from_name(level).is_some() {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -677,9 +696,7 @@ fn system_variable_result(
             session_sql_mode,
             settings,
             status_flags,
-            session_variables.foreign_key_checks,
-            session_variables.sql_notes,
-            &session_variables.time_zone,
+            session_variables,
         )?;
         columns.push(column);
         if session_variables.raw_character_set_results
@@ -714,34 +731,20 @@ fn system_variable_column(
     session_sql_mode: SessionSqlMode,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
-    foreign_key_checks: bool,
-    sql_notes: bool,
-    time_zone: &str,
+    session_variables: &MySqlSessionVariables,
 ) -> Option<(ColumnDefinitionConfig, String)> {
-    let (session_sql_mode, status_flags, foreign_key_checks, sql_notes, time_zone) =
-        match read.scope() {
-            MySqlVariableScope::Session => (
-                session_sql_mode,
-                status_flags,
-                foreign_key_checks,
-                sql_notes,
-                time_zone,
-            ),
-            MySqlVariableScope::Global => (
-                SessionSqlMode::default(),
-                SERVER_STATUS_AUTOCOMMIT,
-                MySqlSessionVariables::default().foreign_key_checks,
-                MySqlSessionVariables::default().sql_notes,
-                SERVER_TIME_ZONE_AT_THE_START,
-            ),
-        };
-    if let Some((value, length, unsigned)) = counted_system_variable(
-        read.name(),
-        settings,
-        status_flags,
-        foreign_key_checks,
-        sql_notes,
-    ) {
+    let at_the_start = MySqlSessionVariables::default();
+    let (session_sql_mode, status_flags, session_variables) = match read.scope() {
+        MySqlVariableScope::Session => (session_sql_mode, status_flags, session_variables),
+        MySqlVariableScope::Global => (
+            SessionSqlMode::default(),
+            SERVER_STATUS_AUTOCOMMIT,
+            &at_the_start,
+        ),
+    };
+    if let Some((value, length, unsigned)) =
+        counted_system_variable(read.name(), settings, status_flags, session_variables)
+    {
         let mut column =
             ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
         column.catalog = "def".into();
@@ -752,7 +755,7 @@ fn system_variable_column(
             MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 };
         return Some((column, value));
     }
-    let value = worded_system_variable(read.name(), session_sql_mode, time_zone)?;
+    let value = worded_system_variable(read.name(), session_sql_mode, session_variables)?;
     // A call is NOT NULL and a variable is not, and their reported widths
     // differ; both measured.
     let called = read.called();
@@ -777,18 +780,21 @@ fn counted_system_variable(
     name: &str,
     settings: MySqlBootstrapSettings,
     status_flags: u16,
-    foreign_key_checks: bool,
-    sql_notes: bool,
+    session_variables: &MySqlSessionVariables,
 ) -> Option<(String, u32, bool)> {
     if name.eq_ignore_ascii_case("autocommit") {
         let on = status_flags & SERVER_STATUS_AUTOCOMMIT != 0;
         return Some((u8::from(on).to_string(), 1, false));
     }
     if name.eq_ignore_ascii_case("foreign_key_checks") {
-        return Some((u8::from(foreign_key_checks).to_string(), 1, false));
+        return Some((
+            u8::from(session_variables.foreign_key_checks).to_string(),
+            1,
+            false,
+        ));
     }
     if name.eq_ignore_ascii_case("sql_notes") {
-        return Some((u8::from(sql_notes).to_string(), 1, false));
+        return Some((u8::from(session_variables.sql_notes).to_string(), 1, false));
     }
     // A READ ONLY transaction leaves MySQL's session default unchanged. This
     // server does not accept a change to that default, so it remains off.
@@ -834,16 +840,16 @@ fn counted_system_variable(
 /// The system variables this server answers with a word.
 ///
 /// Each is something this server decides rather than a default copied from
-/// MySQL: it speaks utf8mb4 and nothing else, it runs in UTC, it runs every
-/// session at `REPEATABLE READ`, it runs nothing when a connection opens, and
-/// it is under the licence this repository carries.
+/// MySQL: it speaks utf8mb4 and nothing else, it runs in UTC, it runs a
+/// session at the level the session asked for, it runs nothing when a
+/// connection opens, and it is under the licence this repository carries.
 ///
 /// Measured on MySQL 8.4.11: every one of these answers the same `VAR_STRING`
 /// of length 87380 with 31 decimals and no flags that `@@version` does.
 fn worded_system_variable(
     name: &str,
     session_sql_mode: SessionSqlMode,
-    time_zone: &str,
+    session_variables: &MySqlSessionVariables,
 ) -> Option<String> {
     if name.eq_ignore_ascii_case("version") {
         return Some(SERVER_VERSION.to_owned());
@@ -887,11 +893,17 @@ fn worded_system_variable(
         return Some(SERVER_SYSTEM_TIME_ZONE.to_owned());
     }
     if name.eq_ignore_ascii_case("time_zone") {
-        return Some(time_zone.to_owned());
+        return Some(session_variables.time_zone.clone());
     }
-    // The only level a session is allowed to run at.
+    // Measured on MySQL 8.4.11: this reads the session's level, not one set
+    // for the next transaction alone, even inside the transaction using it.
     if name.eq_ignore_ascii_case("transaction_isolation") {
-        return Some(SERVER_TRANSACTION_ISOLATION.to_owned());
+        return Some(
+            session_variables
+                .transaction_isolation
+                .variable_value()
+                .to_owned(),
+        );
     }
     // Nothing runs when a connection opens.
     if name.eq_ignore_ascii_case("init_connect") {
@@ -1171,41 +1183,119 @@ mod tests {
         assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
     }
 
-    /// A connection pool opens by naming the isolation level it wants.
-    /// Measured on MySQL 8.4.11: `REPEATABLE-READ` is the default and the level
-    /// these sessions run at, so a client naming it is describing where it
-    /// already is. The other three are refused rather than accepted and
+    /// The two levels this server keeps are taken, and each reads back as the
+    /// session's level. The other two are refused rather than accepted and
     /// ignored — a client told yes to `SERIALIZABLE` would reason about a
     /// guarantee it does not have.
     #[test]
-    fn takes_the_isolation_level_it_already_runs_at_and_no_other() {
+    fn takes_the_isolation_levels_it_keeps_and_no_other() {
         let mut session = MySqlSessionVariables::default();
-        let mut run = |sql: &str| {
+        let mut run = |sql: &str, status_flags: u16| {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
                 None,
                 SessionSqlMode::default(),
-                2,
+                status_flags,
             )
         };
-        for sql in [
-            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-            "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
-            "set local transaction isolation level repeatable read",
+        let read_back = |run: &mut dyn FnMut(&str, u16) -> _| {
+            let Ok(Some(CommandExecutionResult::ResultSet(result))) =
+                run("SELECT @@transaction_isolation", SERVER_STATUS_AUTOCOMMIT)
+            else {
+                panic!("the level must read back");
+            };
+            String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
+        };
+        for (sql, level) in [
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                "READ-COMMITTED",
+            ),
+            (
+                "set local transaction isolation level repeatable read",
+                "REPEATABLE-READ",
+            ),
+            (
+                "SET SESSION transaction_isolation = 'READ-COMMITTED'",
+                "READ-COMMITTED",
+            ),
+            (
+                "SET transaction_isolation = 'REPEATABLE-READ'",
+                "REPEATABLE-READ",
+            ),
         ] {
             assert!(
-                matches!(run(sql), Ok(Some(CommandExecutionResult::Ok(_)))),
+                matches!(
+                    run(sql, SERVER_STATUS_AUTOCOMMIT),
+                    Ok(Some(CommandExecutionResult::Ok(_)))
+                ),
                 "{sql}"
             );
+            assert_eq!(read_back(&mut run), level, "{sql}");
         }
+
+        // Measured on MySQL 8.4.11: the next-transaction forms leave the
+        // session's level where it was.
         for sql in [
-            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
-            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
-            "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET @@transaction_isolation = 'READ-COMMITTED'",
         ] {
             assert!(
-                matches!(run(sql), Err(FrontendErrorKind::Unsupported)),
+                matches!(
+                    run(sql, SERVER_STATUS_AUTOCOMMIT),
+                    Ok(Some(CommandExecutionResult::Ok(_)))
+                ),
+                "{sql}"
+            );
+            assert_eq!(read_back(&mut run), "REPEATABLE-READ", "{sql}");
+        }
+        assert_eq!(
+            session.isolation_for_next_transaction(),
+            MySqlIsolationLevel::ReadCommitted
+        );
+        session.use_up_next_transaction_isolation();
+        assert_eq!(
+            session.isolation_for_next_transaction(),
+            MySqlIsolationLevel::RepeatableRead
+        );
+
+        let mut run = |sql: &str, status_flags: u16| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                status_flags,
+            )
+        };
+        // Inside a transaction the next-transaction form is 1568, while the
+        // session form is taken.
+        assert_eq!(
+            run(
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                SERVER_STATUS_IN_TRANS
+            ),
+            Err(FrontendErrorKind::TransactionCharacteristicsInProgress)
+        );
+        assert!(matches!(
+            run(
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                SERVER_STATUS_IN_TRANS
+            ),
+            Ok(Some(CommandExecutionResult::Ok(_)))
+        ));
+
+        for sql in [
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
+            "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+        ] {
+            assert!(
+                matches!(
+                    run(sql, SERVER_STATUS_AUTOCOMMIT),
+                    Err(FrontendErrorKind::Unsupported)
+                ),
                 "{sql}"
             );
         }

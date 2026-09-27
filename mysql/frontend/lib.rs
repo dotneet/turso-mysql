@@ -30,13 +30,13 @@ pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use session::{
     MySqlAffectedRowsMode, MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata,
     MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlIndexEntry,
-    MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlIsolationLevel, MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
     MySqlQueryError, MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlTable,
-    MySqlTableKind, MySqlTriggerMetadata, MySqlViewMetadata, MySqlWriteResult, ParameterMarker,
-    DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
+    MySqlTableKind, MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata,
+    MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
 pub use temporal_zone::shift_timestamp;
 pub use truncate_table::MySqlTruncateTableError;

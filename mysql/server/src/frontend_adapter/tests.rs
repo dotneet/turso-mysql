@@ -30577,3 +30577,6 @@ fn a_prepared_select_reads_a_json_column() {
         [vec![BinaryResultValue::Integer(2), BinaryResultValue::Null]]
     );
 }
+
+#[cfg(unix)]
+mod transaction_isolation;

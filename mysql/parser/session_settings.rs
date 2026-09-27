@@ -41,11 +41,19 @@ pub enum MySqlSessionSetting {
         collation: Option<String>,
     },
     /// `SET [SESSION] TRANSACTION ISOLATION LEVEL <level>`, with the level as
-    /// written and its words joined by one space.
+    /// written and its words joined by one space, or the same level set
+    /// through `transaction_isolation`, where a hyphen joins the words.
     ///
     /// The `GLOBAL` scope is not one of these: it changes what other sessions
     /// get, which is not a thing this server can honestly accept.
-    TransactionIsolationLevel(String),
+    TransactionIsolationLevel {
+        level: String,
+        /// Whether the level holds for the next transaction alone. Measured
+        /// on MySQL 8.4.11: `SET TRANSACTION` and `SET @@transaction_isolation`
+        /// written with no scope word do this, while `SESSION`, `LOCAL` and a
+        /// plain `transaction_isolation` set the session's level.
+        next_transaction_only: bool,
+    },
 }
 
 /// Parses one supported `SET` of a session variable.
@@ -65,11 +73,9 @@ pub fn parse_optional_session_setting(
         return Ok(None);
     }
     // `SESSION` and `LOCAL` both name the session, which is also the default.
-    let _ = scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL");
+    let scoped = scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL");
     // `SET TRANSACTION ISOLATION LEVEL <level>` is its own statement too. With
-    // no scope word it names the next transaction rather than the session,
-    // which makes no difference to a server that answers only the level it is
-    // already in.
+    // no scope word it names the next transaction rather than the session.
     if scanner.take_keyword("TRANSACTION") {
         if !scanner.take_keyword("ISOLATION") || !scanner.take_keyword("LEVEL") {
             return Ok(None);
@@ -80,7 +86,10 @@ pub fn parse_optional_session_setting(
         if !scanner.at_end() {
             return Err(ParseError::TrailingAdminCommandTokens);
         }
-        return Ok(Some(MySqlSessionSetting::TransactionIsolationLevel(level)));
+        return Ok(Some(MySqlSessionSetting::TransactionIsolationLevel {
+            level,
+            next_transaction_only: !scoped,
+        }));
     }
     // `SET NAMES` is its own statement, not an assignment.
     if scanner.take_keyword("NAMES") {
@@ -103,13 +112,22 @@ pub fn parse_optional_session_setting(
             collation,
         }));
     }
+    let unscoped_system_variable = !scoped && scanner.at_unscoped_system_variable();
     let Some(name) = scanner.take_variable_name() else {
         return Ok(None);
     };
     if !scanner.take_byte(b'=') {
         return Ok(None);
     }
-    let setting = if name.eq_ignore_ascii_case("sql_mode") {
+    let setting = if name.eq_ignore_ascii_case("transaction_isolation") {
+        let Some(level) = scanner.take_string(mode) else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::TransactionIsolationLevel {
+            level,
+            next_transaction_only: unscoped_system_variable,
+        }
+    } else if name.eq_ignore_ascii_case("sql_mode") {
         if let Some(value) = scanner.take_string(mode) {
             MySqlSessionSetting::SqlMode(named_sql_modes(&value))
         } else if let Some(name) = scanner.take_user_variable_reference() {
@@ -381,6 +399,19 @@ impl<'a> Scanner<'a> {
     }
 
     /// Reads a variable name, with or without the `@@` and a scope prefix.
+    /// Reports whether the next word is `@@name` with no scope after the two
+    /// signs, which for `transaction_isolation` names the next transaction.
+    fn at_unscoped_system_variable(&mut self) -> bool {
+        self.skip_spaces();
+        let rest = &self.sql[self.cursor..];
+        let Some(name) = rest.strip_prefix("@@") else {
+            return false;
+        };
+        !["SESSION.", "LOCAL.", "GLOBAL."].iter().any(|scope| {
+            name.len() >= scope.len() && name[..scope.len()].eq_ignore_ascii_case(scope)
+        })
+    }
+
     fn take_variable_name(&mut self) -> Option<String> {
         self.skip_spaces();
         let mut cursor = self.cursor;
@@ -761,33 +792,59 @@ mod tests {
     /// not the parser's, so all four come back here.
     #[test]
     fn reads_set_transaction_isolation_level() {
-        for (sql, level) in [
+        for (sql, level, next_transaction_only) in [
             (
                 "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
                 "REPEATABLE READ",
+                true,
             ),
             (
                 "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
                 "REPEATABLE READ",
+                false,
             ),
             (
                 "set local transaction isolation level read committed",
                 "READ COMMITTED",
+                false,
             ),
             (
                 "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
                 "READ UNCOMMITTED",
+                true,
             ),
             (
                 "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;",
                 "SERIALIZABLE",
+                true,
+            ),
+            (
+                "SET @@SESSION.transaction_isolation = 'READ-COMMITTED'",
+                "READ-COMMITTED",
+                false,
+            ),
+            (
+                "SET SESSION transaction_isolation = 'REPEATABLE-READ'",
+                "REPEATABLE-READ",
+                false,
+            ),
+            (
+                "SET transaction_isolation = 'READ-COMMITTED'",
+                "READ-COMMITTED",
+                false,
+            ),
+            (
+                "SET @@transaction_isolation = 'REPEATABLE-READ'",
+                "REPEATABLE-READ",
+                true,
             ),
         ] {
             assert_eq!(
                 parse(sql),
-                Some(MySqlSessionSetting::TransactionIsolationLevel(
-                    level.to_owned()
-                )),
+                Some(MySqlSessionSetting::TransactionIsolationLevel {
+                    level: level.to_owned(),
+                    next_transaction_only,
+                }),
                 "{sql}"
             );
         }

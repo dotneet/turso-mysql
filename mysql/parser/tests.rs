@@ -7470,7 +7470,7 @@ fn reads_start_transaction_with_consistent_snapshot() {
     ] {
         assert_eq!(
             parse_optional_transaction_command(sql, mode),
-            Ok(Some(MySqlTransactionCommand::Begin)),
+            Ok(Some(MySqlTransactionCommand::BeginWithConsistentSnapshot)),
             "{sql}"
         );
     }

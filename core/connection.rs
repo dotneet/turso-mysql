@@ -3087,6 +3087,65 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Fixes what an explicit transaction reads now, instead of at its first
+    /// read.
+    ///
+    /// A deferred `BEGIN` takes its read snapshot when the transaction first
+    /// reads, so a row committed in between is seen. MySQL's `START
+    /// TRANSACTION WITH CONSISTENT SNAPSHOT` takes it at the statement, and
+    /// this is what lets a frontend do the same.
+    pub fn begin_read_snapshot(&self) -> Result<()> {
+        self.check_read_snapshot_can_change()?;
+        if self.get_tx_state() != TransactionState::None {
+            return Ok(());
+        }
+        self.pager.load().begin_read_tx()?;
+        self.set_tx_state(TransactionState::Read);
+        Ok(())
+    }
+
+    /// Lets go of the read snapshot of an explicit transaction that has not
+    /// written, so its next statement reads what is committed by then.
+    ///
+    /// This is how a READ COMMITTED transaction reads. A transaction that has
+    /// written holds the write lock, so nothing else can commit and its
+    /// snapshot is already the latest; it is left alone.
+    pub fn release_read_snapshot(&self) -> Result<()> {
+        self.check_read_snapshot_can_change()?;
+        match self.get_tx_state() {
+            TransactionState::Read => {
+                self.pager.load().end_read_tx();
+                self.set_tx_state(TransactionState::None);
+            }
+            TransactionState::None | TransactionState::Write { .. } => {}
+            state @ TransactionState::PendingUpgrade { .. } => {
+                turso_assert!(false, "a transaction is mid-upgrade with no statement running", {
+                    "state": format!("{state:?}")
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_read_snapshot_can_change(&self) -> Result<()> {
+        if self.get_auto_commit() {
+            return Err(LimboError::TxError(
+                "a read snapshot belongs to an explicit transaction".to_string(),
+            ));
+        }
+        if self.mv_store().is_some() {
+            return Err(LimboError::TxError(
+                "moving a read snapshot is not supported with MVCC".to_string(),
+            ));
+        }
+        if self.n_active_root_statements.load(Ordering::SeqCst) != 0 {
+            return Err(LimboError::StatementsInProgress(
+                "cannot move a read snapshot while a statement is running",
+            ));
+        }
+        Ok(())
+    }
+
     /// Mark the active explicit transaction poisoned so COMMIT rolls it back.
     ///
     /// This is used when a write statement under BEGIN is abandoned before it

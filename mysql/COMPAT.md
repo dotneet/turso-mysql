@@ -2517,12 +2517,10 @@ before and so leaves the read-only transaction before it runs; measured,
 `START TRANSACTION WITH CONSISTENT SNAPSHOT` is taken, which is what
 `mysqldump --single-transaction` opens with — inside the versioned comment
 `/*!40100 WITH CONSISTENT SNAPSHOT */`, which the tokenizer expands, so both
-spellings arrive the same. It begins a transaction, and one thing about it
-differs from MySQL: MySQL takes the read view at the statement, and the engine's
-`BEGIN` is deferred, so the view is taken at the first read. Everything read
-after that comes from one view, which is the property a dump needs; what a dump
-can pick up that MySQL's would not is a row committed in the gap between the
-statement and the first read.
+spellings arrive the same. The read view is taken at the statement, as MySQL
+takes it, so a row committed before the first read stays unseen. Measured on
+8.4.11: under `READ COMMITTED` the phrase is ignored with warning 138, and the
+transaction begins all the same; so it is here.
 
 `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` are taken. Each ends the
 transaction and begins another at once. Measured on 8.4.11 over an empty table:
@@ -2557,16 +2555,45 @@ undoes nothing; the server runs over files, where they work. And a name that is
 a reserved word is taken unquoted here — `SAVEPOINT select` — where MySQL
 answers 1064 for it.
 
-`SET [SESSION] TRANSACTION ISOLATION LEVEL REPEATABLE READ` is taken, which is
-what a connection pool sends when it opens. Measured on 8.4.11,
-`REPEATABLE-READ` is MySQL's default and it is the level these sessions run at,
-so a client naming it is describing where it already is. The other three levels
-are refused rather than accepted and ignored: a client told yes to
-`SERIALIZABLE` would go on reasoning about a guarantee it does not have. The
-`GLOBAL` scope is refused for the same reason — it changes what other sessions
-get. With no scope word MySQL applies the level to the next transaction rather
-than the session, which makes no difference to a server that answers only the
-level it is already in.
+Two isolation levels are kept, `REPEATABLE READ`, MySQL's default, and
+`READ COMMITTED`, which Django asks for on every connection. Both come out of
+what the engine already does. An explicit transaction reads from one snapshot
+of the whole database, and writes under one write lock over the whole
+database. `REPEATABLE READ` holds the snapshot until the transaction ends.
+`READ COMMITTED` lets it go before each statement until the transaction writes,
+so every statement reads what is committed as it starts. After the first write
+the transaction holds the write lock, nothing else can commit, and the
+snapshot it has is already the latest.
+
+They are set the ways MySQL sets them. `SET SESSION TRANSACTION ISOLATION
+LEVEL`, `SET LOCAL ...` and `SET [SESSION] transaction_isolation = '...'` set the
+session's level. `SET TRANSACTION ISOLATION LEVEL` and `SET
+@@transaction_isolation = '...'`, with no scope word, set the next transaction
+alone. Measured on 8.4.11, and matched here: `@@transaction_isolation` reads the
+session's level even inside a transaction running at another; the next-
+transaction form answers 1568 inside a transaction, while the session form is
+taken there and holds from the next transaction on; and the next-transaction
+level is used up by the next transaction that begins — `START TRANSACTION`, or a
+statement reading a table, which is a transaction of its own — but not by
+`SELECT 1` or by a statement that fails. `READ UNCOMMITTED` and `SERIALIZABLE`
+are refused rather than accepted and ignored: a client told yes to either would
+go on reasoning about a guarantee it does not have. The `GLOBAL` scope is refused
+for the same reason — it changes what other sessions get.
+
+One thing about `REPEATABLE READ` differs, and it is where a snapshot of the
+whole database runs out. MySQL reads the latest committed row for an `UPDATE`,
+a `DELETE` or a locking read, and goes on reading every other row from the old
+snapshot. Measured on 8.4.11: a transaction that read before another session
+committed a change to row 2 can still update row 1, and afterwards still reads
+row 2 as it was. A snapshot here cannot mix rows from two moments, so that
+write fails instead. The transaction is rolled back and answered with 1213,
+SQLSTATE 40001 — what MySQL answers for a transaction it has to give up on,
+rolling it back the same way — and a client that retries a transaction on 1213
+or 40001 recovers by running it again. It happens only when another session
+committed between the transaction's first read and its first write. Under
+`READ COMMITTED` the snapshot is new at every statement, so it can happen only
+when another session commits in the middle of a statement this server runs in
+more than one step, such as a checked `INSERT` that reads before it writes.
 
 A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
 with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and
@@ -3052,9 +3079,9 @@ speaks `utf8mb4` and refuses any other character set, so all five
 declared the way MySQL declares one, so `@@collation_server` and
 `@@collation_database` read `utf8mb4_0900_ai_ci` — which is what every
 `SHOW CREATE TABLE` and `information_schema` reading here already says. The server
-uses UTC for its own clock, so `@@system_time_zone` reads `UTC`. Every
-session runs at `REPEATABLE READ` and no other level is taken, so
-`@@transaction_isolation` reads `REPEATABLE-READ`. The counter numbers from one
+uses UTC for its own clock, so `@@system_time_zone` reads `UTC`.
+`@@transaction_isolation` reads the level the session runs at, `REPEATABLE-READ`
+until the session asks for `READ COMMITTED`. The counter numbers from one
 and steps by one, so both `@@auto_increment_*` read 1. A connection a client
 called interactive is kept no longer than any other, so `@@interactive_timeout`
 reads what `@@wait_timeout` does. Nothing runs when a connection opens, so

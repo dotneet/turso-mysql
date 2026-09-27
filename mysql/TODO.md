@@ -234,7 +234,7 @@ boolean literal.
 | `LOCK TABLES ... READ LOCAL` and `LOW_PRIORITY WRITE` | refused; the first lets other sessions insert while the lock is held and the second changes who waits for whom, and one write lock answers neither |
 | A savepoint over an in-memory database | taken and does nothing; the engine needs the pager's sub-journal to undo anything, and over an in-memory database `SAVEPOINT` and `ROLLBACK TO` both answer OK without rolling back. The server runs over files, where it works |
 | A savepoint name that is a reserved word — `SAVEPOINT select` | taken; MySQL answers 1064 unless it is quoted |
-| `SET TRANSACTION ISOLATION LEVEL` naming a level other than `REPEATABLE READ`, or `GLOBAL` | refused; the sessions run at `REPEATABLE READ` and saying yes to another would be a guarantee this does not keep |
+| `SET TRANSACTION ISOLATION LEVEL` naming `READ UNCOMMITTED` or `SERIALIZABLE`, or `GLOBAL` | refused; `READ COMMITTED` and `REPEATABLE READ` are kept, and saying yes to another would be a guarantee this does not keep |
 | `SELECT ... FOR UPDATE` / `FOR SHARE` | works, and the lock is held. A session kept out by it waits and answers 1205, the way MySQL's does. One lock over the whole database rather than one for each row, so it is stronger than MySQL's — see COMPAT.md |
 | `SET innodb_lock_wait_timeout` | works, one to 1073741824 seconds, and the session starts at MySQL's fifty |
 | `LOCK IN SHARE MODE`, MySQL's older spelling of `FOR SHARE` | refused; the parser does not read it |
@@ -394,6 +394,9 @@ Behaviour that works but does not match MySQL lives in
 - `TIMESTAMP` converts explicit `INSERT ... VALUES` input and direct column
   output for fixed-offset sessions. Wider non-UTC queries and writes are
   refused as listed above
+- A `REPEATABLE READ` transaction that writes after another session committed
+  since its first read is rolled back with 1213, where MySQL writes and keeps
+  reading the old snapshot for the rows it did not touch
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
 - complex compound projections still have conservative nullable metadata

@@ -376,6 +376,11 @@ pub enum FrontendErrorKind {
     NotNullViolation,
     /// A write was attempted inside a `START TRANSACTION READ ONLY`.
     ReadOnlyTransaction,
+    /// A transaction's read snapshot went stale before it could write, and it
+    /// was rolled back.
+    SerializationFailure,
+    /// A level for the next transaction was set inside a transaction.
+    TransactionCharacteristicsInProgress,
     /// A `ROLLBACK TO` or `RELEASE SAVEPOINT` named a savepoint that is not
     /// there.
     NoSuchSavepoint,
@@ -415,6 +420,21 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1792,
             *b"25006",
             b"Cannot execute statement in a READ ONLY transaction.".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: 1213, SQLSTATE 40001, for a transaction
+        // MySQL rolls back because it cannot finish it.
+        FrontendErrorKind::SerializationFailure => (
+            1213,
+            *b"40001",
+            b"Deadlock found when trying to get lock; try restarting transaction".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: 1568, SQLSTATE 25001, for `SET TRANSACTION`
+        // with no scope word inside a transaction.
+        FrontendErrorKind::TransactionCharacteristicsInProgress => (
+            1568,
+            *b"25001",
+            b"Transaction characteristics can't be changed while a transaction is in progress"
+                .as_slice(),
         ),
         // Measured on MySQL 8.4.11: 1305, SQLSTATE 42000, for a savepoint that
         // is not there. MySQL names it — `SAVEPOINT nosuch does not exist` —
@@ -2431,6 +2451,12 @@ mod tests {
             (FrontendErrorKind::NoDatabaseSelected, 1046, *b"3D000"),
             (FrontendErrorKind::DuplicateDatabase, 1007, *b"HY000"),
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
+            (FrontendErrorKind::SerializationFailure, 1213, *b"40001"),
+            (
+                FrontendErrorKind::TransactionCharacteristicsInProgress,
+                1568,
+                *b"25001",
+            ),
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
