@@ -2155,6 +2155,11 @@ pub(crate) fn translate_insert(
         if columns.is_empty() {
             return unsupported("INSERT SELECT without an explicit column list");
         }
+        // The rendered copy has no room for the upsert clause, and dropping it
+        // would turn MySQL's update of a colliding row into a key error.
+        if insert.on.is_some() {
+            return unsupported("INSERT SELECT with ON DUPLICATE KEY UPDATE");
+        }
         let rendered = translate_select_query(
             source,
             sql,

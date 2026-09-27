@@ -6188,6 +6188,9 @@ fn translates_insert_select_and_names_what_it_reads() {
         // A SELECT needing a second rendering pass has no way to ask for one.
         "INSERT INTO dst (n) SELECT n FROM src ORDER BY n",
         "INSERT INTO dst (n) SELECT n FROM src WHERE n = ?",
+        // The copy is written with no upsert clause, so one is refused rather
+        // than dropped.
+        "INSERT INTO dst (id, n) SELECT id, n FROM src ON DUPLICATE KEY UPDATE n = n + 1",
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
     }

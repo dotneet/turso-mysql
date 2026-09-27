@@ -295,6 +295,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
 | `INSERT ... SELECT` whose `SELECT` needs a second rendering pass | refused; there is no way to ask for that pass from a DML statement |
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
+| `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` | refused; the copy is rendered with no upsert clause, and what a colliding copied row updates and reports has not been measured |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
 | An `INSERT` into a counted table carrying a trigger, or into a table whose trigger writes into a counted table | refused; a restored dump's counted table with a trigger takes no new row. The rows the dump wrote before making its trigger are taken |
