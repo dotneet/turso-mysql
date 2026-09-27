@@ -3704,6 +3704,65 @@ fn alter_without_its_column_position(
     Ok(sql[..offset].trim_end().to_owned())
 }
 
+/// Leaves the `_utf8mb4` introducer off every word written with one.
+///
+/// Measured on MySQL 8.4.11: `email = _utf8mb4'ANN@X.COM'` finds the row
+/// holding `ann@x.com`, as the word without it does — an introducer names the
+/// character set the word is written in, this server speaks that one alone,
+/// and the word keeps the same collation and the same readiness to take the
+/// column's. Any other introducer stays, and is refused where the statement
+/// is read.
+fn without_utf8mb4_introducers(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<std::borrow::Cow<'_, str>, ParseError> {
+    if !sql.to_ascii_lowercase().contains("_utf8mb4") {
+        return Ok(std::borrow::Cow::Borrowed(sql));
+    }
+    let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
+        .tokenize_with_location()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let mut cuts = Vec::new();
+    for (at, token) in tokens.iter().enumerate() {
+        let Token::Word(word) = &token.token else {
+            continue;
+        };
+        if word.quote_style.is_some() || !word.value.eq_ignore_ascii_case("_utf8mb4") {
+            continue;
+        }
+        let Some(introduced) = tokens[at + 1..]
+            .iter()
+            .find(|token| !matches!(token.token, Token::Whitespace(_)))
+        else {
+            continue;
+        };
+        if !matches!(
+            introduced.token,
+            Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+        ) {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            byte_offset_of_location(sql, token.span.start),
+            byte_offset_of_location(sql, introduced.span.start),
+        ) else {
+            return unsupported("SELECT character set introducer");
+        };
+        cuts.push(start..end);
+    }
+    if cuts.is_empty() {
+        return Ok(std::borrow::Cow::Borrowed(sql));
+    }
+    let mut kept = String::with_capacity(sql.len());
+    let mut from = 0;
+    for cut in cuts {
+        kept.push_str(&sql[from..cut.start]);
+        from = cut.end;
+    }
+    kept.push_str(&sql[from..]);
+    Ok(std::borrow::Cow::Owned(kept))
+}
+
 /// The byte offset one line-and-column location stands at.
 fn byte_offset_of_location(sql: &str, location: sqlparser::tokenizer::Location) -> Option<usize> {
     if location.line == 0 || location.column == 0 {
@@ -4016,6 +4075,7 @@ fn parse_select_inner(
     real_columns: &[String],
     json_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
+    let sql = &*without_utf8mb4_introducers(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
     let Statement::Query(query) = statement else {
         return Err(ParseError::ExpectedSelect);

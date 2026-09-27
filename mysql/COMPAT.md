@@ -1543,6 +1543,27 @@ finds. It holds over an inequality and over an ordering comparison as well:
 in byte order. So the byte collation drops the UCA9 collation a text comparison
 otherwise asks for, and nothing else changes.
 
+`WHERE BINARY name = 'alpha'` compares the column by its bytes, which is how
+a statement asks for the row spelled exactly so. MySQL reads the `BINARY` as a
+cast of the column alone, where sqlparser reads it as a cast of everything
+after it, so the condition is read back out with its first column compared by
+its bytes — `BINARY name = 'a' AND n > 0` is `(BINARY name) = 'a' AND n > 0`.
+Measured on 8.4.11 over 'alpha', 'Alpha', 'ALPHA' and 'alpha ': it finds the
+first alone, `= 'alpha '` the last alone — a binary string keeps its trailing
+spaces where `utf8mb4_bin` pads them away — and `<> 'alpha'` and `< 'alpha'`
+compare the bytes too. `CAST(name = 'x' AS BINARY)`, which sqlparser reads the
+same way and MySQL reads as a cast of the answer, is told apart by the text
+before the column and refused. A bound value, a number, a `LIKE` and a
+`BINARY` on the right of a comparison are refused.
+
+A word written with the `_utf8mb4` introducer is the word: measured on 8.4.11,
+`name = _utf8mb4'ALPHA'` finds what `name = 'ALPHA'` finds, in a comparison, a
+membership test, a `LIKE` and a result column alike, since the introducer names
+the one character set this server speaks and leaves the word the collation a
+plain one has. A `SELECT` reads it without the introducer. Any other
+introducer — `_latin1`, `_binary` — changes how the word compares and is
+refused.
+
 Five shapes are refused. A collation over a `LIKE` is one: the checked LIKE matcher takes the default UCA9 rules, so naming a byte
 collation there requires a separate matcher — measured, MySQL answers
 the one row spelled exactly so. A collation over a membership test is another,

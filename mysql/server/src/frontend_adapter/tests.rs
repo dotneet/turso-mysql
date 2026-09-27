@@ -30657,3 +30657,6 @@ mod window_offsets;
 
 #[cfg(unix)]
 mod day_counts;
+
+#[cfg(unix)]
+mod binary_comparisons;

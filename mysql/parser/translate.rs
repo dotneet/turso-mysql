@@ -7190,6 +7190,26 @@ fn render_select_predicate(
             "({} IS NOT NULL)",
             render_select_expr(expr, render_context)?
         )),
+        // `WHERE BINARY name = 'alpha'` is how a statement asks for the row
+        // spelled exactly so. MySQL reads the `BINARY` as a cast of the column
+        // alone, and sqlparser reads it as a cast of everything after it, so
+        // the condition is read back out with the first column compared by
+        // its bytes. Measured on 8.4.11 over 'alpha', 'Alpha', 'ALPHA' and
+        // 'alpha ': it finds the first alone, and `'alpha '` the last alone —
+        // a binary string keeps its trailing spaces, where `utf8mb4_bin`
+        // pads them away.
+        Expr::Cast {
+            kind: sqlparser::ast::CastKind::Cast,
+            expr: cast,
+            data_type: sqlparser::ast::DataType::Binary(None),
+            format: None,
+            array: false,
+        } if written_as_a_binary_prefix(cast, render_context.source) => {
+            let Some(condition) = compared_by_bytes_first(cast) else {
+                return unsupported("SELECT BINARY over anything but a column compared");
+            };
+            render_select_predicate(&condition, render_context)
+        }
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
         {
@@ -7360,6 +7380,68 @@ fn render_select_predicate(
 /// MySQL 8.4.11, a word against a word is compared without regard to case and
 /// a number against a word coerces the word to a number, neither of which the
 /// engine does, so those keep the refusal every uncalibrated comparison has.
+/// Reports whether a cast to `BINARY` was written as the `BINARY` prefix of
+/// the column first in it rather than as `CAST(... AS BINARY)`, which sqlparser
+/// reads the same way and which means a cast of the answer.
+fn written_as_a_binary_prefix(cast: &Expr, source: &str) -> bool {
+    use sqlparser::ast::Spanned;
+    let Some(start) = byte_offset(source, first_operand(cast).span().start) else {
+        return false;
+    };
+    let Some(before) = source.get(..start) else {
+        return false;
+    };
+    let before = before.trim_end();
+    let Some(keyword_start) = before.len().checked_sub("BINARY".len()) else {
+        return false;
+    };
+    before
+        .get(keyword_start..)
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("BINARY"))
+        && !before[..keyword_start]
+            .chars()
+            .next_back()
+            .is_some_and(|character| character.is_alphanumeric() || character == '_')
+}
+
+/// The operand written first in a chain of `AND`, `OR` and comparisons.
+fn first_operand(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::BinaryOp { left, .. } => first_operand(left),
+        other => other,
+    }
+}
+
+/// Reads a condition sqlparser put under a `BINARY` back out, with the
+/// comparison written first comparing its column by its bytes and everything
+/// after it as it was: `BINARY name = 'a' AND n > 0` is `(BINARY name) = 'a'
+/// AND n > 0`, the prefix binding tighter than any operator.
+fn compared_by_bytes_first(condition: &Expr) -> Option<Expr> {
+    let Expr::BinaryOp { left, op, right } = condition else {
+        return None;
+    };
+    if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+        return Some(Expr::BinaryOp {
+            left: Box::new(compared_by_bytes_first(left)?),
+            op: op.clone(),
+            right: right.clone(),
+        });
+    }
+    if !is_checked_select_comparison_operator(op) || !matches!(left.as_ref(), Expr::Identifier(_)) {
+        return None;
+    }
+    Some(Expr::BinaryOp {
+        left: Box::new(Expr::Collate {
+            expr: left.clone(),
+            collation: ObjectName(vec![ObjectNamePart::Identifier(
+                sqlparser::ast::Ident::new("binary"),
+            )]),
+        }),
+        op: op.clone(),
+        right: right.clone(),
+    })
+}
+
 fn names_a_whole_number(expr: &Expr) -> bool {
     match expr {
         Expr::Value(value) => {
