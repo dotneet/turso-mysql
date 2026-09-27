@@ -353,8 +353,8 @@ fn signed_integer_defaults_are_normalized_with_i64_bounds() {
         ),
         (
             "CREATE TABLE t (value INT DEFAULT +1)",
-            "CREATE TABLE \"t\" (\"value\" INT DEFAULT +1)",
-            "CREATE TABLE `t` (`value` INT DEFAULT +1)",
+            "CREATE TABLE \"t\" (\"value\" INT DEFAULT 1)",
+            "CREATE TABLE `t` (`value` INT DEFAULT 1)",
         ),
         (
             "CREATE TABLE t (value BIGINT DEFAULT -9223372036854775808)",
@@ -383,7 +383,6 @@ fn signed_integer_defaults_are_normalized_with_i64_bounds() {
     for sql in [
         "CREATE TABLE t (value BIGINT DEFAULT -9223372036854775809)",
         "CREATE TABLE t (value BIGINT DEFAULT +9223372036854775808)",
-        "CREATE TABLE t (value BIGINT DEFAULT -1.0)",
     ] {
         assert!(matches!(
             parse_create_table(sql, SessionSqlMode::default()),
@@ -4682,6 +4681,148 @@ fn bigint_unsigned_default_keeps_u64_max_as_decimal_text() {
         SessionSqlMode::default(),
     )
     .is_err());
+}
+
+/// Measured on MySQL 8.4.11: a word naming a number is taken as the default
+/// of a column of whole numbers and rounded half away from zero, and one
+/// outside the column's range after rounding, or naming no number, is 1067.
+#[test]
+fn a_whole_number_column_takes_a_word_naming_a_number_as_its_default() {
+    let stored = |declared: &str| {
+        parse_create_table(
+            &format!("CREATE TABLE t (v {declared})"),
+            SessionSqlMode::default(),
+        )
+        .map(|translated| translated.as_sql().to_owned())
+    };
+    for (declared, expected) in [
+        ("INT NOT NULL DEFAULT '5'", "\"v\" INT NOT NULL DEFAULT 5"),
+        ("INT DEFAULT '4.5'", "\"v\" INT DEFAULT 5"),
+        ("INT DEFAULT '4.4'", "\"v\" INT DEFAULT 4"),
+        ("INT DEFAULT '-4.5'", "\"v\" INT DEFAULT -5"),
+        ("INT DEFAULT ' 7'", "\"v\" INT DEFAULT 7"),
+        ("INT DEFAULT '  -3  '", "\"v\" INT DEFAULT -3"),
+        ("INT DEFAULT '+8'", "\"v\" INT DEFAULT 8"),
+        ("INT DEFAULT '007'", "\"v\" INT DEFAULT 7"),
+        ("INT DEFAULT '.5'", "\"v\" INT DEFAULT 1"),
+        ("INT DEFAULT '5.'", "\"v\" INT DEFAULT 5"),
+        ("INT DEFAULT '1e2'", "\"v\" INT DEFAULT 100"),
+        ("INT DEFAULT '25e-1'", "\"v\" INT DEFAULT 3"),
+        ("INT DEFAULT 4.5", "\"v\" INT DEFAULT 5"),
+        ("INT DEFAULT -2147483648.4", "\"v\" INT DEFAULT -2147483648"),
+        ("SMALLINT DEFAULT '-3'", "\"v\" SMALLINT DEFAULT -3"),
+        (
+            "TINYINT NOT NULL DEFAULT '1'",
+            "\"v\" TINYINT NOT NULL DEFAULT 1",
+        ),
+        (
+            "TINYINT(1) NOT NULL DEFAULT '0'",
+            "\"v\" BOOLEAN NOT NULL DEFAULT 0",
+        ),
+        ("BOOLEAN DEFAULT '2'", "\"v\" BOOLEAN DEFAULT 2"),
+        (
+            "INT UNSIGNED DEFAULT '-0.4'",
+            "\"v\" INT UNSIGNED DEFAULT 0",
+        ),
+        (
+            "INT UNSIGNED DEFAULT '4294967295'",
+            "\"v\" INT UNSIGNED DEFAULT 4294967295",
+        ),
+        (
+            "BIGINT DEFAULT '-9223372036854775808.4'",
+            "\"v\" BIGINT DEFAULT -9223372036854775808",
+        ),
+        (
+            "BIGINT UNSIGNED DEFAULT ' 7'",
+            "\"v\" mysql_uint64 DEFAULT '7'",
+        ),
+        (
+            "BIGINT UNSIGNED DEFAULT '18446744073709551615.4'",
+            "\"v\" mysql_uint64 DEFAULT '18446744073709551615'",
+        ),
+    ] {
+        let stored = stored(declared).unwrap_or_else(|error| panic!("{declared}: {error}"));
+        assert!(stored.contains(expected), "{declared}: {stored}");
+    }
+    for declared in [
+        "INT DEFAULT ''",
+        "INT DEFAULT ' '",
+        "INT DEFAULT 'abc'",
+        "INT DEFAULT '5a'",
+        "INT DEFAULT '0x10'",
+        "INT DEFAULT '1,5'",
+        "INT DEFAULT '1 000'",
+        "INT DEFAULT '- 1'",
+        "INT DEFAULT '+-1'",
+        "INT DEFAULT 'NULL'",
+        "INT DEFAULT '.'",
+        "INT DEFAULT 'e2'",
+        "TINYINT DEFAULT '300'",
+        "TINYINT DEFAULT '127.5'",
+        "TINYINT DEFAULT 300",
+        "TINYINT DEFAULT -129",
+        "TINYINT UNSIGNED DEFAULT '-1'",
+        "INT UNSIGNED DEFAULT '-0.5'",
+        "INT DEFAULT '2147483648'",
+        "INT DEFAULT -2147483648.5",
+        "MEDIUMINT DEFAULT '8388608'",
+        "BOOLEAN DEFAULT '128'",
+        "BIGINT DEFAULT '9223372036854775807.5'",
+        // Taken by MySQL, and not here: an unquoted exponent is rounded half
+        // to even there, a bare trailing `e` is read as though it were not
+        // written, and a tab is skipped where a newline is not.
+        "INT DEFAULT 2.5e0",
+        "INT DEFAULT '1e'",
+        "INT DEFAULT '\t7'",
+    ] {
+        assert!(stored(declared).is_err(), "{declared}");
+    }
+}
+
+/// Measured on MySQL 8.4.11: a word naming no number is 1067 on a `DOUBLE`,
+/// and one naming a number prints as the number the column holds, so only a
+/// word MySQL prints back as it was written is taken.
+#[test]
+fn a_floating_column_takes_a_word_mysql_prints_back_unchanged() {
+    let stored = |declared: &str| {
+        parse_create_table(
+            &format!("CREATE TABLE t (v {declared})"),
+            SessionSqlMode::default(),
+        )
+    };
+    for declared in [
+        "DOUBLE DEFAULT '0'",
+        "DOUBLE DEFAULT '1.5'",
+        "DOUBLE DEFAULT '-12.5'",
+        "DOUBLE DEFAULT '-0'",
+        "DOUBLE DEFAULT '0.0000001'",
+        "DOUBLE DEFAULT '123456789012345'",
+        "FLOAT DEFAULT '0.1'",
+        "FLOAT DEFAULT '3.14159'",
+        "FLOAT DEFAULT '0.000001'",
+        "DOUBLE UNSIGNED DEFAULT '1.5'",
+        "DOUBLE DEFAULT 1.25",
+        "DOUBLE DEFAULT -3",
+    ] {
+        assert!(stored(declared).is_ok(), "{declared}");
+    }
+    for declared in [
+        "DOUBLE DEFAULT ''",
+        "DOUBLE DEFAULT 'x'",
+        "DOUBLE DEFAULT ' 1'",
+        "DOUBLE DEFAULT '1.50'",
+        "DOUBLE DEFAULT '1.'",
+        "DOUBLE DEFAULT '007'",
+        "DOUBLE DEFAULT '.5'",
+        "DOUBLE DEFAULT '1e2'",
+        "DOUBLE DEFAULT '1234567890123456'",
+        "FLOAT DEFAULT '1234567'",
+        "DOUBLE UNSIGNED DEFAULT '-1'",
+        "DOUBLE DEFAULT 1.50",
+        "DOUBLE DEFAULT +1.5",
+    ] {
+        assert!(stored(declared).is_err(), "{declared}");
+    }
 }
 
 #[test]

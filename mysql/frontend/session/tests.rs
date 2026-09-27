@@ -4748,19 +4748,23 @@ fn column_metadata_fails_closed_for_unrepresentable_table_keys() -> Result<()> {
     ));
 
     // Measured on MySQL 8.4.11: `INT DEFAULT 1.25` prints `DEFAULT '1'`, the
-    // default being rounded to the places the column holds. Rounding it the
-    // way MySQL rounds is a rule this has not got, so the statement is refused
-    // rather than the table being left holding a default it would print
-    // differently.
+    // default being rounded to the places the column holds, and a default past
+    // the column's range is 1067.
+    connection.execute("CREATE TABLE decimal_default (value INT DEFAULT 1.25)")?;
+    assert_eq!(
+        connection
+            .list_columns(&MySqlTableName::parse("decimal_default").unwrap())
+            .unwrap()
+            .first()
+            .and_then(MySqlColumnMetadata::default_value),
+        Some(&MySqlColumnDefault::Integer {
+            text: "1".to_owned(),
+            value: 1
+        })
+    );
     assert!(connection
-        .execute("CREATE TABLE decimal_default (value INT DEFAULT 1.25)")
+        .execute("CREATE TABLE integer_overflow (value BIGINT DEFAULT 9223372036854775808)")
         .is_err());
-    connection
-        .execute("CREATE TABLE integer_overflow (value BIGINT DEFAULT 9223372036854775808)")?;
-    assert!(matches!(
-        connection.list_columns(&MySqlTableName::parse("integer_overflow").unwrap()),
-        Err(MySqlColumnMetadataError::UnsupportedDefinition)
-    ));
     connection.close()?;
     Ok(())
 }

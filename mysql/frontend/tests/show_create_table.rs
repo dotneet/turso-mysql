@@ -124,14 +124,13 @@ fn a_missing_table_and_a_view_are_told_apart() {
 #[test]
 fn a_table_this_frontend_cannot_describe_fails_closed() {
     let connection = connection();
-    // A DEFAULT this frontend cannot read back: a whole number too wide for the
-    // engine to hold would be stored as some other number. A named index and a
-    // written-out fraction both used to belong here and no longer do — the key
-    // line is printed now, and a fraction is printed at its column's scale.
+    // A CHECK, which the column metadata has nowhere to print. A named index, a
+    // written-out fraction and a whole number too wide for its column all used
+    // to belong here and no longer do — the key line is printed now, a
+    // fraction is printed at its column's scale, and the too-wide number is
+    // refused by the `CREATE TABLE`, as MySQL refuses it with 1067.
     connection
-        .execute(
-            "CREATE TABLE sc_undescribed (id INT NOT NULL, label BIGINT DEFAULT 9223372036854775808)",
-        )
+        .execute("CREATE TABLE sc_undescribed (id INT NOT NULL, label INT CHECK (label > 0))")
         .unwrap();
     assert!(matches!(
         connection.show_create_table(&MySqlTableName::parse("sc_undescribed").unwrap()),

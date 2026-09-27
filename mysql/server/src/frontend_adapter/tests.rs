@@ -30526,8 +30526,8 @@ fn a_column_prints_the_default_it_was_declared_with() {
     );
 
     for ddl in [
-        "CREATE TABLE refused (a INT DEFAULT 1.25)",
         "CREATE TABLE refused (a INT DEFAULT 'x')",
+        "CREATE TABLE refused (a DOUBLE DEFAULT 'x')",
     ] {
         assert!(adapter.execute_query(ddl).is_err(), "{ddl}");
     }
@@ -30630,3 +30630,6 @@ mod date_arithmetic;
 #[cfg(unix)]
 #[cfg(unix)]
 mod union_shapes;
+
+#[cfg(unix)]
+mod migration_ddl;

@@ -6848,18 +6848,25 @@ fn render_column_option(
                     moment_with_fraction_sql(digits as u8)
                 )));
             }
-            if matches!(data_type, DataType::BigIntUnsigned(_)) {
-                if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
-                    return Ok(Some("DEFAULT NULL".to_owned()));
+            if let Some(range) = whole_number_range_of(data_type) {
+                let integer = whole_number_default(expr, range)?;
+                // The engine holds a BIGINT UNSIGNED in a type of its own that
+                // reads its default as a word.
+                if matches!(data_type, DataType::BigIntUnsigned(_)) {
+                    return match integer {
+                        Some(integer) => Ok(Some(format!("DEFAULT '{integer}'"))),
+                        None if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) => {
+                            Ok(Some("DEFAULT NULL".to_owned()))
+                        }
+                        None => unsupported("BIGINT UNSIGNED DEFAULT literal"),
+                    };
                 }
-                let written = decimal_default_text(expr)?;
-                let rounded = round_decimal_to_scale(&written, 20, 0)?;
-                let integer = rounded
-                    .parse::<u64>()
-                    .map_err(|_| ParseError::Unsupported {
-                        feature: "BIGINT UNSIGNED DEFAULT outside u64 range",
-                    })?;
-                return Ok(Some(format!("DEFAULT '{integer}'")));
+                if let Some(integer) = integer {
+                    return Ok(Some(format!("DEFAULT {integer}")));
+                }
+            }
+            if floating_point_type(data_type) {
+                reject_a_floating_default_mysql_would_print_otherwise(expr, data_type)?;
             }
             if let Some((precision, scale)) = decimal_size_of(data_type)? {
                 if matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Null)) {
@@ -6869,7 +6876,6 @@ fn render_column_option(
                 let rounded = round_decimal_to_scale(&written, precision, scale)?;
                 return Ok(Some(format!("DEFAULT '{rounded}'")));
             }
-            reject_a_default_the_column_would_round(expr, data_type)?;
             Ok(Some(format!("DEFAULT {}", render_default(expr)?)))
         }
         ColumnOption::Check(check) => {
@@ -6941,45 +6947,207 @@ fn render_column_option(
     }
 }
 
-/// Refuses a written default a `DECIMAL` column would have to round.
+/// The smallest and largest value a column of whole numbers holds, or `None`
+/// for a column of any other kind.
+fn whole_number_range_of(data_type: &DataType) -> Option<(i128, i128)> {
+    let (low, high) = match data_type {
+        DataType::TinyInt(_) | DataType::Bool | DataType::Boolean => {
+            (i8::MIN.into(), i8::MAX.into())
+        }
+        DataType::SmallInt(_) => (i16::MIN.into(), i16::MAX.into()),
+        DataType::MediumInt(_) => (-(1 << 23), (1 << 23) - 1),
+        DataType::Int(_) | DataType::Integer(_) => (i32::MIN.into(), i32::MAX.into()),
+        DataType::BigInt(_) => (i64::MIN.into(), i64::MAX.into()),
+        DataType::TinyIntUnsigned(_) => (0, u8::MAX.into()),
+        DataType::SmallIntUnsigned(_) => (0, u16::MAX.into()),
+        DataType::MediumIntUnsigned(_) => (0, (1 << 24) - 1),
+        DataType::IntUnsigned(_) | DataType::IntegerUnsigned(_) => (0, u32::MAX.into()),
+        DataType::BigIntUnsigned(_) => (0, u64::MAX.into()),
+        _ => return None,
+    };
+    Some((low, high))
+}
+
+/// The whole number a written default stores in a column of whole numbers, or
+/// `None` for a default that is not a written number or a word at all — `NULL`
+/// and `TRUE` among them.
 ///
-/// Measured on MySQL 8.4.11: a decimal column keeps its default at its own
-/// scale and prints it back that way — `DECIMAL(10,2) DEFAULT 3` prints
-/// `DEFAULT '3.00'`, and `DEFAULT 1.5` on a `DECIMAL(6,3)` prints `'1.500'`.
-/// Where the default carries more places than the column holds it is rounded —
-/// `1.239` into a `DECIMAL(10,2)` prints `'1.24'` — and rounding it the way
-/// MySQL rounds is a rule this has not got, so that one is refused rather than
-/// printed at a scale MySQL would not print.
-fn reject_a_default_the_column_would_round(
+/// Measured on MySQL 8.4.11: a word that reads as a number is taken and
+/// rounded half away from zero, and so is a written number with a point —
+/// `INT DEFAULT '4.5'` and `DEFAULT 4.5` both print `DEFAULT '5'`, `'-4.5'`
+/// prints `'-5'`, `' 7'` and `'7 '` print `'7'`, `'007'` prints `'7'`, `'.5'`
+/// prints `'1'`, `'5.'` prints `'5'`, and `'1e2'` and `'25e-1'` print `'100'`
+/// and `'3'`. What lands outside the column's range after rounding is 1067 —
+/// `TINYINT DEFAULT '300'`, `'127.5'`, `TINYINT UNSIGNED DEFAULT '-1'` — while
+/// `INT UNSIGNED DEFAULT '-0.4'` rounds to 0 and is taken. A word that is not a
+/// number is 1067 as well: `''`, `'abc'`, `'5a'`, `'0x10'`, `'1,5'`, `'1 000'`.
+///
+/// Refused as well, though MySQL takes them: a written number with an
+/// exponent, which MySQL reads as a binary64 and rounds half to even — `2.5e0`
+/// prints `'2'` where `'2.5e0'` prints `'3'` — a word ending in a bare `e`,
+/// which MySQL reads as though the `e` were not there, and a word with a tab
+/// or another space than the plain one around it.
+fn whole_number_default(
+    expr: &Expr,
+    (low, high): (i128, i128),
+) -> Result<Option<i128>, ParseError> {
+    let (sign, value) = match expr {
+        Expr::Value(value) => ("", &value.value),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => ("-", &value.value),
+            _ => return unsupported("DEFAULT integer literal"),
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => ("", &value.value),
+            _ => return unsupported("DEFAULT integer literal"),
+        },
+        _ => return Ok(None),
+    };
+    let written = match value {
+        Value::Number(digits, false) if !digits.contains(['e', 'E']) => {
+            format!("{sign}{digits}")
+        }
+        Value::Number(_, _) => return unsupported("DEFAULT number written with an exponent"),
+        Value::SingleQuotedString(word) if sign.is_empty() => {
+            number_in_a_word(word).ok_or(ParseError::Unsupported {
+                feature: "a word that is not a number as the default of a column of numbers",
+            })?
+        }
+        _ if sign.is_empty() => return Ok(None),
+        _ => return unsupported("DEFAULT integer literal"),
+    };
+    let rounded = round_half_away_from_zero(&written)?;
+    if !(low..=high).contains(&rounded) {
+        return unsupported("DEFAULT outside the range of its column");
+    }
+    Ok(Some(rounded))
+}
+
+/// The number a word names, spelled the way `BigDecimal` reads one, when the
+/// whole word is one: plain spaces around it, a sign, digits with a point
+/// anywhere among them, and an exponent of at most three digits.
+fn number_in_a_word(word: &str) -> Option<String> {
+    let word = word.trim_matches(' ');
+    let (sign, unsigned) = match word.as_bytes().first()? {
+        b'-' => ("-", &word[1..]),
+        b'+' => ("", &word[1..]),
+        _ => ("", word),
+    };
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !all_digits(whole) || !all_digits(fraction) {
+        return None;
+    }
+    let exponent = match exponent {
+        None => String::new(),
+        Some(exponent) => {
+            let digits = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+            if !(1..=3).contains(&digits.len()) || !all_digits(digits) {
+                return None;
+            }
+            format!("e{exponent}")
+        }
+    };
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = if fraction.is_empty() { "0" } else { fraction };
+    Some(format!("{sign}{whole}.{fraction}{exponent}"))
+}
+
+fn round_half_away_from_zero(written: &str) -> Result<i128, ParseError> {
+    use bigdecimal::{BigDecimal, RoundingMode, ToPrimitive};
+    use std::str::FromStr;
+
+    let parsed = BigDecimal::from_str(written).map_err(|_| ParseError::Unsupported {
+        feature: "DEFAULT number",
+    })?;
+    parsed
+        .with_scale_round(0, RoundingMode::HalfUp)
+        .to_i128()
+        .ok_or(ParseError::Unsupported {
+            feature: "DEFAULT outside the range of its column",
+        })
+}
+
+fn floating_point_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Double(_)
+            | DataType::DoubleUnsigned(_)
+            | DataType::Float(_)
+            | DataType::FloatUnsigned(_)
+    )
+}
+
+/// Refuses a word as the default of a `DOUBLE` or a `FLOAT` unless MySQL
+/// prints it back exactly as it was written.
+///
+/// Measured on MySQL 8.4.11: a word that is not a number is 1067 — `''`, `'x'`
+/// — and one that is prints the number the column holds, not the word:
+/// `DOUBLE DEFAULT ' 1'` prints `'1'`, `'1.50'` prints `'1.5'`, `'1e2'` prints
+/// `'100'`, `'1234567890123456'` prints `'1.234567890123456e15'` and `FLOAT
+/// DEFAULT '1234567'` prints `'1234570'`. The engine keeps the word as it was
+/// written, so the words taken are the ones MySQL prints unchanged — up to
+/// fifteen digits on a `DOUBLE` and six on a `FLOAT`, measured up to
+/// `'123456789012345'`, `'0.0000001'` and `FLOAT DEFAULT '0.000001'` — and a
+/// negative one on an unsigned column, 1067 in MySQL, is refused too.
+fn reject_a_floating_default_mysql_would_print_otherwise(
     expr: &Expr,
     data_type: &DataType,
 ) -> Result<(), ParseError> {
-    let Some(scale) = decimal_scale_of(data_type) else {
-        return Ok(());
-    };
-    let written = match expr {
-        Expr::Value(value) => value,
-        Expr::UnaryOp { expr, .. } => match expr.as_ref() {
-            Expr::Value(value) => value,
+    let word = match expr {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(word) | Value::Number(word, false) => word.clone(),
             _ => return Ok(()),
         },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                Value::Number(digits, false) => format!("-{digits}"),
+                _ => return unsupported("DEFAULT literal"),
+            },
+            _ => return unsupported("DEFAULT literal"),
+        },
+        Expr::UnaryOp { .. } => return unsupported("DEFAULT literal"),
         _ => return Ok(()),
     };
-    let Value::Number(digits, false) = &written.value else {
-        // A column of numbers takes a written word only where the word names a
-        // number — measured, `INT DEFAULT 'x'` answers 1067 and
-        // `DECIMAL(10,2) DEFAULT '4.5'` is taken and prints `'4.50'`. Reading a
-        // word as a number is a rule this has not got, so both are refused.
-        if matches!(&written.value, Value::SingleQuotedString(_)) {
-            return unsupported("a written word as the default of a column of numbers");
-        }
-        return Ok(());
+    let (single, most_places) = match data_type {
+        DataType::Float(_) | DataType::FloatUnsigned(_) => (true, 6),
+        _ => (false, 7),
     };
-    let places = digits
-        .split_once('.')
-        .map_or(0, |(_, fraction)| fraction.len());
-    if places > scale as usize {
-        return unsupported("DEFAULT with more places than the column holds");
+    let unsigned = matches!(
+        data_type,
+        DataType::DoubleUnsigned(_) | DataType::FloatUnsigned(_)
+    );
+    let magnitude = match word.strip_prefix('-') {
+        Some(_) if unsigned => {
+            return unsupported("a negative default on an unsigned column");
+        }
+        Some(magnitude) => magnitude,
+        None => &word,
+    };
+    let (whole, fraction) = magnitude.split_once('.').unwrap_or((magnitude, ""));
+    let printed_as_written = !whole.is_empty()
+        && whole.bytes().all(|byte| byte.is_ascii_digit())
+        && (whole == "0" || !whole.starts_with('0'))
+        && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        && (magnitude.len() == whole.len() || fraction.ends_with(|last: char| last != '0'))
+        && fraction.len() <= most_places;
+    let significant_digits = format!("{whole}{fraction}").trim_start_matches('0').len();
+    let most_digits = if single { 6 } else { 15 };
+    if !printed_as_written || significant_digits > most_digits {
+        return unsupported("a word as the default of a floating-point column");
     }
     Ok(())
 }
@@ -7050,35 +7218,6 @@ pub fn round_decimal_to_scale(
         return unsupported("DECIMAL DEFAULT out of range");
     }
     Ok(rounded.to_plain_string())
-}
-
-/// The scale a column holds its values at, for the types that hold a number
-/// at a scale of their own.
-///
-/// A column of whole numbers holds them at no places at all, which is why a
-/// default written with any is one it would have to round: measured on 8.4.11,
-/// `INT DEFAULT 1.25` and `INT DEFAULT 1.0` both print `DEFAULT '1'`.
-fn decimal_scale_of(data_type: &DataType) -> Option<i64> {
-    let info = match data_type {
-        DataType::Decimal(info) | DataType::Numeric(info) | DataType::Dec(info) => info,
-        DataType::TinyInt(_)
-        | DataType::SmallInt(_)
-        | DataType::MediumInt(_)
-        | DataType::Int(_)
-        | DataType::Integer(_)
-        | DataType::BigInt(_)
-        | DataType::TinyIntUnsigned(_)
-        | DataType::SmallIntUnsigned(_)
-        | DataType::MediumIntUnsigned(_)
-        | DataType::IntUnsigned(_)
-        | DataType::IntegerUnsigned(_)
-        | DataType::BigIntUnsigned(_) => return Some(0),
-        _ => return None,
-    };
-    match info {
-        ExactNumberInfo::PrecisionAndScale(_, scale) => Some(*scale),
-        ExactNumberInfo::Precision(_) | ExactNumberInfo::None => Some(0),
-    }
 }
 
 /// Answers whether an unqualified name is one of the given words.

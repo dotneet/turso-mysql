@@ -639,9 +639,25 @@ which was measured for that: a quote doubled, a backslash written twice.
 
 `DECIMAL` defaults are read as exact decimal values and rounded to the column's
 scale. `DECIMAL(10,2) DEFAULT 1.239` prints `'1.24'`, and
-`DECIMAL(10,2) DEFAULT '4.5'` prints `'4.50'`. A fractional default on an integer
-column remains refused; MySQL rounds it and prints an integer. A written word
-as the default of an integer or floating column remains refused.
+`DECIMAL(10,2) DEFAULT '4.5'` prints `'4.50'`.
+
+A column of whole numbers takes a word naming a number as its default, which is
+how Laravel writes every default (`->default(0)` and `->default(false)` both
+become `DEFAULT '0'`) and how `mysqldump` and `SHOW CREATE TABLE` print one.
+Measured on 8.4.11 and matched: the word is read as an exact number and rounded
+half away from zero into the column — `INT NOT NULL DEFAULT '5'` prints
+`DEFAULT '5'`, `'4.5'` prints `'5'`, `'-4.5'` prints `'-5'`, `' 7'` and `'7 '` print
+`'7'`, `'007'` prints `'7'`, `'.5'` prints `'1'`, `'1e2'` prints `'100'` and
+`TINYINT(1) NOT NULL DEFAULT '0'` prints `'0'` — and a written number with a point
+is rounded the same way, `INT DEFAULT 1.25` printing `'1'`. `SHOW COLUMNS` and
+`information_schema.COLUMNS` report the same number unquoted. MySQL answers 1067
+for a word naming no number (`''`, `'abc'`, `'5a'`, `'0x10'`) and for a default that
+lands outside the column's range once rounded (`TINYINT DEFAULT '300'`,
+`'127.5'`, `TINYINT UNSIGNED DEFAULT '-1'`), and this refuses the same
+statements, while `INT UNSIGNED DEFAULT '-0.4'` rounds to 0 in both. A `DOUBLE` or
+`FLOAT` takes a default MySQL prints back as it was written, `'0'` or `'1.5'`,
+and refuses one MySQL would print as some other number (`'1.50'`, `' 1'`,
+`'1e2'`) along with a word naming no number, which MySQL answers 1067 for.
 
 `DEFAULT` written where a value goes asks for the column's own default, which is what a
 generated `INSERT` writes for a column it has nothing to say about. The engine has no spelling
