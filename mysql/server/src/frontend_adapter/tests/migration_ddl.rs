@@ -361,13 +361,17 @@ fn alter_column_sets_and_drops_a_default() {
         &mut adapter,
         "ALTER TABLE s1 ALTER COLUMN c SET DEFAULT 'it''s'",
     );
+    run(
+        &mut adapter,
+        "ALTER TABLE s1 ALTER COLUMN d SET DEFAULT '4.5'",
+    );
     let expected = concat!(
         "CREATE TABLE `s1` (\n",
         "  `id` int NOT NULL,\n",
         "  `a` int DEFAULT '5',\n",
         "  `b` int NOT NULL,\n",
         "  `c` varchar(10) DEFAULT 'it''s',\n",
-        "  `d` decimal(8,2) DEFAULT NULL,\n",
+        "  `d` decimal(8,2) DEFAULT '4.50',\n",
         "  `f` text,\n",
         "  PRIMARY KEY (`id`)\n",
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
@@ -380,7 +384,7 @@ fn alter_column_sets_and_drops_a_default() {
             some(&["a", "5"]),
             vec![Some("b".to_owned()), None],
             some(&["c", "it's"]),
-            vec![Some("d".to_owned()), None],
+            some(&["d", "4.50"]),
             vec![Some("f".to_owned()), None],
         ]
     );
@@ -396,7 +400,7 @@ fn alter_column_sets_and_drops_a_default() {
             None,
             Some("1".to_owned()),
             Some("it's".to_owned()),
-            None
+            Some("4.50".to_owned())
         ]]
     );
 
@@ -406,9 +410,6 @@ fn alter_column_sets_and_drops_a_default() {
         "ALTER TABLE s1 ALTER COLUMN b SET DEFAULT NULL",
         "ALTER TABLE s1 ALTER COLUMN f SET DEFAULT 'x'",
         "ALTER TABLE s1 ALTER COLUMN nope SET DEFAULT 1",
-        // Taken by MySQL. A `DECIMAL` column restated in place reads back as
-        // one no `SELECT` here takes, so its default is not changed that way.
-        "ALTER TABLE s1 ALTER COLUMN d SET DEFAULT '4.5'",
         // Taken by MySQL, which then prints the column with no default at
         // all, a shape this cannot keep.
         "ALTER TABLE s1 ALTER COLUMN a DROP DEFAULT",
@@ -418,6 +419,48 @@ fn alter_column_sets_and_drops_a_default() {
 
     let mut adapter = reopened(&directory, adapter);
     assert!(printed_table(&mut adapter, "s1").contains("  `b` int NOT NULL,\n"));
+}
+
+/// A `DECIMAL` column restated by `MODIFY` in the same form is read by the
+/// session that changed it, not only once the database is opened again.
+///
+/// Measured on MySQL 8.4.11: after `MODIFY d DECIMAL(12,3)` a stored 1.5 reads
+/// `1.500`, every row written again in the new form. The engine keeps a
+/// `DECIMAL` as the text it was written as, so a change of size or sign, or
+/// into or out of a `DECIMAL`, is refused.
+#[test]
+fn a_decimal_column_restated_by_modify_is_read_by_the_session_that_changed_it() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE s2 (id INT NOT NULL PRIMARY KEY, d DECIMAL(8,2), n INT)",
+    );
+    run(&mut adapter, "INSERT INTO s2 VALUES (1, 1.5, 2)");
+    run(
+        &mut adapter,
+        "ALTER TABLE s2 MODIFY d DECIMAL(8,2) NOT NULL",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT d FROM s2"),
+        vec![some(&["1.50"])]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT * FROM s2"),
+        vec![some(&["1", "1.50", "2"])]
+    );
+    for sql in [
+        "ALTER TABLE s2 MODIFY d DECIMAL(12,3)",
+        "ALTER TABLE s2 MODIFY d DECIMAL(8,2) UNSIGNED",
+        "ALTER TABLE s2 CHANGE d e INT",
+        "ALTER TABLE s2 MODIFY n DECIMAL(8,2)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(
+        rows(&mut adapter, "SELECT d FROM s2"),
+        vec![some(&["1.50"])]
+    );
 }
 
 /// Laravel's `comment()` on a table writes `alter table t comment = 'x'` and

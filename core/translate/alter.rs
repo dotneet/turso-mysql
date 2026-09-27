@@ -2046,7 +2046,17 @@ pub fn translate_alter_table(
                 match rename {
                     true => (false, false, None),
                     false => {
-                        let replacement_column = Column::try_from(&definition)?;
+                        // The column a table is loaded with has its custom type
+                        // resolved, so the one replacing it has to be too, or a
+                        // MySQL DECIMAL would read as NUMERIC until a reopen
+                        // and its rows would be rewritten under that affinity.
+                        let mut replacement_column = Column::try_from(&definition)?;
+                        resolver.with_schema(database_id, |schema| {
+                            schema.resolve_custom_type_affinity(
+                                &mut replacement_column,
+                                btree.is_strict,
+                            )
+                        });
                         let old_column = &btree.columns()[column_index];
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();

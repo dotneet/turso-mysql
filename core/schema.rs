@@ -1058,6 +1058,25 @@ impl Schema {
                 .is_some_and(|type_def| type_def.is_builtin)
     }
 
+    /// Gives one column the storage type and affinity of the base type its
+    /// custom type resolves to; see [`BTreeTable::resolve_custom_type_affinities`].
+    pub(crate) fn resolve_custom_type_affinity(&self, col: &mut Column, is_strict: bool) {
+        if !is_strict && !self.is_builtin_mysql_numeric_blob_type(&col.ty_str) {
+            return;
+        }
+        if col.is_array() {
+            // Arrays are stored as record-format blobs regardless of element type.
+            col.set_ty(Type::Blob);
+            col.override_affinity(Affinity::Blob);
+            return;
+        }
+        if let Ok(Some(resolved)) = self.resolve_type_unchecked(&col.ty_str) {
+            let (base_ty, _) = type_from_name(&resolved.primitive);
+            col.set_ty(base_ty);
+            col.override_affinity(Affinity::affinity(&resolved.primitive));
+        }
+    }
+
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
     pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
@@ -3660,21 +3679,9 @@ impl BTreeTable {
     /// instead of the custom type name (e.g. "doubled" contains "DOUB"
     /// which would incorrectly map to REAL instead of INTEGER).
     pub fn resolve_custom_type_affinities(&mut self, schema: &Schema) {
+        let is_strict = self.is_strict;
         for col in &mut self.columns {
-            if !self.is_strict && !schema.is_builtin_mysql_numeric_blob_type(&col.ty_str) {
-                continue;
-            }
-            if col.is_array() {
-                // Arrays are stored as record-format blobs regardless of element type.
-                col.set_ty(Type::Blob);
-                col.override_affinity(Affinity::Blob);
-                continue;
-            }
-            if let Ok(Some(resolved)) = schema.resolve_type_unchecked(&col.ty_str) {
-                let (base_ty, _) = type_from_name(&resolved.primitive);
-                col.set_ty(base_ty);
-                col.override_affinity(Affinity::affinity(&resolved.primitive));
-            }
+            schema.resolve_custom_type_affinity(col, is_strict);
         }
     }
 

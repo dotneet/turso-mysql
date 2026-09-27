@@ -3552,11 +3552,6 @@ pub fn alter_column_default_restated(
                 column_name.value.clone(),
             )));
         };
-        // A `DECIMAL` column restated by a `MODIFY` reads back as one no
-        // `SELECT` here takes, so its default is not changed that way.
-        if decimal_size_of(&column.data_type)?.is_some() {
-            return unsupported("changing the default of a DECIMAL column in place");
-        }
         let mut column = column.clone();
         column
             .options

@@ -4856,7 +4856,13 @@ fn a_default_change_is_a_modify_of_the_column_with_its_new_default() {
     }
     // Taken by MySQL, which then prints the column with no default at all.
     assert!(restated("ALTER TABLE s1 ALTER COLUMN a DROP DEFAULT").is_err());
-    assert!(restated("ALTER TABLE s1 ALTER COLUMN d SET DEFAULT 1").is_err());
+    // A DECIMAL restated with only its default changed keeps its size.
+    assert_eq!(
+        restated("ALTER TABLE s1 ALTER COLUMN d SET DEFAULT 1").unwrap(),
+        Some(MySqlColumnDefaultChange::Restated(
+            "ALTER TABLE `s1` MODIFY COLUMN `d` DECIMAL(8,2) DEFAULT 1".to_owned()
+        ))
+    );
     // Measured: 1067, written either way.
     for sql in [
         "CREATE TABLE t (a INT NOT NULL DEFAULT NULL)",

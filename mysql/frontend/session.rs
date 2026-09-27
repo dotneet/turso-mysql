@@ -3225,6 +3225,7 @@ impl MySqlConnection {
             self.reject_alter_with_marked_trigger()?;
             self.reject_alter_with_marked_view(&alter.body)?;
             self.reject_alter_over_a_primary_key_column(&alter.name.name, &alter.body)?;
+            self.reject_alter_changing_a_decimal(&alter.name.name, &alter.body)?;
         }
         if matches!(stmt, Stmt::CreateTrigger { .. }) {
             self.reject_duplicate_marked_insert_trigger(&stmt)?;
@@ -7698,6 +7699,65 @@ impl MySqlConnection {
             ));
         }
         Ok(())
+    }
+
+    /// Refuses a `MODIFY` or `CHANGE` that gives a `DECIMAL` column another
+    /// size or sign, or turns a column into or out of a `DECIMAL`.
+    ///
+    /// MySQL writes every stored value again in the column's new form —
+    /// measured on 8.4.11, a 1.5 in a `DECIMAL(8,2)` reads `1.500` after
+    /// `MODIFY d DECIMAL(12,3)` — while the engine keeps a `DECIMAL` as the
+    /// text it was written as, so the rows would keep their old form. The
+    /// same `DECIMAL` restated with another default or nullability is taken.
+    fn reject_alter_changing_a_decimal(
+        &self,
+        target: &turso_parser::ast::Name,
+        body: &AlterTableBody,
+    ) -> Result<()> {
+        let AlterTableBody::AlterColumn { old, new } = body else {
+            return Ok(());
+        };
+        let Ok(table) = MySqlTableName::parse(target.as_str()) else {
+            return Ok(());
+        };
+        let Ok(columns) = self.list_columns(&table) else {
+            return Ok(());
+        };
+        let Some(before) = columns
+            .iter()
+            .find(|column| column.name().eq_ignore_ascii_case(old.as_str()))
+        else {
+            return Ok(());
+        };
+        let before = before
+            .decimal_size()
+            .map(|size| (before.type_name() == "DECIMAL UNSIGNED", size));
+        let after = match new.col_type.as_ref() {
+            Some(data_type) if data_type.name.eq_ignore_ascii_case("mysql_decimal") => Some((
+                false,
+                turso_mysql_parser::stored_decimal_size(data_type)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?,
+            )),
+            Some(data_type)
+                if data_type
+                    .name
+                    .eq_ignore_ascii_case("mysql_decimal_unsigned") =>
+            {
+                Some((
+                    true,
+                    turso_mysql_parser::stored_decimal_size(data_type)
+                        .map_err(|error| LimboError::ParseError(error.to_string()))?,
+                ))
+            }
+            _ => None,
+        };
+        if before == after {
+            return Ok(());
+        }
+        Err(LimboError::ParseError(
+            "changing a DECIMAL column's size, sign or type in place needs its rows written again"
+                .to_string(),
+        ))
     }
 
     fn reject_alter_with_marked_trigger(&self) -> Result<()> {

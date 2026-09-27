@@ -17309,7 +17309,13 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     });
-    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    let mut new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    conn.with_schema(*db, |schema| {
+        let is_strict = schema
+            .get_btree_table(&normalized_table_name)
+            .is_some_and(|table| table.is_strict);
+        schema.resolve_custom_type_affinity(&mut new_column, is_strict);
+    });
     let new_name = definition.col_name.as_str().to_owned();
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {
