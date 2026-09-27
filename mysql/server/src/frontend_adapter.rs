@@ -6089,8 +6089,22 @@ fn scalar_call_column_definition(
     // before any column is looked at, the way `RAND()` is.
     if matches!(
         function,
-        ScalarFunction::BuildsJson | ScalarFunction::ChangesJson
+        ScalarFunction::BuildsJson
+            | ScalarFunction::ChangesJson
+            | ScalarFunction::CollectsBuiltJson
     ) {
+        for column_name in columns {
+            let (table, ordinal) = source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .column_named(column_name)?;
+            let source = table
+                .columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            if !writes_into_a_document_the_way_mysql_does(source) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+        }
         let mut definition = column_definition(name, MYSQL_TYPE_JSON);
         definition.column_length = u32::MAX - 3;
         definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
@@ -6876,6 +6890,7 @@ fn scalar_call_column_definition(
         | ScalarFunction::Digests
         | ScalarFunction::BuildsJson
         | ScalarFunction::ChangesJson
+        | ScalarFunction::CollectsBuiltJson
         | ScalarFunction::GroupsDigits
         | ScalarFunction::CutsDigits
         | ScalarFunction::SearchesJson
@@ -7339,6 +7354,28 @@ fn written_moment_definition(name: String, literal_characters: u32) -> ColumnDef
     definition.decimals = NOT_FIXED_DECIMALS;
     set_column_flags(&mut definition, 0);
     definition
+}
+
+/// Reports whether a column's value goes into a built JSON document the way
+/// MySQL writes it there.
+///
+/// Measured on MySQL 8.4.11: words and `ENUM` members as strings, whole
+/// numbers, a `DOUBLE`, a `YEAR` and a `DECIMAL` with no places as numbers, a
+/// `DATE` and a `DATETIME` as strings, and a `JSON` column as the document it
+/// holds. The rest are refused: a `TIME`, a `TIMESTAMP` — written in the
+/// session's zone — and a `DECIMAL` with places each by a rule the rendering
+/// does not follow, and a `FLOAT`, a `SET`, a `BIT` and binary strings have not
+/// been measured.
+#[cfg(unix)]
+fn writes_into_a_document_the_way_mysql_does(source: &MySqlColumnMetadata) -> bool {
+    is_text_column(source)
+        || is_whole_number_column(source.type_name())
+        || turso_mysql_parser::enum_members(source.type_name()).is_some()
+        || matches!(
+            source.type_name(),
+            "DOUBLE" | "YEAR" | "DATE" | "DATETIME" | "JSON"
+        )
+        || source.decimal_size().is_some_and(|(_, scale)| scale == 0)
 }
 
 #[cfg(unix)]

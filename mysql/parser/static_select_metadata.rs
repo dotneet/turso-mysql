@@ -311,6 +311,9 @@ pub enum ScalarFunction {
     /// `JSON_SET`, `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE`, which
     /// answer a document with one member changed.
     ChangesJson,
+    /// `JSON_ARRAYAGG` over a `JSON_OBJECT` or `JSON_ARRAY` built from each
+    /// row, which answers an array of the documents.
+    CollectsBuiltJson,
     /// `FORMAT`, which writes a number for a person to read.
     GroupsDigits,
     /// `TRUNCATE`, which cuts a number off at a count of places.
@@ -2228,6 +2231,31 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         }
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::BuildsJson,
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
+    // `JSON_ARRAYAGG(JSON_OBJECT('id', id, 'name', name))` is how an API
+    // answer nests the rows it read into one document. The columns are the
+    // ones the document is built from, held to what the builder takes.
+    if named(&["JSON_ARRAYAGG"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(built),
+        ))] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::BuildsJson,
+            columns,
+            ..
+        }) = scalar_call(built)
+        else {
+            return None;
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::CollectsBuiltJson,
             columns,
             literal_characters: 0,
             not_null: false,

@@ -1396,7 +1396,13 @@ fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
         || static_select_metadata::aggregate_over_branches(function).is_some()
         || matches!(
             static_select_metadata::scalar_call(function),
-            Some(StaticSelectMetadata::DefaultedAggregate(_))
+            Some(
+                StaticSelectMetadata::DefaultedAggregate(_)
+                    | StaticSelectMetadata::ScalarCall {
+                        function: static_select_metadata::ScalarFunction::CollectsBuiltJson,
+                        ..
+                    }
+            )
         )
 }
 
@@ -5526,9 +5532,19 @@ fn render_scalar_call(
         _ => false,
     };
     if has_decimal_argument
-        && !["ABS", "TRUNCATE", "ROUND", "FORMAT"]
-            .iter()
-            .any(|call| name.value.eq_ignore_ascii_case(call))
+        && ![
+            "ABS",
+            "TRUNCATE",
+            "ROUND",
+            "FORMAT",
+            "JSON_ARRAY",
+            "JSON_OBJECT",
+            "JSON_SET",
+            "JSON_INSERT",
+            "JSON_REPLACE",
+        ]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call))
     {
         return unsupported("SELECT function over DECIMAL requires exact numeric handling");
     }
@@ -5883,7 +5899,24 @@ fn render_scalar_call(
         return Ok(format!(
             "mysql_json_document({}({}))",
             name.value.to_lowercase(),
-            render_scalar_arguments(function, render_context)?
+            render_json_builder_arguments(function, render_context)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("JSON_ARRAYAGG") {
+        // Each row's document is read back as a document, so the array holds
+        // it rather than its text. Over no rows MySQL answers NULL where the
+        // engine answers an empty array.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked JSON_ARRAYAGG was checked to have an argument list");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(built),
+        ))] = arguments.args.as_slice()
+        else {
+            unreachable!("a checked JSON_ARRAYAGG was checked to take a built document");
+        };
+        return Ok(format!(
+            "CASE WHEN count(*) = 0 THEN NULL ELSE mysql_json_document(json_group_array(json({}))) END",
+            render_scalar_call(built, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_SET")
         || name.value.eq_ignore_ascii_case("JSON_INSERT")
@@ -5892,11 +5925,41 @@ fn render_scalar_call(
     {
         // The engine changes the same member the same way — the paths this
         // takes are the ones the two agree on — and writes the answer without
-        // MySQL's spacing, so it is written again.
+        // MySQL's spacing, so it is written again. A value put into the
+        // document is written into it the way a built document writes one.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let removes = name.value.eq_ignore_ascii_case("JSON_REMOVE");
+        let rendered = arguments
+            .args
+            .iter()
+            .enumerate()
+            .map(|(position, argument)| {
+                let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = argument
+                else {
+                    return unsupported("SELECT call argument");
+                };
+                if !removes && position > 0 && position % 2 == 0 {
+                    return render_json_value_argument(expr, render_context);
+                }
+                // The document changed is a JSON column or text; MySQL refuses
+                // a number or a moment there with 3146.
+                if position == 0
+                    && (decimal_operand_scale(expr, render_context.decimal_columns).is_some()
+                        || matches!(expr, Expr::Identifier(column) if render_context.is_moment_column(&column.value)))
+                {
+                    return unsupported("JSON document changed that is not a document");
+                }
+                scalar_argument(function, position)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
         return Ok(format!(
-            "mysql_json_document({}({}))",
-            name.value.to_lowercase(),
-            render_scalar_arguments(function, render_context)?
+            "mysql_json_document({}({rendered}))",
+            name.value.to_lowercase()
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_CONTAINS_PATH") {
         // The engine's json_type answers the kind at a path and nothing at all
@@ -6430,6 +6493,97 @@ fn render_aggregate_over_branches(
             _,
         ) => unreachable!("only COUNT, SUM, AVG, MIN and MAX are read over a CASE"),
     })
+}
+
+/// Renders what `JSON_ARRAY` and `JSON_OBJECT` are given, each the way MySQL
+/// writes it into a document.
+///
+/// Measured on MySQL 8.4.11: a `JSON` column is written in as the document it
+/// holds rather than as its text, a `DATETIME` as a string carrying six places
+/// of a second — `"2026-01-02 03:04:05.000000"` — and a `BIGINT UNSIGNED` or a
+/// `DECIMAL` with no places as the number it holds, which the engine reads out
+/// of either as text. A `DECIMAL` with places is written with every place it
+/// carries — `1.50` — which a document read back through the engine loses, so
+/// it is refused, and so is a number written with a place the engine would
+/// not write back.
+fn render_json_builder_arguments(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    arguments
+        .args
+        .iter()
+        .map(|argument| {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                argument
+            else {
+                return unsupported("SELECT call argument");
+            };
+            render_json_value_argument(expr, render_context)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|arguments| arguments.join(", "))
+}
+
+fn render_json_value_argument(
+    expr: &Expr,
+    render_context: &SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let Expr::Identifier(column) = expr else {
+        if names_a_number_a_double_writes_differently(expr) {
+            return unsupported("JSON document built from a number written with a trailing zero");
+        }
+        return render_scalar_argument_expr(expr);
+    };
+    let rendered = render_ident(column);
+    if render_context.is_json_column(&column.value) {
+        return Ok(format!("json({rendered})"));
+    }
+    if render_context.is_moment_column(&column.value) {
+        return Ok(format!(
+            "substr({rendered} || CASE WHEN instr({rendered}, '.') > 0 THEN '000000' ELSE '.000000' END, 1, 26)"
+        ));
+    }
+    match decimal_operand_scale(expr, render_context.decimal_columns) {
+        Some(0) => Ok(format!("json({rendered})")),
+        Some(_) => unsupported("JSON document built from a DECIMAL with places"),
+        None => Ok(rendered),
+    }
+}
+
+/// Reports whether a number written with a point goes into a document with
+/// digits the engine's double would not write back.
+///
+/// Measured on MySQL 8.4.11: `JSON_ARRAY(1.5, 1.0, 10.00, 1.10)` is
+/// `[1.5, 1.0, 10.00, 1.10]` — every place written is kept — where the engine
+/// reads each as a double and writes `10.0` and `1.1`. A double writes back
+/// the shortest digits that read as it, which are the written ones while no
+/// place past the first is a trailing zero and fifteen digits hold them.
+fn names_a_number_a_double_writes_differently(expr: &Expr) -> bool {
+    let written = match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: inner,
+        } => inner.as_ref(),
+        other => other,
+    };
+    let Expr::Value(value) = written else {
+        return false;
+    };
+    let Value::Number(number, false) = &value.value else {
+        return false;
+    };
+    let Some((whole, fraction)) = number.split_once('.') else {
+        return false;
+    };
+    if number.contains(['e', 'E']) {
+        return false;
+    }
+    (fraction.len() > 1 && fraction.ends_with('0'))
+        || whole.trim_start_matches('0').len() + fraction.len() > 15
 }
 
 /// Reads the clock to a count of places of a second.

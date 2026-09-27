@@ -106,7 +106,11 @@ JSON: `JSON_SEARCH` with a path to search inside. `JSON_SET`,
 `JSON_INSERT`, `JSON_REPLACE` and `JSON_REMOVE` take a path naming one member
 of the top-level object and refuse a wider one, which is the range the engine
 and MySQL agree on. `JSON_ARRAY` and `JSON_OBJECT` refuse a nested call and a
-boolean literal.
+boolean literal, and they and `JSON_SET` refuse a `DECIMAL` with places, a
+number written with a trailing zero past its first place (`10.00`), a `TIME`, a `TIMESTAMP`, a `FLOAT`, a `SET`, a
+`BIT` and binary strings, each written into a document by a rule not followed
+or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
+`JSON_ARRAY` and no other call.
 
 ---
 

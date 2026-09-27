@@ -3574,6 +3574,33 @@ boolean literal is refused: MySQL writes `true` where the engine has only the
 number one to write. `JSON_OBJECT` with an odd number of arguments is refused,
 where MySQL answers 1582.
 
+A column's value goes into a built document — and into one `JSON_SET`,
+`JSON_INSERT` or `JSON_REPLACE` changes — the way MySQL writes it there,
+measured on 8.4.11 over every kind taken: a word or an `ENUM` member as a
+string, a whole number, a `DOUBLE` and a `YEAR` as numbers, a `BIGINT
+UNSIGNED` — the usual key — and a `DECIMAL` with no places as the number they
+hold, `{"id": 18446744073709551615}`, a `DATE` as a string, a `DATETIME` as a
+string carrying six places of a second whatever the column keeps,
+`"2026-01-02 03:04:05.000000"`, and a `JSON` column as the document it holds
+rather than its text. These used to answer a `DATETIME` without its places and
+a `JSON` column as a string, and to refuse the unsigned key. A number written with a point keeps
+the places it was written with, `JSON_ARRAY(1.5, 1.0)` being `[1.5, 1.0]`,
+which the engine's double writes back the same way. Refused: a `DECIMAL` with
+places, and a number written with a trailing zero past its first place or with
+more than fifteen digits, which MySQL writes with every place they carry
+(`1.50`, `10.00`) and a double does not; a `TIME`, and a `TIMESTAMP`, which MySQL
+writes in the session's zone; and a `FLOAT`, a `SET`, a `BIT` and binary
+strings, which have not been measured. A number or a moment as the document
+`JSON_SET` changes is refused, which MySQL answers 3146 for.
+
+`JSON_ARRAYAGG(JSON_OBJECT(...))` and `JSON_ARRAYAGG(JSON_ARRAY(...))` nest the
+document built from each row into one array, which is how an API answer puts
+a list of rows into one value; grouped, each group's rows go into its own
+array. Measured on 8.4.11, it reports the JSON column the builders report and
+answers NULL over no rows, and it aggregates the statement, so a bare column
+beside it without a `GROUP BY` is refused as MySQL refuses it with 1140. Each
+row's document is read back as a document before it goes into the array.
+
 The four that change a document take a path naming one member of the top-level
 object — `$.a`, not `$.a.b` or `$.a[0]`. That is the range the two agree on.
 Measured on 8.4.11 against the engine: MySQL leaves `JSON_SET('{}', '$.x.y',
