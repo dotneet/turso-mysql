@@ -5373,8 +5373,8 @@ fn render_window_call(
     }) {
         return unsupported("SELECT window function over DECIMAL requires exact numeric handling");
     }
-    // `NTILE` carries a count and `LAG` and `LEAD` a column; the rest carry
-    // nothing, and each spelling is the engine's own.
+    // `NTILE` carries a count and `LAG` and `LEAD` a column, an offset and a
+    // default; the rest carry nothing, and each spelling is the engine's own.
     let arguments = arguments
         .args
         .iter()

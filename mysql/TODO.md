@@ -93,7 +93,9 @@ Every window function MySQL has is taken, with a `ROWS` or `RANGE` frame and a
 answers 1235 for, a frame bound that is not a plain non-negative number, a
 window term that is not a plain column, a named window standing for another
 name or built on one, a windowed aggregate over anything but one plain column,
-and a `LAG` or `LEAD` carrying an offset or a default.
+and a `LAG` or `LEAD` whose offset is not written or whose default is of
+another kind than its column — a number over a word, a word over a day, a
+number with a point.
 Numbers: a seeded `RAND(n)` is refused: the engine has no seeded random, so
 answering one would answer a different sequence.
 Written values: a number with a point or an exponent, a hexadecimal or bit

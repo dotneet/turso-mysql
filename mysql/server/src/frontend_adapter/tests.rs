@@ -15142,9 +15142,8 @@ fn window_calls_answer_the_shape_mysql_answers() {
         "SELECT SUM(n) OVER (ORDER BY id ROWS BETWEEN n PRECEDING AND CURRENT ROW) FROM w",
         // Measured: NTILE(0) answers 1210, so a count below one is refused.
         "SELECT NTILE(0) OVER (ORDER BY n) FROM w",
-        // An offset or a default argument brings rules of its own.
-        "SELECT LAG(n, 2) OVER (ORDER BY id) FROM w",
-        "SELECT LAG(n, 1, 0) OVER (ORDER BY id) FROM w",
+        // A default of another kind than the column's changes the type.
+        "SELECT LAG(n, 1, 1.5) OVER (ORDER BY id) FROM w",
         "SELECT SUM(n + 1) OVER (ORDER BY id) FROM w",
         // Measured: NTH_VALUE(col, 0) answers 1210, like NTILE(0).
         "SELECT NTH_VALUE(n, 0) OVER (ORDER BY id) FROM w",
@@ -30652,3 +30651,6 @@ mod built_documents;
 
 #[cfg(unix)]
 mod text_widths;
+
+#[cfg(unix)]
+mod window_offsets;

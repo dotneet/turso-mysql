@@ -356,6 +356,12 @@ pub enum ScalarFunction {
     /// window, which answer another row's value for the column they name, and
     /// NULL where there is no such row.
     ShiftsRow,
+    /// `LAG` and `LEAD` over a whole-number column with a written whole number
+    /// to answer where there is no such row, which widens the answer to the
+    /// default's own width.
+    ShiftsRowOrNumber,
+    /// The same over a `VARCHAR` with a written word to answer.
+    ShiftsRowOrWord,
     /// `SQRT` and `POW`, which answer a floating-point DOUBLE of length 23 and not-fixed decimals.
     Approximates,
     /// `PI`, which reads nothing and answers a narrower double than the rest.
@@ -1164,11 +1170,73 @@ pub(super) fn classify_window_call(
             kind,
         });
     }
+    // `LAG(col, 2)` reads the row two back, and `LAG(col, 1, 0)` answers 0
+    // where there is no such row. Measured on MySQL 8.4.11: an offset leaves
+    // the shape alone, and 0 reads the row itself; a default widens the answer
+    // to its own width — `LAG(n, 1, 99999999999)` over an INT reports 12 and
+    // `LAG(s, 1, 'a much longer default')` over a VARCHAR(10) 84 — and a
+    // default of NULL is no default at all. A default of another kind than the
+    // column's changes the type, `LAG(n, 1, 1.5)` answering a NEWDECIMAL, so
+    // a whole number is taken over a whole-number column and a word over a
+    // `VARCHAR`, which the frontend checks.
+    if named(&["LAG", "LEAD"]) && matches!(arguments.args.len(), 2 | 3) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Identifier(column),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(offset),
+        )), default @ ..] = arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let Value::Number(offset, false) = &offset.value else {
+            return None;
+        };
+        offset.parse::<u64>().ok()?;
+        let (function, literal_characters) = match default {
+            [] => (ScalarFunction::ShiftsRow, 0),
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                default,
+            ))] => match default {
+                Expr::Value(value) if matches!(value.value, Value::Null) => {
+                    (ScalarFunction::ShiftsRow, 0)
+                }
+                Expr::Value(value)
+                    if matches!(
+                        &value.value,
+                        Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+                    ) =>
+                {
+                    let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) =
+                        &value.value
+                    else {
+                        unreachable!("the guard requires a written word");
+                    };
+                    (
+                        ScalarFunction::ShiftsRowOrWord,
+                        u32::try_from(word.chars().count()).ok()?,
+                    )
+                }
+                _ => match classify_static_select_expr(default)? {
+                    StaticSelectMetadata::Integer { digit_count, .. } => (
+                        ScalarFunction::ShiftsRowOrNumber,
+                        digit_count.checked_add(1)?,
+                    ),
+                    _ => return None,
+                },
+            },
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function,
+            columns: vec![column.value.clone()],
+            literal_characters,
+            not_null: false,
+        });
+    }
     // `LAG` and `LEAD` read another row of the window and `FIRST_VALUE`,
     // `LAST_VALUE` and `NTH_VALUE` read one of its ends; all five answer the
-    // column's own shape and may find no row at all. An offset or a default
-    // argument on a `LAG` or `LEAD` brings rules of its own, unmeasured, and
-    // `NTH_VALUE(col, 0)` answers 1210, so its count is one or more.
+    // column's own shape and may find no row at all. `NTH_VALUE(col, 0)`
+    // answers 1210, so its count is one or more.
     let takes_a_count = named(&["NTH_VALUE"]);
     if named(&["LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE"]) || takes_a_count {
         let (column, count) = match arguments.args.as_slice() {

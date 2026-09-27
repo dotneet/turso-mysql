@@ -1053,8 +1053,9 @@ the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
 
 `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)`, `PERCENT_RANK()`,
-`CUME_DIST()`, `LAG(col)`, `LEAD(col)`, `FIRST_VALUE(col)`, `LAST_VALUE(col)`
-and `NTH_VALUE(col, n)` number, rank and shift the rows a `SELECT` answers. Both engines
+`CUME_DIST()`, `LAG(col [, offset [, default]])`, `LEAD(col [, offset [, default]])`,
+`FIRST_VALUE(col)`, `LAST_VALUE(col)` and `NTH_VALUE(col, n)` number, rank and
+shift the rows a `SELECT` answers. Both engines
 spell them the same way, so only the window is rewritten: a text column is
 partitioned and ordered under the case-ignoring collation MySQL's default gives
 it, the same treatment an outer `ORDER BY` gets, so `'a'` and `'A'` are one
@@ -1083,6 +1084,17 @@ reach for may not be there; they carry the numeric flag and, unlike `ABS`, not
 the binary one, so a `LAG` over an `INT` reports length 11 and one over a
 `DECIMAL(10,2)` reports 12 with its scale.
 
+`LAG` and `LEAD` take a written offset and a default for the row that is not
+there. Measured on 8.4.11: an offset leaves the shape the plain call reports,
+and 0 reads the row itself; a default widens the answer to its own width —
+`LAG(n, 1, 99999999999)` over an `INT` reports 12, `LAG(s, 1, 'a much longer
+default')` over a `VARCHAR(10)` 84 — and over a NOT NULL column makes the
+answer NOT NULL, which `LAG(nn)` alone is not. A default of `NULL` is no
+default. A default of another kind than the column's changes the type —
+`LAG(n, 1, 1.5)` answers a `NEWDECIMAL`, `LAG(d, 1, '2000-01-01')` over a
+`DATE` a `VAR_STRING` — so only a whole number over a whole-number column and
+a word over a `VARCHAR` are taken. An offset read from the row is refused.
+
 A frame says which rows around this one a call reads, and `ROWS` and `RANGE` are
 both taken, with `CURRENT ROW`, an unbounded end, or a non-negative whole number
 of rows or of the ordering column's own units at either bound. The shorthand
@@ -1107,8 +1119,7 @@ spelling of the same thing, and so is an `OVER` naming a window nothing defined.
 A window term still has to be a plain column: an expression is not something the
 checked ordering path can answer for.
 `NTILE(0)` and `NTH_VALUE(col, 0)` are refused, which MySQL answers 1210 for,
-and a `LAG` or `LEAD` carrying an offset or a default is refused, bringing rules
-of its own.
+and so is a `LAG` or `LEAD` whose default is of another kind than its column.
 
 A `DOUBLE` is written the way MySQL writes one, which the engine's own text form
 did not do. Both write the shortest digits that read back as the same double,

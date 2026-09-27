@@ -6484,7 +6484,24 @@ fn scalar_call_column_definition(
     // always nullable because the row they reach for may not be there. They
     // carry the numeric flag and, unlike ABS, not the binary one, and a text
     // column keeps its collation.
-    if function == ScalarFunction::ShiftsRow {
+    //
+    // A default for the row that is not there widens the answer to its own
+    // width, and over a NOT NULL column makes it NOT NULL too: measured,
+    // `LAG(nn, 1, 0)` over an `INT NOT NULL` reports NOT NULL where `LAG(nn)`
+    // does not.
+    if matches!(
+        function,
+        ScalarFunction::ShiftsRow
+            | ScalarFunction::ShiftsRowOrNumber
+            | ScalarFunction::ShiftsRowOrWord
+    ) {
+        let defaults_to_a_number = function == ScalarFunction::ShiftsRowOrNumber;
+        let defaults_to_a_word = function == ScalarFunction::ShiftsRowOrWord;
+        if (defaults_to_a_number && !is_whole_number_column(source.type_name()))
+            || (defaults_to_a_word && source.type_name() != "VARCHAR")
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         let mut definition = source_metadata.column_definition_for_reference(
             Some((table.table_reference.clone(), ordinal)),
             name,
@@ -6496,15 +6513,24 @@ fn scalar_call_column_definition(
         ) {
             definition.column_type = MYSQL_TYPE_LONGLONG;
         }
+        let default_width = if defaults_to_a_word {
+            literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER)
+        } else {
+            literal_characters
+        };
+        definition.column_length = definition.column_length.max(default_width);
         definition.schema.clear();
         definition.table.clear();
         definition.original_table.clear();
         definition.original_name.clear();
-        let flags = if is_text_column(source) {
+        let mut flags = if is_text_column(source) {
             0
         } else {
             MYSQL_NUM_FLAG
         };
+        if function != ScalarFunction::ShiftsRow && !source.nullable() && !table.outer {
+            flags |= MYSQL_NOT_NULL_FLAG;
+        }
         set_column_flags(&mut definition, flags);
         return Ok(definition);
     }
@@ -7162,7 +7188,11 @@ fn scalar_call_column_definition(
         ScalarFunction::NowToAFraction { .. } | ScalarFunction::TimeOfDayToAFraction { .. } => {
             unreachable!("a clock reading to a fraction was answered above")
         }
-        ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
+        ScalarFunction::RanksRows
+        | ScalarFunction::RanksFraction
+        | ScalarFunction::ShiftsRow
+        | ScalarFunction::ShiftsRowOrNumber
+        | ScalarFunction::ShiftsRowOrWord => {
             unreachable!("the window calls were answered above")
         }
         ScalarFunction::Compares | ScalarFunction::NegatesTruth | ScalarFunction::TestsTruth => {
@@ -7485,7 +7515,9 @@ fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
             | turso_mysql_parser::StaticSelectMetadata::ScalarCall {
                 function: ScalarFunction::RanksRows
                     | ScalarFunction::RanksFraction
-                    | ScalarFunction::ShiftsRow,
+                    | ScalarFunction::ShiftsRow
+                    | ScalarFunction::ShiftsRowOrNumber
+                    | ScalarFunction::ShiftsRowOrWord,
                 ..
             }
     )
