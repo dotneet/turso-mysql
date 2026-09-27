@@ -36,10 +36,10 @@ pub use session::{
     MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
-    MySqlQueryError, MySqlRenameTableError, MySqlShowCreateTableError, MySqlShowCreateTableResult,
-    MySqlSkippedView, MySqlTable, MySqlTableKind, MySqlTransactionOutcome, MySqlTriggerMetadata,
-    MySqlViewMetadata, MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT,
-    MAX_PREPARED_STMT_COUNT,
+    MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError, MySqlShowCreateTableError,
+    MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable, MySqlTableKind,
+    MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata, MySqlWriteResult,
+    ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
 pub use temporal_zone::shift_timestamp;
 pub use truncate_table::MySqlTruncateTableError;

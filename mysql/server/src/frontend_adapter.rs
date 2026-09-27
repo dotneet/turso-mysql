@@ -2337,6 +2337,41 @@ where
             };
         }
 
+        if let Some(command) =
+            turso_mysql_parser::parse_optional_show_create_view(sql, SessionSqlMode::default())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let selected_database = self
+                .session
+                .selected_database()
+                .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                .to_owned();
+            reject_other_database_qualifier(command.database(), &selected_database)?;
+            self.authorize(DatabaseAction::Query {
+                database: &selected_database,
+            })?;
+            let connection = self.session.connection().map_err(database_error_kind)?;
+            if let Some(view) = connection
+                .view_metadata(command.table())
+                .map_err(|_| FrontendErrorKind::Internal)?
+            {
+                return show_create_view_result(view, self.status_flags());
+            }
+            // Measured on MySQL 8.4.11: a table of that name is 1347 and a
+            // name nothing has is 1146.
+            let tables = connection.list_tables().map_err(frontend_error_kind)?;
+            return Err(
+                if tables
+                    .iter()
+                    .any(|table| table.name() == command.table().as_str())
+                {
+                    FrontendErrorKind::NotView
+                } else {
+                    FrontendErrorKind::MissingObject
+                },
+            );
+        }
+
         if let Some(command) = parse_optional_show_triggers(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -2491,6 +2526,53 @@ where
         }
         self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
+        let replacement = if may_create_a_view_or_trigger(sql) {
+            turso_mysql_parser::parse_optional_view_replacement(sql, connection.parser_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        } else {
+            None
+        };
+        if let Some(replacement) = replacement {
+            let creator = self
+                .authorizer
+                .schema_creator_username(&self.principal)
+                .map_err(authorization_frontend_error)?
+                .map(|username| {
+                    SchemaSqlCreator::new(
+                        username,
+                        crate::session_variables::reported_sql_mode(connection.parser_mode()),
+                    )
+                });
+            connection
+                .replace_view(&replacement, creator)
+                .map_err(|error| match error {
+                    turso_mysql::MySqlReplaceViewError::NotView => FrontendErrorKind::NotView,
+                    turso_mysql::MySqlReplaceViewError::MissingView => {
+                        FrontendErrorKind::MissingObject
+                    }
+                    turso_mysql::MySqlReplaceViewError::Query(error) => frontend_query_error(error),
+                })?;
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: connection_status_flags(connection),
+                ..CommandOkResult::default()
+            }));
+        }
+        // Measured on MySQL 8.4.11: a `CREATE VIEW` naming a table or a view
+        // that is already there is 1050, before anything else is read.
+        if may_create_a_view_or_trigger(sql) {
+            if let Ok(turso_parser::ast::Stmt::CreateView { view_name, .. }) =
+                turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode())
+            {
+                let view = MySqlTableName::parse(view_name.name.as_str())
+                    .map_err(|_| FrontendErrorKind::Syntax)?;
+                if connection
+                    .names_a_table(&view)
+                    .map_err(frontend_error_kind)?
+                {
+                    return Err(FrontendErrorKind::DuplicateObject);
+                }
+            }
+        }
         if may_create_a_view_or_trigger(sql)
             && matches!(
                 turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
@@ -4096,8 +4178,8 @@ fn prepare_for_client_statement(
         .map_err(frontend_query_error)
 }
 
-/// Whether a statement could be a `CREATE VIEW` or a `CREATE TRIGGER`, which
-/// every one names in so many words. Parsing a statement as schema DDL to find
+/// Whether a statement could be a `CREATE VIEW`, an `ALTER VIEW` or a
+/// `CREATE TRIGGER`, which every one names in so many words. Parsing a statement as schema DDL to find
 /// out costs as much as running a primary-key `SELECT`, so the rest skip it.
 fn may_create_a_view_or_trigger(sql: &str) -> bool {
     [b"VIEW".as_slice(), b"TRIGGER".as_slice()]

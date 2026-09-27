@@ -21,6 +21,7 @@ mod moment_difference;
 mod mysql_ddl;
 mod network_address;
 mod number_format;
+mod replace_view;
 mod select_projection_origins;
 mod session_queries;
 mod session_settings;
@@ -129,6 +130,7 @@ pub use mysql_ddl::{
 };
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
+pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
 pub use select_projection_origins::{
     compound_drops_repeated_rows, select_projection_origins, MySqlSelectProjectionOrigin,
 };
@@ -2947,6 +2949,27 @@ pub fn parse_optional_show_create_table(
         return Ok(None);
     }
     if !consume_admin_word(&tokens, &mut cursor, "TABLE") {
+        return Ok(None);
+    }
+    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    if !admin_command_ends(&tokens, cursor) {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlShowCreateTableCommand { database, table }))
+}
+
+/// Parses `SHOW CREATE VIEW [db.]name`, which names its view the way
+/// `SHOW CREATE TABLE` names its table.
+pub fn parse_optional_show_create_view(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlShowCreateTableCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    if !consume_admin_word(&tokens, &mut cursor, "SHOW")
+        || !consume_admin_word(&tokens, &mut cursor, "CREATE")
+        || !consume_admin_word(&tokens, &mut cursor, "VIEW")
+    {
         return Ok(None);
     }
     let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;

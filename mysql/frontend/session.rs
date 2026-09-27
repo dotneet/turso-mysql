@@ -31,8 +31,8 @@ use turso_mysql_parser::{
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
     MySqlDropViewCommand, MySqlSelectSource, MySqlTableName, MySqlTransactionCommand,
-    MySqlTruncateTableCommand, ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
-    StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
+    MySqlTruncateTableCommand, MySqlViewReplacement, ParseError as MySqlParseError, SessionSqlMode,
+    StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -311,6 +311,17 @@ pub enum MySqlDropViewError {
     /// One statement named the same view twice, which MySQL answers with 1066.
     NamedTwice,
     Engine(LimboError),
+}
+
+/// Failure while writing a view again with `CREATE OR REPLACE VIEW` or
+/// `ALTER VIEW`.
+#[derive(Debug)]
+pub enum MySqlReplaceViewError {
+    /// A table has the name: MySQL answers 1347.
+    NotView,
+    /// `ALTER VIEW` named nothing: MySQL answers 1146.
+    MissingView,
+    Query(MySqlQueryError),
 }
 
 /// A name a `DROP VIEW IF EXISTS` passed over, each noted by MySQL.
@@ -3398,6 +3409,82 @@ impl MySqlConnection {
                 .map_err(MySqlQueryError::Engine)?;
         }
         result
+    }
+
+    /// Writes a view again, as `CREATE OR REPLACE VIEW` and `ALTER VIEW` do.
+    ///
+    /// Measured on MySQL 8.4.11: either answers 1347 for a table of that name,
+    /// `ALTER VIEW` answers 1146 for a name nothing has, and `CREATE OR
+    /// REPLACE VIEW` makes the view then. The old view is dropped and the new
+    /// one made inside one transaction, so a body the checked `CREATE VIEW`
+    /// refuses leaves the old view standing.
+    pub fn replace_view(
+        &self,
+        replacement: &MySqlViewReplacement,
+        creator: Option<SchemaSqlCreator>,
+    ) -> std::result::Result<(), MySqlReplaceViewError> {
+        let engine = |error| MySqlReplaceViewError::Query(MySqlQueryError::Engine(error));
+        parse_create_view_ast(replacement.create_view(), self.parser_mode()).map_err(|error| {
+            MySqlReplaceViewError::Query(MySqlQueryError::Unsupported(error.to_string()))
+        })?;
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(engine)?;
+        }
+        let tables = self.list_tables().map_err(engine)?;
+        let replaced = match tables
+            .iter()
+            .find(|table| table.name() == replacement.view().as_str())
+        {
+            Some(table) if table.kind() != MySqlTableKind::View => {
+                return Err(MySqlReplaceViewError::NotView);
+            }
+            Some(_) => true,
+            None if replacement.requires_the_view() => {
+                return Err(MySqlReplaceViewError::MissingView);
+            }
+            None => false,
+        };
+        self.inner
+            .prepare("BEGIN")
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(engine)?;
+        let written = self.drop_and_create_view(replacement, replaced, creator);
+        let finish = if written.is_ok() {
+            "COMMIT"
+        } else {
+            "ROLLBACK"
+        };
+        self.inner
+            .prepare(finish)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(engine)?;
+        written.map_err(engine)
+    }
+
+    fn drop_and_create_view(
+        &self,
+        replacement: &MySqlViewReplacement,
+        replaced: bool,
+        creator: Option<SchemaSqlCreator>,
+    ) -> Result<()> {
+        if replaced {
+            let name = replacement.view().as_str();
+            let stmt = Stmt::DropView {
+                if_exists: false,
+                view_name: turso_parser::ast::QualifiedName::single(
+                    turso_parser::ast::Name::exact(name.to_owned()),
+                ),
+            };
+            let sql = format!("DROP VIEW \"{}\"", name.replace('"', "\"\""));
+            self.inner
+                .prepare_translated_stmt(stmt, &sql)
+                .and_then(|mut statement| statement.run_ignore_rows())?;
+        }
+        self.prepare_schema_with_creator(replacement.create_view(), false, creator)
+            .and_then(|mut statement| statement.run_ignore_rows())
     }
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.

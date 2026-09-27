@@ -114,3 +114,65 @@ fn drop_view_takes_if_exists_and_several_names() {
         ["Note|1051|Unknown table 'probe.v2'"]
     );
 }
+
+/// MySQL prints the definer's host, `localhost` for the measured `root`, and
+/// the connection's collation, `utf8mb4_0900_ai_ci`; this server prints `%`,
+/// knowing no host, and the `utf8mb4_general_ci` it claims everywhere.
+#[test]
+fn create_or_replace_and_alter_view_write_the_view_again() {
+    let (_directory, mut adapter) = adapter();
+    let shown =
+        |adapter: &mut Adapter, view: &str| rows(adapter, &format!("SHOW CREATE VIEW {view}"));
+    run(
+        &mut adapter,
+        "CREATE OR REPLACE VIEW v3 AS SELECT id FROM plain",
+    );
+    assert_eq!(
+        shown(&mut adapter, "v3"),
+        ["v3|CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v3` AS select `plain`.`id` AS `id` from `plain`|utf8mb4|utf8mb4_general_ci"]
+    );
+    run(
+        &mut adapter,
+        "CREATE OR REPLACE VIEW v3 AS SELECT id, name FROM plain",
+    );
+    assert_eq!(
+        shown(&mut adapter, "v3"),
+        ["v3|CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v3` AS select `plain`.`id` AS `id`,`plain`.`name` AS `name` from `plain`|utf8mb4|utf8mb4_general_ci"]
+    );
+    run(&mut adapter, "ALTER VIEW v3 AS SELECT name FROM plain");
+    assert_eq!(
+        shown(&mut adapter, "v3"),
+        ["v3|CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v3` AS select `plain`.`name` AS `name` from `plain`|utf8mb4|utf8mb4_general_ci"]
+    );
+    run(&mut adapter, "INSERT INTO plain (id, name) VALUES (1, 'x')");
+    assert_eq!(rows(&mut adapter, "SELECT name FROM v3"), ["x"]);
+
+    for (sql, error) in [
+        (
+            "CREATE OR REPLACE VIEW plain AS SELECT id FROM posts",
+            FrontendErrorKind::NotView,
+        ),
+        (
+            "ALTER VIEW plain AS SELECT id FROM posts",
+            FrontendErrorKind::NotView,
+        ),
+        (
+            "ALTER VIEW nope AS SELECT id FROM posts",
+            FrontendErrorKind::MissingObject,
+        ),
+        (
+            "CREATE VIEW v3 AS SELECT id FROM plain",
+            FrontendErrorKind::DuplicateObject,
+        ),
+        ("SHOW CREATE VIEW plain", FrontendErrorKind::NotView),
+        ("SHOW CREATE VIEW nope", FrontendErrorKind::MissingObject),
+    ] {
+        assert_eq!(adapter.execute_query(sql), Err(error), "{sql}");
+    }
+    // A body the checked CREATE VIEW refuses leaves the old view standing.
+    assert!(adapter
+        .execute_query("CREATE OR REPLACE VIEW v3 AS SELECT id FROM plain LIMIT 1")
+        .is_err());
+    assert_eq!(rows(&mut adapter, "SELECT name FROM v3"), ["x"]);
+    assert_eq!(views(&mut adapter), ["v3|VIEW"]);
+}
