@@ -358,7 +358,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `TINYINT`/`SMALLINT`/`MEDIUMINT`/`INT` `UNSIGNED` | works |
 | `BIGINT UNSIGNED` | works across 0..18446744073709551615, including prepared binary values, indexed comparisons, and reopening a database; see COMPAT.md for the remaining expression boundaries |
 | `VARCHAR`, `CHAR`, `TEXT`, `TINYTEXT`, `MEDIUMTEXT`, `LONGTEXT`, `BLOB`, `TINYBLOB`, `MEDIUMBLOB`, `LONGBLOB` | works |
-| `DECIMAL`, `DOUBLE`, `FLOAT` | works |
+| `DECIMAL`, `DOUBLE`, `FLOAT`, and the other spellings `DOUBLE PRECISION`, `REAL`, `FLOAT4`, `FLOAT8` | works |
 | `DATETIME`, `TIMESTAMP` | works with fractional precision 0 through 6; fixed-offset TIMESTAMP conversions have the boundaries below |
 | An unsigned prepared value above `i64::MAX` compared with a signed `BIGINT` | refused with 1235; MySQL finds no matching signed row, but this frontend has not implemented that cross-type comparison |
 | `BIGINT UNSIGNED AUTO_INCREMENT` | supported with a separate `mysql_uint64` primary key and a durable `u64` counter, including starts above `i64::MAX`, multirow generated IDs, explicit wide IDs, and reopening; `ON DUPLICATE KEY UPDATE` is refused because its updated-row ID cannot yet be reported correctly |

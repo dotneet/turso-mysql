@@ -497,3 +497,53 @@ fn a_table_keeps_its_comment() {
         vec![some(&["1", "1"])]
     );
 }
+
+/// Django writes `double precision` for every `FloatField`.
+#[test]
+fn double_precision_and_real_are_doubles() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE f1 (a DOUBLE PRECISION, b REAL, c DOUBLE PRECISION UNSIGNED, d REAL NOT NULL DEFAULT 1.5, e FLOAT4, f FLOAT8)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO f1 (a, b, c, d) VALUES (0.1, 0.1, 0.1, 0.1)",
+    );
+    let expected = concat!(
+        "CREATE TABLE `f1` (\n",
+        "  `a` double DEFAULT NULL,\n",
+        "  `b` double DEFAULT NULL,\n",
+        "  `c` double unsigned DEFAULT NULL,\n",
+        "  `d` double NOT NULL DEFAULT '1.5',\n",
+        "  `e` float DEFAULT NULL,\n",
+        "  `f` double DEFAULT NULL\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    for reopen in [false, true] {
+        if reopen {
+            adapter = reopened(&directory, adapter);
+        }
+        let adapter = &mut adapter;
+        assert_eq!(printed_table(adapter, "f1"), expected);
+        assert_eq!(
+            rows(adapter, "SELECT a, b, c, d FROM f1"),
+            vec![some(&["0.1", "0.1", "0.1", "0.1"])]
+        );
+        assert_eq!(
+            rows(
+                adapter,
+                "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE FROM information_schema.COLUMNS \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'f1' ORDER BY ORDINAL_POSITION"
+            ),
+            vec![
+                some(&["a", "double", "double"]),
+                some(&["b", "double", "double"]),
+                some(&["c", "double", "double unsigned"]),
+                some(&["d", "double", "double"]),
+                some(&["e", "float", "float"]),
+                some(&["f", "double", "double"]),
+            ]
+        );
+    }
+}

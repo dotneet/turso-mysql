@@ -473,7 +473,6 @@ fn renderer_preserves_trailing_backslash_under_both_string_modes() {
 fn renderer_rejects_sqlite_ast_fields_outside_the_checked_subset() {
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY)",
-        "CREATE TABLE t (value REAL)",
         "CREATE TABLE t (id INTEGER, CHECK (id LIKE 'x'))",
     ] {
         let statement = parse_sqlite_create_table(sql);
@@ -5601,7 +5600,6 @@ fn rejects_mysql_attributes_instead_of_dropping_them() {
         "CREATE TABLE t (id INTEGER DEFAULT CURRENT_TIMESTAMP)",
         "CREATE TABLE t (id INTEGER, UNIQUE KEY uq_id (id))",
         "CREATE TABLE t (id INTEGER, CHECK (RAND() > 0))",
-        "CREATE TABLE t (value REAL)",
         "CREATE TABLE t (id INTEGER, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES app.parent (id))",
         "CREATE TABLE t (id INTEGER, CHECK (3 / 2 = 1))",
         "CREATE TABLE t (id INTEGER, CHECK (NOT id BETWEEN 0 AND 1))",

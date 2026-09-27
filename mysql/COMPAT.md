@@ -659,6 +659,14 @@ statements, while `INT UNSIGNED DEFAULT '-0.4'` rounds to 0 in both. A `DOUBLE` 
 and refuses one MySQL would print as some other number (`'1.50'`, `' 1'`,
 `'1e2'`) along with a word naming no number, which MySQL answers 1067 for.
 
+`DOUBLE PRECISION`, which Django writes for every `FloatField`, `REAL` and
+`FLOAT8` are other spellings of `DOUBLE`, and `FLOAT4` of `FLOAT`; the column
+keeps nothing of the spelling. Measured on 8.4.11 and matched: each prints as
+`double` (or `float`) in `SHOW CREATE TABLE` and `information_schema.COLUMNS`,
+`DOUBLE PRECISION UNSIGNED` and `REAL UNSIGNED` as `double unsigned`. `REAL` is a
+`DOUBLE` because MySQL's `REAL_AS_FLOAT` mode is off, which it is by default and
+in the one mode this server runs in.
+
 A column declared `NOT NULL DEFAULT NULL`, in either order, is refused, as MySQL
 refuses it with 1067.
 

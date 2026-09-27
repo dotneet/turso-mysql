@@ -4703,6 +4703,7 @@ pub fn parse_mysql_numeric_spec(
                     column.data_type,
                     DataType::Float(sqlparser::ast::ExactNumberInfo::None)
                         | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                        | DataType::Float4
                 )
             })
             .collect(),
@@ -4713,6 +4714,8 @@ pub fn parse_mysql_numeric_spec(
                 matches!(
                     column.data_type,
                     DataType::DoubleUnsigned(sqlparser::ast::ExactNumberInfo::None)
+                        | DataType::DoublePrecisionUnsigned
+                        | DataType::RealUnsigned
                         | DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None)
                         | DataType::DecimalUnsigned(_)
                         | DataType::DecUnsigned(_)
@@ -6608,6 +6611,16 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::FloatUnsigned(sqlparser::ast::ExactNumberInfo::None) => {
             "FLOAT UNSIGNED".to_owned()
         }
+        // MySQL's other spellings of the same two types, which a column keeps
+        // nothing of: measured on 8.4.11, `DOUBLE PRECISION`, `REAL` and
+        // `FLOAT8` print `double`, `DOUBLE PRECISION UNSIGNED` and `REAL
+        // UNSIGNED` print `double unsigned`, and `FLOAT4` prints `float`.
+        // `REAL` is a `DOUBLE` because the `REAL_AS_FLOAT` mode is off, which
+        // it is in MySQL's default and in the only mode this server runs in.
+        // Django writes `double precision` for every `FloatField`.
+        DataType::DoublePrecision | DataType::Real | DataType::Float8 => "DOUBLE".to_owned(),
+        DataType::DoublePrecisionUnsigned | DataType::RealUnsigned => "DOUBLE UNSIGNED".to_owned(),
+        DataType::Float4 => "FLOAT".to_owned(),
         // MySQL stores BOOLEAN and BOOL as TINYINT and reports both as
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.
@@ -7245,8 +7258,14 @@ fn floating_point_type(data_type: &DataType) -> bool {
         data_type,
         DataType::Double(_)
             | DataType::DoubleUnsigned(_)
+            | DataType::DoublePrecision
+            | DataType::DoublePrecisionUnsigned
+            | DataType::Real
+            | DataType::RealUnsigned
+            | DataType::Float8
             | DataType::Float(_)
             | DataType::FloatUnsigned(_)
+            | DataType::Float4
     )
 }
 
@@ -7285,12 +7304,15 @@ fn reject_a_floating_default_mysql_would_print_otherwise(
         _ => return Ok(()),
     };
     let (single, most_places) = match data_type {
-        DataType::Float(_) | DataType::FloatUnsigned(_) => (true, 6),
+        DataType::Float(_) | DataType::FloatUnsigned(_) | DataType::Float4 => (true, 6),
         _ => (false, 7),
     };
     let unsigned = matches!(
         data_type,
-        DataType::DoubleUnsigned(_) | DataType::FloatUnsigned(_)
+        DataType::DoubleUnsigned(_)
+            | DataType::DoublePrecisionUnsigned
+            | DataType::RealUnsigned
+            | DataType::FloatUnsigned(_)
     );
     let magnitude = match word.strip_prefix('-') {
         Some(_) if unsigned => {
