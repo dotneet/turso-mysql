@@ -30750,3 +30750,6 @@ mod database_collation;
 
 #[cfg(unix)]
 mod cut_group_concat;
+
+#[cfg(unix)]
+mod triggers;

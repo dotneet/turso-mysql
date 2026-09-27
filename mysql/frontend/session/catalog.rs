@@ -256,7 +256,13 @@ impl MySqlConnection {
             .filter(|trigger| !trigger.temporary)
             .map(|trigger| trigger_metadata(trigger))
             .collect::<Result<Vec<_>>>()?;
-        triggers.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        // Measured on MySQL 8.4.11: `SHOW TRIGGERS` lists them by table, a
+        // table's `INSERT` triggers before its `UPDATE` and `DELETE` ones, and
+        // `BEFORE` before `AFTER`. One table, event and timing carries one
+        // trigger here, so nothing is left to order by.
+        triggers.sort_unstable_by(|left, right| {
+            (&left.table, left.event, left.timing).cmp(&(&right.table, right.event, right.timing))
+        });
         Ok(triggers)
     }
 
@@ -1384,19 +1390,15 @@ fn trigger_metadata(trigger: &turso_core::schema::Trigger) -> Result<MySqlTrigge
         ansi_quotes: decoded.context.sql_mode.ansi_quotes,
         no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
     };
-    let parsed = parse_schema_ddl_ast(decoded.normalized_ddl, mode)
+    let written = turso_mysql_parser::written_trigger(decoded.normalized_ddl, mode)
         .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-    let create_statement =
-        turso_mysql_parser::render_show_create_trigger_mysql(&parsed, &creator.username)
-            .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-    let (_, statement) = create_statement
-        .rsplit_once(" FOR EACH ROW ")
-        .ok_or_else(|| LimboError::Corrupt("normalized trigger lost its body".into()))?;
     Ok(MySqlTriggerMetadata {
         name: trigger.name.clone(),
         table: trigger.table_name.clone(),
-        statement: statement.to_owned(),
-        create_statement,
+        event: written.event(),
+        timing: written.timing(),
+        statement: written.body().to_owned(),
+        create_statement: written.show_create(&creator.username),
         creator,
     })
 }

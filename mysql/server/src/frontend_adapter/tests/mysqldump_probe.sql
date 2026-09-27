@@ -43,7 +43,7 @@ CREATE TABLE `audit` (
 
 LOCK TABLES `audit` WRITE;
 /*!40000 ALTER TABLE `audit` DISABLE KEYS */;
-INSERT INTO `audit` VALUES (1,'Hello'),(2,'It\'s \"quoted\"'),(3,'Café');
+INSERT INTO `audit` VALUES (1,'post Hello'),(2,'post It\'s \"quoted\"'),(3,'post Café');
 /*!40000 ALTER TABLE `audit` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -84,7 +84,7 @@ UNLOCK TABLES;
 /*!50003 SET @saved_sql_mode       = @@sql_mode */ ;
 /*!50003 SET sql_mode              = 'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION' */ ;
 DELIMITER ;;
-/*!50003 CREATE*/ /*!50017 DEFINER=`dump_owner`@`%`*/ /*!50003 TRIGGER `posts_audit` AFTER INSERT ON `posts` FOR EACH ROW INSERT INTO audit (note) VALUES (NEW.title) */;;
+/*!50003 CREATE*/ /*!50017 DEFINER=`dump_owner`@`%`*/ /*!50003 TRIGGER `posts_audit` AFTER INSERT ON `posts` FOR EACH ROW INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title)) */;;
 DELIMITER ;
 /*!50003 SET sql_mode              = @saved_sql_mode */ ;
 /*!50003 SET character_set_client  = @saved_cs_client */ ;
@@ -197,4 +197,4 @@ USE `probe`;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2026-09-27 23:28:58
+-- Dump completed on 2026-09-27 23:51:59

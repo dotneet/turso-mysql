@@ -2209,10 +2209,10 @@ pub(super) fn show_triggers_result(
     for trigger in triggers {
         let fields = [
             trigger.name,
-            "INSERT".to_owned(),
+            trigger.event.written().to_owned(),
             trigger.table,
             trigger.statement,
-            "AFTER".to_owned(),
+            trigger.timing.written().to_owned(),
             trigger.creator.created_at,
             trigger.creator.sql_mode,
             format!("{}@%", trigger.creator.username),

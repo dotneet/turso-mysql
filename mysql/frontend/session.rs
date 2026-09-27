@@ -1,5 +1,6 @@
 mod catalog;
 mod transaction_isolation;
+mod trigger_body;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,10 +24,9 @@ use turso_mysql_parser::{
     parse_dml, parse_insert_values_written_into, parse_optional_autocommit_setting,
     parse_prepared_auto_increment_insert, parse_schema_ddl_ast, parse_select,
     parse_transaction_command, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, AutoIncrementRowValue, BoundAutoIncrementInsert,
-    CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedComparisonAnswer,
-    CheckedComparisonNow, CheckedComparisonOperand, CheckedInsertValue,
+    render_create_table_mysql_with_mode, render_create_view_mysql_with_mode, AutoIncrementRowValue,
+    BoundAutoIncrementInsert, CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert,
+    CheckedComparisonAnswer, CheckedComparisonNow, CheckedComparisonOperand, CheckedInsertValue,
     CheckedPrimaryKeyCreateTable, CheckedSelectComparison, CheckedSelectComparisonOperator,
     CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
@@ -320,6 +320,9 @@ pub struct MySqlViewMetadata {
 pub struct MySqlTriggerMetadata {
     pub name: String,
     pub table: String,
+    pub event: turso_mysql_parser::MySqlTriggerEvent,
+    pub timing: turso_mysql_parser::MySqlTriggerTiming,
+    /// The body as it was written.
     pub statement: String,
     pub create_statement: String,
     pub creator: SchemaSqlCreator,
@@ -3684,7 +3687,18 @@ impl MySqlConnection {
             self.reject_alter_changing_a_decimal(&alter.name.name, &alter.body)?;
         }
         if matches!(stmt, Stmt::CreateTrigger { .. }) {
-            self.reject_duplicate_marked_insert_trigger(&stmt)?;
+            let written = turso_mysql_parser::trigger_written_as_mysql_keeps_it(sql, mode)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?
+                .ok_or_else(|| {
+                    LimboError::ParseError("a CREATE TRIGGER that reads as none".to_string())
+                })?;
+            // The trigger is made from, and kept as, its header written the
+            // way MySQL prints it and its body as it was written.
+            if written != sql {
+                return self.prepare_schema_with_creator(&written, implicit_index, creator);
+            }
+            self.check_trigger_body(&written)?;
+            self.reject_a_second_trigger_for_one_event(&stmt)?;
         }
         if let Stmt::CreateIndex {
             idx_name,
@@ -3742,9 +3756,7 @@ impl MySqlConnection {
             }
             Stmt::CreateView { .. } => render_create_view_mysql_with_mode(&stmt, mode)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
-            Stmt::CreateTrigger { .. } => render_create_trigger_mysql_with_mode(&stmt, mode)
-                .map_err(|error| LimboError::ParseError(error.to_string()))?,
-            Stmt::AlterTable(_) => sql.to_string(),
+            Stmt::CreateTrigger { .. } | Stmt::AlterTable(_) => sql.to_string(),
             _ => unreachable!("MySQL schema parser returned an unsupported statement"),
         };
         let formatter: Arc<dyn SchemaSqlFormatter> = match creator {
@@ -9508,29 +9520,31 @@ impl MySqlConnection {
         Ok(())
     }
 
-    fn reject_duplicate_marked_insert_trigger(&self, stmt: &Stmt) -> Result<()> {
-        let Stmt::CreateTrigger { tbl_name, .. } = stmt else {
+    /// Refuses a second trigger for one table, event and timing: MySQL runs
+    /// such triggers in the order they were made, which is not kept here.
+    fn reject_a_second_trigger_for_one_event(&self, stmt: &Stmt) -> Result<()> {
+        let Stmt::CreateTrigger {
+            tbl_name,
+            time,
+            event,
+            ..
+        } = stmt
+        else {
             unreachable!("checked CREATE TRIGGER statement");
         };
-        let rows = self
-            .inner
-            .prepare("SELECT tbl_name, sql FROM sqlite_schema WHERE type = 'trigger'")?
-            .run_collect_rows()?;
-        for row in rows {
-            let [table_name, _sql] = row.as_slice() else {
-                return Err(LimboError::InternalError(
-                    "sqlite_schema trigger row has an invalid shape".to_string(),
-                ));
-            };
-            if table_name
-                .to_string()
+        let schema = self.inner.current_schema();
+        let taken = schema.triggers.values().flatten().any(|trigger| {
+            trigger
+                .table_name
                 .eq_ignore_ascii_case(tbl_name.name.as_str())
-            {
-                return Err(LimboError::ParseError(
-                    "a trigger already exists for this table; MySQL trigger ordering is not supported"
-                        .to_string(),
-                ));
-            }
+                && Some(trigger.time) == *time
+                && trigger.event == *event
+        });
+        if taken {
+            return Err(LimboError::ParseError(
+                "a trigger already exists for this table, event and timing; MySQL trigger ordering is not supported"
+                    .to_string(),
+            ));
         }
         Ok(())
     }

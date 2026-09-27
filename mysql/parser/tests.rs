@@ -6825,60 +6825,163 @@ fn rejects_unsafe_create_view_forms() {
 }
 
 #[test]
-fn translates_and_renders_safe_create_triggers() {
-    let statement = parse_create_trigger_ast(
-        "CREATE TRIGGER `copy user` AFTER INSERT ON `users` FOR EACH ROW BEGIN INSERT INTO `audit log` (`user name`, `kind`) VALUES (NEW.`name`, 'created'); END",
+fn keeps_a_trigger_body_the_way_mysql_keeps_it() {
+    // Each body is what MySQL 8.4.11's `SHOW CREATE TRIGGER` printed for the
+    // same statement: the header written its own way, the body as written
+    // without the whitespace around it or the `;` ending the statement.
+    for (sql, written, body) in [
+        (
+            "CREATE TRIGGER copy_user AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit_log (user_name, kind) VALUES (NEW.`name`, 'created'); END",
+            "CREATE TRIGGER `copy_user` AFTER INSERT ON `users` FOR EACH ROW BEGIN INSERT INTO audit_log (user_name, kind) VALUES (NEW.`name`, 'created'); END",
+            "BEGIN INSERT INTO audit_log (user_name, kind) VALUES (NEW.`name`, 'created'); END",
+        ),
+        (
+            "create   trigger t9 after   insert on posts for each row   insert into audit(note) values (concat('x ', new.title))  ;",
+            "CREATE TRIGGER `t9` AFTER INSERT ON `posts` FOR EACH ROW insert into audit(note) values (concat('x ', new.title))",
+            "insert into audit(note) values (concat('x ', new.title))",
+        ),
+        (
+            "CREATE TRIGGER t10 AFTER UPDATE ON posts FOR EACH ROW\nBEGIN\n  INSERT INTO audit (note) VALUES (CONCAT(OLD.title, ' -> ', NEW.title));\nEND",
+            "CREATE TRIGGER `t10` AFTER UPDATE ON `posts` FOR EACH ROW BEGIN\n  INSERT INTO audit (note) VALUES (CONCAT(OLD.title, ' -> ', NEW.title));\nEND",
+            "BEGIN\n  INSERT INTO audit (note) VALUES (CONCAT(OLD.title, ' -> ', NEW.title));\nEND",
+        ),
+        (
+            "CREATE TRIGGER semi2 AFTER DELETE ON users FOR EACH ROW INSERT INTO counters (id, n) VALUES (OLD.id, 2) ;  ",
+            "CREATE TRIGGER `semi2` AFTER DELETE ON `users` FOR EACH ROW INSERT INTO counters (id, n) VALUES (OLD.id, 2)",
+            "INSERT INTO counters (id, n) VALUES (OLD.id, 2)",
+        ),
+        (
+            "/*!50003 CREATE*/ /*!50017 DEFINER=`dump_owner`@`%`*/ /*!50003 TRIGGER `posts_audit` AFTER INSERT ON `posts` FOR EACH ROW INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title)) */",
+            "CREATE TRIGGER `posts_audit` AFTER INSERT ON `posts` FOR EACH ROW INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title))",
+            "INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title))",
+        ),
+    ] {
+        let mode = SessionSqlMode::default();
+        let kept = trigger_written_as_mysql_keeps_it(sql, mode)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{sql}"));
+        assert_eq!(kept, written, "{sql}");
+        assert_eq!(
+            trigger_written_as_mysql_keeps_it(&kept, mode).unwrap().as_deref(),
+            Some(written)
+        );
+        assert_eq!(written_trigger(&kept, mode).unwrap().body(), body);
+        let statement = parse_create_trigger_ast(&kept, mode).unwrap();
+        assert_eq!(mysql_create_trigger_ddl(&statement, &kept, mode).unwrap(), kept);
+    }
+
+    let kept = written_trigger(
+        "CREATE TRIGGER `t10` AFTER UPDATE ON `posts` FOR EACH ROW BEGIN\n  INSERT INTO audit (note) VALUES (CONCAT(OLD.title, ' -> ', NEW.title));\nEND",
         SessionSqlMode::default(),
     )
     .unwrap();
-
-    assert!(matches!(statement, Stmt::CreateTrigger { .. }));
-    let rendered = render_create_trigger_mysql(&statement).unwrap();
+    assert_eq!(kept.name().as_str(), "t10");
+    assert_eq!(kept.table().as_str(), "posts");
+    assert_eq!(kept.timing(), MySqlTriggerTiming::After);
+    assert_eq!(kept.event(), MySqlTriggerEvent::Update);
     assert_eq!(
-        rendered,
-        "CREATE TRIGGER `copy user` AFTER INSERT ON `users` FOR EACH ROW BEGIN INSERT INTO `audit log` (`user name`, `kind`) VALUES (NEW.`name`, 'created'); END"
+        kept.show_create("root"),
+        "CREATE DEFINER=`root`@`%` TRIGGER `t10` AFTER UPDATE ON `posts` FOR EACH ROW BEGIN\n  INSERT INTO audit (note) VALUES (CONCAT(OLD.title, ' -> ', NEW.title));\nEND"
     );
-    for mode in [
-        SessionSqlMode::default(),
-        SessionSqlMode {
-            ansi_quotes: true,
-            no_backslash_escapes: true,
-        },
-    ] {
-        let reparsed = parse_create_trigger_ast(&rendered, mode).unwrap();
-        assert_eq!(
-            render_create_trigger_mysql_with_mode(&reparsed, mode).unwrap(),
-            rendered
-        );
-    }
 }
 
 #[test]
-fn mysql_cli_trigger_for_the_dump_fixture_reaches_the_schema_renderer() {
-    let sql = "CREATE TRIGGER dump_copy AFTER INSERT ON dump_records FOR EACH ROW BEGIN INSERT INTO dump_audit (id, name) VALUES (NEW.id, NEW.name); END";
-    let rendered = "CREATE TRIGGER `dump_copy` AFTER INSERT ON `dump_records` FOR EACH ROW BEGIN INSERT INTO `dump_audit` (`id`, `name`) VALUES (NEW.`id`, NEW.`name`); END";
-    for sent in [sql.to_owned(), format!("{sql};")] {
-        let statement = parse_schema_ddl_ast(&sent, SessionSqlMode::default()).unwrap();
-        assert!(matches!(statement, Stmt::CreateTrigger { .. }));
+fn translates_a_trigger_body_the_same_whatever_its_columns_hold() {
+    for (sql, engine) in [
+        (
+            "CREATE TRIGGER t2 AFTER INSERT ON users FOR EACH ROW INSERT INTO audit (msg) VALUES (CONCAT('new ', NEW.name))",
+            "CREATE TRIGGER \"t2\" AFTER INSERT ON \"users\" FOR EACH ROW BEGIN INSERT INTO \"audit\" (\"msg\") VALUES (('new ' || NEW.\"name\")); END",
+        ),
+        (
+            "CREATE TRIGGER t4 AFTER INSERT ON posts FOR EACH ROW UPDATE counters SET n = n + 1 WHERE id = NEW.owner_id",
+            "CREATE TRIGGER \"t4\" AFTER INSERT ON \"posts\" FOR EACH ROW BEGIN UPDATE \"counters\" SET \"n\" = (\"n\" + 1) WHERE (\"id\" = NEW.\"owner_id\"); END",
+        ),
+        (
+            "CREATE TRIGGER t5 AFTER DELETE ON posts FOR EACH ROW BEGIN DELETE FROM tags WHERE post_id = OLD.id AND kind = 2; UPDATE counters SET n = n - 1, last = NULL WHERE id = OLD.owner_id; END",
+            "CREATE TRIGGER \"t5\" AFTER DELETE ON \"posts\" FOR EACH ROW BEGIN DELETE FROM \"tags\" WHERE (\"post_id\" = OLD.\"id\") AND (\"kind\" = 2); UPDATE \"counters\" SET \"n\" = (\"n\" - 1), \"last\" = NULL WHERE (\"id\" = OLD.\"owner_id\"); END",
+        ),
+    ] {
+        let mode = SessionSqlMode::default();
         assert_eq!(
-            render_create_trigger_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap(),
-            rendered
+            crate::trigger_definition::translate_create_trigger(sql, mode).unwrap(),
+            engine,
+            "{sql}"
         );
     }
+    let body = trigger_body_readings(
+        "CREATE TRIGGER t4 AFTER UPDATE ON posts FOR EACH ROW UPDATE counters SET n = n + 1, label = CONCAT(OLD.title, '/', NEW.title) WHERE id = NEW.owner_id",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(body.table().as_str(), "posts");
+    assert_eq!(body.event(), MySqlTriggerEvent::Update);
+    let [write] = body.writes() else {
+        panic!("one statement");
+    };
+    assert_eq!(write.table().as_str(), "counters");
+    assert_eq!(write.kind(), MySqlTriggerWriteKind::Update);
+    assert_eq!(
+        write.assigned(),
+        [
+            (
+                "n".to_owned(),
+                MySqlTriggerValue::Shifted {
+                    column: Box::new(MySqlTriggerValue::Column("n".to_owned())),
+                    by: 1
+                }
+            ),
+            (
+                "label".to_owned(),
+                MySqlTriggerValue::Joined(vec![
+                    MySqlTriggerValue::Row {
+                        new: false,
+                        column: "title".to_owned()
+                    },
+                    MySqlTriggerValue::Word("/".to_owned()),
+                    MySqlTriggerValue::Row {
+                        new: true,
+                        column: "title".to_owned()
+                    },
+                ])
+            ),
+        ]
+    );
+    assert_eq!(
+        write.compared(),
+        [(
+            "id".to_owned(),
+            MySqlTriggerValue::Row {
+                new: true,
+                column: "owner_id".to_owned()
+            }
+        )]
+    );
 }
 
 #[test]
 fn rejects_unsafe_create_trigger_forms() {
     for sql in [
+        // A `BEFORE` trigger can change the row, which the engine has no
+        // statement for.
         "CREATE TRIGGER before_insert BEFORE INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
-        "CREATE TRIGGER update_insert AFTER UPDATE ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
-        "CREATE TRIGGER delete_insert AFTER DELETE ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (OLD.name); END",
         "CREATE TRIGGER conditional AFTER INSERT ON users FOR EACH ROW WHEN NEW.name IS NOT NULL BEGIN INSERT INTO audit (name) VALUES (NEW.name); END",
-        "CREATE TRIGGER multi AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name); INSERT INTO audit (name) VALUES ('again'); END",
         "CREATE TRIGGER expression AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (LOWER(NEW.name)); END",
         "CREATE TRIGGER select_insert AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) SELECT name FROM users; END",
         "CREATE TRIGGER upsert AFTER INSERT ON users FOR EACH ROW BEGIN INSERT INTO audit (name) VALUES (NEW.name) ON DUPLICATE KEY UPDATE name = NEW.name; END",
         "CREATE TRIGGER ignored AFTER INSERT ON users FOR EACH ROW BEGIN INSERT IGNORE INTO audit (name) VALUES (NEW.name); END",
+        "CREATE TRIGGER two_rows AFTER INSERT ON users FOR EACH ROW INSERT INTO audit (name) VALUES (NEW.name), ('x')",
+        "CREATE TRIGGER no_columns AFTER INSERT ON users FOR EACH ROW INSERT INTO audit VALUES (NEW.name)",
+        // 1363 in MySQL.
+        "CREATE TRIGGER no_new AFTER DELETE ON users FOR EACH ROW INSERT INTO audit (name) VALUES (NEW.name)",
+        "CREATE TRIGGER no_old AFTER INSERT ON users FOR EACH ROW INSERT INTO audit (name) VALUES (OLD.name)",
+        // 1442 in MySQL when the trigger runs.
+        "CREATE TRIGGER own_table AFTER INSERT ON users FOR EACH ROW UPDATE users SET n = 1 WHERE id = NEW.id",
+        "CREATE TRIGGER fraction AFTER INSERT ON users FOR EACH ROW INSERT INTO audit (n) VALUES (1.5)",
+        "CREATE TRIGGER sorted AFTER INSERT ON users FOR EACH ROW UPDATE counters SET n = 1 ORDER BY id LIMIT 1",
+        "CREATE TRIGGER everything AFTER INSERT ON users FOR EACH ROW DELETE FROM counters",
+        "CREATE TRIGGER compared AFTER INSERT ON users FOR EACH ROW UPDATE counters SET n = 1 WHERE id > NEW.id",
+        "CREATE TRIGGER twice AFTER INSERT ON users FOR EACH ROW UPDATE counters SET n = 1, m = n WHERE id = NEW.id",
+        "CREATE TRIGGER other_db AFTER INSERT ON users FOR EACH ROW INSERT INTO other.audit (name) VALUES (NEW.name)",
     ] {
         assert!(
             parse_create_trigger_ast(sql, SessionSqlMode::default()).is_err(),

@@ -13,8 +13,7 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode, table_options_of,
-    SessionSqlMode,
+    render_create_table_mysql_with_mode, table_options_of, SessionSqlMode,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -415,8 +414,9 @@ impl Dialect for MySqlDialect {
                     return Dialect::schema_sql_for_replay(&turso_core::SqliteDialect, kind, sql);
                 };
                 let statement = parse_marked_trigger(decoded)?;
-                let normalized = render_create_trigger_mysql_with_mode(
+                let normalized = turso_mysql_parser::mysql_create_trigger_ddl(
                     &statement,
+                    decoded.normalized_ddl,
                     session_sql_mode(decoded.context.sql_mode),
                 )
                 .map_err(|error| {

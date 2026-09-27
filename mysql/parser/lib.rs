@@ -39,6 +39,7 @@ mod str_to_date;
 mod table_collation;
 mod temporal_value;
 mod translate;
+mod trigger_definition;
 mod truncate_table;
 mod view_definition;
 mod written_bytes;
@@ -133,11 +134,9 @@ pub use moment_difference::{days_between, units_between};
 pub use mysql_ddl::{
     render_counted_create_table_mysql_with_mode, render_create_index_mysql,
     render_create_index_mysql_with_mode, render_create_table_mysql,
-    render_create_table_mysql_with_mode, render_create_trigger_mysql,
-    render_create_trigger_mysql_with_mode, render_create_view_mysql,
-    render_create_view_mysql_with_mode, render_show_create_trigger_mysql,
-    render_show_create_view_mysql, render_view_definition_mysql, stored_character_length,
-    stored_temporal_precision,
+    render_create_table_mysql_with_mode, render_create_view_mysql,
+    render_create_view_mysql_with_mode, render_show_create_view_mysql,
+    render_view_definition_mysql, stored_character_length, stored_temporal_precision,
 };
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
@@ -189,6 +188,11 @@ pub use temporal_value::{
     year_from_number,
 };
 pub use translate::{MySqlCatalogTable, MySqlDerivedColumns, MySqlSelectSource};
+pub use trigger_definition::{
+    mysql_create_trigger_ddl, trigger_body_readings, trigger_written_as_mysql_keeps_it,
+    written_trigger, MySqlTriggerBody, MySqlTriggerEvent, MySqlTriggerTiming, MySqlTriggerValue,
+    MySqlTriggerWrite, MySqlTriggerWriteKind, MySqlWrittenTrigger,
+};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use view_definition::{
     created_view_name, mysql_create_view_ddl, render_show_create_written_view_mysql,
@@ -5261,11 +5265,7 @@ pub fn parse_create_view_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Pa
 pub fn parse_create_trigger_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
     let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
     let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
-    let statement = parse_one_statement(sql, mode)?;
-    let Statement::CreateTrigger(trigger) = statement else {
-        return Err(ParseError::ExpectedCreateTrigger);
-    };
-    let normalized = translate_create_trigger(&trigger)?;
+    let normalized = trigger_definition::translate_create_trigger(sql, mode)?;
     parse_normalized_create_trigger(&normalized)
 }
 
@@ -5274,7 +5274,17 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
     let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
     let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
     reject_unsupported_mysql_string_escapes(sql, mode)?;
-    let statement = parse_one_statement(sql, mode)?;
+    let statement = match parse_one_statement(sql, mode) {
+        Ok(statement) => statement,
+        Err(error) => {
+            return match trigger_definition::parse_trigger(sql, mode) {
+                Ok(Some(_)) => parse_normalized_create_trigger(
+                    &trigger_definition::translate_create_trigger(sql, mode)?,
+                ),
+                _ => Err(error),
+            }
+        }
+    };
     match statement {
         Statement::CreateTable(table) => match translate_create_table(&table) {
             Ok(translated) => parse_normalized_create_table(translated.as_sql()),
@@ -5290,8 +5300,8 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
             let normalized = translate_create_view(&view, mode)?;
             parse_normalized_create_view(&normalized)
         }
-        Statement::CreateTrigger(trigger) => {
-            let normalized = translate_create_trigger(&trigger)?;
+        Statement::CreateTrigger(_) => {
+            let normalized = trigger_definition::translate_create_trigger(sql, mode)?;
             parse_normalized_create_trigger(&normalized)
         }
         Statement::AlterTable(alter) => {
@@ -6101,134 +6111,6 @@ pub(crate) fn refuse_view_options(view: &CreateView) -> Result<(), ParseError> {
         return unsupported("CREATE VIEW option");
     }
     Ok(())
-}
-
-fn translate_create_trigger(trigger: &CreateTrigger) -> Result<String, ParseError> {
-    if trigger.or_alter
-        || trigger.temporary
-        || trigger.or_replace
-        || trigger.is_constraint
-        || !trigger.period_before_table
-        || trigger.referenced_table_name.is_some()
-        || !trigger.referencing.is_empty()
-        || trigger.condition.is_some()
-        || trigger.exec_body.is_some()
-        || trigger.statements_as
-        || trigger.characteristics.is_some()
-    {
-        return unsupported("CREATE TRIGGER option");
-    }
-    if trigger.period != Some(TriggerPeriod::After)
-        || !matches!(trigger.events.as_slice(), [SqlTriggerEvent::Insert])
-        || !matches!(
-            trigger.trigger_object,
-            Some(TriggerObjectKind::ForEach(TriggerObject::Row))
-        )
-    {
-        return unsupported("CREATE TRIGGER timing or event");
-    }
-
-    let trigger_name = render_unqualified_name(&trigger.name)?;
-    let table_name = render_unqualified_name(&trigger.table_name)?;
-    let statements = trigger.statements.as_ref().ok_or(ParseError::Unsupported {
-        feature: "CREATE TRIGGER body",
-    })?;
-    let sqlparser::ast::ConditionalStatements::BeginEnd(body) = statements else {
-        return unsupported("CREATE TRIGGER body");
-    };
-    let [Statement::Insert(insert)] = body.statements.as_slice() else {
-        return unsupported("CREATE TRIGGER body");
-    };
-    let TableObject::TableName(target_table) = &insert.table else {
-        return unsupported("CREATE TRIGGER INSERT target");
-    };
-    if !insert.optimizer_hints.is_empty()
-        || insert.or.is_some()
-        || insert.ignore
-        || !insert.into
-        || insert.table_alias.is_some()
-        || insert.overwrite
-        || !insert.assignments.is_empty()
-        || insert.partitioned.is_some()
-        || !insert.after_columns.is_empty()
-        || insert.has_table_keyword
-        || insert.on.is_some()
-        || insert.returning.is_some()
-        || insert.output.is_some()
-        || insert.priority.is_some()
-        || insert.insert_alias.is_some()
-        || insert.settings.is_some()
-        || insert.format_clause.is_some()
-        || insert.multi_table_insert_type.is_some()
-        || !insert.multi_table_into_clauses.is_empty()
-        || !insert.multi_table_when_clauses.is_empty()
-        || insert.multi_table_else_clause.is_some()
-    {
-        return unsupported("CREATE TRIGGER INSERT option");
-    }
-    let target_table = render_unqualified_name(target_table)?;
-    if insert.columns.is_empty() {
-        return unsupported("CREATE TRIGGER INSERT without columns");
-    }
-    let columns = insert
-        .columns
-        .iter()
-        .map(render_unqualified_name)
-        .collect::<Result<Vec<_>, _>>()?;
-    let Some(source) = &insert.source else {
-        return unsupported("CREATE TRIGGER INSERT source");
-    };
-    if source.with.is_some()
-        || source.order_by.is_some()
-        || source.limit_clause.is_some()
-        || source.fetch.is_some()
-        || !source.locks.is_empty()
-        || source.for_clause.is_some()
-        || source.settings.is_some()
-        || source.format_clause.is_some()
-        || !source.pipe_operators.is_empty()
-    {
-        return unsupported("CREATE TRIGGER INSERT source");
-    }
-    let SetExpr::Values(values) = source.body.as_ref() else {
-        return unsupported("CREATE TRIGGER INSERT SELECT");
-    };
-    if values.explicit_row || values.value_keyword {
-        return unsupported("CREATE TRIGGER INSERT VALUES option");
-    }
-    let [values] = values.rows.as_slice() else {
-        return unsupported("CREATE TRIGGER INSERT VALUES rows");
-    };
-    if values.len() != columns.len() {
-        return unsupported("CREATE TRIGGER INSERT value count");
-    }
-    let values = values
-        .iter()
-        .map(render_trigger_value)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(format!(
-        "CREATE TRIGGER {trigger_name} AFTER INSERT ON {table_name} FOR EACH ROW BEGIN INSERT INTO {target_table} ({}) VALUES ({}); END",
-        columns.join(", "),
-        values.join(", ")
-    ))
-}
-
-fn render_trigger_value(value: &Expr) -> Result<String, ParseError> {
-    match value {
-        Expr::CompoundIdentifier(parts) if matches!(parts.as_slice(), [prefix, _] if prefix.value.eq_ignore_ascii_case("NEW")) => {
-            Ok(format!("NEW.{}", render_ident(&parts[1])))
-        }
-        Expr::Value(value) => match &value.value {
-            Value::Number(value, _) => Ok(value.clone()),
-            Value::SingleQuotedString(value) | Value::DoubleQuotedString(value) => {
-                Ok(format!("'{}'", value.replace('\'', "''")))
-            }
-            Value::Boolean(value) => Ok(if *value { "TRUE" } else { "FALSE" }.to_string()),
-            Value::Null => Ok("NULL".to_string()),
-            _ => unsupported("CREATE TRIGGER literal"),
-        },
-        _ => unsupported("CREATE TRIGGER value expression"),
-    }
 }
 
 /// Renders one MySQL `ALTER TABLE` as the SQLite statements it means.

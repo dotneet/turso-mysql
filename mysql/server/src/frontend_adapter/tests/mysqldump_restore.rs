@@ -4,11 +4,11 @@
 //! `mysqldump_probe.sql` is a real dump, taken with `mysqldump
 //! --single-transaction --databases probe` from MySQL 8.4.11, of a schema with
 //! counted tables, a foreign key, `JSON`, `DECIMAL` defaults, a
-//! `utf8mb4_unicode_ci` table beside `utf8mb4_0900_ai_ci` ones, a trigger, and
-//! a view of one table and a view joining two, both created by a latin1
-//! client. Its objects were made by an account `dump_owner`@`%`, which is the
-//! `DEFINER` the dump names. Every expectation here was measured by restoring
-//! that same file there.
+//! `utf8mb4_unicode_ci` table beside `utf8mb4_0900_ai_ci` ones, a trigger
+//! writing a `CONCAT` of its row into another table, and a view of one table
+//! and a view joining two, both created by a latin1 client. Its objects were
+//! made by an account `dump_owner`@`%`, which is the `DEFINER` the dump names.
+//! Every expectation here was measured by restoring that same file there.
 
 use super::*;
 
@@ -176,9 +176,9 @@ fn a_standard_dump_restores_every_row_it_holds() {
     assert_eq!(
         rows(&mut adapter, "SELECT * FROM audit ORDER BY id"),
         [
-            row(&[Some("1"), Some("Hello")]),
-            row(&[Some("2"), Some("It's \"quoted\"")]),
-            row(&[Some("3"), Some("Café")]),
+            row(&[Some("1"), Some("post Hello")]),
+            row(&[Some("2"), Some("post It's \"quoted\"")]),
+            row(&[Some("3"), Some("post Café")]),
         ]
     );
     assert_eq!(
@@ -293,11 +293,24 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
             "CREATE ALGORITHM=UNDEFINED DEFINER=`dump_owner`@`%` SQL SECURITY DEFINER VIEW `user_posts` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`)))"
         )
     );
+    // The trigger's body reads back as the dump wrote it, as MySQL's does.
     let triggers = rows(&mut adapter, "SHOW TRIGGERS");
     assert_eq!(triggers.len(), 1);
     assert_eq!(
-        triggers[0][..3],
-        row(&[Some("posts_audit"), Some("INSERT"), Some("posts")])
+        triggers[0][..5],
+        row(&[
+            Some("posts_audit"),
+            Some("INSERT"),
+            Some("posts"),
+            Some("INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title))"),
+            Some("AFTER"),
+        ])
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW CREATE TRIGGER posts_audit")[0][2].as_deref(),
+        Some(
+            "CREATE DEFINER=`dump_owner`@`%` TRIGGER `posts_audit` AFTER INSERT ON `posts` FOR EACH ROW INSERT INTO audit (note) VALUES (CONCAT('post ', NEW.title))"
+        )
     );
     // MySQL writes a new post and its audit row, numbered 4 in both tables.
     let new_post = ok(

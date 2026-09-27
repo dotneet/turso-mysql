@@ -8,8 +8,8 @@ pub use turso_core::SchemaSqlKind;
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_table_ast, render_counted_create_table_mysql_with_mode,
-    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
-    render_create_trigger_mysql_with_mode, table_options_of, SessionSqlMode,
+    render_create_index_mysql_with_mode, render_create_table_mysql_with_mode, table_options_of,
+    SessionSqlMode,
 };
 
 const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
@@ -411,7 +411,7 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
                     ansi_quotes: self.sql_mode.ansi_quotes,
                     no_backslash_escapes: self.sql_mode.no_backslash_escapes,
                 };
-                render_create_trigger_mysql_with_mode(stmt, mode)
+                turso_mysql_parser::mysql_create_trigger_ddl(stmt, input, mode)
             }
             _ => unreachable!("checked supported MySQL schema kind"),
         }

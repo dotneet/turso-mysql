@@ -34,9 +34,11 @@ pub fn parse_optional_mysqldump_ddl(sql: &str) -> Result<Option<MySqlDumpDdl>, P
         let Some(rest) = rest.strip_prefix(" TRIGGER ") else {
             return unsupported("mysqldump CREATE DEFINER statement");
         };
-        let trigger = normalize_trigger_body(rest)?;
+        if !rest.contains(" FOR EACH ROW ") {
+            return unsupported("mysqldump TRIGGER body");
+        }
         return Ok(Some(MySqlDumpDdl {
-            normalized_sql: format!("CREATE TRIGGER {trigger}"),
+            normalized_sql: format!("CREATE TRIGGER {rest}"),
             definer: Some(definer),
         }));
     }
@@ -179,19 +181,6 @@ fn take_backtick_name(sql: &str) -> Option<(String, &str)> {
     None
 }
 
-fn normalize_trigger_body(trigger: &str) -> Result<String, ParseError> {
-    let Some((head, body)) = trigger.split_once(" FOR EACH ROW ") else {
-        return unsupported("mysqldump TRIGGER body");
-    };
-    if body.starts_with("BEGIN ") && body.ends_with(" END") {
-        return Ok(trigger.to_owned());
-    }
-    if body.contains(';') {
-        return unsupported("mysqldump TRIGGER body");
-    }
-    Ok(format!("{head} FOR EACH ROW BEGIN {body}; END"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,7 +190,7 @@ mod tests {
         let trigger = "/*!50003 CREATE*/ /*!50017 DEFINER=`gateadmin`@`%`*/ /*!50003 TRIGGER `copy` AFTER INSERT ON `records` FOR EACH ROW INSERT INTO audit (id) VALUES (NEW.id) */";
         let parsed = parse_optional_mysqldump_ddl(trigger).unwrap().unwrap();
         assert_eq!(parsed.definer(), Some("gateadmin"));
-        assert_eq!(parsed.normalized_sql(), "CREATE TRIGGER `copy` AFTER INSERT ON `records` FOR EACH ROW BEGIN INSERT INTO audit (id) VALUES (NEW.id); END");
+        assert_eq!(parsed.normalized_sql(), "CREATE TRIGGER `copy` AFTER INSERT ON `records` FOR EACH ROW INSERT INTO audit (id) VALUES (NEW.id)");
 
         let view = "/*!50001 CREATE ALGORITHM=UNDEFINED */\n/*!50013 DEFINER=`gateadmin`@`%` SQL SECURITY DEFINER */\n/*!50001 VIEW `names` AS select `records`.`id` AS `id` from `records` */";
         let parsed = parse_optional_mysqldump_ddl(view).unwrap().unwrap();

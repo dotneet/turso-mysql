@@ -1702,8 +1702,8 @@ fn schema_ddl_commits_prior_work_and_returns_idle_after_success() -> Result<()> 
         ),
         (
             "trigger",
-            Some("CREATE TABLE triggered_notes (body TEXT)"),
-            "CREATE TRIGGER copy_note AFTER INSERT ON triggered_notes FOR EACH ROW BEGIN INSERT INTO committed_notes (id) VALUES (NEW.rowid); END",
+            Some("CREATE TABLE triggered_notes (id INT, body TEXT)"),
+            "CREATE TRIGGER copy_note AFTER INSERT ON triggered_notes FOR EACH ROW BEGIN INSERT INTO committed_notes (id) VALUES (NEW.id); END",
             "copy_note",
             "trigger",
         ),
