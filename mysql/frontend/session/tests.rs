@@ -5327,7 +5327,8 @@ fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Resu
         .unwrap();
     for value in [
         MySqlPreparedValue::Real(2.0),
-        MySqlPreparedValue::Text("2".to_string()),
+        MySqlPreparedValue::Text("2.0".to_string()),
+        MySqlPreparedValue::Text(" 2".to_string()),
         MySqlPreparedValue::Blob(vec![b'2']),
     ] {
         assert!(matches!(
@@ -5337,6 +5338,18 @@ fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Resu
             ))
         ));
     }
+    // A word naming a whole number is bound as that number, which is what
+    // MySQL reads it as.
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                invalid_metadata.statement_id,
+                &[MySqlPreparedValue::Text("02".to_string())],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))?,
+        vec![vec![MySqlPreparedValue::Integer(2)]]
+    );
 
     connection.close()?;
     Ok(())
@@ -5523,9 +5536,11 @@ fn comparisons_leave_out_rows_whose_column_is_null() -> Result<()> {
         .execute_prepared_select(prepared.statement_id, &[MySqlPreparedValue::Null], None)
         .unwrap()
         .is_empty());
-    // Values MySQL would coerce are refused rather than guessed at.
+    // Values MySQL would coerce are refused rather than guessed at. A word
+    // naming a whole number is the one MySQL reads as exactly that number.
     for value in [
-        MySqlPreparedValue::Text("1".to_string()),
+        MySqlPreparedValue::Text("1.5".to_string()),
+        MySqlPreparedValue::Text("1abc".to_string()),
         MySqlPreparedValue::Real(1.5),
     ] {
         assert!(

@@ -118,7 +118,7 @@ boolean literal.
 | `NOT`, `IS TRUE`, `IS FALSE`, `IS NOT TRUE` and `IS NOT FALSE` over a word, a `DECIMAL`, or anything but a column in a projection | refused; measured, MySQL reads a word as the number it begins with — `NOT 'apple'` is 1 — and the engine does not. In a `WHERE` they take whatever the `WHERE` reader takes |
 | `WITH ROLLUP` | refused |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
-| A `CASE` or `IF` branch carrying a scale — `THEN 1.5 ELSE 0`, `THEN <decimal column>` | refused; MySQL answers a NEWDECIMAL there rather than the LONGLONG a whole-number branch answers |
+| A `CASE` or `IF` branch written as a number with a point — `THEN 1.5 ELSE 0` | refused; MySQL answers a NEWDECIMAL there by a rule of its own. A `DECIMAL` column branch is taken |
 | A `CASE` or `IF` mixing a word branch and a number branch | refused; that is a coercion, and what MySQL answers for it has not been measured |
 | A `CASE` or `IF` branch holding an aggregate or arithmetic | refused; only a written number and a column have been measured |
 | `SET n = DEFAULT` on an `UPDATE` | refused; MySQL writes the column's own default and this cannot work out what that is from the statement alone |
@@ -424,6 +424,8 @@ speaks; anything measured here from now on has to pass that flag.
 | An ordering comparison against an `ENUM` or `SET` column — `state > 'active'` | refused; MySQL reads an `ENUM` by the position its members were declared in, which is not the order their words read in |
 | A number compared against an `ENUM` or `SET` column — `state = 2` | refused; MySQL reads it as a member's position and the stored value is the word |
 | A `WHERE` comparison against a number written with a fraction and a text column — `label > 1.5` | refused; MySQL reads the text as a number, which is the coercion a string against an integer column is refused for |
+| A word against a column holding numbers that is not a whole number spelled out — `age = '1.5'`, `' 30'`, `'3e1'`, `''`, `'30abc'` — or any word against a `DOUBLE`, or one past an `i64` | refused; measured, MySQL reads `'1.5'` against an `INT` as a double, the others without a warning or with warning 1292, and this reads only the words it can spell out as the one number MySQL reads. `id = '1'`, `IN ('1', '2')`, `BETWEEN`, a `DECIMAL` against `'10.5'`, a word bound against a whole-number column and `YEAR(col) = '2026'` are taken |
+| A word bound against a call — `YEAR(created_at) = ?` | refused; a bound value against a call is refused whatever it binds |
 | A `HAVING` counted against a number written with a fraction — `HAVING COUNT(*) > 1.5` | refused; a count is a whole number |
 | A run of digits too long for an `i64` in a comparison against an integer or floating column — `n > 9223372036854775808` | refused; an exact `DECIMAL` column accepts up to 65 written digits after its type has been checked |
 | `ENUM` | works |

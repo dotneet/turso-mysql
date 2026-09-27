@@ -1669,7 +1669,10 @@ impl MySqlConnection {
             .filter(|column| is_integer_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        if rewritten.is_empty() && decimal_columns.is_empty() {
+        if rewritten.is_empty()
+            && decimal_columns.is_empty()
+            && !translated.compares_a_written_number()
+        {
             return Ok((
                 translated,
                 rewritten,
@@ -2471,6 +2474,7 @@ impl MySqlConnection {
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
         let mut bound_temporal = Vec::new();
+        let mut whole_number_parameters = Vec::new();
         if let PreparedExecutionPlan::Select {
             checked_comparisons,
             ..
@@ -2496,11 +2500,14 @@ impl MySqlConnection {
                 self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
             let bound_decimal =
                 self.decimal_comparison_parameters(source_tables, checked_comparisons)?;
+            whole_number_parameters =
+                self.whole_number_comparison_parameters(source_tables, checked_comparisons)?;
             Self::validate_select_comparison_values(
                 checked_comparisons,
                 values,
                 &bound_temporal,
                 &bound_decimal,
+                &whole_number_parameters,
             )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
             Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
@@ -2550,6 +2557,17 @@ impl MySqlConnection {
                             "TIMESTAMP parameter must be a string".to_owned(),
                         )),
                     };
+                }
+                if let MySqlPreparedValue::Text(written) = value {
+                    if whole_number_parameters.contains(&ordinal) {
+                        return Ok(Value::from_i64(bound_whole_number(written).ok_or_else(
+                            || {
+                                LimboError::InternalError(
+                                    "a bound word was checked to name a whole number".to_owned(),
+                                )
+                            },
+                        )?));
+                    }
                 }
                 match bound_temporal
                     .iter()
@@ -6083,6 +6101,44 @@ impl MySqlConnection {
         Ok(bound)
     }
 
+    /// Finds the parameters that meet a column holding whole numbers.
+    ///
+    /// Laravel binds every value it reads from a request as a word, and
+    /// MySQL reads a bound word naming a whole number as exactly that number
+    /// there — measured on 8.4.11, binding `'9007199254740993'` against a
+    /// `BIGINT` finds that row and not its neighbour. A `BIGINT UNSIGNED` is
+    /// left to the `DECIMAL` path, which reads a bound word exactly already.
+    fn whole_number_comparison_parameters(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<Vec<usize>> {
+        let mut bound = Vec::new();
+        for comparison in comparisons {
+            let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
+                continue;
+            };
+            if comparison.answers().is_some()
+                || matches!(
+                    comparison.operator(),
+                    CheckedSelectComparisonOperator::Like
+                        | CheckedSelectComparisonOperator::NotLike
+                )
+            {
+                continue;
+            }
+            for table in comparison_tables(source_tables, comparison)? {
+                if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
+                    if is_integer_type(&type_name) && type_name != "BIGINT UNSIGNED" {
+                        bound.push(*ordinal);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(bound)
+    }
+
     /// Holds a DML statement's comparisons to the columns they name.
     ///
     /// A statement that reads no table beyond the one it writes says that
@@ -6335,6 +6391,7 @@ impl MySqlConnection {
         values: &[MySqlPreparedValue],
         bound_temporal: &[BoundTemporalParameter],
         bound_decimal: &[usize],
+        whole_number_parameters: &[usize],
     ) -> Result<()> {
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -6369,13 +6426,15 @@ impl MySqlConnection {
                 MySqlPreparedValue::UnsignedInteger(_) => {
                     !patterns && !stored_as_a_moment && bound_decimal.contains(ordinal)
                 }
-                MySqlPreparedValue::Text(_) => {
+                MySqlPreparedValue::Text(written) => {
                     if patterns {
                         true
                     } else {
                         comparison.collated()
                             || stored_as_a_moment
                             || bound_decimal.contains(ordinal)
+                            || (whole_number_parameters.contains(ordinal)
+                                && bound_whole_number(written).is_some())
                     }
                 }
                 _ => false,
@@ -9138,6 +9197,15 @@ pub(crate) enum BoundTemporalForm {
 pub(crate) struct BoundTemporalParameter {
     ordinal: usize,
     form: BoundTemporalForm,
+}
+
+/// The whole number a bound word names, which is what MySQL reads it as
+/// against a column holding whole numbers.
+fn bound_whole_number(written: &str) -> Option<i64> {
+    match turso_mysql_parser::read_written_number(written)? {
+        turso_mysql_parser::WrittenNumber::Whole(value) => Some(value),
+        turso_mysql_parser::WrittenNumber::Decimal(_) => None,
+    }
 }
 
 /// Which form a column holds, for the columns that hold a day or a moment.

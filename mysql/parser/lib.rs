@@ -34,6 +34,7 @@ mod table_collation;
 mod temporal_value;
 mod translate;
 mod truncate_table;
+mod written_number;
 
 use admin_command::{
     admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
@@ -164,6 +165,7 @@ pub use temporal_value::{
 };
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
+pub use written_number::{read_written_number, WrittenNumber};
 
 /// Longest `VARCHAR` this server takes, in characters.
 ///
@@ -888,6 +890,7 @@ pub struct TranslatedSelect {
     counts_distinct_column: bool,
     tests_a_bare_column: bool,
     compares_a_written_day: bool,
+    compares_a_written_number: bool,
     compares_a_large_decimal_integer: bool,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     source_table: Option<MySqlTableName>,
@@ -1207,9 +1210,19 @@ pub struct TranslatedDml {
     ordered_columns: Vec<String>,
     collation_sensitive_call_columns: Vec<String>,
     json_reading_columns: Vec<String>,
+    /// Whether a comparison names a column against a word naming a number,
+    /// which is read as that number only once the column is known to hold
+    /// numbers.
+    compares_a_written_number: bool,
 }
 
 impl TranslatedDml {
+    /// Reports whether a comparison names a column against a word naming a
+    /// number, which a second reading knowing the columns' types renders.
+    pub fn compares_a_written_number(&self) -> bool {
+        self.compares_a_written_number
+    }
+
     /// Returns the columns read by a call the statement compares under
     /// `utf8mb4_0900_ai_ci`'s weights.
     pub fn collation_sensitive_call_columns(&self) -> &[String] {
@@ -1497,6 +1510,7 @@ impl TranslatedSelect {
             || self.counts_distinct_column
             || self.tests_a_bare_column
             || self.compares_a_written_day
+            || self.compares_a_written_number
             || self.compares_a_large_decimal_integer
             || self.orders_wildcard_ordinal
             || self.checked_comparisons.iter().any(|comparison| {
@@ -4028,6 +4042,7 @@ fn parse_select_inner(
         counts_distinct_column,
         tests_a_bare_column,
         compares_a_written_day,
+        compares_a_written_number,
         compares_a_large_decimal_integer,
         checked_subquery_comparisons,
     } = translate_select_query(
@@ -4056,6 +4071,7 @@ fn parse_select_inner(
         counts_distinct_column,
         tests_a_bare_column,
         compares_a_written_day,
+        compares_a_written_number,
         compares_a_large_decimal_integer,
         checked_subquery_comparisons,
         sqlite_sql,
@@ -4178,6 +4194,7 @@ pub fn parse_dml_knowing_numeric_columns(
         ordered_columns,
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
         json_reading_columns: render_context.json_reading_columns,
+        compares_a_written_number: render_context.compares_a_written_number,
     })
 }
 

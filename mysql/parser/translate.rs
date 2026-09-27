@@ -266,6 +266,7 @@ pub(crate) struct RenderedSelect {
     pub(crate) counts_distinct_column: bool,
     pub(crate) tests_a_bare_column: bool,
     pub(crate) compares_a_written_day: bool,
+    pub(crate) compares_a_written_number: bool,
     pub(crate) compares_a_large_decimal_integer: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) source_table: Option<MySqlTableName>,
@@ -451,6 +452,7 @@ pub(crate) fn translate_select_query(
         counts_distinct_column: render_context.counts_distinct_column,
         tests_a_bare_column: render_context.tests_a_bare_column,
         compares_a_written_day: render_context.compares_a_written_day,
+        compares_a_written_number: render_context.compares_a_written_number,
         compares_a_large_decimal_integer: render_context.compares_a_large_decimal_integer,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         source_table,
@@ -4000,6 +4002,10 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether a comparison names a column against a written day, which reads
     /// differently depending on whether the column holds a day or a moment.
     compares_a_written_day: bool,
+    /// Whether a comparison names a column against a word naming a number,
+    /// which MySQL reads as that number against a column holding numbers.
+    /// `number_a_written_word_names` says when it matters.
+    pub(crate) compares_a_written_number: bool,
     compares_a_large_decimal_integer: bool,
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
@@ -4043,6 +4049,7 @@ impl<'a> SelectRenderContext<'a> {
             counts_distinct_column: false,
             tests_a_bare_column: false,
             compares_a_written_day: false,
+            compares_a_written_number: false,
             compares_a_large_decimal_integer: false,
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
@@ -7123,13 +7130,19 @@ fn render_checked_in_list(
         .iter()
         .any(|(known, _)| known.eq_ignore_ascii_case(&column_name));
     let allow_large_integer = render_context.table_columns.is_empty() || decimal_column;
+    let json_column = render_context.is_json_column(&column_name);
     let mut members = Vec::with_capacity(list.len());
     for element in list {
-        members.push(render_checked_select_comparison_rhs_allowing_large_integer(
+        let (rendered, rhs) = render_checked_select_comparison_rhs_allowing_large_integer(
             element,
             render_context,
             allow_large_integer,
-        )?);
+        )?;
+        members.push(if json_column {
+            (rendered, rhs)
+        } else {
+            number_a_written_word_names(rendered, rhs, &column_name, render_context)
+        });
     }
     // One text member collates the whole list, because MySQL compares every
     // member under the column's collation rather than each member's own. A `?`
@@ -7159,7 +7172,6 @@ fn render_checked_in_list(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
-    let json_column = render_context.is_json_column(&column_name);
     let rendered = if json_column {
         let matches = members
             .iter()
@@ -7367,6 +7379,11 @@ fn render_checked_select_comparison(
     )?;
     let (rendered_rhs, rhs) =
         midnight_of_a_written_day(rendered_rhs, rhs, &column_name, render_context);
+    let (rendered_rhs, rhs) = if named_collation.is_none() && !json_column {
+        number_a_written_word_names(rendered_rhs, rhs, &column_name, render_context)
+    } else {
+        (rendered_rhs, rhs)
+    };
     let operator =
         checked_select_comparison_operator(&op_reversed).expect("comparison operator guard");
     // A bare column already has its declared collation in the stored schema.
@@ -7539,6 +7556,76 @@ fn midnight_of_a_written_day(
     )
 }
 
+/// Reads a word against a column holding numbers as the number it names, which
+/// is what MySQL reads it as.
+///
+/// Measured on MySQL 8.4.11: against a whole-number column MySQL reads a word
+/// naming a whole number as exactly that number — `big = '9007199254740993'`
+/// finds that row and not its neighbour, which a comparison between doubles
+/// would — and against a `DECIMAL` it reads a word naming a decimal exactly
+/// too. Only the frontend can see which kind the column is, so a statement
+/// writing such a word says so and is rendered a second time knowing. Against
+/// any other column, or a whole-number column with a word carrying a point,
+/// the word is left alone, and the frontend holds it to the column as ever.
+fn number_a_written_word_names(
+    rendered: String,
+    rhs: CheckedSelectComparisonRhs,
+    column_name: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> (String, CheckedSelectComparisonRhs) {
+    let CheckedSelectComparisonRhs::Text(written) = &rhs else {
+        return (rendered, rhs);
+    };
+    let Some(number) = crate::read_written_number(written) else {
+        return (rendered, rhs);
+    };
+    render_context.compares_a_written_number = true;
+    let whole_number_column = render_context
+        .integer_columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case(column_name));
+    let decimal_column = !whole_number_column
+        && render_context
+            .decimal_columns
+            .iter()
+            .any(|(column, _)| column.eq_ignore_ascii_case(column_name));
+    match number {
+        crate::WrittenNumber::Whole(value) if whole_number_column || decimal_column => (
+            value.to_string(),
+            CheckedSelectComparisonRhs::SignedInteger(value),
+        ),
+        crate::WrittenNumber::Decimal(number) if decimal_column => (
+            format!("'{number}'"),
+            CheckedSelectComparisonRhs::Decimal(number),
+        ),
+        _ => (rendered, rhs),
+    }
+}
+
+/// Reads a word against a call answering a whole number as the number it
+/// names.
+///
+/// MySQL compares a call's answer with a word as two doubles — measured on
+/// 8.4.11, `YEAR(created_at) = '2026'` finds the rows of 2026 — which is the
+/// exact comparison for every whole number a double holds exactly. So only a
+/// word naming a whole number nearer zero than 2^53 is read.
+fn whole_number_a_written_word_names(
+    rendered: String,
+    rhs: CheckedSelectComparisonRhs,
+) -> (String, CheckedSelectComparisonRhs) {
+    const EXACT_IN_A_DOUBLE: u64 = 1 << 53;
+    let CheckedSelectComparisonRhs::Text(written) = &rhs else {
+        return (rendered, rhs);
+    };
+    match crate::read_written_number(written) {
+        Some(crate::WrittenNumber::Whole(value)) if value.unsigned_abs() < EXACT_IN_A_DOUBLE => (
+            value.to_string(),
+            CheckedSelectComparisonRhs::SignedInteger(value),
+        ),
+        _ => (rendered, rhs),
+    }
+}
+
 /// Renders a comparison against a subquery answering one value, or nothing
 /// when the comparison is not that shape.
 ///
@@ -7699,6 +7786,11 @@ fn render_comparison_over_a_call(
     };
     let rendered_call = render_select_expr(call, render_context)?;
     let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
+    let (rendered_rhs, rhs) = if answers == crate::CheckedComparisonAnswer::WholeNumber {
+        whole_number_a_written_word_names(rendered_rhs, rhs)
+    } else {
+        (rendered_rhs, rhs)
+    };
     let collated = answers == crate::CheckedComparisonAnswer::Text
         && matches!(rhs, CheckedSelectComparisonRhs::Text(_));
     let collation = if collated {

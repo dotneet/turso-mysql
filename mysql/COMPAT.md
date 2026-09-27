@@ -1742,6 +1742,29 @@ is true, the word coerced to a number; and a number written with a fraction has
 not been measured here. `NULL = NULL` is false in both, but is written as a
 comparison rather than as `IS`, and stays refused with the rest.
 
+A word naming a whole number against a column holding whole numbers is read as
+that number, which is how PHP writes every value: WordPress's
+`$wpdb->prepare('%s')` and PDO with emulated prepares send `WHERE id = '1'`, and
+Laravel binds what it reads from a request as a word. Measured on 8.4.11 and
+matched over `=`, `<>`, `<`, `IN`, `NOT IN` and `BETWEEN`, in a `SELECT`, an
+`UPDATE` and a `DELETE`: MySQL reads the word as exactly the number —
+`big = '9007199254740993'` over a `BIGINT` finds that row and not the one
+holding 9007199254740992, which a comparison between doubles would also find —
+and a sign or leading zeroes name the same number, `'+3'`, `'03'` and `'-0'`
+among them. Against a `DECIMAL` a word naming a decimal is read exactly too:
+`balance = '10.5'` finds 10.50, and `'10.500000000000000001'` finds nothing. A
+word bound as a string against a whole-number column is bound as its number,
+and `YEAR(created_at) = '2026'` reads the word against the whole number the
+call answers — MySQL compares those as doubles, so only a number nearer zero
+than 2^53 is read there. Each is rendered a second time knowing the column's
+type, the way a written day is.
+
+Every other word keeps the refusal: MySQL reads `age = '1.5'` as a comparison
+between doubles, `' 30'`, `'30 '`, `'3e1'` and `''` without a warning by rules
+not spelled out here, and `'30abc'`, `'abc'` and `'0x1E'` with warning 1292. A
+word against a `DOUBLE`, a word past what an `i64` holds, and a word under an
+explicit `COLLATE` are refused too.
+
 `IFNULL` and `COALESCE` take an aggregate as the thing they default, which is
 how a report asks for a total over rows that may not be there —
 `IFNULL(SUM(n), 0)` — or for the highest of nothing —
@@ -4510,6 +4533,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | A `CASE` or `IF` whose branches are numbers | partial | partial | n/a | n/a | partial | [`branch classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-numeric-branches.json), [P0 manifest](conformance/Makefile) | Taken in a projection and in a `SET`. The answer is a `LONGLONG` as wide as its widest branch plus one for the sign, NOT NULL only when every branch is and there is an `ELSE`. A branch carrying a scale, and a word branch beside a number branch, are refused. |
 | A `CASE`, `IF`, `IFNULL` or `COALESCE` over columns, and `CASE col WHEN` | partial | partial | partial | partial | partial | [`branch classifier`](parser/static_select_metadata.rs), [`branch renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [adapter tests](server/src/frontend_adapter/tests/conditional_expressions.rs) | The kind every branch shares — the widest integer type, a `DECIMAL` with the most digits either side of the point, a `DOUBLE`, or a `VAR_STRING` four bytes a character — measured on 8.4.11 over both protocols. A `CASE` answers each `DECIMAL` branch at its own scale and `IFNULL`/`COALESCE` at the answer's. Needs the one table's column types; unsigned, `TEXT`, `FLOAT` and temporal columns, a word beside a number, a join, and an `UPDATE` writing one of the new forms are refused. |
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` over a `CASE` or `IF` | partial | partial | partial | partial | partial | [`aggregate renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [adapter tests](server/src/frontend_adapter/tests/conditional_expressions.rs) | `SUM` and `AVG` answer a `NEWDECIMAL` 22 and 4 digits wider than the `CASE` at its scale, or a `DOUBLE`; `MIN` and `MAX` the `CASE`'s own shape over whole numbers and doubles. `MIN`/`MAX` over a `DECIMAL` or words, and ordering by an `AVG` of one, are refused. Grouped, MySQL drops the binary flag from `SUM`, `COUNT`, `MIN` and `MAX`, which this does not. |
+| A word naming a number against a column holding numbers — `WHERE id = '1'` | partial | partial | partial | partial | partial | [`word reader`](parser/written_number.rs), [`comparison renderer`](parser/translate.rs), [`bound values`](frontend/session.rs), [adapter tests](server/src/frontend_adapter/tests/written_numbers.rs) | A whole number spelled out (sign and leading zeroes allowed) against a whole-number or `DECIMAL` column, and a decimal against a `DECIMAL`, is read as that exact number in `=`, `<>`, `<`, `IN`, `NOT IN`, `BETWEEN`, a result-column comparison, an `UPDATE` and a `DELETE`; a word bound as a string against a whole-number column is bound as its number; a whole number below 2^53 against a call answering a whole number (`YEAR(col) = '2026'`). Words MySQL reads as doubles, with warning 1292, or by rules not spelled out here (`'1.5'` against an `INT`, `' 30'`, `'3e1'`, `''`, `'30abc'`), words against a `DOUBLE`, and words past an `i64` are refused. |
 | An integer column's display width — `INT(11)`, `TINYINT(1)` | yes | yes | n/a | n/a | yes | [`column renderer`](parser/lib.rs), [oracle case](conformance/cases/p0/create-table-display-width.json), [P0 manifest](conformance/Makefile) | Taken and dropped, which is what MySQL 8.4 does with one; the counted column takes one too. `TINYINT(1)` is kept and is the same stored type as `BOOLEAN`, reporting a length of 1 where `TINYINT` reports 4. MySQL's warning 1681 is not raised. |
 | `INSERT` writing an `AUTO_INCREMENT` column its own ids | partial | partial | n/a | n/a | partial | [`written ids`](../mysql/frontend/session.rs), [oracle case](conformance/cases/p0/insert-written-auto-increment.json), [P0 manifest](conformance/Makefile) | The counter is raised past the highest id written, so a later counted row never repeats one. Measured and matched: rows out of order, an id below the counter, a negative id, the reported id being the last row's, and `LAST_INSERT_ID()` staying as it stood. A written 0 or NULL asks the counter for the next number, the way leaving the column out does, and a statement whose every row asks that way is numbered from one reserved range and reports the first of it. A statement mixing a row that names its own number with one that asks is refused, MySQL moving the counter row by row there. |
 | `INSERT ... VALUES` with `DEFAULT` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-default-value.json), [P0 manifest](conformance/Makefile) | `DEFAULT` and `DEFAULT(col)` naming that same column ask for the column's own default, and are rendered by leaving the column out — measured, MySQL answers the same value, the same NULL and the same 1364 for both. An `AUTO_INCREMENT` column counts on. Every column of a counted table given `DEFAULT` is the row of defaults, which takes the next number like any other row. `DEFAULT` in one row and a value in another is refused, so is `DEFAULT` beside `ON DUPLICATE KEY UPDATE`, and so is `SET n = DEFAULT` on an `UPDATE`. |

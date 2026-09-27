@@ -197,9 +197,10 @@ fn truth_values_refuse_what_mysql_reads_by_another_rule() {
         "SELECT NOT name FROM items",
         "SELECT name IS TRUE FROM items",
         "SELECT NOT price FROM items",
-        // A word against a number, and a column against a column, are
-        // coercions; a parameter carries no kind until it binds.
-        "SELECT qty > '1' FROM items",
+        // A word not spelling a whole number against a number, and a column
+        // against a column, are coercions; a parameter carries no kind until
+        // it binds.
+        "SELECT qty > '1.5' FROM items",
         "SELECT qty > name FROM items",
         "SELECT qty > ? FROM items",
         "SELECT qty = NULL FROM items",
