@@ -4153,6 +4153,138 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Runs an `ALTER TABLE t ENGINE=InnoDB`, which names the engine the table
+    /// already has.
+    ///
+    /// Measured on MySQL 8.4.11: the table is rebuilt and nothing a client can
+    /// see changes — its rows, its keys and where its counter stands are as
+    /// they were — so there is nothing to do but commit what came before, as
+    /// every DDL statement does.
+    pub fn execute_table_engine_restated(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.a_base_table_named(table)?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        Ok(())
+    }
+
+    /// Runs an `ALTER TABLE t AUTO_INCREMENT = n`, which says where the table's
+    /// numbering goes on from.
+    ///
+    /// Measured on MySQL 8.4.11: the next row takes `n`, or one past the
+    /// highest id the table holds when `n` is not past it, and that may be
+    /// below where the counter stood — after the rows above it are deleted,
+    /// `AUTO_INCREMENT = 5` hands out 5 again where 8 was next. The allocator
+    /// only moves forward, so a change that would move it back is refused. A
+    /// table that counts nothing takes the statement and nothing changes.
+    pub fn execute_table_counter_change(
+        &self,
+        table: &MySqlTableName,
+        next: u64,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.a_base_table_named(table)?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        let Some(table) = self
+            .load_auto_increment_table(table.as_str())
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(());
+        };
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            MySqlQueryError::Unsupported(
+                "AUTO_INCREMENT update requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let highest = self.highest_counted_id(&table)?;
+        let next = next.max(highest.saturating_add(1));
+        // The allocator counts the numbers already handed out, so a table
+        // whose next row is to take `next` has had `next - 1` of them.
+        let handed_out = next - 1;
+        // Measured on MySQL 8.4.11: a number past the column's type is taken,
+        // and the next row answers 1467. This refuses the statement instead of
+        // storing a mark no row could take, as `CREATE TABLE` does.
+        if handed_out > auto_increment_ceiling(&table) {
+            return Err(MySqlQueryError::Unsupported(
+                "ALTER TABLE AUTO_INCREMENT past the column's type".to_string(),
+            ));
+        }
+        let mut lease = capability
+            .allocator
+            .lease_high_water(table.key)
+            .map_err(MySqlQueryError::Engine)?;
+        let current = capability
+            .io
+            .block(|| lease.read())
+            .map_err(MySqlQueryError::Engine)?;
+        if handed_out < current {
+            lease.release().map_err(MySqlQueryError::Engine)?;
+            return Err(MySqlQueryError::Unsupported(
+                "ALTER TABLE AUTO_INCREMENT below where the counter stands".to_string(),
+            ));
+        }
+        if handed_out > current {
+            capability
+                .io
+                .block(|| lease.advance_past(handed_out))
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        lease.release().map_err(MySqlQueryError::Engine)
+    }
+
+    /// Refuses a name that is not a base table.
+    ///
+    /// Measured on MySQL 8.4.11: 1146 for a name that is not there and 1347
+    /// for a view; the second is refused here, having no error of its own.
+    fn a_base_table_named(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        if schema.get_btree_table(table.as_str()).is_some() {
+            return Ok(());
+        }
+        if schema.get_view(table.as_str()).is_some() {
+            return Err(MySqlQueryError::Unsupported(
+                "ALTER TABLE naming a view".to_string(),
+            ));
+        }
+        Err(MySqlQueryError::MissingTable)
+    }
+
+    /// The highest id a counted table holds, or 0 when it holds none.
+    fn highest_counted_id(
+        &self,
+        table: &AutoIncrementTable,
+    ) -> std::result::Result<u64, MySqlQueryError> {
+        let sql = format!(
+            "SELECT MAX({}) FROM {}",
+            sqlite_quoted(&table.definition.allocator_column_name),
+            sqlite_quoted(&table.name)
+        );
+        let rows = self
+            .inner
+            .prepare(sql)
+            .and_then(|mut statement| statement.run_collect_rows())
+            .map_err(MySqlQueryError::Engine)?;
+        let [row] = rows.as_slice() else {
+            return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                "MAX answered other than one row".to_string(),
+            )));
+        };
+        match row.as_slice() {
+            [Value::Null] => Ok(0),
+            [Value::Numeric(Numeric::Integer(id))] => Ok(u64::try_from(*id).unwrap_or(0)),
+            _ => Err(MySqlQueryError::Unsupported(
+                "the highest id of a table counting past a signed integer".to_string(),
+            )),
+        }
+    }
+
     /// Runs one `RENAME TABLE`, renaming every pair it names or none of them.
     ///
     /// Measured on MySQL 8.4.11: the pairs are taken in the order written, each

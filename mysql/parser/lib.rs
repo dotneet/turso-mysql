@@ -171,7 +171,8 @@ pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column,
     create_table_with_its_collation_on_each_text_column, table_collation_of, table_comment_change,
-    table_options_of, MySqlTableCollation, MySqlTableOptions,
+    table_counter_change, table_engine_restated, table_options_of, MySqlTableCollation,
+    MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,

@@ -155,6 +155,101 @@ pub fn table_comment_change(
     Ok(Some((table, super::checked_table_comment(comment)?)))
 }
 
+/// Reads an `ALTER TABLE t ENGINE=InnoDB` that does nothing else, as the table
+/// it names.
+///
+/// Django and Rails write it in some migrations. Every table here is the
+/// InnoDB table MySQL makes, so this names the engine the table already has.
+/// Another engine is refused: measured on MySQL 8.4.11, `ENGINE=MyISAM` is
+/// taken and printed back by `SHOW CREATE TABLE`. Answers `None` for any
+/// other statement, the engine beside some other operation among them.
+pub fn table_engine_restated(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<super::MySqlTableName>, ParseError> {
+    let Some((table, option, value)) = one_table_option(sql, mode) else {
+        return Ok(None);
+    };
+    if !option.eq_ignore_ascii_case("ENGINE") {
+        return Ok(None);
+    }
+    let Token::Word(engine) = value else {
+        return Ok(None);
+    };
+    let engine = engine.value;
+    if !engine.eq_ignore_ascii_case("InnoDB") {
+        return Err(ParseError::Unsupported {
+            feature: "ALTER TABLE ENGINE other than InnoDB",
+        });
+    }
+    Ok(Some(table))
+}
+
+/// Reads an `ALTER TABLE t AUTO_INCREMENT = n` that does nothing else, as the
+/// table and the number its next row is to take.
+///
+/// A number written any way but a plain whole one is refused: measured on
+/// MySQL 8.4.11, `-5` and `'7'` are each 1064 and `1.5` is rounded, a rule
+/// this does not repeat. Answers `None` for any other statement.
+pub fn table_counter_change(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<(super::MySqlTableName, u64)>, ParseError> {
+    let Some((table, option, value)) = one_table_option(sql, mode) else {
+        return Ok(None);
+    };
+    if !option.eq_ignore_ascii_case("AUTO_INCREMENT") {
+        return Ok(None);
+    }
+    let Token::Number(digits, false) = value else {
+        return Err(ParseError::Unsupported {
+            feature: "ALTER TABLE AUTO_INCREMENT value",
+        });
+    };
+    let next = digits.parse::<u64>().map_err(|_| ParseError::Unsupported {
+        feature: "ALTER TABLE AUTO_INCREMENT value",
+    })?;
+    Ok(Some((table, next)))
+}
+
+/// Reads `ALTER TABLE <table> <option> [=] <value>` and nothing more, as the
+/// table, the option's name and its value.
+fn one_table_option(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Option<(super::MySqlTableName, String, Token)> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let mut words = tokens
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+    let named = |token: Option<&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next().as_ref(), "ALTER") || !named(words.next().as_ref(), "TABLE") {
+        return None;
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return None;
+    };
+    let Some(Token::Word(option)) = words.next() else {
+        return None;
+    };
+    if option.quote_style.is_some() {
+        return None;
+    }
+    let value = match words.next()? {
+        Token::Eq => words.next()?,
+        written => written,
+    };
+    if words.next().is_some() {
+        return None;
+    }
+    let table = super::MySqlTableName::parse(&table.value).ok()?;
+    Some((table, option.value, value))
+}
+
 /// Writes the collation a new table declares onto each of its text columns
 /// that names neither a character set nor a collation.
 ///
@@ -329,6 +424,51 @@ fn write_collation_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_an_engine_or_a_counter_written_alone() {
+        let mode = SessionSqlMode::default();
+        for sql in [
+            "ALTER TABLE t ENGINE=InnoDB",
+            "alter table `t` engine = innodb;",
+            "ALTER TABLE t ENGINE INNODB",
+        ] {
+            assert_eq!(
+                table_engine_restated(sql, mode).unwrap().unwrap().as_str(),
+                "t",
+                "{sql}"
+            );
+        }
+        assert!(table_engine_restated("ALTER TABLE t ENGINE=MyISAM", mode).is_err());
+        for sql in [
+            "ALTER TABLE t ENGINE=InnoDB, ADD COLUMN a INT",
+            "ALTER TABLE t ADD COLUMN a INT",
+            "ALTER TABLE t COMMENT 'x'",
+        ] {
+            assert_eq!(table_engine_restated(sql, mode).unwrap(), None, "{sql}");
+        }
+
+        let (table, next) = table_counter_change("ALTER TABLE t AUTO_INCREMENT = 10", mode)
+            .unwrap()
+            .unwrap();
+        assert_eq!((table.as_str(), next), ("t", 10));
+        assert_eq!(
+            table_counter_change("ALTER TABLE t AUTO_INCREMENT 7;", mode)
+                .unwrap()
+                .map(|(_, next)| next),
+            Some(7)
+        );
+        for sql in [
+            "ALTER TABLE t AUTO_INCREMENT = '7'",
+            "ALTER TABLE t AUTO_INCREMENT = 1.5",
+        ] {
+            assert!(table_counter_change(sql, mode).is_err(), "{sql}");
+        }
+        assert_eq!(
+            table_counter_change("ALTER TABLE t AUTO_INCREMENT = 5, ENGINE=InnoDB", mode).unwrap(),
+            None
+        );
+    }
 
     fn created(sql: &str) -> Option<String> {
         create_table_with_its_collation_on_each_text_column(sql, SessionSqlMode::default()).unwrap()

@@ -818,3 +818,96 @@ fn a_hibernate_boolean_is_a_bit() {
         );
     }
 }
+
+/// `ALTER TABLE t ENGINE=InnoDB`, which Django and Rails write in some
+/// migrations, names the engine every table here has. Measured on MySQL
+/// 8.4.11: the table is rebuilt and nothing a client can see changes — the
+/// counter of a table whose top rows were deleted stays where it stood — and
+/// the statement commits what came before it, so a `ROLLBACK` after it keeps
+/// the row written before it. `ENGINE=MyISAM` is taken there and printed back,
+/// and is refused here; a table that is not there is 1146.
+#[test]
+fn restating_the_engine_changes_nothing_but_commits() {
+    let (_directory, mut adapter) = adapter();
+    let adapter = &mut adapter;
+    run(
+        adapter,
+        "CREATE TABLE ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+    );
+    run(adapter, "INSERT INTO ai (v) VALUES (1), (2), (3), (4), (5)");
+    run(adapter, "DELETE FROM ai WHERE id >= 4");
+    run(adapter, "ALTER TABLE ai ENGINE=InnoDB");
+    assert!(printed_table(adapter, "ai").contains(") ENGINE=InnoDB AUTO_INCREMENT=6 "));
+
+    run(adapter, "BEGIN");
+    run(adapter, "INSERT INTO ai (id, v) VALUES (500, 1)");
+    run(adapter, "ALTER TABLE ai ENGINE = InnoDB");
+    run(adapter, "ROLLBACK");
+    assert_eq!(
+        rows(adapter, "SELECT COUNT(*) FROM ai WHERE id = 500"),
+        [[Some("1".to_owned())]]
+    );
+
+    assert!(adapter
+        .execute_query("ALTER TABLE ai ENGINE=MyISAM")
+        .is_err());
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE missing ENGINE=InnoDB"),
+        Err(FrontendErrorKind::MissingObject)
+    );
+}
+
+/// `ALTER TABLE t AUTO_INCREMENT = n` says where the numbering goes on from.
+/// Measured on MySQL 8.4.11: the next row takes `n`, or one past the highest
+/// id the table holds when `n` is not past it — 3 over ids up to 6 leaves 7
+/// next, 100 makes 100 next, and 50 after that leaves 101 — and a table that
+/// counts nothing takes the statement and changes nothing. MySQL also moves
+/// the counter back when the rows above it are gone, which the allocator
+/// cannot, so that is refused; so is a number past the column's type, which
+/// MySQL takes and then answers 1467 for at the next row.
+#[test]
+fn the_counter_moves_where_mysql_moves_it() {
+    let (_directory, mut adapter) = adapter();
+    let adapter = &mut adapter;
+    run(
+        adapter,
+        "CREATE TABLE ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+    );
+    run(
+        adapter,
+        "INSERT INTO ai (v) VALUES (1), (2), (3), (4), (5), (6)",
+    );
+    let next_id = |adapter: &mut Adapter| {
+        run(adapter, "INSERT INTO ai (v) VALUES (0)");
+        rows(adapter, "SELECT LAST_INSERT_ID()")[0][0]
+            .clone()
+            .unwrap()
+    };
+    run(adapter, "ALTER TABLE ai AUTO_INCREMENT = 3");
+    assert_eq!(next_id(adapter), "7");
+    run(adapter, "ALTER TABLE ai AUTO_INCREMENT = 100");
+    assert_eq!(next_id(adapter), "100");
+    run(adapter, "ALTER TABLE ai AUTO_INCREMENT = 50");
+    assert_eq!(next_id(adapter), "101");
+    assert!(printed_table(adapter, "ai").contains(") ENGINE=InnoDB AUTO_INCREMENT=102 "));
+
+    run(adapter, "DELETE FROM ai WHERE id >= 7");
+    assert!(adapter
+        .execute_query("ALTER TABLE ai AUTO_INCREMENT = 7")
+        .is_err());
+    assert!(adapter
+        .execute_query("ALTER TABLE ai AUTO_INCREMENT = 3000000000")
+        .is_err());
+    assert!(adapter
+        .execute_query("ALTER TABLE ai AUTO_INCREMENT = '7'")
+        .is_err());
+    assert_eq!(next_id(adapter), "102");
+
+    run(adapter, "CREATE TABLE plain (a INT)");
+    run(adapter, "ALTER TABLE plain AUTO_INCREMENT = 10");
+    assert!(!printed_table(adapter, "plain").contains("AUTO_INCREMENT"));
+    assert_eq!(
+        adapter.execute_query("ALTER TABLE missing AUTO_INCREMENT = 10"),
+        Err(FrontendErrorKind::MissingObject)
+    );
+}

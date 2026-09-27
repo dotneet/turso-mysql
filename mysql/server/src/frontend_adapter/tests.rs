@@ -29318,12 +29318,16 @@ fn a_counted_table_starts_where_its_option_says() {
          ENGINE=InnoDB AUTO_INCREMENT=1.5",
         "CREATE TABLE refused (id INT NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) \
          ENGINE=InnoDB AUTO_INCREMENT=100 AUTO_INCREMENT=200",
-        // Where a statement moves the counter of a table already there is a
-        // separate path, and it has not been given this.
-        "ALTER TABLE counted AUTO_INCREMENT = 900",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+
+    // A statement moving the counter of a table already there moves it the
+    // same way.
+    adapter
+        .execute_query("ALTER TABLE counted AUTO_INCREMENT = 900")
+        .unwrap();
+    assert!(printed_schema(&mut adapter, "counted").contains(" AUTO_INCREMENT=900 "));
 }
 
 /// A statement whose `ON UPDATE CURRENT_TIMESTAMP` this could not keep is

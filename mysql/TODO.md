@@ -219,7 +219,8 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 
 | Form | State |
 |---|---|
-| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / the index operations, `RENAME INDEX` among them | refused |
+| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / `ENGINE=InnoDB` / `AUTO_INCREMENT = n` / the index operations, `RENAME INDEX` among them | refused |
+| `ENGINE=InnoDB` or `AUTO_INCREMENT = n` beside any other operation in one `ALTER TABLE`, or naming a view | refused; each is read by its own words and only on its own. Measured, MySQL answers 1347 for a view |
 | `RENAME INDEX` or a table `COMMENT` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` reads neither, so each is read by its own words and only on its own. Measured, MySQL takes both beside anything else |
 | `ALTER TABLE t COMMENT = '...'` while the database holds a view or a trigger | refused; the comment is written by an engine `ALTER TABLE`, which is refused then as every other `ALTER TABLE` is |
 | `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` beside any other operation | refused; each is written as a `MODIFY COLUMN` of the column it names, and only a statement made of them alone is |
@@ -241,7 +242,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | A table `COMMENT` longer than 2048 characters, or written in double quotes | refused; MySQL answers 1628 for the first and takes the second |
 | `AUTO_INCREMENT=<n>` naming a start past what the column holds | refused; measured, MySQL creates the table and answers 1467 for the first row, so this refuses the statement instead of storing a mark no row could take |
 | `AUTO_INCREMENT=<n>` naming anything but a plain whole number | refused; measured, `-5` and `'7'` are each 1064 and `1.5` is rounded down, a rule this does not repeat |
-| `ALTER TABLE ... AUTO_INCREMENT=<n>` | refused; measured, MySQL raises the counter to it and ignores one below the mark it already has, which is what the allocator's own advance does — the `ALTER TABLE` path has not been given it |
+| `ALTER TABLE ... AUTO_INCREMENT=<n>` moving the counter back | refused; measured, MySQL sets the next id to `n` or one past the highest id held, whichever is larger, which moves the counter back once the rows above it are deleted — `AUTO_INCREMENT = 1` after emptying a table starts it again — and the allocator only moves forward. A number past the column's type is refused too, where MySQL takes it and answers 1467 at the next row |
 | Uniqueness over a word — a `PRIMARY KEY` or `UNIQUE` key over `VARCHAR`/`CHAR` | works with fixed Unicode 9 weights, folding accents and case in both comparisons and uniqueness; measured, `'ALPHA'` after `'alpha'` is 1062 both here and there |
 | A `PRIMARY KEY` over a type that is neither a number nor a sized word — `TEXT`, `BLOB`, `DATE` | refused; measured, MySQL answers 1170 for a `TEXT` key for want of a length, and the rest have not been measured |
 | `PRIMARY KEY (a, b)` naming a column without a `NULL`/`NOT NULL` clause | accepted; each key column is stored and reported as `NOT NULL`, as MySQL does. An explicit `NULL` or `DEFAULT NULL` on a key column remains refused |
