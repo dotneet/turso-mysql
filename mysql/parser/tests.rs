@@ -8272,3 +8272,61 @@ fn lock_in_share_mode_is_read_as_for_share() {
     let quoted = parse_select("SELECT 'LOCK IN SHARE MODE' FROM a", mode).unwrap();
     assert!(!quoted.locks_rows());
 }
+
+/// A path is read out of a document the way MySQL 8.4.11 reads it: a member
+/// only out of an object, an element out of an array, and `[0]` over anything
+/// else is the value itself.
+#[test]
+fn a_json_path_is_read_the_way_mysql_reads_it() {
+    let found = |document: &str, path: &str| json_extract(document, path).unwrap();
+    assert_eq!(found(r#"{"a":1}"#, "$[0]").as_deref(), Some(r#"{"a": 1}"#));
+    assert_eq!(found("5", "$[0]").as_deref(), Some("5"));
+    assert_eq!(found(r#""x""#, "$[0][0]").as_deref(), Some(r#""x""#));
+    assert_eq!(found("[5]", "$[1]"), None);
+    assert_eq!(found(r#"[{"a":1}]"#, "$.a"), None);
+    assert_eq!(found(r#"{"a":{"b":1}}"#, "$.a[0].b").as_deref(), Some("1"));
+    assert_eq!(found(r#"{"a b":3}"#, r#"$."a b""#).as_deref(), Some("3"));
+    assert_eq!(found(r#"{"":5}"#, r#"$."""#).as_deref(), Some("5"));
+    assert_eq!(found(r#"{"é":1}"#, r#"$."é""#).as_deref(), Some("1"));
+    assert_eq!(found("[1,2]", "$[01]").as_deref(), Some("2"));
+    assert_eq!(found(r#"{"$a":1,"_b":2}"#, "$.$a").as_deref(), Some("1"));
+    assert_eq!(found(r#"{"A":1}"#, "$.a"), None);
+    assert_eq!(found(r#"{"a":null}"#, "$.a").as_deref(), Some("null"));
+    assert_eq!(
+        found(r#"{"a":{"y":1,"x":[true,null]}}"#, "$.a").as_deref(),
+        Some(r#"{"x": [true, null], "y": 1}"#)
+    );
+    for refused in [
+        "$.1a",
+        "$.é",
+        "$ .a",
+        "$.a ",
+        "$[ 1 ]",
+        "$[*]",
+        "$.*",
+        "$**.a",
+        "$[last]",
+        "$[1 to 2]",
+        r#"$."a\"b""#,
+        "$[1234567890]",
+        "a",
+        "",
+    ] {
+        assert!(!is_a_json_path_this_reads(refused), "{refused}");
+    }
+    assert_eq!(json_extract("not a document", "$"), None);
+}
+
+/// `JSON_UNQUOTE` takes the quotes off a string and writes anything else the
+/// way MySQL prints it.
+#[test]
+fn json_unquote_answers_what_mysql_answers() {
+    assert_eq!(json_unquote(r#""a\nb""#).as_deref(), Some("a\nb"));
+    assert_eq!(json_unquote(r#""é""#).as_deref(), Some("é"));
+    assert_eq!(json_unquote("null").as_deref(), Some("null"));
+    assert_eq!(json_unquote("true").as_deref(), Some("true"));
+    assert_eq!(json_unquote("1.50").as_deref(), Some("1.5"));
+    assert_eq!(json_unquote("-0").as_deref(), Some("0"));
+    assert_eq!(json_unquote("1e300").as_deref(), Some("1e300"));
+    assert_eq!(json_unquote("[1,  2]").as_deref(), Some("[1, 2]"));
+}

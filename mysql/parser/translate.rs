@@ -12,6 +12,8 @@
 
 use super::*;
 
+mod json_condition;
+
 /// One table a `SELECT` reads, with the name the engine reports for it.
 ///
 /// A join reports each column against the reference in the statement, which is
@@ -255,6 +257,7 @@ impl MySqlSelectSource {
 pub(crate) struct RenderedSelect {
     pub(crate) sqlite_sql: String,
     pub(crate) collation_sensitive_call_columns: Vec<String>,
+    pub(crate) json_reading_columns: Vec<String>,
     pub(crate) orders_a_bare_column: bool,
     pub(crate) checks_type_sensitive_expression: bool,
     pub(crate) orders_wildcard_ordinal: bool,
@@ -437,6 +440,7 @@ pub(crate) fn translate_select_query(
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
+        json_reading_columns: render_context.json_reading_columns,
         orders_a_bare_column: render_context.orders_a_bare_column,
         checks_type_sensitive_expression: render_context.checks_type_sensitive_expression,
         orders_wildcard_ordinal: render_context.orders_wildcard_ordinal,
@@ -3805,6 +3809,18 @@ fn render_dml_predicate(
             pattern,
             regexp: _,
         } => render_checked_regexp(*negated, expr, pattern, render_context),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner)
+            if json_condition::reads_a_json_column(inner) =>
+        {
+            json_condition::render_json_null_test(
+                inner,
+                matches!(expr, Expr::IsNotNull(_)),
+                render_context,
+            )
+        }
+        expr @ Expr::Function(_) if json_condition::reads_a_json_column(expr) => {
+            json_condition::render_json_test(expr, render_context)
+        }
         Expr::IsNull(expr) => Ok(format!("({} IS NULL)", render_dml_expr(expr)?)),
         Expr::IsNotNull(expr) => Ok(format!("({} IS NOT NULL)", render_dml_expr(expr)?)),
         Expr::UnaryOp {
@@ -3866,6 +3882,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
     pub(crate) collation_sensitive_call_columns: Vec<String>,
+    /// The columns a JSON reading in a condition reads, each of which the
+    /// frontend holds to being a `JSON` column.
+    pub(crate) json_reading_columns: Vec<String>,
     decimal_columns: &'a [(String, u32)],
     integer_columns: &'a [String],
     real_columns: &'a [String],
@@ -3921,6 +3940,7 @@ impl<'a> SelectRenderContext<'a> {
             source,
             text_columns,
             collation_sensitive_call_columns: Vec::new(),
+            json_reading_columns: Vec::new(),
             decimal_columns: &[],
             integer_columns: &[],
             real_columns: &[],
@@ -6131,6 +6151,18 @@ fn render_select_predicate(
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     match expr {
+        Expr::IsNull(inner) | Expr::IsNotNull(inner)
+            if json_condition::reads_a_json_column(inner) =>
+        {
+            json_condition::render_json_null_test(
+                inner,
+                matches!(expr, Expr::IsNotNull(_)),
+                render_context,
+            )
+        }
+        expr @ Expr::Function(_) if json_condition::reads_a_json_column(expr) => {
+            json_condition::render_json_test(expr, render_context)
+        }
         Expr::IsNull(expr) => Ok(format!(
             "({} IS NULL)",
             render_select_expr(expr, render_context)?
@@ -6538,6 +6570,11 @@ fn render_checked_select_comparison(
     right: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    if let Some(rendered) =
+        json_condition::render_comparison_over_a_json_reading(left, op, right, render_context)?
+    {
+        return Ok(rendered);
+    }
     // A call stands where a column stands, and says what it answers rather
     // than holding a declared type. `WHERE LOWER(email) = 'a'` and
     // `WHERE CHAR_LENGTH(name) > 3` are the shapes this is for.

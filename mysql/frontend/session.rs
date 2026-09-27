@@ -905,6 +905,16 @@ struct PreparedStatement {
     /// reprepare happened, which is where MySQL returns a `?` column to its
     /// generic type.
     reprepares_at_last_refresh: u64,
+    /// Whether an execution has bound a number where a JSON reading is
+    /// compared with a word or looked in for a document.
+    ///
+    /// Measured on MySQL 8.4.11: once one has, MySQL prepares the statement
+    /// again reading that parameter as a number, and goes on reading it so —
+    /// `doc->>'$.a' = ?` bound `'1.0'` after it was bound 1 compares `'1.0'`
+    /// as a number, and `JSON_CONTAINS(doc, ?)` refuses every word after it
+    /// was bound one. Every later word is refused here rather than read
+    /// either way.
+    bound_a_number_to_a_json_reading: bool,
 }
 
 enum PreparedExecutionPlan {
@@ -1373,6 +1383,8 @@ impl MySqlConnection {
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.reject_binary_scalar_collation(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
+                self.refuse_select_json_readings_of_other_columns(&translated)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.validate_select_comparison_columns(
                     translated.source_tables(),
                     translated.checked_comparisons(),
@@ -1497,6 +1509,7 @@ impl MySqlConnection {
                 static_result_projections,
                 execution_plan,
                 time_zone_offset_at_prepare: self.time_zone_offset_seconds(),
+                bound_a_number_to_a_json_reading: false,
             },
         );
         Ok(())
@@ -2436,6 +2449,20 @@ impl MySqlConnection {
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
         let mut bound_temporal = Vec::new();
+        if let PreparedExecutionPlan::Select {
+            checked_comparisons,
+            ..
+        } = &prepared.execution_plan
+        {
+            let binds_a_number = binds_a_number_to_a_json_reading(checked_comparisons, values);
+            let held = hold_json_reading_parameters(
+                checked_comparisons,
+                values,
+                prepared.bound_a_number_to_a_json_reading,
+            );
+            prepared.bound_a_number_to_a_json_reading |= binds_a_number;
+            held?;
+        }
         if let PreparedExecutionPlan::Select {
             source_tables,
             checked_comparisons,
@@ -4859,6 +4886,7 @@ impl MySqlConnection {
         let (translated, rendered_differently) = self.parse_select_knowing_column_types(sql)?;
         Self::reject_internal_catalog_select(&translated)?;
         self.reject_binary_scalar_collation(&translated)?;
+        self.refuse_select_json_readings_of_other_columns(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.reject_index_hints_naming_no_key(&translated)?;
         self.validate_select_comparison_columns(
@@ -4987,6 +5015,7 @@ impl MySqlConnection {
             || typed_rendering
             || translated.needs_column_types()
             || !translated.checked_comparisons().is_empty()
+            || !translated.json_reading_columns().is_empty()
         {
             for source in translated.source_tables() {
                 if let Some(table) = self
@@ -5543,6 +5572,33 @@ impl MySqlConnection {
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
 
+    /// Holds every column a JSON reading in a condition reads to being a
+    /// `JSON` column of the one base table the statement reads.
+    fn refuse_select_json_readings_of_other_columns(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if translated.json_reading_columns().is_empty() {
+            return Ok(());
+        }
+        let [source] = translated.source_tables() else {
+            return Err(MySqlQueryError::Unsupported(
+                "a JSON reading in a condition requires one base table".to_string(),
+            ));
+        };
+        if source.subquery() || !source.projected_columns().is_empty() {
+            return Err(MySqlQueryError::Unsupported(
+                "a JSON reading in a condition requires one base table".to_string(),
+            ));
+        }
+        refuse_json_readings_of_other_columns(
+            &self.inner.current_schema(),
+            source.table().as_str(),
+            translated.json_reading_columns(),
+        )
+        .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
+    }
+
     fn reject_binary_scalar_collation(
         &self,
         translated: &turso_mysql_parser::TranslatedSelect,
@@ -5699,6 +5755,7 @@ impl MySqlConnection {
                 return Err(LimboError::InvalidArgument(refusal));
             }
         }
+        refuse_dml_json_readings_mysql_reads_differently(&self.inner.current_schema(), translated)?;
         self.validate_subquery_comparison_columns(
             translated.source_table(),
             translated.checked_subquery_comparisons(),
@@ -5776,6 +5833,18 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
+            if let Some(answers) = comparison
+                .answers()
+                .filter(|answers| is_a_json_answer(Some(*answers)))
+            {
+                if !checked_comparison_meets_an_answer(comparison.rhs(), answers) {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "DML comparison against a JSON reading requires {}",
+                        answered_kind_name(answers)
+                    )));
+                }
+                continue;
+            }
             refuse_binary_column_like(&self.inner.current_schema(), table.as_str(), comparison)?;
             let Some((type_name, temporal_precision)) =
                 self.comparison_column_type(&table, comparison)?
@@ -5927,6 +5996,10 @@ impl MySqlConnection {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
                 continue;
             };
+            // What binds against a JSON reading was held to its own kinds.
+            if is_a_json_answer(comparison.answers()) {
+                continue;
+            }
             let value = values.get(*ordinal).ok_or_else(|| {
                 LimboError::InternalError(
                     "SELECT comparison placeholder is outside prepared parameters".to_string(),
@@ -8446,8 +8519,101 @@ fn checked_comparison_meets_an_answer(
         (CheckedComparisonAnswer::Moment, CheckedSelectComparisonRhs::Now(now)) => {
             *now == CheckedComparisonNow::Moment
         }
+        // What binds against a JSON reading is held to the kinds it was
+        // rendered for each time the statement runs.
+        (
+            CheckedComparisonAnswer::JsonText,
+            CheckedSelectComparisonRhs::Text(_)
+            | CheckedSelectComparisonRhs::SignedInteger(_)
+            | CheckedSelectComparisonRhs::Decimal(_)
+            | CheckedSelectComparisonRhs::Placeholder { .. },
+        ) => true,
+        (
+            CheckedComparisonAnswer::JsonCount,
+            CheckedSelectComparisonRhs::SignedInteger(_)
+            | CheckedSelectComparisonRhs::Decimal(_)
+            | CheckedSelectComparisonRhs::Placeholder { .. },
+        ) => true,
+        (CheckedComparisonAnswer::JsonDocument, CheckedSelectComparisonRhs::Placeholder { .. }) => {
+            true
+        }
         _ => false,
     }
+}
+
+/// Reports whether an execution binds a number where a JSON reading is
+/// compared with a word or looked in for a document.
+fn binds_a_number_to_a_json_reading(
+    comparisons: &[CheckedSelectComparison],
+    values: &[MySqlPreparedValue],
+) -> bool {
+    json_reading_parameters(comparisons, values).any(|(answers, value)| {
+        answers != CheckedComparisonAnswer::JsonCount
+            && matches!(
+                value,
+                MySqlPreparedValue::Integer(_)
+                    | MySqlPreparedValue::UnsignedInteger(_)
+                    | MySqlPreparedValue::Real(_)
+            )
+    })
+}
+
+/// Holds what binds against a JSON reading to the kinds its comparison was
+/// rendered for.
+///
+/// Measured on MySQL 8.4.11 with a statement prepared once and run with
+/// different values: a word bound against unquoted JSON text is compared as a
+/// word and a number as a number, until a number has been bound, after which
+/// a word is compared as a number too; `JSON_LENGTH(...) = ?` reads a bound
+/// word as a number, `'2x'` as 2; and `JSON_CONTAINS(doc, ?)` bound a number
+/// finds nothing, and then refuses every word with 3146. NULL changes none of
+/// this.
+fn hold_json_reading_parameters(
+    comparisons: &[CheckedSelectComparison],
+    values: &[MySqlPreparedValue],
+    bound_a_number_before: bool,
+) -> Result<()> {
+    for (answers, value) in json_reading_parameters(comparisons, values) {
+        let fits = match (answers, value) {
+            (_, MySqlPreparedValue::Null) => true,
+            (CheckedComparisonAnswer::JsonText, MySqlPreparedValue::Integer(_))
+            | (CheckedComparisonAnswer::JsonText, MySqlPreparedValue::Real(_))
+            | (CheckedComparisonAnswer::JsonCount, MySqlPreparedValue::Integer(_)) => true,
+            (
+                CheckedComparisonAnswer::JsonText | CheckedComparisonAnswer::JsonDocument,
+                MySqlPreparedValue::Text(_),
+            ) => !bound_a_number_before,
+            _ => false,
+        };
+        if !fits {
+            return Err(LimboError::InvalidArgument(format!(
+                "a value bound against a JSON reading has to be {}{}",
+                answered_kind_name(answers),
+                if bound_a_number_before {
+                    ", and a word no longer is once a number has been bound; prepare the statement again"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Pairs each parameter a JSON reading meets with what the reading answers.
+fn json_reading_parameters<'a>(
+    comparisons: &'a [CheckedSelectComparison],
+    values: &'a [MySqlPreparedValue],
+) -> impl Iterator<Item = (CheckedComparisonAnswer, &'a MySqlPreparedValue)> {
+    comparisons.iter().filter_map(move |comparison| {
+        let answers = comparison
+            .answers()
+            .filter(|answers| is_a_json_answer(Some(*answers)))?;
+        let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
+            return None;
+        };
+        values.get(*ordinal).map(|value| (answers, value))
+    })
 }
 
 /// Names what a call answers, for a refusal a client can read.
@@ -8457,6 +8623,9 @@ const fn answered_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
         CheckedComparisonAnswer::WholeNumber => "a number",
         CheckedComparisonAnswer::Day => "a day written the way one is stored",
         CheckedComparisonAnswer::Moment => "a moment written the way one is stored",
+        CheckedComparisonAnswer::JsonText => "a word or a number",
+        CheckedComparisonAnswer::JsonCount => "a number",
+        CheckedComparisonAnswer::JsonDocument => "a JSON document",
     }
 }
 
@@ -8711,10 +8880,80 @@ fn validate_dml_comparison_columns(
             return Err(LimboError::InvalidArgument(refusal));
         }
     }
+    refuse_dml_json_readings_mysql_reads_differently(schema, translated)?;
     validate_frozen_select_comparison_columns(
         schema,
         translated.source_table(),
         translated.checked_comparisons(),
+    )
+}
+
+/// Holds the JSON readings in an `UPDATE` or `DELETE` `WHERE` to what the
+/// `SELECT` path holds them to: each reads a `JSON` column of the one table
+/// the statement writes.
+///
+/// A bound value is refused outright. A prepared `SELECT` holds what binds
+/// against a JSON reading to a word or a number every time it runs, and a
+/// prepared DML statement has no such step.
+fn refuse_dml_json_readings_mysql_reads_differently(
+    schema: &turso_core::schema::Schema,
+    translated: &TranslatedDml,
+) -> Result<()> {
+    if translated.checked_comparisons().iter().any(|comparison| {
+        is_a_json_answer(comparison.answers())
+            && matches!(
+                comparison.rhs(),
+                CheckedSelectComparisonRhs::Placeholder { .. }
+            )
+    }) {
+        return Err(LimboError::InvalidArgument(
+            "DML comparison of a JSON reading with a bound value is unsupported".to_string(),
+        ));
+    }
+    if translated.json_reading_columns().is_empty() {
+        return Ok(());
+    }
+    if !translated.read_tables().is_empty() {
+        return Err(LimboError::InvalidArgument(
+            "a JSON reading in a DML condition requires the one table the statement writes"
+                .to_string(),
+        ));
+    }
+    let table = translated.source_table().ok_or(LimboError::SchemaUpdated)?;
+    refuse_json_readings_of_other_columns(schema, table, translated.json_reading_columns())
+}
+
+/// Holds every column a JSON reading reads to being a `JSON` column.
+///
+/// The readings are MySQL's over a document. Over a text column MySQL reads
+/// the text as a document first, which is not what this measured.
+fn refuse_json_readings_of_other_columns(
+    schema: &turso_core::schema::Schema,
+    table: &str,
+    columns: &[String],
+) -> Result<()> {
+    let table = schema.get_btree_table(table).ok_or_else(|| {
+        LimboError::InvalidArgument("a JSON reading requires a base table".to_string())
+    })?;
+    for name in columns {
+        let (_, column) = table.get_column(name).ok_or(LimboError::SchemaUpdated)?;
+        if !column.ty_str.eq_ignore_ascii_case("JSON") {
+            return Err(LimboError::InvalidArgument(format!(
+                "a JSON reading of {name} requires a JSON column"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_a_json_answer(answers: Option<CheckedComparisonAnswer>) -> bool {
+    matches!(
+        answers,
+        Some(
+            CheckedComparisonAnswer::JsonText
+                | CheckedComparisonAnswer::JsonCount
+                | CheckedComparisonAnswer::JsonDocument
+        )
     )
 }
 

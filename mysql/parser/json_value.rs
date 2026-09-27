@@ -97,6 +97,118 @@ pub fn json_quote(text: &str) -> String {
     written
 }
 
+/// Reads what a path names in a document, the way `JSON_EXTRACT` does, and
+/// writes it the way MySQL prints a document.
+///
+/// `Some(None)` is a path the document does not have, and `None` a document
+/// or a path this cannot read. Measured on MySQL 8.4.11: a member is looked up
+/// in an object and nowhere else, so `$.a` over an array finds nothing; an
+/// element is looked up in an array, except that `[0]` over anything else is
+/// the value itself — MySQL reads a lone value as an array of one — so `$[0]`
+/// over `{"a": 1}` is `{"a": 1}` and `$[1]` over it is nothing; and a member
+/// holding the JSON null is found, as `null`.
+pub fn json_extract(document: &str, path: &str) -> Option<Option<String>> {
+    let steps = read_json_path(path)?;
+    let document = read_document(document)?;
+    let mut found = &document;
+    for step in &steps {
+        let next = match (step, found) {
+            (JsonPathStep::Member(name), JsonValue::Object(members)) => members
+                .iter()
+                .find(|(held, _)| held == name)
+                .map(|(_, value)| value),
+            (JsonPathStep::Member(_), _) => None,
+            (JsonPathStep::Element(index), JsonValue::Array(elements)) => elements.get(*index),
+            (JsonPathStep::Element(0), lone) => Some(lone),
+            (JsonPathStep::Element(_), _) => None,
+        };
+        let Some(next) = next else {
+            return Some(None);
+        };
+        found = next;
+    }
+    let mut written = String::new();
+    write_value(found, &mut written);
+    Some(Some(written))
+}
+
+/// Reports whether a path is one [`json_extract`] reads.
+pub fn is_a_json_path_this_reads(path: &str) -> bool {
+    read_json_path(path).is_some()
+}
+
+/// One step along a JSON path.
+enum JsonPathStep {
+    Member(String),
+    Element(usize),
+}
+
+/// Reads the paths this takes: `$`, then any number of `.name`,
+/// `."quoted name"` and `[n]`.
+///
+/// A bare name is one MySQL takes bare — measured on 8.4.11, `$.1a` is error
+/// 3143 there while `$._a` and `$.$a` are read — written in ASCII; anything
+/// else has to be quoted, and a quoted name holding a `"` or a `\` is refused
+/// rather than having its escapes read. Wildcards, `last`, ranges and spaces
+/// inside a path are refused, and so is an index past nine digits: MySQL
+/// refuses one past 4294967295 with 3143.
+fn read_json_path(path: &str) -> Option<Vec<JsonPathStep>> {
+    let mut rest = path.strip_prefix('$')?;
+    let mut steps = Vec::new();
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix(".\"") {
+            let end = after.find('"')?;
+            let name = &after[..end];
+            if name.contains('\\') {
+                return None;
+            }
+            steps.push(JsonPathStep::Member(name.to_owned()));
+            rest = &after[end + 1..];
+        } else if let Some(after) = rest.strip_prefix('.') {
+            let length = after
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric() || character == '_' || character == '$')
+                })
+                .unwrap_or(after.len());
+            let name = &after[..length];
+            if name.is_empty() || name.starts_with(|character: char| character.is_ascii_digit()) {
+                return None;
+            }
+            steps.push(JsonPathStep::Member(name.to_owned()));
+            rest = &after[length..];
+        } else if let Some(after) = rest.strip_prefix('[') {
+            let end = after.find(']')?;
+            let digits = &after[..end];
+            if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            steps.push(JsonPathStep::Element(digits.parse().ok()?));
+            rest = &after[end + 1..];
+        } else {
+            return None;
+        }
+    }
+    Some(steps)
+}
+
+/// Takes the quotes off a JSON string, the way `JSON_UNQUOTE` does over what
+/// `JSON_EXTRACT` found, and writes anything else the way MySQL prints it.
+///
+/// Measured on MySQL 8.4.11: `"a\nb"` unquotes to a real line break, the JSON
+/// null to the word `null`, `true` to `true`, `1.50` to `1.5`, and an object to
+/// itself written out with its keys in MySQL's order.
+pub fn json_unquote(document: &str) -> Option<String> {
+    match read_document(document)? {
+        JsonValue::Text(text) => Some(text),
+        other => {
+            let mut written = String::new();
+            write_value(&other, &mut written);
+            Some(written)
+        }
+    }
+}
+
 /// Answers whether a JSON number equals a signed SQL integer. Other JSON
 /// types are unequal, and SQL NULL is handled by the caller.
 pub fn json_equals_integer(document: &str, integer: i64) -> Option<bool> {

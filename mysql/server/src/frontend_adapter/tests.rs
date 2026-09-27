@@ -30616,3 +30616,6 @@ mod rails_statements;
 
 #[cfg(unix)]
 mod unicode_collation;
+
+#[cfg(unix)]
+mod json_conditions;

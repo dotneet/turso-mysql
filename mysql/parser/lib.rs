@@ -103,9 +103,10 @@ pub use insert_select::{
     MySqlInsertSelectWithoutColumns, MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
-    json_compare_integer, json_compare_string, json_contains, json_equals_integer, json_keys,
-    json_length, json_merge_patch, json_merge_preserve, json_overlaps, json_quote, json_search,
-    json_type, normalize_json, JsonError,
+    is_a_json_path_this_reads, json_compare_integer, json_compare_string, json_contains,
+    json_equals_integer, json_extract, json_keys, json_length, json_merge_patch,
+    json_merge_preserve, json_overlaps, json_quote, json_search, json_type, json_unquote,
+    normalize_json, JsonError,
 };
 pub use like_pattern::MySqlLikePattern;
 pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
@@ -289,6 +290,19 @@ impl Dialect for SessionMySqlDialect {
 
     fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
         MySqlDialect {}.parse_statement(parser)
+    }
+
+    /// MySQL's `->` and `->>` read one path out of the column on their left and
+    /// bind to it before anything else does: measured on 8.4.11,
+    /// `doc->>'$.lang' = 'en'` compares what was read. sqlparser gives them
+    /// PostgreSQL's precedence, below `=`, which reads that as
+    /// `doc ->> ('$.lang' = 'en')`.
+    fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
+        matches!(
+            parser.peek_token_ref().token,
+            Token::Arrow | Token::LongArrow
+        )
+        .then(|| Ok(self.prec_value(sqlparser::dialect::Precedence::DoubleColon)))
     }
 
     delegate_mysql_bool!(require_interval_qualifier);
@@ -847,6 +861,7 @@ impl BoundAutoIncrementInsert {
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
     collation_sensitive_call_columns: Vec<String>,
+    json_reading_columns: Vec<String>,
     reads_table: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
@@ -958,6 +973,17 @@ pub enum CheckedComparisonAnswer {
     Day,
     /// A moment, written the way a `DATETIME` column holds one.
     Moment,
+    /// Text read out of a `JSON` column, which MySQL compares under
+    /// `utf8mb4_bin` against a word and as a double against a number. A bound
+    /// value is compared by what it binds as, which only holds while the
+    /// statement has never bound a number there — see the frontend.
+    JsonText,
+    /// The count `JSON_LENGTH` answers, compared with a number. A bound value
+    /// has to bind as a whole number.
+    JsonCount,
+    /// A document `JSON_CONTAINS` looks for. A bound value has to bind as
+    /// text, which the dialect then reads as a document.
+    JsonDocument,
 }
 
 /// The comparison operators accepted by the strict integer SELECT subset.
@@ -1157,6 +1183,7 @@ pub struct TranslatedDml {
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     ordered_columns: Vec<String>,
     collation_sensitive_call_columns: Vec<String>,
+    json_reading_columns: Vec<String>,
 }
 
 impl TranslatedDml {
@@ -1164,6 +1191,12 @@ impl TranslatedDml {
     /// `utf8mb4_0900_ai_ci`'s weights.
     pub fn collation_sensitive_call_columns(&self) -> &[String] {
         &self.collation_sensitive_call_columns
+    }
+
+    /// Returns the columns a JSON reading in the `WHERE` reads, each of which
+    /// has to be a `JSON` column of the table the statement writes.
+    pub fn json_reading_columns(&self) -> &[String] {
+        &self.json_reading_columns
     }
 
     /// Returns the normalized statement without a trailing semicolon.
@@ -1404,6 +1437,12 @@ impl TranslatedSelect {
 
     pub fn collation_sensitive_call_columns(&self) -> &[String] {
         &self.collation_sensitive_call_columns
+    }
+
+    /// Returns the columns a JSON reading in a condition reads, each of which
+    /// has to be a `JSON` column of the one table the statement reads.
+    pub fn json_reading_columns(&self) -> &[String] {
+        &self.json_reading_columns
     }
 
     pub fn checks_type_sensitive_expression(&self) -> bool {
@@ -3812,6 +3851,7 @@ fn parse_select_inner(
     let RenderedSelect {
         sqlite_sql,
         collation_sensitive_call_columns,
+        json_reading_columns,
         source_table,
         source_tables,
         checked_comparisons,
@@ -3843,6 +3883,7 @@ fn parse_select_inner(
     )?;
     Ok(TranslatedSelect {
         collation_sensitive_call_columns,
+        json_reading_columns,
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
         checks_type_sensitive_expression,
@@ -3972,6 +4013,7 @@ pub fn parse_dml_knowing_numeric_columns(
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         ordered_columns,
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
+        json_reading_columns: render_context.json_reading_columns,
     })
 }
 

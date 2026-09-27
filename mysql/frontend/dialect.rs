@@ -492,6 +492,16 @@ impl Dialect for MySqlDialect {
         if arg_count == 4 && name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_SEARCH.to_string())));
         }
+        if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_JSON_UNQUOTE) {
+            return Ok(Some(Func::Dialect(MYSQL_JSON_UNQUOTE.to_string())));
+        }
+        if arg_count == 2
+            && (name.eq_ignore_ascii_case(MYSQL_JSON_EXTRACT)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_TEXT_COMPARE)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_HOLDS))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
         if arg_count == 2
             && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
                 || name.eq_ignore_ascii_case(MYSQL_TRUNCATE)
@@ -736,6 +746,87 @@ impl Dialect for MySqlDialect {
                     std::cmp::Ordering::Greater => 1,
                 })
             }));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_EXTRACT) {
+            let [document, path] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let (Value::Text(document), Value::Text(path)) = (document, path) else {
+                return Ok(Value::Null);
+            };
+            let found = turso_mysql_parser::json_extract(document.as_str(), path.as_str())
+                .ok_or_else(|| {
+                    LimboError::InvalidArgument(
+                        "JSON reading over a value that is not a document, or a path it cannot read"
+                            .to_string(),
+                    )
+                })?;
+            return Ok(found.map_or(Value::Null, Value::build_text));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_UNQUOTE) {
+            let [document] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            let Value::Text(document) = document else {
+                return Ok(Value::Null);
+            };
+            let unquoted =
+                turso_mysql_parser::json_unquote(document.as_str()).ok_or_else(|| {
+                    LimboError::InvalidArgument(
+                        "JSON_UNQUOTE over text that is not a document".into(),
+                    )
+                })?;
+            return Ok(Value::build_text(unquoted));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_TEXT_COMPARE) {
+            let [text, operand] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            return Ok(match compare_json_text(text, operand)? {
+                Some(order) => Value::from_i64(match order {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }),
+                None => Value::Null,
+            });
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_HOLDS) {
+            let [target, candidate] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let candidate = match candidate {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(candidate) => candidate.as_str(),
+                _ => {
+                    return Err(LimboError::InvalidArgument(
+                        "JSON_CONTAINS requires a JSON document to look for".to_string(),
+                    ))
+                }
+            };
+            // Measured on MySQL 8.4.11: text that is not a document is error
+            // 3141 there, whether it was written or bound, rather than no
+            // answer at all.
+            turso_mysql_parser::normalize_json(candidate).map_err(|_| {
+                LimboError::InvalidArgument(
+                    "JSON_CONTAINS was given text that is not a JSON document".to_string(),
+                )
+            })?;
+            let Value::Text(target) = target else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::json_contains(target.as_str(), candidate) {
+                    Some(held) => Value::from_i64(i64::from(held)),
+                    None => Value::Null,
+                },
+            );
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_SEARCH) {
             let [document, every, pattern, escape] = args else {
@@ -1139,6 +1230,130 @@ pub(crate) const MYSQL_JSON_OVERLAPS: &str = "mysql_json_overlaps";
 pub(crate) const MYSQL_JSON_SEARCH: &str = "mysql_json_search";
 pub(crate) const MYSQL_JSON_MERGE_PATCH: &str = "mysql_json_merge_patch";
 pub(crate) const MYSQL_JSON_MERGE_PRESERVE: &str = "mysql_json_merge_preserve";
+/// Reads what a path names in a document, and takes the quotes off what was
+/// found, the way `JSON_EXTRACT` and `JSON_UNQUOTE` do. The engine's own `->`
+/// and `->>` read `$[0]` over something that is not an array as nothing where
+/// MySQL reads the value itself, and answer the JSON null as no value where
+/// MySQL answers the word `null`.
+pub(crate) const MYSQL_JSON_EXTRACT: &str = "mysql_json_extract";
+pub(crate) const MYSQL_JSON_UNQUOTE: &str = "mysql_json_unquote";
+/// Compares the text a JSON reading answers with a value, the way MySQL
+/// compares it: against a word under `utf8mb4_bin`, and against a number as
+/// two doubles.
+pub(crate) const MYSQL_JSON_TEXT_COMPARE: &str = "mysql_json_text_compare";
+/// `JSON_CONTAINS` where the document looked for may be bound, which has to
+/// refuse text that is not a document the way MySQL does rather than answer
+/// nothing.
+pub(crate) const MYSQL_JSON_HOLDS: &str = "mysql_json_holds";
+
+/// Compares the text a JSON reading answers with a value, or answers nothing
+/// when either is NULL.
+///
+/// Measured on MySQL 8.4.11: the text carries `utf8mb4_bin`, so against a word
+/// it tells `en` from `EN` and pads with spaces — `en` equals `en  `. Against a
+/// number both sides are read as doubles, the text by the number it begins
+/// with, so `1.50` equals 1.5, `true` equals 0 and `1abc` equals 1.
+fn compare_json_text(text: &Value, operand: &Value) -> Result<Option<std::cmp::Ordering>> {
+    let text = match text {
+        Value::Null => return Ok(None),
+        Value::Text(text) => text.as_str(),
+        _ => {
+            return Err(LimboError::InternalError(
+                "a JSON reading answered something other than text".to_string(),
+            ))
+        }
+    };
+    let number = match operand {
+        Value::Null => return Ok(None),
+        Value::Text(operand) => {
+            return Ok(Some(compare_padded_with_spaces(
+                text.as_bytes(),
+                operand.as_str().as_bytes(),
+            )))
+        }
+        Value::Numeric(Numeric::Integer(integer)) => *integer as f64,
+        Value::Numeric(Numeric::Float(float)) => f64::from(*float),
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "a JSON reading is compared with a word or a number".to_string(),
+            ))
+        }
+    };
+    let read = text_as_a_double(text).ok_or_else(|| {
+        LimboError::InvalidArgument(
+            "a JSON reading names a number too large for a double".to_string(),
+        )
+    })?;
+    Ok(read.partial_cmp(&number))
+}
+
+/// Compares two byte strings under `utf8mb4_bin`, whose order is the order of
+/// the bytes and which reads the shorter one as though it went on in spaces.
+fn compare_padded_with_spaces(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+    let longest = left.len().max(right.len());
+    (0..longest)
+        .map(|at| {
+            let left = left.get(at).copied().unwrap_or(b' ');
+            let right = right.get(at).copied().unwrap_or(b' ');
+            left.cmp(&right)
+        })
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Reads text as the number it begins with, the way MySQL reads a word it
+/// compares with a number.
+///
+/// Measured on MySQL 8.4.11: spaces, tabs and line breaks in front are passed
+/// over; a sign, digits, a point and an exponent are read for as long as they
+/// make a number, so `1e5x` is 100000, `1e` is 1 and `.5` is 0.5; and anything
+/// else is 0 — `abc`, `0x10`, `inf`, `nan` and a full-width digit alike. A
+/// number too large for a double answers nothing, the one case this does not
+/// read MySQL's way.
+fn text_as_a_double(text: &str) -> Option<f64> {
+    let bytes = text.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .unwrap_or(bytes.len());
+    let start = at;
+    if matches!(bytes.get(at), Some(b'+' | b'-')) {
+        at += 1;
+    }
+    let digits_before = count_digits(&bytes[at..]);
+    at += digits_before;
+    let mut digits_after = 0;
+    if bytes.get(at) == Some(&b'.') {
+        digits_after = count_digits(&bytes[at + 1..]);
+        if digits_before + digits_after > 0 {
+            at += 1 + digits_after;
+        }
+    }
+    if digits_before + digits_after == 0 {
+        return Some(0.0);
+    }
+    if matches!(bytes.get(at), Some(b'e' | b'E')) {
+        let mut exponent_at = at + 1;
+        if matches!(bytes.get(exponent_at), Some(b'+' | b'-')) {
+            exponent_at += 1;
+        }
+        let exponent_digits = count_digits(&bytes[exponent_at..]);
+        if exponent_digits > 0 {
+            at = exponent_at + exponent_digits;
+        }
+    }
+    let read = text[start..at]
+        .parse::<f64>()
+        .expect("the digits read make a number");
+    read.is_finite().then_some(read)
+}
+
+fn count_digits(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count()
+}
 
 const MYSQL_JSON_READINGS: [&str; 5] = [
     MYSQL_JSON_DOCUMENT,
@@ -2052,6 +2267,59 @@ mod tests {
         SchemaSqlContext, SchemaSqlMode, SchemaSqlV2Metadata,
     };
     use turso_parser::{ast::Cmd, parser::Parser};
+
+    /// Measured on MySQL 8.4.11 as `'<text>' = <number>`.
+    #[test]
+    fn text_is_read_as_the_number_it_begins_with() {
+        for (text, number) in [
+            ("1abc", 1.0),
+            ("abc", 0.0),
+            ("1e2", 100.0),
+            (".5", 0.5),
+            ("1.", 1.0),
+            ("+1", 1.0),
+            ("-", 0.0),
+            (" 12abc", 12.0),
+            ("1e", 1.0),
+            ("1e+", 1.0),
+            ("0x10", 0.0),
+            ("\t1", 1.0),
+            ("\n1", 1.0),
+            ("\r1", 1.0),
+            ("\u{b}1", 1.0),
+            ("\u{c}1", 1.0),
+            ("１", 0.0),
+            ("inf", 0.0),
+            ("nan", 0.0),
+            ("1_000", 1.0),
+            ("-0", 0.0),
+            ("1 ", 1.0),
+            ("1e5x", 100000.0),
+            ("-.5", -0.5),
+            ("- 1", 0.0),
+            ("00012", 12.0),
+            ("1.5e-1", 0.15),
+            ("1E1", 10.0),
+            ("0.1", 0.1),
+            ("1.e5", 100000.0),
+        ] {
+            assert_eq!(text_as_a_double(text), Some(number), "{text:?}");
+        }
+        assert_eq!(text_as_a_double("1e400"), None);
+    }
+
+    /// `utf8mb4_bin` reads the shorter side as though it went on in spaces, so
+    /// a tab sorts below the space it is compared with. Measured on MySQL
+    /// 8.4.11 against `JSON_UNQUOTE`: `'a' > 'a\t'` is 1.
+    #[test]
+    fn utf8mb4_bin_pads_with_spaces() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_padded_with_spaces(b"en", b"en  "), Ordering::Equal);
+        assert_eq!(compare_padded_with_spaces(b"en ", b"en"), Ordering::Equal);
+        assert_eq!(compare_padded_with_spaces(b"en", b"EN"), Ordering::Greater);
+        assert_eq!(compare_padded_with_spaces(b"a", b"a\t"), Ordering::Greater);
+        assert_eq!(compare_padded_with_spaces(b"a", b"ab"), Ordering::Less);
+    }
 
     #[test]
     fn regexp_refuses_unicode_case_folds_it_cannot_match() {

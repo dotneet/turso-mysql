@@ -3106,6 +3106,60 @@ JSON numbers follow MySQL 8.4.11's RapidJSON conversion, including its
 rounding at `1000000000000000.1` and `1e-30`. They read back as `1e15` and
 `9.999999999999999e-31`, respectively.
 
+A `WHERE` — of a `SELECT`, an `UPDATE` or a `DELETE` — takes the conditions
+the frameworks write over a `JSON` column: Laravel's `where('meta->lang',
+'en')`, which is `json_unquote(json_extract(meta, '$."lang"')) = ?`, its
+`whereJsonContains`, `whereJsonContainsKey`, `whereJsonLength` and
+`whereNull('meta->x')`, and the `meta->>'$.lang' = 'en'` Rails users write by
+hand. Each reads a column of the one table the statement reads, and the
+column has to be a `JSON` one. What each answers, measured on 8.4.11 over the
+same rows:
+
+- `col->>'path'` and `JSON_UNQUOTE(JSON_EXTRACT(col, 'path'))` answer text
+  with the `utf8mb4_bin` collation. Against a word it tells `en` from `EN`
+  and pads with spaces, so `'en  '` finds `en`; against a number both sides
+  are read as doubles, the text by the number it begins with — `'1.50'`
+  equals 1.5, `'true'` equals 0 and `'1abc'` equals 1. The JSON null
+  unquotes to the word `null`, which is not NULL, `true` to `true`, and
+  anything that is not a string is written out the way MySQL prints it, so
+  `meta->>'$.tags'` is `["x", "y"]`. Every comparison operator is taken
+  with a written word, a number or NULL, and `<=>` with a written one.
+- `col->'path'` and `JSON_EXTRACT(col, 'path')` answer a JSON value, which
+  is compared by JSON's rules, the ones a whole `JSON` column is compared by:
+  `doc->'$.a' = '1'` finds the string `"1"` and not the number, a word is
+  compared byte for byte with no padding, and a string ranks above every
+  number, so `doc->'$.n' > 1` finds `"1"`.
+- `JSON_EXTRACT(...) IS NULL` is true only where the path is not there, a
+  member holding the JSON null being found; `JSON_TYPE(...)` names it `NULL`,
+  and that word is compared under `utf8mb4_bin` too, so `= 'null'` finds
+  nothing.
+- `JSON_CONTAINS(col, candidate[, 'path'])` and
+  `JSON_CONTAINS_PATH(col, 'one' | 'all', 'path', ...)` stand on their own
+  as a condition, the second also under Laravel's `ifnull(..., 0)`. A
+  candidate that is not a document is error 3141 there, and refused here.
+- `JSON_LENGTH(col[, 'path'])` is compared with a number. A written word is
+  refused: MySQL reads `json_length(doc) = '6'` as a number.
+
+A path is read the way MySQL reads it rather than the way the engine's own
+`->` does: `$`, `.name`, `."quoted name"` — the spelling Laravel writes every
+member in — and `[n]`, where a member is found only in an object and `[0]`
+over anything that is not an array is the value itself, MySQL reading a lone
+value as an array of one. The engine reads that as nothing. A name MySQL
+refuses bare, such as `$.1a`, is refused, and so are wildcards, `last`,
+ranges, spaces inside a path and a quoted name holding a quote or a
+backslash.
+
+A `?` meets these the way it meets them in MySQL: a word binds as a word and
+a number as a number, `JSON_LENGTH` takes a whole number, and `JSON_CONTAINS`
+looks for a document bound as text. Measured with a statement prepared once
+and run again: once a number has been bound where a word is compared or a
+document looked for, MySQL prepares the statement again reading that
+parameter as a number and keeps reading every later word so — `'1.0'` then
+equals 1, and `JSON_CONTAINS` refuses every word with 3146. From that point
+the statement refuses a word here, and a number bound to `JSON_CONTAINS` is
+refused outright. A prepared `UPDATE` or `DELETE` has no step holding what
+binds, so a `?` against a JSON reading is refused there.
+
 A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
 these connections now run with it on, which is what makes taking the syntax
 honest: until now the constraint was refused precisely because a stored one
