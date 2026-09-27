@@ -813,6 +813,42 @@ impl MySqlConnection {
         catalog_name: &str,
         stored_sql: &str,
     ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        let mut metadata = self.read_view_columns(requested_name, catalog_name, stored_sql)?;
+        for column in &mut metadata {
+            column.key = MySqlColumnKey::None;
+            column.default_sql = None;
+            column.default_value = None;
+            column.extra.clear();
+        }
+        Ok(metadata)
+    }
+
+    /// Reads the columns a `SELECT` from a view reads, each as its base table
+    /// declares it, keys and defaults included.
+    ///
+    /// Measured on MySQL 8.4.11, a view projecting one table's columns reports
+    /// each on the wire the way the table does — `id` in a view over a table
+    /// keyed by it carries the primary-key flags — where `SHOW COLUMNS` of the
+    /// view leaves the key out.
+    pub fn columns_a_view_reads(
+        &self,
+        view: &MySqlTableName,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        let stored_sql = self
+            .inner
+            .current_schema()
+            .get_view(view.as_str())
+            .map(|stored| stored.sql.clone())
+            .ok_or(MySqlColumnMetadataError::TableNotFound)?;
+        self.read_view_columns(view.as_str(), view.as_str(), &stored_sql)
+    }
+
+    fn read_view_columns(
+        &self,
+        requested_name: &str,
+        catalog_name: &str,
+        stored_sql: &str,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
         if !catalog_name.eq_ignore_ascii_case(requested_name) {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
@@ -891,10 +927,6 @@ impl MySqlConnection {
                 .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
             let mut column = source.clone();
             column.name = projected_name;
-            column.key = MySqlColumnKey::None;
-            column.default_sql = None;
-            column.default_value = None;
-            column.extra.clear();
             metadata.push(column);
         }
         if core_view.columns.len() != metadata.len() {

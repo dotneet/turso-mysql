@@ -176,3 +176,61 @@ fn create_or_replace_and_alter_view_write_the_view_again() {
     assert_eq!(rows(&mut adapter, "SELECT name FROM v3"), ["x"]);
     assert_eq!(views(&mut adapter), ["v3|VIEW"]);
 }
+
+fn columns(adapter: &mut Adapter, sql: &str) -> Vec<ColumnDefinitionConfig> {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must return a result set");
+    };
+    result.columns
+}
+
+/// Measured on MySQL 8.4.11: a view projecting one table's columns reports
+/// each the way the table does — type, length, collation and flags, the
+/// primary key's among them — under the view's name as both its table and
+/// its original table, or under the alias it is read through as its table.
+#[test]
+fn a_view_reports_its_columns_the_way_its_table_does() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE VIEW v1 AS SELECT id, title FROM posts",
+    );
+    let table = columns(&mut adapter, "SELECT id, title FROM posts");
+    let view = columns(&mut adapter, "SELECT * FROM v1 ORDER BY id");
+    assert_eq!(view.len(), 2);
+    for (view, table) in view.iter().zip(&table) {
+        assert_eq!(view.table, "v1");
+        assert_eq!(view.original_table, "v1");
+        assert_eq!(view.schema, "probe");
+        assert_eq!(
+            (
+                &view.name,
+                view.column_type,
+                view.column_length,
+                view.flags,
+                view.decimals,
+                view.character_set
+            ),
+            (
+                &table.name,
+                table.column_type,
+                table.column_length,
+                table.flags,
+                table.decimals,
+                table.character_set
+            )
+        );
+    }
+    assert_eq!(view[0].column_type, MYSQL_TYPE_LONG);
+    assert_eq!(view[1].column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(view[1].column_length, 80);
+
+    let aliased = columns(&mut adapter, "SELECT x.id FROM v1 x");
+    assert_eq!(aliased[0].table, "x");
+    assert_eq!(aliased[0].original_table, "v1");
+    assert_eq!(aliased[0].flags, table[0].flags);
+
+    let counted = columns(&mut adapter, "SELECT COUNT(*) FROM v1");
+    assert_eq!(counted[0].table, "");
+    assert_eq!(counted[0].column_type, MYSQL_TYPE_LONGLONG);
+}

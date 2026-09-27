@@ -8064,20 +8064,24 @@ fn table_result_metadata_for_references(
             });
             continue;
         }
-        // View output metadata has different visibility and key/default
-        // semantics from its base table. Keep it on the established generic
-        // path until its MySQL wire fields have an oracle-backed contract.
         let table_kind = listed
             .iter()
             .find(|table| table.name().eq_ignore_ascii_case(source.table().as_str()))
             .map(|table| table.kind())
             .ok_or(FrontendErrorKind::MissingObject)?;
-        if table_kind != MySqlTableKind::BaseTable {
-            return Ok(None);
-        }
-        let columns = connection
-            .list_columns(source.table())
-            .map_err(column_metadata_error_kind)?;
+        let columns = if table_kind == MySqlTableKind::BaseTable {
+            connection
+                .list_columns(source.table())
+                .map_err(column_metadata_error_kind)?
+        } else {
+            // A view projecting one table's columns reports each the way the
+            // table does, under the view's own name. Any other view stays on
+            // the generic path, its wire fields not measured.
+            match connection.columns_a_view_reads(source.table()) {
+                Ok(columns) => columns,
+                Err(_) => return Ok(None),
+            }
+        };
         tables.push(SourceTableColumns {
             source_table: source.table().as_str().to_owned(),
             table_reference: source.reference().to_owned(),
