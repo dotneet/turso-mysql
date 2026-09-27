@@ -123,6 +123,11 @@ boolean literal.
 | An `UPDATE ... SET` value taken from `(SELECT COUNT(*) FROM ...)` | refused; a count says nothing about the kind of the column written, and the pair is held to one kind |
 | An `UPDATE ... SET` value whose subquery reads a column its own table does not hold | refused; that is a correlated read of the row being changed, which has not been measured |
 | A collation over a `LIKE` or a membership test — `name LIKE 'a' COLLATE utf8mb4_bin`, `name IN ('a' COLLATE utf8mb4_bin)` | refused; the checked LIKE matcher uses the column's default UCA9 rule, while explicit byte collation and membership-test overrides need separate checked paths |
+| `%`, `DIV` or a negation over a `DOUBLE` or a `DECIMAL`, and `MOD` over a `DOUBLE` | refused; measured, MySQL answers a `DOUBLE` of 23 or the column's own `DECIMAL`, and the engine's `%` reads a real number as a whole one |
+| `%` or `DIV` by zero, `DIV -1`, and a negated `BIGINT` | refused; MySQL answers NULL with warning 1365 for the first, and 1690 for the smallest `BIGINT` in the others, where the engine answers a real number |
+| `%`, `DIV` or a negation in a `WHERE` | refused; the comparison reader takes a call there, and the column's kind is checked only for a projection |
+| `ROUND` of a `DECIMAL` or a `BIGINT` left of the point, and `FLOOR` or `CEIL` of a `DECIMAL` | refused; measured, `ROUND` of a `BIGINT` past the largest one is 1690, and the others answer shapes of their own |
+| `ROUND` naming its places with anything but a written whole number | refused; the answer's width is worked out from them |
 | `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2`, `LOG10` | refused; measured, `ATAN(10)` and `TAN(10)` differ from MySQL in the last place, and the rest come from the same maths library, so agreeing at the points tried is not a promise |
 | `BIN` or `OCT` over a word — `BIN(name)` | refused; MySQL reads the word as the number it names, which is 0 for a word that names none |
 | `CONCAT` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; the generic text conversion of exact decimal blobs and floating values has not been verified against MySQL's numeric formatting |

@@ -844,7 +844,7 @@ also refused when its source column collation cannot be checked.
 The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
 `REPLACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE` (2 arguments), `HEX` (text columns),
 `LENGTH`, `CHAR_LENGTH` (and its `CHARACTER_LENGTH` spelling), `NOW()` with
-`CURRENT_TIMESTAMP`, `ABS`, `SIGN`, `SQRT`, `POW` (with `POWER`), `MOD`, `ROUND` over one argument,
+`CURRENT_TIMESTAMP`, `ABS`, `SIGN`, `SQRT`, `POW` (with `POWER`), `MOD`, `ROUND`,
 `GREATEST`, `LEAST`, `NULLIF`,
 `IFNULL` with `COALESCE`, `CONCAT`, `CONCAT_WS`, `SUBSTRING` (with `SUBSTR`),
 `SUBSTRING_INDEX`, `MD5`, `SHA1` (with `SHA`), `SHA2`, and `LEFT` with `RIGHT`. A `CASE` and its call spelling `IF` are taken
@@ -861,7 +861,9 @@ engine's case-sensitivity; and `LENGTH` and `CHAR_LENGTH` a `LONGLONG` of length
 10. Over an `INT` of length 11 and a
 `DECIMAL(10,2)` of length 12: `ABS` keeps the column's own width and scale,
 `MOD` keeps the column's numeric shape (widening `INT` to `LONGLONG` 11) and answers `BINARY NUM` (not NOT NULL since division by zero yields NULL),
-`ROUND`, `FLOOR`, `CEIL`, `CEILING`, and `SIGN` answer a `LONGLONG` of length 21 however wide the argument was (and carry `NOT NULL` when their column does),
+`SIGN` answers a `LONGLONG` of length 21 however wide the argument was, and
+`ROUND`, `FLOOR`, `CEIL` and `CEILING` answer the kind of number their column
+holds, as the next paragraphs say (each carries `NOT NULL` when its column does),
 `SQRT` and `POW` answer a `DOUBLE` of length 23 and not-fixed decimals (31),
 `GREATEST` and `LEAST` take 2 or more homogenous arguments (all integers or all text) and answer the widest width (e.g. `LONGLONG` 11 for integer, or `max_len * 4` for text), preserving `NOT NULL` only if all arguments are non-null;
 `NULLIF(expr1, expr2)` answers expr1's shape (widening `INT` to `LONGLONG` 11) with `NOT_NULL_FLAG` cleared since matching arguments yield NULL;
@@ -2931,6 +2933,54 @@ Refused beside these: each over a `TEXT`, which MySQL answers as a
 `MEDIUM_BLOB` of 1048560; each over a `DECIMAL` or a real column; a place, a
 count or a `SHA2` size read from the row; and a call compared against a `?`,
 which carries no kind until it binds.
+
+`col % n`, `col DIV n` and `-col` are taken over a column of whole numbers.
+Measured on 8.4.11, each answers a `LONGLONG` as wide as the column — 4 over a
+`TINYINT`, 6 over a `SMALLINT`, 11 over an `INT`, 20 over a `BIGINT`, and 4
+over a `TINYINT(1)`, which reports 1 on its own (`MOD` now reports that 4
+too). A negation keeps the column's `NOT NULL`; `%` and `DIV` never do, since
+a zero divisor answers NULL. `%` keeps the dividend's sign and `DIV` cuts
+toward zero — `-7 % -3` is -1 and `-7 DIV 2` is -3 — which the engine's `%` and
+`/` over whole numbers do too. The divisor has to be a written whole number.
+Refused: a zero divisor, which MySQL answers NULL for with a warning this does
+not raise; `DIV -1`, and `-col` over a `BIGINT`, which MySQL answers 1690 for at
+the smallest `BIGINT` and the engine a real number; and each over a `DOUBLE` or
+a `DECIMAL`, which MySQL answers as a `DOUBLE` or a `DECIMAL` (`MOD` over a
+`DOUBLE` too, which used to report a whole number). A negation names its
+column `-i`, as MySQL does. `-col` orders rows too — `ORDER BY -qty`.
+
+`ROUND(col [, places])` takes a written number of places, and none means 0.
+Measured on 8.4.11, what it answers is the kind of number its column holds:
+
+- over a whole number a `LONGLONG` of 21, rounding half away from zero left of
+  the point (`ROUND(15, -1)` is 20, `ROUND(-25, -1)` -30, `ROUND(2147483647,
+  -1)` 2147483650) and leaving the number alone right of it. A `BIGINT`
+  rounded left of the point is refused: past the largest one MySQL answers
+  1690;
+- over a `DOUBLE` a `DOUBLE` of 23, worked out the way MySQL's `my_double_round`
+  works it: the number is scaled by the power of ten the places name, rounded
+  half to even, and scaled back. So `ROUND(2.5)` is 2, `ROUND(0.15e0, 1)` is 0.2
+  because 0.15 times ten is 1.5 exactly, `ROUND(0.25e0, 1)` is 0.2,
+  `ROUND(1.005e0, 2)` is 1 because 1.005 times a hundred falls short of 100.5,
+  and `ROUND(2.675e0, 2)` is 2.68. The engine's `round` rounds half away from
+  zero, so the dialect answers the call. `ROUND(x)` over a `DOUBLE` used to
+  answer a whole number rounded half away from zero, a `LONGLONG` where MySQL
+  answers a `DOUBLE`;
+- over a `DECIMAL` a `DECIMAL` rounded half away from zero, whose scale is the
+  places held to the column's own and whose width gains a whole digit for the
+  carry when a place is cut away: over a `DECIMAL(10,3)`, `ROUND(d)` reports 9,
+  `ROUND(d, 1)` 11 with a scale of 1, and `ROUND(d, 5)` the column's own 12 and
+  3. `ROUND(-0.155)` is 0, not -0. A place left of the point is refused.
+
+`FLOOR`, `CEIL` and `CEILING` answer a `LONGLONG` of 21 over a whole number and
+a `DOUBLE` of 23 over a `DOUBLE` — they used to answer a whole number for both.
+Over a `DECIMAL` they stay refused.
+
+A `DOUBLE` rounded to a negative zero is written `-0`, as MySQL writes it —
+measured, `ROUND(-0.4e0)` and `CEIL(-0.5e0)` are both `-0`, and so is a `-0e0`
+stored in a `DOUBLE` column. Every `DOUBLE` used to be written without the sign
+of a zero; a written `-0.0` is a `DECIMAL`, which stores a zero with no sign in
+both engines, so what is stored reads back `0` as it did.
 
 `RAND()` answers a double between zero and one, NOT NULL, as MySQL's does. A
 seeded `RAND(n)` is refused: the engine has no seeded random, so answering one

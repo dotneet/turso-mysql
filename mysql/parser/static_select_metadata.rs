@@ -212,9 +212,18 @@ pub enum ScalarFunction {
     ShiftsAWrittenMoment,
     /// `ABS`, which answers its argument's own numeric shape.
     KeepsNumericShape,
-    /// `ROUND` with one argument, which answers a whole number however wide
-    /// the argument was.
+    /// `SIGN`, which answers a whole number however wide the argument was.
     Truncates,
+    /// `ROUND`, to the places it names or to a whole number, which answers
+    /// the kind of number its column holds.
+    RoundsToPlaces { places: i32 },
+    /// `FLOOR`, `CEIL` and `CEILING`, which answer the kind of number their
+    /// column holds.
+    RoundsToWhole,
+    /// `-col`, which answers the column's own width as a whole number.
+    Negates,
+    /// `col DIV n`, which answers the whole number of times it goes in.
+    DividesWhole,
     /// `IFNULL` and `COALESCE`, which answer the column's shape and cannot be
     /// null when a later argument cannot.
     Defaulted,
@@ -358,6 +367,20 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             Value::Null => Some(StaticSelectMetadata::Null),
             _ => None,
         },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: negated,
+        } if matches!(negated.as_ref(), Expr::Identifier(_)) => {
+            let Expr::Identifier(column) = negated.as_ref() else {
+                unreachable!("the guard requires a column");
+            };
+            Some(StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::Negates,
+                columns: vec![column.value.clone()],
+                literal_characters: 0,
+                not_null: false,
+            })
+        }
         Expr::UnaryOp { op, expr } => {
             let sign = match op {
                 UnaryOperator::Plus => StaticIntegerSign::Positive,
@@ -417,6 +440,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
         Expr::Ceil { expr, field } => classify_floor_ceil(expr, field),
         Expr::BinaryOp { .. } => classify_json_arrow(expr)
             .or_else(|| interval_shift_as_call(expr).and_then(|call| scalar_call(&call)))
+            .or_else(|| classify_whole_division(expr))
             .or_else(|| classify_arithmetic(expr).map(StaticSelectMetadata::Arithmetic)),
         Expr::Subquery(query) => classify_scalar_subquery(query),
         Expr::Exists { .. } => Some(StaticSelectMetadata::Exists),
@@ -507,6 +531,38 @@ pub(super) fn interval_shift_as_call(expr: &Expr) -> Option<sqlparser::ast::Func
         null_treatment: None,
         over: None,
         within_group: Vec::new(),
+    })
+}
+
+/// Classifies `col % n` and `col DIV n`, which MySQL answers as whole numbers
+/// the column's own width.
+///
+/// The divisor has to be a written whole number. Zero is refused: MySQL
+/// answers NULL with a warning this does not raise. So is `DIV -1`: measured,
+/// the smallest `BIGINT` divided by it is 1690, where the engine answers a
+/// real number.
+fn classify_whole_division(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let function = match op {
+        sqlparser::ast::BinaryOperator::Modulo => ScalarFunction::Modulo,
+        sqlparser::ast::BinaryOperator::MyIntegerDivide => ScalarFunction::DividesWhole,
+        _ => return None,
+    };
+    let Expr::Identifier(column) = left.as_ref() else {
+        return None;
+    };
+    match crate::translate::direct_signed_integer(right)? {
+        0 => return None,
+        -1 if function == ScalarFunction::DividesWhole => return None,
+        _ => {}
+    }
+    Some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns: vec![column.value.clone()],
+        literal_characters: 0,
+        not_null: false,
     })
 }
 
@@ -1088,7 +1144,7 @@ fn classify_floor_ceil(
         return None;
     };
     Some(StaticSelectMetadata::ScalarCall {
-        function: ScalarFunction::Truncates,
+        function: ScalarFunction::RoundsToWhole,
         columns: vec![column.value.clone()],
         literal_characters: 0,
         not_null: false,
@@ -1726,6 +1782,30 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             },
             columns: vec![column.value.clone()],
             literal_characters: counted,
+            not_null: false,
+        });
+    }
+    // `ROUND(col [, places])` rounds to a written number of places; with none
+    // it rounds to a whole number, which is the same as naming 0.
+    if named(&["ROUND"]) {
+        let (column, places) = match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            ))] => (column, 0),
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Identifier(column),
+            )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(places))] => {
+                (
+                    column,
+                    i32::try_from(crate::translate::direct_signed_integer(places)?).ok()?,
+                )
+            }
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::RoundsToPlaces { places },
+            columns: vec![column.value.clone()],
+            literal_characters: 0,
             not_null: false,
         });
     }
@@ -2368,7 +2448,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     } else if named(&["SQRT", "DEGREES", "RADIANS"]) {
         ScalarFunction::Approximates
     // FLOOR and CEIL are their own AST shapes, classified above.
-    } else if named(&["ROUND", "CEILING", "SIGN"]) {
+    } else if named(&["CEILING"]) {
+        ScalarFunction::RoundsToWhole
+    } else if named(&["SIGN"]) {
         ScalarFunction::Truncates
     // Measured on MySQL 8.4.11: each of the three reports no NOT NULL flag
     // even over a NOT NULL column, which the `not_null: false` below says.

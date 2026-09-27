@@ -474,6 +474,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_SUBSTRING_INDEX) {
             return Ok(Some(Func::Dialect(MYSQL_SUBSTRING_INDEX.to_string())));
         }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_ROUND) {
+            return Ok(Some(Func::Dialect(MYSQL_ROUND.to_string())));
+        }
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_REGEXP) {
             return Ok(Some(Func::Dialect(MYSQL_REGEXP.to_string())));
         }
@@ -766,6 +769,32 @@ impl Dialect for MySqlDialect {
                 *from,
                 count,
             )));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_ROUND) {
+            let [value, places] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let Value::Numeric(Numeric::Integer(places)) = places else {
+                return Ok(Value::Null);
+            };
+            return match value {
+                Value::Null => Ok(Value::Null),
+                Value::Numeric(Numeric::Integer(whole)) => mysql_round_whole(*whole, *places)
+                    .map(Value::from_i64)
+                    .ok_or_else(|| {
+                        LimboError::InvalidArgument(
+                            "BIGINT value is out of range in ROUND".to_string(),
+                        )
+                    }),
+                Value::Numeric(Numeric::Float(real)) => {
+                    Ok(Value::from_f64(mysql_round_real(f64::from(*real), *places)))
+                }
+                _ => Err(LimboError::InvalidArgument(
+                    "MySQL ROUND requires a number".to_string(),
+                )),
+            };
         }
         if name.eq_ignore_ascii_case(MYSQL_SUBSTRING_INDEX) {
             let [value, delimiter, count] = args else {
@@ -1253,6 +1282,65 @@ fn mysql_substring_index(text: &str, delimiter: &str, count: i64) -> String {
         Some(&at) => text[at + delimiter.len()..].to_owned(),
         None => text.to_owned(),
     }
+}
+
+/// Rounds a whole number or a real one the way `ROUND` does. The engine's
+/// `round` takes no places left of the point, and rounds a real number half
+/// away from zero where MySQL rounds it half to even.
+pub(crate) const MYSQL_ROUND: &str = "mysql_round";
+
+/// Rounds a whole number to a place left of the point, half away from zero.
+///
+/// Measured on MySQL 8.4.11: `ROUND(15, -1)` is 20 and `ROUND(-25, -1)` is -30,
+/// and a place at or right of the point leaves the number as it is. An answer
+/// past a `BIGINT` is MySQL's 1690, and answers nothing here.
+fn mysql_round_whole(whole: i64, places: i64) -> Option<i64> {
+    if places >= 0 {
+        return Some(whole);
+    }
+    // A place past the nineteenth digit rounds every BIGINT to zero.
+    let Ok(digits) = u32::try_from(places.unsigned_abs()) else {
+        return Some(0);
+    };
+    if digits > 19 {
+        return Some(0);
+    }
+    let step = 10_i128.pow(digits);
+    let magnitude = i128::from(whole).abs();
+    let rounded = (magnitude + step / 2) / step * step;
+    i64::try_from(if whole < 0 { -rounded } else { rounded }).ok()
+}
+
+/// Rounds a real number the way MySQL's `my_double_round` does: it scales by
+/// the power of ten the places name, rounds half to even, and scales back.
+///
+/// Measured on MySQL 8.4.11: `ROUND(2.5)` is 2, `ROUND(0.15e0, 1)` is 0.2
+/// because 0.15 times ten is 1.5 exactly, `ROUND(1.005e0, 2)` is 1 because
+/// 1.005 times a hundred falls short of 100.5, and `ROUND(2.675e0, 2)` is 2.68.
+/// A scale past the largest double answers the number itself to the right of
+/// the point and zero to the left of it.
+fn mysql_round_real(value: f64, places: i64) -> f64 {
+    let digits = places.unsigned_abs();
+    // MySQL reads the power from a table of written constants up to 1e308,
+    // and past that works out an infinity.
+    let scale = if digits <= 308 {
+        format!("1e{digits}")
+            .parse::<f64>()
+            .expect("a written power of ten is a number")
+    } else {
+        f64::INFINITY
+    };
+    if places < 0 {
+        if scale.is_infinite() {
+            return 0.0;
+        }
+        return (value / scale).round_ties_even() * scale;
+    }
+    let scaled = value * scale;
+    if scaled.is_infinite() {
+        return value;
+    }
+    scaled.round_ties_even() / scale
 }
 
 /// Writes a whole number in binary or in octal, the way `BIN` and `OCT` do.

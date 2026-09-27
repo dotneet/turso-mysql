@@ -1495,6 +1495,10 @@ impl TranslatedSelect {
                             function: ScalarFunction::CutsDigits
                                 | ScalarFunction::KeepsNumericShape
                                 | ScalarFunction::Truncates
+                                | ScalarFunction::RoundsToPlaces { .. }
+                                | ScalarFunction::RoundsToWhole
+                                | ScalarFunction::Negates
+                                | ScalarFunction::DividesWhole
                                 | ScalarFunction::Modulo
                                 | ScalarFunction::Widest
                                 | ScalarFunction::Hexadecimal

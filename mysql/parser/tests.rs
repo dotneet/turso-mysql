@@ -968,7 +968,7 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         // an overflow.
         (
             "SELECT ROUND(n) FROM s",
-            "SELECT CAST(round(\"n\") AS INTEGER) AS \"ROUND(n)\" FROM \"s\"",
+            "SELECT mysql_round(\"n\", 0) AS \"ROUND(n)\" FROM \"s\"",
         ),
         (
             "SELECT IFNULL(n, 0) FROM s",
@@ -1227,15 +1227,26 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         ),
         (
             "SELECT FLOOR(n) FROM s",
-            "SELECT CAST(floor(\"n\") AS INTEGER) AS \"FLOOR(n)\" FROM \"s\"",
+            "SELECT floor(\"n\") AS \"FLOOR(n)\" FROM \"s\"",
         ),
         (
             "SELECT CEIL(n) FROM s",
-            "SELECT CAST(ceil(\"n\") AS INTEGER) AS \"CEIL(n)\" FROM \"s\"",
+            "SELECT ceil(\"n\") AS \"CEIL(n)\" FROM \"s\"",
         ),
         (
             "SELECT CEILING(n) FROM s",
-            "SELECT CAST(ceil(\"n\") AS INTEGER) AS \"CEILING(n)\" FROM \"s\"",
+            "SELECT ceil(\"n\") AS \"CEILING(n)\" FROM \"s\"",
+        ),
+        // ROUND names its places, and the dialect rounds each kind of number
+        // the way MySQL does.
+        (
+            "SELECT ROUND(n, -1) FROM s",
+            "SELECT mysql_round(\"n\", -1) AS \"ROUND(n, -1)\" FROM \"s\"",
+        ),
+        // `%`, `DIV` and a negated column keep MySQL's spelling as their name.
+        (
+            "SELECT n % 2, n DIV 2, -n FROM s",
+            "SELECT (\"n\" % 2) AS \"n % 2\", (\"n\" / 2) AS \"n DIV 2\", (-\"n\") AS \"-n\" FROM \"s\"",
         ),
     ] {
         assert_eq!(
@@ -3672,8 +3683,31 @@ fn decimal_abs_keeps_exact_digits_and_scale() {
 
 #[test]
 fn decimal_scalar_calls_without_exact_comparison_are_rejected() {
+    // ROUND is rounded as a DECIMAL, to the places held to the column's scale.
+    assert_eq!(
+        parse_select_knowing_decimal_columns(
+            "SELECT ROUND(v), ROUND(v, 1), ROUND(v, 5) FROM amounts",
+            SessionSqlMode::default(),
+            &[],
+            &["v".to_string()],
+            &[],
+            &[],
+            &[],
+            &[("v".to_string(), 2)],
+        )
+        .unwrap()
+        .as_sql(),
+        concat!(
+            "SELECT mysql_decimal_round(\"v\", 0) AS \"ROUND(v)\", ",
+            "mysql_decimal_round(\"v\", 1) AS \"ROUND(v, 1)\", ",
+            "mysql_decimal_round(\"v\", 2) AS \"ROUND(v, 5)\" FROM \"amounts\""
+        )
+    );
     for sql in [
-        "SELECT ROUND(v) FROM amounts",
+        "SELECT ROUND(v, -1) FROM amounts",
+        "SELECT -v FROM amounts",
+        "SELECT v % 2 FROM amounts",
+        "SELECT v DIV 2 FROM amounts",
         "SELECT CEILING(v) FROM amounts",
         "SELECT FLOOR(v) FROM amounts",
         "SELECT CEIL(v) FROM amounts",

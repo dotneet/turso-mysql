@@ -6364,13 +6364,37 @@ fn scalar_call_column_definition(
         // Measured: ABS over an INT answers a LONGLONG of the INT's own length
         // 11, and over a DECIMAL(10,2) a NEWDECIMAL of 12 with its scale — the
         // width and the scale are the column's, and only an integer widens.
-        ScalarFunction::KeepsNumericShape | ScalarFunction::Modulo => {
+        ScalarFunction::KeepsNumericShape => {
             let mut definition = own_shape(name)?;
             if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
                 definition.column_type = MYSQL_TYPE_LONGLONG;
             }
             definition
         }
+        // Measured on MySQL 8.4.11: `MOD(n, 2)`, `n % 2`, `n DIV 2` and `-n`
+        // each answer a LONGLONG as wide as the column — 4 over a TINYINT, 6
+        // over a SMALLINT, 11 over an INT and 20 over a BIGINT, and 4 over a
+        // TINYINT(1), which reports 1 on its own. Over a DOUBLE or a DECIMAL
+        // they answer a real or a decimal instead, which is not taken here.
+        // A BIGINT is not negated: its smallest value has no negative, which
+        // MySQL answers 1690 for and the engine a real number.
+        ScalarFunction::Modulo | ScalarFunction::DividesWhole | ScalarFunction::Negates => {
+            if !is_signed_whole_number_column(source.type_name())
+                || (function == ScalarFunction::Negates && source.type_name() == "BIGINT")
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let mut definition = own_shape(name)?;
+            definition.column_type = MYSQL_TYPE_LONGLONG;
+            if source.type_name() == "BOOLEAN" {
+                definition.column_length = 4;
+            }
+            definition
+        }
+        ScalarFunction::RoundsToPlaces { places } => {
+            rounded_definition(name, source, Some(places))?
+        }
+        ScalarFunction::RoundsToWhole => rounded_definition(name, source, None)?,
         // Measured: a whole number of length 21 however wide the argument was.
         ScalarFunction::Truncates => {
             let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
@@ -6558,7 +6582,11 @@ fn scalar_call_column_definition(
         || (!source.nullable()
             && matches!(
                 function,
-                ScalarFunction::KeepsNumericShape | ScalarFunction::Truncates
+                ScalarFunction::KeepsNumericShape
+                    | ScalarFunction::Truncates
+                    | ScalarFunction::RoundsToPlaces { .. }
+                    | ScalarFunction::RoundsToWhole
+                    | ScalarFunction::Negates
             ));
     set_column_flags(
         &mut definition,
@@ -6571,6 +6599,65 @@ fn scalar_call_column_definition(
         definition.flags |= MYSQL_UNSIGNED_FLAG;
     }
     Ok(definition)
+}
+
+/// Builds the column `ROUND`, or with no places `FLOOR` and `CEIL`, reports.
+///
+/// Measured on MySQL 8.4.11: over a whole number a LONGLONG of 21 whatever the
+/// places; over a DOUBLE a DOUBLE of 23; over a DECIMAL a DECIMAL whose scale
+/// is the places held to the column's own, with one more whole digit when a
+/// place is cut away for the carry — `DECIMAL(10,3)` rounded to 1 reports 11
+/// with a scale of 1, to none 9, and to 5 the column's own 12 and 3. A `BIGINT`
+/// rounded left of the point, which MySQL answers 1690 for past the largest
+/// one, a DECIMAL rounded left of the point, `FLOOR` and `CEIL` over a DECIMAL,
+/// and every other type are refused.
+#[cfg(unix)]
+fn rounded_definition(
+    name: String,
+    source: &MySqlColumnMetadata,
+    places: Option<i32>,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    if is_signed_whole_number_column(source.type_name()) {
+        if source.type_name() == "BIGINT" && places.is_some_and(|places| places < 0) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 21;
+        return Ok(definition);
+    }
+    if source.type_name() == "DOUBLE" {
+        let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+        definition.column_length = 23;
+        definition.decimals = NOT_FIXED_DECIMALS;
+        return Ok(definition);
+    }
+    let (Some(places), "DECIMAL", Some((precision, scale))) =
+        (places, source.type_name(), source.decimal_size())
+    else {
+        return Err(FrontendErrorKind::Unsupported);
+    };
+    let kept = u32::try_from(places)
+        .map_err(|_| FrontendErrorKind::Unsupported)?
+        .min(scale);
+    let cut = scale - kept;
+    let precision = if cut > 0 {
+        precision - cut + 1
+    } else {
+        precision
+    };
+    let mut definition = column_definition(name, MYSQL_TYPE_NEWDECIMAL);
+    definition.column_length = precision + 1 + u32::from(kept > 0);
+    definition.decimals = u8::try_from(kept).map_err(|_| FrontendErrorKind::Internal)?;
+    Ok(definition)
+}
+
+/// Reports whether a column counts in whole numbers that carry a sign.
+#[cfg(unix)]
+fn is_signed_whole_number_column(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "BOOLEAN"
+    )
 }
 
 /// Builds the column `UNIX_TIMESTAMP` or `FROM_UNIXTIME` reports.
@@ -7905,7 +7992,7 @@ const MYSQL_DOUBLE_PLAIN_DIGITS: i32 = 15;
 /// MySQL writes the shortest digits that read back as the same double, which is
 /// what Rust writes too, and then chooses between writing the number out in
 /// full and writing an exponent. Measured on 8.4.11: `1` for a whole number
-/// rather than `1.0`, `0.3333333333333333` at sixteen digits, `0` for a
+/// rather than `1.0`, `0.3333333333333333` at sixteen digits, `-0` for a
 /// negative zero, and `1e20`, `1.5e-300` and `1.2345678901234568e16` with no
 /// sign or padding on the exponent.
 fn mysql_double_text(value: f64) -> String {
@@ -7913,7 +8000,7 @@ fn mysql_double_text(value: f64) -> String {
         return value.to_string();
     }
     if value == 0.0 {
-        return "0".to_owned();
+        return if value.is_sign_negative() { "-0" } else { "0" }.to_owned();
     }
     let scientific = format!("{value:e}");
     let Some((mantissa, exponent)) = scientific.split_once('e') else {

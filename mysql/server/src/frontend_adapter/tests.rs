@@ -14657,7 +14657,10 @@ fn a_double_reads_back_the_way_mysql_writes_one() {
     // `DOUBLE` column and reading it back.
     for (value, text) in [
         (1.0, "1"),
-        (-0.0, "0"),
+        // Measured: a negative zero stored with `-0e0`, or answered by
+        // `ROUND(-0.4e0)`, reads `-0`. A written `-0.0` is a DECIMAL, which
+        // stores as a zero with no sign in both engines.
+        (-0.0, "-0"),
         (0.0, "0"),
         (0.25, "0.25"),
         (0.1, "0.1"),
@@ -30607,6 +30610,8 @@ mod fractional_moments;
 #[cfg(unix)]
 mod rails_statements;
 
+#[cfg(unix)]
+mod numeric_operators;
 #[cfg(unix)]
 mod string_functions;
 #[cfg(unix)]

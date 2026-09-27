@@ -4136,6 +4136,15 @@ fn render_select_item(
             if matches!(
                 static_select_metadata::classify_static_select_expr(expr),
                 Some(StaticSelectMetadata::Arithmetic(_))
+            ) || matches!(
+                (
+                    expr,
+                    static_select_metadata::classify_static_select_expr(expr)
+                ),
+                (
+                    Expr::UnaryOp { .. } | Expr::BinaryOp { .. },
+                    Some(StaticSelectMetadata::ScalarCall { .. })
+                )
             ) =>
         {
             let name = source_text(render_context.source, expr)
@@ -4573,6 +4582,29 @@ fn render_select_expr(
         } if matches!(expr.as_ref(), Expr::Value(value) if matches!(&value.value, Value::Number(_, false))) => {
             Ok(format!("(+{})", render_select_expr(expr, render_context)?))
         }
+        // `-col` over a whole number. The column's type is the frontend's to
+        // check, which refuses the one kind whose smallest value has no
+        // negative.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr: negated,
+        } if matches!(
+            static_select_metadata::classify_static_select_expr(expr),
+            Some(StaticSelectMetadata::ScalarCall {
+                function: static_select_metadata::ScalarFunction::Negates,
+                ..
+            })
+        ) =>
+        {
+            if contains_decimal_operand(negated, render_context.decimal_columns) {
+                return unsupported("SELECT negation over DECIMAL requires exact numeric handling");
+            }
+            render_context.checks_type_sensitive_expression = true;
+            Ok(format!(
+                "(-{})",
+                render_select_expr(negated, render_context)?
+            ))
+        }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
         Expr::Case {
             operand: None,
@@ -4657,8 +4689,10 @@ fn render_select_expr(
             else {
                 return unsupported("FLOOR option");
             };
+            // The engine's `floor` keeps a whole number whole and a real number
+            // real, which is the kind MySQL answers for each.
             let inner = render_select_expr(inner, render_context)?;
-            Ok(format!("CAST(floor({inner}) AS INTEGER)"))
+            Ok(format!("floor({inner})"))
         }
         Expr::Ceil { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
@@ -4673,7 +4707,7 @@ fn render_select_expr(
                 return unsupported("CEIL option");
             };
             let inner = render_select_expr(inner, render_context)?;
-            Ok(format!("CAST(ceil({inner}) AS INTEGER)"))
+            Ok(format!("ceil({inner})"))
         }
         // MySQL's own spelling of a JSON reading. The engine spells it the same
         // way, and the value read still has to be written the way MySQL writes
@@ -4704,6 +4738,31 @@ fn render_select_expr(
             let call = static_select_metadata::interval_shift_as_call(expr)
                 .expect("the guard read the operator as a shift");
             render_scalar_call(&call, render_context)
+        }
+        // `col % n` and `col DIV n` over a whole number, which the engine's
+        // `%` and `/` answer the same way: both keep the dividend's sign and
+        // cut toward zero, and both answer NULL for a zero divisor.
+        Expr::BinaryOp {
+            left,
+            op: op @ (BinaryOperator::Modulo | BinaryOperator::MyIntegerDivide),
+            right,
+        } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
+            if contains_decimal_operand(left, render_context.decimal_columns) {
+                return unsupported(
+                    "SELECT whole division over DECIMAL requires exact numeric handling",
+                );
+            }
+            render_context.checks_type_sensitive_expression = true;
+            let operator = if matches!(op, BinaryOperator::Modulo) {
+                "%"
+            } else {
+                "/"
+            };
+            Ok(format!(
+                "({} {operator} {})",
+                render_select_expr(left, render_context)?,
+                render_select_expr(right, render_context)?
+            ))
         }
         Expr::BinaryOp { left, op, right }
             if static_select_metadata::classify_arithmetic(expr).is_some() =>
@@ -5231,7 +5290,7 @@ fn render_scalar_call(
         _ => false,
     };
     if has_decimal_argument
-        && !["ABS", "TRUNCATE"]
+        && !["ABS", "TRUNCATE", "ROUND"]
             .iter()
             .any(|call| name.value.eq_ignore_ascii_case(call))
     {
@@ -5442,20 +5501,40 @@ fn render_scalar_call(
         return Ok("round(pi(), 6)".to_owned());
     } else if let Some(engine) = engine_math_reading(&name.value) {
         engine
-    } else if name.value.eq_ignore_ascii_case("ROUND") || name.value.eq_ignore_ascii_case("CEILING")
-    {
-        // The engine answers this as a float where MySQL answers a whole
-        // number, and a float where a column promised an integer reads as an
-        // overflow, so the cast is what keeps the two agreeing.
-        let func = if name.value.eq_ignore_ascii_case("ROUND") {
-            "round"
-        } else {
-            "ceil"
+    } else if name.value.eq_ignore_ascii_case("CEILING") {
+        return Ok(format!("ceil({})", single_column_argument(function)));
+    } else if name.value.eq_ignore_ascii_case("ROUND") {
+        let Some(StaticSelectMetadata::ScalarCall {
+            function: static_select_metadata::ScalarFunction::RoundsToPlaces { places },
+            ..
+        }) = static_select_metadata::scalar_call(function)
+        else {
+            unreachable!("a checked ROUND was checked to name its places");
         };
-        return Ok(format!(
-            "CAST({func}({}) AS INTEGER)",
-            single_column_argument(function)
-        ));
+        let value = scalar_argument(function, 0)?;
+        // MySQL rounds a DECIMAL half away from zero at the places it names,
+        // held to the column's own scale, which is what the engine's decimal
+        // rounding does. A place left of the point is not taken for one.
+        if let Some(scale) = match &function.args {
+            FunctionArguments::List(arguments) => {
+                arguments.args.first().and_then(|argument| match argument {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(expr),
+                    ) => decimal_operand_scale(expr, render_context.decimal_columns),
+                    _ => None,
+                })
+            }
+            _ => None,
+        } {
+            let Ok(places) = u32::try_from(places) else {
+                return unsupported("SELECT ROUND of a DECIMAL left of the point");
+            };
+            return Ok(format!(
+                "mysql_decimal_round({value}, {})",
+                places.min(scale)
+            ));
+        }
+        return Ok(format!("mysql_round({value}, {places})"));
     } else if name.value.eq_ignore_ascii_case("IF") {
         // MySQL's `IF` is the call spelling of a two-branch `CASE`, which is
         // the shape the engine reads.
@@ -6204,6 +6283,21 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
             .rposition(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
             .map_or(0, |pos| pos + 1);
         start = name_start;
+    }
+    // A negation's span covers what it negates and not its sign.
+    if matches!(
+        expr,
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            ..
+        }
+    ) {
+        let sign = bytes[..start]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?;
+        if bytes[sign] == b'-' {
+            start = sign;
+        }
     }
     // A bare `CURRENT_DATE` is a call with no parentheses at all, so there is
     // no closing one to reach for and its span is already the whole name.
