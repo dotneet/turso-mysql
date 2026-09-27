@@ -5424,13 +5424,35 @@ fn checks_one_canonical_auto_increment_column_without_changing_the_general_path(
     .is_ok());
 }
 
+/// MySQL takes a counted column's three attributes in any order. Measured on
+/// MySQL 8.4.11: Django's `bigint AUTO_INCREMENT NOT NULL PRIMARY KEY` and
+/// `INT NOT NULL PRIMARY KEY AUTO_INCREMENT` both print back as the one
+/// definition.
+#[test]
+fn takes_a_counted_columns_attributes_in_any_order() {
+    for sql in [
+        "CREATE TABLE `django_migrations` (`id` bigint AUTO_INCREMENT NOT NULL PRIMARY KEY, `app` varchar(255) NOT NULL)",
+        "CREATE TABLE `django_migrations` (`id` bigint NOT NULL PRIMARY KEY AUTO_INCREMENT, `app` varchar(255) NOT NULL)",
+        "CREATE TABLE `django_migrations` (`id` bigint PRIMARY KEY NOT NULL AUTO_INCREMENT, `app` varchar(255) NOT NULL)",
+    ] {
+        let checked = parse_auto_increment_create_table(sql, SessionSqlMode::default())
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert_eq!(
+            checked.normalized_mysql_ddl,
+            "CREATE TABLE `django_migrations` (`id` BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, `app` VARCHAR(255) NOT NULL)",
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn rejects_auto_increment_shapes_outside_the_checked_slice() {
     for sql in [
         "CREATE TABLE app.t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TEMPORARY TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
-        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY AUTO_INCREMENT)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY DEFAULT 1)",
+        "CREATE TABLE t (id INT NOT NULL NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+        "CREATE TABLE t (id INT AUTO_INCREMENT AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, PRIMARY KEY (id))",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, other INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
         "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY AUTOINCREMENT)",

@@ -868,6 +868,9 @@ fn system_variable_column(
     status_flags: u16,
     session_variables: &MySqlSessionVariables,
 ) -> Option<(ColumnDefinitionConfig, String)> {
+    if let Some((from, to)) = read.zone_conversion() {
+        return Some(zone_conversion_column(read, from, to));
+    }
     let at_the_start = MySqlSessionVariables::default();
     let (session_sql_mode, status_flags, session_variables) = match read.scope() {
         MySqlVariableScope::Session => (session_sql_mode, status_flags, session_variables),
@@ -902,6 +905,29 @@ fn system_variable_column(
     column.decimals = NOT_FIXED_DECIMALS;
     column.flags = if called { MYSQL_NOT_NULL_FLAG } else { 0 };
     Some((column, value))
+}
+
+/// Answers whether `CONVERT_TZ` can convert between two zones, which is
+/// whether this server knows both.
+///
+/// It knows `UTC`, `SYSTEM` and fixed offsets and no named zone, which is a
+/// MySQL whose zone tables are empty: there `CONVERT_TZ` answers NULL for a
+/// named zone. Measured on MySQL 8.4.11, the column is a LONGLONG of length 1
+/// that is NOT NULL, with the binary and numeric flags.
+fn zone_conversion_column(
+    read: &MySqlSystemVariableRead,
+    from: &str,
+    to: &str,
+) -> (ColumnDefinitionConfig, String) {
+    let mut column =
+        ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
+    column.catalog = "def".into();
+    column.character_set = MYSQL_BINARY_COLLATION;
+    column.column_length = 1;
+    column.decimals = 0;
+    column.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+    let known = parse_time_zone_offset(from).is_some() && parse_time_zone_offset(to).is_some();
+    (column, u8::from(known).to_string())
 }
 
 /// The system variables this server answers with a number, with the width
@@ -1343,6 +1369,57 @@ mod tests {
         };
         assert_eq!(result.rows, vec![vec![None]]);
         assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    }
+
+    /// Django reads this row whenever it connects, and its first statement
+    /// after is the isolation level it wants.
+    #[test]
+    fn answers_the_row_django_reads_when_it_connects() {
+        let mut session = MySqlSessionVariables::default();
+        let Ok(Some(CommandExecutionResult::ResultSet(result))) = session.execute_query(
+            "\n                SELECT VERSION(),\n                       @@sql_mode,\n                       @@default_storage_engine,\n                       @@sql_auto_is_null,\n                       @@lower_case_table_names,\n                       CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL\n            ",
+            MySqlBootstrapSettings::default(),
+            None,
+            SessionSqlMode::default(),
+            SERVER_STATUS_AUTOCOMMIT,
+        ) else {
+            panic!("Django's row must be answered");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Some(SERVER_VERSION.as_bytes().to_vec()),
+                Some(reported_sql_mode(SessionSqlMode::default()).into_bytes()),
+                Some(b"InnoDB".to_vec()),
+                Some(b"0".to_vec()),
+                Some(b"1".to_vec()),
+                Some(b"1".to_vec()),
+            ]]
+        );
+        let probe = &result.columns[5];
+        assert_eq!(
+            probe.name,
+            "CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL"
+        );
+        assert_eq!(probe.column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(probe.column_length, 1);
+        assert_eq!(
+            probe.flags,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
+
+        // A named zone is one this server does not know, which a MySQL with
+        // empty zone tables answers NULL for.
+        let Ok(Some(CommandExecutionResult::ResultSet(named))) = session.execute_query(
+            "SELECT CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'Europe/Paris') IS NOT NULL",
+            MySqlBootstrapSettings::default(),
+            None,
+            SessionSqlMode::default(),
+            SERVER_STATUS_AUTOCOMMIT,
+        ) else {
+            panic!("the probe must be answered");
+        };
+        assert_eq!(named.rows, vec![vec![Some(b"0".to_vec())]]);
     }
 
     /// Rails opens every connection with this one statement. Measured on

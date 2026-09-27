@@ -84,6 +84,7 @@ pub struct MySqlSystemVariableRead {
     name: String,
     scope: MySqlVariableScope,
     called: bool,
+    zone_conversion: Option<(String, String)>,
     column_name: String,
 }
 
@@ -111,6 +112,17 @@ impl MySqlSystemVariableRead {
     /// not, and an alias over either leaves that alone.
     pub fn called(&self) -> bool {
         self.called
+    }
+
+    /// Returns the two zones of a `CONVERT_TZ('<moment>', from, to) IS NOT
+    /// NULL`, which asks whether the server can convert between them.
+    ///
+    /// Django asks this beside `VERSION()` and four variables whenever it
+    /// connects, to learn whether the server has named zones.
+    pub fn zone_conversion(&self) -> Option<(&str, &str)> {
+        self.zone_conversion
+            .as_ref()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
     }
 
     /// Returns the name MySQL gives the result column.
@@ -178,7 +190,14 @@ fn take_system_variable_read(
     let start = scanner.cursor;
     let mut scope = MySqlVariableScope::Session;
     let mut called = false;
-    let name = if scanner.take_keyword("VERSION") {
+    let mut zone_conversion = None;
+    let name = if scanner.take_keyword("CONVERT_TZ") {
+        let Some(zones) = take_zone_conversion_probe(scanner) else {
+            return Ok(None);
+        };
+        zone_conversion = Some(zones);
+        String::new()
+    } else if scanner.take_keyword("VERSION") {
         scanner.skip_gaps();
         if !scanner.take_byte(b'(') {
             return Ok(None);
@@ -225,8 +244,70 @@ fn take_system_variable_read(
         name,
         scope,
         called,
+        zone_conversion,
         column_name: alias.unwrap_or(expression),
     }))
+}
+
+/// Reads the rest of `CONVERT_TZ('<moment>', from, to) IS NOT NULL`.
+///
+/// The moment has to be written the one way MySQL reads without a rule of
+/// its own, `YYYY-MM-DD hh:mm:ss`, since a moment it cannot read makes the
+/// call NULL whatever the zones are.
+fn take_zone_conversion_probe(scanner: &mut Scanner) -> Option<(String, String)> {
+    scanner.skip_gaps();
+    if !scanner.take_byte(b'(') {
+        return None;
+    }
+    scanner.skip_gaps();
+    let moment = scanner.take_nullable_string()??;
+    if !is_a_plain_moment(&moment) {
+        return None;
+    }
+    let mut zones = [String::new(), String::new()];
+    for zone in &mut zones {
+        scanner.skip_gaps();
+        if !scanner.take_byte(b',') {
+            return None;
+        }
+        scanner.skip_gaps();
+        *zone = scanner.take_nullable_string()??;
+    }
+    scanner.skip_gaps();
+    if !scanner.take_byte(b')') {
+        return None;
+    }
+    for word in ["IS", "NOT", "NULL"] {
+        scanner.skip_gaps();
+        if !scanner.take_keyword(word) {
+            return None;
+        }
+    }
+    let [from, to] = zones;
+    Some((from, to))
+}
+
+fn is_a_plain_moment(moment: &str) -> bool {
+    let bytes = moment.as_bytes();
+    let number = |range: std::ops::Range<usize>| {
+        bytes[range.clone()]
+            .iter()
+            .all(u8::is_ascii_digit)
+            .then(|| moment[range].parse::<u32>().ok())
+            .flatten()
+    };
+    bytes.len() == 19
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b' '
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && number(0..4).is_some_and(|year| year >= 1)
+        && number(5..7).is_some_and(|month| (1..=12).contains(&month))
+        && number(8..10).is_some_and(|day| (1..=28).contains(&day))
+        && number(11..13).is_some_and(|hour| hour < 24)
+        && number(14..16).is_some_and(|minute| minute < 60)
+        && number(17..19).is_some_and(|second| second < 60)
 }
 
 /// A checked `SELECT` of user variables, which the session answers from what

@@ -3502,12 +3502,23 @@ fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Resul
                 .get(index)
                 .is_some_and(|token| is_unquoted_word(token, "COMMENT"))
     };
-    let declares_the_key = position + 2 < tokens.len()
-        && is_unquoted_word(tokens[position + 1], "PRIMARY")
-        && is_unquoted_word(tokens[position + 2], "KEY")
-        && ends_the_definition(position + 3);
-    let ends_the_column = ends_the_definition(position + 1);
-    if !declares_the_key && !ends_the_column {
+    // `NOT NULL` and `PRIMARY KEY` may follow the marker in either order —
+    // Django writes `AUTO_INCREMENT NOT NULL PRIMARY KEY` — and which of them
+    // the column carries, and how often, is checked on the parsed column.
+    let mut after = position + 1;
+    loop {
+        let pair = |first: &str, second: &str| {
+            after + 1 < tokens.len()
+                && is_unquoted_word(tokens[after], first)
+                && is_unquoted_word(tokens[after + 1], second)
+        };
+        if pair("PRIMARY", "KEY") || pair("NOT", "NULL") {
+            after += 2;
+        } else {
+            break;
+        }
+    }
+    if !ends_the_definition(after) {
         return unsupported("AUTO_INCREMENT token order; expected PRIMARY KEY");
     }
     Ok(())
@@ -5114,25 +5125,24 @@ fn validate_auto_increment_column(column: &ColumnDef) -> Result<(), ParseError> 
     {
         return unsupported("named column COMMENT");
     }
-    let rest = match rest.as_slice() {
-        [not_null, rest @ ..]
-            if not_null.name.is_none() && matches!(not_null.option, ColumnOption::NotNull) =>
-        {
-            rest
+    // MySQL takes the three in any order — Django writes `bigint
+    // AUTO_INCREMENT NOT NULL PRIMARY KEY` — so each is counted rather than
+    // read at a place.
+    let (mut not_null, mut auto_increment, mut primary_key) = (0, 0, 0);
+    for option in rest {
+        if option.name.is_some() {
+            return unsupported("AUTO_INCREMENT column attributes");
         }
-        rest => rest,
-    };
-    let [auto_increment, primary_key] = rest else {
-        return unsupported("AUTO_INCREMENT column attributes");
-    };
-    if auto_increment.name.is_some()
-        || !matches!(
-            &auto_increment.option,
-            ColumnOption::DialectSpecific(tokens) if is_auto_increment_tokens(tokens)
-        )
-        || primary_key.name.is_some()
-        || !is_plain_inline_primary_key(&primary_key.option)
-    {
+        match &option.option {
+            ColumnOption::NotNull => not_null += 1,
+            ColumnOption::DialectSpecific(tokens) if is_auto_increment_tokens(tokens) => {
+                auto_increment += 1;
+            }
+            primary if is_plain_inline_primary_key(primary) => primary_key += 1,
+            _ => return unsupported("AUTO_INCREMENT column attributes"),
+        }
+    }
+    if not_null > 1 || auto_increment != 1 || primary_key != 1 {
         return unsupported("AUTO_INCREMENT column attributes");
     }
     Ok(())
