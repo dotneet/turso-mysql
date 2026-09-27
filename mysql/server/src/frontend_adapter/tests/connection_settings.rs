@@ -124,3 +124,87 @@ fn the_idle_time_a_session_asks_for_reaches_its_connection() {
     run(&mut adapter, "SET @@SESSION.wait_timeout = DEFAULT");
     assert_eq!(adapter.session_wait_timeout(), None);
 }
+
+/// `TRADITIONAL` stands for modes this server behaves as — the strict ones,
+/// the two zero-date ones, division by zero and no engine substitution — and
+/// MySQL keeps it as a mode of its own. Measured on MySQL 8.4.11: it reads
+/// back as `STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,
+/// NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION`,
+/// and `ANSI`, which stands for modes this server does not keep, is refused.
+#[test]
+fn a_session_may_ask_for_the_traditional_modes() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, "SET @@session.sql_mode = 'TRADITIONAL'");
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@sql_mode"),
+        [[Some(
+            "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,\
+             NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION"
+                .to_owned()
+        )]]
+    );
+    run(
+        &mut adapter,
+        "SET sql_mode = 'traditional,ONLY_FULL_GROUP_BY'",
+    );
+    assert!(adapter.execute_query("SET sql_mode = 'ANSI'").is_err());
+}
+
+/// A `SELECT` running past `max_execution_time` is stopped. Measured on MySQL
+/// 8.4.11: any whole number of milliseconds is taken and read back as a
+/// LONGLONG of 21, `DEFAULT` is 0 — no limit — and a `SELECT` running longer
+/// answers 3024 while an `UPDATE` runs on.
+#[test]
+fn a_select_running_past_max_execution_time_is_stopped() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE counted (n INT NOT NULL PRIMARY KEY)",
+    );
+    let values = (1..=300)
+        .map(|n| format!("({n})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run(
+        &mut adapter,
+        &format!("INSERT INTO counted VALUES {values}"),
+    );
+    let slow = "SELECT COUNT(*) FROM counted a CROSS JOIN counted b CROSS JOIN counted c";
+
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@max_execution_time"),
+        [[Some("0".to_owned())]]
+    );
+    run(&mut adapter, "SET SESSION max_execution_time = 1");
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@session.max_execution_time"),
+        [[Some("1".to_owned())]]
+    );
+    assert_eq!(
+        adapter.execute_query(slow),
+        Err(FrontendErrorKind::QueryTimeout)
+    );
+    let prepared = adapter.execute_stmt_prepare(slow).unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(prepared.statement_id, &[]),
+        Err(FrontendErrorKind::QueryTimeout)
+    );
+    // The session is still usable, and a write is not held to the limit.
+    run(&mut adapter, "UPDATE counted SET n = n WHERE n = 1");
+
+    run(&mut adapter, "SET max_execution_time = DEFAULT");
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@max_execution_time"),
+        [[Some("0".to_owned())]]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COUNT(*) FROM counted a CROSS JOIN counted b"
+        ),
+        [[Some("90000".to_owned())]]
+    );
+    assert!(adapter
+        .execute_query("SET GLOBAL max_execution_time = 5")
+        .is_err());
+}

@@ -354,7 +354,11 @@ speaks; anything measured here from now on has to pass that flag.
 | `SELECT @@net_read_timeout`, `@@socket` | refused as 1193; this server has no equivalent session setting. The message does not name the variable where MySQL's does |
 | A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
-| `SHOW PROCESSLIST` | not started |
+| `SHOW [FULL] PROCESSLIST` | refused; measured, a session without the `PROCESS` privilege sees every connection of its own account — a pool's other connections among them — and this session knows only itself |
+| `SHOW [GLOBAL] STATUS` | refused; MySQL answers 330 counters about the whole server, `Threads_connected` and `Uptime` among them, which a session here has no reading of |
+| `SHOW COLLATION` / `SHOW CHARACTER SET` with a `WHERE` other than `=` and `LIKE` tests joined by `AND` | refused; the listing is filtered here rather than by a query engine |
+| `SET group_concat_max_len` | refused; MySQL cuts a `GROUP_CONCAT` at that many bytes with warning 1260 and reports a result column sized by it — measured, up to 512 a `VAR_STRING` of four bytes a character, past it a `LONG_BLOB` of 64 times the value — and this server cuts nothing |
+| A `GROUP_CONCAT` longer than 1024 bytes | answered whole, where MySQL, under its default `group_concat_max_len`, cuts it to 1024 bytes and warns with 1260 |
 | `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
@@ -390,7 +394,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `@@version`, `@@version_comment`, `VERSION()` | works |
 | `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
 | The variables a driver reads before it sends any work — the `@@character_set_*` and `@@collation_*` names, `@@time_zone`, `@@system_time_zone`, `@@transaction_isolation`, `@@auto_increment_increment`, `@@auto_increment_offset`, `@@interactive_timeout`, `@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license` | works; each answers what this server decides for itself, and three read differently from MySQL's own — see COMPAT.md |
-| `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in; `sql_mode` may be an expression over `@@sql_mode`, and `NO_AUTO_VALUE_ON_ZERO` is kept |
+| `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in; `sql_mode` may be an expression over `@@sql_mode`, `NO_AUTO_VALUE_ON_ZERO` is kept, and `TRADITIONAL` is taken, standing for modes of that list alone. `@@sql_mode` always reads back `ONLY_FULL_GROUP_BY`, which this server keeps whatever the session names |
 | `SET wait_timeout`, `SET sql_auto_is_null = 0`, `SET sql_safe_updates = 0`, several assignments in one `SET` | works |
 | A `SET` of a `GLOBAL` variable, `sql_auto_is_null = 1` or `sql_safe_updates = 1` | refused; nothing here can change another session, and neither rule is one this server has |
 | `SET wait_timeout` outside one second through a year | refused, where MySQL clamps it with a warning |

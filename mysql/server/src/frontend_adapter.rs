@@ -81,9 +81,10 @@ use turso_mysql_parser::{
     MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
 };
 use turso_mysql_parser::{
-    parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
-    parse_optional_show_errors, parse_optional_show_warnings, parse_optional_truncate_table,
-    parse_select, SessionSqlMode,
+    parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
+    parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
+    parse_optional_truncate_table, parse_select, MySqlShowCharacterSetsCommand,
+    MySqlShowListingFilter, MySqlShowValueTest, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{parse_optional_named_lock_query, write_the_current_database_in};
@@ -211,6 +212,9 @@ struct DatabasePreparedStatement {
     database: String,
     source_tables: Vec<MySqlSelectSource>,
     read_only_select: bool,
+    /// Whether this is a `SELECT`, which a session's `max_execution_time`
+    /// holds to its limit whether or not it locks the rows it reads.
+    selects: bool,
     connection: MySqlConnection,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
@@ -407,6 +411,12 @@ impl MySqlCommandAdapter {
         {
             return Ok(show_engines_result(status_flags));
         }
+        if let Some(command) =
+            parse_optional_show_character_sets(sql, self.connection.parser_mode())
+                .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            return show_character_sets_result(&command, status_flags);
+        }
         if let Some(command) = parse_optional_show_warnings(sql, self.connection.parser_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -449,6 +459,7 @@ impl MySqlCommandAdapter {
             &[],
             CheckedQueryOptions {
                 query_timeout: None,
+                select_time_limit: self.session_variables.select_time_limit(),
                 affected_rows_mode: MySqlAffectedRowsMode::Changed,
                 sql_notes: self.session_variables.sql_notes(),
                 raised: &mut self.raised_warnings,
@@ -1195,6 +1206,7 @@ where
                 database,
                 source_tables: Vec::new(),
                 read_only_select: true,
+                selects: false,
                 connection,
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
@@ -2577,6 +2589,14 @@ where
             };
             return show_columns_result(columns, self.status_flags(), command.full(), privileges);
         }
+        // The collations and character sets are the server's, and MySQL lists
+        // them with no database selected.
+        if let Some(command) =
+            parse_optional_show_character_sets(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            return show_character_sets_result(&command, self.status_flags());
+        }
 
         let selected_database = self
             .session
@@ -2734,6 +2754,7 @@ where
             &source_tables,
             CheckedQueryOptions {
                 query_timeout: self.query_timeout,
+                select_time_limit: self.session_variables.select_time_limit(),
                 affected_rows_mode,
                 sql_notes: self.session_variables.sql_notes(),
                 raised: &mut self.raised_warnings,
@@ -2818,6 +2839,7 @@ where
                 source_tables,
                 read_only_select: parse_select(sql, self.session.session_sql_mode())
                     .is_ok_and(|select| !select.locks_rows()),
+                selects: parse_select(sql, self.session.session_sql_mode()).is_ok(),
                 connection,
                 connection_statement_id,
                 parameter_types: None,
@@ -2863,6 +2885,7 @@ where
                 database,
                 source_tables: Vec::new(),
                 read_only_select: false,
+                selects: false,
                 connection,
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
@@ -2950,11 +2973,19 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
+        let timeout = if statement.selects {
+            the_shorter_limit(
+                self.query_timeout,
+                self.session_variables.select_time_limit(),
+            )
+        } else {
+            self.query_timeout
+        };
         let mut result = execute_database_prepared_statement(
             statement,
             parameter_payload,
             long_data,
-            self.query_timeout,
+            timeout,
             affected_rows_mode,
         )?;
         if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
@@ -3054,6 +3085,10 @@ where
 /// How one checked statement is run, and where what it warns about is kept.
 struct CheckedQueryOptions<'a> {
     query_timeout: Option<Duration>,
+    /// How long a `SELECT` may run, which the session sets with
+    /// `max_execution_time`; the shorter of this and the query timeout
+    /// holds.
+    select_time_limit: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
     sql_notes: bool,
     /// Every warning the statement raises, so a later `SHOW WARNINGS` can
@@ -3070,6 +3105,7 @@ fn execute_checked_query(
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let CheckedQueryOptions {
         query_timeout,
+        select_time_limit,
         affected_rows_mode,
         sql_notes,
         raised,
@@ -3373,7 +3409,7 @@ fn execute_checked_query(
             sql,
             selected_database,
             source_tables,
-            query_timeout,
+            the_shorter_limit(query_timeout, select_time_limit),
         )?;
         result.status_flags = connection_status_flags(connection);
         return Ok(CommandExecutionResult::ResultSet(result));
@@ -4555,6 +4591,14 @@ fn contains_unrecognized_system_variable(sql: &str) -> bool {
         }
     }
     false
+}
+
+/// The limit that stops a statement first, of two it may be held to.
+fn the_shorter_limit(first: Option<Duration>, second: Option<Duration>) -> Option<Duration> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (limit, None) | (None, limit) => limit,
+    }
 }
 
 fn execute_checked_select_with_timeout(
@@ -9608,6 +9652,217 @@ fn show_engines_result(status_flags: u16) -> CommandExecutionResult {
         warnings: 0,
         status_flags,
     })
+}
+
+/// Answers `SHOW COLLATION` and `SHOW CHARACTER SET` with what this server
+/// has.
+///
+/// This server speaks utf8mb4 alone, so it lists the collations a column, a
+/// table or the connection may be declared with — `utf8mb4_0900_ai_ci`,
+/// `utf8mb4_bin`, `utf8mb4_unicode_ci`, and `utf8mb4_general_ci`, which the
+/// handshake names — and the binary one every `BLOB` and `VARBINARY` holds,
+/// where MySQL lists every one it has. Each row, and each column's shape, was
+/// measured on MySQL 8.4.11, which lists both in name order. A `LIKE` and a
+/// word compared in a `WHERE` match without regard to case and to trailing
+/// spaces, as MySQL matches them there.
+fn show_character_sets_result(
+    command: &MySqlShowCharacterSetsCommand,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let keyed = MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    let (columns, rows, filter): (_, &[&[&str]], _) = match command {
+        MySqlShowCharacterSetsCommand::Collations(filter) => (
+            show_listing_columns(
+                "COLLATIONS",
+                &[
+                    (
+                        "Collation",
+                        "COLLATIONS",
+                        MYSQL_TYPE_VAR_STRING,
+                        256,
+                        MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                    (
+                        "Charset",
+                        "COLLATIONS",
+                        MYSQL_TYPE_VAR_STRING,
+                        256,
+                        MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                    (
+                        "Id",
+                        "COLLATIONS",
+                        MYSQL_TYPE_LONGLONG,
+                        20,
+                        MYSQL_UNSIGNED_FLAG,
+                    ),
+                    ("Default", "COLLATIONS", MYSQL_TYPE_VAR_STRING, 12, 0),
+                    ("Compiled", "COLLATIONS", MYSQL_TYPE_VAR_STRING, 12, 0),
+                    (
+                        "Sortlen",
+                        "COLLATIONS",
+                        MYSQL_TYPE_LONG,
+                        10,
+                        MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                    (
+                        "Pad_attribute",
+                        "COLLATIONS",
+                        MYSQL_TYPE_STRING,
+                        36,
+                        MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                ],
+            ),
+            &[
+                &["binary", "binary", "63", "Yes", "Yes", "1", "NO PAD"],
+                &[
+                    "utf8mb4_0900_ai_ci",
+                    "utf8mb4",
+                    "255",
+                    "Yes",
+                    "Yes",
+                    "0",
+                    "NO PAD",
+                ],
+                &["utf8mb4_bin", "utf8mb4", "46", "", "Yes", "1", "PAD SPACE"],
+                &[
+                    "utf8mb4_general_ci",
+                    "utf8mb4",
+                    "45",
+                    "",
+                    "Yes",
+                    "1",
+                    "PAD SPACE",
+                ],
+                &[
+                    "utf8mb4_unicode_ci",
+                    "utf8mb4",
+                    "224",
+                    "",
+                    "Yes",
+                    "8",
+                    "PAD SPACE",
+                ],
+            ],
+            filter,
+        ),
+        MySqlShowCharacterSetsCommand::CharacterSets(filter) => (
+            show_listing_columns(
+                "CHARACTER_SETS",
+                &[
+                    ("Charset", "cs", MYSQL_TYPE_VAR_STRING, 256, keyed),
+                    (
+                        "Description",
+                        "cs",
+                        MYSQL_TYPE_VAR_STRING,
+                        8192,
+                        MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                    (
+                        "Default collation",
+                        "col",
+                        MYSQL_TYPE_VAR_STRING,
+                        256,
+                        keyed,
+                    ),
+                    (
+                        "Maxlen",
+                        "cs",
+                        MYSQL_TYPE_LONG,
+                        10,
+                        MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                    ),
+                ],
+            ),
+            &[
+                &["binary", "Binary pseudo charset", "binary", "1"],
+                &["utf8mb4", "UTF-8 Unicode", "utf8mb4_0900_ai_ci", "4"],
+            ],
+            filter,
+        ),
+    };
+    let mut kept = Vec::new();
+    for row in rows {
+        if show_listing_keeps(filter, &columns, row)? {
+            kept.push(
+                row.iter()
+                    .map(|value| Some(value.as_bytes().to_vec()))
+                    .collect(),
+            );
+        }
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows: kept,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// The columns of a `SHOW` listing that reads one `information_schema`
+/// table, every one of them NOT NULL.
+fn show_listing_columns(
+    table: &str,
+    columns: &[(&str, &str, u8, u32, u16)],
+) -> Vec<ColumnDefinitionConfig> {
+    columns
+        .iter()
+        .map(|(name, original_table, column_type, length, flags)| {
+            let mut column = column_definition((*name).to_owned(), *column_type);
+            "information_schema".clone_into(&mut column.schema);
+            table.clone_into(&mut column.table);
+            (*original_table).clone_into(&mut column.original_table);
+            column.original_name = column.name.clone();
+            column.column_length = *length;
+            column.decimals = 0;
+            set_column_flags(&mut column, MYSQL_NOT_NULL_FLAG | flags);
+            column
+        })
+        .collect()
+}
+
+/// Reports whether a `SHOW` listing keeps one of its rows.
+///
+/// A `LIKE` reads the first column. A `WHERE` names the columns by name,
+/// without regard to case, and one the listing does not have is refused, as
+/// MySQL answers 1054 for it.
+fn show_listing_keeps(
+    filter: &MySqlShowListingFilter,
+    columns: &[ColumnDefinitionConfig],
+    row: &[&str],
+) -> Result<bool, FrontendErrorKind> {
+    match filter {
+        MySqlShowListingFilter::Everything => Ok(true),
+        MySqlShowListingFilter::Like(pattern) => Ok(pattern.matches(row[0])),
+        MySqlShowListingFilter::Where(tests) => {
+            for test in tests {
+                let position = columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(test.column()))
+                    .ok_or(FrontendErrorKind::UnknownColumn)?;
+                let value = row[position];
+                let holds = match test.test() {
+                    MySqlShowValueTest::EqualsWord(word) => value
+                        .trim_end_matches(' ')
+                        .eq_ignore_ascii_case(word.trim_end_matches(' ')),
+                    // A number compared with a column of words reads each
+                    // word as a number, which has not been measured here.
+                    MySqlShowValueTest::EqualsNumber(number) => {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| FrontendErrorKind::Unsupported)?
+                            == *number
+                    }
+                    MySqlShowValueTest::Like(pattern) => pattern.matches(value),
+                };
+                if !holds {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// Answers `SHOW ERRORS` for what the last statement raised.

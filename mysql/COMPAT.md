@@ -2722,6 +2722,48 @@ and write shapes are described with `TIMESTAMP` below.
 `SET information_schema_stats_expiry` is taken for any value: it is how long
 MySQL caches `information_schema` statistics, and there are none here.
 
+`SET max_execution_time` takes any whole number of milliseconds and `DEFAULT`,
+which is 0 and no limit, and `@@max_execution_time` and `SHOW VARIABLES` read
+it back as MySQL does, an unsigned `LONGLONG` of 21. A `SELECT` — text or
+prepared, locking its rows or not — running longer is stopped with 3024, and
+the shorter of this and the server's own query timeout holds. Measured on
+8.4.11: a `SELECT` and a `SELECT ... FOR UPDATE` over a join too wide to finish
+in 10 ms both answer 3024, and an `UPDATE` reading the same join runs on, which
+is what happens here. MySQL clamps a negative value to 0 with warning 1292 and
+answers 1232 for a word, where this refuses both.
+
+`SET sql_mode = 'TRADITIONAL'` is taken, alone or beside other modes: measured
+on 8.4.11 it stands for `STRICT_TRANS_TABLES`, `STRICT_ALL_TABLES`,
+`NO_ZERO_IN_DATE`, `NO_ZERO_DATE`, `ERROR_FOR_DIVISION_BY_ZERO` and
+`NO_ENGINE_SUBSTITUTION`, each a mode this server behaves as, and MySQL keeps
+`TRADITIONAL` as a mode of its own and reads it back before
+`NO_ENGINE_SUBSTITUTION`. `ANSI` stands for modes this server does not keep and
+is refused. `@@sql_mode` reads `ONLY_FULL_GROUP_BY` back whatever a session
+names, the rule being one this server keeps regardless; MySQL drops it when a
+session leaves it out.
+
+`SHOW COLLATION` and `SHOW CHARACTER SET` (or `SHOW CHARSET`) list what this
+server has rather than everything MySQL has: the utf8mb4 collations a column,
+a table or the connection may be declared with — `utf8mb4_0900_ai_ci`,
+`utf8mb4_bin`, `utf8mb4_unicode_ci` and the handshake's `utf8mb4_general_ci`
+— and the `binary` collation and character set every `BLOB` holds, where MySQL
+lists 287 collations over 41 character sets. Each row and each column's shape
+was measured on 8.4.11, and both come back in name order, as MySQL answers
+them. No database need be selected. A `LIKE` names the rows to list and a
+`WHERE` may test the columns with `=` and `LIKE` joined by `AND`: measured,
+both match words without regard to case, so `Charset = 'UTF8MB4'` lists the
+utf8mb4 rows; a column the listing has not got is 1054, and any other test is
+refused.
+
+`SHOW PROCESSLIST` and `SHOW STATUS` stay refused. Measured on 8.4.11, a
+session without the `PROCESS` privilege sees every connection of its own
+account, a pool's other connections among them, and a session here knows only
+itself; and the 330 status counters describe the whole server. `SET
+group_concat_max_len` is refused: MySQL cuts a `GROUP_CONCAT` at that many
+bytes with warning 1260 and sizes the result column by it, and this server
+cuts nothing — which also means that under MySQL's default of 1024 a longer
+`GROUP_CONCAT` is answered whole here where MySQL cuts it.
+
 A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
 spells out on every text column, so refusing them stopped a `mysqldump` from
 being restored. `utf8mb4` is the accepted character set. Text columns take

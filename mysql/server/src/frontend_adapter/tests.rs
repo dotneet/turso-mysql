@@ -30733,3 +30733,6 @@ mod derived_tables;
 
 #[cfg(unix)]
 mod information_schema_wildcards;
+
+#[cfg(unix)]
+mod character_set_listings;

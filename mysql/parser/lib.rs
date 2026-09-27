@@ -26,6 +26,7 @@ mod select_projection_origins;
 mod session_queries;
 mod session_settings;
 mod shift_moment;
+mod show_character_sets;
 mod show_engines;
 mod show_full_tables;
 mod show_table_status;
@@ -147,6 +148,10 @@ pub use session_settings::{
     MySqlUserVariableValue, SqlModeValue,
 };
 pub use shift_moment::shifted_moment;
+pub use show_character_sets::{
+    parse_optional_show_character_sets, MySqlShowCharacterSetsCommand, MySqlShowColumnTest,
+    MySqlShowListingFilter, MySqlShowValueTest,
+};
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,

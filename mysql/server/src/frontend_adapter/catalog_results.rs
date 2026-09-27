@@ -946,7 +946,16 @@ pub(super) fn information_schema_routines_columns() -> Vec<ColumnDefinitionConfi
                 u16::from(DEFAULT_UTF8MB4_COLLATION)
             };
             column.column_length = column_length;
-            column.flags = flags;
+            // Measured: every number and the null type also carry the
+            // numeric flag.
+            column.flags = if matches!(
+                column_type,
+                MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_NULL
+            ) {
+                flags | MYSQL_NUM_FLAG
+            } else {
+                flags
+            };
             if name == "PARAMETER_STYLE" {
                 column.decimals = 31;
             }
@@ -1699,7 +1708,13 @@ pub(super) fn information_schema_schemata_columns() -> Vec<ColumnDefinitionConfi
                 256,
                 listed,
             ),
-            ("SQL_PATH", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
+            (
+                "SQL_PATH",
+                "",
+                MYSQL_TYPE_NULL,
+                0,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            ),
             (
                 "DEFAULT_ENCRYPTION",
                 "schemata",

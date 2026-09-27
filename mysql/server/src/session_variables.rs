@@ -150,6 +150,9 @@ pub(crate) struct MySqlSessionVariables {
     sql_mode_choices: SqlModeChoices,
     /// The idle time the session asked for in place of the server's own.
     wait_timeout: Option<Duration>,
+    /// How long, in milliseconds, a `SELECT` may run before it is stopped;
+    /// zero for no limit.
+    max_execution_time: u64,
     /// The collation the session runs its connection on.
     connection_collation: ConnectionCollation,
 }
@@ -166,14 +169,22 @@ struct SqlModeChoices {
     /// Store a written 0 in a counted column rather than taking the next
     /// number.
     no_auto_value_on_zero: bool,
+    /// `TRADITIONAL`, which MySQL keeps as a mode of its own beside the ones
+    /// it stands for, and reads back.
+    traditional: bool,
 }
 
 impl SqlModeChoices {
     fn named_in(modes: &[String]) -> Self {
         let named = |wanted: &str| modes.iter().any(|mode| mode.eq_ignore_ascii_case(wanted));
+        // Measured on MySQL 8.4.11: `TRADITIONAL` reads back as
+        // `STRICT_TRANS_TABLES,STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,
+        // ERROR_FOR_DIVISION_BY_ZERO,TRADITIONAL,NO_ENGINE_SUBSTITUTION`.
+        let traditional = named("TRADITIONAL");
         Self {
-            strict_all_tables: named("STRICT_ALL_TABLES"),
+            strict_all_tables: named("STRICT_ALL_TABLES") || traditional,
             no_auto_value_on_zero: named("NO_AUTO_VALUE_ON_ZERO"),
+            traditional,
         }
     }
 }
@@ -198,6 +209,7 @@ impl Default for MySqlSessionVariables {
             next_transaction_isolation: None,
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
+            max_execution_time: 0,
             connection_collation: ConnectionCollation::default(),
         }
     }
@@ -230,6 +242,12 @@ impl MySqlSessionVariables {
     /// Forgets a level set for the next transaction alone, once one began.
     pub(crate) fn use_up_next_transaction_isolation(&mut self) {
         self.next_transaction_isolation = None;
+    }
+
+    /// How long a `SELECT` this session runs may take before it is stopped,
+    /// if the session set a limit.
+    pub(crate) fn select_time_limit(&self) -> Option<Duration> {
+        (self.max_execution_time > 0).then(|| Duration::from_millis(self.max_execution_time))
     }
 
     pub(crate) fn time_zone_offset_seconds(&self) -> i32 {
@@ -437,6 +455,9 @@ impl MySqlSessionVariables {
             }
             MySqlSessionSetting::WaitTimeout(seconds) => {
                 self.wait_timeout = seconds.map(Duration::from_secs);
+            }
+            MySqlSessionSetting::MaxExecutionTime(milliseconds) => {
+                self.max_execution_time = milliseconds.unwrap_or(0);
             }
             MySqlSessionSetting::ForeignKeyChecks(enabled) => {
                 self.foreign_key_checks = enabled;
@@ -757,7 +778,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 32] = [
+const SHOWN_VARIABLES: [&str; 33] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -776,6 +797,7 @@ const SHOWN_VARIABLES: [&str; 32] = [
     "license",
     "lower_case_table_names",
     "max_allowed_packet",
+    "max_execution_time",
     "net_write_timeout",
     "performance_schema",
     "sql_auto_is_null",
@@ -841,6 +863,11 @@ fn accept_session_setting(
         // is the caller's to keep, and a value past either end is refused
         // rather than clamped with MySQL's warning.
         MySqlSessionSetting::WaitTimeout(None) => Ok(()),
+        // Measured on MySQL 8.4.11: any whole number of milliseconds is taken
+        // and read back as written, and a `SELECT` or `SELECT ... FOR UPDATE`
+        // running longer is stopped with 3024 while an `UPDATE` runs on. The
+        // caller stops a `SELECT` that way.
+        MySqlSessionSetting::MaxExecutionTime(_) => Ok(()),
         MySqlSessionSetting::WaitTimeout(Some(seconds)) => {
             if (1..=31_536_000).contains(seconds) {
                 Ok(())
@@ -968,7 +995,8 @@ fn accept_session_setting(
 /// reads the variable and writes it back is taken: writes are refused rather
 /// than truncated, an impossible date is refused, `InnoDB` is the only engine
 /// and is what `SHOW CREATE TABLE` reports, and division by zero never reaches
-/// a write. Every other mode is refused rather than silently ignored.
+/// a write. `TRADITIONAL` names nothing but modes of that list. Every other
+/// mode is refused rather than silently ignored.
 fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) -> bool {
     if mode.eq_ignore_ascii_case("ANSI_QUOTES") {
         return session_sql_mode.ansi_quotes;
@@ -984,6 +1012,7 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
         "NO_ZERO_DATE",
         "ERROR_FOR_DIVISION_BY_ZERO",
         "NO_ENGINE_SUBSTITUTION",
+        "TRADITIONAL",
     ]
     .iter()
     .any(|known| mode.eq_ignore_ascii_case(known))
@@ -1176,6 +1205,11 @@ fn counted_system_variable(
             .wait_timeout
             .map_or(settings.wait_timeout_seconds(), |wait| wait.as_secs());
         return Some((seconds.to_string(), 21, true));
+    }
+    // Measured on MySQL 8.4.11: 0 until a session sets it, and an unsigned
+    // LONGLONG of 21.
+    if name.eq_ignore_ascii_case("max_execution_time") {
+        return Some((session_variables.max_execution_time.to_string(), 21, true));
     }
     // Neither rule is one this server has, and a session is refused both.
     if name.eq_ignore_ascii_case("sql_auto_is_null")
@@ -1372,7 +1406,8 @@ pub(crate) fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
 /// The `sql_mode` a session reads back, with the flags it turned on.
 ///
 /// Measured on MySQL 8.4.11: `NO_AUTO_VALUE_ON_ZERO` reads back after
-/// `ONLY_FULL_GROUP_BY` and `STRICT_ALL_TABLES` after `STRICT_TRANS_TABLES`.
+/// `ONLY_FULL_GROUP_BY`, `STRICT_ALL_TABLES` after `STRICT_TRANS_TABLES`, and
+/// `TRADITIONAL` before `NO_ENGINE_SUBSTITUTION`.
 fn reported_sql_mode_with(session_sql_mode: SessionSqlMode, choices: SqlModeChoices) -> String {
     let mut modes = Vec::with_capacity(10);
     if session_sql_mode.ansi_quotes {
@@ -1393,8 +1428,11 @@ fn reported_sql_mode_with(session_sql_mode: SessionSqlMode, choices: SqlModeChoi
         "NO_ZERO_IN_DATE",
         "NO_ZERO_DATE",
         "ERROR_FOR_DIVISION_BY_ZERO",
-        "NO_ENGINE_SUBSTITUTION",
     ]);
+    if choices.traditional {
+        modes.push("TRADITIONAL");
+    }
+    modes.push("NO_ENGINE_SUBSTITUTION");
     modes.join(",")
 }
 
@@ -2883,6 +2921,7 @@ mod tests {
                 ("license", "MIT"),
                 ("lower_case_table_names", "1"),
                 ("max_allowed_packet", "67108864"),
+                ("max_execution_time", "0"),
                 ("net_write_timeout", "60"),
                 ("performance_schema", "OFF"),
                 ("sql_auto_is_null", "OFF"),

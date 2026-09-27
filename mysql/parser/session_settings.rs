@@ -68,6 +68,12 @@ pub enum MySqlSessionSetting {
     SqlModeExpression(SqlModeValue),
     /// `SET wait_timeout = <n>`, or `DEFAULT` for the server's own.
     WaitTimeout(Option<u64>),
+    /// `SET max_execution_time = <n>`, in milliseconds, or `DEFAULT` for no
+    /// limit.
+    ///
+    /// This one changes how the server behaves: a `SELECT` running longer
+    /// than it is stopped.
+    MaxExecutionTime(Option<u64>),
     /// `SET sql_auto_is_null = 0` or `= 1`.
     SqlAutoIsNull(bool),
     /// `SET sql_safe_updates = 0` or `= 1`.
@@ -317,6 +323,14 @@ fn take_one_session_setting(
             MySqlSessionSetting::WaitTimeout(None)
         } else if let Some(value) = scanner.take_unsigned() {
             MySqlSessionSetting::WaitTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("max_execution_time") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::MaxExecutionTime(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::MaxExecutionTime(Some(value))
         } else {
             return Ok(None);
         }
@@ -1336,6 +1350,16 @@ mod tests {
             parse("SET @@SESSION.wait_timeout = DEFAULT"),
             Some(MySqlSessionSetting::WaitTimeout(None))
         );
+        assert_eq!(
+            parse("SET SESSION max_execution_time = 1000"),
+            Some(MySqlSessionSetting::MaxExecutionTime(Some(1000)))
+        );
+        assert_eq!(
+            parse("SET @@max_execution_time = DEFAULT"),
+            Some(MySqlSessionSetting::MaxExecutionTime(None))
+        );
+        // Measured on MySQL 8.4.11: a word is 1232, which is not a setting.
+        assert_eq!(parse("SET max_execution_time = '10'"), None);
     }
 
     /// Rails without strict mode takes the strict modes out with `REPLACE`.
