@@ -1348,7 +1348,7 @@ impl MySqlConnection {
             .parse_select_knowing_column_types(sql)
             .map_err(|_| MySqlParseError::ExpectedSelect)
         {
-            Ok(translated) => {
+            Ok((translated, rendered_differently)) => {
                 Self::reject_internal_catalog_select(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.reject_binary_scalar_collation(&translated)
@@ -1372,7 +1372,8 @@ impl MySqlConnection {
                 let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
-                let frozen = self.frozen_select_parser(sql, &translated, &statement);
+                let frozen =
+                    self.frozen_select_parser(&translated, rendered_differently, &statement);
                 let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
                 let statement = self
                     .inner
@@ -4835,7 +4836,7 @@ impl MySqlConnection {
         &self,
         sql: &str,
     ) -> std::result::Result<(Statement, Vec<Option<StaticSelectMetadata>>), MySqlQueryError> {
-        let translated = self.parse_select_knowing_column_types(sql)?;
+        let (translated, rendered_differently) = self.parse_select_knowing_column_types(sql)?;
         Self::reject_internal_catalog_select(&translated)?;
         self.reject_binary_scalar_collation(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
@@ -4860,7 +4861,7 @@ impl MySqlConnection {
             .parse_ast()
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         self.validate_session_timestamp_select(&translated, &stmt)?;
-        let frozen = self.frozen_select_parser(sql, &translated, &stmt);
+        let frozen = self.frozen_select_parser(&translated, rendered_differently, &stmt);
         let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let stmt = self
             .inner
@@ -4945,13 +4946,11 @@ impl MySqlConnection {
 
     fn frozen_select_parser(
         &self,
-        sql: &str,
         translated: &turso_mysql_parser::TranslatedSelect,
+        typed_rendering: bool,
         statement: &Stmt,
     ) -> FrozenSelectParser {
         let mode = self.parser_mode();
-        let typed_rendering =
-            parse_select(sql, mode).is_ok_and(|untyped| untyped.as_sql() != translated.as_sql());
         let reads_type_specific_column = translated.source_tables().iter().any(|source| {
             self.list_columns(source.table()).is_ok_and(|columns| {
                 columns
@@ -5202,18 +5201,32 @@ impl MySqlConnection {
     /// without regard to case where the engine will not unless it is asked to,
     /// and it reads a written day against a column holding a moment as that
     /// day's midnight.
+    /// Reads a `SELECT`, a second time with its columns' types where they
+    /// change how it is written, and answers whether they did: the reprepare
+    /// parser keeps the typed statement when they did.
     fn parse_select_knowing_column_types(
         &self,
         sql: &str,
-    ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
+    ) -> std::result::Result<(turso_mysql_parser::TranslatedSelect, bool), MySqlQueryError> {
         if self.time_zone_offset_seconds() != 0 && uses_session_local_clock(sql) {
             return Err(MySqlQueryError::Unsupported(
                 "session-local clock functions in a non-UTC time zone are unsupported".to_owned(),
             ));
         }
+        let untyped = parse_select(sql, self.parser_mode())
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let untyped_sql = untyped.as_sql().to_owned();
+        let typed = self.with_column_types(sql, untyped)?;
+        let rendered_differently = typed.as_sql() != untyped_sql;
+        Ok((typed, rendered_differently))
+    }
+
+    fn with_column_types(
+        &self,
+        sql: &str,
+        translated: turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
         let mode = self.parser_mode();
-        let translated =
-            parse_select(sql, mode).map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let has_decimal_source = translated.source_tables().iter().any(|source| {
             self.list_columns(source.table())
                 .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))

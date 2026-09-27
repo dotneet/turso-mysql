@@ -2454,11 +2454,13 @@ where
         }
         self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
-        if matches!(
-            turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
-            Ok(turso_parser::ast::Stmt::CreateView { .. }
-                | turso_parser::ast::Stmt::CreateTrigger { .. })
-        ) {
+        if may_create_a_view_or_trigger(sql)
+            && matches!(
+                turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
+                Ok(turso_parser::ast::Stmt::CreateView { .. }
+                    | turso_parser::ast::Stmt::CreateTrigger { .. })
+            )
+        {
             if let Some(username) = self
                 .authorizer
                 .schema_creator_username(&self.principal)
@@ -3903,6 +3905,19 @@ fn prepare_for_client_statement(
             written_zero,
         )
         .map_err(frontend_query_error)
+}
+
+/// Whether a statement could be a `CREATE VIEW` or a `CREATE TRIGGER`, which
+/// every one names in so many words. Parsing a statement as schema DDL to find
+/// out costs as much as running a primary-key `SELECT`, so the rest skip it.
+fn may_create_a_view_or_trigger(sql: &str) -> bool {
+    [b"VIEW".as_slice(), b"TRIGGER".as_slice()]
+        .iter()
+        .any(|word| {
+            sql.as_bytes()
+                .windows(word.len())
+                .any(|window| window.eq_ignore_ascii_case(word))
+        })
 }
 
 /// Settles what one statement from the client left behind.

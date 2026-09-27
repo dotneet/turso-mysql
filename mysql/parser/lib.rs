@@ -3604,10 +3604,38 @@ fn is_unquoted_word(token: &Token, expected: &str) -> bool {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread read a statement in [`parse_select`] rather
+    /// than answering from the last read.
+    pub(crate) static SELECT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Parses exactly one MySQL `SELECT` statement and translates the supported
 /// semantics-preserving subset to SQLite SQL.
+///
+/// The server reads each statement more than once on its way to running it —
+/// once to authorize it and again to prepare it — so the last statement this
+/// thread read is kept with its answer, which follows from the text and the
+/// mode alone.
 pub fn parse_select(sql: &str, mode: SessionSqlMode) -> Result<TranslatedSelect, ParseError> {
-    parse_select_with_column_types(sql, mode, &[], &[], &[])
+    type LastRead = Option<(String, SessionSqlMode, Result<TranslatedSelect, ParseError>)>;
+    thread_local! {
+        static LAST_READ: std::cell::RefCell<LastRead> = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(answer) = LAST_READ.with(|last| {
+        last.borrow()
+            .as_ref()
+            .filter(|(read, read_mode, _)| read == sql && *read_mode == mode)
+            .map(|(_, _, answer)| answer.clone())
+    }) {
+        return answer;
+    }
+    #[cfg(test)]
+    SELECT_READS.with(|reads| reads.set(reads.get() + 1));
+    let answer = parse_select_with_column_types(sql, mode, &[], &[], &[]);
+    LAST_READ.with(|last| *last.borrow_mut() = Some((sql.to_owned(), mode, answer.clone())));
+    answer
 }
 
 /// Parses a checked `SELECT`, told which columns hold text or a moment, what

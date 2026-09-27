@@ -8209,3 +8209,25 @@ fn a_column_keeps_the_comment_it_was_written_with() {
         vec![("id".to_owned(), "the id".to_owned())]
     );
 }
+
+/// The server reads a statement to authorize it and again to prepare it, so
+/// the last one read is answered from memory, and only for the same text and
+/// mode.
+#[test]
+fn the_last_select_read_is_answered_without_reading_it_again() {
+    let reads = || crate::SELECT_READS.with(std::cell::Cell::get);
+    let before = reads();
+    let sql = "SELECT id FROM the_last_select_read WHERE id = 1";
+    let first = parse_select(sql, SessionSqlMode::default()).unwrap();
+    assert_eq!(parse_select(sql, SessionSqlMode::default()).unwrap(), first);
+    assert_eq!(reads(), before + 1);
+    let ansi = SessionSqlMode {
+        ansi_quotes: true,
+        no_backslash_escapes: false,
+    };
+    parse_select(sql, ansi).unwrap();
+    assert_eq!(reads(), before + 2);
+    assert!(parse_select("SELECT id FROM the_last_select_read WHERE", ansi).is_err());
+    assert!(parse_select("SELECT id FROM the_last_select_read WHERE", ansi).is_err());
+    assert_eq!(reads(), before + 3);
+}

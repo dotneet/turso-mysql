@@ -293,6 +293,9 @@ pub fn is_connector_j_information_schema_collation_query(
     mode: SessionSqlMode,
 ) -> Result<bool, ParseError> {
     const QUERY: &str = "SELECT DEFAULT_COLLATION_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'information_schema'";
+    if !names_information_schema(sql) {
+        return Ok(false);
+    }
     let actual = tokenize_information_schema_query(sql, mode)?;
     if actual.iter().any(|token| {
         matches!(
@@ -316,6 +319,9 @@ pub fn is_connector_j_reserved_keywords_query(
 ) -> Result<bool, ParseError> {
     const QUERY: &str =
         "SELECT WORD FROM INFORMATION_SCHEMA.KEYWORDS WHERE RESERVED = 1 ORDER BY WORD";
+    if !names_information_schema(sql) {
+        return Ok(false);
+    }
     let actual = tokenize_information_schema_query(sql, mode)?;
     if actual.iter().any(|token| {
         matches!(
@@ -471,6 +477,12 @@ mod connector_j_tests {
             parse_optional_connector_j_schemata_listing_query("SELECT 'unterminated", mode),
             Ok(None)
         );
+        for recognizes in [
+            is_connector_j_information_schema_collation_query,
+            is_connector_j_reserved_keywords_query,
+        ] {
+            assert_eq!(recognizes("SELECT 'unterminated", mode), Ok(false));
+        }
         assert!(parse_optional_connector_j_information_schema_query(
             "SELECT 'unterminated FROM information_schema.tables",
             mode
