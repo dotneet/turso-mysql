@@ -1356,6 +1356,25 @@ a type this can work out. A `SUM` or `AVG` over a text or temporal column is
 refused too: MySQL answers those by coercing the column, which has not been
 measured.
 
+`ROUND(SUM(col), n)` and `ROUND(AVG(col), n)` are taken over a signed whole
+number or a `DECIMAL` column, which is how a report prints a total or an
+average. Measured on MySQL 8.4.11, the answer is a `NEWDECIMAL` worked out from
+the aggregate's own precision and scale — a `SUM` 22 more digits than the
+column and its scale, an `AVG` 4 more digits and 4 more places. Rounding to
+more places than that scale, or to as many when there are any, keeps the
+aggregate's shape: `ROUND(AVG(views), 6)` and `ROUND(AVG(views), 4)` over an
+`INT` both answer 16 characters with 4 places and `5.0000`. Rounding to fewer
+keeps the whole part, adds a digit for the carry rounding can make and keeps the
+places named: `ROUND(AVG(views), 2)` answers 15 with 2, and `ROUND(SUM(views))`
+34 where `SUM(views)` answers 33. It is nullable, NULL over no rows, and carries
+the binary flag. MySQL takes the average as an exact decimal four places past
+the column's and rounds that half away from zero, so the engine's exact
+`mysql_decimal_avg` and `mysql_decimal_sum` answer it rather than its float
+`AVG` — over -2 and -3, `ROUND(AVG(n))` is -3. Refused: rounding left of the
+point, which the engine's decimal rounding stops short of; `MIN`, `MAX` and
+`COUNT` inside, which answer shapes of their own; and a float or an unsigned
+column.
+
 A `WITH` clause names a subquery so the statement can read it as a table.
 Measured on 8.4.11: a column that comes through a CTE names the CTE as its table
 and carries the base column's own type and flags — a primary key stays a primary
@@ -1620,11 +1639,11 @@ answers a `LONG` of 4 there where it answers a `YEAR` on its own, and `MONTH` a
 `LONG` of 3 where it answers a `LONGLONG`. `SUM`, `MIN` and `MAX` lose the
 binary flag the same way; words lose the 31 decimals a call's words carry; a day
 keeps its shape; and an `AVG`, worked out afterwards from a sum and a count,
-keeps its own. A grouping key carries the group flag, 32768 — the bit MySQL also
+keeps its own, as does a `ROUND` over a total or an average. A grouping key carries the group flag, 32768 — the bit MySQL also
 sends as the numeric flag, so a client reads a `DATE` or a `DATE_FORMAT` key as
 flagged numeric. What the temporary table does to any other answer has not been
-measured and is refused: a `GROUP_CONCAT`, a `MIN` over a moment, a literal, a
-call over an aggregate. MySQL uses the same table for a statement grouping by a
+measured and is refused: a `GROUP_CONCAT`, a `MIN` over a moment, a literal,
+arithmetic. MySQL uses the same table for a statement grouping by a
 column no index covers, and reports the same shapes there; this keeps the
 shapes MySQL reports when an index answers the grouping instead — measured,
 `SELECT user_id, COUNT(*) ... GROUP BY user_id` reports the count's binary flag

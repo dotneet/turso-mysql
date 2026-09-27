@@ -5953,6 +5953,7 @@ impl MySqlConnection {
                 matches!(answer, StaticSelectMetadata::Arithmetic(shape) if shape.names_a_column())
                     || matches!(answer,
                         StaticSelectMetadata::ColumnAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. }
+                        | StaticSelectMetadata::RoundedAggregate { .. }
                         | StaticSelectMetadata::WindowAggregate { kind: turso_mysql_parser::ColumnAggregateKind::Sum | turso_mysql_parser::ColumnAggregateKind::Avg, .. })
                     || matches!(answer,
                         StaticSelectMetadata::ScalarCall {

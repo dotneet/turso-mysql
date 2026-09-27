@@ -1420,6 +1420,7 @@ fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
                         function: static_select_metadata::ScalarFunction::CollectsBuiltJson,
                         ..
                     }
+                    | StaticSelectMetadata::RoundedAggregate { .. }
             )
         )
 }
@@ -5852,6 +5853,14 @@ fn render_scalar_call(
         }
         return Ok(format!("ceil({})", single_column_argument(function)));
     } else if name.value.eq_ignore_ascii_case("ROUND") {
+        if let Some(StaticSelectMetadata::RoundedAggregate {
+            column_name,
+            kind,
+            places,
+        }) = static_select_metadata::scalar_call(function)
+        {
+            return render_rounded_aggregate(&column_name, kind, places, render_context);
+        }
         let Some(StaticSelectMetadata::ScalarCall {
             function: static_select_metadata::ScalarFunction::RoundsToPlaces { places },
             ..
@@ -6711,6 +6720,44 @@ fn render_clock_to_a_fraction(format: &str, whole_length: u32, places: u32) -> S
         Some(padding) if padding > 0 => format!("({read} || '{}')", "0".repeat(padding as usize)),
         _ => read,
     }
+}
+
+/// Renders `ROUND(SUM(col), n)` and the same over `AVG` as MySQL works them
+/// out: the aggregate as an exact decimal, then rounded half away from zero.
+///
+/// MySQL's `AVG` answers four more places than the column has and rounds
+/// there before `ROUND` rounds again, so the average is taken as the exact
+/// decimal the engine's own `mysql_decimal_avg` answers, which is the same
+/// number, rather than as a float. A place beyond the aggregate's own scale
+/// adds no digits: measured on 8.4.11, `ROUND(AVG(views), 6)` over an `INT`
+/// answers `5.0000`.
+///
+/// The column's scale is the frontend's to know, so a first reading assumes a
+/// whole-number column and the second, told which columns are decimals,
+/// renders the scale they carry. A column holding a float is refused where the
+/// result's shape is worked out.
+fn render_rounded_aggregate(
+    column_name: &str,
+    kind: ColumnAggregateKind,
+    places: u32,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    render_context.checks_type_sensitive_expression = true;
+    let column_scale = render_context
+        .decimal_columns
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(column_name))
+        .map_or(0, |(_, scale)| *scale);
+    let (aggregate, scale) = match kind {
+        ColumnAggregateKind::Sum => ("mysql_decimal_sum", column_scale),
+        ColumnAggregateKind::Avg => ("mysql_decimal_avg", (column_scale + 4).min(30)),
+        _ => unreachable!("only SUM and AVG are rounded aggregates"),
+    };
+    Ok(format!(
+        "mysql_decimal_round({aggregate}({}), {})",
+        render_ident_str(column_name),
+        places.min(scale)
+    ))
 }
 
 /// Names the reading that answers a MySQL JSON call the engine has none for.

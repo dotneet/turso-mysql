@@ -287,3 +287,144 @@ fn a_grouped_statement_refuses_what_only_full_group_by_refuses() {
         );
     }
 }
+
+/// `ROUND(AVG(n), 2)` is how a report prints an average. MySQL answers a
+/// decimal worked out from the aggregate's own shape, and rounds the exact
+/// average, half away from zero.
+#[test]
+fn a_rounded_total_or_average_answers_the_decimal_mysql_answers() {
+    let (_directory, mut adapter) = adapter();
+    let decimal = |length, decimals| {
+        (
+            MYSQL_TYPE_NEWDECIMAL,
+            length,
+            decimals,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        )
+    };
+    // Rounding to at least the average's four places keeps its shape;
+    // rounding to fewer keeps the whole part and adds a digit for the carry.
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT ROUND(AVG(views), 2), ROUND(AVG(views)), ROUND(AVG(views), 6), ROUND(AVG(views), 4), ROUND(AVG(views), 3), ROUND(SUM(views)), ROUND(SUM(views), 1) FROM posts",
+    );
+    assert_eq!(
+        shapes,
+        [
+            decimal(15, 2),
+            decimal(12, 0),
+            decimal(16, 4),
+            decimal(16, 4),
+            decimal(16, 3),
+            decimal(34, 0),
+            decimal(33, 0),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[&[
+            Some("5.00"),
+            Some("5"),
+            Some("5.0000"),
+            Some("5.0000"),
+            Some("5.000"),
+            Some("25"),
+            Some("25"),
+        ]])
+    );
+
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT ROUND(AVG(balance), 2), ROUND(AVG(balance)), ROUND(AVG(balance), 8), ROUND(SUM(balance), 1), ROUND(SUM(balance), 3) FROM users",
+    );
+    assert_eq!(
+        shapes,
+        [
+            decimal(13, 2),
+            decimal(10, 0),
+            decimal(16, 6),
+            decimal(34, 1),
+            decimal(34, 2),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[&[
+            Some("36.83"),
+            Some("37"),
+            Some("36.830000"),
+            Some("110.5"),
+            Some("110.49"),
+        ]])
+    );
+
+    // Over no rows it is NULL, and in a grouped report it keeps its shape.
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT ROUND(AVG(views), 2) AS a FROM posts WHERE id > 100",
+    );
+    assert_eq!(answered, rows(&[&[None]]));
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT DATE(created_at), ROUND(AVG(views), 2) FROM posts GROUP BY DATE(created_at) ORDER BY 1",
+    );
+    assert_eq!(shapes[1], decimal(15, 2));
+    assert_eq!(
+        answered,
+        rows(&[
+            &[None, Some("0.00")],
+            &[Some("2025-12-31"), Some("5.00")],
+            &[Some("2026-01-05"), Some("6.50")],
+            &[Some("2026-02-01"), Some("7.00")],
+        ])
+    );
+
+    adapter
+        .execute_query("CREATE TABLE halves (g INT, n INT, d DECIMAL(6,3))")
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO halves VALUES (1, -2, -0.005), (1, -3, -0.010), (2, 1, 0.001), (2, 1, 0.002), (2, 2, 0.002)")
+        .unwrap();
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT g, ROUND(AVG(n)), ROUND(AVG(n), 3), ROUND(AVG(d), 2), ROUND(SUM(d), 2), ROUND(AVG(d), 5) FROM halves GROUP BY g ORDER BY g",
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[
+                Some("1"),
+                Some("-3"),
+                Some("-2.500"),
+                Some("-0.01"),
+                Some("-0.02"),
+                Some("-0.00750"),
+            ],
+            &[
+                Some("2"),
+                Some("1"),
+                Some("1.333"),
+                Some("0.00"),
+                Some("0.01"),
+                Some("0.00167"),
+            ],
+        ])
+    );
+
+    for sql in [
+        // Left of the point, which the engine's decimal rounding stops short
+        // of, and over a largest value, which answers a shape of its own.
+        "SELECT ROUND(AVG(views), -1) FROM posts",
+        "SELECT ROUND(MAX(views), 2) FROM posts",
+        // 1140: a column beside the aggregate.
+        "SELECT id, ROUND(AVG(views), 2) FROM posts",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

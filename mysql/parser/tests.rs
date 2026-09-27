@@ -106,6 +106,30 @@ fn decimal_aggregates_use_exact_core_functions() {
 }
 
 #[test]
+fn a_rounded_total_or_average_rounds_the_exact_decimal_to_its_own_scale() {
+    let sql =
+        "SELECT ROUND(AVG(v), 2), ROUND(AVG(v), 9), ROUND(SUM(v), 1), ROUND(AVG(n)) FROM amounts";
+    assert!(parse_select(sql, SessionSqlMode::default())
+        .unwrap()
+        .needs_column_types());
+    let translated = parse_select_knowing_decimal_columns(
+        sql,
+        SessionSqlMode::default(),
+        &[],
+        &[],
+        &[],
+        &[],
+        &[],
+        &[("v".to_string(), 2)],
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT mysql_decimal_round(mysql_decimal_avg(\"v\"), 2) AS \"ROUND(AVG(v), 2)\", mysql_decimal_round(mysql_decimal_avg(\"v\"), 6) AS \"ROUND(AVG(v), 9)\", mysql_decimal_round(mysql_decimal_sum(\"v\"), 1) AS \"ROUND(SUM(v), 1)\", mysql_decimal_round(mysql_decimal_avg(\"n\"), 0) AS \"ROUND(AVG(n))\" FROM \"amounts\""
+    );
+}
+
+#[test]
 fn decimal_arithmetic_keeps_fractional_literals_exact() {
     let mode = SessionSqlMode::default();
     for (source, rendered) in [

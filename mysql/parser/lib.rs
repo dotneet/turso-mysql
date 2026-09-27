@@ -1602,6 +1602,7 @@ impl TranslatedSelect {
                             | ScalarFunction::ReadsThePlace,
                         ..
                     } | StaticSelectMetadata::Arithmetic(_)
+                        | StaticSelectMetadata::RoundedAggregate { .. }
                 )
             })
     }

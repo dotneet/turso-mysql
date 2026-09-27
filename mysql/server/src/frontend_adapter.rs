@@ -5313,6 +5313,57 @@ impl TableResultMetadata {
         Ok(definition)
     }
 
+    /// Builds the result column `ROUND(SUM(col), n)` or `ROUND(AVG(col), n)`
+    /// reports.
+    ///
+    /// Measured on MySQL 8.4.11, over the precision and scale the aggregate
+    /// answers on its own — a `SUM` 22 more digits than the column and its
+    /// scale, an `AVG` 4 more digits and 4 more places. Rounding to more places
+    /// than that scale, or to as many when there are any, keeps the
+    /// aggregate's shape: `ROUND(AVG(views), 6)` and `ROUND(AVG(views), 4)`
+    /// over an `INT` both answer 16 characters with 4 places. Rounding to
+    /// fewer keeps the whole part, adds one digit for the carry rounding can
+    /// make and keeps the places named: `ROUND(AVG(views), 2)` answers 15 with
+    /// 2, and `ROUND(SUM(views))` 34 with none where `SUM(views)` answers 33.
+    /// The length counts a sign and, when there are places, the point.
+    ///
+    /// The answer is nullable, belongs to no table, and carries the binary
+    /// flag a numeric aggregate carries. A column that is not a whole number
+    /// or a `DECIMAL` has not been measured and is refused.
+    fn rounded_aggregate_column_definition(
+        &self,
+        name: String,
+        column_name: &str,
+        kind: ColumnAggregateKind,
+        places: u32,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let (table, ordinal) = self.column_named(column_name)?;
+        let source = table
+            .columns
+            .get(ordinal)
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        let (column_precision, column_scale) =
+            decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+        let (precision, scale) = match kind {
+            ColumnAggregateKind::Sum => (column_precision + 22, column_scale),
+            ColumnAggregateKind::Avg => (
+                column_precision + 4,
+                (column_scale + 4).min(MYSQL_MAX_DECIMAL_SCALE),
+            ),
+            _ => return Err(FrontendErrorKind::Internal),
+        };
+        let (precision, scale) = if places > 0 && places >= scale {
+            (precision, scale)
+        } else {
+            (precision - scale + 1 + places, places)
+        };
+        let mut definition = column_definition(name, MYSQL_TYPE_NEWDECIMAL);
+        definition.column_length = precision + 1 + u32::from(scale > 0);
+        definition.decimals = scale as u8;
+        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+        Ok(definition)
+    }
+
     /// Builds the result column an arithmetic expression reports.
     ///
     /// Measured on MySQL 8.4.11. `+` and `-` give a precision of
@@ -7846,6 +7897,7 @@ fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
+        | turso_mysql_parser::StaticSelectMetadata::RoundedAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
         | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner)
@@ -7936,6 +7988,13 @@ fn aggregate_column_definition(
             set_column_flags(&mut definition, flags);
             Ok(definition)
         }
+        turso_mysql_parser::StaticSelectMetadata::RoundedAggregate {
+            column_name,
+            kind,
+            places,
+        } => source_metadata
+            .ok_or(FrontendErrorKind::Unsupported)?
+            .rounded_aggregate_column_definition(name, column_name, *kind, *places),
         turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable { answer, key } => {
             let mut definition = match static_column_definition(name.clone(), answer) {
                 Some(definition) => definition,
@@ -8019,6 +8078,7 @@ fn read_out_of_the_grouping_table(
     use turso_mysql_parser::StaticSelectMetadata;
     let stored = match answer {
         StaticSelectMetadata::Count => true,
+        StaticSelectMetadata::RoundedAggregate { .. } => false,
         StaticSelectMetadata::ColumnAggregate { kind, .. } => match kind {
             ColumnAggregateKind::MinMax | ColumnAggregateKind::Sum => true,
             ColumnAggregateKind::Avg => false,

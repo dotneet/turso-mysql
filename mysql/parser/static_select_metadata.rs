@@ -100,6 +100,18 @@ pub enum StaticSelectMetadata {
     /// A value written out in full, whose shape is fixed by how it is
     /// written.
     WrittenValue(crate::WrittenValue),
+    /// `ROUND(SUM(col), n)` or `ROUND(AVG(col), n)`, which answers a decimal
+    /// worked out from the aggregate's own precision and scale.
+    ///
+    /// Like `ColumnAggregate` this is finished by the server, which is the only
+    /// side that can see the column's precision.
+    RoundedAggregate {
+        column_name: String,
+        kind: ColumnAggregateKind,
+        /// The places it rounds to: zero or more, since a place left of the
+        /// point is refused.
+        places: u32,
+    },
     /// An answer of a statement grouping by an expression, which MySQL groups
     /// in a temporary table and reports the table's column for rather than the
     /// answer's own shape.
@@ -2224,6 +2236,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // `ROUND(col [, places])` rounds to a written number of places; with none
     // it rounds to a whole number, which is the same as naming 0.
     if named(&["ROUND"]) {
+        if let Some(rounded) = rounded_aggregate(arguments.args.as_slice()) {
+            return Some(rounded);
+        }
         let (column, places) = match arguments.args.as_slice() {
             [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
                 Expr::Identifier(column),
@@ -3151,6 +3166,41 @@ pub(super) fn date_shift_spelled_out(
         clauses: Vec::new(),
     });
     Some(spelled)
+}
+
+/// Classifies `ROUND(SUM(col) [, places])` and the same over `AVG`, which is
+/// how a report asks for a total or an average it can print.
+///
+/// Measured on MySQL 8.4.11 it answers a decimal worked out from the
+/// aggregate's own. Rounding left of the point is not taken: the engine's
+/// decimal rounding stops at the point.
+fn rounded_aggregate(arguments: &[sqlparser::ast::FunctionArg]) -> Option<StaticSelectMetadata> {
+    let (aggregate, places) = match arguments {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(aggregate),
+        ))] => (aggregate, 0),
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Function(aggregate),
+        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(places))] => {
+            (
+                aggregate,
+                u32::try_from(crate::translate::direct_signed_integer(places)?).ok()?,
+            )
+        }
+        _ => return None,
+    };
+    if aggregate.over.is_some() {
+        return None;
+    }
+    let (kind, column) = column_aggregate_argument(aggregate)?;
+    if !matches!(kind, ColumnAggregateKind::Sum | ColumnAggregateKind::Avg) {
+        return None;
+    }
+    Some(StaticSelectMetadata::RoundedAggregate {
+        column_name: column.value.clone(),
+        kind,
+        places,
+    })
 }
 
 /// Classifies `EXTRACT(<field> FROM column)`, which reads a part of a moment
