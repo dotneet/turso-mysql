@@ -911,3 +911,147 @@ fn the_counter_moves_where_mysql_moves_it() {
         Err(FrontendErrorKind::MissingObject)
     );
 }
+
+/// `CREATE TABLE ... LIKE` makes an empty table shaped like its source: the
+/// columns, keys, collation and comment, with a foreign key's own index kept
+/// as a plain key, the constraint itself left behind and a counter that
+/// starts again from 1.
+#[test]
+fn a_table_made_like_another_takes_its_shape_but_not_its_rows_or_links() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         email VARCHAR(255) NOT NULL, UNIQUE KEY uk_email (email)) COMMENT='people'",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+         user_id INT NOT NULL, title VARCHAR(100) DEFAULT 'x', \
+         CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO users (email) VALUES ('a'), ('b')",
+    );
+
+    run(&mut adapter, "CREATE TABLE users2 LIKE users");
+    assert_eq!(
+        printed_table(&mut adapter, "users2"),
+        "CREATE TABLE `users2` (\n  \
+         `id` int NOT NULL AUTO_INCREMENT,\n  \
+         `email` varchar(255) NOT NULL,\n  \
+         PRIMARY KEY (`id`),\n  \
+         UNIQUE KEY `uk_email` (`email`)\n\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='people'"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM users2"),
+        [[Some("0".to_owned())]]
+    );
+    run(&mut adapter, "INSERT INTO users2 (email) VALUES ('a')");
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        [[Some("1".to_owned())]]
+    );
+
+    run(&mut adapter, "CREATE TABLE posts2 (LIKE posts)");
+    assert_eq!(
+        printed_table(&mut adapter, "posts2"),
+        "CREATE TABLE `posts2` (\n  \
+         `id` int NOT NULL AUTO_INCREMENT,\n  \
+         `user_id` int NOT NULL,\n  \
+         `title` varchar(100) DEFAULT 'x',\n  \
+         PRIMARY KEY (`id`),\n  \
+         KEY `fk_user` (`user_id`)\n\
+         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    run(&mut adapter, "INSERT INTO posts2 (user_id) VALUES (99)");
+}
+
+/// Measured on MySQL 8.4.11: the source is looked at before the new name, so
+/// a missing source is 1146 and a view 1347 even under `IF NOT EXISTS` with a
+/// new name that is taken; then the same name twice is 1066, and a taken name
+/// 1050, as a note under `IF NOT EXISTS`. The statement commits what came
+/// before it.
+#[test]
+fn a_table_made_like_another_answers_mysqls_errors_in_mysqls_order() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255))",
+    );
+    run(&mut adapter, "CREATE VIEW v AS SELECT id FROM users");
+    run(&mut adapter, "CREATE TABLE users2 LIKE users");
+    for (sql, expected) in [
+        (
+            "CREATE TABLE IF NOT EXISTS users2 LIKE nosuch",
+            FrontendErrorKind::MissingObject,
+        ),
+        (
+            "CREATE TABLE IF NOT EXISTS users2 LIKE v",
+            FrontendErrorKind::NotBaseTable,
+        ),
+        (
+            "CREATE TABLE users LIKE users",
+            FrontendErrorKind::NotUniqueTable,
+        ),
+        (
+            "CREATE TABLE users2 LIKE users",
+            FrontendErrorKind::DuplicateObject,
+        ),
+        (
+            "CREATE TABLE v LIKE users",
+            FrontendErrorKind::DuplicateObject,
+        ),
+        (
+            "CREATE TEMPORARY TABLE u9 LIKE users",
+            FrontendErrorKind::Unsupported,
+        ),
+        (
+            "CREATE TABLE u9 LIKE reports.users",
+            FrontendErrorKind::Unsupported,
+        ),
+    ] {
+        assert_eq!(adapter.execute_query(sql).err(), Some(expected), "{sql}");
+    }
+    run(&mut adapter, "CREATE TABLE IF NOT EXISTS users2 LIKE users");
+    assert_eq!(
+        rows(&mut adapter, "SHOW WARNINGS"),
+        [[
+            Some("Note".to_owned()),
+            Some("1050".to_owned()),
+            Some("Table 'users2' already exists".to_owned()),
+        ]]
+    );
+
+    run(&mut adapter, "BEGIN");
+    run(&mut adapter, "INSERT INTO users (email) VALUES ('z')");
+    run(&mut adapter, "CREATE TABLE u4 LIKE users");
+    run(&mut adapter, "ROLLBACK");
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM users"),
+        [[Some("1".to_owned())]]
+    );
+}
+
+/// A table with a `CHECK` is refused as a source: `SHOW CREATE TABLE` has no
+/// way yet to print one, and the copy is made from what it prints.
+#[test]
+fn a_table_with_a_check_is_not_copied() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE checked (id INT, CHECK (id > 0))",
+    );
+    assert_eq!(
+        adapter
+            .execute_query("CREATE TABLE checked2 LIKE checked")
+            .err(),
+        Some(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW TABLES LIKE 'checked%'"),
+        [[Some("checked".to_owned())]]
+    );
+}

@@ -65,8 +65,9 @@ use turso_mysql_parser::{
     parse_optional_analyze_table, parse_optional_check_table,
     parse_optional_connector_j_information_schema_query,
     parse_optional_connector_j_schemata_listing_query, parse_optional_create_table_as_select,
-    parse_optional_create_table_with_keys, parse_optional_created_table, parse_optional_describe,
-    parse_optional_flush_tables, parse_optional_gorm_information_schema_prepared_query,
+    parse_optional_create_table_like, parse_optional_create_table_with_keys,
+    parse_optional_created_table, parse_optional_describe, parse_optional_flush_tables,
+    parse_optional_gorm_information_schema_prepared_query,
     parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
     parse_optional_information_schema_tables, parse_optional_lock_tables,
     parse_optional_show_columns, parse_optional_show_create_table,
@@ -3320,6 +3321,47 @@ fn execute_checked_query(
             status_flags: connection_status_flags(connection),
             ..CommandOkResult::default()
         }));
+    }
+    if let Some(like) = parse_optional_create_table_like(sql, connection.parser_mode())
+        .map_err(|_| FrontendErrorKind::Unsupported)?
+    {
+        // Measured on MySQL 8.4.11: the source is looked at first — 1146 when
+        // it is not there and 1347 when it is a view, even with `IF NOT
+        // EXISTS` and a new name that is taken — then 1066 when both names
+        // are the same table, and only then 1050 for a new name that is taken.
+        let copy = connection
+            .create_table_like_statement(&like)
+            .map_err(|error| match error {
+                MySqlShowCreateTableError::MissingTable => FrontendErrorKind::MissingObject,
+                MySqlShowCreateTableError::NotTable => FrontendErrorKind::NotBaseTable,
+                MySqlShowCreateTableError::Unsupported => FrontendErrorKind::Unsupported,
+                MySqlShowCreateTableError::Engine(error) => frontend_error_kind(error),
+            })?;
+        if like
+            .table()
+            .as_str()
+            .eq_ignore_ascii_case(like.source().as_str())
+        {
+            return Err(FrontendErrorKind::NotUniqueTable);
+        }
+        let copy = if like.only_if_missing() {
+            copy.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+        } else {
+            copy
+        };
+        return execute_checked_query(
+            connection,
+            &copy,
+            selected_database,
+            source_tables,
+            CheckedQueryOptions {
+                query_timeout,
+                select_time_limit,
+                affected_rows_mode,
+                sql_notes,
+                raised,
+            },
+        );
     }
     if is_schema_statement(sql) {
         turso_mysql_parser::refuse_checks_numbered_out_of_order(sql, connection.parser_mode())

@@ -7,6 +7,7 @@ mod analyze_table;
 mod check_constraints;
 mod checked_primary_key;
 mod create_table_as_select;
+mod create_table_like;
 mod current_database;
 mod date_format;
 mod drop_table;
@@ -100,6 +101,7 @@ pub use create_table_as_select::{
     parse_optional_create_table_as_select, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
+pub use create_table_like::{parse_optional_create_table_like, MySqlCreateTableLike};
 pub use current_database::write_the_current_database_in;
 pub use date_format::{
     days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,

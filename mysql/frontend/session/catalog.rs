@@ -106,6 +106,34 @@ impl MySqlConnection {
         &self,
         table: &MySqlTableName,
     ) -> std::result::Result<MySqlShowCreateTableResult, MySqlShowCreateTableError> {
+        let create_statement = self.render_table_definition(table, table.as_str(), false)?;
+        Ok(MySqlShowCreateTableResult {
+            table: table.as_str().to_owned(),
+            create_statement,
+        })
+    }
+
+    /// The `CREATE TABLE` that makes a `CREATE TABLE ... LIKE`'s new table.
+    ///
+    /// Measured on MySQL 8.4.11: the new table takes the source's columns,
+    /// keys, collation and comment and none of its rows; a foreign key's own
+    /// index stays as a plain key while the constraint itself is left behind,
+    /// and the new table counts from 1.
+    pub fn create_table_like_statement(
+        &self,
+        like: &turso_mysql_parser::MySqlCreateTableLike,
+    ) -> std::result::Result<String, MySqlShowCreateTableError> {
+        self.render_table_definition(like.source(), like.table().as_str(), true)
+    }
+
+    /// Prints one base table's definition under `named`; a copy leaves out
+    /// its foreign keys and where its counter stands.
+    fn render_table_definition(
+        &self,
+        table: &MySqlTableName,
+        named: &str,
+        for_a_copy: bool,
+    ) -> std::result::Result<String, MySqlShowCreateTableError> {
         match self.stored_object_kind(table)? {
             None => return Err(MySqlShowCreateTableError::MissingTable),
             Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
@@ -159,19 +187,19 @@ impl MySqlConnection {
             })?,
             None => Default::default(),
         };
-        let create_statement = crate::show_create_table::render_create_table(
-            table.as_str(),
+        if for_a_copy {
+            foreign_keys.clear();
+        }
+        let next_auto_increment = next_auto_increment.filter(|_| !for_a_copy);
+        crate::show_create_table::render_create_table(
+            named,
             &options,
             &columns,
             &indexes,
             &foreign_keys,
             next_auto_increment,
         )
-        .ok_or(MySqlShowCreateTableError::Unsupported)?;
-        Ok(MySqlShowCreateTableResult {
-            table: table.as_str().to_owned(),
-            create_statement,
-        })
+        .ok_or(MySqlShowCreateTableError::Unsupported)
     }
 
     /// Reads one stored view with its original creation settings.
