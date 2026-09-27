@@ -721,6 +721,50 @@ mod tests {
         Ok(())
     }
 
+    /// A session that read a table's columns, or the list of tables, sees
+    /// another session's change to them on its next read.
+    #[test]
+    fn a_session_sees_the_columns_another_session_changed() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("shared").unwrap();
+        let mut reader = catalog.new_session(binary_context());
+        let mut writer = catalog.new_session(binary_context());
+        for session in [&mut reader, &mut writer] {
+            session
+                .select_database("shared")
+                .map_err(|_| turso_core::LimboError::InternalError("select".into()))?;
+        }
+        let connection = |session: &MySqlDatabaseSession| session.connection().unwrap().clone();
+        connection(&writer).execute("CREATE TABLE records (id INT, label TEXT)")?;
+        let table = turso_mysql_parser::MySqlTableName::parse("records").unwrap();
+        let names = |session: &MySqlDatabaseSession| {
+            connection(session)
+                .list_columns(&table)
+                .unwrap()
+                .iter()
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&reader), ["id", "label"]);
+        connection(&writer).execute("ALTER TABLE records ADD COLUMN n INT")?;
+        assert_eq!(names(&reader), ["id", "label", "n"]);
+
+        let tables = |session: &MySqlDatabaseSession| {
+            connection(session)
+                .list_tables()
+                .unwrap()
+                .iter()
+                .map(|table| table.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tables(&reader), ["records"]);
+        connection(&writer).execute("CREATE TABLE notes (id INT)")?;
+        assert_eq!(tables(&reader), ["notes", "records"]);
+        Ok(())
+    }
+
     /// Only a closed engine connection runs the closing checkpoint, so a
     /// session that ends has to close its connection, or the WAL stays as
     /// large as the last write made it and the next open reads all of it.

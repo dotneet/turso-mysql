@@ -3831,13 +3831,16 @@ impl Database {
     fn open_shared_wal_coordination_inner(
         &self,
     ) -> Result<Option<Arc<MappedSharedWalCoordination>>> {
+        // A database opened from files handed over already open is refused
+        // multiprocess WAL when it opens, so it has no coordination to find,
+        // which is not an error: every schema reparse asks.
+        if !self.opts.enable_multiprocess_wal {
+            return Ok(None);
+        }
         if self.preopened_main_file {
             return Err(LimboError::InvalidArgument(
                 "a pre-opened database has no shared-WAL coordination capability".to_string(),
             ));
-        }
-        if !self.opts.enable_multiprocess_wal {
-            return Ok(None);
         }
         if !self.io.supports_shared_wal_coordination() {
             return Err(LimboError::InvalidArgument(format!(
