@@ -2927,6 +2927,9 @@ fn execute_checked_query(
             Err(turso_mysql::MySqlDropViewError::NotView) => {
                 return Err(FrontendErrorKind::NotView)
             }
+            Err(turso_mysql::MySqlDropViewError::NamedTwice) => {
+                unreachable!("one dropped view is never named twice")
+            }
             Err(turso_mysql::MySqlDropViewError::Engine(error)) => {
                 return Err(frontend_error_kind(error))
             }
@@ -2936,16 +2939,35 @@ fn execute_checked_query(
             ..CommandOkResult::default()
         }));
     }
-    if let Some(name) = parse_optional_drop_view(sql, connection.parser_mode())
+    if let Some(command) = parse_optional_drop_view(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Syntax)?
     {
-        connection.drop_view(&name).map_err(|error| match error {
-            turso_mysql::MySqlDropViewError::MissingView => FrontendErrorKind::UnknownView,
-            turso_mysql::MySqlDropViewError::NotView => FrontendErrorKind::NotView,
-            turso_mysql::MySqlDropViewError::Engine(error) => frontend_error_kind(error),
-        })?;
+        let skipped = connection
+            .drop_views(&command)
+            .map_err(|error| match error {
+                turso_mysql::MySqlDropViewError::MissingView => FrontendErrorKind::UnknownView,
+                turso_mysql::MySqlDropViewError::NotView => FrontendErrorKind::NotView,
+                turso_mysql::MySqlDropViewError::NamedTwice => FrontendErrorKind::NotUniqueTable,
+                turso_mysql::MySqlDropViewError::Engine(error) => frontend_error_kind(error),
+            })?;
+        // Measured on MySQL 8.4.11: one note for each name an `IF EXISTS`
+        // passed over, in the order the statement named them.
+        let noted = if sql_notes { skipped.len() } else { 0 };
+        if sql_notes {
+            for skipped in &skipped {
+                raised.push(match skipped {
+                    turso_mysql::MySqlSkippedView::Missing(view) => {
+                        MySqlWarning::unknown_table(selected_database, view)
+                    }
+                    turso_mysql::MySqlSkippedView::NotView(table) => {
+                        MySqlWarning::not_a_view(selected_database, table)
+                    }
+                });
+            }
+        }
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
+            warnings: u16::try_from(noted).unwrap_or(u16::MAX),
             ..CommandOkResult::default()
         }));
     }
@@ -8610,6 +8632,22 @@ impl MySqlWarning {
             level: "Note",
             code: 1051,
             message: format!("Unknown table '{qualified}'"),
+        }
+    }
+
+    /// The note MySQL raises for `DROP VIEW IF EXISTS` naming a table.
+    ///
+    /// Measured on MySQL 8.4.11: `Note`, code 1347, `'probe.plain' is not
+    /// VIEW`.
+    fn not_a_view(database: Option<&str>, table: &str) -> Self {
+        let qualified = match database {
+            Some(database) => format!("{database}.{table}"),
+            None => table.to_owned(),
+        };
+        Self {
+            level: "Note",
+            code: 1347,
+            message: format!("'{qualified}' is not VIEW"),
         }
     }
 }

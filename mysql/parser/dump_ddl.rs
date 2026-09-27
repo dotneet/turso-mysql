@@ -74,8 +74,13 @@ pub fn parse_optional_mysqldump_drop_view(
     let Some(name) = inner.strip_prefix("DROP VIEW IF EXISTS ") else {
         return Ok(None);
     };
-    parse_optional_drop_view(&format!("DROP VIEW {name}"), mode)?
-        .map_or_else(|| unsupported("mysqldump DROP VIEW"), |name| Ok(Some(name)))
+    match parse_optional_drop_view(&format!("DROP VIEW {name}"), mode)? {
+        Some(command) => match command.views() {
+            [view] => Ok(Some(view.clone())),
+            _ => unsupported("mysqldump DROP VIEW"),
+        },
+        None => unsupported("mysqldump DROP VIEW"),
+    }
 }
 
 /// Reads `ALTER TABLE t DISABLE KEYS` or `ENABLE KEYS`, which `mysqldump`

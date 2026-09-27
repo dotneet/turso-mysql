@@ -30675,3 +30675,6 @@ mod decimal_to_whole;
 
 #[cfg(unix)]
 mod column_comparisons;
+
+#[cfg(unix)]
+mod views;

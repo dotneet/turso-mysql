@@ -97,7 +97,7 @@ pub use date_format::{
     days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,
 };
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
-pub use drop_view::parse_optional_drop_view;
+pub use drop_view::{parse_optional_drop_view, MySqlDropViewCommand};
 pub use dump_ddl::{
     parse_optional_alter_table_keys, parse_optional_mysqldump_ddl,
     parse_optional_mysqldump_drop_view, MySqlDumpDdl,

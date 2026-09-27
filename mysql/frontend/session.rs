@@ -30,8 +30,8 @@ use turso_mysql_parser::{
     CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
-    MySqlSelectSource, MySqlTableName, MySqlTransactionCommand, MySqlTruncateTableCommand,
-    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
+    MySqlDropViewCommand, MySqlSelectSource, MySqlTableName, MySqlTransactionCommand,
+    MySqlTruncateTableCommand, ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
     StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
 };
 use turso_parser::ast::{
@@ -303,12 +303,23 @@ impl MySqlShowCreateTableResult {
     }
 }
 
-/// Failure while dropping one checked MySQL view.
+/// Failure while dropping checked MySQL views.
 #[derive(Debug)]
 pub enum MySqlDropViewError {
     MissingView,
     NotView,
+    /// One statement named the same view twice, which MySQL answers with 1066.
+    NamedTwice,
     Engine(LimboError),
+}
+
+/// A name a `DROP VIEW IF EXISTS` passed over, each noted by MySQL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlSkippedView {
+    /// Nothing of that name is there: note 1051.
+    Missing(String),
+    /// A table is there: note 1347.
+    NotView(String),
 }
 
 /// Failure while renaming tables with one `RENAME TABLE`.
@@ -4860,6 +4871,78 @@ impl MySqlConnection {
             .and_then(|mut statement| statement.run_ignore_rows())
             .map(|_| ())
             .map_err(MySqlQueryError::Engine)
+    }
+
+    /// Drops the views one `DROP VIEW` names, committing preceding work first.
+    ///
+    /// Measured on MySQL 8.4.11: a name given twice is 1066 whatever else the
+    /// statement names; without `IF EXISTS`, a table among the names is 1347
+    /// and otherwise a missing name is 1051, and either drops none of the
+    /// others; with it, every view named is dropped and each other name is
+    /// noted, in the order the statement named them.
+    pub fn drop_views(
+        &self,
+        command: &MySqlDropViewCommand,
+    ) -> std::result::Result<Vec<MySqlSkippedView>, MySqlDropViewError> {
+        let mut named: Vec<&MySqlTableName> = Vec::with_capacity(command.views().len());
+        for view in command.views() {
+            if named.contains(&view) {
+                return Err(MySqlDropViewError::NamedTwice);
+            }
+            named.push(view);
+        }
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("COMMIT")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropViewError::Engine)?;
+        }
+        let tables = self.list_tables().map_err(MySqlDropViewError::Engine)?;
+        let mut present = Vec::with_capacity(named.len());
+        let mut skipped = Vec::new();
+        for view in named {
+            match tables.iter().find(|table| table.name() == view.as_str()) {
+                Some(table) if table.kind() == MySqlTableKind::View => present.push(view),
+                Some(_) => skipped.push(MySqlSkippedView::NotView(view.as_str().to_owned())),
+                None => skipped.push(MySqlSkippedView::Missing(view.as_str().to_owned())),
+            }
+        }
+        if !command.if_exists() {
+            if skipped
+                .iter()
+                .any(|skipped| matches!(skipped, MySqlSkippedView::NotView(_)))
+            {
+                return Err(MySqlDropViewError::NotView);
+            }
+            if !skipped.is_empty() {
+                return Err(MySqlDropViewError::MissingView);
+            }
+        }
+        let mut result = Ok(());
+        for view in present {
+            let stmt = Stmt::DropView {
+                if_exists: false,
+                view_name: turso_parser::ast::QualifiedName::single(
+                    turso_parser::ast::Name::exact(view.as_str().to_owned()),
+                ),
+            };
+            let sql = format!("DROP VIEW \"{}\"", view.as_str().replace('"', "\"\""));
+            result = self
+                .inner
+                .prepare_translated_stmt(stmt, &sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropViewError::Engine);
+            if result.is_err() {
+                break;
+            }
+        }
+        if !self.inner.get_auto_commit() {
+            self.inner
+                .prepare("ROLLBACK")
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropViewError::Engine)?;
+        }
+        result.map(|()| skipped)
     }
 
     /// Drops one view, committing preceding work before checking its existence.

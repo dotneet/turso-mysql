@@ -1,10 +1,33 @@
 use super::*;
 
-/// Parses one unqualified `DROP VIEW name` without optional clauses.
+/// One checked `DROP VIEW` command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlDropViewCommand {
+    views: Vec<MySqlTableName>,
+    if_exists: bool,
+}
+
+impl MySqlDropViewCommand {
+    /// Returns the canonical unqualified view names, in the order the command
+    /// named them.
+    pub fn views(&self) -> &[MySqlTableName] {
+        &self.views
+    }
+
+    /// Returns whether the command used `IF EXISTS`.
+    pub const fn if_exists(&self) -> bool {
+        self.if_exists
+    }
+}
+
+/// Parses one `DROP VIEW [IF EXISTS] name [, name] ... [RESTRICT | CASCADE]`.
+///
+/// Measured on MySQL 8.4.11, `RESTRICT` and `CASCADE` are read and change
+/// nothing. A name qualified by its database is refused.
 pub fn parse_optional_drop_view(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Option<MySqlTableName>, ParseError> {
+) -> Result<Option<MySqlDropViewCommand>, ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
     let sql_tokens = Tokenizer::new(&dialect, sql)
         .tokenize()
@@ -28,11 +51,30 @@ pub fn parse_optional_drop_view(
     {
         return Ok(None);
     }
-    let table = consume_admin_table_name(&tokens, &mut cursor)?;
-    if table.as_str().starts_with("sqlite_") || table.as_str().starts_with("__turso_internal_") {
-        return Err(ParseError::Unsupported {
-            feature: "internal view name",
-        });
+    let if_exists = if consume_admin_word(&tokens, &mut cursor, "IF") {
+        if !consume_admin_word(&tokens, &mut cursor, "EXISTS") {
+            return Err(ParseError::ExpectedAdminCommand);
+        }
+        true
+    } else {
+        false
+    };
+    let mut views = Vec::new();
+    loop {
+        let view = consume_admin_table_name(&tokens, &mut cursor)?;
+        if view.as_str().starts_with("sqlite_") || view.as_str().starts_with("__turso_internal_") {
+            return Err(ParseError::Unsupported {
+                feature: "internal view name",
+            });
+        }
+        views.push(view);
+        if !matches!(tokens.get(cursor), Some(AdminToken::Comma)) {
+            break;
+        }
+        cursor += 1;
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "RESTRICT") {
+        consume_admin_word(&tokens, &mut cursor, "CASCADE");
     }
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
@@ -40,7 +82,7 @@ pub fn parse_optional_drop_view(
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(table))
+    Ok(Some(MySqlDropViewCommand { views, if_exists }))
 }
 
 #[cfg(test)]
@@ -48,23 +90,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_view_accepts_only_one_unqualified_name() {
+    fn drop_view_reads_its_names_and_if_exists() {
+        let command = parse_optional_drop_view("DROP VIEW `Records`;", SessionSqlMode::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.views()[0].as_str(), "records");
+        assert!(!command.if_exists());
+        let command = parse_optional_drop_view(
+            "drop view if exists a, `B` cascade",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            parse_optional_drop_view("DROP VIEW `Records`;", SessionSqlMode::default())
+            command
+                .views()
+                .iter()
+                .map(MySqlTableName::as_str)
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(command.if_exists());
+        assert!(
+            parse_optional_drop_view("DROP VIEW v RESTRICT", SessionSqlMode::default())
                 .unwrap()
-                .unwrap()
-                .as_str(),
-            "records"
+                .is_some()
         );
         for sql in [
-            "DROP VIEW IF EXISTS v",
             "DROP VIEW db.v",
-            "DROP VIEW a, b",
-            "DROP VIEW v CASCADE",
+            "DROP VIEW IF v",
+            "DROP VIEW v RESTRICT CASCADE",
             "DROP VIEW v; SELECT 1",
             "DROP VIEW sqlite_schema",
             "DROP VIEW `unterminated",
             "DROP VIEW 'string'",
+            "DROP VIEW a,",
         ] {
             assert!(
                 parse_optional_drop_view(sql, SessionSqlMode::default()).is_err(),
