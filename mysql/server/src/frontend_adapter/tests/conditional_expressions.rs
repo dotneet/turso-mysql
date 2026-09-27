@@ -260,6 +260,52 @@ fn ifnull_and_coalesce_fall_one_column_back_onto_another() {
     );
 }
 
+/// Measured on MySQL 8.4.11, a whole number falling back onto a `DOUBLE` or a
+/// `FLOAT` answers the column's kind at a length of 23, the fallback row
+/// included: `IFNULL(score, 0)` reads `0` as a `DOUBLE`. A day, a moment or a
+/// JSON document answers a type of its own, which is refused.
+#[test]
+fn a_whole_number_falls_back_onto_a_real_column_as_a_real() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE readings (id INT NOT NULL PRIMARY KEY, f FLOAT NULL, at DATETIME NULL, day DATE NULL, doc JSON NULL)",
+        "INSERT INTO readings (id, f, at, day, doc) VALUES (1, 2.5, '2026-01-02 03:04:05', '2026-01-02', '[1]'), (2, NULL, NULL, NULL, NULL)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let sql = "SELECT IFNULL(score, 0) AS s, COALESCE(score, 0) AS c FROM users ORDER BY id";
+    let text = result(&mut adapter, sql);
+    assert_eq!(
+        shapes(&text),
+        [(MYSQL_TYPE_DOUBLE, 23, NOT_FIXED_DECIMALS, NOT_NULL_NUMBER); 2]
+    );
+    assert_eq!(rows(&text), ["1.5 1.5", "0 0", "2.25 2.25", "0 0"]);
+    let binary = prepared(&mut adapter, sql);
+    assert_eq!(binary.rows[1][0], BinaryResultValue::Real(0.0));
+
+    let sql = "SELECT IFNULL(f, 0) FROM readings ORDER BY id";
+    let text = result(&mut adapter, sql);
+    assert_eq!(
+        shapes(&text),
+        [(MYSQL_TYPE_FLOAT, 23, NOT_FIXED_DECIMALS, NOT_NULL_NUMBER)]
+    );
+    assert_eq!(rows(&text), ["2.5", "0"]);
+    assert_eq!(
+        prepared(&mut adapter, sql).rows[1][0],
+        BinaryResultValue::Real(0.0)
+    );
+
+    for sql in [
+        "SELECT IFNULL(at, 0) FROM readings",
+        "SELECT IFNULL(day, 0) FROM readings",
+        "SELECT IFNULL(doc, 0) FROM readings",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// `SUM(CASE WHEN ... THEN 1 ELSE 0 END)` is how a report counts the rows
 /// meeting a condition. `SUM` and `AVG` answer a NEWDECIMAL over whole
 /// numbers, at the `CASE`'s scale over a `DECIMAL` whatever the rows held,

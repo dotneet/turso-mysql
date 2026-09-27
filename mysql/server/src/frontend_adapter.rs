@@ -7368,11 +7368,21 @@ fn scalar_call_column_definition(
             definition
         }
         // Measured: the column's own shape, and NOT NULL because the fallback
-        // cannot be null.
+        // cannot be null. A whole number widens to a LONGLONG, and a `DOUBLE`
+        // or a `FLOAT` keeps its kind at a length of 23. A day or a moment
+        // answers a VAR_STRING and a JSON a LONG_BLOB, which are refused
+        // rather than modelled.
         ScalarFunction::Defaulted => {
             let mut definition = own_shape(name)?;
-            if definition.column_type != MYSQL_TYPE_NEWDECIMAL {
-                definition.column_type = MYSQL_TYPE_LONGLONG;
+            match definition.column_type {
+                MYSQL_TYPE_NEWDECIMAL => {}
+                MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
+                | MYSQL_TYPE_LONGLONG => definition.column_type = MYSQL_TYPE_LONGLONG,
+                MYSQL_TYPE_DOUBLE | MYSQL_TYPE_FLOAT => {
+                    definition.column_length = 23;
+                    definition.decimals = NOT_FIXED_DECIMALS;
+                }
+                _ => return Err(FrontendErrorKind::Unsupported),
             }
             definition
         }

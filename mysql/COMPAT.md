@@ -1300,7 +1300,9 @@ that agrees. And `NOW()` reads the clock in UTC, which is the zone this server r
 in — see the `TIMESTAMP` note below.
 
 Each takes one plain column, and `IFNULL` a second argument that cannot itself
-be null, which is the whole reason a client writes it. MySQL takes a text call
+be null, which is the whole reason a client writes it. A whole number falling
+back onto a `DOUBLE` or a `FLOAT` answers the column's kind at a length of 23,
+the fallback row included, as measured on MySQL 8.4.11. MySQL takes a text call
 over a number and a numeric one over text by coercing it, which has not been
 measured, so each is answered only over the kind it is for, and an expression
 argument has no length this could work out.

@@ -6378,11 +6378,19 @@ fn render_scalar_call(
     } else if name.value.eq_ignore_ascii_case("IFNULL")
         || name.value.eq_ignore_ascii_case("COALESCE")
     {
-        return Ok(format!(
+        let rendered = format!(
             "{}({})",
             name.value.to_lowercase(),
             render_scalar_arguments(function, render_context)?
-        ));
+        );
+        // Measured on MySQL 8.4.11, `IFNULL(score, 0)` over a `DOUBLE` or a
+        // `FLOAT` answers the column's kind for the fallback row too, which
+        // the engine would answer as the whole number it was written as.
+        return Ok(if falls_back_from_a_real_column(function, render_context) {
+            format!("CAST({rendered} AS REAL)")
+        } else {
+            rendered
+        });
     } else if name.value.eq_ignore_ascii_case("GREATEST") {
         record_all_collation_sensitive_call_columns(function, render_context);
         let values = scalar_arguments(function)?;
@@ -6411,6 +6419,26 @@ fn render_scalar_call(
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", single_column_argument(function)))
+}
+
+fn falls_back_from_a_real_column(
+    function: &sqlparser::ast::Function,
+    render_context: &SelectRenderContext<'_>,
+) -> bool {
+    let Some(StaticSelectMetadata::ScalarCall {
+        function: static_select_metadata::ScalarFunction::Defaulted,
+        columns,
+        ..
+    }) = static_select_metadata::scalar_call(function)
+    else {
+        return false;
+    };
+    columns.iter().any(|column| {
+        render_context
+            .real_columns
+            .iter()
+            .any(|real| real.eq_ignore_ascii_case(column))
+    })
 }
 
 /// How the answer of a `CASE`, `IF`, `IFNULL` or `COALESCE` is written for the

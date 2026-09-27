@@ -68,6 +68,7 @@ numbers and over columns of one kind, and `COUNT`, `SUM`, `AVG`, `MIN` and
 | A `WHERE` testing a column of words on its own — `WHERE name` | refused; MySQL reads a word as the number it begins with, where the engine compares a word against a number by their kinds |
 | A `WHERE` testing a column on its own in an `UPDATE` or a `DELETE` | refused; neither has a second rendering pass to learn whether the column is one of words |
 | `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |
+| `IFNULL` / `COALESCE` falling a written number back onto a day, a moment or a `JSON` column | refused; measured, MySQL answers a `VAR_STRING` four bytes to each character of the column's text (40 for a `DATE`, 76 for a `DATETIME`) and a `LONG_BLOB` for a `JSON` |
 | `NULLIF` over two columns of words, or a number against a word | refused; MySQL reads a word as a number and compares two words without regard to case, where the engine compares them by their kinds |
 | `GREATEST`, `LEAST`, `NULLIF` and `MD5` over written values alone, naming no column | refused; each answers a shape read off the column it names, and there is none |
 | `CAST(col AS CHAR)` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; conversion through the engine's generic text cast has not been verified against MySQL's numeric formatting |
