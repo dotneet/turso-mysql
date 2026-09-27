@@ -30615,3 +30615,7 @@ mod json_conditions;
 
 #[cfg(unix)]
 mod date_arithmetic;
+
+#[cfg(unix)]
+#[cfg(unix)]
+mod union_shapes;

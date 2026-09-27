@@ -59,9 +59,10 @@ use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
 };
 use turso_mysql_parser::{
-    is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
-    parse_connector_j_foreign_keys, parse_optional_account_admin_command,
-    parse_optional_alter_table_indexes, parse_optional_analyze_table, parse_optional_check_table,
+    compound_drops_repeated_rows, is_connector_j_information_schema_collation_query,
+    is_connector_j_reserved_keywords_query, parse_connector_j_foreign_keys,
+    parse_optional_account_admin_command, parse_optional_alter_table_indexes,
+    parse_optional_analyze_table, parse_optional_check_table,
     parse_optional_connector_j_information_schema_query,
     parse_optional_connector_j_schemata_listing_query, parse_optional_create_table_as_select,
     parse_optional_create_table_with_keys, parse_optional_created_table, parse_optional_describe,
@@ -3761,6 +3762,12 @@ fn prepared_statement_result(
     } else {
         Vec::new()
     };
+    #[cfg(unix)]
+    let drops_repeated_rows = match (compound, sql) {
+        (true, Some(sql)) => compound_drops_repeated_rows(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?,
+        _ => false,
+    };
     let columns = metadata
         .result_columns
         .into_iter()
@@ -3836,7 +3843,12 @@ fn prepared_statement_result(
     let mut columns = columns;
     #[cfg(unix)]
     if compound {
-        apply_compound_nullability(&mut columns, &projection_origins, source_metadata.as_ref());
+        apply_compound_shape(
+            &mut columns,
+            &projection_origins,
+            source_metadata.as_ref(),
+            drops_repeated_rows,
+        )?;
     }
     Ok(PreparedStatementResult {
         statement_id: metadata.statement_id,
@@ -4139,6 +4151,10 @@ fn execute_checked_select_with_timeout(
         Vec::new()
     };
     #[cfg(unix)]
+    let drops_repeated_rows = compound
+        && compound_drops_repeated_rows(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?;
+    #[cfg(unix)]
     let source_references = if windowed {
         Vec::new()
     } else {
@@ -4237,7 +4253,12 @@ fn execute_checked_select_with_timeout(
     let mut columns = columns;
     #[cfg(unix)]
     if compound {
-        apply_compound_nullability(&mut columns, &projection_origins, source_metadata.as_ref());
+        apply_compound_shape(
+            &mut columns,
+            &projection_origins,
+            source_metadata.as_ref(),
+            drops_repeated_rows,
+        )?;
     }
     let rendering = columns
         .iter()
@@ -4446,6 +4467,19 @@ impl TableResultMetadata {
         matches.next().is_none().then_some(one)
     }
 
+    /// Returns the table column a branch's result column reads, where it is a
+    /// base table's own column.
+    fn projection_column(
+        &self,
+        branch: usize,
+        table_name: Option<&str>,
+        column_name: &str,
+    ) -> Option<&MySqlColumnMetadata> {
+        let (source, ordinal) = self.projection_source(branch, table_name, column_name)?;
+        let ordinal = source.column_ordinal(ordinal).ok()?;
+        source.columns.get(ordinal)
+    }
+
     fn projection_is_not_null(
         &self,
         branch: usize,
@@ -4471,15 +4505,202 @@ impl TableResultMetadata {
     }
 }
 
+/// Works out each result column of a `UNION`, `EXCEPT` or `INTERSECT` from
+/// every branch, where the engine reports only the first branch's column.
+///
+/// A column every branch takes straight from a table, or a `NULL` in some
+/// branches, is given the shape MySQL gives the columns, and one whose pair
+/// has not been measured is refused rather than answered with the first
+/// branch's shape. A column beside a written value is refused: measured,
+/// `SELECT i ... UNION SELECT 1` over an `INT` answers a `LONGLONG` of 11,
+/// a rule of its own.
+///
+/// A query dropping repeated rows is refused over words compared without
+/// regard to case: measured, `'aa'` then `'AA'` answers `aa` in MySQL, which
+/// keeps the first it meets, and `AA` in the engine.
+#[cfg(unix)]
+fn apply_compound_shape(
+    columns: &mut [ColumnDefinitionConfig],
+    branches: &[Vec<MySqlSelectProjectionOrigin>],
+    source_metadata: Option<&TableResultMetadata>,
+    drops_repeated_rows: bool,
+) -> Result<(), FrontendErrorKind> {
+    if branches.len() < 2 || branches.iter().any(|branch| branch.len() != columns.len()) {
+        return Ok(());
+    }
+    for (index, definition) in columns.iter_mut().enumerate() {
+        let mut sources = Vec::with_capacity(branches.len());
+        let mut every_branch_is_a_column_or_null = true;
+        let mut writes_a_value = false;
+        for (branch, origins) in branches.iter().enumerate() {
+            match &origins[index] {
+                MySqlSelectProjectionOrigin::Column { table, column } => {
+                    match source_metadata.and_then(|metadata| {
+                        metadata.projection_column(branch, table.as_deref(), column)
+                    }) {
+                        Some(source) => sources.push(source),
+                        None => every_branch_is_a_column_or_null = false,
+                    }
+                }
+                MySqlSelectProjectionOrigin::Null => {}
+                MySqlSelectProjectionOrigin::NonNullLiteral => writes_a_value = true,
+                MySqlSelectProjectionOrigin::Other => every_branch_is_a_column_or_null = false,
+            }
+        }
+        if writes_a_value && !sources.is_empty() {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        if drops_repeated_rows && sources.iter().any(|source| compares_words_by_fold(source)) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        if every_branch_is_a_column_or_null && !sources.is_empty() {
+            apply_compound_column_shape(definition, &sources)?;
+        }
+    }
+    apply_compound_nullability(columns, branches, source_metadata);
+    Ok(())
+}
+
+/// Answers whether a column holds words two of which can be equal without
+/// being spelled alike.
+#[cfg(unix)]
+fn compares_words_by_fold(source: &MySqlColumnMetadata) -> bool {
+    is_text_column(source) && source.collation_name() != Some("utf8mb4_bin")
+}
+
+/// One source column as a compound query's result column sees it.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompoundMember {
+    /// A signed whole number, ranked by how wide its type is.
+    WholeNumber(u8),
+    Varchar(u32),
+    Char(u32),
+    Text,
+    Double,
+    Decimal(u32, u32),
+    DateTime,
+    Date,
+}
+
+/// Gives a compound result column the shape MySQL gives the columns its
+/// branches read.
+///
+/// Measured on MySQL 8.4.11. Two whole numbers answer the wider one's type at
+/// its own width — `TINYINT` with `INT` a `LONG` of 11, `INT` with `BIGINT` a
+/// `LONGLONG` of 20 — and a `TINYINT(1)` counts as a `TINYINT`, reporting 4
+/// where the column alone reports 1. Two words answer a `VAR_STRING` as wide as
+/// the wider, four bytes to the character, and two `CHAR`s stay a `CHAR` as
+/// wide as the wider. A `TEXT` beside a `TEXT` or a `VARCHAR` answers a `BLOB` of 1048560,
+/// where the column alone reports 262140. A `DOUBLE` reports 23 where the
+/// column alone reports 22. A `DECIMAL`, a `DATETIME` and a `DATE` beside their
+/// own kind at the same size keep the column's shape.
+///
+/// Everything else is refused: a word beside a number, which MySQL answers as
+/// a word and the engine keeps as two kinds that compare differently; a
+/// `DECIMAL` beside a different `DECIMAL`; words under two collations; and
+/// every type whose pair has not been measured.
+#[cfg(unix)]
+fn apply_compound_column_shape(
+    definition: &mut ColumnDefinitionConfig,
+    sources: &[&MySqlColumnMetadata],
+) -> Result<(), FrontendErrorKind> {
+    let (first, rest) = sources.split_first().ok_or(FrontendErrorKind::Internal)?;
+    if rest
+        .iter()
+        .any(|source| source.collation_name() != first.collation_name())
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let mut merged = compound_member(first).ok_or(FrontendErrorKind::Unsupported)?;
+    for source in rest {
+        let member = compound_member(source).ok_or(FrontendErrorKind::Unsupported)?;
+        merged = merge_compound_members(merged, member).ok_or(FrontendErrorKind::Unsupported)?;
+    }
+    match merged {
+        CompoundMember::WholeNumber(rank) => {
+            let (column_type, length) = match rank {
+                1 => (MYSQL_TYPE_TINY, 4),
+                2 => (MYSQL_TYPE_SHORT, 6),
+                3 => (MYSQL_TYPE_LONG, 11),
+                _ => (MYSQL_TYPE_LONGLONG, 20),
+            };
+            definition.column_type = column_type;
+            definition.column_length = length;
+            definition.decimals = 0;
+            set_column_flags(definition, 0);
+        }
+        CompoundMember::Varchar(characters) => {
+            definition.column_type = MYSQL_TYPE_VAR_STRING;
+            definition.column_length = characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.decimals = 0;
+            set_column_flags(definition, 0);
+        }
+        CompoundMember::Text => {
+            definition.column_type = MYSQL_TYPE_BLOB;
+            definition.column_length = 1_048_560;
+            definition.decimals = 0;
+            set_column_flags(definition, MYSQL_BLOB_FLAG);
+        }
+        CompoundMember::Double => {
+            definition.column_type = MYSQL_TYPE_DOUBLE;
+            definition.column_length = 23;
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(definition, 0);
+        }
+        CompoundMember::Char(characters) => {
+            definition.column_type = MYSQL_TYPE_STRING;
+            definition.column_length = characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.decimals = 0;
+            set_column_flags(definition, 0);
+        }
+        CompoundMember::Decimal(..) | CompoundMember::DateTime | CompoundMember::Date => {}
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn compound_member(source: &MySqlColumnMetadata) -> Option<CompoundMember> {
+    Some(match source.type_name() {
+        "TINYINT" | "BOOLEAN" => CompoundMember::WholeNumber(1),
+        "SMALLINT" => CompoundMember::WholeNumber(2),
+        "INT" | "INTEGER" => CompoundMember::WholeNumber(3),
+        "BIGINT" => CompoundMember::WholeNumber(4),
+        "VARCHAR" => CompoundMember::Varchar(source.character_length()?),
+        "CHAR" => CompoundMember::Char(source.character_length()?),
+        "TEXT" => CompoundMember::Text,
+        "DOUBLE" => CompoundMember::Double,
+        "DECIMAL" => {
+            let (precision, scale) = source.decimal_size()?;
+            CompoundMember::Decimal(precision, scale)
+        }
+        "DATETIME" if source.temporal_precision().unwrap_or(0) == 0 => CompoundMember::DateTime,
+        "DATE" => CompoundMember::Date,
+        _ => return None,
+    })
+}
+
+#[cfg(unix)]
+fn merge_compound_members(left: CompoundMember, right: CompoundMember) -> Option<CompoundMember> {
+    use CompoundMember::{Char, Text, Varchar, WholeNumber};
+    match (left, right) {
+        (WholeNumber(left), WholeNumber(right)) => Some(WholeNumber(left.max(right))),
+        (Char(left), Char(right)) => Some(Char(left.max(right))),
+        (Varchar(left) | Char(left), Varchar(right) | Char(right)) => {
+            Some(Varchar(left.max(right)))
+        }
+        (Text, Text | Varchar(_)) | (Varchar(_), Text) => Some(Text),
+        (left, right) if left == right => Some(left),
+        _ => None,
+    }
+}
+
 #[cfg(unix)]
 fn apply_compound_nullability(
     columns: &mut [ColumnDefinitionConfig],
     branches: &[Vec<MySqlSelectProjectionOrigin>],
     source_metadata: Option<&TableResultMetadata>,
 ) {
-    if branches.len() < 2 || branches.iter().any(|branch| branch.len() != columns.len()) {
-        return;
-    }
     for (index, definition) in columns.iter_mut().enumerate() {
         let all_not_null =
             branches

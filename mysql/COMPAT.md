@@ -1159,11 +1159,40 @@ answers 1 and `INTERSECT` answers 2 and 3, and the engine answers the same for
 both.
 
 The result columns belong to neither table. Measured on 8.4.11: a compound
-query's column keeps its type and length and names no table, and carries none of
-the source column's key facts. It also keeps `NOT_NULL` when both branches are
-NOT NULL; this drops it either way, because the engine reports only the first
-branch's column and cannot tell — a column a client believes may be NULL is
-never wrong, where the reverse would be.
+query's column names no table, carries none of the source column's key facts,
+and keeps `NOT_NULL` only when every branch is NOT NULL. Its type is worked out
+from every branch, not only the first, which is the one the engine reports:
+
+- two whole numbers answer the wider type at its own width — `TINYINT` with
+  `SMALLINT` a `SHORT` of 6, `INT` with `BIGINT` a `LONGLONG` of 20 — and a
+  `TINYINT(1)` counts as a `TINYINT`, reporting 4 where the column alone
+  reports 1;
+- two words answer a `VAR_STRING` as wide as the wider, four bytes to the
+  character, and two `CHAR`s a `CHAR` as wide as the wider;
+- a `TEXT` beside a `TEXT` or a `VARCHAR` answers a `BLOB` of 1048560, where
+  the column alone reports 262140, and a `DOUBLE` beside a `DOUBLE` reports 23
+  where the column alone reports 22;
+- a `DECIMAL`, a `DATETIME` and a `DATE` beside the same type at the same size
+  keep the column's shape, and a `NULL` branch changes nothing.
+
+Every other pair is refused: a number beside a word, which MySQL answers as a
+`VAR_STRING` (`INT` with `VARCHAR(10)` is 44) and the engine keeps as two kinds
+that compare differently; a whole number beside a `DOUBLE` or a `DECIMAL`; a
+`DATE` beside a `DATETIME`; two collations; a column beside a written value,
+which MySQL answers by a rule of its own (`SELECT i ... UNION SELECT 1` over an
+`INT` is a `LONGLONG` of 11); and every type whose pair has not been measured,
+`FLOAT`, `MEDIUMINT` and the unsigned ones among them.
+
+A `UNION`, `EXCEPT` or `INTERSECT` that drops repeated rows is refused over
+words compared without regard to case. Measured: `'aa'` in one branch and
+`'AA'` in the other answer `aa` in MySQL, which keeps the first it meets, and
+`AA` in the engine. `UNION ALL` keeps both and is taken, and so is a column
+declared `utf8mb4_bin`, where the two are different words.
+
+A table holding a `DECIMAL` is read by a union that does not name the
+`DECIMAL`: only the first branch's table is read for column types, so a
+`DECIMAL` named in a later branch, or reached through a wildcard or an
+expression, is still refused.
 
 Refused: `EXCEPT ALL` and `INTERSECT ALL`, which keep duplicates the plain forms
 collapse — measured on 8.4.11 over rows (1), (1), (2) against (2), `EXCEPT`

@@ -121,7 +121,9 @@ pub use mysql_ddl::{
     render_show_create_view_mysql, stored_character_length, stored_temporal_precision,
 };
 pub use number_format::{format_number, truncate_number};
-pub use select_projection_origins::{select_projection_origins, MySqlSelectProjectionOrigin};
+pub use select_projection_origins::{
+    compound_drops_repeated_rows, select_projection_origins, MySqlSelectProjectionOrigin,
+};
 pub use session_queries::{
     parse_optional_named_lock_query, parse_optional_select_database,
     parse_optional_system_variable_query, parse_optional_user_variable_query, MySqlNamedLockCall,

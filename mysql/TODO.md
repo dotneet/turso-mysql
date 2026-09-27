@@ -151,6 +151,12 @@ boolean literal.
 | `HAVING` naming an alias for something other than an aggregate or a column — `SELECT LOWER(name) AS l FROM t GROUP BY name HAVING l > 'a'` | refused; the name resolves, but what it stands for is a shape the `HAVING` renderer does not take |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
+| A `UNION` of three or more branches | refused; the reader takes two |
+| A `UNION` column pairing a number with a word, a whole number with a `DOUBLE` or `DECIMAL`, a `DATE` with a `DATETIME`, or a column with a written value | refused; measured, MySQL converts each pair by a rule of its own — `INT` with `VARCHAR(10)` a `VAR_STRING` of 44, `INT` with `DECIMAL(10,2)` a `NEWDECIMAL` of 14, `INT` with `DOUBLE` a `DOUBLE`, `INT` with a written 1 a `LONGLONG` of 11 — and the engine keeps two kinds apart |
+| A `UNION` over `FLOAT`, `MEDIUMINT`, unsigned, `TIME`, `TIMESTAMP`, `YEAR`, `ENUM`, `SET`, `JSON`, `BLOB`, a fractional `DATETIME` or two different `DECIMAL`s | refused; their pairs have not been measured |
+| A `UNION`, `EXCEPT` or `INTERSECT` dropping repeated rows over words compared without regard to case | refused; measured, MySQL keeps the first of `'aa'` and `'AA'` and the engine the last. `UNION ALL` and `utf8mb4_bin` columns are taken |
+| A `UNION` naming a `DECIMAL` column, or reaching one through a wildcard or an expression | refused; only the first branch's table is read for column types |
+| A `UNION` branch projecting a wildcard or an expression | taken with the first branch's shape, which is what the engine reports; MySQL's shape for the mixture has not been measured |
 | `WITH RECURSIVE` | refused |
 | A wildcard projection in a CTE body, or in a derived table's | refused; no name to resolve an ordinal through |
 | A derived table whose body projects an expression or an aggregate — `(SELECT SUM(n) AS total FROM t) x` | refused; the same, there is no table column for the ordinal to land on |

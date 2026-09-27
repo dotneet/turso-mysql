@@ -5289,9 +5289,18 @@ impl MySqlConnection {
             .iter()
             .any(|source| source.branch() > 0)
         {
+            let origins = turso_mysql_parser::select_projection_origins(sql, mode);
+            let projects_only_plain_columns = origins.as_ref().is_ok_and(|branches| {
+                branches.iter().flatten().all(|origin| {
+                    !matches!(
+                        origin,
+                        turso_mysql_parser::MySqlSelectProjectionOrigin::Other
+                    )
+                })
+            });
             let projects_only_literals = !translated.needs_column_types()
                 && translated.checked_comparisons().is_empty()
-                && turso_mysql_parser::select_projection_origins(sql, mode).is_ok_and(|branches| {
+                && origins.as_ref().is_ok_and(|branches| {
                     branches.iter().all(|branch| {
                         !branch.is_empty()
                             && branch.iter().all(|origin| {
@@ -5324,8 +5333,17 @@ impl MySqlConnection {
                         "cannot resolve compound SELECT column types: {error}"
                     ))
                 })?;
+                // Only the first branch's table is read for column types, so a
+                // `DECIMAL` a later branch names would be read as whatever the
+                // engine stores it as. One the statement never names, through
+                // a wildcard or otherwise, is only a neighbour of the columns
+                // it reads.
                 if !projects_only_literals
-                    && columns.iter().any(|column| column.decimal_size().is_some())
+                    && columns.iter().any(|column| {
+                        column.decimal_size().is_some()
+                            && (!projects_only_plain_columns
+                                || sql_mentions_column(sql, column.name()))
+                    })
                 {
                     return Err(MySqlQueryError::Unsupported(
                         "compound SELECT over DECIMAL columns is unsupported".to_string(),

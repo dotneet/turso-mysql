@@ -1,6 +1,6 @@
 //! Source columns for result metadata that the engine loses in sorters.
 
-use sqlparser::ast::{Expr, Select, SelectItem, SetExpr, Statement, Value};
+use sqlparser::ast::{Expr, Select, SelectItem, SetExpr, SetQuantifier, Statement, Value};
 
 use crate::{parse_one_statement, ParseError, SessionSqlMode};
 
@@ -47,6 +47,22 @@ pub fn select_projection_origins(
         }
     };
     Ok(branches.into_iter().map(projection_origins).collect())
+}
+
+/// Answers whether a compound query drops a row equal to one it already
+/// answers — a plain `UNION`, `EXCEPT` or `INTERSECT` — rather than keeping
+/// every row the way `UNION ALL` does. A query that is not compound drops
+/// nothing.
+pub fn compound_drops_repeated_rows(sql: &str, mode: SessionSqlMode) -> Result<bool, ParseError> {
+    let Statement::Query(query) = parse_one_statement(sql, mode)? else {
+        return Err(ParseError::ExpectedSelect);
+    };
+    Ok(match query.body.as_ref() {
+        SetExpr::SetOperation { set_quantifier, .. } => {
+            !matches!(set_quantifier, SetQuantifier::All)
+        }
+        _ => false,
+    })
 }
 
 fn branch_select(expr: &SetExpr) -> Option<&Select> {
