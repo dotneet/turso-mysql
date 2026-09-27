@@ -200,7 +200,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `HAVING` naming an alias for something other than an aggregate or a column — `SELECT LOWER(name) AS l FROM t GROUP BY name HAVING l > 'a'` | refused; the name resolves, but what it stands for is a shape the `HAVING` renderer does not take |
 | `EXCEPT ALL`, `INTERSECT ALL` | refused; they keep duplicates the plain forms collapse, and the engine has no spelling for them |
 | A `UNION` branch with its own `ORDER BY` or `LIMIT` | refused |
-| A `UNION` of three or more branches | refused; the reader takes two |
+| A `UNION` of three or more branches | refused, but where every branch reads the same columns of the same `information_schema` table, which is how TypeORM reads one table's catalog rows a branch; which shape MySQL answers for a column three kinds meet in has not been measured, and a chain mixing `UNION` with `UNION ALL` loses MySQL's rule that a `UNION DISTINCT` undoes the `UNION ALL`s left of it |
 | A `UNION` column pairing a number with a word, a whole number with a `DOUBLE` or `DECIMAL`, a `DATE` with a `DATETIME`, or a column with a written value | refused; measured, MySQL converts each pair by a rule of its own — `INT` with `VARCHAR(10)` a `VAR_STRING` of 44, `INT` with `DECIMAL(10,2)` a `NEWDECIMAL` of 14, `INT` with `DOUBLE` a `DOUBLE`, `INT` with a written 1 a `LONGLONG` of 11 — and the engine keeps two kinds apart |
 | A `UNION` over `FLOAT`, `MEDIUMINT`, unsigned, `TIME`, `TIMESTAMP`, `YEAR`, `ENUM`, `SET`, `JSON`, `BLOB`, a fractional `DATETIME` or two different `DECIMAL`s | refused; their pairs have not been measured |
 | A `UNION`, `EXCEPT` or `INTERSECT` dropping repeated rows over words compared without regard to case | refused; measured, MySQL keeps the first of `'aa'` and `'AA'` and the engine the last. `UNION ALL` and `utf8mb4_bin` columns are taken |
@@ -211,7 +211,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | A derived table or CTE whose body projects an expression without aggregating — `(SELECT n + 1 AS m FROM t) x` | refused; MySQL reads that body straight through, and what it reports for the expression there has not been measured |
 | A derived table or CTE whose body aggregates with a call other than `DATE`, a `GROUP_CONCAT`, or `DISTINCT` | refused; the shape MySQL stores it in has not been measured |
 | A comparison or an aggregate over a total or an average a derived table worked out — `WHERE t.s > 1`, `SELECT SUM(c) FROM totals` | refused; measured, `SUM(c)` over a count answers a `NEWDECIMAL` of 43, a rule not worked out here |
-| A derived table whose body reads more than one table, or that is written `LATERAL` or names its own columns | refused |
+| A derived table whose body reads more than one table, or that is written `LATERAL` or names its own columns | refused; a body that is a `UNION` of branches each reading the same columns of one `information_schema` table is taken, which is what TypeORM writes |
 | A derived table in an `UPDATE` or a `DELETE` | refused; each reads its own table |
 | `DISTINCT ON` | refused, and no part of MySQL |
 

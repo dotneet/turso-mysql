@@ -1076,3 +1076,206 @@ ORDER BY k.TABLE_NAME,
         ])]
     );
 }
+
+/// TypeORM's `loadTables` for three tables, every read as its current release
+/// writes it: a `UNION` with one branch per table, derived tables over
+/// wildcards, and joins between those.
+///
+/// Measured on MySQL 8.4.11 over the same tables. A `UNION` answers its rows
+/// in no promised order, so they are compared sorted.
+#[test]
+fn typeorm_loads_three_tables_as_it_writes_it() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query(
+            "CREATE TABLE tags (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, \
+             name VARCHAR(20) NOT NULL, post_id INT, KEY idx_name (name), \
+             CONSTRAINT fk_tag_post FOREIGN KEY (post_id) REFERENCES posts (id))",
+        )
+        .unwrap();
+    let per_table = |select: &str, schema_column: &str, table_column: &str| {
+        ["users", "posts", "tags"]
+            .iter()
+            .map(|table| {
+                format!("{select} WHERE {schema_column} = 'reports' AND {table_column} = '{table}'")
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ")
+    };
+    let sorted = |adapter: &mut Adapter, sql: &str| {
+        let mut read = rows(adapter, sql);
+        read.sort();
+        read
+    };
+
+    let tables = per_table(
+        "SELECT `TABLE_SCHEMA`, `TABLE_NAME`, `TABLE_COMMENT` FROM `INFORMATION_SCHEMA`.`TABLES`",
+        "`TABLE_SCHEMA`",
+        "`TABLE_NAME`",
+    );
+    assert_eq!(
+        sorted(&mut adapter, &tables),
+        [
+            row(&[Some("reports"), Some("posts"), Some("")]),
+            row(&[Some("reports"), Some("tags"), Some("")]),
+            row(&[Some("reports"), Some("users"), Some("")]),
+        ]
+    );
+
+    let columns = per_table(
+        "SELECT * FROM `INFORMATION_SCHEMA`.`COLUMNS`",
+        "`TABLE_SCHEMA`",
+        "`TABLE_NAME`",
+    );
+    let keys = sorted(&mut adapter, &columns)
+        .into_iter()
+        .map(|column| (column[2].clone(), column[3].clone(), column[16].clone()))
+        .collect::<Vec<_>>();
+    let key = |table: &str, column: &str, key: &str| {
+        (
+            Some(table.to_owned()),
+            Some(column.to_owned()),
+            Some(key.to_owned()),
+        )
+    };
+    assert_eq!(
+        keys,
+        [
+            key("posts", "id", "PRI"),
+            key("posts", "title", ""),
+            key("posts", "user_id", "MUL"),
+            key("tags", "id", "PRI"),
+            key("tags", "name", "MUL"),
+            key("tags", "post_id", "MUL"),
+            key("users", "age", ""),
+            key("users", "email", "UNI"),
+            key("users", "id", "PRI"),
+        ]
+    );
+
+    let key_columns = per_table(
+        "SELECT * FROM `INFORMATION_SCHEMA`.`KEY_COLUMN_USAGE` `kcu`",
+        "`kcu`.`TABLE_SCHEMA`",
+        "`kcu`.`TABLE_NAME`",
+    );
+    let primary_keys = sorted(
+        &mut adapter,
+        &format!("SELECT * FROM ({key_columns}) `kcu` WHERE `CONSTRAINT_NAME` = 'PRIMARY'"),
+    );
+    assert_eq!(
+        primary_keys
+            .iter()
+            .map(|key| (key[5].as_deref(), key[6].as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("posts"), Some("id")),
+            (Some("tags"), Some("id")),
+            (Some("users"), Some("id")),
+        ]
+    );
+    assert!(primary_keys.iter().all(|key| key.len() == 12));
+
+    let statistics = per_table(
+        "SELECT * FROM `INFORMATION_SCHEMA`.`STATISTICS`",
+        "`TABLE_SCHEMA`",
+        "`TABLE_NAME`",
+    );
+    let referential = per_table(
+        "SELECT * FROM `INFORMATION_SCHEMA`.`REFERENTIAL_CONSTRAINTS`",
+        "`CONSTRAINT_SCHEMA`",
+        "`TABLE_NAME`",
+    );
+    let indices = sorted(
+        &mut adapter,
+        &format!(
+            "SELECT `s`.* FROM ({statistics}) `s` LEFT JOIN ({referential}) `rc` ON `s`.`INDEX_NAME` = `rc`.`CONSTRAINT_NAME` AND `s`.`TABLE_SCHEMA` = `rc`.`CONSTRAINT_SCHEMA` WHERE `s`.`INDEX_NAME` != 'PRIMARY' AND `rc`.`CONSTRAINT_NAME` IS NULL"
+        ),
+    );
+    assert_eq!(
+        indices
+            .iter()
+            .map(|index| (
+                index[2].as_deref(),
+                index[5].as_deref(),
+                index[7].as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (Some("tags"), Some("idx_name"), Some("name")),
+            (Some("users"), Some("uk_email"), Some("email")),
+        ]
+    );
+    assert!(indices.iter().all(|index| index.len() == 18));
+
+    let foreign_keys = sorted(
+        &mut adapter,
+        &format!(
+            "SELECT `kcu`.`TABLE_SCHEMA`, `kcu`.`TABLE_NAME`, `kcu`.`CONSTRAINT_NAME`, `kcu`.`COLUMN_NAME`, `kcu`.`REFERENCED_TABLE_SCHEMA`, `kcu`.`REFERENCED_TABLE_NAME`, `kcu`.`REFERENCED_COLUMN_NAME`, `rc`.`DELETE_RULE` `ON_DELETE`, `rc`.`UPDATE_RULE` `ON_UPDATE` FROM ({key_columns}) `kcu` INNER JOIN ({referential}) `rc` ON `rc`.`CONSTRAINT_SCHEMA` = `kcu`.`CONSTRAINT_SCHEMA` AND `rc`.`TABLE_NAME` = `kcu`.`TABLE_NAME` AND `rc`.`CONSTRAINT_NAME` = `kcu`.`CONSTRAINT_NAME`"
+        ),
+    );
+    assert_eq!(
+        foreign_keys,
+        [
+            row(&[
+                Some("reports"),
+                Some("posts"),
+                Some("fk_user"),
+                Some("user_id"),
+                Some("reports"),
+                Some("users"),
+                Some("id"),
+                Some("CASCADE"),
+                Some("NO ACTION"),
+            ]),
+            row(&[
+                Some("reports"),
+                Some("tags"),
+                Some("fk_tag_post"),
+                Some("post_id"),
+                Some("reports"),
+                Some("posts"),
+                Some("id"),
+                Some("NO ACTION"),
+                Some("NO ACTION"),
+            ]),
+        ]
+    );
+}
+
+/// A `UNION` of three is taken only where every branch reads the same columns
+/// of the same `information_schema` table: which shape MySQL answers for a
+/// column three kinds meet in has not been measured, and MySQL lets a `UNION
+/// DISTINCT` undo the `UNION ALL` left of it, which a flat list would lose.
+#[test]
+fn a_union_of_three_is_taken_only_over_one_catalog_table() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "SELECT id FROM users UNION SELECT id FROM posts UNION SELECT id FROM users",
+        "SELECT TABLE_NAME FROM information_schema.TABLES UNION ALL SELECT TABLE_NAME FROM information_schema.TABLES UNION SELECT TABLE_NAME FROM information_schema.TABLES",
+        "SELECT TABLE_NAME FROM information_schema.TABLES UNION SELECT TABLE_NAME FROM information_schema.STATISTICS UNION SELECT TABLE_NAME FROM information_schema.TABLES",
+        "SELECT TABLE_NAME FROM information_schema.TABLES UNION SELECT TABLE_SCHEMA FROM information_schema.TABLES UNION SELECT TABLE_NAME FROM information_schema.TABLES",
+        "SELECT * FROM (SELECT * FROM information_schema.TABLES UNION SELECT * FROM information_schema.TABLES) t",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// MySQL holds every key column NOT NULL, and says so for the counted key of
+/// an `AUTO_INCREMENT` table too, which the engine does not mark. Measured on
+/// MySQL 8.4.11: `SHOW INDEX` answers an empty `Null` for it, and
+/// `STATISTICS` an empty `NULLABLE`.
+#[test]
+fn a_counted_key_is_never_null_in_the_index_listings() {
+    let (_directory, mut adapter) = adapter();
+    let shown = rows(&mut adapter, "SHOW INDEX FROM users");
+    assert_eq!(shown[0][2].as_deref(), Some("PRIMARY"));
+    assert_eq!(shown[0][9].as_deref(), Some(""));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT NULLABLE FROM information_schema.STATISTICS \
+             WHERE TABLE_NAME = 'users' AND INDEX_NAME = 'PRIMARY'",
+        ),
+        [row(&[Some("")])]
+    );
+}

@@ -305,12 +305,15 @@ impl MySqlConnection {
         let mut primary = Vec::new();
         if let Some(btree) = core_table.btree() {
             for (position, (column_name, _)) in btree.primary_key_columns.iter().enumerate() {
+                // MySQL holds every key column NOT NULL. The engine does not
+                // mark the column its rowid stands for, which is the counted
+                // key of an `AUTO_INCREMENT` table, so it is not asked.
                 primary.push(MySqlIndexEntry {
                     key_name: "PRIMARY".to_owned(),
                     column_name: column_name.clone(),
                     sequence_in_index: position as u32 + 1,
                     unique: true,
-                    nullable: nullable(column_name),
+                    nullable: false,
                 });
             }
         }

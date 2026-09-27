@@ -3072,7 +3072,9 @@ estimate of the distinct values, cached for a day by default — measured on
 go — and the engine keeps no estimate, so it answers NULL, which is what MySQL
 answers for an index it has none for and what `SHOW INDEX` answers here. A
 key column's `NULLABLE` is always empty, MySQL holding every key column NOT
-NULL. A comparison against one of
+NULL, and `SHOW INDEX` answers an empty `Null` for it likewise; measured on
+8.4.11, both do for the counted key of an `AUTO_INCREMENT` table, which the
+engine does not mark NOT NULL. A comparison against one of
 these columns is held to the type the column holds rather than to text, so
 `WHERE NON_UNIQUE = 0` is taken and `WHERE NON_UNIQUE = 'no'` is refused. An
 `ORDER BY` over one of the text columns sorts without regard to case, the way
@@ -3142,7 +3144,11 @@ one.
 A wildcard is answered over every one of these tables but `TABLES` and
 `VIEWS`, each of which answers all of MySQL's columns in the order MySQL
 declares them; those two leave out columns this server has nothing true to
-answer with. MySQL reports an `information_schema` column's shape by how the
+answer with. A wildcard over one of them may stand in a derived table's body
+too, whose columns are then that table's, and that body may be a `UNION` of
+branches that each read the same columns of the same table — which is how
+TypeORM's `loadTables` reads one table's rows a branch — as may a whole
+statement. A `UNION` of three or more over anything else is still refused. MySQL reports an `information_schema` column's shape by how the
 query is carried out — a query with an `ORDER BY` reports a column's original
 table and flags differently from one without — and this answers the shape of
 the query with one, as every column here was pinned to.

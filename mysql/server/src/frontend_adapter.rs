@@ -4870,16 +4870,22 @@ impl SourceTableColumns {
         if self.projected_columns.is_empty() {
             return Ok(ordinal);
         }
-        if !self.catalog_columns.is_empty() || !self.view_columns.is_empty() {
-            // A CTE over an `information_schema` table or a grouping view
-            // would have to count through what the CTE projected, which is
-            // not read here.
+        if !self.view_columns.is_empty() {
+            // A CTE over a grouping view would have to count through what the
+            // CTE projected, which is not read here.
             return Err(FrontendErrorKind::Unsupported);
         }
         let name = self
             .projected_columns
             .get(ordinal)
             .ok_or(FrontendErrorKind::Internal)?;
+        if !self.catalog_columns.is_empty() {
+            return self
+                .catalog_columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+                .ok_or(FrontendErrorKind::UnknownColumn);
+        }
         self.columns
             .iter()
             .position(|column| column.name().eq_ignore_ascii_case(name))

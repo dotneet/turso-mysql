@@ -487,17 +487,24 @@ pub(crate) fn translate_select_query(
                 ) => "INTERSECT",
                 _ => return unsupported("SELECT set operation"),
             };
-            let (left, right) = (
-                unwrap_select_body(left.as_ref())?,
-                unwrap_select_body(right.as_ref())?,
-            );
-            let (left, mut sources) = render_select_body(left, &mut render_context)?;
-            let (right, right_sources) = render_select_body(right, &mut render_context)?;
-            sources.extend(right_sources.into_iter().map(|mut source| {
-                source.branch = 1;
-                source
-            }));
-            (format!("{left} {keyword} {right}"), sources)
+            if matches!(
+                unwrap_query_wrappers(left.as_ref())?,
+                SetExpr::SetOperation { .. }
+            ) {
+                render_catalog_union(query.body.as_ref(), &mut render_context)?
+            } else {
+                let (left, right) = (
+                    unwrap_select_body(left.as_ref())?,
+                    unwrap_select_body(right.as_ref())?,
+                );
+                let (left, mut sources) = render_select_body(left, &mut render_context)?;
+                let (right, right_sources) = render_select_body(right, &mut render_context)?;
+                sources.extend(right_sources.into_iter().map(|mut source| {
+                    source.branch = 1;
+                    source
+                }));
+                (format!("{left} {keyword} {right}"), sources)
+            }
         }
         _ => return unsupported("compound SELECT query"),
     };
@@ -625,12 +632,100 @@ fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseErr
     ))
 }
 
+/// Renders a `UNION` of three or more branches, each reading the same
+/// `information_schema` table.
+///
+/// TypeORM reads one table's catalog rows per branch, one branch for every
+/// table it syncs. Every branch reads the same columns of the same table, so
+/// the result column's shape is that table's, and no pair of kinds has to be
+/// reconciled. A `UNION` of three over anything else is refused: which shape
+/// MySQL answers for a column three kinds meet in has not been measured.
+fn render_catalog_union(
+    body: &SetExpr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Vec<MySqlSelectSource>), ParseError> {
+    let (keyword, branches) = union_branches(body)?;
+    if branches
+        .iter()
+        .any(|branch| branch.projection != branches[0].projection)
+    {
+        return unsupported("UNION of three or more branches naming different columns");
+    }
+    let mut rendered = Vec::with_capacity(branches.len());
+    let mut sources = Vec::new();
+    for (branch, select) in branches.into_iter().enumerate() {
+        let (body, branch_sources) = render_select_body(select, render_context)?;
+        let [source] = branch_sources.as_slice() else {
+            return unsupported("UNION of three or more branches over a join");
+        };
+        if source.catalog.is_none() {
+            return unsupported("UNION of three or more branches over a user table");
+        }
+        rendered.push(body);
+        sources.extend(branch_sources.into_iter().map(|mut source| {
+            source.branch = branch;
+            source
+        }));
+    }
+    let first = &sources[0];
+    if sources.iter().any(|source| source.catalog != first.catalog) {
+        return unsupported("UNION of three or more branches over different tables");
+    }
+    Ok((rendered.join(&format!(" {keyword} ")), sources))
+}
+
+/// Reads a chain of `UNION`s into its branches, in the order they are
+/// written.
+///
+/// A chain mixing `UNION` with `UNION ALL`, `EXCEPT` or `INTERSECT` is
+/// refused: MySQL lets a `UNION DISTINCT` undo the `UNION ALL`s left of it
+/// and binds `INTERSECT` tighter than the rest, which a flat list would lose.
+fn union_branches(
+    body: &SetExpr,
+) -> Result<(&'static str, Vec<&sqlparser::ast::Select>), ParseError> {
+    let SetExpr::SetOperation {
+        left,
+        op: sqlparser::ast::SetOperator::Union,
+        set_quantifier,
+        right,
+    } = unwrap_query_wrappers(body)?
+    else {
+        return unsupported("SELECT set operation chain");
+    };
+    let keyword = match set_quantifier {
+        sqlparser::ast::SetQuantifier::None | sqlparser::ast::SetQuantifier::Distinct => "UNION",
+        sqlparser::ast::SetQuantifier::All => "UNION ALL",
+        _ => return unsupported("SELECT set operation"),
+    };
+    let mut branches = match unwrap_query_wrappers(left.as_ref())? {
+        left @ SetExpr::SetOperation { .. } => {
+            let (left_keyword, branches) = union_branches(left)?;
+            if left_keyword != keyword {
+                return unsupported("SELECT set operation chain mixing kinds");
+            }
+            branches
+        }
+        left => vec![unwrap_select_body(left)?],
+    };
+    branches.push(unwrap_select_body(right.as_ref())?);
+    Ok((keyword, branches))
+}
+
 /// Unwraps parenthesised query wrappers around a compound branch, refusing any
 /// branch that carries options like `ORDER BY` or `LIMIT` that cannot be
 /// flattened into the set operation.
 fn unwrap_select_body(expr: &SetExpr) -> Result<&sqlparser::ast::Select, ParseError> {
-    match expr {
+    match unwrap_query_wrappers(expr)? {
         SetExpr::Select(select) => Ok(select),
+        _ => unsupported("SELECT set operation branch"),
+    }
+}
+
+/// Takes the parentheses off a compound branch, refusing one that carries
+/// options like `ORDER BY` or `LIMIT` that cannot be flattened into the set
+/// operation.
+fn unwrap_query_wrappers(expr: &SetExpr) -> Result<&SetExpr, ParseError> {
+    match expr {
         SetExpr::Query(query) => {
             if query.fetch.is_some()
                 || !query.locks.is_empty()
@@ -644,9 +739,9 @@ fn unwrap_select_body(expr: &SetExpr) -> Result<&sqlparser::ast::Select, ParseEr
             {
                 return unsupported("compound branch query clause");
             }
-            unwrap_select_body(query.body.as_ref())
+            unwrap_query_wrappers(query.body.as_ref())
         }
-        _ => unsupported("SELECT set operation branch"),
+        other => Ok(other),
     }
 }
 
@@ -1266,7 +1361,10 @@ fn render_derived_table(
     let Some(render_context) = render_context else {
         return unsupported("derived table outside a SELECT");
     };
-    let (body, _) = render_subquery(subquery, render_context)?;
+    let body = match unwrap_query_wrappers(subquery.body.as_ref())? {
+        SetExpr::SetOperation { .. } => render_derived_catalog_union(subquery, render_context)?,
+        _ => render_subquery(subquery, render_context)?.0,
+    };
     let Some(source) = render_context.subquery_tables.pop() else {
         return unsupported("derived table requires one table");
     };
@@ -1285,6 +1383,48 @@ fn render_derived_table(
             hinted_indexes: Vec::new(),
         },
     ))
+}
+
+/// Renders a derived table whose body is a `UNION` of branches that each
+/// read the same columns of the same `information_schema` table, leaving that
+/// one table recorded as what the derived table reads.
+///
+/// TypeORM reads a table's indexes and keys this way, one branch for every
+/// table it syncs. Every branch reads the one table's columns, so the derived
+/// table's columns are that table's.
+fn render_derived_catalog_union(
+    subquery: &sqlparser::ast::Query,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.limit_clause.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+        || !subquery.pipe_operators.is_empty()
+    {
+        return unsupported("SELECT subquery clause");
+    }
+    let (keyword, branches) = union_branches(subquery.body.as_ref())?;
+    let held_before = render_context.subquery_tables.len();
+    let mut rendered = Vec::with_capacity(branches.len());
+    for select in branches {
+        rendered.push(render_subquery_select(select, render_context)?.0);
+    }
+    // Two branches reading the same columns of the same table under the same
+    // name are recorded as one table, so anything else leaves more than one.
+    let read_one_catalog_table = render_context.subquery_tables.len() == held_before + 1
+        && render_context
+            .subquery_tables
+            .last()
+            .is_some_and(|source| source.catalog.is_some());
+    if !read_one_catalog_table {
+        return unsupported("derived table UNION over anything but one information_schema table");
+    }
+    Ok(rendered.join(&format!(" {keyword} ")))
 }
 
 /// Renders a `WITH` clause, and returns what each name stands for.
@@ -1389,6 +1529,14 @@ fn render_subquery(
     let SetExpr::Select(select) = subquery.body.as_ref() else {
         return unsupported("SELECT subquery body");
     };
+    render_subquery_select(select, render_context)
+}
+
+/// Renders the one `SELECT` a subquery is, recording the table it reads.
+fn render_subquery_select(
+    select: &sqlparser::ast::Select,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, Option<(String, String)>), ParseError> {
     let comparisons_before = render_context.checked_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
     let [source] = sources.as_slice() else {
@@ -1412,21 +1560,36 @@ fn render_subquery(
         }
         _ => None,
     };
-    let projected_columns = select
-        .projection
-        .iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(Expr::Identifier(column)) => Some(column.value.clone()),
-            SelectItem::ExprWithAlias {
-                expr: Expr::Identifier(column),
-                ..
-            } => Some(column.value.clone()),
-            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
-                Some(parts[1].value.clone())
-            }
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>();
+    let projected_columns = match (select.projection.as_slice(), source.catalog) {
+        // An `information_schema` table's columns are known without reading
+        // any stored DDL, so a wildcard over one names them all.
+        ([SelectItem::Wildcard(options)], Some(catalog))
+            if wildcard_options_are_empty(options) && catalog.answers_every_column() =>
+        {
+            Some(
+                catalog
+                    .columns()
+                    .iter()
+                    .map(|(column, _)| (*column).to_owned())
+                    .collect(),
+            )
+        }
+        _ => select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(Expr::Identifier(column)) => Some(column.value.clone()),
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(column),
+                    ..
+                } => Some(column.value.clone()),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if parts.len() == 2 => {
+                    Some(parts[1].value.clone())
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>(),
+    };
     for source in &mut sources {
         source.subquery = true;
         source.projected_columns = projected_columns.clone().unwrap_or_default();

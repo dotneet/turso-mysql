@@ -31,15 +31,7 @@ pub fn select_projection_origins(
     };
     let branches = match query.body.as_ref() {
         SetExpr::Select(select) => vec![select.as_ref()],
-        SetExpr::SetOperation { left, right, .. } => {
-            let left = branch_select(left).ok_or(ParseError::Unsupported {
-                feature: "compound branch projection",
-            })?;
-            let right = branch_select(right).ok_or(ParseError::Unsupported {
-                feature: "compound branch projection",
-            })?;
-            vec![left, right]
-        }
+        SetExpr::SetOperation { .. } => compound_branches(query.body.as_ref())?,
         _ => {
             return Err(ParseError::Unsupported {
                 feature: "SELECT projection",
@@ -47,6 +39,25 @@ pub fn select_projection_origins(
         }
     };
     Ok(branches.into_iter().map(projection_origins).collect())
+}
+
+/// Reads a chain of set operations into its branches, in the order they are
+/// written; `a UNION b UNION c` nests the first two on the left.
+fn compound_branches(expr: &SetExpr) -> Result<Vec<&Select>, ParseError> {
+    let unsupported = ParseError::Unsupported {
+        feature: "compound branch projection",
+    };
+    match expr {
+        SetExpr::SetOperation { left, right, .. } => {
+            let mut branches = match left.as_ref() {
+                SetExpr::SetOperation { .. } => compound_branches(left)?,
+                left => vec![branch_select(left).ok_or_else(|| unsupported.clone())?],
+            };
+            branches.push(branch_select(right).ok_or(unsupported)?);
+            Ok(branches)
+        }
+        _ => Err(unsupported),
+    }
 }
 
 /// Answers whether a compound query drops a row equal to one it already
@@ -141,5 +152,21 @@ mod tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn keeps_every_branch_of_a_chain_in_the_order_written() {
+        let branches = select_projection_origins(
+            "SELECT a FROM t UNION SELECT b FROM t UNION (SELECT c FROM t)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        let column = |name: &str| {
+            vec![MySqlSelectProjectionOrigin::Column {
+                table: None,
+                column: name.into(),
+            }]
+        };
+        assert_eq!(branches, vec![column("a"), column("b"), column("c")]);
     }
 }
