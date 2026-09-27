@@ -8887,7 +8887,13 @@ fn read_out_of_the_grouping_table(
     use turso_mysql_parser::StaticSelectMetadata;
     let stored = match answer {
         StaticSelectMetadata::Count => true,
-        StaticSelectMetadata::RoundedAggregate { .. } => false,
+        // Measured: a written word or whole number is not stored, and keeps
+        // the shape it has on its own.
+        StaticSelectMetadata::RoundedAggregate { .. }
+        | StaticSelectMetadata::Integer { .. }
+        | StaticSelectMetadata::WrittenValue(turso_mysql_parser::WrittenValue::Word { .. }) => {
+            false
+        }
         StaticSelectMetadata::ColumnAggregate { kind, .. } => match kind {
             ColumnAggregateKind::MinMax | ColumnAggregateKind::Sum => true,
             ColumnAggregateKind::Avg => false,

@@ -5685,7 +5685,10 @@ fn accepts_the_complete_signed_i64_literal_range() {
         "SELECT 9223372036854775807"
     );
     let minimum = parse_select("SELECT -9223372036854775808", SessionSqlMode::default()).unwrap();
-    assert_eq!(minimum.as_sql(), "SELECT (-9223372036854775808)");
+    assert_eq!(
+        minimum.as_sql(),
+        "SELECT (-9223372036854775808) AS \"-9223372036854775808\""
+    );
     assert!(matches!(minimum.parse_ast().unwrap(), Stmt::Select(_)));
 }
 

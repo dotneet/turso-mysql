@@ -452,6 +452,190 @@ fn a_written_word_converted_to_utf8mb4_is_as_wide_as_its_characters() {
         .is_err());
 }
 
+/// Measured: a word written in quotes is named after the word as it reads —
+/// its escapes worked out and without its quotes — and is a `VAR_STRING`
+/// four bytes to each character, never null, in both protocols.
+#[test]
+fn a_written_word_is_named_after_itself_and_as_wide_as_its_characters() {
+    let (_directory, mut adapter) = adapter();
+    let sql = r#"SELECT 'abc', "abc", '', 'it''s', 'ab\'c', 'a\nb', 'é', 'éé😀', '\%a', 'a' AS x, _utf8mb4'abc', id FROM posts"#;
+    assert_eq!(
+        row(&mut adapter, sql),
+        ["abc", "abc", "", "it's", "ab'c", "a\nb", "é", "éé😀", "\\%a", "a", "abc", "1"]
+    );
+    let shapes = shapes(&mut adapter, sql);
+    let words: Vec<_> = shapes[..11]
+        .iter()
+        .map(
+            |(name, column_type, length, decimals, flags, character_set)| {
+                assert_eq!(
+                    (*column_type, *decimals, *flags, *character_set),
+                    (
+                        MYSQL_TYPE_VAR_STRING,
+                        NOT_FIXED_DECIMALS,
+                        MYSQL_NOT_NULL_FLAG,
+                        TEXT
+                    ),
+                    "{name}"
+                );
+                (name.as_str(), *length)
+            },
+        )
+        .collect();
+    assert_eq!(
+        words,
+        [
+            ("abc", 12),
+            ("abc", 12),
+            ("", 0),
+            ("it's", 16),
+            ("ab'c", 16),
+            ("a\nb", 12),
+            ("é", 4),
+            // MySQL keeps a name in utf8mb3, which has no room for 😀.
+            ("éé?", 12),
+            ("\\%a", 12),
+            ("x", 4),
+            ("abc", 12),
+        ]
+    );
+    assert_eq!(shapes[11].0, "id");
+    assert_eq!(
+        binary_row(&mut adapter, "SELECT 'abc'"),
+        [BinaryResultValue::Text("abc".to_owned())]
+    );
+}
+
+/// Measured: the spaces and control characters before a word are left out of
+/// its name, which stops at a NUL and at 255 bytes, never splitting a
+/// character, while the column still counts every character.
+#[test]
+fn a_written_word_s_name_is_cut_where_mysql_cuts_it() {
+    let (_directory, mut adapter) = adapter();
+    let sql = r"SELECT '   lead', '\t', 'a\0b', 'trail   ', '\rab'";
+    let names: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(name, _, length, ..)| (name, length))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("lead".to_owned(), 28),
+            (String::new(), 4),
+            ("a".to_owned(), 12),
+            ("trail   ".to_owned(), 32),
+            ("ab".to_owned(), 12),
+        ]
+    );
+    for (word, name, length) in [
+        ("c".repeat(300), "c".repeat(255), 1200),
+        (format!("{}éz", "c".repeat(254)), "c".repeat(254), 1024),
+        (
+            format!("{}😀z", "c".repeat(253)),
+            format!("{}?z", "c".repeat(253)),
+            1020,
+        ),
+    ] {
+        let sql = format!("SELECT '{word}'");
+        let result = result(&mut adapter, &sql);
+        assert_eq!(result.columns[0].name, name);
+        assert_eq!(result.columns[0].column_length, length);
+        assert_eq!(result.rows[0][0].as_deref(), Some(word.as_bytes()));
+    }
+}
+
+/// MySQL joins words written one after another into one value and names the
+/// column after the first alone, which sqlparser does not keep apart.
+#[test]
+fn words_written_one_after_another_are_refused() {
+    let (_directory, mut adapter) = adapter();
+    for sql in ["SELECT 'a' 'b'", "SELECT 'a' \"b\"", "SELECT 'a''' 'b'"] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// Measured: a signed whole number is named as written, a minus sign kept and
+/// a plus sign left out, where the engine names it `(-1)`.
+#[test]
+fn a_signed_whole_number_is_named_as_written() {
+    let (_directory, mut adapter) = adapter();
+    let sql = "SELECT -1, - 1, +1, -9223372036854775808";
+    assert_eq!(
+        row(&mut adapter, sql),
+        ["-1", "-1", "1", "-9223372036854775808"]
+    );
+    let names: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(name, column_type, length, ..)| (name, column_type, length))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("-1".to_owned(), MYSQL_TYPE_LONGLONG, 2),
+            ("- 1".to_owned(), MYSQL_TYPE_LONGLONG, 2),
+            ("1".to_owned(), MYSQL_TYPE_LONGLONG, 2),
+            ("-9223372036854775808".to_owned(), MYSQL_TYPE_LONGLONG, 20),
+        ]
+    );
+}
+
+/// Measured: a statement grouping by a call stores its groups in a table of
+/// their own, and a written word or whole number beside them is not stored
+/// there and keeps the shape it has on its own.
+#[test]
+fn a_written_word_or_number_keeps_its_shape_beside_a_grouping_by_a_call() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE visits (id INT PRIMARY KEY, at DATETIME NULL)",
+        "INSERT INTO visits VALUES (1, '2026-01-02 03:04:05'), (2, '2026-01-02 05:00:00'), (3, '2026-01-03 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let sql = "SELECT 'daily' AS kind, 'é', 7, -1, DATE(at) AS d, COUNT(*) FROM visits GROUP BY DATE(at) ORDER BY d";
+    let grouped = result(&mut adapter, sql);
+    assert_eq!(grouped.rows.len(), 2);
+    let shapes: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .take(4)
+        .map(|(name, column_type, length, decimals, flags, _)| {
+            (name, column_type, length, decimals, flags)
+        })
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            (
+                "kind".to_owned(),
+                MYSQL_TYPE_VAR_STRING,
+                20,
+                NOT_FIXED_DECIMALS,
+                MYSQL_NOT_NULL_FLAG
+            ),
+            (
+                "é".to_owned(),
+                MYSQL_TYPE_VAR_STRING,
+                4,
+                NOT_FIXED_DECIMALS,
+                MYSQL_NOT_NULL_FLAG
+            ),
+            (
+                "7".to_owned(),
+                MYSQL_TYPE_LONGLONG,
+                2,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+            (
+                "-1".to_owned(),
+                MYSQL_TYPE_LONGLONG,
+                2,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+        ]
+    );
+}
+
 #[test]
 fn a_written_value_stands_beside_columns_under_its_alias() {
     let (_directory, mut adapter) = adapter();

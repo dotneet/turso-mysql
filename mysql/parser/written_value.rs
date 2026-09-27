@@ -1,7 +1,7 @@
-//! Values a projection writes out in full: a number with a point or an
-//! exponent, a hexadecimal or bit literal, a cast or a `CONVERT` of a written
-//! value, and a few calls over written values alone — `HEX(255)`,
-//! `CHAR(65)`, `FIELD('b', 'a', 'b')`, `TRUNCATE(1.567, 2)`.
+//! Values a projection writes out in full: a word in quotes, a number with a
+//! point or an exponent, a hexadecimal or bit literal, a cast or a `CONVERT`
+//! of a written value, and a few calls over written values alone —
+//! `HEX(255)`, `CHAR(65)`, `FIELD('b', 'a', 'b')`, `TRUNCATE(1.567, 2)`.
 //!
 //! Each is worked out here, before the statement runs, into the text MySQL
 //! answers, because the engine would answer a different one — it prints `0.10`
@@ -22,6 +22,9 @@ const DECIMAL_MOST_PLACES: u32 = 30;
 /// The shape of a value written out in a projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WrittenValue {
+    /// A word written in quotes. Measured: never null, four bytes to each
+    /// character, `'abc'` a `VAR_STRING` of 12.
+    Word { characters: u32 },
     /// A `NEWDECIMAL`: a number written with a point, or a cast to `DECIMAL`.
     /// A cast of `NULL` is the one that can be null.
     Decimal {
@@ -64,6 +67,12 @@ pub(crate) fn read_written_value(expr: &Expr) -> Option<(WrittenValue, String)> 
             Value::Number(written, false) => written_number(written, false),
             Value::HexStringLiteral(digits) => written_hexadecimal(digits),
             Value::SingleQuotedByteStringLiteral(bits) => written_bits(bits),
+            Value::SingleQuotedString(word) | Value::DoubleQuotedString(word) => Some((
+                WrittenValue::Word {
+                    characters: u32::try_from(word.chars().count()).ok()?,
+                },
+                format!("'{}'", word.replace('\'', "''")),
+            )),
             _ => None,
         },
         Expr::UnaryOp {
@@ -103,6 +112,41 @@ pub(crate) fn read_written_value(expr: &Expr) -> Option<(WrittenValue, String)> 
         _ => None,
     }
 }
+
+/// The name MySQL gives the column of a word written in quotes with no alias.
+///
+/// Measured on MySQL 8.4.11: the word as it reads once its escapes are
+/// worked out — `'it''s'` is named `it's` and `'a\nb'` carries its line
+/// break — with the spaces and control characters before it left out, `' '`
+/// being named nothing at all, cut at a NUL, each character outside the
+/// Basic Multilingual Plane written `?`, and cut to 255 bytes without
+/// splitting a character. MySQL keeps a column's name in utf8mb3, which has
+/// no room for those characters, and in 255 bytes.
+pub(crate) fn word_column_name(word: &str) -> String {
+    let word = word.trim_start_matches(|character: char| {
+        character.is_ascii() && !character.is_ascii_graphic()
+    });
+    let word = word.split('\0').next().unwrap_or_default();
+    let mut name: String = word
+        .chars()
+        .map(|character| {
+            if character.len_utf8() == 4 {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let mut kept = name.len().min(MOST_NAME_BYTES);
+    while !name.is_char_boundary(kept) {
+        kept -= 1;
+    }
+    name.truncate(kept);
+    name
+}
+
+/// The most bytes MySQL keeps of a column's name.
+const MOST_NAME_BYTES: usize = 255;
 
 /// Reads a call over written values alone that this works out in full.
 ///

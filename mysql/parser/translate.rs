@@ -981,6 +981,34 @@ fn render_written_value(
         SelectItem::ExprWithAlias { alias, .. } => {
             Ok(format!("{rendered} AS {}", render_ident(alias)))
         }
+        SelectItem::UnnamedExpr(Expr::Value(value))
+            if matches!(
+                value.value,
+                Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+            ) =>
+        {
+            let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) = &value.value
+            else {
+                unreachable!("the guard requires a word in quotes");
+            };
+            // sqlparser joins `'a' 'b'` into one word, and MySQL names the
+            // column after the first alone.
+            let start = byte_offset(render_context.source, value.span.start).ok_or(
+                ParseError::Unsupported {
+                    feature: "SELECT written word whose source text cannot be recovered",
+                },
+            )?;
+            if another_word_follows(
+                render_context.source,
+                start,
+                render_context.no_backslash_escapes,
+            ) != Some(false)
+            {
+                return unsupported("SELECT words written one after another");
+            }
+            let name = crate::written_value::word_column_name(word).replace('"', "\"\"");
+            Ok(format!("{rendered} AS \"{name}\""))
+        }
         SelectItem::UnnamedExpr(expr) => {
             // Measured: MySQL leaves a written plus sign out of the name,
             // `+1.5` being named `1.5`, and keeps a minus sign in it.
@@ -1000,6 +1028,30 @@ fn render_written_value(
         }
         _ => unreachable!("only an expression item carries a written value"),
     }
+}
+
+/// Reports whether the word in quotes written at `start` has another written
+/// right after it, or `None` when no word in quotes starts there.
+fn another_word_follows(source: &str, start: usize, no_backslash_escapes: bool) -> Option<bool> {
+    let written = source.get(start..)?;
+    let mut characters = written.char_indices().peekable();
+    let (_, quote) = characters
+        .next()
+        .filter(|(_, quote)| matches!(quote, '\'' | '"'))?;
+    let mut end = None;
+    while let Some((offset, character)) = characters.next() {
+        if character == '\\' && !no_backslash_escapes {
+            characters.next();
+        } else if character == quote {
+            if characters.peek().map(|(_, next)| *next) == Some(quote) {
+                characters.next();
+            } else {
+                end = Some(offset + character.len_utf8());
+                break;
+            }
+        }
+    }
+    Some(written.get(end?..)?.trim_start().starts_with(['\'', '"']))
 }
 
 /// Reports whether a `HAVING` filters rows rather than groups.
@@ -4677,6 +4729,28 @@ fn render_select_item(
                 render_select_expr(expr, render_context)?
             ))
         }
+        // Measured: MySQL leaves a written plus sign out of a whole number's
+        // name, `+1` being named `1`, where the engine names it `(+1)`.
+        SelectItem::UnnamedExpr(
+            expr @ Expr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr: signed,
+            },
+        ) if matches!(
+            static_select_metadata::classify_static_select_expr(expr),
+            Some(StaticSelectMetadata::Integer { .. })
+        ) =>
+        {
+            let name = source_text(render_context.source, signed)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT whole number whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!(
+                "{} AS \"{name}\"",
+                render_select_expr(expr, render_context)?
+            ))
+        }
         SelectItem::UnnamedExpr(expr) if names_an_interval_shift(expr) => {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -4705,6 +4779,14 @@ fn render_select_item(
                         | Expr::IsNotTrue(_)
                         | Expr::IsNotFalse(_),
                     Some(StaticSelectMetadata::ScalarCall { .. })
+                ) | (
+                    // Measured: `-1` is named `-1` and `- 1` `- 1`, as
+                    // written, where the engine names it `(-1)`.
+                    Expr::UnaryOp {
+                        op: UnaryOperator::Minus,
+                        ..
+                    },
+                    Some(StaticSelectMetadata::Integer { .. })
                 )
             ) =>
         {

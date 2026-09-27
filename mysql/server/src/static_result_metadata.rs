@@ -97,6 +97,13 @@ pub(crate) fn static_result_column_metadata(
 fn written_value_metadata(written: WrittenValue) -> StaticResultColumnMetadata {
     let text_collation = u16::from(DEFAULT_UTF8MB4_COLLATION);
     match written {
+        WrittenValue::Word { characters } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_VAR_STRING,
+            character_set: text_collation,
+            column_length: characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            flags: MYSQL_NOT_NULL_FLAG,
+            decimals: NOT_FIXED_DECIMALS,
+        },
         // A sign and a point beside the digits: `1.50` reports 5 and
         // `CAST(1 AS DECIMAL(10,2))` 12, and a whole number no point.
         WrittenValue::Decimal {

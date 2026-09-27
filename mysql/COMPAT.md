@@ -884,6 +884,21 @@ A value written out in full in the statement's own result is worked out before t
 statement runs, into the text MySQL answers and the column MySQL reports, because the engine
 answers a different one. Measured on 8.4.11:
 
+- A word in quotes is a `VAR_STRING` four bytes to each character, never null — `'abc'`
+  reports 12, `''` 0 and `'é'` 4 — in both protocols, where it used to report 4096 and be
+  nullable. It is named after the word as it reads, without its quotes and with its
+  escapes worked out: `'it''s'` is named `it's` and `'a\nb'` carries its line break.
+  The spaces and control characters before it are left out of the name, `' '` being
+  named nothing at all; the name stops at a NUL, writes each character outside the Basic
+  Multilingual Plane as `?` (MySQL keeps a name in utf8mb3), and is cut to 255 bytes
+  without splitting a character, while the column counts every character. Words written
+  one after another, `'a' 'b'`, are refused: MySQL names the column after the first alone
+  and sqlparser joins them into one. `N'abc'`, which MySQL answers with a deprecation
+  warning, and `_binary'abc'` stay refused.
+- A signed whole number is named as written, `-1` as `-1`, `- 1` as `- 1` and `+1` as
+  `1`, where the engine names them `(-1)` and `(+1)`.
+- A written word or whole number beside a grouping by a call keeps the shape it has on its
+  own: MySQL does not store it in the table it groups in.
 - A number written with a point is a `NEWDECIMAL` that reports its digits, a point and a
   sign — `1.5` reports 4 with one decimal, `.5` 3, `0.10` 5 with two, and `100.` 4 with
   none — and it answers the digits it was written with, `0.10` rather than the engine's

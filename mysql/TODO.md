@@ -108,7 +108,11 @@ Numbers: a seeded `RAND(n)` is refused: the engine has no seeded random, so
 answering one would answer a different sequence.
 Written values: a number with a point or an exponent, a hexadecimal or bit
 literal, and a cast of a written value are taken only in the statement's own
-result, not in a subquery, a derived table or a `UNION` branch. A number with
+result, not in a subquery, a derived table or a `UNION` branch. A word in quotes
+in a `UNION` branch is still named with its quotes and reported as a nullable
+`VAR_STRING` of 4096; measured, MySQL names it after the first branch's word
+and reports four bytes to each character of the widest branch's word, 0
+decimals, NOT NULL — `'abcdefgh' UNION 'de'` a `VAR_STRING` of 32. A number with
 redundant leading zeroes (`007.5`), a word or a `DOUBLE` cast to `DECIMAL`, and
 a cast a warning comes with are refused.
 Temporal: `FROM_UNIXTIME` over a fraction or a word, which MySQL carries into
@@ -371,6 +375,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `SHOW [FULL] PROCESSLIST` | refused; measured, a session without the `PROCESS` privilege sees every connection of its own account — a pool's other connections among them — and this session knows only itself |
 | `SHOW [GLOBAL] STATUS` | refused; MySQL answers 330 counters about the whole server, `Threads_connected` and `Uptime` among them, which a session here has no reading of |
 | `SHOW COLLATION` / `SHOW CHARACTER SET` with a `WHERE` other than `=` and `LIKE` tests joined by `AND` | refused; the listing is filtered here rather than by a query engine |
+| The `NUM` flag on a column worked out rather than read from a table — a written `1.5`, `TRUE`, `NULL`, `COUNT(*)`, `@@group_concat_max_len` | sent, where MySQL does not: measured on the wire on 8.4.11, `1.5` and `COUNT(*)` carry `0x81`, `NULL` `0x80` and `@@group_concat_max_len` `0xa0`. `libmysqlclient` sets the flag itself for every numeric type, so the `mysql` client shows it either way |
 | `SET group_concat_max_len` below 4, or read from a user variable | refused; measured, MySQL takes anything below 4 as 4 with warning 1292 (`Truncated incorrect group_concat_max_len value: '0'`) |
 | `SET @x = @@group_concat_max_len` past the largest `BIGINT` | refused; a user variable here holds no unsigned number |
 | A `GROUP_CONCAT` column of a statement sorting its groups by anything but the grouped columns, or of `SELECT DISTINCT` over groups | reports the shape it has unsorted; measured, MySQL reads it out of a table it sorts through — a `VAR_STRING` with 0 decimals up to 512, past it a `BLOB` of 16 bytes to each (16384 at 1024) with the blob flag — and every other aggregate column of the statement loses its binary flag there too |
