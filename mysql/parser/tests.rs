@@ -1450,6 +1450,38 @@ fn a_cte_names_the_table_its_body_reads() {
 }
 
 #[test]
+fn a_recursive_cte_counting_through_numbers_reads_no_table() {
+    let translated = parse_select(
+        "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 2 FROM n WHERE x <= 9) SELECT x FROM n WHERE x > 3",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "WITH RECURSIVE \"n\"(\"x\") AS (SELECT 1 UNION ALL SELECT \"x\" + 2 FROM \"n\" WHERE \"x\" <= 9) ",
+            "SELECT \"x\" FROM \"n\" WHERE (\"x\" > 3)"
+        )
+    );
+    // The sequence reads no table, and its columns hold whole numbers.
+    assert!(translated.source_tables().is_empty());
+    assert_eq!(
+        translated.checked_comparisons()[0].answers(),
+        Some(CheckedComparisonAnswer::WholeNumber)
+    );
+    assert_eq!(
+        translated.static_result_metadata(),
+        [StaticSelectProjectionMetadata::Literal(
+            StaticSelectMetadata::CountedColumn {
+                table: "n".to_owned(),
+                column: "x".to_owned(),
+                length: 2,
+            }
+        )]
+    );
+}
+
+#[test]
 fn a_subquery_is_read_and_its_tables_kept_apart() {
     let translated = parse_select(
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM accounts)",

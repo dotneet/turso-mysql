@@ -86,6 +86,7 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::AggregateOverBranches { .. }
         | StaticSelectMetadata::ScalarCall { .. }
         | StaticSelectMetadata::RoundedAggregate { .. }
+        | StaticSelectMetadata::CountedColumn { .. }
         | StaticSelectMetadata::FromTheGroupingTable { .. } => return None,
     })
 }

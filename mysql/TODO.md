@@ -206,7 +206,8 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | A `UNION`, `EXCEPT` or `INTERSECT` dropping repeated rows over words compared without regard to case | refused; measured, MySQL keeps the first of `'aa'` and `'AA'` and the engine the last. `UNION ALL` and `utf8mb4_bin` columns are taken |
 | A `UNION` naming a `DECIMAL` column, or reaching one through a wildcard or an expression | refused; only the first branch's table is read for column types |
 | A `UNION` branch projecting a wildcard or an expression | taken with the first branch's shape, which is what the engine reports; MySQL's shape for the mixture has not been measured |
-| `WITH RECURSIVE` | refused |
+| `WITH RECURSIVE` over anything but a counted sequence of whole numbers — walking a tree of parents, a run of days | refused; the engine has no recursion limit, where MySQL answers 3636 past `cte_max_recursion_depth`, so only a depth the statement decides is taken |
+| An aggregate other than `COUNT(*)` over a counted sequence, or the sequence read beside a table | refused; measured, `MAX(x)` answers a `LONGLONG` of 20 and `SUM(x)` a `NEWDECIMAL` of 42, rules not worked out here |
 | A derived table or CTE whose body projects an expression without aggregating — `(SELECT n + 1 AS m FROM t) x` | refused; MySQL reads that body straight through, and what it reports for the expression there has not been measured |
 | A derived table or CTE whose body aggregates with a call other than `DATE`, a `GROUP_CONCAT`, or `DISTINCT` | refused; the shape MySQL stores it in has not been measured |
 | A comparison or an aggregate over a total or an average a derived table worked out — `WHERE t.s > 1`, `SELECT SUM(c) FROM totals` | refused; measured, `SUM(c)` over a count answers a `NEWDECIMAL` of 43, a rule not worked out here |

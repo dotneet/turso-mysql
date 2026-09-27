@@ -1424,10 +1424,36 @@ projected names are carried for exactly that reason.
 
 A CTE's body projects what a derived table's does and reports the same shapes —
 `*`, a column under an alias, and in a body that aggregates the answers it works
-out; see the derived table paragraphs. Refused: `WITH RECURSIVE`, a body that
-reads more than one table or carries its own `ORDER BY` or `LIMIT`, a column
-list on the name, the materialization hints, and an expression in a body that
-does not aggregate. A `WHERE` comparison against a
+out; see the derived table paragraphs.
+
+`WITH RECURSIVE` is taken over a counted sequence — `WITH RECURSIVE n(x) AS
+(SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n` — which
+is how a statement asks for a run of numbers. Every column starts at a written
+whole number and steps by adding, subtracting or multiplying one; one column
+steps up by a written positive number and the recursion stops at a written
+`<` or `<=` bound on it; `UNION` and `UNION ALL` are both taken, and the
+columns are named in a list or by the first row's aliases. Measured on MySQL
+8.4.11, each column is a nullable `LONGLONG` as wide as its first value's digits
+and one more — `1` and `-1` report 2 and `10` reports 3 — whatever it steps to,
+with no flags, naming the sequence and itself and no database or original table.
+The statement reads the sequence alone: its columns, `*`, a `COUNT(*)`, a
+comparison of a column against a whole number, an `ORDER BY` and a `LIMIT`.
+
+The engine runs a recursive CTE the way SQLite does, which answers MySQL's rows
+but has no limit on how deep it goes. MySQL answers 3636 once a recursion runs
+past `cte_max_recursion_depth`, 1000 by default — measured, 999 rows past the
+first are answered and 1000 are not — and 1690 once a value runs past a
+`BIGINT`. So only a sequence whose length and values the statement itself
+decides is taken, and one that would run past either limit is refused. A
+recursion whose depth depends on the rows it reads — walking a tree of parents
+— is refused: the engine would loop for ever over a cycle MySQL answers 3636
+for.
+
+Refused: a recursion reading a table or read beside one; an aggregate other
+than `COUNT(*)` over the sequence; and, for a CTE that does not recurse, a body
+that reads more than one table or carries its own `ORDER BY` or `LIMIT`, a
+column list on the name, the materialization hints, and an expression in a
+body that does not aggregate. A `WHERE` comparison against a
 qualified column is accepted when the qualifier matches the single source table,
 alias, or CTE name, so `WHERE c.id = 1` works as expected. Multi-table joins or
 unmatching qualifiers remain refused.

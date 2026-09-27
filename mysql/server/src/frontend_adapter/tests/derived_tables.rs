@@ -566,3 +566,101 @@ fn a_derived_table_refuses_what_has_not_been_measured() {
         );
     }
 }
+
+/// `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x <
+/// 5)` is how a statement asks for a run of numbers.
+#[test]
+fn a_recursive_cte_counting_through_numbers_answers_what_mysql_answers() {
+    let (_directory, mut adapter) = adapter();
+    // Each column is a nullable LONGLONG as wide as its first value's digits
+    // and one more, naming the sequence and itself.
+    let counted = |name, table, length| Column {
+        name,
+        table,
+        original_table: "",
+        original_name: name,
+        names_the_database: false,
+        column_type: MYSQL_TYPE_LONGLONG,
+        length,
+        decimals: 0,
+        flags: MYSQL_NUM_FLAG,
+        character_set: BINARY,
+    };
+    let one_to_five = rows(&[
+        &[Some("1")],
+        &[Some("2")],
+        &[Some("3")],
+        &[Some("4")],
+        &[Some("5")],
+    ]);
+    for sql in [
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n",
+        "WITH RECURSIVE n AS (SELECT 1 AS x UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT * FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x <= 4) SELECT n.x FROM n",
+    ] {
+        let (columns, answered) = read(&mut adapter, sql);
+        assert_columns(sql, &columns, &[counted("x", "n", 2)]);
+        assert_eq!(answered, one_to_five, "{sql}");
+    }
+
+    let sql = "WITH RECURSIVE n(x) AS (SELECT 10 UNION ALL SELECT x + 1 FROM n WHERE x < 15) SELECT x FROM n";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_columns(sql, &columns, &[counted("x", "n", 3)]);
+    assert_eq!(answered.len(), 6);
+    let sql = "WITH RECURSIVE n(x, y) AS (SELECT -1, 2 UNION ALL SELECT x + 1, y * 2 FROM n WHERE x < 3) SELECT x, y FROM n";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_columns(sql, &columns, &[counted("x", "n", 2), counted("y", "n", 2)]);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("-1"), Some("2")],
+            &[Some("0"), Some("4")],
+            &[Some("1"), Some("8")],
+            &[Some("2"), Some("16")],
+            &[Some("3"), Some("32")],
+        ])
+    );
+
+    let (_, answered) = read(
+        &mut adapter,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n WHERE x > 2 ORDER BY x DESC LIMIT 2",
+    );
+    assert_eq!(answered, rows(&[&[Some("5")], &[Some("4")]]));
+    // 999 rows past the first is as deep as MySQL goes by default.
+    let (columns, answered) = read(
+        &mut adapter,
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1000) SELECT COUNT(*) FROM n",
+    );
+    assert_eq!(
+        columns[0].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+    assert_eq!(answered, rows(&[&[Some("1000")]]));
+
+    for sql in [
+        // 3636: a thousand rows past the first.
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1001) SELECT COUNT(*) FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x + 5 FROM n WHERE x < 5005) SELECT COUNT(*) FROM n",
+        // 1690 once a value runs past a BIGINT, and a recursion with no
+        // bound the statement names.
+        "WITH RECURSIVE n(x, y) AS (SELECT 1, 1 UNION ALL SELECT x + 1, y * 1000000 FROM n WHERE x < 10) SELECT y FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n) SELECT x FROM n LIMIT 3",
+        // A recursion whose depth depends on the rows it reads.
+        "WITH RECURSIVE t AS (SELECT id, user_id FROM posts WHERE user_id IS NULL UNION ALL SELECT p.id, p.user_id FROM posts p JOIN t ON p.user_id = t.id) SELECT id FROM t",
+        // An aggregate over the sequence's column, and a word against it.
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT SUM(x) FROM n",
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x FROM n WHERE x = 'a'",
+        // The sequence beside a table.
+        "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 5) SELECT x, id FROM n JOIN posts ON posts.id = n.x",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

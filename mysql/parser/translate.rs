@@ -15,6 +15,7 @@ use super::*;
 mod derived;
 mod grouping;
 mod json_condition;
+mod recursive;
 
 pub use derived::MySqlDerivedColumns;
 
@@ -330,10 +331,17 @@ pub(crate) fn translate_select_query(
     render_context.real_columns = real_columns;
     render_context.json_columns = json_columns;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
+    let mut sequence = None;
     if let Some(with) = &query.with {
-        let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
-        prefix = rendered;
-        cte_tables = sources;
+        if with.recursive {
+            let counted = recursive::read_counted_sequence(with)?;
+            prefix = counted.render();
+            sequence = Some(counted);
+        } else {
+            let (rendered, sources) = render_common_table_expressions(with, &mut render_context)?;
+            prefix = rendered;
+            cte_tables = sources;
+        }
     }
     // An `ORDER BY` ordinal names a projected column, so the projection has to
     // outlive the body that rendered it. A compound query orders by its first
@@ -428,6 +436,13 @@ pub(crate) fn translate_select_query(
                 "SELECT comparison qualifier must name a table the statement reads",
             );
         }
+    }
+    if let Some(sequence) = &sequence {
+        recursive::read_the_sequence(
+            sequence,
+            &mut source_tables,
+            &mut render_context.checked_comparisons,
+        )?;
     }
     normalized.insert_str(0, &prefix);
     let source_table = match source_tables
@@ -1538,6 +1553,9 @@ pub(crate) fn select_static_result_metadata(
         _ => select,
     };
     let grouped_by_an_expression = grouping::expression_grouping_keys(select);
+    if let Some(counted) = recursive::counted_projection(query, select) {
+        return counted;
+    }
     select
         .projection
         .iter()

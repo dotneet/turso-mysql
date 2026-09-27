@@ -8076,6 +8076,23 @@ fn aggregate_column_definition(
         } => source_metadata
             .ok_or(FrontendErrorKind::Unsupported)?
             .rounded_aggregate_column_definition(name, column_name, *kind, *places),
+        // Measured on MySQL 8.4.11: a column of a `WITH RECURSIVE` sequence
+        // counting through whole numbers is a nullable LONGLONG as wide as its
+        // first value's digits and one more, with no flags, naming the
+        // sequence and itself and no database or original table.
+        turso_mysql_parser::StaticSelectMetadata::CountedColumn {
+            table,
+            column,
+            length,
+        } => {
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = *length;
+            definition.decimals = 0;
+            definition.table.clone_from(table);
+            definition.original_name.clone_from(column);
+            set_column_flags(&mut definition, 0);
+            Ok(definition)
+        }
         turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable { answer, key } => {
             let mut definition = match static_column_definition(name.clone(), answer) {
                 Some(definition) => definition,

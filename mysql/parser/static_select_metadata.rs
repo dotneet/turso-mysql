@@ -112,6 +112,14 @@ pub enum StaticSelectMetadata {
         /// point is refused.
         places: u32,
     },
+    /// A column of a `WITH RECURSIVE` counted sequence, which MySQL reports as
+    /// a nullable `LONGLONG` as wide as its first value's digits and one more.
+    CountedColumn {
+        /// The name the statement reads the sequence under.
+        table: String,
+        column: String,
+        length: u32,
+    },
     /// An answer of a statement grouping by an expression, which MySQL groups
     /// in a temporary table and reports the table's column for rather than the
     /// answer's own shape.
