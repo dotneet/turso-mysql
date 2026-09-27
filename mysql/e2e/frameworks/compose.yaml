@@ -1,0 +1,195 @@
+# Real frameworks against a live turso-mysql server and a real MySQL 8.4.
+# Driven by run.sh; see README.md. Every container, network and volume is
+# prefixed with turso-e2e-.
+name: turso-e2e-fw
+
+x-rust-image: &rust-image rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
+
+x-mysql-image: &mysql-image mysql:8.4.11@sha256:85b9bf2e29cf836ecb8c2a15a935d4ba0c606631dff1dd79531a11983c638f2a
+
+# run.sh passes E2E_APP, E2E_TARGET and E2E_UPSTREAM with -e.
+x-app: &app
+  profiles: [apps]
+  networks: [net]
+  entrypoint: ["/e2e/src/common/run-app.sh"]
+  environment:
+    E2E_PASSWORD: ${E2E_PASSWORD:-}
+    E2E_USER: e2e
+  volumes:
+    - .:/e2e/src:ro
+    - ${E2E_RUN_DIR:-./.run}/tls/ca.pem:/e2e/tls/ca.pem:ro
+    - ${E2E_RUN_DIR:-./.run}/bin/sqlproxy:/e2e/bin/sqlproxy:ro
+    - ${E2E_RUN_DIR:-./.run}/tls:/e2e/proxy-tls:ro
+    - ${E2E_RUN_DIR:-./.run}/results:/results
+
+networks:
+  net:
+    name: turso-e2e-fw-net
+
+volumes:
+  cargo-registry:
+    name: turso-e2e-cargo-registry
+  cargo-git:
+    name: turso-e2e-cargo-git
+  cargo-target:
+    name: turso-e2e-cargo-target
+  go-cache:
+    name: turso-e2e-go-cache
+
+services:
+  # Debug build of the three server binaries into a cached volume, never into
+  # the checkout's target/.
+  build:
+    profiles: [build]
+    image: *rust-image
+    working_dir: /src
+    environment:
+      CARGO_TARGET_DIR: /target
+      CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-8}
+      # The checkout's rust-toolchain.toml names the "1.88" channel, which
+      # rustup would download again next to the image's 1.88.0.
+      RUSTUP_TOOLCHAIN: 1.88.0
+    volumes:
+      - ../../..:/src:ro
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+      - cargo-target:/target
+    # One package at a time: three debug binaries linking at once exhaust an
+    # 8 GB Docker Desktop VM (ld is killed).
+    command:
+      - sh
+      - -ec
+      - |
+        cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
+        cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
+        cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
+
+  # Static SQL-logging TLS proxy that every app runs next to itself.
+  sqlproxy-build:
+    profiles: [build]
+    image: golang:1.25.2-bookworm@sha256:42d8e9dea06f23d0bfc908826455213ee7f3ed48c43e287a422064220c501be9
+    working_dir: /src
+    environment:
+      CGO_ENABLED: "0"
+      GOFLAGS: -trimpath
+      GOCACHE: /go-cache/build
+      GOMODCACHE: /go-cache/mod
+    volumes:
+      - ./sqlproxy:/src:ro
+      - go-cache:/go-cache
+      - ${E2E_RUN_DIR:-./.run}/bin:/out
+    command: ["go", "build", "-o", "/out/sqlproxy", "."]
+
+  turso:
+    profiles: [servers]
+    image: *rust-image
+    networks: [net]
+    hostname: turso
+    environment:
+      E2E_PASSWORD: ${E2E_PASSWORD:-}
+      E2E_DATABASES: ${E2E_DATABASES:-}
+    volumes:
+      - cargo-target:/target:ro
+      - ./server/boot-turso.sh:/boot-turso.sh:ro
+      - ${E2E_RUN_DIR:-./.run}/tls:/tls-in:ro
+      - ${E2E_RUN_DIR:-./.run}/turso-log:/log
+    tmpfs:
+      - /run/t:mode=755
+    entrypoint: ["/boot-turso.sh"]
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/t/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  mysql:
+    profiles: [servers]
+    image: *mysql-image
+    networks: [net]
+    hostname: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${E2E_PASSWORD:-}
+      MYSQL_USER: e2e
+      MYSQL_PASSWORD: ${E2E_PASSWORD:-}
+    command:
+      - --ssl-ca=/tls/ca.pem
+      - --ssl-cert=/tls/server-chain.pem
+      - --ssl-key=/tls/server-key.pem
+      - --require-secure-transport=ON
+    volumes:
+      - ${E2E_RUN_DIR:-./.run}/tls-mysql:/tls:ro
+      - ./server/mysql-init.sql:/docker-entrypoint-initdb.d/e2e.sql:ro
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --protocol=tcp -h 127.0.0.1 --ssl-mode=REQUIRED --silent"]
+      interval: 2s
+      timeout: 5s
+      retries: 90
+
+  # Recreates databases straight on a server, outside any app.
+  dbadmin:
+    <<: *app
+    image: *mysql-image
+    entrypoint: ["/e2e/src/common/reset-db.sh"]
+
+  mysqlcli:
+    <<: *app
+    image: *mysql-image
+    working_dir: /e2e/src/apps/mysqlcli
+    command: ["./run.sh"]
+
+  mysqldump:
+    <<: *app
+    image: *mysql-image
+    working_dir: /e2e/src/apps/mysqldump
+    command: ["./run.sh"]
+
+  laravel:
+    <<: *app
+    build: ./apps/laravel
+    image: turso-e2e-fw-laravel:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  prisma:
+    <<: *app
+    build: ./apps/prisma
+    image: turso-e2e-fw-prisma:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  typeorm:
+    <<: *app
+    build: ./apps/typeorm
+    image: turso-e2e-fw-typeorm:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  django:
+    <<: *app
+    build: ./apps/django
+    image: turso-e2e-fw-django:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  rails:
+    <<: *app
+    build: ./apps/rails
+    image: turso-e2e-fw-rails:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  sqlalchemy:
+    <<: *app
+    build: ./apps/sqlalchemy
+    image: turso-e2e-fw-sqlalchemy:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  gorm:
+    <<: *app
+    build: ./apps/gorm
+    image: turso-e2e-fw-gorm:local
+    working_dir: /app
+    command: ["./run.sh"]

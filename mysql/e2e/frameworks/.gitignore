@@ -1,0 +1,2 @@
+# Per-run TLS material, proxy binary, logs and results.
+/.run/
