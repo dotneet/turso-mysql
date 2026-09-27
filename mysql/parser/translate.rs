@@ -7824,6 +7824,17 @@ fn render_checked_select_comparison(
             render_context,
         ));
     }
+    if let Some(answers) = answer_of_a_call_reading_a_column(rhs_expr) {
+        if named_collation.is_some() {
+            return unsupported("SELECT comparison of a column and a call under a named collation");
+        }
+        return render_column_against_a_call(
+            (qualifier, column),
+            &op_reversed,
+            (rhs_expr, answers),
+            render_context,
+        );
+    }
     let column_name = column.value.clone();
     let json_column = render_context.is_json_column(&column_name);
     if json_column && named_collation.is_some() {
@@ -8028,6 +8039,75 @@ fn render_column_pair_comparison(
             answers: None,
         });
     comparison
+}
+
+/// What a call reading a column answers, when it is one a comparison takes.
+///
+/// A call reading nothing — `CURDATE()`, `NOW() - INTERVAL 1 DAY` — is a value
+/// the value reader takes, and is left to it.
+fn answer_of_a_call_reading_a_column(expr: &Expr) -> Option<crate::CheckedComparisonAnswer> {
+    let Some(StaticSelectMetadata::ScalarCall { columns, .. }) =
+        static_select_metadata::classify_static_select_expr(expr)
+    else {
+        return None;
+    };
+    if columns.is_empty() {
+        return None;
+    }
+    static_select_metadata::comparison_answer(expr).filter(|answers| {
+        matches!(
+            answers,
+            crate::CheckedComparisonAnswer::Text
+                | crate::CheckedComparisonAnswer::WholeNumber
+                | crate::CheckedComparisonAnswer::Day
+                | crate::CheckedComparisonAnswer::Moment
+        )
+    })
+}
+
+/// Renders a column compared with a call — `WHERE email = LOWER(name)`.
+///
+/// The column is held to the kind the call answers. Two words compare under
+/// the collation both carry, which the frontend holds to `utf8mb4_0900_ai_ci`
+/// for the column and for every column the call reads, as it does for a call
+/// against a written word.
+fn render_column_against_a_call(
+    (qualifier, column): (Option<&Ident>, &Ident),
+    op: &BinaryOperator,
+    (call, answers): (&Expr, crate::CheckedComparisonAnswer),
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
+    let rendered_call = render_select_expr(call, render_context)?;
+    let collated = answers == crate::CheckedComparisonAnswer::Text;
+    let collation = if collated {
+        record_the_columns_a_text_call_reads(call, render_context);
+        render_context
+            .collation_sensitive_call_columns
+            .push(column.value.clone());
+        " COLLATE MYSQL_UCA9_AI_CI"
+    } else {
+        ""
+    };
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
+            inner_source: None,
+            column_name: column.value.clone(),
+            operator,
+            rhs: CheckedSelectComparisonRhs::Call(answers),
+            collated,
+            answers: None,
+        });
+    Ok(format!(
+        "({rendered_column} {} {rendered_call}{collation})",
+        checked_select_comparison_sql_operator(op)
+    ))
 }
 
 /// Reads a written day against a column holding a moment as that day's
@@ -8295,6 +8375,15 @@ fn render_comparison_over_a_call(
     let Some(operator) = checked_select_comparison_operator(&op_reversed) else {
         return Ok(None);
     };
+    if let Some(other_answers) = static_select_metadata::comparison_answer(rhs_expr) {
+        return render_comparison_of_two_calls(
+            (call, answers),
+            &op_reversed,
+            (rhs_expr, other_answers),
+            render_context,
+        )
+        .map(Some);
+    }
     let rendered_call = render_select_expr(call, render_context)?;
     let (rendered_rhs, rhs) = render_checked_select_comparison_rhs(rhs_expr, render_context)?;
     let (rendered_rhs, rhs) = if answers == crate::CheckedComparisonAnswer::WholeNumber {
@@ -8328,6 +8417,60 @@ fn render_comparison_over_a_call(
             answers: Some(answers),
         });
     Ok(Some(rendered))
+}
+
+/// Renders one call compared with another — `LOWER(name) = LOWER('ANN')`.
+///
+/// The two have to answer one kind. Two words are compared without regard to
+/// case, as a word against a written word is: measured on 8.4.11, MySQL takes
+/// the collation of the column a call reads over a written word's, and one
+/// column's over another's when the two are the same, and the frontend holds
+/// every column either call reads to that one collation.
+fn render_comparison_of_two_calls(
+    (call, answers): (&Expr, crate::CheckedComparisonAnswer),
+    op: &BinaryOperator,
+    (other, other_answers): (&Expr, crate::CheckedComparisonAnswer),
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    use crate::CheckedComparisonAnswer;
+
+    if answers != other_answers
+        || !matches!(
+            answers,
+            CheckedComparisonAnswer::Text
+                | CheckedComparisonAnswer::WholeNumber
+                | CheckedComparisonAnswer::Day
+                | CheckedComparisonAnswer::Moment
+        )
+    {
+        return unsupported("SELECT comparison of two calls answering different kinds");
+    }
+    let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
+    let rendered_call = render_select_expr(call, render_context)?;
+    let rendered_other = render_select_expr(other, render_context)?;
+    let collated = answers == CheckedComparisonAnswer::Text;
+    let collation = if collated {
+        record_the_columns_a_text_call_reads(call, render_context);
+        record_the_columns_a_text_call_reads(other, render_context);
+        " COLLATE MYSQL_UCA9_AI_CI"
+    } else {
+        ""
+    };
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: None,
+            inner_source: None,
+            column_name: String::new(),
+            operator,
+            rhs: CheckedSelectComparisonRhs::Call(other_answers),
+            collated,
+            answers: Some(answers),
+        });
+    Ok(format!(
+        "({rendered_call}{collation} {} {rendered_other})",
+        checked_select_comparison_sql_operator(op)
+    ))
 }
 
 /// Renders a `LIKE` against one text column using MySQL's Unicode 9 weights.
@@ -8618,6 +8761,16 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
                 "SELECT comparison requires an exact signed integer, a string, NULL, or ?",
             ),
         },
+        // `LOWER('ANN')` is the word it answers, written out: the value is
+        // then held to the column it meets the way that word would be.
+        Expr::Function(function) if case_of_a_written_word(function).is_some() => {
+            let word = case_of_a_written_word(function)
+                .expect("the guard requires a written word in another case");
+            Ok((
+                format!("'{}'", word.replace('\'', "''")),
+                CheckedSelectComparisonRhs::Text(word),
+            ))
+        }
         Expr::Function(function) if CheckedComparisonNow::read(function).is_some() => {
             let now = CheckedComparisonNow::read(function)
                 .expect("the guard requires a call answering the moment");
@@ -8717,6 +8870,49 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
             unsupported("SELECT comparison requires an exact signed integer, a string, NULL, or ?")
         }
     }
+}
+
+/// Reads `LOWER('...')` or `UPPER('...')` over a written word as the word it
+/// answers.
+///
+/// Only a word written in ASCII is read: MySQL changes the case of the rest
+/// by Unicode rules this does not reproduce.
+fn case_of_a_written_word(function: &sqlparser::ast::Function) -> Option<String> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    let lower = ["LOWER", "LCASE"]
+        .iter()
+        .any(|candidate| name.value.eq_ignore_ascii_case(candidate));
+    let upper = ["UPPER", "UCASE"]
+        .iter()
+        .any(|candidate| name.value.eq_ignore_ascii_case(candidate));
+    if name.quote_style.is_some() || !(lower || upper) || function.over.is_some() {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+        value,
+    )))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) = &value.value else {
+        return None;
+    };
+    if !word.is_ascii() {
+        return None;
+    }
+    Some(if lower {
+        word.to_ascii_lowercase()
+    } else {
+        word.to_ascii_uppercase()
+    })
 }
 
 fn large_integer_comparison(

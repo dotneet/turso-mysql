@@ -921,6 +921,20 @@ ones that answer a real number are left out: what a `DOUBLE` compares equal to i
 its own and it has not been measured. A column on either side of the operator is read the way
 it always was, so `WHERE d = CURDATE()` is unchanged.
 
+A call meets another call answering the same kind — `LOWER(name) = UPPER(email)`,
+`CHAR_LENGTH(name) < CHAR_LENGTH(nick)`, `DATE(dt) = DATE(d)`, `YEAR(dt) = YEAR(d)` — and a
+column holding that kind — `email = LOWER(name)`, `CHAR_LENGTH(name) = id`, `DATE(dt) = d`.
+Two words compare without regard to case under `utf8mb4_0900_ai_ci`, which is what MySQL
+compares them under when every column either side reads carries it; a column under
+`utf8mb4_bin` or `utf8mb4_unicode_ci` is refused there, as it is under a call against a
+written word (measured on 8.4.11, `LOWER(name) = b` with `b` under `utf8mb4_bin` compares
+under `utf8mb4_bin`). A word against a number, a day against a moment, and a `DATETIME(3)`
+against a call answering a moment are refused. `LOWER('ANN')` and `UPPER('ann')` over a word
+written in ASCII are read as the word they answer, so `LOWER(name) = LOWER('ANN')` is
+`LOWER(name) = 'ann'`; outside ASCII MySQL changes case by Unicode rules and the call is
+refused. Each of these, and a call against a written value, is taken in an `UPDATE` and a
+`DELETE` as well, where a call against a written value used to be refused.
+
 A `JSON` column in a checked one-table `SELECT` accepts `=`, `<>`, `<=>`, `<`,
 `<=`, `>` and `>=` against written strings and signed 64-bit integers, plus
 `IN` and `NOT IN` against those values and SQL `NULL`. A written

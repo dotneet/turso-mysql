@@ -1,4 +1,5 @@
-//! A column compared with another column in a `WHERE` or a join's `ON`.
+//! A column or a call compared with another column or call in a `WHERE` or a
+//! join's `ON`.
 //!
 //! Every expectation here was measured on MySQL 8.4.11.
 
@@ -27,6 +28,8 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
         "INSERT INTO posts VALUES (1, 1, 5), (2, 1, 50), (3, 2, 1)",
         "CREATE TABLE ranks (id INT PRIMARY KEY, n INT)",
         "INSERT INTO ranks VALUES (1, 4), (2, 10)",
+        "CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(191) NOT NULL, nick TEXT, b VARCHAR(10) COLLATE utf8mb4_bin, d DATE, dt DATETIME)",
+        "INSERT INTO people (id, name, email, nick, b, d, dt) VALUES (1, 'Ann', 'ann', 'ANN', 'ann', '2024-01-01', '2024-01-01 00:00:00'), (2, 'Bob', 'bob@x', 'bobby', 'Bob', '2024-01-02', '2024-01-01 10:00:00'), (3, 'cat', 'CAT', NULL, 'x', '2023-05-05', '2023-05-05 00:00:00'), (4, 'Dan', 'dan', 'dan ', 'dan', '2024-01-01', NULL)",
         "CREATE TABLE amounts (id INT PRIMARY KEY, p DECIMAL(30,20), q DECIMAL(30,20), n INT, s DECIMAL(5,2))",
         "INSERT INTO amounts VALUES (1, 1.00000000000000000001, 1.00000000000000000002, 1, 1.00), (2, 1.00000000000000000000, 1.0, 1, 1.01), (3, 12345678.00000000000001, 12345678.00000000000001, 12345678, 0.10)",
     ] {
@@ -266,4 +269,109 @@ fn a_prepared_statement_compares_a_pair_beside_a_bound_value() {
             ..
         }))
     ));
+}
+
+/// A call beside another call or a column, and a written word in another
+/// case, which MySQL answers before it compares.
+#[test]
+fn a_call_meets_another_call_or_a_column_of_its_kind() {
+    let (_directory, mut adapter) = adapter();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM people WHERE LOWER(name) = LOWER('ANN') ORDER BY id",
+            &["1"][..],
+        ),
+        (
+            "SELECT id FROM people WHERE UPPER(name) > UPPER('b') ORDER BY id",
+            &["2", "3", "4"],
+        ),
+        (
+            "SELECT id FROM people WHERE name = UPPER('ann') ORDER BY id",
+            &["1"],
+        ),
+        // utf8mb4_bin keeps case, so the lowered word is not 'Bob'.
+        (
+            "SELECT id FROM people WHERE b = LOWER('BOB') ORDER BY id",
+            &[],
+        ),
+        (
+            "SELECT id FROM people WHERE LOWER(name) = UPPER(email) ORDER BY id",
+            &["1", "3", "4"],
+        ),
+        (
+            "SELECT id FROM people WHERE LOWER(name) < LOWER(email) ORDER BY id",
+            &["2"],
+        ),
+        (
+            "SELECT id FROM people WHERE LOWER(name) = LOWER(nick) ORDER BY id",
+            &["1"],
+        ),
+        (
+            "SELECT id FROM people WHERE CHAR_LENGTH(name) < CHAR_LENGTH(nick) ORDER BY id",
+            &["2", "4"],
+        ),
+        (
+            "SELECT id FROM people WHERE DATE(dt) = DATE(d) ORDER BY id",
+            &["1", "3"],
+        ),
+        (
+            "SELECT id FROM people WHERE YEAR(dt) = YEAR(d) ORDER BY id",
+            &["1", "2", "3"],
+        ),
+        (
+            "SELECT id FROM people WHERE LOWER(name) = email ORDER BY id",
+            &["1", "3", "4"],
+        ),
+        (
+            "SELECT id FROM people WHERE email = LOWER(name) ORDER BY id",
+            &["1", "3", "4"],
+        ),
+        (
+            "SELECT id FROM people WHERE email < UPPER(name) ORDER BY id",
+            &[],
+        ),
+        (
+            "SELECT id FROM people WHERE CHAR_LENGTH(name) = id ORDER BY id",
+            &["3"],
+        ),
+        (
+            "SELECT id FROM people WHERE id < CHAR_LENGTH(email) ORDER BY id",
+            &["1", "2"],
+        ),
+        (
+            "SELECT id FROM people WHERE DATE(dt) = d ORDER BY id",
+            &["1", "3"],
+        ),
+    ] {
+        assert_eq!(rows(&mut adapter, sql), expected, "{sql}");
+    }
+    for sql in [
+        // Measured: compared under utf8mb4_bin, finding rows 1 and 4.
+        "SELECT id FROM people WHERE LOWER(name) = LOWER(b)",
+        "SELECT id FROM people WHERE LOWER(name) = b",
+        // A word against a number, which MySQL reads as a number first.
+        "SELECT id FROM people WHERE LOWER(name) = CHAR_LENGTH(email)",
+        "SELECT id FROM people WHERE CHAR_LENGTH(name) = name",
+        "SELECT id FROM people WHERE LOWER(name) = id",
+        // MySQL changes the case of a word outside ASCII by Unicode rules.
+        "SELECT id FROM people WHERE LOWER(name) = LOWER('\u{e9}')",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        affected(&mut adapter, "DELETE FROM people WHERE LOWER(name) = 'bob'"),
+        1
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "UPDATE people SET nick = 'same' WHERE LOWER(name) = LOWER(email)"
+        ),
+        3
+    );
+    assert_eq!(
+        affected(&mut adapter, "DELETE FROM people WHERE email = LOWER(name)"),
+        3
+    );
+    assert!(rows(&mut adapter, "SELECT id FROM people").is_empty());
 }

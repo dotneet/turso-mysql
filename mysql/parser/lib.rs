@@ -936,6 +936,9 @@ pub enum CheckedSelectComparisonRhs {
         qualifier: Option<String>,
         name: String,
     },
+    /// Another call, answering this. The two calls meet when they answer the
+    /// same kind.
+    Call(CheckedComparisonAnswer),
 }
 
 /// What a call answering the moment the statement runs answers.

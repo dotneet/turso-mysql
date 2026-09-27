@@ -6311,13 +6311,12 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         for comparison in comparisons {
-            if let Some(answers) = comparison
-                .answers()
-                .filter(|answers| is_a_json_answer(Some(*answers)))
-            {
+            // A call says what it answers, as it does in a `SELECT`, so the
+            // value it meets is held to that.
+            if let Some(answers) = comparison.answers() {
                 if !checked_comparison_meets_an_answer(comparison.rhs(), answers) {
                     return Err(LimboError::InvalidArgument(format!(
-                        "DML comparison against a JSON reading requires {}",
+                        "DML comparison against a call requires {}",
                         answered_kind_name(answers)
                     )));
                 }
@@ -9346,6 +9345,17 @@ fn checked_comparison_fits_column(
         // Two columns are held to each other by `column_pair_refusal`, which
         // needs both of them.
         CheckedSelectComparisonRhs::Column { .. } => false,
+        // A call meets a column holding what it answers, in the form it
+        // answers it in.
+        CheckedSelectComparisonRhs::Call(answers) => match answers {
+            CheckedComparisonAnswer::Text => is_text_type(type_name),
+            CheckedComparisonAnswer::WholeNumber => is_integer_type(type_name),
+            CheckedComparisonAnswer::Day => type_name == "DATE",
+            CheckedComparisonAnswer::Moment => matches!(type_name, "DATETIME" | "TIMESTAMP"),
+            CheckedComparisonAnswer::JsonText
+            | CheckedComparisonAnswer::JsonCount
+            | CheckedComparisonAnswer::JsonDocument => false,
+        },
     }
 }
 
@@ -9650,6 +9660,11 @@ fn checked_comparison_meets_an_answer(
 ) -> bool {
     match (answers, rhs) {
         (_, CheckedSelectComparisonRhs::Null) => true,
+        // The renderer takes two calls only when they answer one kind, and
+        // not a kind read out of JSON.
+        (answers, CheckedSelectComparisonRhs::Call(other)) => {
+            answers == *other && !is_a_json_answer(Some(answers))
+        }
         (CheckedComparisonAnswer::Text, CheckedSelectComparisonRhs::Text(_)) => true,
         (
             CheckedComparisonAnswer::WholeNumber,
@@ -9796,10 +9811,25 @@ fn checked_comparison_column_refusal(
             "a signed integer column, because a parameter carries no type"
         }
         CheckedSelectComparisonRhs::Column { .. } => "a column of the same kind",
+        CheckedSelectComparisonRhs::Call(answers) => answered_column_kind_name(*answers),
     };
     LimboError::InvalidArgument(format!(
         "SELECT comparison on {column_name} requires {wanted}, found {type_name}"
     ))
+}
+
+/// Names the column a call answering this meets, for a refusal a client can
+/// read.
+const fn answered_column_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
+    match answers {
+        CheckedComparisonAnswer::Text => "a text column",
+        CheckedComparisonAnswer::WholeNumber => "a whole-number column",
+        CheckedComparisonAnswer::Day => "a DATE column",
+        CheckedComparisonAnswer::Moment => "a DATETIME or TIMESTAMP column",
+        CheckedComparisonAnswer::JsonText
+        | CheckedComparisonAnswer::JsonCount
+        | CheckedComparisonAnswer::JsonDocument => "no column",
+    }
 }
 
 fn validate_frozen_select_comparison_columns(
