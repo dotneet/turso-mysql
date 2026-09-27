@@ -310,6 +310,43 @@ fn round_rounds_each_kind_of_number_the_way_mysql_does() {
     );
 }
 
+/// `FORMAT` over a DECIMAL rounds the exact decimal, half away from zero.
+#[test]
+fn format_groups_a_decimal_rounded_as_the_decimal_it_is() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("CREATE TABLE fm (id INT PRIMARY KEY, d DECIMAL(10,3))")
+        .unwrap();
+    adapter
+        .execute_query(
+            "INSERT INTO fm VALUES (1, 1234567.125), (2, -0.005), (3, -1234.5), (4, NULL), (5, -0.004), (6, 9999999.995)",
+        )
+        .unwrap();
+    let sql = "SELECT FORMAT(d, 2), FORMAT(d, 0), FORMAT(d, 5), FORMAT(d, -1) FROM fm ORDER BY id";
+    assert_eq!(
+        rows(&mut adapter, sql),
+        [
+            "1,234,567.13 1,234,567 1,234,567.12500 1,234,567",
+            "-0.01 0 -0.00500 0",
+            "-1,234.50 -1,235 -1,234.50000 -1,235",
+            "NULL NULL NULL NULL",
+            "0.00 0 -0.00400 0",
+            "10,000,000.00 10,000,000 9,999,999.99500 10,000,000",
+        ]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT FORMAT(d, 40) FROM fm WHERE id = 1"),
+        ["1,234,567.125000000000000000000000000000"]
+    );
+    // The width is the column's own 12, a comma for every three digits, and
+    // thirty-two, four bytes to the character.
+    let column = &result(&mut adapter, sql).columns[0];
+    assert_eq!(
+        (column.column_type, column.column_length),
+        (MYSQL_TYPE_VAR_STRING, 192)
+    );
+}
+
 #[test]
 fn numeric_operators_refuse_what_mysql_answers_by_another_rule() {
     let (_directory, mut adapter) = adapter();

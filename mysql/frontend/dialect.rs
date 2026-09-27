@@ -1036,15 +1036,22 @@ impl Dialect for MySqlDialect {
                     "{name} takes two arguments"
                 )));
             };
-            let number = match value {
-                Value::Numeric(Numeric::Integer(integer)) => *integer as f64,
-                Value::Numeric(Numeric::Float(float)) => f64::from(*float),
-                _ => return Ok(Value::Null),
-            };
             // Measured on MySQL 8.4.11: a negative count answers no fraction
             // at all rather than rounding to a whole ten.
             let decimals = match decimals {
                 Value::Numeric(Numeric::Integer(integer)) => u32::try_from(*integer).unwrap_or(0),
+                _ => return Ok(Value::Null),
+            };
+            // A DECIMAL reaches here written out in full, so it is rounded as
+            // written rather than through a double.
+            if let Value::Text(written) = value {
+                return Ok(Value::build_text(
+                    turso_mysql_parser::format_written_decimal(written.as_str(), decimals),
+                ));
+            }
+            let number = match value {
+                Value::Numeric(Numeric::Integer(integer)) => *integer as f64,
+                Value::Numeric(Numeric::Float(float)) => f64::from(*float),
                 _ => return Ok(Value::Null),
             };
             return Ok(Value::build_text(turso_mysql_parser::format_number(

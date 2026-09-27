@@ -46,6 +46,36 @@ pub fn format_number(value: f64, decimals: u32) -> String {
     out
 }
 
+/// Writes an exact decimal the way MySQL's `FORMAT` writes a `DECIMAL`.
+///
+/// The decimal is written out in full, as the engine writes one, so it is
+/// rounded as written rather than through a double. Measured on MySQL 8.4.11
+/// over a `DECIMAL(10,3)`: `FORMAT(1234567.125, 2)` is `1,234,567.13`,
+/// `FORMAT(-0.005, 2)` is `-0.01`, `FORMAT(-0.004, 2)` is `0.00` with no sign,
+/// and `FORMAT(-0.004, 5)` is `-0.00400`.
+pub fn format_written_decimal(written: &str, decimals: u32) -> String {
+    let decimals = decimals.min(MAX_FORMAT_DECIMALS) as usize;
+    let (negative, magnitude) = match written.strip_prefix('-') {
+        Some(magnitude) => (true, magnitude),
+        None => (false, written),
+    };
+    let rounded = round_away_from_zero(magnitude, decimals);
+    let (whole, fraction) = match rounded.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (rounded.as_str(), ""),
+    };
+    let mut out = String::with_capacity(whole.len() + whole.len() / 3 + fraction.len() + 2);
+    if negative && rounded.bytes().any(|digit| digit != b'0' && digit != b'.') {
+        out.push('-');
+    }
+    group_in_threes(whole, &mut out);
+    if !fraction.is_empty() {
+        out.push('.');
+        out.push_str(fraction);
+    }
+    out
+}
+
 /// Rounds a written decimal to `decimals` places, half away from zero.
 fn round_away_from_zero(written: &str, decimals: usize) -> String {
     let (whole, fraction) = match written.split_once('.') {

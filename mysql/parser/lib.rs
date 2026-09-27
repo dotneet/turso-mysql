@@ -120,7 +120,7 @@ pub use mysql_ddl::{
     render_create_view_mysql_with_mode, render_show_create_trigger_mysql,
     render_show_create_view_mysql, stored_character_length, stored_temporal_precision,
 };
-pub use number_format::{format_number, truncate_number};
+pub use number_format::{format_number, format_written_decimal, truncate_number};
 pub use select_projection_origins::{
     compound_drops_repeated_rows, select_projection_origins, MySqlSelectProjectionOrigin,
 };

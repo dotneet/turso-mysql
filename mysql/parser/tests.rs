@@ -3686,7 +3686,7 @@ fn decimal_scalar_calls_without_exact_comparison_are_rejected() {
     // ROUND is rounded as a DECIMAL, to the places held to the column's scale.
     assert_eq!(
         parse_select_knowing_decimal_columns(
-            "SELECT ROUND(v), ROUND(v, 1), ROUND(v, 5) FROM amounts",
+            "SELECT ROUND(v), ROUND(v, 1), ROUND(v, 5), FORMAT(v, 40) FROM amounts",
             SessionSqlMode::default(),
             &[],
             &["v".to_string()],
@@ -3700,7 +3700,9 @@ fn decimal_scalar_calls_without_exact_comparison_are_rejected() {
         concat!(
             "SELECT mysql_decimal_round(\"v\", 0) AS \"ROUND(v)\", ",
             "mysql_decimal_round(\"v\", 1) AS \"ROUND(v, 1)\", ",
-            "mysql_decimal_round(\"v\", 2) AS \"ROUND(v, 5)\" FROM \"amounts\""
+            "mysql_decimal_round(\"v\", 2) AS \"ROUND(v, 5)\", ",
+            "mysql_format(mysql_decimal_round(\"v\", 30), 30) AS \"FORMAT(v, 40)\" ",
+            "FROM \"amounts\""
         )
     );
     for sql in [
@@ -3715,7 +3717,6 @@ fn decimal_scalar_calls_without_exact_comparison_are_rejected() {
         "SELECT GREATEST(v, w) FROM amounts",
         "SELECT LEAST(v, w) FROM amounts",
         "SELECT HEX(v) FROM amounts",
-        "SELECT FORMAT(v, 2) FROM amounts",
         "SELECT NULLIF(v, 0) FROM amounts",
         "SELECT CAST(v AS SIGNED) FROM amounts",
         "SELECT CONVERT(v, SIGNED) FROM amounts",

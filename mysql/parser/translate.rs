@@ -5358,7 +5358,7 @@ fn render_scalar_call(
         _ => false,
     };
     if has_decimal_argument
-        && !["ABS", "TRUNCATE", "ROUND"]
+        && !["ABS", "TRUNCATE", "ROUND", "FORMAT"]
             .iter()
             .any(|call| name.value.eq_ignore_ascii_case(call))
     {
@@ -5898,6 +5898,29 @@ fn render_scalar_call(
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("FORMAT") {
+        // A DECIMAL is rounded half away from zero and written out in full
+        // first, as MySQL rounds one, so its digits are grouped as they stand
+        // rather than through a double.
+        if has_decimal_argument {
+            let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+                unreachable!("a checked FORMAT was checked to have an argument list");
+            };
+            let Some(places) = arguments.args.get(1).and_then(|argument| match argument {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expr,
+                )) => direct_signed_integer(expr),
+                _ => None,
+            }) else {
+                return unsupported("SELECT FORMAT of a DECIMAL to places not written whole");
+            };
+            // Measured on MySQL 8.4.11: a negative count writes no fraction
+            // and a count past thirty writes thirty.
+            let places = places.clamp(0, 30);
+            return Ok(format!(
+                "mysql_format(mysql_decimal_round({}, {places}), {places})",
+                scalar_argument(function, 0)?
+            ));
+        }
         return Ok(format!(
             "mysql_format({}, {})",
             scalar_argument(function, 0)?,

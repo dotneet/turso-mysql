@@ -3223,6 +3223,13 @@ zero rather than to the even digit — `0.5`, `1.5` and `2.5` are `1`, `2` and
 `0`, a negative count answers no fraction at all rather than rounding to a
 whole ten, and asking for forty digits answers thirty.
 
+A `DECIMAL` is rounded as the exact decimal it is, half away from zero, rather
+than through a double: measured over a `DECIMAL(10,3)`, `FORMAT(1234567.125, 2)`
+is `1,234,567.13`, `FORMAT(9999999.995, 2)` is `10,000,000.00`,
+`FORMAT(-0.005, 2)` is `-0.01`, `FORMAT(-0.004, 2)` is `0.00` with no sign and
+`FORMAT(-0.004, 5)` is `-0.00400`. The engine rounds it with its decimal
+rounding and the dialect groups what that writes.
+
 The result is a VAR_STRING whose width is the column's own length plus a comma
 for every three of its digits plus thirty-two, and the count does not change
 it — measured, 184 over an `INT` of 11, 232 over a `BIGINT` of 20, 244 over a
