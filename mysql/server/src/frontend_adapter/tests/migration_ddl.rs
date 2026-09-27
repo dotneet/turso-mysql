@@ -345,3 +345,77 @@ fn rename_index_keeps_the_index_and_its_place() {
     let shown = rows(&mut adapter, "SHOW INDEX FROM i5");
     assert_eq!(shown[1][2].as_deref(), Some("kz"));
 }
+
+/// Rails' `change_column_default` writes `ALTER TABLE t ALTER COLUMN c SET
+/// DEFAULT ...`, and `DROP DEFAULT` for a column that may not be NULL.
+#[test]
+fn alter_column_sets_and_drops_a_default() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE s1 (id INT NOT NULL PRIMARY KEY, a INT, b INT NOT NULL DEFAULT 3, c VARCHAR(10) DEFAULT 'x', d DECIMAL(8,2), f TEXT)",
+    );
+    run(&mut adapter, "ALTER TABLE s1 ALTER COLUMN a SET DEFAULT 5");
+    run(&mut adapter, "ALTER TABLE `s1` ALTER `b` DROP DEFAULT");
+    run(
+        &mut adapter,
+        "ALTER TABLE s1 ALTER COLUMN c SET DEFAULT 'it''s'",
+    );
+    let expected = concat!(
+        "CREATE TABLE `s1` (\n",
+        "  `id` int NOT NULL,\n",
+        "  `a` int DEFAULT '5',\n",
+        "  `b` int NOT NULL,\n",
+        "  `c` varchar(10) DEFAULT 'it''s',\n",
+        "  `d` decimal(8,2) DEFAULT NULL,\n",
+        "  `f` text,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(printed_table(&mut adapter, "s1"), expected);
+    assert_eq!(
+        defaults(&mut adapter, "s1"),
+        vec![
+            vec![Some("id".to_owned()), None],
+            some(&["a", "5"]),
+            vec![Some("b".to_owned()), None],
+            some(&["c", "it's"]),
+            vec![Some("d".to_owned()), None],
+            vec![Some("f".to_owned()), None],
+        ]
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE s1 ALTER COLUMN a SET DEFAULT NULL",
+    );
+    assert!(printed_table(&mut adapter, "s1").contains("  `a` int DEFAULT NULL,\n"));
+    run(&mut adapter, "INSERT INTO s1 (id, b) VALUES (1, 1)");
+    assert_eq!(
+        rows(&mut adapter, "SELECT a, b, c, d FROM s1"),
+        vec![vec![
+            None,
+            Some("1".to_owned()),
+            Some("it's".to_owned()),
+            None
+        ]]
+    );
+
+    for sql in [
+        // Measured: 1067, 1067, 1101 and 1054.
+        "ALTER TABLE s1 ALTER COLUMN a SET DEFAULT 'abc'",
+        "ALTER TABLE s1 ALTER COLUMN b SET DEFAULT NULL",
+        "ALTER TABLE s1 ALTER COLUMN f SET DEFAULT 'x'",
+        "ALTER TABLE s1 ALTER COLUMN nope SET DEFAULT 1",
+        // Taken by MySQL. A `DECIMAL` column restated in place reads back as
+        // one no `SELECT` here takes, so its default is not changed that way.
+        "ALTER TABLE s1 ALTER COLUMN d SET DEFAULT '4.5'",
+        // Taken by MySQL, which then prints the column with no default at
+        // all, a shape this cannot keep.
+        "ALTER TABLE s1 ALTER COLUMN a DROP DEFAULT",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    let mut adapter = reopened(&directory, adapter);
+    assert!(printed_table(&mut adapter, "s1").contains("  `b` int NOT NULL,\n"));
+}

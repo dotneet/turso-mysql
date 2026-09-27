@@ -4825,6 +4825,51 @@ fn a_floating_column_takes_a_word_mysql_prints_back_unchanged() {
     }
 }
 
+/// Measured on MySQL 8.4.11: `ALTER COLUMN c SET DEFAULT v` and `DROP
+/// DEFAULT` leave the column as it was but for its default.
+#[test]
+fn a_default_change_is_a_modify_of_the_column_with_its_new_default() {
+    let stored = "CREATE TABLE `s1` (`id` INT NOT NULL PRIMARY KEY, `a` INT DEFAULT NULL, `b` INT NOT NULL DEFAULT 3, `c` VARCHAR(10) DEFAULT 'x', `d` DECIMAL(8,2) DEFAULT NULL)";
+    let restated =
+        |sql: &str| alter_column_default_restated(stored, sql, SessionSqlMode::default());
+    assert_eq!(
+        restated("ALTER TABLE s1 ALTER COLUMN a SET DEFAULT 5").unwrap(),
+        Some(MySqlColumnDefaultChange::Restated(
+            "ALTER TABLE `s1` MODIFY COLUMN `a` INT DEFAULT 5".to_owned()
+        ))
+    );
+    assert_eq!(
+        restated("ALTER TABLE `s1` ALTER `b` DROP DEFAULT, ALTER c SET DEFAULT 'y'").unwrap(),
+        Some(MySqlColumnDefaultChange::Restated(
+            "ALTER TABLE `s1` MODIFY COLUMN `b` INT NOT NULL, MODIFY COLUMN `c` VARCHAR(10) DEFAULT 'y'"
+                .to_owned()
+        ))
+    );
+    assert_eq!(
+        restated("ALTER TABLE s1 ALTER COLUMN nope SET DEFAULT 1").unwrap(),
+        Some(MySqlColumnDefaultChange::NoSuchColumn("nope".to_owned()))
+    );
+    for sql in [
+        "ALTER TABLE s1 ADD COLUMN n INT",
+        "ALTER TABLE s1 ALTER COLUMN a SET DEFAULT 1, ADD COLUMN n INT",
+    ] {
+        assert_eq!(restated(sql).unwrap(), None, "{sql}");
+    }
+    // Taken by MySQL, which then prints the column with no default at all.
+    assert!(restated("ALTER TABLE s1 ALTER COLUMN a DROP DEFAULT").is_err());
+    assert!(restated("ALTER TABLE s1 ALTER COLUMN d SET DEFAULT 1").is_err());
+    // Measured: 1067, written either way.
+    for sql in [
+        "CREATE TABLE t (a INT NOT NULL DEFAULT NULL)",
+        "CREATE TABLE t (a VARCHAR(3) DEFAULT NULL NOT NULL)",
+    ] {
+        assert!(
+            parse_create_table(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
 #[test]
 fn preserves_explicit_nullable_mediumint_through_checked_rendering() {
     let create = "CREATE TABLE `numbers` (`value` MEDIUMINT NULL)";
@@ -4948,12 +4993,6 @@ fn keeps_nullable_and_default_null_column_options_distinct() {
             "CREATE TABLE `t` (`value` MEDIUMINT NULL DEFAULT NULL)",
             2,
         ),
-        (
-            "CREATE TABLE t (value MEDIUMINT NOT NULL DEFAULT NULL)",
-            "CREATE TABLE \"t\" (\"value\" MEDIUMINT NOT NULL DEFAULT NULL)",
-            "CREATE TABLE `t` (`value` MEDIUMINT NOT NULL DEFAULT NULL)",
-            2,
-        ),
     ] {
         assert_eq!(parse_create_table(sql, mode).unwrap().as_sql(), normalized);
         let statement = parse_create_table_ast(sql, mode).unwrap();
@@ -4976,6 +5015,8 @@ fn keeps_nullable_and_default_null_column_options_distinct() {
 fn rejects_ambiguous_nullable_column_options() {
     let mode = SessionSqlMode::default();
     for sql in [
+        // Measured on MySQL 8.4.11: 1067.
+        "CREATE TABLE t (value MEDIUMINT NOT NULL DEFAULT NULL)",
         "CREATE TABLE t (value MEDIUMINT NULL NULL)",
         "CREATE TABLE t (value MEDIUMINT NULL NOT NULL)",
         "CREATE TABLE t (value MEDIUMINT NOT NULL NULL)",

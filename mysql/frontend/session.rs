@@ -3333,6 +3333,15 @@ impl MySqlConnection {
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
     pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        match self.column_default_an_alter_changes(sql)? {
+            Some(turso_mysql_parser::MySqlColumnDefaultChange::Restated(restated)) => {
+                return self.execute_schema_ddl(&restated);
+            }
+            Some(turso_mysql_parser::MySqlColumnDefaultChange::NoSuchColumn(name)) => {
+                return Err(MySqlQueryError::Engine(LimboError::NoSuchColumn { name }));
+            }
+            None => {}
+        }
         if let Some(collated) = self.with_the_table_collation_on_each_text_column(sql)? {
             return self.execute_schema_ddl(&collated);
         }
@@ -3482,6 +3491,34 @@ impl MySqlConnection {
             )));
         };
         self.advance_auto_increment_past(&table, start - 1, None)
+    }
+
+    /// An `ALTER TABLE ... ALTER COLUMN c SET DEFAULT` or `DROP DEFAULT`, read
+    /// against the table it changes. Answers `None` for every other statement.
+    fn column_default_an_alter_changes(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<turso_mysql_parser::MySqlColumnDefaultChange>, MySqlQueryError>
+    {
+        if !sql
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ALTER"))
+        {
+            return Ok(None);
+        }
+        let mode = self.parser_mode();
+        let Some(target) = turso_mysql_parser::alter_table_target(sql, mode) else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .stored_table_statement(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        turso_mysql_parser::alter_column_default_restated(&stored, sql, mode)
+            .map_err(mysql_query_parse_error)
     }
 
     /// A `CREATE TABLE` or `ALTER TABLE` with the collation of its table

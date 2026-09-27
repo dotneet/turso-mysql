@@ -182,9 +182,14 @@ boolean literal.
 
 | Form | State |
 |---|---|
-| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / the index operations, `RENAME INDEX` among them | refused |
 | `RENAME INDEX` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` does not read it, so it is read by its own words and only on its own. Measured, MySQL takes it beside anything else |
+| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / the index operations, `RENAME INDEX` among them | refused |
+| `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` beside any other operation | refused; each is written as a `MODIFY COLUMN` of the column it names, and only a statement made of them alone is |
+| `ALTER COLUMN c DROP DEFAULT` on a column that may hold NULL | refused; measured, MySQL takes it and then prints the column with no `DEFAULT` at all — `` `a` int, `` — where a nullable column with no default of its own prints `DEFAULT NULL` here |
+| `ALTER COLUMN ... SET DEFAULT` or `DROP DEFAULT` on a `DECIMAL` column | refused; the change is a `MODIFY COLUMN`, and a `DECIMAL` column restated by one is read back as a column no `SELECT` takes (see below) |
+| `MODIFY COLUMN` of a `DECIMAL` column | taken, and every `SELECT` naming the column afterwards is refused as unsupported; found while writing `ALTER COLUMN ... SET DEFAULT`, not yet looked into |
 | `RENAME INDEX` of the key a column declares for itself — `email VARCHAR(255) UNIQUE` | refused; the engine keeps that one with no statement of its own to write again under the new name |
+| `ALTER COLUMN ... SET DEFAULT` on a column with a `COMMENT` or `ON UPDATE CURRENT_TIMESTAMP`, or on the primary-key column | refused, for the reasons a `MODIFY COLUMN` of one is |
 | Moving the column a table counts on, or the one its key is over | refused; the counted column stands for the engine's rowid and the key is what the rows are found by, and neither survives being written somewhere else |
 | `ALTER TABLE ... ADD COLUMN ... FIRST`/`AFTER` on a table carrying a trigger | refused; the table is written again and a trigger is not the table's own row, where MySQL leaves one where it stood |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |

@@ -179,14 +179,14 @@ use std::{fmt, num::NonZeroUsize};
 
 use sqlparser::{
     ast::{
-        AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits, CharacterLength,
-        ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable, CreateTableOptions,
-        CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr, FromTable,
-        FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert, NullsDistinctOption,
-        ObjectName, ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind, SelectFlavor,
-        SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor, TableObject,
-        TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind, TriggerPeriod,
-        UnaryOperator, Update, Value,
+        AlterColumnOperation, AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits,
+        CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable,
+        CreateTableOptions, CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr,
+        FromTable, FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert,
+        NullsDistinctOption, ObjectName, ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind,
+        SelectFlavor, SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor,
+        TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind,
+        TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -3476,6 +3476,127 @@ pub fn table_with_a_column_placed(
     )))
 }
 
+/// What an `ALTER TABLE ... ALTER COLUMN c SET DEFAULT` or `DROP DEFAULT`
+/// means for the table it changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlColumnDefaultChange {
+    /// The same change written as a `MODIFY COLUMN` restating each column
+    /// whole with its new default, which the `ALTER TABLE` path already runs.
+    Restated(String),
+    /// The statement names a column the table has not got, which MySQL
+    /// answers 1054 for — measured, `Unknown column 'nope' in 's1'`.
+    NoSuchColumn(String),
+}
+
+/// Reads an `ALTER TABLE` whose every operation sets or drops a column's
+/// default — Rails' `change_column_default` — against the table it changes,
+/// and answers it as a `MODIFY COLUMN` of each column with its new default.
+///
+/// Measured on MySQL 8.4.11: `ALTER COLUMN a SET DEFAULT 5` and the shorter
+/// `ALTER a SET DEFAULT 5` leave the column as it was but for the default,
+/// which prints the way the same default written in a `CREATE TABLE` prints
+/// and is checked the same way — a word naming no number on an `INT` is 1067,
+/// a default on a `TEXT` is 1101 — and `DROP DEFAULT` on a `NOT NULL` column
+/// leaves it printing `` `b` int NOT NULL ``.
+///
+/// Refused, where MySQL takes it: `DROP DEFAULT` on a column that may hold
+/// NULL, which MySQL then prints with no `DEFAULT` at all — `` `a` int, `` —
+/// a shape this has no way to keep, a nullable column with no default of its
+/// own printing `DEFAULT NULL` here.
+///
+/// Answers `None` for any other statement, including one mixing these with
+/// other operations, which is left to be refused where it is read.
+pub fn alter_column_default_restated(
+    stored_ddl: &str,
+    alter_sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlColumnDefaultChange>, ParseError> {
+    let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
+        return Ok(None);
+    };
+    let changes =
+        alter
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                AlterTableOperation::AlterColumn {
+                    column_name,
+                    op:
+                        op @ (AlterColumnOperation::SetDefault { .. }
+                        | AlterColumnOperation::DropDefault),
+                } => Some((column_name, op)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>();
+    let Some(changes) = changes.filter(|changes| !changes.is_empty()) else {
+        return Ok(None);
+    };
+    let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let mut restated = Vec::with_capacity(changes.len());
+    for (column_name, op) in changes {
+        let Some(column) = stored
+            .columns
+            .iter()
+            .find(|column| column.name.value.eq_ignore_ascii_case(&column_name.value))
+        else {
+            return Ok(Some(MySqlColumnDefaultChange::NoSuchColumn(
+                column_name.value.clone(),
+            )));
+        };
+        // A `DECIMAL` column restated by a `MODIFY` reads back as one no
+        // `SELECT` here takes, so its default is not changed that way.
+        if decimal_size_of(&column.data_type)?.is_some() {
+            return unsupported("changing the default of a DECIMAL column in place");
+        }
+        let mut column = column.clone();
+        column
+            .options
+            .retain(|option| !matches!(option.option, ColumnOption::Default(_)));
+        match op {
+            // Measured on MySQL 8.4.11: 1101 for a default on a `TEXT`, which
+            // a `CREATE TABLE` here still takes.
+            AlterColumnOperation::SetDefault { .. }
+                if matches!(
+                    column.data_type,
+                    DataType::TinyText
+                        | DataType::Text
+                        | DataType::MediumText
+                        | DataType::LongText
+                        | DataType::TinyBlob
+                        | DataType::Blob(_)
+                        | DataType::MediumBlob
+                        | DataType::LongBlob
+                        | DataType::JSON
+                ) =>
+            {
+                return unsupported("a default on a TEXT, BLOB or JSON column");
+            }
+            AlterColumnOperation::SetDefault { value } => column.options.push(ColumnOptionDef {
+                name: None,
+                option: ColumnOption::Default(value.clone()),
+            }),
+            AlterColumnOperation::DropDefault => {
+                if !column
+                    .options
+                    .iter()
+                    .any(|option| matches!(option.option, ColumnOption::NotNull))
+                {
+                    return unsupported("DROP DEFAULT on a column that may hold NULL");
+                }
+            }
+            _ => unreachable!("only default changes are collected"),
+        }
+        restated.push(format!("MODIFY COLUMN {column}"));
+    }
+    Ok(Some(MySqlColumnDefaultChange::Restated(format!(
+        "ALTER TABLE {} {}",
+        render_mysql_object_name(&alter.name)?,
+        restated.join(", ")
+    ))))
+}
+
 /// Whether one column is the one the table's primary key is over.
 fn names_the_key(table: &CreateTable, column: &str) -> bool {
     let inline = table.columns.iter().any(|declared| {
@@ -6513,6 +6634,19 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
+    // Measured on MySQL 8.4.11: `NOT NULL DEFAULT NULL`, in either order, is
+    // 1067, and so is an `ALTER COLUMN ... SET DEFAULT NULL` on such a column.
+    if column
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::NotNull))
+        && column.options.iter().any(|option| {
+            matches!(&option.option, ColumnOption::Default(Expr::Value(value))
+                if matches!(value.value, Value::Null))
+        })
+    {
+        return unsupported("DEFAULT NULL on a NOT NULL column");
+    }
     let collation = engine_collation_of(column);
     let options = column
         .options
