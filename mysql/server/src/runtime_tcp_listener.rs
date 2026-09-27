@@ -216,6 +216,13 @@ impl RuntimeTcpListener {
         stream
             .set_nonblocking(false)
             .map_err(|_| RuntimeTcpListenerError::TransportConfiguration)?;
+        // A result goes out as several small writes. Held back until the
+        // client acknowledges the first, as the kernel does by default, each
+        // answer waits out the client's delayed acknowledgement: tens of
+        // milliseconds a statement.
+        stream
+            .set_nodelay(true)
+            .map_err(|_| RuntimeTcpListenerError::TransportConfiguration)?;
         stream
             .set_read_timeout(Some(self.config.timeouts().tls()))
             .map_err(|_| RuntimeTcpListenerError::TransportConfiguration)?;
@@ -1603,6 +1610,7 @@ mod tests {
         let runtime = protocol_runtime(Duration::from_secs(1));
         let client = TcpStream::connect(runtime.listener.local_addr()).expect("test client");
         let accepted = runtime.listener.accept().expect("accepted stream");
+        assert!(accepted.stream.nodelay().unwrap());
         assert_ne!(accepted.connection_id(), 0);
         assert!(!accepted.tls_deadline().le(&Instant::now()));
         assert_eq!(accepted.limits().max_write_frames(), 16);
