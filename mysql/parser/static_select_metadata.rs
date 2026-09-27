@@ -207,6 +207,10 @@ pub enum ScalarFunction {
     ReadsTheDayOfTheYear,
     /// `WEEK`, which answers 0 to 53.
     ReadsTheWeek,
+    /// `YEARWEEK`, which answers the year and the week as one number.
+    ReadsTheYearAndWeek,
+    /// `TO_DAYS`, which counts the days from the year zero.
+    CountsDaysFromTheYearZero,
     /// `DAYNAME` and `MONTHNAME`, which answer the English name of a day of
     /// the week or of a month.
     NamesTheDayOrMonth,
@@ -2783,6 +2787,43 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `ADDDATE` and `SUBDATE` are `DATE_ADD` and `DATE_SUB` under other names,
+    // and a bare count is a count of days. Measured on MySQL 8.4.11, each
+    // reports what its `DATE_ADD` spelling reports.
+    if named(&["ADDDATE", "SUBDATE"]) {
+        return scalar_call(&date_shift_spelled_out(function)?);
+    }
+    // `TO_DAYS(d)` counts the days from the year zero, and `YEARWEEK(d)` the
+    // year and the week together, by the countings a written mode names. Each
+    // reads a moment the counts above read.
+    if named(&["TO_DAYS", "YEARWEEK"]) {
+        let (moment, mode) = match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(moment))] => {
+                (moment, None)
+            }
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(moment)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(mode))]
+                if named(&["YEARWEEK"]) =>
+            {
+                (moment, Some(mode))
+            }
+            _ => return None,
+        };
+        if let Some(mode) = mode {
+            week_mode(mode)?;
+        }
+        let mut columns = Vec::new();
+        counted_moment(moment, &mut columns)?;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if named(&["TO_DAYS"]) {
+                ScalarFunction::CountsDaysFromTheYearZero
+            } else {
+                ScalarFunction::ReadsTheYearAndWeek
+            },
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     // `DAYNAME(d)` and `MONTHNAME(d)` name the day of the week and the month
     // a moment falls in, and `WEEK(d)` numbers its week, by the counting a
     // written mode from 0 through 7 names. Each reads a moment the counts
@@ -2901,6 +2942,60 @@ pub(super) fn clock_places(function: &sqlparser::ast::Function) -> Option<u32> {
         }
         _ => None,
     }
+}
+
+/// Writes `ADDDATE(x, n)` and `SUBDATE(x, n)` as the `DATE_ADD(x, INTERVAL n
+/// DAY)` and `DATE_SUB` they mean, and `ADDDATE(x, INTERVAL ...)` as the same
+/// call under its other name.
+pub(super) fn date_shift_spelled_out(
+    function: &sqlparser::ast::Function,
+) -> Option<sqlparser::ast::Function> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    let spelled_out = if name.value.eq_ignore_ascii_case("ADDDATE") {
+        "DATE_ADD"
+    } else if name.value.eq_ignore_ascii_case("SUBDATE") {
+        "DATE_SUB"
+    } else {
+        return None;
+    };
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [shifted @ sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(_)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(count))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let interval = match count {
+        Expr::Interval(interval) => interval.clone(),
+        count => {
+            crate::translate::direct_signed_integer(count)?;
+            sqlparser::ast::Interval {
+                value: Box::new(count.clone()),
+                leading_field: Some(sqlparser::ast::DateTimeField::Day),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            }
+        }
+    };
+    let mut spelled = function.clone();
+    spelled.name = sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+        sqlparser::ast::Ident::new(spelled_out),
+    )]);
+    spelled.args = sqlparser::ast::FunctionArguments::List(sqlparser::ast::FunctionArgumentList {
+        duplicate_treatment: None,
+        args: vec![
+            shifted.clone(),
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Interval(interval),
+            )),
+        ],
+        clauses: Vec::new(),
+    });
+    Some(spelled)
 }
 
 /// Classifies `EXTRACT(<field> FROM column)`, which reads a part of a moment

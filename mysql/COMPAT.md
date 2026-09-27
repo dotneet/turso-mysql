@@ -1768,6 +1768,21 @@ The shapes are measured too: `WEEK` a LONGLONG of 3, and `DAYNAME` and
 `MONTHNAME` a `VAR_STRING` of 36 in utf8mb4, all nullable. A name is compared
 without regard to case — `WHERE DAYNAME(d) = 'sunday'` finds the Sundays.
 
+`YEARWEEK(d)` and `YEARWEEK(d, mode)` write the year and the week together,
+counting as `WEEK` does in the same mode with the bit set that keeps a week in
+the year it mostly falls in, and `TO_DAYS(d)` counts the days from the year
+zero by the calendar MySQL keeps. Each reads what `WEEK` reads. Measured on
+8.4.11: `YEARWEEK('2026-01-15')` is 202602 and 202603 in mode 1,
+`TO_DAYS('2026-01-15')` is 739996, and the first of January of the year one is
+day 366, in week 53 of the year zero. `YEARWEEK` reports a LONGLONG of 7 and
+`TO_DAYS` one of 8, both nullable over a NOT NULL column.
+
+`ADDDATE` and `SUBDATE` are `DATE_ADD` and `DATE_SUB` under other names, and
+a bare count is a count of days: `ADDDATE(d, 1)` is `DATE_ADD(d, INTERVAL 1
+DAY)`. Measured on 8.4.11, each reports what its `DATE_ADD` spelling reports,
+and is taken wherever that spelling is taken as a result column. A count read
+from the row is refused, as it is for `DATE_ADD`.
+
 A `LIKE` pattern may be written in pieces — `LIKE CONCAT('%', ?, '%')` is how
 a search filter wraps the value it binds in wildcards, and
 `LIKE CONCAT('%', 'lph', '%')` the same pattern written out. Measured on MySQL

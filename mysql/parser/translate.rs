@@ -5636,6 +5636,34 @@ fn render_scalar_call(
             "mysql_week({}, {mode})",
             moment_argument(function, render_context)?
         ));
+    } else if name.value.eq_ignore_ascii_case("ADDDATE")
+        || name.value.eq_ignore_ascii_case("SUBDATE")
+    {
+        let spelled = static_select_metadata::date_shift_spelled_out(function)
+            .expect("a checked ADDDATE was checked to spell out as a DATE_ADD");
+        return render_scalar_call(&spelled, render_context);
+    } else if name.value.eq_ignore_ascii_case("TO_DAYS") {
+        return Ok(format!(
+            "mysql_to_days({})",
+            moment_argument(function, render_context)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("YEARWEEK") {
+        // Measured on MySQL 8.4.11: a `YEARWEEK` with no mode counts by mode
+        // 0, as `WEEK` does.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let mode = match arguments.args.get(1) {
+            Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                mode,
+            ))) => static_select_metadata::week_mode(mode)
+                .expect("a checked YEARWEEK was checked to name a mode from 0 through 7"),
+            _ => 0,
+        };
+        return Ok(format!(
+            "mysql_yearweek({}, {mode})",
+            moment_argument(function, render_context)?
+        ));
     } else if name.value.eq_ignore_ascii_case("QUARTER") {
         // The engine has no quarter of its own, so it is counted off the
         // month: January through March answer 1, and December answers 4.

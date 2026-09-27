@@ -30654,3 +30654,6 @@ mod text_widths;
 
 #[cfg(unix)]
 mod window_offsets;
+
+#[cfg(unix)]
+mod day_counts;

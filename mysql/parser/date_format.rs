@@ -38,6 +38,28 @@ pub fn week_number(written: &str, mode: u32) -> Option<u32> {
     Some(week(&read_moment(written)?, mode).0)
 }
 
+/// The year and week `YEARWEEK(written, mode)` answers, written together as
+/// one number, or nothing when the value names no moment.
+///
+/// `YEARWEEK` counts weeks the way `WEEK` does in the same mode with the bit
+/// set that keeps a week in the year it mostly falls in, so a day early in
+/// January can answer the last week of the year before — measured on MySQL
+/// 8.4.11, `YEARWEEK('2026-01-15')` is 202602 and `YEARWEEK('0001-01-01')` is
+/// 53, the week of the year zero.
+pub fn year_and_week(written: &str, mode: u32) -> Option<u32> {
+    assert!(mode <= 7, "YEARWEEK takes a mode from 0 through 7");
+    let (week, year) = week(&read_moment(written)?, mode | 2);
+    Some(year * 100 + week)
+}
+
+/// The days `TO_DAYS(written)` counts from the year zero, or nothing when the
+/// value names no moment. Measured on MySQL 8.4.11: `TO_DAYS('2026-01-15')` is
+/// 739996 and `TO_DAYS('0001-01-01')` is 366.
+pub fn days_from_the_year_zero(written: &str) -> Option<i64> {
+    let moment = read_moment(written)?;
+    Some(day_number(moment.year, moment.month, moment.day))
+}
+
 /// How many characters MySQL reserves in a result column for one specifier.
 ///
 /// Measured on 8.4.11 by reading the column width back one specifier at a

@@ -91,7 +91,9 @@ pub use create_table_as_select::{
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
 pub use current_database::write_the_current_database_in;
-pub use date_format::{format_moment, format_width, week_number};
+pub use date_format::{
+    days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,
+};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use dump_ddl::{

@@ -6228,7 +6228,10 @@ fn scalar_call_column_definition(
     if columns.is_empty()
         && matches!(
             function,
-            ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek
+            ScalarFunction::NamesTheDayOrMonth
+                | ScalarFunction::ReadsTheWeek
+                | ScalarFunction::ReadsTheYearAndWeek
+                | ScalarFunction::CountsDaysFromTheYearZero
         )
     {
         return Ok(calendar_name_or_week_definition(name, function));
@@ -6384,7 +6387,10 @@ fn scalar_call_column_definition(
     }
     if matches!(
         function,
-        ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek
+        ScalarFunction::NamesTheDayOrMonth
+            | ScalarFunction::ReadsTheWeek
+            | ScalarFunction::ReadsTheYearAndWeek
+            | ScalarFunction::CountsDaysFromTheYearZero
     ) {
         let [column_name] = columns else {
             return Err(FrontendErrorKind::Internal);
@@ -7167,7 +7173,10 @@ fn scalar_call_column_definition(
         ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween => {
             unreachable!("the counts between two moments were answered above")
         }
-        ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek => {
+        ScalarFunction::NamesTheDayOrMonth
+        | ScalarFunction::ReadsTheWeek
+        | ScalarFunction::ReadsTheYearAndWeek
+        | ScalarFunction::CountsDaysFromTheYearZero => {
             unreachable!("the calendar names and the week were answered above")
         }
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
@@ -7355,8 +7364,14 @@ fn calendar_name_or_week_definition(
         definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         return definition;
     }
+    // Measured on MySQL 8.4.11: `WEEK` reports 3, `YEARWEEK` 7 and `TO_DAYS`
+    // 8, each nullable even over a NOT NULL column.
     let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
-    definition.column_length = 3;
+    definition.column_length = match function {
+        ScalarFunction::ReadsTheYearAndWeek => 7,
+        ScalarFunction::CountsDaysFromTheYearZero => 8,
+        _ => 3,
+    };
     definition.decimals = 0;
     set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
     definition
