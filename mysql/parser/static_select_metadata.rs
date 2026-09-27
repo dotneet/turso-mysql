@@ -178,8 +178,8 @@ pub enum ScalarFunction {
     ReadsTheYearAsANumber,
     /// `DATEDIFF`, which answers the days between two dates.
     CountsDaysBetween,
-    /// `TIMESTAMPDIFF` over a unit of fixed length, which counts whole units
-    /// from the first moment to the second.
+    /// `TIMESTAMPDIFF`, which counts whole units from the first moment to the
+    /// second.
     CountsUnitsBetween,
     /// `DATE_ADD` and `DATE_SUB` over an interval of whole days, months or
     /// years, which answer the column's own kind.
@@ -1887,8 +1887,6 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
-    // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
-    // two, counting the date alone, as a LONGLONG of length 9.
     // `JSON_TYPE`, `JSON_LENGTH` and `JSON_KEYS` read a whole column or one
     // path out of it, so each takes a reading rather than a plain column.
     for (names, function) in [
@@ -2016,22 +2014,22 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         });
     }
     // `TIMESTAMPDIFF(<unit>, a, b)` counts whole units from the first moment
-    // to the second. Only the units of fixed length are taken: a month and a
-    // year are counted by the calendar rather than by their length, which is
-    // not a rule the engine follows.
+    // to the second. Each moment is a column, a reading of the clock, or a
+    // moment written out as a word — `TIMESTAMPDIFF(DAY, created_at, NOW())`
+    // is how a report asks how old a row is.
     if named(&["TIMESTAMPDIFF"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(left),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(right),
-        ))] = arguments.args.as_slice()
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(from)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(to))] =
+            arguments.args.as_slice()
         else {
             return None;
         };
-        timestampdiff_unit_seconds(unit)?;
+        timestampdiff_unit(unit)?;
+        let mut columns = Vec::new();
+        counted_moment(from, &mut columns)?;
+        counted_moment(to, &mut columns)?;
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::CountsUnitsBetween,
-            columns: vec![left.value.clone(), right.value.clone()],
+            columns,
             literal_characters: 0,
             not_null: false,
         });
@@ -2093,18 +2091,21 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: finds,
         });
     }
+    // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers the days between the
+    // two, counting the date alone, as a LONGLONG of length 9. Its moments
+    // are the ones `TIMESTAMPDIFF` counts between.
     if named(&["DATEDIFF"]) {
-        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(left),
-        )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(right),
-        ))] = arguments.args.as_slice()
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(later)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(earlier))] =
+            arguments.args.as_slice()
         else {
             return None;
         };
+        let mut columns = Vec::new();
+        counted_moment(later, &mut columns)?;
+        counted_moment(earlier, &mut columns)?;
         return Some(StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::CountsDaysBetween,
-            columns: vec![left.value.clone(), right.value.clone()],
+            columns,
             literal_characters: 0,
             not_null: false,
         });
@@ -2232,36 +2233,63 @@ fn names_a_clock_reading(function: &sqlparser::ast::Function) -> bool {
             .any(|reading| name.value.eq_ignore_ascii_case(reading))
 }
 
-/// How many seconds a `TIMESTAMPDIFF` unit of fixed length holds.
+/// Reads one moment `TIMESTAMPDIFF` or `DATEDIFF` counts from or to, and
+/// records it when it is a column.
 ///
-/// A month, a quarter and a year are counted by the calendar rather than by a
-/// length, and a microsecond is finer than either side of the comparison
-/// carries, so none of the four is taken.
-pub(super) fn timestampdiff_unit_seconds(unit: &Expr) -> Option<i64> {
+/// A reading of the clock and a moment written out as a word carry their own
+/// moment. A word that names no moment is left out: measured, MySQL answers
+/// NULL for it with warning 1292, and the warning is not raised here. A
+/// `CURTIME()` is left out too, a time of day being a span rather than a
+/// moment.
+fn counted_moment(expr: &Expr, columns: &mut Vec<String>) -> Option<()> {
+    match expr {
+        Expr::Identifier(column) => columns.push(column.value.clone()),
+        Expr::Function(function) if names_a_clock_reading(function) => {}
+        Expr::Value(value) => {
+            let (Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)) =
+                &value.value
+            else {
+                return None;
+            };
+            crate::temporal_value::read_moment(written)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Names the unit a `TIMESTAMPDIFF` counts in, the way the rendered call
+/// spells it.
+pub(super) fn timestampdiff_unit(unit: &Expr) -> Option<&'static str> {
     let named = match unit {
-        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::Identifier(ident) if ident.quote_style.is_none() => ident.value.clone(),
         Expr::Interval(interval) => match interval.leading_field.as_ref()? {
+            sqlparser::ast::DateTimeField::Microsecond => "MICROSECOND".to_owned(),
             sqlparser::ast::DateTimeField::Second => "SECOND".to_owned(),
             sqlparser::ast::DateTimeField::Minute => "MINUTE".to_owned(),
             sqlparser::ast::DateTimeField::Hour => "HOUR".to_owned(),
             sqlparser::ast::DateTimeField::Day => "DAY".to_owned(),
             sqlparser::ast::DateTimeField::Week(None) => "WEEK".to_owned(),
+            sqlparser::ast::DateTimeField::Month => "MONTH".to_owned(),
+            sqlparser::ast::DateTimeField::Quarter => "QUARTER".to_owned(),
+            sqlparser::ast::DateTimeField::Year => "YEAR".to_owned(),
             _ => return None,
         },
         _ => return None,
     };
-    for (spelling, seconds) in [
-        ("SECOND", 1),
-        ("MINUTE", 60),
-        ("HOUR", 3600),
-        ("DAY", 86_400),
-        ("WEEK", 604_800),
-    ] {
-        if named.eq_ignore_ascii_case(spelling) {
-            return Some(seconds);
-        }
-    }
-    None
+    [
+        "microsecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+    ]
+    .into_iter()
+    .find(|spelling| named.eq_ignore_ascii_case(spelling))
 }
 
 /// Reads `(column, '$path')`, the one shape of `JSON_EXTRACT` this takes.

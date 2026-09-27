@@ -126,6 +126,12 @@ pub(crate) fn read_moment(written: &str) -> Option<Moment> {
     read_moment_with_precision(written, 0).map(|(moment, _)| moment)
 }
 
+/// Reads a moment the way [`read_moment`] does, keeping the fraction of a
+/// second as a count of microseconds.
+pub(crate) fn read_moment_to_the_microsecond(written: &str) -> Option<(Moment, u32)> {
+    read_moment_with_precision(written, 6)
+}
+
 fn read_moment_with_precision(written: &str, precision: u8) -> Option<(Moment, u32)> {
     if precision > 6 {
         return None;

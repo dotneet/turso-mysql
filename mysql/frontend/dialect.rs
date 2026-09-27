@@ -451,6 +451,12 @@ impl Dialect for MySqlDialect {
         if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_SHIFT_MOMENT) {
             return Ok(Some(Func::Dialect(MYSQL_SHIFT_MOMENT.to_string())));
         }
+        if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_TIMESTAMPDIFF) {
+            return Ok(Some(Func::Dialect(MYSQL_TIMESTAMPDIFF.to_string())));
+        }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_DATEDIFF) {
+            return Ok(Some(Func::Dialect(MYSQL_DATEDIFF.to_string())));
+        }
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
@@ -970,6 +976,38 @@ impl Dialect for MySqlDialect {
                 },
             );
         }
+        if name.eq_ignore_ascii_case(MYSQL_TIMESTAMPDIFF) {
+            let [unit, from, to] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes three arguments"
+                )));
+            };
+            let (Value::Text(unit), Value::Text(from), Value::Text(to)) = (unit, from, to) else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::units_between(unit.as_str(), from.as_str(), to.as_str()) {
+                    Some(counted) => Value::from_i64(counted),
+                    None => Value::Null,
+                },
+            );
+        }
+        if name.eq_ignore_ascii_case(MYSQL_DATEDIFF) {
+            let [later, earlier] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let (Value::Text(later), Value::Text(earlier)) = (later, earlier) else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::days_between(later.as_str(), earlier.as_str()) {
+                    Some(counted) => Value::from_i64(counted),
+                    None => Value::Null,
+                },
+            );
+        }
         if MYSQL_JSON_READINGS
             .iter()
             .any(|reading| name.eq_ignore_ascii_case(reading))
@@ -1010,6 +1048,12 @@ pub(crate) const MYSQL_STR_TO_DATE: &str = "mysql_str_to_date";
 /// not do: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28`, where
 /// the engine overflows into March.
 pub(crate) const MYSQL_SHIFT_MOMENT: &str = "mysql_shift_moment";
+/// Counting the time between two moments MySQL's way: `TIMESTAMPDIFF` counts
+/// months by the calendar and seconds to the microsecond, and `DATEDIFF`
+/// counts the days alone. The engine has no calendar month, and its
+/// `unixepoch` drops the fraction of a second.
+pub(crate) const MYSQL_TIMESTAMPDIFF: &str = "mysql_timestampdiff";
+pub(crate) const MYSQL_DATEDIFF: &str = "mysql_datediff";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";

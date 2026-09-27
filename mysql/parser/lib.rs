@@ -17,6 +17,7 @@ mod insert_select;
 mod json_value;
 mod like_pattern;
 mod lock_tables;
+mod moment_difference;
 mod mysql_ddl;
 mod number_format;
 mod select_projection_origins;
@@ -110,6 +111,7 @@ pub use json_value::{
 };
 pub use like_pattern::MySqlLikePattern;
 pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
+pub use moment_difference::{days_between, units_between};
 pub use mysql_ddl::{
     render_counted_create_table_mysql_with_mode, render_create_index_mysql,
     render_create_index_mysql_with_mode, render_create_table_mysql,

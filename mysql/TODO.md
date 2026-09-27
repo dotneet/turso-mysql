@@ -128,7 +128,7 @@ boolean literal.
 | A `REGEXP` whose subject or pattern contains non-ASCII text | refused; MySQL ICU expands some characters during case folding, such as `ß` to `ss`, which Rust regex does not |
 | A bound `REGEXP` pattern — `name REGEXP ?` | refused; what a written pattern is checked for has no equivalent at bind time |
 | `DATE_FORMAT` over a call that is not a clock reading — `DATE_FORMAT(DATE(m), ...)`, `DATE_FORMAT(CURTIME(), ...)` | refused; the three shapes taken are a column, a clock reading and a word, and what MySQL writes for the rest has not been measured |
-| `TIMESTAMPDIFF` over `MONTH`, `QUARTER` or `YEAR` | refused; MySQL counts those by the calendar rather than by a fixed length, which the engine has no rule for |
+| A `?` or a word naming no moment in `TIMESTAMPDIFF` or `DATEDIFF` — `DATEDIFF(created_at, ?)`, `DATEDIFF('2024-02-30', d)` | refused; MySQL reads a bound value by the type the client sent, and answers NULL for a word naming no day |
 | `GROUP_CONCAT(col ORDER BY ...)` | refused; the engine's translator drops an aggregate's own `ORDER BY` (`core/translate/expr/translator.rs`), so the rows would be joined in whatever order they were read and the answer would differ silently |
 | An index hint on an `UPDATE` or `DELETE` target | refused; the hint is dropped for a `SELECT` but that shape has not been measured |
 | `EXTRACT(WEEK FROM ...)` and `EXTRACT(QUARTER FROM ...)` | refused; MySQL counts a week by rules of its own and the engine has no quarter, and neither has been measured |

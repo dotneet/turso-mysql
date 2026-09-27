@@ -117,7 +117,7 @@ fn moment_seconds_on(moment: Moment, seconds: i64) -> Option<Moment> {
 
 /// Days from 1970-01-01 to the day named, by the shift-and-count method every
 /// civil calendar conversion uses.
-fn days_from_civil(year: u32, month: u32, day: u32) -> Option<i64> {
+pub(crate) fn days_from_civil(year: u32, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return None;
     }

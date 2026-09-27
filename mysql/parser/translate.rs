@@ -5266,30 +5266,36 @@ fn render_scalar_call(
         };
         return Ok(render_shifted_moment(&render_ident(column), count));
     } else if name.value.eq_ignore_ascii_case("TIMESTAMPDIFF") {
-        // MySQL counts whole units from the first moment to the second,
-        // dropping whatever is left over — measured, 23 hours and 59 minutes
-        // is 0 days and −2 days stays −2. Dividing the seconds between them
-        // truncates the same way in the engine.
+        // The engine has no calendar month and its `unixepoch` drops the
+        // fraction of a second, so the whole count is the frontend's.
         let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
             unreachable!("a checked scalar call was checked to have an argument list");
         };
-        let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit))) =
-            arguments.args.first()
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unit)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(from)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(to))] =
+            arguments.args.as_slice()
         else {
-            unreachable!("a checked TIMESTAMPDIFF was checked to name a unit");
+            unreachable!("a checked TIMESTAMPDIFF was checked to take a unit and two moments");
         };
-        let seconds = static_select_metadata::timestampdiff_unit_seconds(unit)
-            .expect("a checked TIMESTAMPDIFF was checked to name a unit of fixed length");
-        let (left, right) = (scalar_argument(function, 1)?, scalar_argument(function, 2)?);
+        let unit = static_select_metadata::timestampdiff_unit(unit)
+            .expect("a checked TIMESTAMPDIFF was checked to name a unit");
         return Ok(format!(
-            "CAST((unixepoch({right}) - unixepoch({left})) / {seconds} AS INTEGER)"
+            "mysql_timestampdiff('{unit}', {}, {})",
+            render_select_expr(from, render_context)?,
+            render_select_expr(to, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("DATEDIFF") {
-        // MySQL counts whole days between the dates alone, dropping any
-        // time either carries, which `date()` does here.
-        let [left, right] = two_column_arguments(function);
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(later)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(earlier))] =
+            arguments.args.as_slice()
+        else {
+            unreachable!("a checked DATEDIFF was checked to take two moments");
+        };
         return Ok(format!(
-            "CAST(julianday(date({left})) - julianday(date({right})) AS INTEGER)"
+            "mysql_datediff({}, {})",
+            render_select_expr(later, render_context)?,
+            render_select_expr(earlier, render_context)?
         ));
     } else if name.value.eq_ignore_ascii_case("LOWER") {
         "mysql_lower"
@@ -5762,22 +5768,6 @@ fn extract_strftime_field(field: &sqlparser::ast::DateTimeField) -> Option<&'sta
         sqlparser::ast::DateTimeField::Second => Some("%S"),
         _ => None,
     }
-}
-
-/// Renders the two columns a checked two-column call names.
-fn two_column_arguments(function: &sqlparser::ast::Function) -> [String; 2] {
-    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
-        unreachable!("a checked call was checked to have an argument list");
-    };
-    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-        Expr::Identifier(left),
-    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-        Expr::Identifier(right),
-    ))] = arguments.args.as_slice()
-    else {
-        unreachable!("a checked call was checked to take two columns");
-    };
-    [render_ident(left), render_ident(right)]
 }
 
 fn single_column_argument(function: &sqlparser::ast::Function) -> String {

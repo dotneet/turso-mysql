@@ -5466,6 +5466,16 @@ fn scalar_call_column_definition(
             return Ok(read_moment_definition(name, function));
         }
     }
+    // Measured: `DATEDIFF(NOW(), '2024-01-01')` reports what the same count
+    // over a column reports, and reads no column to be held to a date.
+    if columns.is_empty()
+        && matches!(
+            function,
+            ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween
+        )
+    {
+        return Ok(counted_between_definition(name, function));
+    }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
@@ -5538,8 +5548,9 @@ fn scalar_call_column_definition(
         }
     }
     // Measured on MySQL 8.4.11: `DATEDIFF(b, a)` answers a LONGLONG of length
-    // 9, and it is nullable because either date may be. Both columns have to
-    // hold a date: what MySQL does with anything else is a coercion.
+    // 9, and it is nullable because either date may be. Every column counted
+    // from has to hold a date: what MySQL does with anything else is a
+    // coercion.
     if matches!(
         function,
         ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween
@@ -5556,17 +5567,7 @@ fn scalar_call_column_definition(
                 return Err(FrontendErrorKind::Unsupported);
             }
         }
-        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
-        // Measured: a `DATEDIFF` reports length 9 and a `TIMESTAMPDIFF` 21,
-        // whichever unit it counts.
-        definition.column_length = if function == ScalarFunction::CountsDaysBetween {
-            9
-        } else {
-            21
-        };
-        definition.decimals = 0;
-        set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
-        return Ok(definition);
+        return Ok(counted_between_definition(name, function));
     }
     // Every call past here reads one column and answers its shape. `NULLIF`
     // is the one that may name a second: it compares the two and answers the
@@ -6267,6 +6268,22 @@ fn epoch_call_definition(
         &mut definition,
         MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
+    definition
+}
+
+/// Measured on MySQL 8.4.11: a `DATEDIFF` reports a LONGLONG of length 9 and
+/// a `TIMESTAMPDIFF` one of 21, whichever unit it counts, and both are
+/// nullable whatever they count between.
+#[cfg(unix)]
+fn counted_between_definition(name: String, function: ScalarFunction) -> ColumnDefinitionConfig {
+    let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+    definition.column_length = if function == ScalarFunction::CountsDaysBetween {
+        9
+    } else {
+        21
+    };
+    definition.decimals = 0;
+    set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
     definition
 }
 

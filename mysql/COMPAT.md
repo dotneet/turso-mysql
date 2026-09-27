@@ -1454,18 +1454,27 @@ is a format that is not written out — the format is what says what the answer
 will be.
 
 `TIMESTAMPDIFF(<unit>, a, b)` counts whole units from the first moment to the
-second, dropping whatever is left over. Measured on MySQL 8.4.11 over four
-pairs — two and a half days apart, two hours apart across midnight, two days
-apart backwards, and one second short of a day — and matched: the backward pair
-answers −2 days rather than −3, and the one a second short answers 0 days and
-23 hours. Dividing the seconds between the two moments truncates the same way
-in the engine, which is what makes the count the same count. Every unit reports
-a whole number of length 21, where `DATEDIFF` reports 9.
+second, dropping whatever is left over, towards zero either way. Measured on
+MySQL 8.4.11 over sixteen pairs of `DATETIME(6)` values and matched for every
+unit: two days and a half backwards is −2 days, one second short of a day is 0
+days, and `10:00:00.5` to the next month's `10:00:00.4` is 2678399 seconds —
+the count is taken to the microsecond before the rest is dropped, where
+subtracting the engine's `unixepoch` would drop each fraction first and answer
+2678400. A month is counted by the calendar: it is whole once the later moment
+reaches the same day of the month and the same time of day, so January 31st to
+February 29th is 0 months, and a quarter and a year are three and twelve of
+those. `MICROSECOND` is counted too. The whole count is the frontend's own
+reading, which the rendered SQL calls. Every unit reports a whole number of
+length 21, where `DATEDIFF` reports 9.
 
-Only the units of fixed length are taken: SECOND, MINUTE, HOUR, DAY and WEEK. A
-month, a quarter and a year are counted by the calendar rather than by their
-length, which is not a rule the engine follows, and a microsecond is finer than
-either side of the comparison carries. Both moments have to be columns.
+Each moment — here and in `DATEDIFF` — is a date column, a reading of the clock
+or a moment written out as a word: `DATEDIFF(NOW(), created_at)` and
+`TIMESTAMPDIFF(DAY, created_at, NOW())` are how a report asks how old a row is,
+and measured, each reports the shape the same count over two columns reports.
+A word is read the way MySQL reads one — `DATEDIFF('2024-1-5', '2024-01-01')`
+is 4. A word that names no moment is refused: MySQL answers NULL for it. So are
+`CURTIME()`, a span rather than a moment, a column that holds no date, which
+MySQL coerces, and a `?`, which MySQL reads by the type the client binds.
 
 An index hint — `USE`, `FORCE` or `IGNORE INDEX`, in either the `INDEX` or the
 `KEY` spelling — is dropped. It says which key to plan with and nothing about
@@ -2826,8 +2835,9 @@ day it did not name.
 out of these for a reason of its own rather than the coercion one: it holds a
 span running to 838 hours, which MySQL reads out whole and the engine's reader
 cannot. `DATEDIFF(b, a)` answers the days between the two as a `LONGLONG` of
-length 9, counting the date alone and dropping any time either carries, and
-both its arguments have to hold a date.
+length 9, counting the date alone and dropping any time either carries —
+measured, `2024-01-15 10:00:00` to `2024-02-15 09:59:59` is 31 days where
+`TIMESTAMPDIFF` counts 30 — and every column it names has to hold a date.
 
 `DATE_ADD(column, INTERVAL n unit)` and `DATE_SUB` shift a date. Measured on
 8.4.11: an interval of whole days, months or years keeps the column's own kind
@@ -4046,7 +4056,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Arithmetic over an aggregate or a decimal — `SUM(amount) * 2`, `amount + 1` | partial | partial | n/a | n/a | partial | [`arithmetic classifier`](parser/static_select_metadata.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-aggregate-arithmetic.json), [P0 manifest](conformance/Makefile) | An aggregate stands where a column stands. Three measured rules cover adding, multiplying and dividing, over whole numbers and decimals alike. Whether the answer is a decimal is not whether it carries places: `SUM(n) + 1` is one and `COUNT(*) + 1` is not. `GROUP_CONCAT`, a deviation and a windowed aggregate are refused. |
 | A column beside an aggregate with no `GROUP BY` | partial | partial | n/a | n/a | partial | [`aggregated projection`](parser/translate.rs), [oracle case](conformance/cases/p0/select-aggregated-projection.json), [P0 manifest](conformance/Makefile) | Refused, where MySQL answers 1140 — a column anywhere in the projection, not only one standing on its own. A literal crosses. A window and a subquery do not aggregate the statement, and a `GROUP BY` gives every column a group. |
 | `DATE_FORMAT(NOW(), ...)` / `STR_TO_DATE('...', ...)` — a moment that is not a column | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-moment-argument.json), [P0 manifest](conformance/Makefile) | A clock reading and a moment written out as a word stand where a column stands. Both report exactly what the column form reports: the shape comes from the format. `NOW`, `CURRENT_TIMESTAMP`, `CURDATE` and `CURRENT_DATE` are the readings taken; a `STR_TO_DATE` reads text, so it takes a word and not a reading. |
-| `TIMESTAMPDIFF(<unit>, a, b)` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-timestampdiff.json), [P0 manifest](conformance/Makefile) | Whole units from the first moment to the second, over the units of fixed length — SECOND, MINUTE, HOUR, DAY and WEEK. A whole number of length 21, where `DATEDIFF` reports 9. MONTH, QUARTER, YEAR and MICROSECOND are refused. |
+| `TIMESTAMPDIFF(<unit>, a, b)` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-timestampdiff.json), [P0 manifest](conformance/Makefile) | Whole units from the first moment to the second, to the microsecond, with a month counted by the calendar — every unit from MICROSECOND to YEAR. Each moment is a date column, `NOW()` or `CURDATE()`, or a written moment; `DATEDIFF` takes the same. A whole number of length 21, where `DATEDIFF` reports 9. A bound `?`, a word naming no moment and `CURTIME()` are refused. |
 | `USE` / `FORCE` / `IGNORE INDEX` | partial | partial | n/a | n/a | partial | [`table source renderer`](parser/translate.rs), [`hint validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-index-hint.json), [P0 manifest](conformance/Makefile) | Dropped: a hint says which key to plan with and nothing about which rows come back. The keys it names are checked against the table, because one naming a key the table has not got is 1176 in MySQL. Both spellings, a `FOR` scope, several keys at once, an alias and either side of a join are covered. A hint on an `UPDATE` or `DELETE` target is still refused. |
 | `QUARTER`, `WEEKDAY`, `DAYOFWEEK`, `DAYOFYEAR`, `DAYOFMONTH`, `LAST_DAY`, `EXTRACT` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-calendar-readings.json), [P0 manifest](conformance/Makefile) | The engine has none of these by name, so each is counted off what it does have. Every value and every reported shape is pinned to the 8.4.11 golden, `EXTRACT(YEAR FROM ...)` included, which reports a whole number of length 5 where `YEAR` reports a YEAR of length 4. |
 | `LIKE CONCAT('%', ?, '%')` — a pattern written in pieces | partial | partial | n/a | n/a | partial | [`LIKE renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-like-concat-pattern.json), [P0 manifest](conformance/Makefile) | The pieces spell one pattern, and written ones are joined into it. A bound piece stays a piece and the join is left to the engine. A piece naming a column and a second bound piece are refused. Backslash escapes are read by the dedicated UCA9 LIKE matcher. |

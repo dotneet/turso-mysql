@@ -2546,23 +2546,31 @@ fn the_math_readings_render_as_the_engine_spells_them() {
     }
 }
 
-/// `TIMESTAMPDIFF` counts whole units by dividing the seconds between the two
-/// moments, which truncates the way MySQL truncates. Only the units of fixed
-/// length are taken.
+/// `TIMESTAMPDIFF` is counted by the frontend's own reading, which counts a
+/// month by the calendar and a second to the microsecond. Each moment is a
+/// column, a reading of the clock, or a moment written out as a word.
 #[test]
-fn timestampdiff_renders_as_the_seconds_between_divided() {
+fn timestampdiff_renders_as_the_frontends_count() {
     for (sql, normalized) in [
         (
             "SELECT TIMESTAMPDIFF(SECOND, a, b) FROM td",
-            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 1 AS INTEGER) AS \"TIMESTAMPDIFF(SECOND, a, b)\" FROM \"td\"",
+            "SELECT mysql_timestampdiff('second', \"a\", \"b\") AS \"TIMESTAMPDIFF(SECOND, a, b)\" FROM \"td\"",
         ),
         (
-            "SELECT TIMESTAMPDIFF(DAY, a, b) FROM td",
-            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 86400 AS INTEGER) AS \"TIMESTAMPDIFF(DAY, a, b)\" FROM \"td\"",
+            "SELECT TIMESTAMPDIFF(MONTH, a, b) FROM td",
+            "SELECT mysql_timestampdiff('month', \"a\", \"b\") AS \"TIMESTAMPDIFF(MONTH, a, b)\" FROM \"td\"",
         ),
         (
-            "SELECT TIMESTAMPDIFF(WEEK, a, b) FROM td",
-            "SELECT CAST((unixepoch(\"b\") - unixepoch(\"a\")) / 604800 AS INTEGER) AS \"TIMESTAMPDIFF(WEEK, a, b)\" FROM \"td\"",
+            "SELECT timestampdiff(microsecond, a, b) FROM td",
+            "SELECT mysql_timestampdiff('microsecond', \"a\", \"b\") AS \"timestampdiff(microsecond, a, b)\" FROM \"td\"",
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(DAY, a, NOW()) FROM td",
+            "SELECT mysql_timestampdiff('day', \"a\", datetime('now')) AS \"TIMESTAMPDIFF(DAY, a, NOW())\" FROM \"td\"",
+        ),
+        (
+            "SELECT TIMESTAMPDIFF(YEAR, '2000-02-29', CURDATE()) FROM td",
+            "SELECT mysql_timestampdiff('year', '2000-02-29', date('now')) AS \"TIMESTAMPDIFF(YEAR, '2000-02-29', CURDATE())\" FROM \"td\"",
         ),
     ] {
         let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
@@ -2570,14 +2578,15 @@ fn timestampdiff_renders_as_the_seconds_between_divided() {
         assert!(translated.parse_ast().is_ok(), "{sql}");
     }
     for sql in [
-        // Counted by the calendar rather than by a length.
-        "SELECT TIMESTAMPDIFF(MONTH, a, b) FROM td",
-        "SELECT TIMESTAMPDIFF(QUARTER, a, b) FROM td",
-        "SELECT TIMESTAMPDIFF(YEAR, a, b) FROM td",
-        // Finer than either side carries.
-        "SELECT TIMESTAMPDIFF(MICROSECOND, a, b) FROM td",
-        // Both moments have to be columns.
-        "SELECT TIMESTAMPDIFF(DAY, a, NOW()) FROM td",
+        "SELECT TIMESTAMPDIFF(FORTNIGHT, a, b) FROM td",
+        "SELECT TIMESTAMPDIFF(`DAY`, a, b) FROM td",
+        // A time of day is a span rather than a moment.
+        "SELECT TIMESTAMPDIFF(DAY, a, CURTIME()) FROM td",
+        // A word that names no moment answers NULL with a warning in MySQL.
+        "SELECT TIMESTAMPDIFF(DAY, a, '2024-02-30') FROM td",
+        "SELECT TIMESTAMPDIFF(DAY, a, ?) FROM td",
+        "SELECT TIMESTAMPDIFF(DAY, a, 20240101) FROM td",
+        "SELECT TIMESTAMPDIFF(DAY, a) FROM td",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
@@ -6358,10 +6367,18 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
             "SELECT mysql_shift_moment(\"a\", 1, 'hour') AS \"DATE_ADD(a, INTERVAL 1 HOUR)\" FROM \"d\"",
         ),
         // MySQL counts whole days between the dates alone, dropping any
-        // time either carries.
+        // time either carries, and the frontend counts them the same way.
         (
             "SELECT DATEDIFF(a, b) FROM d",
-            "SELECT CAST(julianday(date(\"a\")) - julianday(date(\"b\")) AS INTEGER) AS \"DATEDIFF(a, b)\" FROM \"d\"",
+            "SELECT mysql_datediff(\"a\", \"b\") AS \"DATEDIFF(a, b)\" FROM \"d\"",
+        ),
+        (
+            "SELECT DATEDIFF(NOW(), a) FROM d",
+            "SELECT mysql_datediff(datetime('now'), \"a\") AS \"DATEDIFF(NOW(), a)\" FROM \"d\"",
+        ),
+        (
+            "SELECT DATEDIFF('2026-12-25', CURRENT_DATE) FROM d",
+            "SELECT mysql_datediff('2026-12-25', date('now')) AS \"DATEDIFF('2026-12-25', CURRENT_DATE)\" FROM \"d\"",
         ),
     ] {
         assert_eq!(
@@ -6380,6 +6397,8 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
         "SELECT YEAR(a, b) FROM d",
         "SELECT DATEDIFF(a) FROM d",
         "SELECT DATEDIFF(a, b, c) FROM d",
+        "SELECT DATEDIFF(a, 'soon') FROM d",
+        "SELECT DATEDIFF(a, CURTIME()) FROM d",
         "SELECT DATE_ADD(a, 1) FROM d",
         // A count worked out from a row cannot be multiplied for a week or a
         // quarter, so a shift counts a written number and nothing else.

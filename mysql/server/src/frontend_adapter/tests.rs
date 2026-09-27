@@ -6866,11 +6866,8 @@ fn an_index_hint_names_a_key_and_changes_no_rows() {
 /// two days apart backwards, and one second short of a day — and matched: the
 /// backward pair answers −2 days rather than −3, and the one a second short
 /// answers 0 days and 23 hours. Every unit reports a whole number of length
-/// 21, where `DATEDIFF` reports 9.
-///
-/// Only the units of fixed length are taken. A month, a quarter and a year are
-/// counted by the calendar rather than by their length, which is not a rule
-/// the engine follows, so those are refused.
+/// 21, where `DATEDIFF` reports 9. The calendar units and the fractions of a
+/// second are pinned in `tests/date_arithmetic.rs`.
 #[cfg(unix)]
 #[test]
 fn timestampdiff_counts_whole_units_between_two_moments() {
@@ -6942,14 +6939,10 @@ fn timestampdiff_counts_whole_units_between_two_moments() {
     };
     assert_eq!(compared.rows, vec![vec![Some(b"1".to_vec())]]);
 
-    for sql in [
-        "SELECT TIMESTAMPDIFF(MONTH, a, b) FROM td",
-        "SELECT TIMESTAMPDIFF(QUARTER, a, b) FROM td",
-        "SELECT TIMESTAMPDIFF(YEAR, a, b) FROM td",
-        "SELECT TIMESTAMPDIFF(MICROSECOND, a, b) FROM td",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
+    // A number is a coercion MySQL makes and this does not.
+    assert!(adapter
+        .execute_query("SELECT TIMESTAMPDIFF(DAY, id, b) FROM td")
+        .is_err());
 }
 
 /// `DATE_FORMAT(NOW(), '%Y-%m-%d')` is how a statement asks for today written
@@ -30619,3 +30612,6 @@ mod unicode_collation;
 
 #[cfg(unix)]
 mod json_conditions;
+
+#[cfg(unix)]
+mod date_arithmetic;
