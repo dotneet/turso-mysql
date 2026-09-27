@@ -2646,6 +2646,18 @@ impl MySqlConnection {
             .clone()
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        if bound.rowwise_conflicts() {
+            return self
+                .execute_auto_increment_conflict_rows(
+                    &insert.sql,
+                    insert.insert.clone(),
+                    table,
+                    values,
+                    deadline,
+                    affected_rows_mode,
+                )
+                .map(MySqlPreparedExecutionResult::Write);
+        }
         if let Some(result) = self.execute_high_water_mixed_insert(
             &insert.sql,
             &bound,
@@ -6438,6 +6450,7 @@ impl MySqlConnection {
                         sql,
                         insert,
                         table,
+                        &[],
                         None,
                         MySqlAffectedRowsMode::Changed,
                     )?;
@@ -6542,6 +6555,7 @@ impl MySqlConnection {
                         sql,
                         insert,
                         table,
+                        &[],
                         deadline,
                         affected_rows_mode,
                     )
@@ -7429,6 +7443,7 @@ impl MySqlConnection {
         sql: &str,
         insert: CheckedAutoIncrementInsert,
         table: AutoIncrementTable,
+        values: &[Value],
         deadline: Option<turso_core::MonotonicInstant>,
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> Result<MySqlWriteResult> {
@@ -7446,7 +7461,7 @@ impl MySqlConnection {
                 "multirow conflict INSERT requires generated IDs in every row".to_string(),
             ));
         }
-        let reserved = self.reserve_insert_row_ids(&bound, &table, &[], deadline)?;
+        let reserved = self.reserve_insert_row_ids(&bound, &table, values, deadline)?;
         let mut next_id = reserved.first_generated.ok_or_else(|| {
             LimboError::InternalError("rowwise AUTO_INCREMENT INSERT reserved no ID".to_string())
         })?;
@@ -7469,6 +7484,16 @@ impl MySqlConnection {
                 let mut statement = self
                     .inner
                     .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                // One row keeps the numbers its `?`s had in the whole
+                // statement, so the values bound up to its highest one cover
+                // it and the upsert clause after every row.
+                let parameter_count = statement.parameters_count();
+                let bound_values = values.get(..parameter_count).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+                    )
+                })?;
+                bind_prepared_values(&mut statement, bound_values)?;
                 let timeout = self
                     .remaining_write_timeout(deadline)
                     .map_err(Into::<LimboError>::into)?;

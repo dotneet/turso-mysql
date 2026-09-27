@@ -689,3 +689,75 @@ fn an_upsert_reports_a_wide_unsigned_id_it_matched() {
         ]
     );
 }
+
+/// Laravel prepares every statement, so `upsert()` over several rows arrives
+/// with its values bound, and so does `insertOrIgnore()`.
+#[test]
+fn a_prepared_upsert_of_several_rows_reports_what_the_text_one_does() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "create table `lp` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)",
+    );
+    run(
+        &mut adapter,
+        "alter table `lp` add unique `lp_email_unique`(`email`)",
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `lp` (`email`, `name`) values (?, ?), (?, ?), (?, ?)",
+            &words(&["a@x.com", "A", "b@x.com", "B", "c@x.com", "C"]),
+        ),
+        (3, 1)
+    );
+    let upsert = "insert into `lp` (`email`, `name`) values (?, ?), (?, ?) as laravel_upsert_alias on duplicate key update `name` = `laravel_upsert_alias`.`name`";
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            upsert,
+            &words(&["b@x.com", "B2", "d@x.com", "D"])
+        ),
+        (3, 4)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "4");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            upsert,
+            &words(&["a@x.com", "A2", "b@x.com", "B2"])
+        ),
+        (2, 2)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "4");
+    // A value bound in the upsert clause comes after every row's.
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `lp` (`email`, `name`) values (?, ?), (?, ?) as laravel_upsert_alias on duplicate key update `name` = ?",
+            &words(&["e@x.com", "E", "a@x.com", "A9", "Z"]),
+        ),
+        (3, 8)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert ignore into `lp` (`email`, `name`) values (?, ?), (?, ?)",
+            &words(&["a@x.com", "A", "f@x.com", "F"]),
+        ),
+        (1, 10)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "10");
+    assert_eq!(counter(&mut adapter, "lp").as_deref(), Some("12"));
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, email, name FROM lp ORDER BY id"),
+        vec![
+            some(&["1", "a@x.com", "Z"]),
+            some(&["2", "b@x.com", "B2"]),
+            some(&["3", "c@x.com", "C"]),
+            some(&["4", "d@x.com", "D"]),
+            some(&["8", "e@x.com", "E"]),
+            some(&["10", "f@x.com", "F"]),
+        ]
+    );
+}

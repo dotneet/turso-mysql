@@ -4186,7 +4186,7 @@ pub fn parse_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal, false)
+    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal)
 }
 
 /// Parses one AUTO_INCREMENT INSERT that can be executed through a prepared
@@ -4199,14 +4199,13 @@ pub fn parse_prepared_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value, true)
+    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value)
 }
 
 fn parse_checked_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
     accepts_value: fn(&Expr) -> bool,
-    prepared: bool,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
     validate_auto_increment_insert_token_shape(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
@@ -4264,9 +4263,6 @@ fn parse_checked_auto_increment_insert(
             .collect(),
         _ => Vec::new(),
     };
-    if rowwise_conflicts && prepared {
-        return unsupported("prepared multirow IGNORE or ON DUPLICATE AUTO_INCREMENT INSERT");
-    }
     let mut normalized_insert = insert.clone();
     let mut mixed_default_columns = Vec::new();
     let mut ignored_null_columns = Vec::new();

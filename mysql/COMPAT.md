@@ -1947,7 +1947,10 @@ second matches reporting the id of the row it *wrote*; a row that matched gives
 its number back to the next row the statement adds, so `('c', ...), ('e', ...)`
 where `c` matches writes `e` with the number `c` would have taken; one that added
 no row but changed one reports the id of the last row it matched, changed or
-not; and one that changed nothing reports 0. The
+not; and one that changed nothing reports 0. A prepared statement of several rows
+— which is how Laravel, preparing everything, sends `upsert()` and `insertOrIgnore()` —
+is written the same way, each row binding the values its own `?`s and the upsert clause's
+name, and reports the same: measured, over bound values exactly as over written ones. The
 [oracle case](conformance/cases/p0/insert-counted-upsert.json) pins the single row.
 
 A `BIGINT UNSIGNED` counted column takes an upsert as well, which is the key
