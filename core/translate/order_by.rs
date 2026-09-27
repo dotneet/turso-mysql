@@ -148,6 +148,12 @@ pub struct SortMetadata {
     pub has_sequence: bool,
     /// Whether to use heap-sort with BTreeIndex instead of full-collection sort through Sorter
     pub use_heap_sort: bool,
+    /// Whether a sort key holds a custom type column's decoded value.
+    ///
+    /// A statement that groups or aggregates reads each column from a register
+    /// the grouping filled, which already holds the decoded value, so a result
+    /// column sharing that key slot must not be decoded a second time.
+    pub sort_keys_are_decoded: bool,
 }
 pub struct EmitOrderBy;
 
@@ -264,6 +270,7 @@ impl EmitOrderBy {
             remappings,
             has_sequence,
             use_heap_sort,
+            sort_keys_are_decoded: has_group_by || !aggregates.is_empty(),
         });
 
         if use_heap_sort {
@@ -343,6 +350,7 @@ impl EmitOrderBy {
             ref remappings,
             has_sequence,
             use_heap_sort,
+            sort_keys_are_decoded,
         } = *t_ctx.meta_sort.as_ref().unwrap();
 
         let sorter_column_count = order_by.len()
@@ -418,7 +426,7 @@ impl EmitOrderBy {
             // Deduplicated columns share a sort key slot, which stores the encoded
             // (on-disk) value (decode was suppressed during sorter insert). Apply
             // DECODE now so the result set contains human-readable values.
-            if remapping.deduplicated {
+            if remapping.deduplicated && !sort_keys_are_decoded {
                 if let Some((col, type_def)) = result_column_custom_type_info(
                     &rc.expr,
                     &plan.table_references,

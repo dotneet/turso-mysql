@@ -422,3 +422,19 @@ test custom-comparator-roundtrips-through-sql {
 expect {
     CREATE TYPE rt_type2 BASE text ENCODE string_reverse (value) DECODE string_reverse (value) OPERATOR '<' string_reverse
 }
+
+# A grouped statement reads a column from the register its group filled, which
+# already holds the decoded value. A result column sharing that ORDER BY key
+# used to be decoded a second time, and `numeric_decode` refused the number.
+@requires strict "uses STRICT tables"
+test grouped-order-by-decodes-a-shared-key-once {
+    CREATE TABLE t_grp(id INTEGER PRIMARY KEY, g numeric(10,0)) STRICT;
+    INSERT INTO t_grp VALUES (1, 2), (2, 10), (3, 10), (4, NULL), (5, 3);
+    SELECT g, count(*) FROM t_grp GROUP BY g ORDER BY count(*) DESC, g;
+}
+expect {
+    10|2
+    |1
+    2|1
+    3|1
+}
