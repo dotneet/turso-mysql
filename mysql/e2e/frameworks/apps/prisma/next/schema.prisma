@@ -1,0 +1,58 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "mysql"
+  url               = env("DATABASE_URL")
+  shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+model User {
+  id        BigInt   @id @default(autoincrement())
+  email     String   @unique @db.VarChar(191)
+  name      String   @db.VarChar(100)
+  balance   Decimal  @default(0) @db.Decimal(10, 2)
+  isActive  Boolean  @default(true) @map("is_active")
+  profile   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  posts     Post[]
+
+  @@map("users")
+}
+
+model Post {
+  id          BigInt    @id @default(autoincrement())
+  userId      BigInt    @map("user_id")
+  title       String    @db.VarChar(200)
+  slug        String?   @db.VarChar(200)
+  body        String?   @db.Text
+  publishedAt DateTime? @map("published_at")
+  views       BigInt    @default(0)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tags        PostTag[]
+
+  @@index([userId])
+  @@index([slug])
+  @@map("posts")
+}
+
+model Tag {
+  id    BigInt    @id @default(autoincrement())
+  name  String    @unique @db.VarChar(100)
+  posts PostTag[]
+
+  @@map("tags")
+}
+
+model PostTag {
+  postId BigInt @map("post_id")
+  tagId  BigInt @map("tag_id")
+  post   Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@index([tagId])
+  @@map("post_tag")
+}

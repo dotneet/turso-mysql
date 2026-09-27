@@ -1,0 +1,11 @@
+development:
+  adapter: mysql2
+  encoding: utf8mb4
+  host: <%= ENV.fetch("E2E_HOST") %>
+  port: <%= ENV.fetch("E2E_PORT") %>
+  username: <%= ENV.fetch("E2E_USER") %>
+  password: <%= ENV.fetch("E2E_PASSWORD") %>
+  database: <%= ENV.fetch("E2E_APP") %>
+  sslca: <%= ENV.fetch("E2E_CA") %>
+  ssl_mode: verify_identity
+  pool: 5

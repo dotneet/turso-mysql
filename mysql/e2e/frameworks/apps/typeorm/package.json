@@ -1,0 +1,17 @@
+{
+  "name": "turso-e2e-typeorm",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "mysql2": "3.24.4",
+    "reflect-metadata": "0.2.2",
+    "typeorm": "0.3.31"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}

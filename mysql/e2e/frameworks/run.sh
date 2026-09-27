@@ -104,15 +104,33 @@ run_apps() {
       || { log "${app}: image build failed, see results/${app}.build.log"; continue; }
     for target in ${targets}; do
       log "${app} against ${target}"
+      # A server that stopped fails the reset; that is reported and the next
+      # target still runs, rather than `set -e` ending the whole run silently.
       # shellcheck disable=SC2046
       compose --profile apps run --rm --name "turso-e2e-fw-dbadmin-${app}-${target}" \
-        dbadmin "${target}" $(databases_of "${app}") >/dev/null
+        dbadmin "${target}" $(databases_of "${app}") >/dev/null \
+        || { log "${app} against ${target}: resetting its databases failed"; server_still_running "${target}"; continue; }
       compose --profile apps run --rm --name "turso-e2e-fw-${app}-${target}" \
         -e E2E_APP="${app}" -e E2E_TARGET="${target}" -e E2E_UPSTREAM="${target}:3306" \
         "${app}" >"${E2E_RUN_DIR}/results/${app}-${target}.run.log" 2>&1 \
         || log "${app} against ${target}: container failed, see results/${app}-${target}.run.log"
+      server_still_running "${target}"
     done
   done
+}
+
+# Says so loudly when a server stopped, with the end of its log: every later
+# step would otherwise fail only as a refused connection.
+server_still_running() {
+  local target="$1"
+  local state
+  state="$(docker inspect -f '{{.State.Status}}' "turso-e2e-fw-${target}-1" 2>/dev/null || echo missing)"
+  if [[ "${state}" != "running" ]]; then
+    log "SERVER ${target} IS ${state}"
+    if [[ "${target}" == "turso" && -f "${E2E_RUN_DIR}/turso-log/server.log" ]]; then
+      tail -n 20 "${E2E_RUN_DIR}/turso-log/server.log" >&2
+    fi
+  fi
 }
 
 report() {

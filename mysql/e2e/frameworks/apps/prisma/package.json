@@ -1,0 +1,9 @@
+{
+  "name": "turso-e2e-prisma",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "prisma": "6.19.3"
+  }
+}
