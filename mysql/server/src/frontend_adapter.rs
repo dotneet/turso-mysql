@@ -6004,6 +6004,26 @@ fn scalar_call_column_definition(
         set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
         return Ok(definition);
     }
+    // Measured on MySQL 8.4.11: a clock reading to a fraction of a second
+    // reports the places it was asked for and is that much wider, one more
+    // for the point — `NOW(6)` a DATETIME of 26, `CURTIME(3)` a TIME of 12.
+    if let ScalarFunction::NowToAFraction { places }
+    | ScalarFunction::TimeOfDayToAFraction { places } = function
+    {
+        let moment = matches!(function, ScalarFunction::NowToAFraction { .. });
+        let mut definition = column_definition(
+            name,
+            if moment {
+                MYSQL_TYPE_DATETIME
+            } else {
+                MYSQL_TYPE_TIME
+            },
+        );
+        definition.column_length = if moment { 20 } else { 9 } + places;
+        definition.decimals = u8::try_from(places).map_err(|_| FrontendErrorKind::Internal)?;
+        set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG);
+        return Ok(definition);
+    }
     // Measured: a shift of a clock reading answers the same type the reading
     // does — a DATETIME of 19 for a moment, a DATE of 10 for a day shifted by
     // whole days — and is nullable where the reading itself is not. It reads
@@ -7071,6 +7091,9 @@ fn scalar_call_column_definition(
         ScalarFunction::Now => unreachable!("NOW was answered above"),
         ScalarFunction::Today => unreachable!("CURDATE was answered above"),
         ScalarFunction::TimeOfDay => unreachable!("CURTIME was answered above"),
+        ScalarFunction::NowToAFraction { .. } | ScalarFunction::TimeOfDayToAFraction { .. } => {
+            unreachable!("a clock reading to a fraction was answered above")
+        }
         ScalarFunction::RanksRows | ScalarFunction::RanksFraction | ScalarFunction::ShiftsRow => {
             unreachable!("the window calls were answered above")
         }

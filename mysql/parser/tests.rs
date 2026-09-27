@@ -1258,9 +1258,9 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
 
     for sql in [
         // An expression argument has no length this could work out, and
-        // NOW takes none at all.
+        // NOW takes no more than six places of a second.
         "SELECT LOWER(v || 'z') FROM s",
-        "SELECT NOW(3) FROM s",
+        "SELECT NOW(7) FROM s",
         // A count this cannot read leaves no width to answer with.
         "SELECT LEFT(v, n) FROM s",
         "SELECT SUBSTRING(v, 1, n) FROM s",
@@ -6779,7 +6779,7 @@ fn reads_a_date_column_and_the_calls_that_answer_a_day() {
     for sql in [
         "SELECT CURDATE(1) FROM d",
         "SELECT CURRENT_DATE(1) FROM d",
-        "SELECT CURTIME(1) FROM d",
+        "SELECT CURTIME(7) FROM d",
         "SELECT YEAR() FROM d",
         "SELECT YEAR(a, b) FROM d",
         "SELECT DATEDIFF(a) FROM d",

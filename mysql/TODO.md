@@ -475,8 +475,9 @@ Behaviour that works but does not match MySQL lives in
 - A `REPEATABLE READ` transaction that writes after another session committed
   since its first read is rolled back with 1213, where MySQL writes and keeps
   reading the old snapshot for the rows it did not touch
-- `CURRENT_TIMESTAMP(n)` as a default or on update reads the engine's clock,
-  which stops at the millisecond, so digits past the third are zeros
+- `CURRENT_TIMESTAMP(n)` as a default or on update, and `NOW(n)`,
+  `CURTIME(n)` and their spellings as a result column, read the engine's
+  clock, which stops at the millisecond, so digits past the third are zeros
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
 - complex compound projections still have conservative nullable metadata

@@ -5538,10 +5538,24 @@ fn render_scalar_call(
         || name.value.eq_ignore_ascii_case("CHARACTER_LENGTH")
     {
         "length"
+    } else if let Some(StaticSelectMetadata::ScalarCall {
+        function: static_select_metadata::ScalarFunction::NowToAFraction { places },
+        ..
+    }) = static_select_metadata::scalar_call(function)
+    {
+        return Ok(render_clock_to_a_fraction("%Y-%m-%d %H:%M:%f", 20, places));
+    } else if let Some(StaticSelectMetadata::ScalarCall {
+        function: static_select_metadata::ScalarFunction::TimeOfDayToAFraction { places },
+        ..
+    }) = static_select_metadata::scalar_call(function)
+    {
+        return Ok(render_clock_to_a_fraction("%H:%M:%f", 9, places));
     } else if name.value.eq_ignore_ascii_case("NOW")
         || name.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
         || name.value.eq_ignore_ascii_case("UTC_TIMESTAMP")
         || name.value.eq_ignore_ascii_case("SYSDATE")
+        || name.value.eq_ignore_ascii_case("LOCALTIME")
+        || name.value.eq_ignore_ascii_case("LOCALTIMESTAMP")
     {
         return Ok("datetime('now')".to_owned());
     } else if name.value.eq_ignore_ascii_case("CURDATE")
@@ -6416,6 +6430,23 @@ fn render_aggregate_over_branches(
             _,
         ) => unreachable!("only COUNT, SUM, AVG, MIN and MAX are read over a CASE"),
     })
+}
+
+/// Reads the clock to a count of places of a second.
+///
+/// The engine's clock reads to the millisecond, so the places past the third
+/// are always zero — a reading MySQL's clock could have taken, at a coarser
+/// grain. Cutting rather than rounding is what MySQL does: measured,
+/// `UTC_TIMESTAMP(2)` beside `UTC_TIME(3)` of `.137` answers `.13`.
+fn render_clock_to_a_fraction(format: &str, whole_length: u32, places: u32) -> String {
+    let read = format!(
+        "substr(strftime('{format}', 'now'), 1, {})",
+        whole_length + places.min(3)
+    );
+    match places.checked_sub(3) {
+        Some(padding) if padding > 0 => format!("({read} || '{}')", "0".repeat(padding as usize)),
+        _ => read,
+    }
 }
 
 /// Names the reading that answers a MySQL JSON call the engine has none for.

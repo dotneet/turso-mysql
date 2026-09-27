@@ -969,7 +969,14 @@ impl CheckedComparisonNow {
         if named(&["CURDATE", "CURRENT_DATE", "UTC_DATE"]) {
             return Some(Self::Day);
         }
-        if named(&["NOW", "CURRENT_TIMESTAMP", "UTC_TIMESTAMP", "SYSDATE"]) {
+        if named(&[
+            "NOW",
+            "CURRENT_TIMESTAMP",
+            "UTC_TIMESTAMP",
+            "SYSDATE",
+            "LOCALTIME",
+            "LOCALTIMESTAMP",
+        ]) {
             return Some(Self::Moment);
         }
         named(&["CURTIME", "CURRENT_TIME", "UTC_TIME"]).then_some(Self::TimeOfDay)

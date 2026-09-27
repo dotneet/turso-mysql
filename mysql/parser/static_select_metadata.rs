@@ -183,6 +183,12 @@ pub enum ScalarFunction {
     Today,
     /// `CURTIME` and `CURRENT_TIME`, which answer the time of day alone.
     TimeOfDay,
+    /// `NOW(n)` and its spellings, which answer the moment to `n` places of
+    /// a second.
+    NowToAFraction { places: u32 },
+    /// `CURTIME(n)` and its spellings, which answer the time of day to `n`
+    /// places of a second.
+    TimeOfDayToAFraction { places: u32 },
     /// `YEAR`, which reads the year out of a date and answers a `YEAR`.
     ReadsTheYear,
     /// `MONTH` and `DAY`, which read a smaller part of the same date.
@@ -1438,9 +1444,22 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
         sqlparser::ast::FunctionArguments::Subquery(_) => false,
     };
-    if named(&["NOW", "CURRENT_TIMESTAMP", "UTC_TIMESTAMP", "SYSDATE"]) {
-        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::Now,
+    // Measured on MySQL 8.4.11: `LOCALTIME` and `LOCALTIMESTAMP` are two more
+    // spellings of `NOW()`, and each of them, like `CURTIME`, takes a count
+    // of places for the fraction of a second, from 0 through 6.
+    if named(&[
+        "NOW",
+        "CURRENT_TIMESTAMP",
+        "UTC_TIMESTAMP",
+        "SYSDATE",
+        "LOCALTIME",
+        "LOCALTIMESTAMP",
+    ]) {
+        return clock_places(function).map(|places| StaticSelectMetadata::ScalarCall {
+            function: match places {
+                0 => ScalarFunction::Now,
+                places => ScalarFunction::NowToAFraction { places },
+            },
             columns: Vec::new(),
             literal_characters: 0,
             not_null: true,
@@ -1488,8 +1507,11 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         });
     }
     if named(&["CURTIME", "CURRENT_TIME", "UTC_TIME"]) {
-        return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::TimeOfDay,
+        return clock_places(function).map(|places| StaticSelectMetadata::ScalarCall {
+            function: match places {
+                0 => ScalarFunction::TimeOfDay,
+                places => ScalarFunction::TimeOfDayToAFraction { places },
+            },
             columns: Vec::new(),
             literal_characters: 0,
             not_null: true,
@@ -2757,6 +2779,29 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         literal_characters: 0,
         not_null: false,
     })
+}
+
+/// Reads the places of a second a clock reading was asked for: none written,
+/// or a written count from 0 through 6. Measured: MySQL refuses 7 and more
+/// with 1426.
+pub(super) fn clock_places(function: &sqlparser::ast::Function) -> Option<u32> {
+    let arguments = match &function.args {
+        sqlparser::ast::FunctionArguments::None => return Some(0),
+        sqlparser::ast::FunctionArguments::List(arguments) => arguments,
+        sqlparser::ast::FunctionArguments::Subquery(_) => return None,
+    };
+    match arguments.args.as_slice() {
+        [] => Some(0),
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(value),
+        ))] => {
+            let Value::Number(places, false) = &value.value else {
+                return None;
+            };
+            places.parse::<u32>().ok().filter(|places| *places <= 6)
+        }
+        _ => None,
+    }
 }
 
 /// Classifies `EXTRACT(<field> FROM column)`, which reads a part of a moment

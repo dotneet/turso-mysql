@@ -349,6 +349,17 @@ are, and answers what they answer. A session in another zone is refused all four
 which this does not convert. The bare `UTC_TIMESTAMP` spelling, without parentheses, is read
 as a column name.
 
+`LOCALTIME` and `LOCALTIMESTAMP`, with or without parentheses, are two more spellings of
+`NOW()`, measured on 8.4.11 to report the same NOT NULL `DATETIME` of 19, and are read
+wherever `NOW()` is. Each moment reading and each time-of-day reading takes a count of places
+for the fraction of a second, from 0 through 6 — MySQL refuses 7 with 1426 — and as a result
+column reports that many decimals and is that much wider, one more for the point: `NOW(6)` a
+`DATETIME` of 26 and `CURTIME(3)` a `TIME` of 12. The engine's clock reads to the millisecond,
+so a reading asked for four places or more answers zeroes past the third — a reading MySQL's
+own clock could have taken, at a coarser grain — and the fraction is cut rather than rounded,
+as MySQL cuts it. A reading carrying a fraction is taken as a result column only, not in a
+comparison or a shift.
+
 The same three readings are written as values, which is how a row records when it was made:
 `INSERT INTO t (created_at) VALUES (NOW())`, `INSERT ... SET d = CURRENT_DATE`, an
 `ON DUPLICATE KEY UPDATE updated_at = NOW()`, and `UPDATE t SET dt = NOW()` all write it.
