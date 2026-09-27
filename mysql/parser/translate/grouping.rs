@@ -33,6 +33,13 @@ pub(super) fn render_select_group_by(
 ) -> Result<String, ParseError> {
     let mut rendered = Vec::with_capacity(group_by.len());
     for key in group_by {
+        // A key naming the projection's alias for an expression groups by
+        // that expression, which is held to what an expression key is.
+        if let Some(aliased) = aliased_expression(key, projection) {
+            if !groups_the_way_mysql_does(aliased) {
+                return unsupported("GROUP BY key");
+            }
+        }
         if let Some((table, column)) = grouped_column(key) {
             rendered.push(match table {
                 Some(table) => format!("{}.{}", render_ident(table), render_ident(column)),
@@ -171,8 +178,26 @@ pub(super) fn expression_grouping_keys(select: &sqlparser::ast::Select) -> Optio
     };
     group_by
         .iter()
-        .any(|key| grouped_column(key).is_none())
+        .any(|key| {
+            grouped_column(key).is_none() || aliased_expression(key, &select.projection).is_some()
+        })
         .then_some(group_by.as_slice())
+}
+
+/// Returns the expression a key names through the projection's alias for it,
+/// when the key is such a name and the expression is not a whole column.
+fn aliased_expression<'a>(key: &Expr, projection: &'a [SelectItem]) -> Option<&'a Expr> {
+    let Expr::Identifier(name) = key else {
+        return None;
+    };
+    projection.iter().find_map(|item| match item {
+        SelectItem::ExprWithAlias { expr, alias }
+            if alias.value.eq_ignore_ascii_case(&name.value) && grouped_column(expr).is_none() =>
+        {
+            Some(expr)
+        }
+        _ => None,
+    })
 }
 
 /// Reports whether a projected column is one of the grouping keys: written

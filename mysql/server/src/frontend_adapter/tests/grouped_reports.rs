@@ -194,6 +194,26 @@ fn grouping_by_a_day_or_a_month_answers_the_shapes_mysql_reads_back() {
         ])
     );
 
+    // Naming the key by the projection's alias for it is grouping by the
+    // expression, in the same table.
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT DATE_FORMAT(created_at, '%Y-%m') AS m, COUNT(*) FROM posts GROUP BY m ORDER BY m",
+    );
+    assert_eq!(
+        shapes,
+        [(MYSQL_TYPE_VAR_STRING, 28, 0, MYSQL_NUM_FLAG), count]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[None, Some("1")],
+            &[Some("2025-12"), Some("1")],
+            &[Some("2026-01"), Some("2")],
+            &[Some("2026-02"), Some("1")],
+        ])
+    );
+
     // The function name in another case is the same key, and a HAVING may
     // name the projection's alias for it.
     let (_, answered) = report(
@@ -277,6 +297,7 @@ fn a_grouped_statement_refuses_what_only_full_group_by_refuses() {
         // MySQL groups words under the column's collation, where the engine
         // would group the call's answer by its bytes.
         "SELECT UPPER(title), COUNT(*) FROM posts GROUP BY UPPER(title)",
+        "SELECT UPPER(title) AS u, COUNT(*) FROM posts GROUP BY u",
     ] {
         assert!(
             matches!(

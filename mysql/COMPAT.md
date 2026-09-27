@@ -1664,8 +1664,9 @@ the protocol metadata now preserves.
 
 `GROUP BY` is taken over whole columns and over the calls a report groups by —
 `DATE`, `YEAR`, `MONTH`, `DAY`, the other readings of a moment's part,
-`LAST_DAY`, `DAYNAME`, `MONTHNAME` and `DATE_FORMAT` over a column — and is held
-to `ONLY_FULL_GROUP_BY`. That mode is in MySQL 8.4's default `sql_mode` and this
+`LAST_DAY`, `DAYNAME`, `MONTHNAME` and `DATE_FORMAT` over a column, written out
+or named by the projection's alias for it (`... AS m ... GROUP BY m`) — and is
+held to `ONLY_FULL_GROUP_BY`. That mode is in MySQL 8.4's default `sql_mode` and this
 server takes a client's `SET sql_mode` naming it, so the rule is enforced rather
 than assumed. Measured on MySQL 8.4.11:
 
