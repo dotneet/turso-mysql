@@ -263,3 +263,53 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// ALTER COLUMN cannot change a column's UNIQUE or PRIMARY KEY, so a new
+/// definition that leaves the column's own key out keeps it. Dropping it from
+/// the stored SQL alone left its sqlite_autoindex_* entry behind, and the
+/// database could not be opened again. Django's migrations restate a UNIQUE
+/// column this way (`ALTER TABLE auth_group MODIFY name varchar(150) NOT NULL`).
+#[test]
+fn test_alter_column_keeps_the_columns_own_key_across_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_column_keeps_key_reopen.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)")
+            .unwrap();
+        conn.execute("CREATE TABLE p(k TEXT PRIMARY KEY, d TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
+        conn.execute("INSERT INTO p VALUES ('x', 'one')").unwrap();
+        conn.execute("ALTER TABLE u ALTER COLUMN name TO name TEXT NOT NULL")
+            .unwrap();
+        conn.execute("ALTER TABLE p ALTER COLUMN k TO k TEXT NOT NULL")
+            .unwrap();
+        assert!(conn.execute("INSERT INTO u VALUES (2, 'a')").is_err());
+        assert!(conn.execute("INSERT INTO p VALUES ('x', 'two')").is_err());
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        let schema: Vec<(String,)> =
+            conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' ORDER BY name");
+        assert_eq!(
+            schema,
+            vec![
+                ("CREATE TABLE p (k TEXT NOT NULL PRIMARY KEY, d TEXT)".to_string(),),
+                (
+                    "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)"
+                        .to_string(),
+                ),
+            ]
+        );
+        assert!(conn.execute("INSERT INTO u VALUES (2, 'a')").is_err());
+        assert!(conn.execute("INSERT INTO p VALUES ('x', 'two')").is_err());
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+    }
+}

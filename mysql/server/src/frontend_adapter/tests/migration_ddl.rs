@@ -1055,3 +1055,31 @@ fn a_table_with_a_check_is_not_copied() {
         [[Some("checked".to_owned())]]
     );
 }
+
+/// Django creates `auth_group` with `name varchar(80) NOT NULL UNIQUE` and a
+/// later migration restates the column as `MODIFY name varchar(150) NOT
+/// NULL`. MySQL keeps the column's unique key across a MODIFY; here the key
+/// was dropped from the table's stored text but not its index, and the
+/// database could not be opened again — the server stopped on the next
+/// session.
+#[test]
+fn a_unique_column_restated_by_modify_keeps_its_key_across_a_restart() {
+    let (directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `auth_group` (`id` integer AUTO_INCREMENT NOT NULL PRIMARY KEY, `name` varchar(80) NOT NULL UNIQUE)",
+        "INSERT INTO `auth_group` (`name`) VALUES ('editors')",
+        "ALTER TABLE `auth_group` MODIFY `name` varchar(150) NOT NULL",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let mut adapter = reopened(&directory, adapter);
+    assert!(matches!(
+        adapter.execute_query("INSERT INTO `auth_group` (`name`) VALUES ('editors')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    ));
+    adapter
+        .execute_query("INSERT INTO `auth_group` (`name`) VALUES ('viewers')")
+        .unwrap();
+}

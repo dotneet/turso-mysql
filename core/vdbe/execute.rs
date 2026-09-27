@@ -11625,8 +11625,11 @@ pub fn op_function(
                         }
                     };
 
+                    // The definition was written by the translator, which
+                    // refused a key the user added and carried over the key the
+                    // column already had, so it is read as a table's column is.
                     let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+                        Parser::new(column_def.as_bytes()).parse_column_definition(false)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 

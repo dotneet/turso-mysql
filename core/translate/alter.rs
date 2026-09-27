@@ -1977,7 +1977,7 @@ pub fn translate_alter_table(
         body @ (ast::AlterTableBody::AlterColumn { .. }
         | ast::AlterTableBody::RenameColumn { .. }) => {
             let from;
-            let definition;
+            let mut definition;
             let col_name;
             let rename;
 
@@ -2040,6 +2040,18 @@ pub fn translate_alter_table(
                 return Err(LimboError::ParseError(
                     "UNIQUE constraint cannot be altered".to_string(),
                 ));
+            }
+
+            if !rename {
+                let keeps_primary_key = !btree.columns()[column_index].is_rowid_alias();
+                definition.constraints.extend(column_key_constraints(
+                    resolver,
+                    connection,
+                    database_id,
+                    table_name,
+                    from,
+                    keeps_primary_key,
+                )?);
             }
 
             let (rewrites_physical_layout, virtual_generated_values_may_change, replacement_column) =
@@ -2536,6 +2548,63 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Returns the `UNIQUE`, and the `PRIMARY KEY` of a column that is not the
+/// rowid, that a column's own definition carries in the table's stored SQL.
+///
+/// ALTER COLUMN cannot change either (both are refused above), so a new
+/// definition that leaves them out keeps them. Writing the new definition
+/// without them would leave their automatic index in `sqlite_schema` with
+/// nothing in the table's SQL to account for it, and the database could not
+/// be opened again.
+fn column_key_constraints(
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    table_name: &str,
+    column_name: &str,
+    keeps_primary_key: bool,
+) -> Result<Vec<ast::NamedColumnConstraint>> {
+    let table_sql = resolver
+        .with_schema(database_id, |schema| {
+            schema.table_sql(table_name).map(str::to_owned)
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "missing stored SQL for table {table_name} during ALTER COLUMN"
+            ))
+        })?;
+    let stmt = connection
+        .dialect()
+        .parse_schema_sql(crate::dialect::SchemaSqlKind::Table, &table_sql)?;
+    let ast::Stmt::CreateTable {
+        body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    } = stmt
+    else {
+        return Err(LimboError::InternalError(format!(
+            "stored SQL for table {table_name} does not define its columns"
+        )));
+    };
+    let column_name = normalize_ident(column_name);
+    let column = columns
+        .into_iter()
+        .find(|column| normalize_ident(column.col_name.as_str()) == column_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "stored SQL for table {table_name} has no column {column_name}"
+            ))
+        })?;
+    Ok(column
+        .constraints
+        .into_iter()
+        .filter(|constraint| match constraint.constraint {
+            ast::ColumnConstraint::Unique(..) => true,
+            ast::ColumnConstraint::PrimaryKey { .. } => keeps_primary_key,
+            _ => false,
+        })
+        .collect())
 }
 
 // Return the indexes whose persisted entries may become stale after ALTER COLUMN,
