@@ -6049,11 +6049,13 @@ impl MySqlConnection {
         let Ok(table) = MySqlTableName::parse(source_table) else {
             return Ok(translated);
         };
-        if translated
-            .source_tables()
-            .iter()
-            .any(|source| source.subquery() || !source.projected_columns().is_empty())
-        {
+        // A derived table and a CTE say what each of their columns is, so the
+        // statement around them can be read knowing the types; a subquery
+        // reads a table of its own this has no types for.
+        if translated.source_tables().iter().any(|source| {
+            source.subquery()
+                || (!source.projected_columns().is_empty() && source.derived().is_none())
+        }) {
             return Err(MySqlQueryError::Unsupported(
                 "SELECT expression needs a base table's column types".to_string(),
             ));
@@ -6082,9 +6084,10 @@ impl MySqlConnection {
             }
             return Ok(translated);
         }
-        let Ok(columns) = self.list_columns(&table) else {
+        let Ok(table_own_columns) = self.list_columns(&table) else {
             return Ok(translated);
         };
+        let columns = columns_under_derived_names(&table_own_columns, translated.source_tables())?;
         let text_columns = columns
             .iter()
             .filter(|column| is_text_type(column.type_name()))
@@ -6097,20 +6100,16 @@ impl MySqlConnection {
             .filter(|column| matches!(column.type_name(), "DATETIME" | "TIMESTAMP"))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        let table_columns = if let Some(source) = translated.source_tables().first() {
-            if !source.projected_columns().is_empty() {
-                source.projected_columns().to_vec()
-            } else {
-                columns
-                    .iter()
-                    .map(|column| column.name().to_owned())
-                    .collect::<Vec<_>>()
-            }
-        } else {
-            columns
+        let table_columns = match translated
+            .source_tables()
+            .first()
+            .and_then(MySqlSelectSource::derived)
+        {
+            Some(derived) if !derived.names().is_empty() => derived.names().to_vec(),
+            _ => table_own_columns
                 .iter()
                 .map(|column| column.name().to_owned())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         };
         let member_columns = columns
             .iter()
@@ -9311,6 +9310,54 @@ fn names_the_collation_of_words(constraint: &turso_parser::ast::NamedColumnConst
 /// Writes one name the way the engine reads it back.
 fn quoted_engine_name(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Adds the names a derived table or a CTE gives its table's columns, each
+/// carrying the column's own type, so a reading that knows the types knows
+/// what the statement around the body names as well as what the body names.
+///
+/// A name that is also another of the table's columns would stand for two
+/// types at once, so it is refused.
+fn columns_under_derived_names(
+    columns: &[MySqlColumnMetadata],
+    sources: &[MySqlSelectSource],
+) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlQueryError> {
+    let mut named = columns.to_vec();
+    for source in sources {
+        let Some(derived) = source.derived() else {
+            continue;
+        };
+        for (ordinal, name) in derived.names().iter().enumerate() {
+            if derived.answer(ordinal).is_some() {
+                continue;
+            }
+            let base = &source.projected_columns()[ordinal];
+            if name.eq_ignore_ascii_case(base) {
+                continue;
+            }
+            if columns
+                .iter()
+                .any(|column| column.name().eq_ignore_ascii_case(name))
+            {
+                return Err(MySqlQueryError::Unsupported(
+                    "a derived table naming a column after another of its table's columns"
+                        .to_string(),
+                ));
+            }
+            let Some(column) = columns
+                .iter()
+                .find(|column| column.name().eq_ignore_ascii_case(base))
+            else {
+                return Err(MySqlQueryError::Unsupported(
+                    "a derived table projecting a column its table does not have".to_string(),
+                ));
+            };
+            let mut renamed = column.clone();
+            renamed.name.clone_from(name);
+            named.push(renamed);
+        }
+    }
+    Ok(named)
 }
 
 fn is_integer_type(type_name: &str) -> bool {

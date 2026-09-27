@@ -5091,11 +5091,22 @@ fn a_cte_names_a_subquery_and_keeps_its_columns_metadata() {
         ]
     );
 
-    // A body this cannot resolve an ordinal through is refused, and so is
-    // one naming an internal catalog table.
-    assert!(adapter
+    // A body projecting its whole table reads it column for column. It is
+    // read straight through, which keeps every flag — measured on 8.4.11.
+    let CommandExecutionResult::ResultSet(whole) = adapter
         .execute_query("WITH c AS (SELECT * FROM f) SELECT c.id FROM c")
-        .is_err());
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        whole.columns[0].flags,
+        MYSQL_NOT_NULL_FLAG
+            | MYSQL_PRI_KEY_FLAG
+            | MYSQL_PART_KEY_FLAG
+            | MYSQL_NO_DEFAULT_VALUE_FLAG
+    );
+    // A body naming an internal catalog table is refused.
     assert!(adapter
         .execute_query("WITH c AS (SELECT rootpage FROM sqlite_schema) SELECT c.rootpage FROM c")
         .is_err());
@@ -26415,6 +26426,18 @@ fn a_whole_statement_stands_where_a_table_does() {
             vec![("COUNT(*)", MYSQL_TYPE_LONGLONG, 21)],
             vec![vec!["3"]],
         ),
+        // A body projecting its whole table reads it column for column.
+        (
+            "SELECT x.id FROM (SELECT * FROM users) x ORDER BY x.id",
+            vec![("id", MYSQL_TYPE_LONG, 11)],
+            vec![vec!["1"], vec!["2"], vec!["3"]],
+        ),
+        // A body that aggregates says what its column answers.
+        (
+            "SELECT x.total FROM (SELECT SUM(score) AS total FROM users) x",
+            vec![("total", MYSQL_TYPE_NEWDECIMAL, 33)],
+            vec![vec!["60"]],
+        ),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter.execute_query(sql).unwrap() else {
             panic!("{sql} must return a result set");
@@ -26453,11 +26476,9 @@ fn a_whole_statement_stands_where_a_table_does() {
     for sql in [
         // 1248 in MySQL: every derived table must have its own alias.
         "SELECT x.id FROM (SELECT id FROM users)",
-        // A wildcard or an expression leaves no name to resolve a result
-        // column's ordinal through, the reason a CTE's body is held to the
-        // same rule.
-        "SELECT x.id FROM (SELECT * FROM users) x",
-        "SELECT x.total FROM (SELECT SUM(score) AS total FROM users) x",
+        // MySQL reads a body that does not aggregate straight through, and
+        // what it reports for an expression there has not been measured.
+        "SELECT x.more FROM (SELECT score + 1 AS more FROM users) x",
         // A body reading more than one table is refused with every other
         // subquery that does.
         "SELECT x.id FROM (SELECT u.id FROM users u JOIN users v ON v.id = u.id) x",
@@ -30686,3 +30707,6 @@ mod views;
 
 #[cfg(unix)]
 mod grouped_reports;
+
+#[cfg(unix)]
+mod derived_tables;

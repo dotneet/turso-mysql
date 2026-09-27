@@ -12,8 +12,11 @@
 
 use super::*;
 
+mod derived;
 mod grouping;
 mod json_condition;
+
+pub use derived::MySqlDerivedColumns;
 
 /// One table a `SELECT` reads, with the name the engine reports for it.
 ///
@@ -27,6 +30,8 @@ pub struct MySqlSelectSource {
     branch: usize,
     subquery: bool,
     projected_columns: Vec<String>,
+    /// What a derived table or a CTE projects, when this is one.
+    derived: Option<MySqlDerivedColumns>,
     catalog: Option<MySqlCatalogTable>,
     hinted_indexes: Vec<String>,
 }
@@ -236,6 +241,11 @@ impl MySqlSelectSource {
         &self.projected_columns
     }
 
+    /// Returns what a derived table or a CTE projects, when this is one.
+    pub const fn derived(&self) -> Option<&MySqlDerivedColumns> {
+        self.derived.as_ref()
+    }
+
     /// Reports whether a subquery reads this table rather than the statement
     /// itself.
     ///
@@ -394,9 +404,14 @@ pub(crate) fn translate_select_query(
         {
             source.table = cte.table.clone();
             source.projected_columns.clone_from(&cte.projected_columns);
+            source.derived.clone_from(&cte.derived);
         }
     }
     source_tables.append(&mut render_context.subquery_tables);
+    derived::resolve_comparisons_through_derived_columns(
+        &mut render_context.checked_comparisons,
+        &source_tables,
+    )?;
     // A qualified comparison names the table its column belongs to, and that
     // has to be a table the statement reads — a join has several and so does a
     // statement with a subquery, and the qualifier is what says which of them
@@ -1142,9 +1157,7 @@ fn render_derived_table(
     let Some(source) = render_context.subquery_tables.pop() else {
         return unsupported("derived table requires one table");
     };
-    if source.projected_columns.is_empty() {
-        return unsupported("derived table requires a projection of whole columns");
-    }
+    let (projected_columns, derived) = derived::derived_columns(subquery, &source, render_context)?;
     Ok((
         format!("({body}) AS {}", render_ident(&alias.name)),
         MySqlSelectSource {
@@ -1153,7 +1166,8 @@ fn render_derived_table(
             outer: false,
             branch: 0,
             subquery: false,
-            projected_columns: source.projected_columns,
+            projected_columns,
+            derived: Some(derived),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
         },
@@ -1183,16 +1197,12 @@ fn render_common_table_expressions(
         {
             return unsupported("WITH option");
         }
-        let (body, projected) = render_subquery(&cte.query, render_context)?;
+        let (body, _) = render_subquery(&cte.query, render_context)?;
         let Some(source) = render_context.subquery_tables.pop() else {
             return unsupported("WITH body requires one table");
         };
-        let _ = projected;
-        if source.projected_columns.is_empty() {
-            // A wildcard or an expression leaves no name to resolve a result
-            // column's ordinal through.
-            return unsupported("WITH body requires a projection of whole columns");
-        }
+        let (projected_columns, derived) =
+            derived::derived_columns(&cte.query, &source, render_context)?;
         rendered.push(format!("{} AS ({body})", render_ident(&cte.alias.name)));
         sources.push(MySqlSelectSource {
             reference: cte.alias.name.value.clone(),
@@ -1200,7 +1210,8 @@ fn render_common_table_expressions(
             outer: false,
             branch: 0,
             subquery: false,
-            projected_columns: source.projected_columns,
+            projected_columns,
+            derived: Some(derived),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
         });
@@ -4546,6 +4557,7 @@ fn render_select_table(
             branch: 0,
             subquery: false,
             projected_columns: Vec::new(),
+            derived: None,
             catalog,
             hinted_indexes,
         },

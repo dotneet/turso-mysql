@@ -527,12 +527,23 @@ fn decimal_updates_keep_operand_precision_until_assignment() -> Result<()> {
             "SELECT LEAST(a.v, b.v) FROM left_decimal AS a JOIN right_decimal AS b ON a.v = b.v"
         )
         .is_err());
-    assert!(connection
-        .prepare_select("SELECT x / 2 FROM (SELECT v AS x FROM left_decimal) AS q")
-        .is_err());
-    assert!(connection
-        .prepare_select("WITH q AS (SELECT v AS x FROM left_decimal) SELECT x / 2 FROM q")
-        .is_err());
+    // A derived table and a CTE say which of the table's columns each of
+    // theirs is, so a column read under another name is still a decimal and
+    // divides exactly, the way the table's own does.
+    let own = connection
+        .prepare_select("SELECT v / 2 FROM left_decimal")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .run_collect_rows()?;
+    for sql in [
+        "SELECT x / 2 FROM (SELECT v AS x FROM left_decimal) AS q",
+        "WITH q AS (SELECT v AS x FROM left_decimal) SELECT x / 2 FROM q",
+    ] {
+        let renamed = connection
+            .prepare_select(sql)
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?;
+        assert_eq!(renamed, own, "{sql}");
+    }
     connection.execute("CREATE TABLE scalar_join (id INT)")?;
     connection.execute("INSERT INTO scalar_join (id) VALUES (1)")?;
     // The engine compares a DECIMAL with a whole number as a double, where

@@ -489,10 +489,42 @@ may narrow its rows; the columns may be read back in another order than the body
 them; a name needs no alias when only one source answers to it; and a derived table with no
 alias is 1248, as MySQL requires one.
 
-The body has to read one table and project its columns, for the reason a CTE's body does: a
-wildcard or an expression leaves no name to resolve an ordinal through, so
-`(SELECT SUM(n) AS total FROM t) x` is refused. So is a `LATERAL` one, one naming its own
-columns, and one in an `UPDATE` or a `DELETE`, each of which reads its own table.
+The body reads one table. What it projects decides what each column is, and the same holds for
+a CTE's body:
+
+- A column of the table, under its own name or an alias. `(SELECT u.id AS uid FROM users u) x`
+  answers `x.uid` as `users.id`, and TypeORM's pagination query — `SELECT DISTINCT
+  distinctAlias.User_id AS ids_User_id FROM (SELECT User.id AS User_id FROM users User)
+  distinctAlias ORDER BY User_id ASC LIMIT 10` — reads that way.
+- `*`, which reads the table column for column: `WITH active AS (SELECT * FROM users WHERE
+  status = 'active') SELECT * FROM active`.
+- In a body that aggregates, a `COUNT`, a `SUM`, an `AVG`, a `MIN` or a `MAX` over a column, or
+  a `DATE` it groups by — `(SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id) t`. An
+  unaliased one goes by its source text, `COUNT(*)`.
+
+Measured on MySQL 8.4.11, MySQL reads the two kinds of body differently, and the shapes follow
+it. A body that aggregates is written out into a table of its own first, and each column is that
+table's: a column of the table keeps its NOT NULL, its default and its sign but none of its keys
+and no auto-increment, and an answer the body worked out names the derived table, goes by its
+name in the body and names no database and no original table, with every number losing the
+binary flag — a count, a total, a largest and an average alike — words losing the 31 decimals a
+call's words carry, and a day and a moment keeping their binary flag. Any other body is read
+straight through: every column keeps every flag, and a day, a moment and a time of day come back
+in the connection's character set, four bytes to each character they spell — a `DATETIME` 76
+where on its own it reports 19 — and a JSON column in it too. Either way a column of the table
+goes by the name the body gave it and names the table under the name the body read it under,
+its alias when there is one: TypeORM's `ids_User_id` names `User` and `User_id`.
+
+A comparison the outer statement makes on a derived column is held to what the column is: a
+column of the table to its declared type under the body's name for it, a count to a whole
+number, and a largest or smallest to its column's kind — `WHERE t.c > 0`. A total or an average
+compared against a value is refused, having not been measured. So are an expression in a body
+that does not aggregate, which MySQL reads straight through and whose shape there has not been
+measured; a `DISTINCT` body; two columns going by one name, which MySQL answers 1060 for; an
+aggregate over a column the body worked out; a `LATERAL` one; one naming its own columns; and one
+in an `UPDATE` or a `DELETE`, each of which reads its own table. A name the body gives a column
+that is also another of the table's columns is refused where the statement needs the columns'
+types, since it would stand for two.
 
 A shift by months keeps the day inside the month it lands in. MySQL takes the last day of the
 target month where that month has no such day, and the engine's own month arithmetic overflows
@@ -1385,10 +1417,12 @@ through the table. A CTE can project its table's columns in any order, and
 resolving straight into the table hands each column the other's metadata; the
 projected names are carried for exactly that reason.
 
-Refused: `WITH RECURSIVE`, a body that reads more than one table or carries its
-own `ORDER BY` or `LIMIT`, a column list on the name, the materialization hints,
-and a body whose projection is not whole columns — a wildcard or an expression
-leaves no name to resolve an ordinal through. A `WHERE` comparison against a
+A CTE's body projects what a derived table's does and reports the same shapes —
+`*`, a column under an alias, and in a body that aggregates the answers it works
+out; see the derived table paragraphs. Refused: `WITH RECURSIVE`, a body that
+reads more than one table or carries its own `ORDER BY` or `LIMIT`, a column
+list on the name, the materialization hints, and an expression in a body that
+does not aggregate. A `WHERE` comparison against a
 qualified column is accepted when the qualifier matches the single source table,
 alias, or CTE name, so `WHERE c.id = 1` works as expected. Multi-table joins or
 unmatching qualifiers remain refused.
@@ -4892,7 +4926,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL` / `COALESCE` with a written word — `IFNULL(email, 'none')` | partial | partial | n/a | n/a | partial | [`defaulted classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-defaulted-word.json), [P0 manifest](conformance/Makefile) | The column's own width whatever the word's is, NOT NULL, and `VAR_STRING` even over a `CHAR`. A `TEXT` column and a word over a column of numbers are refused. |
 | A join `ON` naming a value — `ON t.id = u.team_id AND t.name = 'red'` | yes | yes | n/a | n/a | yes | [`join predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-join-on-value.json), [P0 manifest](conformance/Makefile) | Goes through the reader a `WHERE` comparison goes through, so the value is held to the column's own type. Column against column stays equality; an `ON` in an `UPDATE` or `DELETE` takes columns alone. |
 | `ORDER BY` over a call — `ORDER BY LOWER(name)` | yes | yes | n/a | n/a | yes | [`ORDER BY renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-call.json), [P0 manifest](conformance/Makefile) | Any call whose shape is already known, collated the way a text column is. A random number is refused. |
-| A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, which the alias then stands for. Its result columns carry the table's own shapes. A wildcard, an expression, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
+| A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate/derived.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, aliased or not, `*`, or — when it aggregates — counts, totals, averages, largest and smallest values and days. A body that aggregates reports the shapes of the table MySQL writes it into, and any other body reports the table's own, a day or a moment in words. An expression in a body that does not aggregate, a `DISTINCT` body, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
 | `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |
 | `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |

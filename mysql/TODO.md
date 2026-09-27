@@ -207,8 +207,9 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | A `UNION` naming a `DECIMAL` column, or reaching one through a wildcard or an expression | refused; only the first branch's table is read for column types |
 | A `UNION` branch projecting a wildcard or an expression | taken with the first branch's shape, which is what the engine reports; MySQL's shape for the mixture has not been measured |
 | `WITH RECURSIVE` | refused |
-| A wildcard projection in a CTE body, or in a derived table's | refused; no name to resolve an ordinal through |
-| A derived table whose body projects an expression or an aggregate — `(SELECT SUM(n) AS total FROM t) x` | refused; the same, there is no table column for the ordinal to land on |
+| A derived table or CTE whose body projects an expression without aggregating — `(SELECT n + 1 AS m FROM t) x` | refused; MySQL reads that body straight through, and what it reports for the expression there has not been measured |
+| A derived table or CTE whose body aggregates with a call other than `DATE`, a `GROUP_CONCAT`, or `DISTINCT` | refused; the shape MySQL stores it in has not been measured |
+| A comparison or an aggregate over a total or an average a derived table worked out — `WHERE t.s > 1`, `SELECT SUM(c) FROM totals` | refused; measured, `SUM(c)` over a count answers a `NEWDECIMAL` of 43, a rule not worked out here |
 | A derived table whose body reads more than one table, or that is written `LATERAL` or names its own columns | refused |
 | A derived table in an `UPDATE` or a `DELETE` | refused; each reads its own table |
 | `DISTINCT ON` | refused, and no part of MySQL |

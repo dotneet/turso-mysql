@@ -1398,10 +1398,46 @@ fn a_cte_names_the_table_its_body_reads() {
     assert_eq!((source.reference(), source.table().as_str()), ("c", "f"));
     assert_eq!(source.projected_columns(), ["n", "id"]);
 
+    // A body that aggregates says what each of its columns answers, and one
+    // projecting `*` reads its table column for column.
+    let translated = parse_select(
+        "WITH c AS (SELECT n, COUNT(*) AS k FROM f GROUP BY n) SELECT c.n, c.k FROM c WHERE c.k > 1",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let [source] = translated.source_tables() else {
+        panic!("one table");
+    };
+    let derived = source.derived().unwrap();
+    assert!(derived.materialized());
+    assert_eq!(derived.names(), ["n", "k"]);
+    assert_eq!(derived.answer(0), None);
+    assert_eq!(derived.answer(1), Some(&StaticSelectMetadata::Count));
+    // The count answers a whole number, which is what its comparison is
+    // held to.
+    let [comparison] = translated.checked_comparisons() else {
+        panic!("one comparison");
+    };
+    assert_eq!(
+        comparison.answers(),
+        Some(CheckedComparisonAnswer::WholeNumber)
+    );
+    let translated = parse_select(
+        "WITH c AS (SELECT * FROM f WHERE id > 1) SELECT c.id FROM c",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(translated.source_tables()[0].projected_columns().is_empty());
+
     for sql in [
-        // A wildcard or an expression leaves no name to resolve through.
-        "WITH c AS (SELECT * FROM f) SELECT c.id FROM c",
+        // MySQL reads a body that does not aggregate straight through, and
+        // what it reports for a call there has not been measured.
         "WITH c AS (SELECT id + 1 FROM f) SELECT c.id FROM c",
+        "WITH c AS (SELECT DATE(d) AS day FROM f) SELECT c.day FROM c",
+        // 1060: two columns going by one name.
+        "WITH c AS (SELECT COUNT(*) AS k, MAX(id) AS k FROM f) SELECT c.k FROM c",
+        // A total has not been measured against a value.
+        "WITH c AS (SELECT SUM(id) AS s FROM f) SELECT c.s FROM c WHERE c.s > 1",
         // Each body reads one table, and RECURSIVE is its own shape.
         "WITH RECURSIVE c AS (SELECT id FROM f) SELECT c.id FROM c",
         "WITH c AS (SELECT f.id FROM f JOIN g ON f.id = g.id) SELECT c.id FROM c",
@@ -4580,16 +4616,25 @@ fn select_source_table_metadata_is_canonical_and_fail_closed() {
     assert_eq!(source.reference(), "rows");
     assert_eq!(source.table().as_str(), "users");
     assert_eq!(source.projected_columns(), ["id"]);
+    // A body projecting its whole table reads it column for column, so the
+    // derived table is the table under another name.
+    let translated = parse_select("SELECT id FROM (SELECT * FROM users) AS rows", mode).unwrap();
+    let [source] = translated.source_tables() else {
+        panic!("a derived table is one source");
+    };
+    assert_eq!(
+        (source.reference(), source.table().as_str()),
+        ("rows", "users")
+    );
+    assert!(source.projected_columns().is_empty());
+    assert!(source
+        .derived()
+        .is_some_and(|derived| derived.names().is_empty()));
 
-    for sql in [
-        "SELECT id FROM app.users",
-        "SELECT id FROM (SELECT * FROM users) AS rows",
-    ] {
-        assert!(
-            parse_select(sql, mode).is_err(),
-            "expected source-table metadata to reject {sql}"
-        );
-    }
+    assert!(
+        parse_select("SELECT id FROM app.users", mode).is_err(),
+        "expected source-table metadata to reject a qualified table"
+    );
 }
 
 #[test]

@@ -73,12 +73,11 @@ use turso_mysql_parser::{
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     renamed_tables, select_projection_origins, table_comment_change, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
-    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
-    GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
-    MySqlDatabaseName, MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
-    MySqlLikePattern, MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource,
-    MySqlTableName, ScalarFunction,
+    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
+    ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
+    MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
+    MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
+    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
@@ -4036,8 +4035,9 @@ fn prepared_statement_result(
                         if let Some((table, ordinal)) =
                             source_metadata.projection_source(0, table.as_deref(), source)
                         {
-                            let mut definition = source_metadata.column_definition_for_reference(
-                                Some((table.table_reference.clone(), ordinal)),
+                            let mut definition = source_metadata.table_column_definition(
+                                table,
+                                ordinal,
                                 column.name,
                                 Some(column_type),
                             )?;
@@ -4609,6 +4609,8 @@ struct SourceTableColumns {
     /// CTE rather than the table itself. A result column's ordinal counts
     /// through these, not through the table's own columns.
     projected_columns: Vec<String>,
+    /// What a derived table or a CTE projects, when this reference is one.
+    derived: Option<MySqlDerivedColumns>,
     /// An outer join can leave this table's row missing, which is what takes
     /// the `NOT NULL` flag off its columns.
     outer: bool,
@@ -4630,6 +4632,12 @@ impl SourceTableColumns {
     /// A CTE can project its table's columns in any order, so the ordinal
     /// counts through what the CTE projected and the name it lands on is
     /// looked up in the table.
+    /// Returns what the derived table's column at `ordinal` answers, when the
+    /// body worked it out rather than reading it from its table.
+    fn answer(&self, ordinal: usize) -> Option<&turso_mysql_parser::StaticSelectMetadata> {
+        self.derived.as_ref()?.answer(ordinal)
+    }
+
     fn column_ordinal(&self, ordinal: usize) -> Result<usize, FrontendErrorKind> {
         if self.projected_columns.is_empty() {
             return Ok(ordinal);
@@ -4719,9 +4727,14 @@ impl TableResultMetadata {
                         .is_none_or(|name| table.table_reference.eq_ignore_ascii_case(name))
             })
             .filter_map(|table| {
-                let ordinal = if !table.projected_columns.is_empty() {
-                    table
-                        .projected_columns
+                let named = table
+                    .derived
+                    .as_ref()
+                    .map(MySqlDerivedColumns::names)
+                    .filter(|names| !names.is_empty())
+                    .unwrap_or(&table.projected_columns);
+                let ordinal = if !named.is_empty() {
+                    named
                         .iter()
                         .position(|name| name.eq_ignore_ascii_case(column_name))
                 } else if !table.catalog_columns.is_empty() {
@@ -5026,7 +5039,36 @@ impl TableResultMetadata {
         let table = self
             .table_for(&table_reference)
             .ok_or(FrontendErrorKind::Unsupported)?;
-        let ordinal = table.column_ordinal(ordinal)?;
+        if let Some(answer) = table.answer(ordinal) {
+            return self.derived_answer_definition(table, ordinal, answer, name);
+        }
+        let mut definition = self.table_column_definition(
+            table,
+            table.column_ordinal(ordinal)?,
+            name,
+            fallback_type,
+        )?;
+        if !self.union && table.derived.is_none() && table.catalog_columns.is_empty() {
+            // The engine reports the name the statement read the table under,
+            // spelled the way it was declared. A derived table's name was
+            // declared by the statement, and MySQL reports it as written.
+            definition.table = table_reference;
+        }
+        if let Some(derived) = &table.derived {
+            read_through_a_derived_table(&mut definition, derived, ordinal);
+        }
+        Ok(definition)
+    }
+
+    /// Builds the result column one of a table's own columns reports, by its
+    /// place among the table's columns.
+    fn table_column_definition(
+        &self,
+        table: &SourceTableColumns,
+        ordinal: usize,
+        name: String,
+        fallback_type: Option<u8>,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         // An `information_schema` column reports the shape MySQL reports for
         // it, which is pinned rather than worked out from a declared type.
         // Only the column itself is answered: an aggregate or a call over one
@@ -5047,7 +5089,7 @@ impl TableResultMetadata {
                 .ok_or(FrontendErrorKind::Internal)?
                 .clone();
             definition.name = name;
-            definition.table = table_reference;
+            definition.table.clone_from(&table.table_reference);
             return Ok(definition);
         }
         let source = table
@@ -5173,7 +5215,7 @@ impl TableResultMetadata {
             }
         }
         definition.schema.clone_from(&self.database);
-        definition.table = table_reference;
+        definition.table.clone_from(&table.table_reference);
         definition.original_table.clone_from(&table.source_table);
         source.name().clone_into(&mut definition.original_name);
         definition.flags = mysql_table_column_flags(source);
@@ -5228,6 +5270,38 @@ impl TableResultMetadata {
         Ok(definition)
     }
 
+    /// Builds the result column a derived table's worked-out column reports.
+    ///
+    /// Measured on MySQL 8.4.11: MySQL writes a body that aggregates out into
+    /// a table of its own, and the column is that table's. It names the
+    /// derived table, goes by the name the body gave it, and names no
+    /// database and no original table. Its shape is the answer's own, stored
+    /// — see [`stored_in_a_derived_table`].
+    fn derived_answer_definition(
+        &self,
+        table: &SourceTableColumns,
+        ordinal: usize,
+        answer: &turso_mysql_parser::StaticSelectMetadata,
+        name: String,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let derived = table.derived.as_ref().ok_or(FrontendErrorKind::Internal)?;
+        let mut definition = match static_column_definition(name.clone(), answer) {
+            Some(definition) => definition,
+            None => aggregate_column_definition(Some(self), name, answer)?,
+        };
+        stored_in_a_derived_table(&mut definition, answer)?;
+        definition.schema.clear();
+        definition.table.clone_from(&table.table_reference);
+        definition.original_table.clear();
+        definition.original_name.clone_from(
+            derived
+                .names()
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Internal)?,
+        );
+        Ok(definition)
+    }
+
     /// Builds the result column an aggregate over `column_name` reports.
     ///
     /// The answer belongs to no table, so the column's own table, key and
@@ -5247,11 +5321,7 @@ impl TableResultMetadata {
             // An `information_schema` table names its columns itself, and an
             // aggregate or a call over one of them has not been measured.
             .ok_or(FrontendErrorKind::Unsupported)?;
-        let mut definition = self.column_definition_for_reference(
-            Some((table.table_reference.clone(), ordinal)),
-            name,
-            None,
-        )?;
+        let mut definition = self.table_column_definition(table, ordinal, name, None)?;
         // Measured on MySQL 8.4.11: `STDDEV_SAMP(v)` answers a DOUBLE of length
         // 23 with the not-fixed decimals value, whatever the column is, and it
         // is nullable — a single row has no sample deviation, which both
@@ -6698,11 +6768,7 @@ fn scalar_call_column_definition(
         let Some(characters) = spelled_characters(source) else {
             return Err(FrontendErrorKind::Unsupported);
         };
-        let mut definition = source_metadata.column_definition_for_reference(
-            Some((table.table_reference.clone(), ordinal)),
-            name,
-            None,
-        )?;
+        let mut definition = source_metadata.table_column_definition(table, ordinal, name, None)?;
         definition.column_length = characters * UTF8MB4_MAX_BYTES_PER_CHARACTER;
         definition.column_type = MYSQL_TYPE_VAR_STRING;
         definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
@@ -6770,11 +6836,7 @@ fn scalar_call_column_definition(
         {
             return Err(FrontendErrorKind::Unsupported);
         }
-        let mut definition = source_metadata.column_definition_for_reference(
-            Some((table.table_reference.clone(), ordinal)),
-            name,
-            None,
-        )?;
+        let mut definition = source_metadata.table_column_definition(table, ordinal, name, None)?;
         if matches!(
             definition.column_type,
             MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
@@ -6879,11 +6941,7 @@ fn scalar_call_column_definition(
         if is_text_column(source) {
             return Err(FrontendErrorKind::Unsupported);
         }
-        let own = source_metadata.column_definition_for_reference(
-            Some((table.table_reference.clone(), ordinal)),
-            name.clone(),
-            None,
-        )?;
+        let own = source_metadata.table_column_definition(table, ordinal, name.clone(), None)?;
         let length = own.column_length;
         let width = length
             .saturating_add(length / 3)
@@ -7090,13 +7148,8 @@ fn scalar_call_column_definition(
             .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
         return Ok(text_call_definition(name, width, not_null));
     }
-    let own_shape = |name: String| {
-        source_metadata.column_definition_for_reference(
-            Some((table.table_reference.clone(), ordinal)),
-            name,
-            None,
-        )
-    };
+    let own_shape =
+        |name: String| source_metadata.table_column_definition(table, ordinal, name, None);
     if function == ScalarFunction::NullsOnMatch {
         // A second column travels with the first where the statement compared
         // two of them. MySQL compares them by their own rules — a number
@@ -8055,6 +8108,104 @@ fn aggregate_column_definition(
     }
 }
 
+/// Gives an answer a derived table's body worked out the shape MySQL reports
+/// for it once the body has been written out into a table of its own.
+///
+/// Measured on MySQL 8.4.11: every number that table stores loses the binary
+/// flag — a count, a total, a largest, and an average too, which a grouping
+/// table works out afterwards and this one stores — and a count stays NOT
+/// NULL. Words lose the 31 decimals a call's words carry. A largest or
+/// smallest moment and a day keep the binary flag a moment carries. Any other
+/// answer has not been measured there and is refused.
+#[cfg(unix)]
+fn stored_in_a_derived_table(
+    definition: &mut ColumnDefinitionConfig,
+    answer: &turso_mysql_parser::StaticSelectMetadata,
+) -> Result<(), FrontendErrorKind> {
+    use turso_mysql_parser::StaticSelectMetadata;
+    if !matches!(
+        answer,
+        StaticSelectMetadata::Count
+            | StaticSelectMetadata::ColumnAggregate {
+                kind: ColumnAggregateKind::MinMax
+                    | ColumnAggregateKind::Sum
+                    | ColumnAggregateKind::Avg,
+                ..
+            }
+            | StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::CastsToDay,
+                ..
+            }
+    ) {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    match definition.column_type {
+        MYSQL_TYPE_TINY
+        | MYSQL_TYPE_SHORT
+        | MYSQL_TYPE_INT24
+        | MYSQL_TYPE_LONG
+        | MYSQL_TYPE_LONGLONG
+        | MYSQL_TYPE_NEWDECIMAL => {
+            let flags = definition.flags & !MYSQL_BINARY_FLAG;
+            set_column_flags(definition, flags);
+        }
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => definition.decimals = 0,
+        MYSQL_TYPE_DATE | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => {
+            let flags = definition.flags | MYSQL_BINARY_FLAG;
+            set_column_flags(definition, flags);
+        }
+        _ => return Err(FrontendErrorKind::Unsupported),
+    }
+    Ok(())
+}
+
+/// Gives a column of a derived table's or a CTE's table the shape MySQL
+/// reports for it through the derived table.
+///
+/// Measured on MySQL 8.4.11. The column goes by the name the body gave it and
+/// names the table the body read under the name the body read it under — its
+/// alias, when it gave one. A body that aggregates is written out into a table
+/// of its own, which keeps a column's NOT NULL, default and sign but none of
+/// its keys and no auto-increment. A body read straight through keeps every
+/// flag, and reports a day, a moment and a time of day in the connection's
+/// character set, four bytes to each character it spells — a `DATETIME` 76
+/// where on its own it reports 19 — and a JSON column in it too, at the widest
+/// length a document has in words.
+#[cfg(unix)]
+fn read_through_a_derived_table(
+    definition: &mut ColumnDefinitionConfig,
+    derived: &MySqlDerivedColumns,
+    ordinal: usize,
+) {
+    if let Some(name) = derived.names().get(ordinal) {
+        definition.original_name.clone_from(name);
+    }
+    derived
+        .inner_reference()
+        .clone_into(&mut definition.original_table);
+    if derived.materialized() {
+        definition.flags &= !(MYSQL_PRI_KEY_FLAG
+            | MYSQL_UNIQUE_KEY_FLAG
+            | MYSQL_MULTIPLE_KEY_FLAG
+            | MYSQL_PART_KEY_FLAG
+            | MYSQL_AUTO_INCREMENT_FLAG);
+        return;
+    }
+    match definition.column_type {
+        MYSQL_TYPE_DATE | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIME => {
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.column_length = definition
+                .column_length
+                .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        }
+        MYSQL_TYPE_JSON => {
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.column_length = u32::MAX - 3;
+        }
+        _ => {}
+    }
+}
+
 /// Gives an answer the shape MySQL reports for it once it has been read out of
 /// the temporary table a statement grouping by an expression groups in.
 ///
@@ -8231,6 +8382,7 @@ fn table_result_metadata_for_references(
                 view_columns: Vec::new(),
                 outer: source.outer(),
                 projected_columns: source.projected_columns().to_vec(),
+                derived: source.derived().cloned(),
             });
             continue;
         }
@@ -8268,6 +8420,7 @@ fn table_result_metadata_for_references(
             view_columns,
             outer: source.outer(),
             projected_columns: source.projected_columns().to_vec(),
+            derived: source.derived().cloned(),
         });
     }
     let metadata = TableResultMetadata {
@@ -8279,7 +8432,9 @@ fn table_result_metadata_for_references(
         let Some(table) = metadata.table_for(reference) else {
             return Err(FrontendErrorKind::Unsupported);
         };
-        table.column_ordinal(*ordinal)?;
+        if table.answer(*ordinal).is_none() {
+            table.column_ordinal(*ordinal)?;
+        }
     }
     Ok(Some(metadata))
 }
@@ -8322,6 +8477,7 @@ fn grouped_view_columns(
             view_columns: Vec::new(),
             projected_columns: Vec::new(),
             outer: false,
+            derived: None,
         }],
         union: false,
     };
@@ -8513,6 +8669,8 @@ pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
 const MYSQL_PRI_KEY_FLAG: u16 = 2;
 #[cfg(unix)]
 const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
+#[cfg(unix)]
+const MYSQL_MULTIPLE_KEY_FLAG: u16 = 8;
 #[cfg(unix)]
 const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;

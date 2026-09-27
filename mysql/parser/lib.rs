@@ -173,7 +173,7 @@ pub use temporal_value::{
     normalize_time_with_precision, normalize_year, seconds_in_the_time, time_of_seconds,
     year_from_number,
 };
-pub use translate::{MySqlCatalogTable, MySqlSelectSource};
+pub use translate::{MySqlCatalogTable, MySqlDerivedColumns, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use view_definition::{
     mysql_create_view_ddl, render_show_create_written_view_mysql,
