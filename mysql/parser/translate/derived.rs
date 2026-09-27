@@ -69,8 +69,15 @@ pub(super) fn derived_columns(
     inner: &MySqlSelectSource,
     render_context: &SelectRenderContext<'_>,
 ) -> Result<(Vec<String>, MySqlDerivedColumns), ParseError> {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return unsupported("derived table body");
+    let select = match super::unwrap_query_wrappers(query.body.as_ref())? {
+        SetExpr::Select(select) => select.as_ref(),
+        // A `UNION` body was held to branches reading the same columns of one
+        // `information_schema` table, so the first branch says what they all
+        // project.
+        union @ SetExpr::SetOperation { .. } if inner.catalog.is_some() => {
+            super::union_branches(union)?.1[0]
+        }
+        _ => return unsupported("derived table body"),
     };
     if select.distinct.is_some() {
         return unsupported("derived table body with DISTINCT");

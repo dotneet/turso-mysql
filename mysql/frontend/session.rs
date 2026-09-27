@@ -6485,6 +6485,9 @@ impl MySqlConnection {
         let mut bound = Vec::new();
         for comparison in comparisons {
             if let CheckedSelectComparisonRhs::Column { qualifier, name } = comparison.rhs() {
+                if joins_two_catalog_columns(source_tables, comparison, qualifier.as_deref()) {
+                    continue;
+                }
                 let left = self.compared_column(
                     column_tables(
                         source_tables,
@@ -9660,6 +9663,33 @@ struct ComparedColumn {
     temporal_precision: Option<u8>,
     collation_name: Option<&'static str>,
     engine_collation: turso_core::CollationSeq,
+}
+
+/// Whether a comparison sets one `information_schema` column equal to
+/// another, which is how TypeORM and Doctrine join the catalog's tables.
+///
+/// Both sides are compared under the collation the catalog gives its
+/// columns, as a comparison against a written word over one already is.
+fn joins_two_catalog_columns(
+    source_tables: &[MySqlSelectSource],
+    comparison: &CheckedSelectComparison,
+    other_qualifier: Option<&str>,
+) -> bool {
+    let reads_the_catalog = |qualifier: Option<&str>| {
+        let source = match qualifier {
+            Some(qualifier) => source_tables
+                .iter()
+                .find(|source| source.reference().eq_ignore_ascii_case(qualifier)),
+            None => match source_tables {
+                [source] => Some(source),
+                _ => None,
+            },
+        };
+        source.is_some_and(|source| source.catalog().is_some())
+    };
+    comparison.operator() == CheckedSelectComparisonOperator::Equal
+        && reads_the_catalog(comparison.qualifier())
+        && reads_the_catalog(other_qualifier)
 }
 
 /// Refuses a column compared with another column where MySQL and the engine
