@@ -489,11 +489,6 @@ impl CheckedAutoIncrementInsert {
         if self.reads_the_clock && self.rowwise_conflicts {
             return unsupported("a clock reading in a multirow IGNORE or ON DUPLICATE KEY UPDATE");
         }
-        if table.allocator_column_type == MySqlIntegerType::BigIntUnsigned
-            && !self.upsert_columns.is_empty()
-        {
-            return unsupported("BIGINT UNSIGNED AUTO_INCREMENT upsert result ID");
-        }
         let allocator_column = TursoName::exact(table.allocator_column_name.clone());
         if self
             .upsert_columns

@@ -1936,13 +1936,26 @@ frontend holds only the number it reserved. Which row the upsert matched is
 decided inside the engine, where several unique keys could have matched, so the
 engine records that row's own number as it writes over it and the frontend
 reports that. `LAST_INSERT_ID()` is left where it stood, measured, so it still
-reads the number the statement before it took.
+reads the number the statement before it took. An upsert that matched a row and
+left it as it stood reports no id at all — measured, affected rows 0 and id 0 —
+where this used to report the matched row's.
 
-A statement of several rows stays refused there. Measured, `VALUES ('b', 2),
-('a', 3)` where only the second matches counts three rows and reports the id of
-the row it *wrote*, so which of a statement's rows the reported id comes from
-depends on what each of them did, and only a single row leaves no question. The
-[oracle case](conformance/cases/p0/insert-counted-upsert.json) pins all of it.
+A statement of several rows is written one row at a time, and what it reports
+follows what each row did. Measured on 8.4.11: a statement that added a row
+reports the first number it added, `VALUES ('b', 2), ('a', 3)` where only the
+second matches reporting the id of the row it *wrote*; a row that matched gives
+its number back to the next row the statement adds, so `('c', ...), ('e', ...)`
+where `c` matches writes `e` with the number `c` would have taken; one that added
+no row but changed one reports the id of the last row it matched, changed or
+not; and one that changed nothing reports 0. The
+[oracle case](conformance/cases/p0/insert-counted-upsert.json) pins the single row.
+
+A `BIGINT UNSIGNED` counted column takes an upsert as well, which is the key
+Laravel counts every table with and its `upsert()` writes against. That column
+is not the engine's own row number — the row number cannot hold its upper range
+— so the id of the row an upsert matched is read back off that row, and reports
+exactly past the engine's signed range: measured, a row numbered
+18446744073709551001 is reported as that number.
 
 `INSERT IGNORE` into a table that counts its own ids is taken over one row.
 The allocator reserves its range before the rows are written, so a row `IGNORE`

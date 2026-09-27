@@ -2691,7 +2691,11 @@ impl MySqlConnection {
                     }
                 }
                 let reported_id = if upserted > 0 {
-                    upserted as u64
+                    if self.inner.mysql_changed_rows() == 0 {
+                        0
+                    } else {
+                        self.id_of_counted_row(&table, upserted)?
+                    }
                 } else if inserted {
                     reserved
                         .first_generated
@@ -7385,16 +7389,7 @@ impl MySqlConnection {
         let statement = bound
             .inject_row_ids(&reserved.ids)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let table_name = table.name.clone();
-        let options = PrepareOptions::default()
-            .with_reprepare_parser(Arc::new(FrozenInjectedAutoIncrementInsertParser {
-                statement: statement.clone(),
-            }))
-            .with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
-                table_name: table.name,
-                table_sql: table.stored_sql,
-                allocator_column_ordinal: table.definition.allocator_column_ordinal,
-            }));
+        let options = injected_auto_increment_prepare_options(&table, statement.clone());
         let mut statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)?;
@@ -7402,15 +7397,19 @@ impl MySqlConnection {
             .remaining_write_timeout(deadline)
             .map_err(Into::<LimboError>::into)?;
         run_checked_write_statement(&mut statement, timeout)
-            .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table_name)))?;
-        // Measured on MySQL 8.4.11: an upsert that wrote over a row reports
-        // that row's own id back to the client and leaves `LAST_INSERT_ID()`
-        // where it stood, while one that added a row reports the number it
-        // took and sets the function to it. Which row the upsert matched is
-        // decided inside the engine, which answers it here.
+            .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))?;
+        // Measured on MySQL 8.4.11: an upsert that changed a row reports that
+        // row's own id back to the client and leaves `LAST_INSERT_ID()` where
+        // it stood, one that left the row as it stood reports no id at all,
+        // and one that added a row reports the number it took and sets the
+        // function to it. Which row the upsert matched is decided inside the
+        // engine, which answers it here.
         let upserted = self.inner.mysql_upserted_rowid();
         if upserted > 0 {
-            return Ok(upserted as u64);
+            if self.inner.mysql_changed_rows() == 0 {
+                return Ok(0);
+            }
+            return self.id_of_counted_row(&table, upserted);
         }
         // A row `IGNORE` skipped took a number and wrote nothing. Measured on
         // 8.4.11: the counter moves past it just the same, the statement
@@ -7458,6 +7457,8 @@ impl MySqlConnection {
         let result = (|| -> Result<MySqlWriteResult> {
             let mut affected_rows = 0_u64;
             let mut first_inserted = None;
+            let mut last_matched = None;
+            let mut changed_a_row = false;
             for row in 0..bound.row_count().get() {
                 self.check_write_deadline(deadline)
                     .map_err(Into::<LimboError>::into)?;
@@ -7480,10 +7481,13 @@ impl MySqlConnection {
                             .map_err(Into::<LimboError>::into)?,
                     )
                     .ok_or(LimboError::IntegerOverflow)?;
-                if self.inner.changes() > 0 && self.inner.mysql_upserted_rowid() == 0 {
+                let upserted = self.inner.mysql_upserted_rowid();
+                if self.inner.changes() > 0 && upserted == 0 {
                     first_inserted.get_or_insert(next_id);
                     next_id = next_id.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
                 }
+                last_matched = (upserted > 0).then_some(upserted);
+                changed_a_row |= upserted > 0 && self.inner.mysql_changed_rows() > 0;
             }
             self.inner
                 .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
@@ -7491,9 +7495,17 @@ impl MySqlConnection {
             if let Some(id) = first_inserted {
                 self.inner.set_mysql_last_insert_id(id);
             }
+            // Measured on MySQL 8.4.11: a statement that added no row but
+            // changed one reports the id of the last row it matched, changed
+            // or not, and one that changed nothing reports none.
+            let last_insert_id = match (first_inserted, last_matched) {
+                (Some(id), _) => id,
+                (None, Some(rowid)) if changed_a_row => self.id_of_counted_row(&table, rowid)?,
+                _ => 0,
+            };
             Ok(MySqlWriteResult {
                 affected_rows,
-                last_insert_id: first_inserted.unwrap_or(0),
+                last_insert_id,
             })
         })();
         if result.is_err() {
@@ -7505,6 +7517,62 @@ impl MySqlConnection {
                 .run_ignore_rows()?;
         }
         result
+    }
+
+    /// The id of the counted row the engine numbers `rowid`.
+    ///
+    /// A signed or `INT UNSIGNED` counted column is the engine's own row
+    /// number. A `BIGINT UNSIGNED` one is a column of its own, since the row
+    /// number cannot hold its upper range, and is read back from the row.
+    fn id_of_counted_row(&self, table: &AutoIncrementTable, rowid: i64) -> Result<u64> {
+        if table.definition.allocator_column_type
+            != turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+        {
+            return u64::try_from(rowid).map_err(|_| {
+                LimboError::InternalError("a counted row has a negative row number".to_string())
+            });
+        }
+        let core_table = self
+            .inner
+            .current_schema()
+            .get_btree_table(&table.name)
+            .ok_or(LimboError::SchemaUpdated)?;
+        let row_number = ["rowid", "_rowid_", "oid"]
+            .into_iter()
+            .find(|name| {
+                !core_table.columns().iter().any(|column| {
+                    column
+                        .name
+                        .as_deref()
+                        .is_some_and(|column| column.eq_ignore_ascii_case(name))
+                })
+            })
+            .ok_or_else(|| {
+                LimboError::ParseError(
+                    "a table whose columns hide every name for its row number".to_string(),
+                )
+            })?;
+        let rows = self
+            .inner
+            .prepare(format!(
+                "SELECT {} FROM {} WHERE {row_number} = {rowid}",
+                sqlite_quoted(&table.definition.allocator_column_name),
+                sqlite_quoted(&table.name)
+            ))?
+            .run_collect_rows()?;
+        match rows.as_slice() {
+            [row] => match row.as_slice() {
+                [value] => match value {
+                    Value::Text(text) => text.as_str().parse::<u64>().ok(),
+                    value => value.as_int().and_then(|id| u64::try_from(id).ok()),
+                },
+                _ => None,
+            },
+            _ => None,
+        }
+        .ok_or_else(|| {
+            LimboError::InternalError("an upserted counted row has no readable id".to_string())
+        })
     }
 
     fn execute_high_water_mixed_insert(

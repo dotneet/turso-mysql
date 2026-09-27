@@ -5796,7 +5796,7 @@ fn unsigned_bigint_auto_increment_uses_a_non_rowid_primary_key() {
 }
 
 #[test]
-fn unsigned_bigint_auto_increment_refuses_upsert_without_a_stored_result_id() {
+fn unsigned_bigint_auto_increment_takes_an_upsert_that_leaves_its_id_alone() {
     let table = parse_auto_increment_create_table(
         "CREATE TABLE t (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, note TEXT)",
         SessionSqlMode::default(),
@@ -5804,6 +5804,12 @@ fn unsigned_bigint_auto_increment_refuses_upsert_without_a_stored_result_id() {
     .unwrap();
     let insert = parse_auto_increment_insert(
         "INSERT INTO t (note) VALUES ('x') ON DUPLICATE KEY UPDATE note = 'y'",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(insert.bind_allocator_table(&table).is_ok());
+    let insert = parse_auto_increment_insert(
+        "INSERT INTO t (note) VALUES ('x') ON DUPLICATE KEY UPDATE id = 7",
         SessionSqlMode::default(),
     )
     .unwrap();

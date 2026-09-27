@@ -549,3 +549,143 @@ fn some(values: &[&str]) -> Vec<Option<String>> {
         .map(|value| Some((*value).to_owned()))
         .collect()
 }
+
+/// Laravel's `upsert()`, over the `bigint unsigned` key every Laravel table
+/// counts with and over an `int` one, which MySQL answers alike.
+#[test]
+fn laravels_upsert_reports_what_mysql_reports_whatever_the_key_type() {
+    for key in ["bigint unsigned", "int"] {
+        let (_directory, mut adapter) = adapter();
+        run(
+            &mut adapter,
+            &format!("create table `lu` (`id` {key} not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null, `votes` int not null default '0')"),
+        );
+        run(
+            &mut adapter,
+            "alter table `lu` add unique `lu_email_unique`(`email`)",
+        );
+        assert_eq!(
+            written(
+                &mut adapter,
+                "insert into `lu` (`email`, `name`) values ('a@x.com', 'A'), ('b@x.com', 'B'), ('c@x.com', 'C')"
+            ),
+            (3, 1)
+        );
+        let upsert = |rows: &str| {
+            format!("insert into `lu` (`email`, `name`) values {rows} as laravel_upsert_alias on duplicate key update `name` = `laravel_upsert_alias`.`name`")
+        };
+        // A row it changed reports that row's own id and spends a number.
+        assert_eq!(
+            written(&mut adapter, &upsert("('b@x.com', 'B2')")),
+            (2, 2),
+            "{key}"
+        );
+        assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "1");
+        assert_eq!(counter(&mut adapter, "lu").as_deref(), Some("5"));
+        assert_eq!(
+            written(&mut adapter, &upsert("('d@x.com', 'D')")),
+            (1, 5),
+            "{key}"
+        );
+        assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "5");
+        // A row it left as it stood reports nothing.
+        assert_eq!(
+            written(&mut adapter, &upsert("('b@x.com', 'B2')")),
+            (0, 0),
+            "{key}"
+        );
+        // Over several rows, a row it changed gives its number back to the
+        // next row it writes.
+        assert_eq!(
+            written(&mut adapter, &upsert("('c@x.com', 'C3'), ('e@x.com', 'E')")),
+            (3, 7),
+            "{key}"
+        );
+        assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "7");
+        assert_eq!(
+            written(
+                &mut adapter,
+                &upsert("('a@x.com', 'A4'), ('c@x.com', 'C4')")
+            ),
+            (4, 3),
+            "{key}"
+        );
+        assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "7");
+        assert_eq!(counter(&mut adapter, "lu").as_deref(), Some("11"));
+        assert_eq!(
+            rows(&mut adapter, "SELECT id, email, name FROM lu ORDER BY id"),
+            vec![
+                some(&["1", "a@x.com", "A4"]),
+                some(&["2", "b@x.com", "B2"]),
+                some(&["3", "c@x.com", "C4"]),
+                some(&["5", "d@x.com", "D"]),
+                some(&["7", "e@x.com", "E"]),
+            ]
+        );
+    }
+}
+
+/// The id an upsert reports is read off the row it matched, however far past
+/// the engine's signed range it runs, and a prepared upsert reports the same.
+#[test]
+fn an_upsert_reports_a_wide_unsigned_id_it_matched() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "create table `lw` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null) AUTO_INCREMENT=18446744073709551000",
+    );
+    run(
+        &mut adapter,
+        "alter table `lw` add unique `lw_email_unique`(`email`)",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `lw` (`email`, `name`) values ('a@x.com', 'A'), ('b@x.com', 'B')"
+        ),
+        (2, 18446744073709551000)
+    );
+    let upsert = |rows: &str| {
+        format!("insert into `lw` (`email`, `name`) values {rows} as laravel_upsert_alias on duplicate key update `name` = `laravel_upsert_alias`.`name`")
+    };
+    assert_eq!(
+        written(&mut adapter, &upsert("('b@x.com', 'B2')")),
+        (2, 18446744073709551001)
+    );
+    assert_eq!(
+        one(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        "18446744073709551000"
+    );
+    assert_eq!(
+        counter(&mut adapter, "lw").as_deref(),
+        Some("18446744073709551003")
+    );
+    // The last row it matched, which it left as it stood.
+    assert_eq!(
+        written(
+            &mut adapter,
+            &upsert("('a@x.com', 'A2'), ('b@x.com', 'B2')")
+        ),
+        (2, 18446744073709551001)
+    );
+    assert_eq!(
+        written(&mut adapter, &upsert("('c@x.com', 'C')")),
+        (1, 18446744073709551005)
+    );
+    assert_eq!(
+        prepared_write(&mut adapter, &upsert("(?, ?)"), &words(&["a@x.com", "A3"])),
+        (2, 18446744073709551000)
+    );
+    assert_eq!(
+        prepared_write(&mut adapter, &upsert("(?, ?)"), &words(&["a@x.com", "A3"])),
+        (0, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, email, name FROM lw ORDER BY id"),
+        vec![
+            some(&["18446744073709551000", "a@x.com", "A3"]),
+            some(&["18446744073709551001", "b@x.com", "B2"]),
+            some(&["18446744073709551005", "c@x.com", "C"]),
+        ]
+    );
+}
