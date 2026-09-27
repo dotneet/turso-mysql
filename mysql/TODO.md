@@ -72,6 +72,7 @@ numbers and over columns of one kind, and `COUNT`, `SUM`, `AVG`, `MIN` and
 | `GREATEST`, `LEAST`, `NULLIF` and `MD5` over written values alone, naming no column | refused; each answers a shape read off the column it names, and there is none |
 | `CAST(col AS CHAR)` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; conversion through the engine's generic text cast has not been verified against MySQL's numeric formatting |
 | `CAST(col AS CHAR)`, `SUBSTRING`, `SUBSTRING_INDEX`, `REPEAT` and `HEX` over a `TEXT` | refused; MySQL answers a `MEDIUM_BLOB` for each, and only `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `REVERSE`, `REPLACE` and `TRIM` have had its width measured |
+| `INET6_ATON`, `INET6_NTOA`, `IS_IPV6` | refused; each reads or answers a 16-byte binary string, unmeasured |
 | `CHARSET(col)` and `COLLATION(col)` | refused; each answers the column's character set or collation name, which the rendered statement does not carry |
 | A text call over a `MEDIUMTEXT` or a `LONGTEXT` | refused; measured, MySQL answers a `LONG_BLOB` — `LOWER(mt)` reports 268435440 and `CONCAT(mt, 'a')` 67108864, `max_allowed_packet` — by a rule not worked out |
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |

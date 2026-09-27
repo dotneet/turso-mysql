@@ -305,6 +305,12 @@ pub enum ScalarFunction {
     QuotesForSql,
     /// `TO_BASE64`, which writes the value out in base64.
     EncodesInBase64,
+    /// `INET_ATON`, which reads a dotted address as a number.
+    ReadsAnAddress,
+    /// `INET_NTOA`, which writes a number out as a dotted address.
+    WritesAnAddress,
+    /// `IS_IPV4`, which answers whether a word is a dotted address.
+    ChecksAnAddress,
     /// `JSON_EXTRACT` over one path, which answers the JSON value it found —
     /// a string comes back with its quotes.
     ReadsAJsonValue,
@@ -2821,6 +2827,48 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // reports what its `DATE_ADD` spelling reports.
     if named(&["ADDDATE", "SUBDATE"]) {
         return scalar_call(&date_shift_spelled_out(function)?);
+    }
+    // `INET_ATON` reads a dotted address out of a word, `INET_NTOA` writes a
+    // number out as one, and `IS_IPV4` says whether a word is one. Each reads
+    // a column or a written value; a written value MySQL answers NULL for
+    // comes with warning 1411, which is not raised here, so it is refused.
+    if named(&["INET_ATON", "INET_NTOA", "IS_IPV4"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let columns = match read {
+            Expr::Identifier(column) => vec![column.value.clone()],
+            _ if named(&["INET_NTOA"]) => {
+                crate::inet_ntoa(crate::translate::direct_signed_integer(read)?)?;
+                Vec::new()
+            }
+            Expr::Value(value) => {
+                let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) =
+                    &value.value
+                else {
+                    return None;
+                };
+                if named(&["INET_ATON"]) {
+                    crate::inet_aton(word)?;
+                }
+                Vec::new()
+            }
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if named(&["INET_ATON"]) {
+                ScalarFunction::ReadsAnAddress
+            } else if named(&["INET_NTOA"]) {
+                ScalarFunction::WritesAnAddress
+            } else {
+                ScalarFunction::ChecksAnAddress
+            },
+            not_null: columns.is_empty() && named(&["IS_IPV4"]),
+            columns,
+            literal_characters: 0,
+        });
     }
     // `TO_DAYS(d)` counts the days from the year zero, and `YEARWEEK(d)` the
     // year and the week together, by the countings a written mode names. Each

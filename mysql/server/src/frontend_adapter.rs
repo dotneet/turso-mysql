@@ -6236,6 +6236,59 @@ fn scalar_call_column_definition(
     {
         return Ok(calendar_name_or_week_definition(name, function));
     }
+    // Measured on MySQL 8.4.11: `INET_ATON` answers an unsigned LONGLONG of
+    // 21, `INET_NTOA` a VAR_STRING of 124 — the fifteen characters an address
+    // runs to and more — and both are nullable whatever they read, a word or a
+    // number no address holds answering NULL. `IS_IPV4` answers a LONGLONG
+    // of 1, NULL only where what it reads is. An address is read out of a
+    // word and written out of a whole number.
+    if matches!(
+        function,
+        ScalarFunction::ReadsAnAddress
+            | ScalarFunction::WritesAnAddress
+            | ScalarFunction::ChecksAnAddress
+    ) {
+        let mut reads_nothing_null = true;
+        for column_name in columns {
+            let (table, ordinal) = source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .column_named(column_name)?;
+            let source = table
+                .columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            let reads_a_number = function == ScalarFunction::WritesAnAddress;
+            if (reads_a_number && !is_whole_number_column(source.type_name()))
+                || (!reads_a_number && !is_text_column(source))
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            reads_nothing_null &= !source.nullable() && !table.outer;
+        }
+        let mut definition = match function {
+            ScalarFunction::WritesAnAddress => text_call_definition(name, 124, false),
+            _ => column_definition(name, MYSQL_TYPE_LONGLONG),
+        };
+        if function != ScalarFunction::WritesAnAddress {
+            let checks = function == ScalarFunction::ChecksAnAddress;
+            definition.column_length = if checks { 1 } else { 21 };
+            definition.decimals = 0;
+            set_column_flags(
+                &mut definition,
+                MYSQL_BINARY_FLAG
+                    | if checks {
+                        if reads_nothing_null {
+                            MYSQL_NOT_NULL_FLAG
+                        } else {
+                            0
+                        }
+                    } else {
+                        MYSQL_UNSIGNED_FLAG
+                    },
+            );
+        }
+        return Ok(definition);
+    }
     // Measured on MySQL 8.4.11: a comparison, `NOT col` and `col IS TRUE`
     // each answer a LONGLONG of length 1. A comparison or a negation is NOT
     // NULL where what it reads cannot be null — `id > 1` and `NOT id` over a
@@ -7058,6 +7111,11 @@ fn scalar_call_column_definition(
         }
         ScalarFunction::QuotesForSql | ScalarFunction::EncodesInBase64 => {
             unreachable!("QUOTE and TO_BASE64 were answered above")
+        }
+        ScalarFunction::ReadsAnAddress
+        | ScalarFunction::WritesAnAddress
+        | ScalarFunction::ChecksAnAddress => {
+            unreachable!("the address calls were answered above")
         }
         // Measured: ABS over an INT answers a LONGLONG of the INT's own length
         // 11, and over a DECIMAL(10,2) a NEWDECIMAL of 12 with its scale — the

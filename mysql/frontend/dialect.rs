@@ -1263,17 +1263,28 @@ pub(crate) const MYSQL_YEARWEEK: &str = "mysql_yearweek";
 pub(crate) const MYSQL_TO_DAYS: &str = "mysql_to_days";
 /// Reads the bytes of a value the way `ASCII`, `ORD`, `CRC32`, `QUOTE` and
 /// `TO_BASE64` do; the engine has none of them.
-pub(crate) const MYSQL_BYTE_READINGS: [&str; 5] = [
+pub(crate) const MYSQL_BYTE_READINGS: [&str; 8] = [
     "mysql_ascii",
     "mysql_ord",
     "mysql_crc32",
     "mysql_quote",
     "mysql_to_base64",
+    "mysql_inet_aton",
+    "mysql_inet_ntoa",
+    "mysql_is_ipv4",
 ];
 
 /// Answers one of `MYSQL_BYTE_READINGS` over a value, which reaches it as a
 /// word, or as a whole number MySQL would write out before reading its bytes.
 fn byte_reading(name: &str, value: &Value) -> Result<Value> {
+    if name.eq_ignore_ascii_case("mysql_inet_ntoa") {
+        return Ok(match value {
+            Value::Numeric(Numeric::Integer(number)) => {
+                turso_mysql_parser::inet_ntoa(*number).map_or(Value::Null, Value::build_text)
+            }
+            _ => Value::Null,
+        });
+    }
     let written = match value {
         Value::Null => {
             return Ok(if name.eq_ignore_ascii_case("mysql_quote") {
@@ -1298,6 +1309,15 @@ fn byte_reading(name: &str, value: &Value) -> Result<Value> {
         Value::from_i64(i64::from(turso_mysql_parser::crc32(written.as_bytes())))
     } else if name.eq_ignore_ascii_case("mysql_quote") {
         Value::build_text(turso_mysql_parser::quoted_for_sql(Some(&written)))
+    } else if name.eq_ignore_ascii_case("mysql_inet_aton") {
+        match turso_mysql_parser::inet_aton(&written) {
+            Some(number) => Value::from_i64(
+                i64::try_from(number).expect("four bytes of an address fit a signed number"),
+            ),
+            None => Value::Null,
+        }
+    } else if name.eq_ignore_ascii_case("mysql_is_ipv4") {
+        Value::from_i64(i64::from(turso_mysql_parser::is_ipv4(&written)))
     } else {
         Value::build_text(turso_mysql_parser::to_base64(written.as_bytes()))
     })

@@ -5653,6 +5653,15 @@ fn render_scalar_call(
             "mysql_week({}, {mode})",
             moment_argument(function, render_context)?
         ));
+    } else if name.value.eq_ignore_ascii_case("INET_ATON")
+        || name.value.eq_ignore_ascii_case("INET_NTOA")
+        || name.value.eq_ignore_ascii_case("IS_IPV4")
+    {
+        return Ok(format!(
+            "mysql_{}({})",
+            name.value.to_ascii_lowercase(),
+            scalar_argument(function, 0)?
+        ));
     } else if name.value.eq_ignore_ascii_case("ASCII")
         || name.value.eq_ignore_ascii_case("ORD")
         || name.value.eq_ignore_ascii_case("CRC32")

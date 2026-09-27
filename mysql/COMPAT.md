@@ -1046,6 +1046,20 @@ character. `QUOTE` and `TO_BASE64` over a `TEXT` answer a `MEDIUM_BLOB` by a
 width rule not measured, and are refused; so are `CHARSET` and `COLLATION`,
 whose answer is the column's collation, which the statement does not carry.
 
+`INET_ATON`, `INET_NTOA` and `IS_IPV4` store and check an IPv4 address as a
+number, which the engine has no calls for, so the dialect answers each.
+Measured on 8.4.11: `INET_ATON` reads up to four groups each at most 255,
+takes the short forms — `127.1` is 2130706433, the last group landing in the
+last byte — and answers NULL for a word that is no address, as an unsigned
+`LONGLONG` of 21; `INET_NTOA` writes a number from 0 through 4294967295 out
+and answers NULL for any other, as a `VAR_STRING` of 124; `IS_IPV4` takes
+exactly four groups of one to three digits, `010.0.0.1` being one, as a
+`LONGLONG` of 1, NULL only for a NULL. An address is read out of a word column
+and written out of a whole-number column. A written value MySQL answers NULL
+for comes with warning 1411, which is not raised here, so it is refused.
+`INET6_ATON`, `INET6_NTOA` and `IS_IPV6` answer binary strings and are not
+taken.
+
 `LPAD`, `RPAD`, `LEFT`, `RIGHT` and `CONCAT` write a number or a moment out
 before they pad, cut or join it, as MySQL does — `LPAD(id, 5, '0')` over a
 `BIGINT UNSIGNED` is `00001` and `LPAD(n, 4, '0')` over -5 is `00-5` — for
