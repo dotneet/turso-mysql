@@ -2218,7 +2218,7 @@ pub(super) fn show_triggers_result(
             format!("{}@%", trigger.creator.username),
             trigger.creator.character_set_client,
             trigger.creator.collation_connection,
-            "utf8mb4_0900_ai_ci".to_owned(),
+            trigger.creator.database_collation,
         ];
         if fields
             .iter()
@@ -2346,7 +2346,7 @@ pub(super) fn show_create_trigger_result(
         trigger.create_statement,
         trigger.creator.character_set_client,
         trigger.creator.collation_connection,
-        "utf8mb4_0900_ai_ci".to_owned(),
+        trigger.creator.database_collation,
         trigger.creator.created_at,
     ];
     if fields

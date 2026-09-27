@@ -124,6 +124,8 @@ pub struct SchemaSqlCreator {
     pub character_set_client: String,
     pub collation_connection: String,
     pub created_at: String,
+    /// The collation of the database a trigger was made in.
+    pub database_collation: String,
 }
 
 impl SchemaSqlCreator {
@@ -140,9 +142,14 @@ impl SchemaSqlCreator {
                 now.format("%Y-%m-%d %H:%M:%S"),
                 now.timestamp_subsec_millis() / 10
             ),
+            database_collation: DEFAULT_DATABASE_COLLATION.to_owned(),
         }
     }
 }
+
+/// The collation of every database made before a database could have
+/// another, and of every one made naming none.
+const DEFAULT_DATABASE_COLLATION: &str = "utf8mb4_0900_ai_ci";
 
 impl SchemaSqlSessionContext {
     /// Capture these session settings for one schema object envelope.
@@ -222,6 +229,10 @@ struct StoredSchemaSqlContextV4 {
     character_set_client_text: String,
     collation_connection_text: String,
     created_at: String,
+    /// Left out for the default collation, so an envelope written before a
+    /// database could have another reads back byte for byte the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    database_collation_text: Option<String>,
 }
 
 /// A validated MySQL schema envelope borrowing the normalized DDL from storage.
@@ -1091,6 +1102,8 @@ impl StoredSchemaSqlContextV4 {
             character_set_client_text: creator.character_set_client.clone(),
             collation_connection_text: creator.collation_connection.clone(),
             created_at: creator.created_at.clone(),
+            database_collation_text: (creator.database_collation != DEFAULT_DATABASE_COLLATION)
+                .then(|| creator.database_collation.clone()),
         };
         stored.validate()?;
         Ok(stored)
@@ -1111,6 +1124,10 @@ impl StoredSchemaSqlContextV4 {
             || self.character_set_client_text != "utf8mb4"
             || self.collation_connection_text != "utf8mb4_general_ci"
             || !valid_mysql_creation_time(&self.created_at)
+            || self
+                .database_collation_text
+                .as_deref()
+                .is_some_and(|collation| collation != "utf8mb4_unicode_ci")
         {
             return Err(SchemaSqlError::InvalidContext);
         }
@@ -1135,6 +1152,10 @@ impl StoredSchemaSqlContextV4 {
             character_set_client: self.character_set_client_text.clone(),
             collation_connection: self.collation_connection_text.clone(),
             created_at: self.created_at.clone(),
+            database_collation: self
+                .database_collation_text
+                .clone()
+                .unwrap_or_else(|| DEFAULT_DATABASE_COLLATION.to_owned()),
         }
     }
 }
@@ -1324,6 +1345,7 @@ mod tests {
             character_set_client: "utf8mb4".to_owned(),
             collation_connection: "utf8mb4_general_ci".to_owned(),
             created_at: "2026-09-27 11:12:13.42".to_owned(),
+            database_collation: "utf8mb4_0900_ai_ci".to_owned(),
         };
         let ddl = "CREATE VIEW `dump_names` AS SELECT `id` FROM `dump_records`";
         let stored = encode_schema_sql_v4(context, &creator, ddl).unwrap();
@@ -1347,6 +1369,67 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A trigger made before a database could have a collation of its own has
+    /// no such field, and its envelope must read back byte for byte the same.
+    #[test]
+    fn a_trigger_keeps_its_database_collation_only_when_it_is_not_the_default() {
+        let context = session_context().for_kind(SchemaSqlKind::Trigger);
+        let ddl = "CREATE TRIGGER `t_audit` AFTER INSERT ON `t` FOR EACH ROW BEGIN INSERT INTO `audit` (`id`) VALUES (NEW.`id`); END";
+        let mut creator = SchemaSqlCreator {
+            username: "owner".to_owned(),
+            sql_mode: String::new(),
+            character_set_client: "utf8mb4".to_owned(),
+            collation_connection: "utf8mb4_general_ci".to_owned(),
+            created_at: "2026-09-27 11:12:13.42".to_owned(),
+            database_collation: "utf8mb4_0900_ai_ci".to_owned(),
+        };
+        let context_json = |stored: &str| {
+            let encoded = stored
+                .strip_prefix(RESERVED_PREFIX)
+                .and_then(|rest| rest.strip_prefix(V4_VERSION_PREFIX))
+                .and_then(|rest| rest.split_once(MARKER_END))
+                .unwrap()
+                .0;
+            String::from_utf8(URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap()
+        };
+        let with_it_as = |stored: &str, collation: &str| {
+            let json =
+                context_json(stored).replace("\"utf8mb4_unicode_ci\"", &format!("\"{collation}\""));
+            format!(
+                "{RESERVED_PREFIX}{V4_VERSION_PREFIX}{}{MARKER_END}{ddl}",
+                URL_SAFE_NO_PAD.encode(json)
+            )
+        };
+
+        let stored = encode_schema_sql_v4(context, &creator, ddl).unwrap();
+        assert!(!context_json(&stored).contains("database_collation"));
+        let decoded = decode_schema_sql(SchemaSqlKind::Trigger, &stored)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.creator().unwrap(), Some(creator.clone()));
+
+        "utf8mb4_unicode_ci".clone_into(&mut creator.database_collation);
+        let stored = encode_schema_sql_v4(context, &creator, ddl).unwrap();
+        assert!(
+            context_json(&stored).ends_with(",\"database_collation_text\":\"utf8mb4_unicode_ci\"}")
+        );
+        let decoded = decode_schema_sql(SchemaSqlKind::Trigger, &stored)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.creator().unwrap(), Some(creator.clone()));
+        assert_eq!(reencode_schema_sql(decoded, ddl).unwrap(), stored);
+
+        for kept_otherwise in ["utf8mb4_0900_ai_ci", "utf8mb4_bin"] {
+            assert!(
+                decode_schema_sql(SchemaSqlKind::Trigger, &with_it_as(&stored, kept_otherwise))
+                    .is_err(),
+                "{kept_otherwise}"
+            );
+        }
+        "utf8mb4_bin".clone_into(&mut creator.database_collation);
+        assert!(encode_schema_sql_v4(context, &creator, ddl).is_err());
     }
 
     #[test]

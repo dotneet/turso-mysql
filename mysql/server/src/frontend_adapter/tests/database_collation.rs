@@ -11,10 +11,14 @@ type Adapter = AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>;
 const ACCOUNT: [u8; 32] = [0x63; 32];
 
 fn session(catalog: &Arc<MySqlDatabaseCatalog>) -> Adapter {
+    session_of(catalog, RecordingAuthorizer::default())
+}
+
+fn session_of(catalog: &Arc<MySqlDatabaseCatalog>, authorizer: RecordingAuthorizer) -> Adapter {
     let mut adapter = AuthorizedDatabaseAdapterFactory::new(
         catalog.clone(),
         binary_context(),
-        Arc::new(RecordingAuthorizer::default()),
+        Arc::new(authorizer),
     )
     .build(AuthenticatedPrincipal::from_account_id_for_testing(
         AccountId::from_bytes(ACCOUNT),
@@ -514,4 +518,55 @@ fn a_database_keeps_its_collation_across_a_restart() {
     );
     run(&mut adapter, "CREATE TABLE posts (id INT NOT NULL PRIMARY KEY, title VARCHAR(100) NOT NULL, body TEXT, kind ENUM('a','b'), code VARCHAR(5) COLLATE utf8mb4_bin, n INT)");
     assert_eq!(show_create_table(&mut adapter, "posts"), POSTS);
+}
+
+/// A trigger reports the collation its database had when it was made, and
+/// keeps reporting it after the database is altered.
+#[test]
+fn a_trigger_keeps_the_collation_its_database_had() {
+    let (directory, catalog, factory) = catalog_factory(Arc::new(RecordingAuthorizer::default()));
+    let mut adapter = session_of(
+        &catalog,
+        RecordingAuthorizer::with_schema_creator("app_owner"),
+    );
+    run(
+        &mut adapter,
+        "CREATE DATABASE app COLLATE utf8mb4_unicode_ci",
+    );
+    run(&mut adapter, "USE app");
+    for sql in [
+        "CREATE TABLE posts (id INT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TABLE pages (id INT PRIMARY KEY, title VARCHAR(20))",
+        "CREATE TABLE audit (note VARCHAR(20))",
+        "CREATE TRIGGER posts_audit AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO audit (note) VALUES (NEW.title); END",
+        "ALTER DATABASE app COLLATE utf8mb4_0900_ai_ci",
+        "CREATE TRIGGER pages_audit AFTER INSERT ON pages FOR EACH ROW BEGIN INSERT INTO audit (note) VALUES (NEW.title); END",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let reported = |adapter: &mut Adapter| {
+        let mut triggers = rows(adapter, "SHOW TRIGGERS")
+            .into_iter()
+            .map(|trigger| (trigger[0].clone().unwrap(), trigger[10].clone().unwrap()))
+            .collect::<Vec<_>>();
+        triggers.sort();
+        triggers
+    };
+    let expected = [
+        ("pages_audit".to_owned(), "utf8mb4_0900_ai_ci".to_owned()),
+        ("posts_audit".to_owned(), "utf8mb4_unicode_ci".to_owned()),
+    ];
+    assert_eq!(reported(&mut adapter), expected);
+    assert_eq!(
+        rows(&mut adapter, "SHOW CREATE TRIGGER posts_audit")[0][5],
+        Some("utf8mb4_unicode_ci".to_owned())
+    );
+    drop(adapter);
+    drop(factory);
+    drop(catalog);
+
+    let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+    let mut adapter = session(&catalog);
+    run(&mut adapter, "USE app");
+    assert_eq!(reported(&mut adapter), expected);
 }

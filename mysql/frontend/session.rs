@@ -3454,9 +3454,18 @@ impl MySqlConnection {
             _ => unreachable!("MySQL schema parser returned an unsupported statement"),
         };
         let formatter: Arc<dyn SchemaSqlFormatter> = match creator {
-            Some(creator)
+            Some(mut creator)
                 if matches!(&stmt, Stmt::CreateView { .. } | Stmt::CreateTrigger { .. }) =>
             {
+                // Measured on MySQL 8.4.11: `SHOW TRIGGERS` reports the
+                // collation the database had when the trigger was made, and
+                // keeps reporting it after an `ALTER DATABASE`. A view
+                // reports none.
+                if matches!(&stmt, Stmt::CreateTrigger { .. }) {
+                    self.database_collation()
+                        .name()
+                        .clone_into(&mut creator.database_collation);
+                }
                 Arc::new(CreatorSchemaSqlFormatter {
                     context: self.schema_context,
                     creator,

@@ -3527,6 +3527,11 @@ here may have. Measured on 8.4.11:
   wrote it — measured under `lower_case_table_names=1`, the rule this server
   keeps, `SHOW CREATE DATABASE MIXEDDB` prints `` `MIXEDDB` `` — after the
   same grant `USE` needs; 1049 for a database that is not there.
+- A trigger reports, as its `Database Collation` in `SHOW TRIGGERS` and `SHOW
+  CREATE TRIGGER`, the collation its database had when the trigger was made,
+  and keeps reporting it after an `ALTER DATABASE`. It is kept with the
+  trigger's other creation settings, and left out for `utf8mb4_0900_ai_ci`,
+  so a trigger stored before is read back unchanged.
 - The collation is kept in the root's registry beside the database, which is
   written whole to a new file, synced and renamed over the old one, so it is
   there after a restart and never half written. A database made before
