@@ -2773,10 +2773,18 @@ pub(crate) fn translate_update(
         let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
             return unsupported("UPDATE assignment target");
         };
-        let [ObjectNamePart::Identifier(name)] = column.0.as_slice() else {
-            return unsupported("UPDATE assignment target");
+        // Rails writes every column it saves qualified by its table, `SET
+        // users.name = ...`, which names the same column.
+        let name = match column.0.as_slice() {
+            [ObjectNamePart::Identifier(name)] => name,
+            [ObjectNamePart::Identifier(qualifier), ObjectNamePart::Identifier(name)]
+                if names_the_updated_table(qualifier, &update.table.relation) =>
+            {
+                name
+            }
+            _ => return unsupported("UPDATE assignment target"),
         };
-        let rendered_name = render_unqualified_name(column)?;
+        let rendered_name = render_ident(name);
         // A value carrying a `?` is written twice where a column is rewritten
         // on update, and a second bare `?` would be a second parameter. The
         // ordinals it took are noted here so the second copy can name them.
@@ -2985,8 +2993,14 @@ pub(crate) fn checked_update(update: &Update) -> Result<CheckedUpdate, ParseErro
             let sqlparser::ast::AssignmentTarget::ColumnName(column) = &assignment.target else {
                 return unsupported("UPDATE assignment target");
             };
-            let [ObjectNamePart::Identifier(column)] = column.0.as_slice() else {
-                return unsupported("qualified UPDATE assignment target");
+            let column = match column.0.as_slice() {
+                [ObjectNamePart::Identifier(column)] => column,
+                [ObjectNamePart::Identifier(qualifier), ObjectNamePart::Identifier(column)]
+                    if names_the_updated_table(qualifier, &update.table.relation) =>
+                {
+                    column
+                }
+                _ => return unsupported("qualified UPDATE assignment target"),
             };
             Ok(CheckedUpdateAssignment {
                 column_name: column.value.clone(),
@@ -3256,6 +3270,15 @@ fn render_dml_order_by(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|expressions| expressions.join(", "))
+}
+
+/// Whether a qualifier names the one table an `UPDATE` changes.
+fn names_the_updated_table(qualifier: &Ident, table: &TableFactor) -> bool {
+    let TableFactor::Table { name, .. } = table else {
+        return false;
+    };
+    matches!(name.0.last(), Some(ObjectNamePart::Identifier(table))
+        if table.value.eq_ignore_ascii_case(&qualifier.value))
 }
 
 fn render_update_table(table: &TableFactor) -> Result<String, ParseError> {
@@ -7190,6 +7213,12 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
                 CheckedSelectComparisonRhs::Text(text.clone()),
             )),
             Value::Null => Ok(("NULL".to_string(), CheckedSelectComparisonRhs::Null)),
+            // MySQL's `TRUE` and `FALSE` are the integers 1 and 0, which is
+            // how Rails writes every boolean it compares.
+            Value::Boolean(value) => Ok((
+                u8::from(*value).to_string(),
+                CheckedSelectComparisonRhs::SignedInteger(i64::from(*value)),
+            )),
             Value::Placeholder(marker) if marker == "?" => {
                 let ordinal = render_context.next_parameter_ordinal()?;
                 Ok((

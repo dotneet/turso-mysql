@@ -2346,6 +2346,14 @@ table's statistics are numbers this server does not keep. `ORDER BY` may be
 left off: the rows come back in table-name order, and a table's columns in
 declaration order, whether or not the query asks for it.
 
+`TRUE` and `FALSE` are the integers 1 and 0 in a comparison too, which is how
+Active Record writes every boolean it compares — `WHERE users.admin = FALSE`,
+`IN (TRUE, FALSE)` — so they meet an integer column as 1 and 0 do and a word
+column as any number does, which is refused. An `UPDATE` may name a column it
+sets qualified by the table it changes, `SET users.name = ...`, which is how
+Active Record saves a loaded record; a qualifier naming any other table is
+refused.
+
 `ALTER TABLE` adds a foreign key to a table that already exists and takes one
 away, which is the other half of what a migration writes. The engine had no
 statement for either, so it has one now: `ADD CONSTRAINT` and `DROP CONSTRAINT`
