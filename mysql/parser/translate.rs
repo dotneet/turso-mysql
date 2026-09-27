@@ -7776,6 +7776,11 @@ fn render_checked_select_comparison(
     {
         return Ok(rendered);
     }
+    if let Some(rendered) =
+        render_comparison_over_arithmetic_or_a_fallback(left, op, right, render_context)?
+    {
+        return Ok(rendered);
+    }
     // `name = 'a' COLLATE utf8mb4_bin` compares the bytes rather than the
     // collation's own reading, and MySQL takes the collation written on either
     // side: measured on 8.4.11 over 'alpha', 'Alpha' and 'ALPHA', both
@@ -7990,6 +7995,277 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// Renders a comparison whose one side reads a column through `+`, `-` or `*`
+/// — `WHERE age + 1 > 10` — or through a fallback — `WHERE COALESCE(age, 0) >
+/// 10` — or nothing when neither side does.
+fn render_comparison_over_arithmetic_or_a_fallback(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let (expression, op, other) = if reads_a_column_through_an_expression(left) {
+        (left, op.clone(), right)
+    } else if reads_a_column_through_an_expression(right) {
+        let Some(reversed) = reverse_checked_comparison_operator(op) else {
+            return Ok(None);
+        };
+        (right, reversed, left)
+    } else {
+        return Ok(None);
+    };
+    let Some(operator) = checked_select_comparison_operator(&op) else {
+        return Ok(None);
+    };
+    if let Some((column, fallback)) = fallback_over_a_column(expression) {
+        return render_comparison_over_a_fallback(
+            column,
+            fallback,
+            (&op, operator),
+            other,
+            render_context,
+        )
+        .map(Some);
+    }
+    render_comparison_over_arithmetic(expression, (&op, operator), other, render_context).map(Some)
+}
+
+fn reads_a_column_through_an_expression(expr: &Expr) -> bool {
+    fallback_over_a_column(expr).is_some() || arithmetic_over_columns(expr).is_some()
+}
+
+/// Reads `COALESCE(col, value)` or `IFNULL(col, value)`.
+fn fallback_over_a_column(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || !["COALESCE", "IFNULL"]
+            .iter()
+            .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
+        || function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(column)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    named_column(column)?;
+    Some((column, fallback))
+}
+
+/// Reads one `+`, `-` or `*` between two columns, or a column and a whole
+/// number no wider than an `INT`, and answers the columns it reads.
+///
+/// The width is what keeps the answer inside a `BIGINT` whatever the column
+/// holds, which the frontend holds the column itself to.
+fn arithmetic_over_columns(expr: &Expr) -> Option<Vec<(Option<&Ident>, &Ident)>> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    if !matches!(
+        op,
+        BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply
+    ) {
+        return None;
+    }
+    let columns = [arithmetic_operand(left)?, arithmetic_operand(right)?]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    (!columns.is_empty()).then_some(columns)
+}
+
+/// Reads one side of the arithmetic: a column, or a whole number no wider
+/// than an `INT`, which reads no column.
+fn arithmetic_operand(expr: &Expr) -> Option<Option<(Option<&Ident>, &Ident)>> {
+    if let Some(column) = named_column(expr) {
+        return Some(Some(column));
+    }
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    let Value::Number(number, false) = &value.value else {
+        return None;
+    };
+    (is_written_as_a_whole_number(number) && number.parse::<i32>().is_ok()).then_some(None)
+}
+
+/// Renders `COALESCE(col, value) op other`.
+///
+/// Both the fallback and the value compared with are held to the column the
+/// way a comparison against the column is, and the column to the kinds whose
+/// fallback the engine answers in the column's own form. Two words compare
+/// under `utf8mb4_0900_ai_ci`, the collation the frontend holds the column to:
+/// measured on 8.4.11, MySQL takes the column's collation over a written
+/// word's.
+fn render_comparison_over_a_fallback(
+    column: &Expr,
+    fallback: &Expr,
+    (op, operator): (&BinaryOperator, CheckedSelectComparisonOperator),
+    other: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let (qualifier, column) = named_column(column).expect("the fallback was read over a column");
+    let (rendered_fallback, fallback_value) =
+        render_checked_select_comparison_rhs(fallback, render_context)?;
+    if !matches!(
+        fallback_value,
+        CheckedSelectComparisonRhs::SignedInteger(_)
+            | CheckedSelectComparisonRhs::Decimal(_)
+            | CheckedSelectComparisonRhs::Text(_)
+    ) {
+        return unsupported("COALESCE comparison falling back on something not written out");
+    }
+    let rendered_fallback = number_without_quotes(rendered_fallback, &fallback_value);
+    let (rendered_other, value) = render_checked_select_comparison_rhs(other, render_context)?;
+    let rendered_other = number_without_quotes(rendered_other, &value);
+    let words = matches!(fallback_value, CheckedSelectComparisonRhs::Text(_));
+    if words
+        && !matches!(
+            value,
+            CheckedSelectComparisonRhs::Text(_) | CheckedSelectComparisonRhs::Null
+        )
+    {
+        return unsupported("COALESCE comparison of a word with something not written out");
+    }
+    let collation = if words {
+        render_context
+            .collation_sensitive_call_columns
+            .push(column.value.clone());
+        " COLLATE MYSQL_UCA9_AI_CI"
+    } else {
+        ""
+    };
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
+    let held = |operator, rhs| CheckedSelectComparison {
+        qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
+        inner_source: None,
+        column_name: column.value.clone(),
+        operator,
+        rhs,
+        collated: words,
+        answers: None,
+    };
+    render_context.checked_comparisons.extend([
+        held(
+            operator,
+            CheckedSelectComparisonRhs::Operand(crate::CheckedComparisonOperand::Fallback),
+        ),
+        held(CheckedSelectComparisonOperator::Equal, fallback_value),
+        held(operator, value),
+    ]);
+    Ok(format!(
+        "(coalesce({rendered_column}, {rendered_fallback}){collation} {} {rendered_other})",
+        checked_select_comparison_sql_operator(op)
+    ))
+}
+
+/// Renders `col + n op other`, and the other arithmetic
+/// `arithmetic_over_columns` reads.
+///
+/// The answer is a whole number, compared with a number written out: measured
+/// on 8.4.11, `age + 1 > 10` over an `INT` finds the rows past nine.
+fn render_comparison_over_arithmetic(
+    expression: &Expr,
+    (op, operator): (&BinaryOperator, CheckedSelectComparisonOperator),
+    other: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let columns = arithmetic_over_columns(expression).expect("the side was read as arithmetic");
+    let (rendered_other, value) = render_checked_select_comparison_rhs(other, render_context)?;
+    if !matches!(
+        value,
+        CheckedSelectComparisonRhs::SignedInteger(_)
+            | CheckedSelectComparisonRhs::Decimal(_)
+            | CheckedSelectComparisonRhs::Null
+    ) {
+        return unsupported("arithmetic comparison with something other than a written number");
+    }
+    let rendered_other = number_without_quotes(rendered_other, &value);
+    let Expr::BinaryOp {
+        left,
+        op: arithmetic,
+        right,
+    } = expression
+    else {
+        unreachable!("arithmetic is one binary operator");
+    };
+    let rendered = format!(
+        "({} {arithmetic} {})",
+        render_compared_arithmetic_operand(left),
+        render_compared_arithmetic_operand(right)
+    );
+    for (qualifier, column) in columns {
+        render_context
+            .checked_comparisons
+            .push(CheckedSelectComparison {
+                qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
+                inner_source: None,
+                column_name: column.value.clone(),
+                operator,
+                rhs: CheckedSelectComparisonRhs::Operand(
+                    crate::CheckedComparisonOperand::Arithmetic,
+                ),
+                collated: false,
+                answers: None,
+            });
+    }
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: None,
+            inner_source: None,
+            column_name: String::new(),
+            operator,
+            rhs: value,
+            collated: false,
+            answers: Some(crate::CheckedComparisonAnswer::WholeNumber),
+        });
+    Ok(format!(
+        "({rendered} {} {rendered_other})",
+        checked_select_comparison_sql_operator(op)
+    ))
+}
+
+fn render_compared_arithmetic_operand(expr: &Expr) -> String {
+    match named_column(expr) {
+        Some((Some(qualifier), column)) => {
+            format!("{}.{}", render_ident(qualifier), render_ident(column))
+        }
+        Some((None, column)) => render_ident(column),
+        None => expr.to_string(),
+    }
+}
+
+/// Writes a number with a fraction out bare where the value reader quotes it.
+///
+/// The reader quotes one so that a column's own affinity reads it as the
+/// number it names. A call or an expression has no affinity, and the engine
+/// would compare a number with the text.
+fn number_without_quotes(rendered: String, value: &CheckedSelectComparisonRhs) -> String {
+    match value {
+        CheckedSelectComparisonRhs::Decimal(written) => format!("({written})"),
+        _ => rendered,
+    }
 }
 
 /// Reads the column an expression names, qualified or not.

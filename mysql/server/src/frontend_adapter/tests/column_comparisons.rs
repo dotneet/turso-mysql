@@ -1,5 +1,6 @@
-//! A column or a call compared with another column or call in a `WHERE` or a
-//! join's `ON`.
+//! A comparison beyond a column against a written value: a column or a call
+//! against another column or call, arithmetic, and a fallback, in a `WHERE` or
+//! a join's `ON`.
 //!
 //! Every expectation here was measured on MySQL 8.4.11.
 
@@ -30,6 +31,8 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
         "INSERT INTO ranks VALUES (1, 4), (2, 10)",
         "CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(191) NOT NULL, nick TEXT, b VARCHAR(10) COLLATE utf8mb4_bin, d DATE, dt DATETIME)",
         "INSERT INTO people (id, name, email, nick, b, d, dt) VALUES (1, 'Ann', 'ann', 'ANN', 'ann', '2024-01-01', '2024-01-01 00:00:00'), (2, 'Bob', 'bob@x', 'bobby', 'Bob', '2024-01-02', '2024-01-01 10:00:00'), (3, 'cat', 'CAT', NULL, 'x', '2023-05-05', '2023-05-05 00:00:00'), (4, 'Dan', 'dan', 'dan ', 'dan', '2024-01-01', NULL)",
+        "CREATE TABLE ex (id INT PRIMARY KEY, age INT, n INT, big BIGINT, iu INT UNSIGNED, score DOUBLE, name VARCHAR(20), b VARCHAR(20) COLLATE utf8mb4_bin, dm DECIMAL(5,2), t TINYINT)",
+        "INSERT INTO ex (id, age, n, big, iu, score, name, b, dm, t) VALUES (1, 30, 2, 9223372036854775807, 0, 29.5, 'Ann', 'Ann', 1.50, 1), (2, NULL, 3, 1, 5, NULL, NULL, NULL, NULL, NULL), (3, 10, -4, -1, 10, 10.0, 'cat', 'cat', 2.00, -1), (4, 9, 9, 5, 3, 9.5, 'Dan', 'dan', 0.50, 0), (5, 2147483647, 2147483647, 0, 4294967295, 1e300, '', '', 9.99, 127)",
         "CREATE TABLE amounts (id INT PRIMARY KEY, p DECIMAL(30,20), q DECIMAL(30,20), n INT, s DECIMAL(5,2))",
         "INSERT INTO amounts VALUES (1, 1.00000000000000000001, 1.00000000000000000002, 1, 1.00), (2, 1.00000000000000000000, 1.0, 1, 1.01), (3, 12345678.00000000000001, 12345678.00000000000001, 12345678, 0.10)",
     ] {
@@ -374,4 +377,118 @@ fn a_call_meets_another_call_or_a_column_of_its_kind() {
         3
     );
     assert!(rows(&mut adapter, "SELECT id FROM people").is_empty());
+}
+
+/// A column read through `+`, `-` or `*`, or through `COALESCE`/`IFNULL`, on
+/// one side of a comparison.
+#[test]
+fn arithmetic_and_a_fallback_compare_the_way_mysql_compares_them() {
+    let (_directory, mut adapter) = adapter();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM ex WHERE age + 1 > 10 ORDER BY id",
+            &["1", "3", "5"][..],
+        ),
+        (
+            "SELECT id FROM ex WHERE 10 < age + 1 ORDER BY id",
+            &["1", "3", "5"],
+        ),
+        ("SELECT id FROM ex WHERE age - n = 1 ORDER BY id", &[]),
+        (
+            "SELECT id FROM ex WHERE age * n > 50 ORDER BY id",
+            &["1", "4", "5"],
+        ),
+        // The widest INT times the widest INT still fits a BIGINT.
+        (
+            "SELECT id FROM ex WHERE age * 2147483647 > 0 ORDER BY id",
+            &["1", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM ex WHERE age + 1 > 10.5 ORDER BY id",
+            &["1", "3", "5"],
+        ),
+        ("SELECT id FROM ex WHERE t + 1 = 2 ORDER BY id", &["1"]),
+        (
+            "SELECT id FROM ex WHERE age + 1 <=> NULL ORDER BY id",
+            &["2"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(age, 0) > 10 ORDER BY id",
+            &["1", "5"],
+        ),
+        (
+            "SELECT id FROM ex WHERE IFNULL(age, 100) > 10 ORDER BY id",
+            &["1", "2", "5"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(age, 0) = 0 ORDER BY id",
+            &["2"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(age, 0) > 1.5 ORDER BY id",
+            &["1", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(score, 0) < 10 ORDER BY id",
+            &["2", "4"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(name, '') = '' ORDER BY id",
+            &["2", "5"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(name, 'x') = 'ANN' ORDER BY id",
+            &["1"],
+        ),
+        (
+            "SELECT id FROM ex WHERE IFNULL(name, 'zzz') > 'b' ORDER BY id",
+            &["2", "3", "4"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(big, 0) > 1 ORDER BY id",
+            &["1", "4"],
+        ),
+        (
+            "SELECT id FROM ex WHERE COALESCE(iu, 0) > 3 ORDER BY id",
+            &["2", "3", "5"],
+        ),
+    ] {
+        assert_eq!(rows(&mut adapter, sql), expected, "{sql}");
+    }
+    for sql in [
+        // Measured: 1690 for a BIGINT past its largest, and for an unsigned
+        // difference below zero.
+        "SELECT id FROM ex WHERE big + 1 > 10",
+        "SELECT id FROM ex WHERE iu - 5 > 0",
+        // A real, a DECIMAL and a word each change what the sum answers.
+        "SELECT id FROM ex WHERE score + 1 > 10",
+        "SELECT id FROM ex WHERE dm + 1 > 2",
+        "SELECT id FROM ex WHERE name + 1 > 0",
+        "SELECT id FROM ex WHERE age + 1 > '10'",
+        "SELECT id FROM ex WHERE age + 1 > ?",
+        "SELECT id FROM ex WHERE age / 2 > 1",
+        "SELECT id FROM ex WHERE age + 1 + 1 > 1",
+        // Measured: compared under utf8mb4_bin.
+        "SELECT id FROM ex WHERE COALESCE(b, '') = 'dan'",
+        "SELECT id FROM ex WHERE COALESCE(dm, 0) > 1",
+        // A word against a number, which MySQL reads as a number first.
+        "SELECT id FROM ex WHERE COALESCE(age, 'x') > 1",
+        "SELECT id FROM ex WHERE COALESCE(name, 0) > 1",
+        "SELECT id FROM ex WHERE COALESCE(name, '') = 1",
+        "SELECT id FROM ex WHERE COALESCE(age, 0) = '1'",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        affected(&mut adapter, "UPDATE ex SET n = 0 WHERE age + 1 > 10"),
+        3
+    );
+    assert_eq!(
+        affected(&mut adapter, "DELETE FROM ex WHERE COALESCE(age, 0) = 0"),
+        1
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, n FROM ex ORDER BY id"),
+        ["1|0", "3|0", "4|9", "5|0"]
+    );
 }

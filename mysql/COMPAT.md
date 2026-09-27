@@ -935,6 +935,25 @@ written in ASCII are read as the word they answer, so `LOWER(name) = LOWER('ANN'
 refused. Each of these, and a call against a written value, is taken in an `UPDATE` and a
 `DELETE` as well, where a call against a written value used to be refused.
 
+One `+`, `-` or `*` over a column — `WHERE age + 1 > 10`, `WHERE age - n = 1`,
+`WHERE age * n > 50` — is compared with a number written out, in a `SELECT`, an `UPDATE` and a
+`DELETE`. Each column it reads has to be a signed whole number no wider than an `INT`, and a
+written operand no wider than one either, so the answer stays inside a `BIGINT` where the two
+engines agree: measured on 8.4.11, `big + 1` past the largest `BIGINT` is 1690 and an
+`INT UNSIGNED` difference below zero is 1690 too, where the engine would go on in floating point.
+A `DOUBLE`, a `DECIMAL` or a word read through arithmetic, a word or a `?` on the other side,
+`/`, and more than one operator are refused.
+
+`COALESCE(col, value)` and `IFNULL(col, value)` on one side of a comparison — `WHERE
+COALESCE(age, 0) > 10`, `WHERE IFNULL(name, '') = ''` — are taken over a whole-number column
+other than a `BIGINT UNSIGNED`, a `DOUBLE`, and a `VARCHAR` or `TEXT`, with the fallback and the
+value compared with each held to the column as a comparison against the column would hold them.
+Words compare under `utf8mb4_0900_ai_ci`, which the column has to carry: measured,
+`COALESCE(b, '') = 'dan'` over a `utf8mb4_bin` `b` compares under `utf8mb4_bin`. Measured and
+matched: `COALESCE(age, 0) > 1.5` finds the rows above one and a half, and
+`IFNULL(name, 'zzz') > 'b'` finds the row holding NULL. A fallback on a `DECIMAL`, a day or a
+moment, a word against a number either way, and more than two arguments are refused.
+
 A `JSON` column in a checked one-table `SELECT` accepts `=`, `<>`, `<=>`, `<`,
 `<=`, `>` and `>=` against written strings and signed 64-bit integers, plus
 `IN` and `NOT IN` against those values and SQL `NULL`. A written

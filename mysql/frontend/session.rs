@@ -25,14 +25,14 @@ use turso_mysql_parser::{
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
     render_create_view_mysql_with_mode, AutoIncrementRowValue, BoundAutoIncrementInsert,
     CheckedAutoIncrementCreateTable, CheckedAutoIncrementInsert, CheckedComparisonAnswer,
-    CheckedComparisonNow, CheckedInsertValue, CheckedPrimaryKeyCreateTable,
-    CheckedSelectComparison, CheckedSelectComparisonOperator, CheckedSelectComparisonRhs,
-    CheckedSubqueryComparison, CheckedUpdateAssignmentValue, MySqlAlterTableIndexOperation,
-    MySqlAlterTableIndexes, MySqlCreateTableAsSelect, MySqlCreateTableAsSelectSource,
-    MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlSelectSource, MySqlTableName,
-    MySqlTransactionCommand, MySqlTruncateTableCommand, ParseError as MySqlParseError,
-    SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml,
-    WrittenZero,
+    CheckedComparisonNow, CheckedComparisonOperand, CheckedInsertValue,
+    CheckedPrimaryKeyCreateTable, CheckedSelectComparison, CheckedSelectComparisonOperator,
+    CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
+    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
+    MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
+    MySqlSelectSource, MySqlTableName, MySqlTransactionCommand, MySqlTruncateTableCommand,
+    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
+    StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -9356,6 +9356,26 @@ fn checked_comparison_fits_column(
             | CheckedComparisonAnswer::JsonCount
             | CheckedComparisonAnswer::JsonDocument => false,
         },
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Arithmetic) => matches!(
+            type_name,
+            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BOOLEAN"
+        ),
+        // The engine answers the fallback in the column's own form for these;
+        // a DECIMAL, a moment and an unsigned BIGINT are each held in a form
+        // of their own that a written fallback is not.
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Fallback) => {
+            (is_integer_type(type_name) && type_name != "BIGINT UNSIGNED")
+                || matches!(
+                    type_name,
+                    "DOUBLE"
+                        | "DOUBLE UNSIGNED"
+                        | "VARCHAR"
+                        | "TEXT"
+                        | "TINYTEXT"
+                        | "MEDIUMTEXT"
+                        | "LONGTEXT"
+                )
+        }
     }
 }
 
@@ -9812,6 +9832,12 @@ fn checked_comparison_column_refusal(
         }
         CheckedSelectComparisonRhs::Column { .. } => "a column of the same kind",
         CheckedSelectComparisonRhs::Call(answers) => answered_column_kind_name(*answers),
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Arithmetic) => {
+            "a signed whole-number column no wider than an INT"
+        }
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Fallback) => {
+            "a whole-number, DOUBLE or text column"
+        }
     };
     LimboError::InvalidArgument(format!(
         "SELECT comparison on {column_name} requires {wanted}, found {type_name}"

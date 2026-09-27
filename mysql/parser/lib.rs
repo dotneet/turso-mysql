@@ -939,6 +939,24 @@ pub enum CheckedSelectComparisonRhs {
     /// Another call, answering this. The two calls meet when they answer the
     /// same kind.
     Call(CheckedComparisonAnswer),
+    /// Not a value the column is compared with: the column is read by an
+    /// expression on one side of the comparison, which only some kinds of
+    /// column may be read through.
+    Operand(CheckedComparisonOperand),
+}
+
+/// How a column is read on one side of a comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckedComparisonOperand {
+    /// By `+`, `-` or `*` — `WHERE age + 1 > 10`. The column has to be a
+    /// signed whole number no wider than an `INT`, so the answer cannot
+    /// leave a `BIGINT`: MySQL raises 1690 there where the engine goes on in
+    /// floating point, and an unsigned column's difference below zero is 1690
+    /// too.
+    Arithmetic,
+    /// By `COALESCE(col, value)` or `IFNULL(col, value)`. The written value
+    /// is held to the column as a comparison of its own would be.
+    Fallback,
 }
 
 /// What a call answering the moment the statement runs answers.

@@ -318,8 +318,10 @@ fn render_text_comparison(
         CheckedSelectComparisonRhs::Now(_) => {
             return unsupported("JSON text comparison with a clock reading")
         }
-        CheckedSelectComparisonRhs::Column { .. } | CheckedSelectComparisonRhs::Call(_) => {
-            unreachable!("the value reader never answers a column or a call")
+        CheckedSelectComparisonRhs::Column { .. }
+        | CheckedSelectComparisonRhs::Call(_)
+        | CheckedSelectComparisonRhs::Operand(_) => {
+            unreachable!("the value reader answers only a value")
         }
     };
     let compared = format!("mysql_json_text_compare({rendered}, {rendered_other})");
@@ -366,8 +368,10 @@ fn render_count_comparison(
         CheckedSelectComparisonRhs::Text(_) | CheckedSelectComparisonRhs::Now(_) => {
             return unsupported("JSON_LENGTH comparison with something other than a number")
         }
-        CheckedSelectComparisonRhs::Column { .. } | CheckedSelectComparisonRhs::Call(_) => {
-            unreachable!("the value reader never answers a column or a call")
+        CheckedSelectComparisonRhs::Column { .. }
+        | CheckedSelectComparisonRhs::Call(_)
+        | CheckedSelectComparisonRhs::Operand(_) => {
+            unreachable!("the value reader answers only a value")
         }
     };
     if operator == CheckedSelectComparisonOperator::NullSafeEqual
