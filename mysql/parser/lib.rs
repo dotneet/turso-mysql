@@ -167,7 +167,8 @@ pub use table_collation::{
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
-    normalize_time_with_precision, normalize_year, year_from_number,
+    normalize_time_with_precision, normalize_year, seconds_in_the_time, time_of_seconds,
+    year_from_number,
 };
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};

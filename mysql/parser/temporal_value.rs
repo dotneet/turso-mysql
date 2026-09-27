@@ -60,6 +60,55 @@ pub fn normalize_time_with_precision(written: &str, precision: u8) -> Option<Str
     ))
 }
 
+/// The seconds `TIME_TO_SEC` counts in the time a stored value holds: a
+/// `TIME` whole, the time of day of a `DATETIME`, and none of a `DATE`.
+///
+/// Measured on MySQL 8.4.11: `-838:59:59` counts -3020399, a fraction of a
+/// second is cut toward zero — `-00:00:01.5` counts -1 — and a `DATE` counts 0.
+/// The value is the one this frontend stored, so anything else names nothing.
+pub fn seconds_in_the_time(stored: &str) -> Option<i64> {
+    let time = match stored.split_once(' ') {
+        Some((_, time)) => time,
+        None if !stored.contains(':') => {
+            normalize_date(stored)?;
+            return Some(0);
+        }
+        None => stored,
+    };
+    let (negative, time) = match time.strip_prefix('-') {
+        Some(time) => (true, time),
+        None => (false, time),
+    };
+    let [hours, minutes, seconds] =
+        <[&str; 3]>::try_from(time.split(':').collect::<Vec<_>>()).ok()?;
+    let seconds = seconds.split_once('.').map_or(seconds, |(whole, _)| whole);
+    let counted = hours.parse::<i64>().ok()? * 3600
+        + minutes.parse::<i64>().ok()? * 60
+        + seconds.parse::<i64>().ok()?;
+    Some(if negative { -counted } else { counted })
+}
+
+/// The time `SEC_TO_TIME` writes for a count of seconds, and whether MySQL
+/// held it to the widest a `TIME` runs to, which it warns about.
+///
+/// Measured on MySQL 8.4.11: 86400 is `24:00:00`, -1 is `-00:00:01`, and
+/// 3020400 is held to `838:59:59`.
+pub fn time_of_seconds(seconds: i64) -> (String, bool) {
+    let most = i64::from(WIDEST_SPAN_SECONDS);
+    let held = seconds.clamp(-most, most);
+    let sign = if held < 0 { "-" } else { "" };
+    let magnitude = held.unsigned_abs();
+    (
+        format!(
+            "{sign}{:02}:{:02}:{:02}",
+            magnitude / 3600,
+            magnitude / 60 % 60,
+            magnitude % 60
+        ),
+        held != seconds,
+    )
+}
+
 /// The year a `YEAR` column stores, written as text.
 ///
 /// Measured: text is read as a number and a number under a hundred names a

@@ -307,6 +307,10 @@ pub enum ScalarFunction {
     EncodesInBase64,
     /// `INET_ATON`, which reads a dotted address as a number.
     ReadsAnAddress,
+    /// `TIME_TO_SEC`, which counts the seconds in a time.
+    CountsTheSecondsOfATime,
+    /// `SEC_TO_TIME`, which writes a count of seconds out as a time.
+    WritesSecondsAsATime,
     /// `INET_NTOA`, which writes a number out as a dotted address.
     WritesAnAddress,
     /// `IS_IPV4`, which answers whether a word is a dotted address.
@@ -2827,6 +2831,49 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     // reports what its `DATE_ADD` spelling reports.
     if named(&["ADDDATE", "SUBDATE"]) {
         return scalar_call(&date_shift_spelled_out(function)?);
+    }
+    // `TIME_TO_SEC` counts the seconds in a time and `SEC_TO_TIME` writes a
+    // count back out as one. Each reads a column or a written value; a
+    // written value MySQL would warn about — a word naming no time, a count
+    // past the widest time — is refused, the warning not being raised here.
+    if named(&["TIME_TO_SEC", "SEC_TO_TIME"]) {
+        let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read))] =
+            arguments.args.as_slice()
+        else {
+            return None;
+        };
+        let counts = named(&["TIME_TO_SEC"]);
+        let columns = match read {
+            Expr::Identifier(column) => vec![column.value.clone()],
+            _ if !counts => {
+                let (_, held) =
+                    crate::time_of_seconds(crate::translate::direct_signed_integer(read)?);
+                if held {
+                    return None;
+                }
+                Vec::new()
+            }
+            Expr::Value(value) => {
+                let (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)) =
+                    &value.value
+                else {
+                    return None;
+                };
+                crate::seconds_in_the_time(&crate::normalize_time(word)?)?;
+                Vec::new()
+            }
+            _ => return None,
+        };
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if counts {
+                ScalarFunction::CountsTheSecondsOfATime
+            } else {
+                ScalarFunction::WritesSecondsAsATime
+            },
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
     }
     // `INET_ATON` reads a dotted address out of a word, `INET_NTOA` writes a
     // number out as one, and `IS_IPV4` says whether a word is one. Each reads

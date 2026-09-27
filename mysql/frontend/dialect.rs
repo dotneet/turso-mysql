@@ -1263,7 +1263,7 @@ pub(crate) const MYSQL_YEARWEEK: &str = "mysql_yearweek";
 pub(crate) const MYSQL_TO_DAYS: &str = "mysql_to_days";
 /// Reads the bytes of a value the way `ASCII`, `ORD`, `CRC32`, `QUOTE` and
 /// `TO_BASE64` do; the engine has none of them.
-pub(crate) const MYSQL_BYTE_READINGS: [&str; 8] = [
+pub(crate) const MYSQL_BYTE_READINGS: [&str; 10] = [
     "mysql_ascii",
     "mysql_ord",
     "mysql_crc32",
@@ -1272,11 +1272,28 @@ pub(crate) const MYSQL_BYTE_READINGS: [&str; 8] = [
     "mysql_inet_aton",
     "mysql_inet_ntoa",
     "mysql_is_ipv4",
+    "mysql_time_to_sec",
+    "mysql_sec_to_time",
 ];
 
 /// Answers one of `MYSQL_BYTE_READINGS` over a value, which reaches it as a
 /// word, or as a whole number MySQL would write out before reading its bytes.
 fn byte_reading(name: &str, value: &Value) -> Result<Value> {
+    if name.eq_ignore_ascii_case("mysql_sec_to_time") {
+        return Ok(match value {
+            Value::Numeric(Numeric::Integer(seconds)) => {
+                Value::build_text(turso_mysql_parser::time_of_seconds(*seconds).0)
+            }
+            _ => Value::Null,
+        });
+    }
+    if name.eq_ignore_ascii_case("mysql_time_to_sec") {
+        return Ok(match value {
+            Value::Text(stored) => turso_mysql_parser::seconds_in_the_time(stored.as_str())
+                .map_or(Value::Null, Value::from_i64),
+            _ => Value::Null,
+        });
+    }
     if name.eq_ignore_ascii_case("mysql_inet_ntoa") {
         return Ok(match value {
             Value::Numeric(Numeric::Integer(number)) => {

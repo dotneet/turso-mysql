@@ -1830,6 +1830,20 @@ zero by the calendar MySQL keeps. Each reads what `WEEK` reads. Measured on
 day 366, in week 53 of the year zero. `YEARWEEK` reports a LONGLONG of 7 and
 `TO_DAYS` one of 8, both nullable over a NOT NULL column.
 
+`TIME_TO_SEC` counts the seconds in a time and `SEC_TO_TIME` writes a count
+back out as one, which the engine has no calls for, so the dialect answers
+each. Measured on 8.4.11: a `TIME` counts whole — `-838:59:59` is -3020399 —
+with a fraction of a second cut toward zero, a `DATETIME` counts its time of
+day and a `DATE` none, as a `LONGLONG` of 10; `SEC_TO_TIME` writes `24:00:00`
+for 86400 and `-00:00:01` for -1, holds a count past the widest time to
+`838:59:59`, and answers a `TIME` of 10. Both are nullable over a NOT NULL
+column. The seconds are counted in a `TIME`, `DATETIME` or `DATE` column or a
+written time, and a time is written out of a whole-number column or a written
+whole number. A `TIMESTAMP`, read in the session's zone, a word column and a
+written value MySQL warns about — a word naming no time, a count past the
+widest time — are refused. `ADDTIME`, `TIME_FORMAT`, `MAKETIME` and
+`MAKEDATE` are not taken.
+
 `ADDDATE` and `SUBDATE` are `DATE_ADD` and `DATE_SUB` under other names, and
 a bare count is a count of days: `ADDDATE(d, 1)` is `DATE_ADD(d, INTERVAL 1
 DAY)`. Measured on 8.4.11, each reports what its `DATE_ADD` spelling reports,

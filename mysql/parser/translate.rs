@@ -5653,6 +5653,28 @@ fn render_scalar_call(
             "mysql_week({}, {mode})",
             moment_argument(function, render_context)?
         ));
+    } else if name.value.eq_ignore_ascii_case("TIME_TO_SEC")
+        || name.value.eq_ignore_ascii_case("SEC_TO_TIME")
+    {
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        // A written time is read the way a TIME column stores it, which is
+        // the form the dialect reads.
+        let read = match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                Expr::Value(value),
+            ))] => match &value.value {
+                Value::SingleQuotedString(word) | Value::DoubleQuotedString(word) => {
+                    let stored = crate::normalize_time(word)
+                        .expect("a checked TIME_TO_SEC was checked to read a time");
+                    format!("'{stored}'")
+                }
+                _ => scalar_argument(function, 0)?,
+            },
+            _ => scalar_argument(function, 0)?,
+        };
+        return Ok(format!("mysql_{}({read})", name.value.to_ascii_lowercase()));
     } else if name.value.eq_ignore_ascii_case("INET_ATON")
         || name.value.eq_ignore_ascii_case("INET_NTOA")
         || name.value.eq_ignore_ascii_case("IS_IPV4")
