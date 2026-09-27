@@ -321,7 +321,9 @@ pub(super) fn information_schema_tables_result_to_execution_result(
             base_table.then(|| b"InnoDB".to_vec()),
             None,
             None,
-            base_table.then(|| b"utf8mb4_0900_ai_ci".to_vec()),
+            table
+                .collation()
+                .map(|collation| collation.name().as_bytes().to_vec()),
             Some(if base_table {
                 Vec::new()
             } else {
@@ -1453,7 +1455,7 @@ pub(super) fn show_table_status_result_to_execution_result(
                 None,
                 None,
                 None,
-                Some(b"utf8mb4_0900_ai_ci".to_vec()),
+                Some(row.collation.as_bytes().to_vec()),
                 None,
                 Some(Vec::new()),
                 Some(Vec::new()),
@@ -1476,6 +1478,8 @@ pub(super) struct ShowTableStatusRow {
     pub name: String,
     pub rows: u64,
     pub auto_increment: Option<u64>,
+    /// The collation the table was declared with.
+    pub collation: &'static str,
 }
 
 /// The eighteen columns, with the shapes measured on MySQL 8.4.11.

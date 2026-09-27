@@ -12,10 +12,10 @@ use crate::{
     ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
     PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
     TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS,
-    COMMAND_SEQUENCE_ID, MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
-    MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG,
-    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT,
-    MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
+    COMMAND_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION, MAX_RESULT_COLUMNS, MYSQL_TYPE_BLOB,
+    MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24,
+    MYSQL_TYPE_JSON, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL,
+    MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
     MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
 };
 
@@ -225,6 +225,12 @@ pub trait CommandExecutor {
         false
     }
 
+    /// Returns the collation ID a text result column reports, which is the
+    /// collation the session runs its connection on.
+    fn connection_collation(&self) -> u16 {
+        u16::from(DEFAULT_UTF8MB4_COLLATION)
+    }
+
     /// Returns the idle time this session asked for with `SET wait_timeout`,
     /// which the connection keeps in place of the runtime's own.
     fn session_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -400,7 +406,11 @@ impl CommandDispatcher {
             }
             ClassicCommand::StmtPrepare { sql } => {
                 let capabilities = negotiated_capabilities(connection)?;
-                let prepared = executor.execute_stmt_prepare(sql);
+                let connection_collation = executor.connection_collation();
+                let prepared = executor.execute_stmt_prepare(sql).map(|mut prepared| {
+                    follow_the_connection_collation(&mut prepared.columns, connection_collation);
+                    prepared
+                });
                 let statement_id = prepared.as_ref().ok().map(|result| result.statement_id);
                 let encoded = encode_prepared_statement(
                     connection.response_packet_codec(),
@@ -454,7 +464,19 @@ impl CommandDispatcher {
                     encode_prepared_execution_result(
                         connection.response_packet_codec(),
                         capabilities,
-                        executor.execute_stmt_execute(statement_id, parameter_payload),
+                        executor
+                            .execute_stmt_execute(statement_id, parameter_payload)
+                            .map(|mut result| {
+                                if let PreparedStatementExecutionResult::ResultSet(rows) =
+                                    &mut result
+                                {
+                                    follow_the_connection_collation(
+                                        &mut rows.columns,
+                                        executor.connection_collation(),
+                                    );
+                                }
+                                result
+                            }),
                     ),
                 )
             }
@@ -475,7 +497,11 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
     if statements.len() == 1 {
         let result = executor.execute_query(sql).and_then(|mut result| {
             set_more_results(&mut result, false);
-            set_result_charset(&mut result, executor.binary_result_charset())?;
+            set_result_charset(
+                &mut result,
+                executor.binary_result_charset(),
+                executor.connection_collation(),
+            )?;
             Ok(result)
         });
         return encode_execution_result(codec, capability_flags, result);
@@ -505,7 +531,11 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
         let result_is_set = matches!(&result, Ok(CommandExecutionResult::ResultSet(_)));
         let result = result.and_then(|mut result| {
             set_more_results(&mut result, more_results);
-            set_result_charset(&mut result, executor.binary_result_charset())?;
+            set_result_charset(
+                &mut result,
+                executor.binary_result_charset(),
+                executor.connection_collation(),
+            )?;
             Ok(result)
         });
         let encoded = match encode_execution_result(codec, capability_flags, result) {
@@ -565,20 +595,22 @@ fn set_more_results(result: &mut CommandExecutionResult, more_results: bool) {
 fn set_result_charset(
     result: &mut CommandExecutionResult,
     binary_result_charset: bool,
+    connection_collation: u16,
 ) -> Result<(), FrontendErrorKind> {
-    if !binary_result_charset {
-        return Ok(());
-    }
     let CommandExecutionResult::ResultSet(rows) = result else {
         return Ok(());
     };
+    if !binary_result_charset {
+        follow_the_connection_collation(&mut rows.columns, connection_collation);
+        return Ok(());
+    }
     for column in &mut rows.columns {
         match column.character_set {
             0 | 63 => {}
-            45 | 46 | 255 if column.column_length == u32::MAX => {
+            45 | 46 | 224 | 255 if column.column_length == u32::MAX => {
                 column.character_set = 63;
             }
-            45 | 46 | 255 if column.column_length % 4 == 0 => {
+            45 | 46 | 224 | 255 if column.column_length % 4 == 0 => {
                 column.character_set = 63;
                 column.column_length /= 4;
             }
@@ -586,6 +618,16 @@ fn set_result_charset(
         }
     }
     Ok(())
+}
+
+/// Gives every text column the connection's collation ID in place of 45, the
+/// one results are built with.
+fn follow_the_connection_collation(columns: &mut [ColumnDefinitionConfig], collation: u16) {
+    for column in columns {
+        if column.character_set == u16::from(DEFAULT_UTF8MB4_COLLATION) {
+            column.character_set = collation;
+        }
+    }
 }
 
 fn split_query_statements(
@@ -1314,6 +1356,29 @@ mod tests {
         max_payload_len: 4096,
     };
 
+    /// Measured on MySQL 8.4.11: under `SET NAMES utf8mb4 COLLATE
+    /// utf8mb4_unicode_ci` every text column reports 224, whatever the column
+    /// is declared with, and a number keeps the binary collation.
+    #[test]
+    fn text_results_report_the_connections_collation() {
+        let mut name = ColumnDefinitionConfig::new("name", MYSQL_TYPE_VAR_STRING);
+        name.character_set = 45;
+        let mut id = ColumnDefinitionConfig::new("id", MYSQL_TYPE_LONGLONG);
+        id.character_set = 63;
+        let mut result = CommandExecutionResult::ResultSet(TextResultSet {
+            columns: vec![name, id],
+            rows: vec![],
+            warnings: 0,
+            status_flags: SERVER_STATUS_AUTOCOMMIT,
+        });
+        set_result_charset(&mut result, false, 224).unwrap();
+        let CommandExecutionResult::ResultSet(rows) = result else {
+            panic!("expected a result set");
+        };
+        assert_eq!(rows.columns[0].character_set, 224);
+        assert_eq!(rows.columns[1].character_set, 63);
+    }
+
     #[test]
     fn binary_results_encode_mysql_show_create_column_metadata() {
         let mut table = ColumnDefinitionConfig::new("Table", MYSQL_TYPE_VAR_STRING);
@@ -1331,7 +1396,7 @@ mod tests {
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
         });
-        set_result_charset(&mut result, true).unwrap();
+        set_result_charset(&mut result, true, u16::from(DEFAULT_UTF8MB4_COLLATION)).unwrap();
         let CommandExecutionResult::ResultSet(rows) = result else {
             panic!("expected a result set");
         };
@@ -1354,7 +1419,7 @@ mod tests {
             warnings: 0,
             status_flags: SERVER_STATUS_AUTOCOMMIT,
         });
-        set_result_charset(&mut result, true).unwrap();
+        set_result_charset(&mut result, true, u16::from(DEFAULT_UTF8MB4_COLLATION)).unwrap();
         let CommandExecutionResult::ResultSet(rows) = result else {
             panic!("expected a result set");
         };

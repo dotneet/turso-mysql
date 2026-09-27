@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use turso_core::CollationSeq;
 use turso_core::{
     dialect::{SchemaCatalogRow, SchemaCatalogValidationContext},
     schema::{is_system_table, BTreeTable, Schema},
@@ -13,7 +14,7 @@ use turso_mysql_parser::{
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, SessionSqlMode,
+    render_create_view_mysql_with_mode, table_collation_of, SessionSqlMode,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -212,11 +213,15 @@ impl Dialect for MySqlDialect {
                 .map_err(|error| LimboError::Corrupt(error.to_string()));
         }
         tbl_name.db_name = None;
-        let normalized =
-            render_create_table_mysql_with_mode(&stmt, session_sql_mode(decoded.context.sql_mode))
-                .map_err(|error| {
-                    LimboError::Corrupt(format!("cannot replay MySQL table SQL: {error}"))
-                })?;
+        let mode = session_sql_mode(decoded.context.sql_mode);
+        let normalized = render_create_table_mysql_with_mode(&stmt, mode)
+            .and_then(|rendered| {
+                let collation = table_collation_of(decoded.normalized_ddl, mode)?;
+                Ok(format!("{rendered}{}", collation.table_option()))
+            })
+            .map_err(|error| {
+                LimboError::Corrupt(format!("cannot replay MySQL table SQL: {error}"))
+            })?;
         reencode_schema_sql(decoded, &normalized)
             .map_err(|error| LimboError::Corrupt(error.to_string()))
     }
@@ -503,6 +508,13 @@ impl Dialect for MySqlDialect {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
+    /// MySQL matches `LIKE` under the collation of the column it reads, and a
+    /// `utf8mb4_unicode_ci` column matches under Unicode 4.0.0's weights.
+    fn function_for_collation(&self, name: &str, collation: CollationSeq) -> Option<String> {
+        (name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) && collation == CollationSeq::MySqlUca400)
+            .then(|| MYSQL_UCA400_LIKE.to_owned())
+    }
+
     fn exec_scalar_function(
         &self,
         connection: &turso_core::Connection,
@@ -632,7 +644,14 @@ impl Dialect for MySqlDialect {
             };
             return checked_mysql_search(haystack, needle, start);
         }
-        if name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
+        let like = if name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
+            Some(turso_core::mysql_uca9_like as fn(&str, &str, Option<char>) -> Result<bool>)
+        } else if name.eq_ignore_ascii_case(MYSQL_UCA400_LIKE) {
+            Some(turso_core::mysql_uca400_like as fn(&str, &str, Option<char>) -> Result<bool>)
+        } else {
+            None
+        };
+        if let Some(like) = like {
             let [value, pattern, escape] = args else {
                 return Err(LimboError::ParseError(format!(
                     "{name} takes three arguments"
@@ -657,7 +676,7 @@ impl Dialect for MySqlDialect {
                     ))
                 }
             };
-            let matched = turso_core::mysql_uca9_like(value.as_str(), pattern.as_str(), escape)?;
+            let matched = like(value.as_str(), pattern.as_str(), escape)?;
             return Ok(Value::from_i64(i64::from(matched)));
         }
         if name.eq_ignore_ascii_case(MYSQL_MD5) {
@@ -938,6 +957,7 @@ pub(crate) const MYSQL_ELT: &str = "mysql_elt";
 /// register, and MySQL's is held to a collation rather than to the pattern.
 pub(crate) const MYSQL_REGEXP: &str = "mysql_regexp";
 pub(crate) const MYSQL_UCA9_LIKE: &str = "mysql_uca9_like";
+pub(crate) const MYSQL_UCA400_LIKE: &str = "mysql_uca400_like";
 pub(crate) const MYSQL_LOWER: &str = "mysql_lower";
 pub(crate) const MYSQL_UPPER: &str = "mysql_upper";
 pub(crate) const MYSQL_INSTR: &str = "mysql_instr";

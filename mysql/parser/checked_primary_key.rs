@@ -10,8 +10,8 @@
 //! every migration tool keeps its own bookkeeping in.
 
 use super::{
-    is_plain_inline_primary_key, parse_normalized_create_table, parse_one_statement,
-    reject_attributes_and_check_options, reject_json_defaults_and_keys,
+    check_table_options, is_plain_inline_primary_key, parse_normalized_create_table,
+    parse_one_statement, reject_attributes_and_check_options, reject_json_defaults_and_keys,
     reject_unsupported_mysql_string_escapes, render_column, render_column_option,
     render_mysql_checked_column, render_mysql_object_name, render_table_constraint,
     table_with_its_key_written_inline, unsupported, written_comment, ParseError, SessionSqlMode,
@@ -228,6 +228,10 @@ fn check_primary_key_options(column: &ColumnDef) -> Result<(), ParseError> {
             // nowhere in the SQLite definition and put back into the stored
             // MySQL DDL by the renderer.
             ColumnOption::Comment(_) if option.name.is_none() => {}
+            // A key over words is matched under the collation its column
+            // names; which ones are taken is checked where it is rendered.
+            ColumnOption::CharacterSet(_) | ColumnOption::Collation(_) if option.name.is_none() => {
+            }
             _ => return unsupported("PRIMARY KEY column attribute"),
         }
     }
@@ -296,13 +300,7 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
         DataType::Int(None) | DataType::Integer(None) => "INT".to_owned(),
         _ => the_type_a_column_is_written_with(column)?,
     };
-    // A key over words matches them under the collation the column is declared
-    // with, and this server matches words without regard to case.
-    let collation = if super::a_column_of_words(&column.data_type) {
-        WORDS_COLLATION
-    } else {
-        ""
-    };
+    let collation = super::engine_collation_of(column);
     let mut definition = format!(
         "{} {data_type}{collation}",
         super::render_ident(&column.name)
@@ -345,8 +343,11 @@ pub(crate) fn render_mysql_create_table(
     // `SHOW CREATE TABLE` never prints `IF NOT EXISTS` — measured, a table
     // written with it prints back without it — so the words are read and left
     // out of what is stored.
+    let collation = check_table_options(&table.table_options)?
+        .collation
+        .table_option();
     Ok(format!(
-        "CREATE {temporary}TABLE {} ({}){engine}",
+        "CREATE {temporary}TABLE {} ({}){engine}{collation}",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))
@@ -376,7 +377,25 @@ fn render_mysql_source_column(
                 _ => options.extend(render_column_option(option, &column.data_type)?),
             }
         }
-        let mut definition = format!("{} {data_type} NOT NULL", render_mysql_ident(&column.name));
+        // The engine's definition is not read back for a key column, so the
+        // collation it names is written here as it was declared.
+        let collation = column
+            .options
+            .iter()
+            .find_map(|option| match &option.option {
+                ColumnOption::Collation(name) => {
+                    ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_unicode_ci"]
+                        .into_iter()
+                        .find(|known| super::unqualified_name_is(name, &[known]))
+                        .map(|known| format!(" COLLATE {known}"))
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut definition = format!(
+            "{} {data_type}{collation} NOT NULL",
+            render_mysql_ident(&column.name)
+        );
         if !options.is_empty() {
             definition.push(' ');
             definition.push_str(&options.join(" "));

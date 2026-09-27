@@ -30,8 +30,48 @@ use crate::{
 /// The character set this server speaks, and the only one it takes.
 const SERVER_CHARACTER_SET: &str = "utf8mb4";
 
-/// The collation the connection runs on, which is the one the handshake sends.
-const SERVER_CONNECTION_COLLATION: &str = "utf8mb4_general_ci";
+/// The collations a session may run its connection on.
+///
+/// Measured on MySQL 8.4.11: every text column of a result reports the
+/// connection's collation, whatever the column is declared with, so this is
+/// what the ID each one carries follows. It says nothing about how a column is
+/// compared: a column is compared under its own collation, and two written
+/// words compared with each other are refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ConnectionCollation {
+    /// `utf8mb4_general_ci`, the one the handshake sends.
+    #[default]
+    General,
+    /// `utf8mb4_0900_ai_ci`, Unicode 9's weights.
+    Unicode9,
+    /// `utf8mb4_unicode_ci`, Unicode 4.0.0's weights, which Laravel sets on
+    /// every connection.
+    Unicode4,
+}
+
+impl ConnectionCollation {
+    fn from_name(name: &str) -> Option<Self> {
+        [Self::General, Self::Unicode9, Self::Unicode4]
+            .into_iter()
+            .find(|collation| collation.name().eq_ignore_ascii_case(name))
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::General => "utf8mb4_general_ci",
+            Self::Unicode9 => "utf8mb4_0900_ai_ci",
+            Self::Unicode4 => "utf8mb4_unicode_ci",
+        }
+    }
+
+    const fn id(self) -> u16 {
+        match self {
+            Self::General => DEFAULT_UTF8MB4_COLLATION as u16,
+            Self::Unicode9 => 255,
+            Self::Unicode4 => 224,
+        }
+    }
+}
 
 /// The collation a table this server writes is declared with, which is the one
 /// `SHOW CREATE TABLE` and every `information_schema` reading already report.
@@ -77,6 +117,8 @@ pub(crate) struct MySqlSessionVariables {
     sql_mode_choices: SqlModeChoices,
     /// The idle time the session asked for in place of the server's own.
     wait_timeout: Option<Duration>,
+    /// The collation the session runs its connection on.
+    connection_collation: ConnectionCollation,
 }
 
 /// The `sql_mode` flags a session may turn on or off.
@@ -118,6 +160,7 @@ impl Default for MySqlSessionVariables {
             next_transaction_isolation: None,
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
+            connection_collation: ConnectionCollation::default(),
         }
     }
 }
@@ -125,6 +168,11 @@ impl Default for MySqlSessionVariables {
 impl MySqlSessionVariables {
     pub(crate) const fn sql_notes(&self) -> bool {
         self.sql_notes
+    }
+
+    /// The collation ID every text column of a result reports.
+    pub(crate) const fn connection_collation_id(&self) -> u16 {
+        self.connection_collation.id()
     }
 
     pub(crate) const fn raw_character_set_results(&self) -> bool {
@@ -321,9 +369,20 @@ impl MySqlSessionVariables {
                 self.raw_character_set_results = false;
                 self.binary_character_set_results = value.eq_ignore_ascii_case("binary");
             }
-            MySqlSessionSetting::Names { .. } => {
+            // Without a collation, the connection keeps the one the handshake
+            // named, as it always has here.
+            MySqlSessionSetting::Names { collation, .. } => {
                 self.raw_character_set_results = false;
                 self.binary_character_set_results = false;
+                self.connection_collation = match collation.as_deref() {
+                    None => ConnectionCollation::default(),
+                    Some(name) => ConnectionCollation::from_name(name)
+                        .expect("an accepted collation is one the connection runs on"),
+                };
+            }
+            MySqlSessionSetting::CollationConnection(name) => {
+                self.connection_collation = ConnectionCollation::from_name(&name)
+                    .expect("an accepted collation is one the connection runs on");
             }
             MySqlSessionSetting::TimeZone(zone) => {
                 self.time_zone = the_zone_read_back(&zone);
@@ -348,7 +407,6 @@ impl MySqlSessionVariables {
             | MySqlSessionSetting::SqlAutoIsNull(_)
             | MySqlSessionSetting::SqlSafeUpdates(_)
             | MySqlSessionSetting::CharacterSetClient(_)
-            | MySqlSessionSetting::CollationConnection(_)
             | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
         }
     }
@@ -718,7 +776,7 @@ fn accept_session_setting(
         MySqlSessionSetting::SqlQuoteShowCreate(true) => Ok(()),
         MySqlSessionSetting::SqlQuoteShowCreate(false) => Err(FrontendErrorKind::Unsupported),
         MySqlSessionSetting::CollationConnection(value) => {
-            if value.eq_ignore_ascii_case(SERVER_CONNECTION_COLLATION) {
+            if ConnectionCollation::from_name(value).is_some() {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -743,7 +801,7 @@ fn accept_session_setting(
             }
             match collation {
                 None => Ok(()),
-                Some(collation) if collation.eq_ignore_ascii_case("utf8mb4_general_ci") => Ok(()),
+                Some(collation) if ConnectionCollation::from_name(collation).is_some() => Ok(()),
                 Some(_) => Err(FrontendErrorKind::Unsupported),
             }
         }
@@ -1048,13 +1106,11 @@ fn worded_system_variable(
     {
         return Some(SERVER_CHARACTER_SET.to_owned());
     }
-    // The handshake sends collation 45, which is what the connection runs on,
-    // while a table this server writes is declared with the collation MySQL
-    // declares one with. Both are what this server already tells a client
-    // elsewhere: 45 in the handshake, and `utf8mb4_0900_ai_ci` in every
-    // `SHOW CREATE TABLE` and `information_schema` reading.
+    // The connection runs on the collation the handshake sends, 45, until the
+    // session names another, while a table this server writes is declared
+    // with the collation MySQL declares one with unless it names its own.
     if name.eq_ignore_ascii_case("collation_connection") {
-        return Some(SERVER_CONNECTION_COLLATION.to_owned());
+        return Some(session_variables.connection_collation.name().to_owned());
     }
     if name.eq_ignore_ascii_case("collation_server")
         || name.eq_ignore_ascii_case("collation_database")
@@ -1971,6 +2027,60 @@ mod tests {
         assert_eq!(read.rows, vec![vec![Some(b"utf8mb4".to_vec())]]);
     }
 
+    /// Laravel names its collation on every connection; a dump names the one
+    /// it was taken under and puts back the one it found.
+    #[test]
+    fn the_connection_runs_on_the_collation_the_session_names() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session
+                .execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        for (sql, collation) in [
+            (
+                "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'",
+                "utf8mb4_unicode_ci",
+            ),
+            (
+                "SET collation_connection = utf8mb4_0900_ai_ci",
+                "utf8mb4_0900_ai_ci",
+            ),
+            ("SET NAMES utf8mb4", "utf8mb4_general_ci"),
+        ] {
+            run(sql);
+            let CommandExecutionResult::ResultSet(read) = run("SELECT @@collation_connection")
+            else {
+                panic!("expected a variable result");
+            };
+            assert_eq!(
+                read.rows,
+                vec![vec![Some(collation.as_bytes().to_vec())]],
+                "{sql}"
+            );
+        }
+        let mut session = MySqlSessionVariables::default();
+        assert_eq!(session.connection_collation_id(), 45);
+        session
+            .execute_query(
+                "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.connection_collation_id(), 224);
+    }
+
     #[test]
     fn mysqldump_uses_the_default_quoted_create_and_binary_results() {
         let mut session = MySqlSessionVariables::default();
@@ -2054,7 +2164,7 @@ mod tests {
             "SET character_set_client = latin1",
             "SET character_set_results = latin1",
             "SET collation_connection = latin1_swedish_ci",
-            "SET collation_connection = utf8mb4_0900_ai_ci",
+            "SET collation_connection = utf8mb4_unicode_520_ci",
             "SET character_set_client = @missing",
             "SET sql_mode = @missing",
         ] {

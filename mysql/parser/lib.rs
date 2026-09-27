@@ -30,6 +30,7 @@ mod show_table_status;
 mod show_triggers;
 mod static_select_metadata;
 mod str_to_date;
+mod table_collation;
 mod temporal_value;
 mod translate;
 mod truncate_table;
@@ -147,6 +148,10 @@ pub use static_select_metadata::{
     StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
+pub use table_collation::{
+    alter_table_with_its_collation_on_each_text_column,
+    create_table_with_its_collation_on_each_text_column, table_collation_of, MySqlTableCollation,
+};
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
     normalize_time_with_precision, normalize_year, year_from_number,
@@ -1151,9 +1156,16 @@ pub struct TranslatedDml {
     read_tables: Vec<MySqlSelectSource>,
     checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     ordered_columns: Vec<String>,
+    collation_sensitive_call_columns: Vec<String>,
 }
 
 impl TranslatedDml {
+    /// Returns the columns read by a call the statement compares under
+    /// `utf8mb4_0900_ai_ci`'s weights.
+    pub fn collation_sensitive_call_columns(&self) -> &[String] {
+        &self.collation_sensitive_call_columns
+    }
+
     /// Returns the normalized statement without a trailing semicolon.
     pub fn as_sql(&self) -> &str {
         &self.sqlite_sql
@@ -3931,6 +3943,7 @@ pub fn parse_dml_knowing_numeric_columns(
         read_tables,
         checked_subquery_comparisons: render_context.checked_subquery_comparisons,
         ordered_columns,
+        collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
     })
 }
 
@@ -5017,7 +5030,7 @@ fn translate_auto_increment_create_table(
         return unsupported("qualified AUTO_INCREMENT table name");
     }
     reject_json_defaults_and_keys(table)?;
-    let starts_the_counter_at = reject_attributes_and_check_options(table)?;
+    let starts_the_counter_at = reject_attributes_and_check_options(table)?.starts_the_counter_at;
     let table = &table_with_its_key_written_inline(table.clone());
     // A foreign key is the one table-level constraint a counted table takes,
     // the same as an ordinary one: both renderings below write whatever
@@ -5237,11 +5250,14 @@ fn render_auto_increment_mysql_ddl(
             .collect::<Result<Vec<_>, ParseError>>()?,
     );
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
+    let collation = check_table_options(&table.table_options)?
+        .collation
+        .table_option();
     // `IF NOT EXISTS` says what to do about a table that is already there, not
     // what the table is, and MySQL never prints it back, so it is left out of
     // the stored DDL.
     Ok(format!(
-        "CREATE {temporary}TABLE {} ({})",
+        "CREATE {temporary}TABLE {} ({}){collation}",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))
@@ -5958,7 +5974,7 @@ fn reject_a_key_over_a_column_that_may_be_null(table: &CreateTable) -> Result<()
 /// but the ones naming what a table is written back as anyway.
 pub(crate) fn reject_attributes_and_check_options(
     table: &CreateTable,
-) -> Result<Option<u64>, ParseError> {
+) -> Result<CheckedTableOptions, ParseError> {
     // `reject_table_attributes` refuses every option outright, so the rest of
     // the shape is checked with the options taken off and they are checked
     // below instead of being dropped.
@@ -5980,27 +5996,32 @@ pub(crate) fn reject_attributes_and_check_options(
 /// `CHARACTER SET utf8mb4` and `COLLATE=utf8mb4_0900_ai_ci` prints back byte
 /// for byte the same as one written with none — so it is taken and left out.
 ///
+/// `COLLATE=utf8mb4_unicode_ci` is taken as well, and is what the table's text
+/// columns are compared under unless they name their own.
+///
 /// Anything else is a claim about storage, ordering or case this cannot keep:
 /// measured, `COLLATE=utf8mb4_bin`, `DEFAULT CHARSET=latin1` and
 /// `ROW_FORMAT=DYNAMIC` are each printed back, so each is refused rather than
 /// quietly dropped.
-pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<Option<u64>, ParseError> {
+pub(crate) fn check_table_options(
+    options: &CreateTableOptions,
+) -> Result<CheckedTableOptions, ParseError> {
     let options = match options {
-        CreateTableOptions::None => return Ok(None),
+        CreateTableOptions::None => return Ok(CheckedTableOptions::default()),
         CreateTableOptions::Plain(options) => options,
         CreateTableOptions::With(_)
         | CreateTableOptions::Options(_)
         | CreateTableOptions::TableProperties(_) => return unsupported("CREATE TABLE option"),
     };
     let mut written = Vec::with_capacity(options.len());
-    let mut starts_the_counter_at = None;
+    let mut checked = CheckedTableOptions::default();
     for option in options {
         let named = match option {
             SqlOption::KeyValue { key, value }
                 if key.value.eq_ignore_ascii_case("AUTO_INCREMENT") =>
             {
                 let start = written_counter_start(value)?;
-                starts_the_counter_at = (start > 1).then_some(start);
+                checked.starts_the_counter_at = (start > 1).then_some(start);
                 "AUTO_INCREMENT"
             }
             SqlOption::NamedParenthesizedList(engine)
@@ -6023,9 +6044,13 @@ pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<Option
                 "CHARACTER SET"
             }
             SqlOption::KeyValue { key, value } if names_a_collation(key) => {
-                if !written_word_is(value, "utf8mb4_0900_ai_ci") {
+                let Some(collation) = written_word(value)
+                    .as_deref()
+                    .and_then(MySqlTableCollation::from_name)
+                else {
                     return unsupported("CREATE TABLE collation");
-                }
+                };
+                checked.collation = collation;
                 "COLLATE"
             }
             _ => return unsupported("CREATE TABLE option"),
@@ -6035,7 +6060,14 @@ pub(crate) fn check_table_options(options: &CreateTableOptions) -> Result<Option
         }
         written.push(named);
     }
-    Ok(starts_the_counter_at)
+    Ok(checked)
+}
+
+/// What a table's options say, past the ones that say nothing.
+#[derive(Debug, Default)]
+pub(crate) struct CheckedTableOptions {
+    pub(crate) starts_the_counter_at: Option<u64>,
+    pub(crate) collation: MySqlTableCollation,
 }
 
 /// The number a `AUTO_INCREMENT=<n>` table option names.
@@ -6081,14 +6113,20 @@ fn names_a_collation(key: &Ident) -> bool {
 
 /// Whether an option's value is one written word, quoted or not.
 fn written_word_is(value: &Expr, expected: &str) -> bool {
+    written_word(value).is_some_and(|written| written.eq_ignore_ascii_case(expected))
+}
+
+/// The one word an option's value is written as, quoted or not.
+fn written_word(value: &Expr) -> Option<String> {
     match value {
-        Expr::Identifier(name) => name.value.eq_ignore_ascii_case(expected),
-        Expr::Value(value) => matches!(
-            &value.value,
-            Value::SingleQuotedString(written) | Value::DoubleQuotedString(written)
-                if written.eq_ignore_ascii_case(expected)
-        ),
-        _ => false,
+        Expr::Identifier(name) => Some(name.value.clone()),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(written) | Value::DoubleQuotedString(written) => {
+                Some(written.clone())
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -6345,20 +6383,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         _ => return unsupported("column type"),
     };
     reject_duplicate_nullable_column_options(&column.options)?;
-    // A key uses the column's collation. Declare MySQL's default collation on
-    // text columns so keys and queries use the same Unicode weights.
-    let collation = if a_column_of_words(&column.data_type) {
-        if column.options.iter().any(|option| {
-            matches!(&option.option, ColumnOption::Collation(name)
-                if unqualified_name_is(name, &["utf8mb4_bin"]))
-        }) {
-            " COLLATE MYSQL_UTF8MB4_BIN"
-        } else {
-            WORDS_COLLATION
-        }
-    } else {
-        ""
-    };
+    let collation = engine_collation_of(column);
     let options = column
         .options
         .iter()
@@ -6388,6 +6413,31 @@ fn render_temporal_type(name: &str, precision: Option<u64>) -> Result<String, Pa
 ///
 /// A column, its keys, and queries against it use one frozen UCA 9 order.
 pub(crate) const WORDS_COLLATION: &str = " COLLATE MYSQL_UCA9_AI_CI";
+
+/// The engine collation a column is declared with: the one it names, or
+/// MySQL's default for a column of words, or none for any other column.
+///
+/// A key uses the column's collation, so keys and queries meet under the same
+/// weights.
+pub(crate) fn engine_collation_of(column: &ColumnDef) -> &'static str {
+    if !a_column_of_words(&column.data_type) {
+        return "";
+    }
+    let named = column
+        .options
+        .iter()
+        .find_map(|option| match &option.option {
+            ColumnOption::Collation(name) => Some(name),
+            _ => None,
+        });
+    match named {
+        Some(name) if unqualified_name_is(name, &["utf8mb4_bin"]) => " COLLATE MYSQL_UTF8MB4_BIN",
+        Some(name) if unqualified_name_is(name, &["utf8mb4_unicode_ci"]) => {
+            " COLLATE MYSQL_UCA400_CI"
+        }
+        _ => WORDS_COLLATION,
+    }
+}
 
 /// Reports whether a column holds words rather than bytes or numbers.
 ///
@@ -6702,10 +6752,10 @@ fn render_column_option(
             )))
         }
         // A dumped schema spells out the charset and collation on every text
-        // column. Naming the one this server has describes where it already is,
-        // so it is taken; naming another would be a claim about ordering and
-        // case that this cannot keep, so it is refused. Text columns already
-        // receive the engine's fixed UCA9 collation when rendered.
+        // column. The collations this server has are taken, and the column is
+        // declared with the matching engine collation where it is rendered;
+        // naming another would be a claim about ordering and case that this
+        // cannot keep, so it is refused.
         ColumnOption::CharacterSet(name) if option.name.is_none() => {
             if !unqualified_name_is(name, &["utf8mb4"]) {
                 return unsupported("column CHARACTER SET");
@@ -6714,7 +6764,10 @@ fn render_column_option(
         }
         ColumnOption::Collation(name) if option.name.is_none() => {
             if !a_column_of_words(data_type)
-                || !unqualified_name_is(name, &["utf8mb4_0900_ai_ci", "utf8mb4_bin"])
+                || !unqualified_name_is(
+                    name,
+                    &["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_unicode_ci"],
+                )
             {
                 return unsupported("column COLLATE");
             }

@@ -1694,6 +1694,7 @@ fn render_order_by_expr(
             ) {
                 return unsupported("SELECT ORDER BY a random number");
             }
+            record_the_columns_a_text_call_reads(expr, render_context);
             return Ok(format!(
                 "{} COLLATE MYSQL_UCA9_AI_CI {direction}",
                 render_select_expr(expr, render_context)?
@@ -3863,7 +3864,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// without this and a second one, for the statements that need it, renders
     /// with it. `orders_a_bare_column` says which those are.
     text_columns: &'a [String],
-    collation_sensitive_call_columns: Vec<String>,
+    pub(crate) collation_sensitive_call_columns: Vec<String>,
     decimal_columns: &'a [(String, u32)],
     integer_columns: &'a [String],
     real_columns: &'a [String],
@@ -5860,6 +5861,26 @@ fn record_collation_sensitive_call_column(
     }
 }
 
+/// Records the columns a call reads, where its answer is ordered or compared
+/// under `utf8mb4_0900_ai_ci`'s weights and may be text. MySQL orders and
+/// compares a text answer under the collation of the column it came from, so
+/// the frontend refuses the call over a column declared with another.
+fn record_the_columns_a_text_call_reads(call: &Expr, render_context: &mut SelectRenderContext<'_>) {
+    if matches!(
+        static_select_metadata::comparison_answer(call),
+        Some(answer) if answer != crate::CheckedComparisonAnswer::Text
+    ) {
+        return;
+    }
+    if let Some(StaticSelectMetadata::ScalarCall { columns, .. }) =
+        static_select_metadata::classify_static_select_expr(call)
+    {
+        render_context
+            .collation_sensitive_call_columns
+            .extend(columns);
+    }
+}
+
 fn record_all_collation_sensitive_call_columns(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
@@ -6918,6 +6939,7 @@ fn render_comparison_over_a_call(
     let collated = answers == crate::CheckedComparisonAnswer::Text
         && matches!(rhs, CheckedSelectComparisonRhs::Text(_));
     let collation = if collated {
+        record_the_columns_a_text_call_reads(call, render_context);
         " COLLATE MYSQL_UCA9_AI_CI"
     } else {
         ""

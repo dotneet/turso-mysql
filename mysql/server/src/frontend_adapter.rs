@@ -1695,6 +1695,10 @@ where
         self.session_variables.binary_character_set_results()
     }
 
+    fn connection_collation(&self) -> u16 {
+        self.session_variables.connection_collation_id()
+    }
+
     fn session_wait_timeout(&self) -> Option<Duration> {
         self.session_variables.wait_timeout()
     }
@@ -2189,6 +2193,7 @@ where
                     name: table.name().to_owned(),
                     rows: counted,
                     auto_increment: None,
+                    collation: table.collation().unwrap_or_default().name(),
                 });
             }
             return show_table_status_result_to_execution_result(rows, self.status_flags());
@@ -3393,6 +3398,7 @@ fn apply_raw_column_collations(
         definition.character_set = match column.collation_name() {
             Some("utf8mb4_0900_ai_ci") => 255,
             Some("utf8mb4_bin") => 46,
+            Some("utf8mb4_unicode_ci") => 224,
             _ => return Err(FrontendErrorKind::Unsupported),
         };
     }

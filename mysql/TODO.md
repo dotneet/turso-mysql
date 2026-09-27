@@ -198,7 +198,10 @@ boolean literal.
 | A written word as the default of an integer or floating column | refused; `DECIMAL(10,2) DEFAULT '4.5'` is accepted and prints `'4.50'`, while the same word on an `INT` answers 1067 in MySQL |
 | Column `COMMENT` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written |
 | A table `COMMENT` | refused; the table-level one has not been measured, and this prints one trailer whatever a table holds |
-| Column `CHARACTER SET` other than `utf8mb4`, or `COLLATE` other than `utf8mb4_0900_ai_ci` / `utf8mb4_bin` | refused; other collations have different comparison rules |
+| Column `CHARACTER SET` other than `utf8mb4`, or `COLLATE` other than `utf8mb4_0900_ai_ci` / `utf8mb4_bin` / `utf8mb4_unicode_ci` | refused; other collations have different comparison rules |
+| `FIELD`, `GREATEST`, `LEAST` or `NULLIF` over a `utf8mb4_unicode_ci` column, or ordering by or comparing a text-answering call over a `utf8mb4_unicode_ci` or `utf8mb4_bin` column — `ORDER BY LOWER(name)` | refused; each compares under `utf8mb4_0900_ai_ci`'s weights and needs the column's collation passed through |
+| An explicit `COLLATE utf8mb4_unicode_ci` inside a query — `ORDER BY name COLLATE utf8mb4_unicode_ci`, `name = 'a' COLLATE utf8mb4_unicode_ci` | refused; the query renderer names only `utf8mb4_0900_ai_ci` and `utf8mb4_bin` |
+| `SHOW CREATE TABLE` for a column that named its table's own non-default collation itself | prints ` COLLATE <name>` where MySQL prints ` CHARACTER SET utf8mb4 COLLATE <name>`; which columns named it themselves is not remembered |
 | Generated columns | refused |
 | Partitioning | refused, and out of scope — see what this frontend is for |
 

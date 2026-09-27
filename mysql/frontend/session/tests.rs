@@ -4003,14 +4003,17 @@ fn lists_user_tables_and_views_in_name_order() -> Result<()> {
         MySqlTable {
             name: "accounts".to_owned(),
             kind: MySqlTableKind::BaseTable,
+            collation: Some(Default::default()),
         },
         MySqlTable {
             name: "active_accounts".to_owned(),
             kind: MySqlTableKind::View,
+            collation: None,
         },
         MySqlTable {
             name: "notes".to_owned(),
             kind: MySqlTableKind::BaseTable,
+            collation: Some(Default::default()),
         },
     ];
     assert_eq!(connection.list_tables()?, expected);

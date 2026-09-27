@@ -8,10 +8,12 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
-This project includes Unicode 9.0 collation data distributed by Unicode, Inc.:
+This project includes Unicode 9.0 and Unicode 4.0.0 collation data distributed
+by Unicode, Inc.:
 
 * License: licenses/core/unicode-data-license.md (Unicode License V3)
-* Homepage: https://www.unicode.org/Public/UCA/9.0.0/
+* Homepage: https://www.unicode.org/Public/UCA/9.0.0/ and
+  https://www.unicode.org/Public/UCA/4.0.0/
 
 This product depends on Error Prone, distributed by the Error Prone project:
 

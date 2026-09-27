@@ -746,6 +746,14 @@ fn render_mysql_column_constraint(
         {
             Ok("COLLATE utf8mb4_bin".to_owned())
         }
+        TursoColumnConstraint::Collate { collation_name }
+            if constraint.name.is_none()
+                && collation_name
+                    .as_str()
+                    .eq_ignore_ascii_case("MYSQL_UCA400_CI") =>
+        {
+            Ok("COLLATE utf8mb4_unicode_ci".to_owned())
+        }
         TursoColumnConstraint::ForeignKey { .. } => unsupported("column REFERENCES constraint"),
         TursoColumnConstraint::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),

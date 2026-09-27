@@ -242,6 +242,8 @@ pub enum MySqlTableKind {
 pub struct MySqlTable {
     name: String,
     kind: MySqlTableKind,
+    /// The collation a base table was declared with. A view has none.
+    collation: Option<turso_mysql_parser::MySqlTableCollation>,
 }
 
 /// The key classification available in the initial MySQL column metadata slice.
@@ -433,6 +435,12 @@ impl MySqlTable {
     /// Returns whether this entry is a base table or a view.
     pub const fn kind(&self) -> MySqlTableKind {
         self.kind
+    }
+
+    /// Returns the collation a base table was declared with, or `None` for a
+    /// view.
+    pub const fn collation(&self) -> Option<turso_mysql_parser::MySqlTableCollation> {
+        self.collation
     }
 }
 
@@ -3072,7 +3080,13 @@ impl MySqlConnection {
             )?);
         }
         let input = match &stmt {
+            // The engine's table has no collation of its own, so the one the
+            // statement declares is written after what the engine keeps.
             Stmt::CreateTable { .. } => render_create_table_mysql_with_mode(&stmt, mode)
+                .and_then(|rendered| {
+                    let collation = turso_mysql_parser::table_collation_of(sql, mode)?;
+                    Ok(format!("{rendered}{}", collation.table_option()))
+                })
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
             Stmt::CreateIndex { .. } => render_create_index_mysql_with_mode(&stmt, mode)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
@@ -3140,6 +3154,9 @@ impl MySqlConnection {
 
     /// Executes one checked schema statement with MySQL implicit-commit semantics.
     pub fn execute_schema_ddl(&self, sql: &str) -> std::result::Result<(), MySqlQueryError> {
+        if let Some(collated) = self.with_the_table_collation_on_each_text_column(sql)? {
+            return self.execute_schema_ddl(&collated);
+        }
         match self.column_an_alter_places(sql)? {
             Some(turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite)) => {
                 return self.write_the_table_again_with(
@@ -3286,6 +3303,36 @@ impl MySqlConnection {
             )));
         };
         self.advance_auto_increment_past(&table, start - 1, None)
+    }
+
+    /// A `CREATE TABLE` or `ALTER TABLE` with the collation of its table
+    /// written onto each text column that names none, where that is not the
+    /// default collation. What is stored then names each column's collation,
+    /// which is what the engine keeps.
+    fn with_the_table_collation_on_each_text_column(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        let mode = self.parser_mode();
+        if let Some(written) =
+            turso_mysql_parser::create_table_with_its_collation_on_each_text_column(sql, mode)
+                .map_err(mysql_query_parse_error)?
+        {
+            return Ok(Some(written));
+        }
+        let Some(target) = turso_mysql_parser::alter_table_target(sql, mode) else {
+            return Ok(None);
+        };
+        let Some(stored) = self
+            .stored_table_statement(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        let collation = turso_mysql_parser::table_collation_of(&stored, mode)
+            .map_err(mysql_query_parse_error)?;
+        turso_mysql_parser::alter_table_with_its_collation_on_each_text_column(sql, mode, collation)
+            .map_err(mysql_query_parse_error)
     }
 
     /// Returns the statements a multi-operation `ALTER TABLE` means, if that is
@@ -5362,15 +5409,10 @@ impl MySqlConnection {
                     "text call needs a base table's column collation".to_string(),
                 ));
             };
-            for name in translated.collation_sensitive_call_columns() {
-                let Some((_, column)) = table.get_column_by_name(name) else {
-                    continue;
-                };
-                if column.collation().name() == "MYSQL_UTF8MB4_BIN" {
-                    return Err(MySqlQueryError::Unsupported(format!(
-                        "text call on utf8mb4_bin column {name} requires binary collation semantics"
-                    )));
-                }
+            if let Some(refusal) =
+                call_over_another_collation(&table, translated.collation_sensitive_call_columns())
+            {
+                return Err(MySqlQueryError::Unsupported(refusal));
             }
         }
         Ok(())
@@ -5496,6 +5538,16 @@ impl MySqlConnection {
     /// table by name; a joined `DELETE` and an `INSERT ... SELECT` read
     /// several, and there the qualifier says which.
     fn validate_dml_comparison_columns(&self, translated: &TranslatedDml) -> Result<()> {
+        if let Some(table) = translated
+            .source_table()
+            .and_then(|table| self.inner.current_schema().get_table(table))
+        {
+            if let Some(refusal) =
+                call_over_another_collation(&table, translated.collation_sensitive_call_columns())
+            {
+                return Err(LimboError::InvalidArgument(refusal));
+            }
+        }
         self.validate_subquery_comparison_columns(
             translated.source_table(),
             translated.checked_subquery_comparisons(),
@@ -7747,13 +7799,17 @@ fn mysql_column_metadata(
 }
 
 fn stored_text_collation_name(column: &turso_parser::ast::ColumnDefinition) -> &'static str {
-    if column.constraints.iter().any(|constraint| {
-        matches!(&constraint.constraint, ColumnConstraint::Collate { collation_name }
-            if collation_name.as_str().eq_ignore_ascii_case("MYSQL_UTF8MB4_BIN"))
-    }) {
-        "utf8mb4_bin"
-    } else {
-        "utf8mb4_0900_ai_ci"
+    let named = column
+        .constraints
+        .iter()
+        .find_map(|constraint| match &constraint.constraint {
+            ColumnConstraint::Collate { collation_name } => Some(collation_name.as_str()),
+            _ => None,
+        });
+    match named {
+        Some(name) if name.eq_ignore_ascii_case("MYSQL_UTF8MB4_BIN") => "utf8mb4_bin",
+        Some(name) if name.eq_ignore_ascii_case("MYSQL_UCA400_CI") => "utf8mb4_unicode_ci",
+        _ => "utf8mb4_0900_ai_ci",
     }
 }
 
@@ -7797,7 +7853,7 @@ fn names_the_collation_of_words(constraint: &turso_parser::ast::NamedColumnConst
         &constraint.constraint,
         ColumnConstraint::Collate { collation_name }
             if constraint.name.is_none()
-                && ["MYSQL_UCA9_AI_CI", "MYSQL_UTF8MB4_BIN", "NOCASE"].iter().any(|name|
+                && ["MYSQL_UCA9_AI_CI", "MYSQL_UTF8MB4_BIN", "MYSQL_UCA400_CI", "NOCASE"].iter().any(|name|
                     collation_name.as_str().eq_ignore_ascii_case(name))
     )
 }
@@ -8494,11 +8550,41 @@ fn validate_dml_comparison_columns(
     schema: &turso_core::schema::Schema,
     translated: &turso_mysql_parser::TranslatedDml,
 ) -> Result<()> {
+    if let Some(table) = translated
+        .source_table()
+        .and_then(|table| schema.get_table(table))
+    {
+        if let Some(refusal) =
+            call_over_another_collation(&table, translated.collation_sensitive_call_columns())
+        {
+            return Err(LimboError::InvalidArgument(refusal));
+        }
+    }
     validate_frozen_select_comparison_columns(
         schema,
         translated.source_table(),
         translated.checked_comparisons(),
     )
+}
+
+/// Names the first of `columns` declared with a collation other than
+/// `utf8mb4_0900_ai_ci`, whose weights the calls reading them compare under.
+fn call_over_another_collation(
+    table: &turso_core::schema::Table,
+    columns: &[String],
+) -> Option<String> {
+    columns.iter().find_map(|name| {
+        let (_, column) = table.get_column_by_name(name)?;
+        match column.collation() {
+            turso_core::CollationSeq::MySqlUtf8mb4Bin => Some(format!(
+                "text call on utf8mb4_bin column {name} requires binary collation semantics"
+            )),
+            turso_core::CollationSeq::MySqlUca400 => Some(format!(
+                "text call on utf8mb4_unicode_ci column {name} requires its collation"
+            )),
+            _ => None,
+        }
+    })
 }
 
 fn validate_dml_ordered_columns_with_schema(
@@ -8820,8 +8906,9 @@ fn uses_session_local_clock(sql: &str) -> bool {
 /// Answers `None` for a string `DEFAULT`, whose escaping this does not decide.
 fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option<String> {
     let mut rendered = format!("{} {}", mysql_quoted(name), copied_column_type(column));
-    if column.collation_name() == Some("utf8mb4_bin") {
-        rendered.push_str(" COLLATE utf8mb4_bin");
+    if let Some(collation @ ("utf8mb4_bin" | "utf8mb4_unicode_ci")) = column.collation_name() {
+        rendered.push_str(" COLLATE ");
+        rendered.push_str(collation);
     }
     if !column.nullable() {
         rendered.push_str(" NOT NULL");

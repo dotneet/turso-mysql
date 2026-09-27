@@ -30596,3 +30596,6 @@ mod fractional_moments;
 
 #[cfg(unix)]
 mod rails_statements;
+
+#[cfg(unix)]
+mod unicode_collation;

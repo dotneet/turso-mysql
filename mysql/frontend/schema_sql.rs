@@ -9,7 +9,8 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_table_ast, render_counted_create_table_mysql_with_mode,
     render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
-    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, SessionSqlMode,
+    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, table_collation_of,
+    SessionSqlMode,
 };
 
 const RESERVED_PREFIX: &str = "/*@turso:mysql-schema:";
@@ -477,6 +478,15 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
             SchemaSqlKind::View => render_create_view_mysql_with_mode(stmt, mode),
             _ => unreachable!("checked supported MySQL schema kind"),
         }
+        // The engine's table has no collation of its own, so the one the
+        // table was declared with is carried over from what it replaces.
+        .and_then(|rendered| match kind {
+            SchemaSqlKind::Table => {
+                let collation = table_collation_of(decoded.normalized_ddl, mode)?;
+                Ok(format!("{rendered}{}", collation.table_option()))
+            }
+            _ => Ok(rendered),
+        })
         .map_err(|error| turso_core::LimboError::ParseError(error.to_string()))?;
         reencode_schema_sql(decoded, &normalized).map_err(schema_sql_error_to_limbo)
     }
@@ -662,6 +672,21 @@ pub fn decode_schema_sql(
         }
     }
     Ok(decoded)
+}
+
+/// The collation one stored table was declared with. A table stored before
+/// this frontend marked its rows has the default.
+pub fn stored_table_collation(
+    stored: &str,
+) -> Result<turso_mysql_parser::MySqlTableCollation, SchemaSqlError> {
+    let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, stored)? else {
+        return Ok(Default::default());
+    };
+    table_collation_of(
+        decoded.normalized_ddl,
+        parser_sql_mode(decoded.context.sql_mode),
+    )
+    .map_err(|_| SchemaSqlError::MalformedTableDefinition)
 }
 
 /// Decode a stored schema row without imposing the sqlite_schema object kind.

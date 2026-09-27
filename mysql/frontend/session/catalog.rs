@@ -16,7 +16,7 @@ impl MySqlConnection {
     /// connection. SQLite and Turso internal tables are deliberately omitted.
     pub fn list_tables(&self) -> Result<Vec<MySqlTable>> {
         let sql = format!(
-            "SELECT name, type FROM sqlite_schema \
+            "SELECT name, type, sql FROM sqlite_schema \
              WHERE type IN ('table', 'view') \
              AND lower(name) NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
              AND lower(name) NOT LIKE '\\_\\_turso\\_internal\\_%' ESCAPE '\\' \
@@ -28,7 +28,7 @@ impl MySqlConnection {
         }
         let mut tables = Vec::with_capacity(rows.len());
         for row in rows {
-            let [name, kind] = row.as_slice() else {
+            let [name, kind, stored] = row.as_slice() else {
                 return Err(LimboError::Corrupt(
                     "sqlite_schema table listing row has an invalid shape".to_string(),
                 ));
@@ -49,9 +49,17 @@ impl MySqlConnection {
                     ));
                 }
             };
+            let collation = match kind {
+                MySqlTableKind::BaseTable => Some(
+                    crate::schema_sql::stored_table_collation(stored.to_text().unwrap_or_default())
+                        .map_err(|error| LimboError::Corrupt(error.to_string()))?,
+                ),
+                MySqlTableKind::View => None,
+            };
             tables.push(MySqlTable {
                 name: name.to_owned(),
                 kind,
+                collation,
             });
         }
         tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -122,8 +130,15 @@ impl MySqlConnection {
         })?;
         let indexes = self.list_indexes(table)?;
         let next_auto_increment = self.next_auto_increment_value(table)?;
+        let collation = match self.inner.current_schema().table_sql(table.as_str()) {
+            Some(stored) => crate::schema_sql::stored_table_collation(stored).map_err(|error| {
+                MySqlShowCreateTableError::Engine(LimboError::Corrupt(error.to_string()))
+            })?,
+            None => Default::default(),
+        };
         let create_statement = crate::show_create_table::render_create_table(
             table.as_str(),
+            collation,
             &columns,
             &indexes,
             &foreign_keys,

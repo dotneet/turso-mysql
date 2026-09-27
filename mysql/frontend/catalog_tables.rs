@@ -194,7 +194,12 @@ impl InternalVirtualTable for InformationSchemaTables {
             {
                 continue;
             }
-            rows.push((name.clone(), "BASE TABLE"));
+            let collation = match schema.table_sql(name) {
+                Some(stored) => crate::schema_sql::stored_table_collation(stored)
+                    .map_err(|error| LimboError::Corrupt(error.to_string()))?,
+                None => Default::default(),
+            };
+            rows.push((name.clone(), "BASE TABLE", Some(collation.name())));
         }
         for name in schema.views.keys() {
             if is_system_table(name)
@@ -203,7 +208,7 @@ impl InternalVirtualTable for InformationSchemaTables {
             {
                 continue;
             }
-            rows.push((name.clone(), "VIEW"));
+            rows.push((name.clone(), "VIEW", None));
         }
         // A scan with nothing to order it by answers in name order, which is
         // what a client that leaves the ORDER BY off is most likely reading.
@@ -234,7 +239,8 @@ fn is_internal_table(name: &str) -> bool {
 
 struct InformationSchemaTablesCursor {
     database: String,
-    rows: Vec<(String, &'static str)>,
+    /// Each table's name, kind and collation.
+    rows: Vec<(String, &'static str, Option<&'static str>)>,
     position: i64,
 }
 
@@ -360,7 +366,7 @@ impl InternalVirtualTableCursor for InformationSchemaTablesCursor {
     }
 
     fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
-        let (name, kind) = &self.rows[self.position as usize];
+        let (name, kind, collation) = &self.rows[self.position as usize];
         let base_table = *kind == "BASE TABLE";
         // Measured on MySQL 8.4.11: a view has no engine, collation or
         // storage, and its comment is `VIEW`. The storage figures are ones
@@ -370,7 +376,7 @@ impl InternalVirtualTableCursor for InformationSchemaTablesCursor {
             1 => Value::build_text(name.clone()),
             2 => Value::build_text((*kind).to_owned()),
             3 if base_table => Value::build_text("InnoDB"),
-            6 if base_table => Value::build_text("utf8mb4_0900_ai_ci"),
+            6 => collation.map_or(Value::Null, Value::build_text),
             3..=6 => Value::Null,
             7 => Value::build_text(if base_table { "" } else { "VIEW" }),
             _ => {

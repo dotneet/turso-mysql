@@ -173,7 +173,9 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalAutoActions, WalFile, WalFileShared},
 };
+pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::mysql_uca400::like as mysql_uca400_like;
 pub use translate::mysql_uca9::compare as mysql_uca9_compare;
 pub use translate::mysql_uca9::like as mysql_uca9_like;
 pub use turso_ext::ContextDestructor;

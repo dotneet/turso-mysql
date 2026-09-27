@@ -6,13 +6,9 @@
 //! spaces of indent, `,\n` between items, no trailing newline, lower-case type
 //! names, and DEFAULT literals in single quotes even when they are numbers.
 
-use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
+use turso_mysql_parser::MySqlTableCollation;
 
-/// What MySQL puts after `ENGINE=InnoDB`, past the optional counter.
-///
-/// The engine uses frozen Unicode 9 weights for MySQL's default collation.
-/// MySQL clients read this table option from the schema text.
-const TABLE_TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
+use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
 
 /// Renders the `Create Table` column of `SHOW CREATE TABLE`.
 ///
@@ -20,6 +16,7 @@ const TABLE_TRAILER: &str = " DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 /// which it leaves out entirely while the counter is still at one.
 pub fn render_create_table(
     table: &str,
+    collation: MySqlTableCollation,
     columns: &[MySqlColumnMetadata],
     indexes: &[MySqlIndexEntry],
     foreign_keys: &[MySqlForeignKey],
@@ -30,7 +27,7 @@ pub fn render_create_table(
     }
     let mut items = Vec::with_capacity(columns.len() + 1);
     for column in columns {
-        items.push(render_column(column)?);
+        items.push(render_column(column, collation)?);
     }
     items.extend(render_keys(indexes));
     items.extend(
@@ -46,9 +43,11 @@ pub fn render_create_table(
     let counter = next_auto_increment
         .map(|next| format!(" AUTO_INCREMENT={next}"))
         .unwrap_or_default();
+    // Measured on MySQL 8.4.11: the collation is printed whatever it is.
     Some(format!(
-        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter}{TABLE_TRAILER}",
-        quoted(table)
+        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET=utf8mb4 COLLATE={}",
+        quoted(table),
+        collation.name()
     ))
 }
 
@@ -136,11 +135,12 @@ fn render_keys(indexes: &[MySqlIndexEntry]) -> Vec<String> {
         .collect()
 }
 
-fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
+fn render_column(
+    column: &MySqlColumnMetadata,
+    table_collation: MySqlTableCollation,
+) -> Option<String> {
     let mut rendered = format!("{} {}", quoted(column.name()), type_name(column)?);
-    if column.collation_name() == Some("utf8mb4_bin") {
-        rendered.push_str(" CHARACTER SET utf8mb4 COLLATE utf8mb4_bin");
-    }
+    rendered.push_str(&collation_clause(column.collation_name(), table_collation));
     if !column.nullable() {
         rendered.push_str(" NOT NULL");
     } else if column.type_name() == "TIMESTAMP" {
@@ -179,6 +179,25 @@ fn render_column(column: &MySqlColumnMetadata) -> Option<String> {
         ));
     }
     Some(rendered)
+}
+
+/// What a column of words says about its collation.
+///
+/// Measured on MySQL 8.4.11: a column whose collation differs from its table's
+/// prints ` CHARACTER SET utf8mb4 COLLATE <name>`; one that takes a table
+/// collation other than `utf8mb4_0900_ai_ci` prints ` COLLATE <name>`; and one
+/// that takes `utf8mb4_0900_ai_ci` from its table prints nothing. MySQL also
+/// prints the longer form for a column that named its table's collation
+/// itself, which this does not remember: such a column prints the shorter one.
+fn collation_clause(column: Option<&str>, table: MySqlTableCollation) -> String {
+    match column {
+        None => String::new(),
+        Some(column) if column != table.name() => {
+            format!(" CHARACTER SET utf8mb4 COLLATE {column}")
+        }
+        Some(_) if table == MySqlTableCollation::default() => String::new(),
+        Some(column) => format!(" COLLATE {column}"),
+    }
 }
 
 /// The words naming the moment a statement runs at, as a column holding

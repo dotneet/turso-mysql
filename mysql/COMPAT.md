@@ -1959,8 +1959,21 @@ versioned comment `mysqldump` wraps them in, since `/*!40100 SET @@SQL_MODE='' *
 runs on any server past the named version.
 
 `SET NAMES` is taken for `utf8mb4`, with no collation or with
-`utf8mb4_general_ci`, which is what this frontend runs on. Any other character
-set or collation is refused.
+`utf8mb4_general_ci`, `utf8mb4_0900_ai_ci` or `utf8mb4_unicode_ci`, and so is
+`SET collation_connection` naming one of those three. Laravel opens every
+connection with `SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'`. The
+connection keeps `utf8mb4_general_ci`, the collation the handshake sends,
+until the session names another, and a `SET NAMES` without a collation goes
+back to it, where MySQL 8.4 would go to `utf8mb4_0900_ai_ci`. Any other
+character set or collation is refused.
+
+Measured on MySQL 8.4.11: the connection's collation is what every text column
+of a result reports — 224 under `utf8mb4_unicode_ci`, 255 under
+`utf8mb4_0900_ai_ci` — whatever the column is declared with, and that holds
+here for text and prepared results alike. It decides nothing else here: a
+column is compared under its own collation, as in MySQL, and the one place the
+connection's collation would decide a comparison, two written words compared
+with each other, is refused.
 
 `SET sql_mode` is taken when every mode it names is one this server already
 behaves as. `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` have to match the session,
@@ -2011,18 +2024,63 @@ A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
 spells out on every text column, so refusing them stopped a `mysqldump` from
 being restored. `utf8mb4` is the accepted character set. Text columns take
 `utf8mb4_0900_ai_ci` by default and may explicitly name `utf8mb4_bin`, which
-uses its own PAD SPACE byte collation. Other names are refused rather than
-ignored. `SET NAMES` still advertises `utf8mb4_general_ci` for connection
-metadata; it does not change a stored column's collation.
+uses its own PAD SPACE byte collation, or `utf8mb4_unicode_ci`. Other names are
+refused rather than ignored.
 With `character_set_results=utf8mb4`, a selected text column reports the
-connection collation ID 45 on the wire, including a `utf8mb4_bin` column.
+connection's collation ID on the wire — 45 until the session names another —
+including a `utf8mb4_bin` column.
 With `SET character_set_results = NULL`, the original column IDs are reported:
-255 for `utf8mb4_0900_ai_ci` and 46 for `utf8mb4_bin`, as measured on MySQL 8.4.
+255 for `utf8mb4_0900_ai_ci`, 46 for `utf8mb4_bin` and 224 for
+`utf8mb4_unicode_ci`, as measured on MySQL 8.4.
 
-The accepted collation is stored in the engine schema. `SHOW CREATE TABLE`
-prints an explicit `utf8mb4_bin` column clause, and `SHOW FULL COLUMNS` and
-`information_schema.COLUMNS.COLLATION_NAME` report it. An explicit spelling
-of the default `utf8mb4_0900_ai_ci` is normalized away and may not be echoed back.
+The accepted collation is stored in the engine schema. `SHOW FULL COLUMNS` and
+`information_schema.COLUMNS.COLLATION_NAME` report it. `SHOW CREATE TABLE`
+prints a column's collation the way MySQL 8.4.11 does, measured: a column
+whose collation differs from its table's gets ` CHARACTER SET utf8mb4 COLLATE
+<name>`, one that takes a table collation other than `utf8mb4_0900_ai_ci` gets
+` COLLATE <name>`, and one that takes `utf8mb4_0900_ai_ci` from its table gets
+nothing. MySQL also prints the longer form for a column that named its table's
+own collation itself; this does not remember which columns did, so such a
+column gets the shorter form, or nothing in a `utf8mb4_0900_ai_ci` table.
+
+`utf8mb4_unicode_ci` is the collation Laravel and Prisma declare every table
+with. It is MySQL's Unicode 4.0.0 collation, and its weights here are
+generated from Unicode's own `allkeys-4.0.0.txt` — checked against MySQL
+8.4.11's `WEIGHT_STRING()` for every character of the Basic Multilingual
+Plane, with no difference. Measured and matched: it ignores case and accents
+(`'á' = 'A'`, `'ß' = 'ss'`); it pads with spaces, so `'a' = 'a '` where
+`utf8mb4_0900_ai_ci` tells them apart, and a tab, weighing less than a space,
+sorts `'a\t'` before `'a'`; about 470 control and formatting characters weigh
+nothing, so `'a' = CONCAT('a', CHAR(1))`; a character Unicode 4.0.0 had not
+yet assigned — `ₐ`, U+2090 — has a weight of its own rather than the `a` it
+matches under `utf8mb4_0900_ai_ci`; and every character past the Basic
+Multilingual Plane weighs the same, so all emoji are equal to one another. Keys
+and `UNIQUE` constraints compare the same way: a `'A'` or an `'a '` is a
+duplicate of an `'a'`.
+
+`LIKE` over a `utf8mb4_unicode_ci` column matches one character at a time
+under those weights, as MySQL does: `'á' LIKE 'A'` and `'ß' LIKE '_'` match,
+while `'ß' LIKE 'ss'`, `'a ' LIKE 'a'` and two different emoji do not. The
+engine picks the matcher from the collation of the column being matched, so a
+query reading a `utf8mb4_unicode_ci` column and a `utf8mb4_0900_ai_ci` column
+matches each under its own. `FIELD`, `GREATEST`, `LEAST` and `NULLIF` over a
+`utf8mb4_unicode_ci` or `utf8mb4_bin` column are refused, and so is ordering
+by a call over one that answers text — `ORDER BY LOWER(name)`, `ORDER BY
+CONCAT(name, 'x')` — or comparing such a call with written text, in a `SELECT`,
+an `UPDATE` or a `DELETE`: each compares under `utf8mb4_0900_ai_ci`'s weights,
+where MySQL compares a call's answer under the collation of the column it
+read.
+
+A table takes `COLLATE=utf8mb4_unicode_ci` in each of MySQL's spellings —
+`DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`, `COLLATE=...`,
+`COLLATE '...'`. Measured on MySQL 8.4.11, every text column of the table that
+names neither a character set nor a collation takes the table's, and so does one
+an `ALTER TABLE ... ADD`, `MODIFY` or `CHANGE` writes the same way; a column
+naming only `CHARACTER SET utf8mb4` takes `utf8mb4_0900_ai_ci`, that character
+set's own default. The table's collation is kept with its stored definition, so
+`SHOW CREATE TABLE` ends with `DEFAULT CHARSET=utf8mb4
+COLLATE=utf8mb4_unicode_ci`, and `information_schema.TABLES.TABLE_COLLATION`
+and `SHOW TABLE STATUS` report it.
 
 `VARBINARY(n)` is taken. It holds bytes rather than characters, which is the
 whole of the difference from a `VARCHAR`: measured on 8.4.11, a
@@ -2155,7 +2213,8 @@ a dropped `AUTO_INCREMENT`'s place is a zero default — `id int NOT NULL
 AUTO_INCREMENT PRIMARY KEY` copies as `id int NOT NULL DEFAULT '0'`, where a
 plain `a int NOT NULL` copies with no default at all. `ROW_COUNT()` afterwards is
 the number of rows copied, and a `ROLLBACK` after one leaves the table there.
-An explicit `utf8mb4_bin` collation on a copied text column is retained.
+An explicit `utf8mb4_bin` or `utf8mb4_unicode_ci` collation on a copied text
+column is retained.
 
 Every projected item has to be a plain column or integer arithmetic over
 columns, with or without an alias, or a lone `*`; an alias renames the column in
@@ -2410,7 +2469,8 @@ Measured on 8.4.11 and matched: a table written with `ENGINE=InnoDB`, with
 `DEFAULT CHARSET=utf8mb4`, `CHARSET=utf8mb4`, `CHARACTER SET utf8mb4` or
 `DEFAULT CHARACTER SET utf8mb4`, or with `COLLATE=utf8mb4_0900_ai_ci` or
 `DEFAULT COLLATE`, prints back byte for byte the same as one written with none,
-and so does a table that counts its own ids. Anything else is a claim this cannot
+and so does a table that counts its own ids. `COLLATE=utf8mb4_unicode_ci` is
+taken too, and kept, as described with column collations. Anything else is a claim this cannot
 keep and is refused rather than quietly dropped — measured, `DEFAULT
 CHARSET=latin1`, `COLLATE=utf8mb4_bin`, `ENGINE=MyISAM` and `ROW_FORMAT=DYNAMIC`
 are each printed back. The same option written twice is refused, MySQL taking
@@ -3134,7 +3194,8 @@ Each name past `@@version` is something this server decides for itself rather
 than a default copied from MySQL, which is what makes it worth answering. It
 speaks `utf8mb4` and refuses any other character set, so all five
 `@@character_set_*` names read `utf8mb4`. The handshake sends collation 45, so
-`@@collation_connection` reads `utf8mb4_general_ci`, and a table written here is
+`@@collation_connection` reads `utf8mb4_general_ci` until the session names
+another, and a table written here is
 declared the way MySQL declares one, so `@@collation_server` and
 `@@collation_database` read `utf8mb4_0900_ai_ci` — which is what every
 `SHOW CREATE TABLE` and `information_schema` reading here already says. The server
@@ -3969,6 +4030,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Table-specific `SELECT` grants (persistence and narrow enforcement) | n/a | n/a | partial | partial | partial | [`account store`](server/src/account_store.rs), [`snapshot format`](server/src/account_store_format.rs), [`authorization API`](server/src/authorization.rs), [`persistent store`](server/src/persistent_account_store.rs), [`runtime store`](server/src/runtime_account_store.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [`offline provisioner`](offline-provisioner/src/main.rs) | Canonical database/table names, the bounded `select` permission, duplicate/order rules, legacy decoding, durable restart, runtime reload/revocation, and `--table-grant DATABASE.TABLE:select` provisioning are covered in the policy backend/CLI. When database-wide `Query` is denied, the adapter falls back only for parser-confirmed canonical unqualified one-table text or prepared `SELECT`, checks the table `Select` action, and reauthorizes prepared execution against its origin database. Joins, multiple sources, qualified sources, internal catalogs, and unsupported query shapes do not use the fallback. SQL `GRANT`/`REVOKE` is limited to table `SELECT` for exact `@'%'` accounts; wider grant forms and catalog filtering beyond the selected-database narrow path remain open; the final recorded privileged Linux gate passed the table-grant selector. |
 | Unsigned integers and `DECIMAL` | partial | partial | partial | partial | partial | [D004 plan](../docs/mysql-compatibility-plan.md), [`DECIMAL` parser](parser/lib.rs), [`exact numeric core`](../core/numeric/decimal.rs) | Fresh `DECIMAL(p,s)` and unsigned columns use exact blobs with declared scale, half-away-from-zero assignment rounding, precision errors, indexed comparisons and ordering, exact `SUM`/`AVG`, and text/prepared output. Projection arithmetic takes a known decimal column or aggregate with a numeric literal through `+`, `-`, `*` or `/`, and known integer columns or aggregates through `+`, `-` or `*`. DECIMAL with a FLOAT/DOUBLE column is refused until mixed precision is implemented. `UPDATE` and `ON DUPLICATE KEY UPDATE` arithmetic with a DECIMAL target keep written and bound decimal operands exact; division by a written nonzero integer is exact. Zero and reversed division and nested or untyped SELECT decimal forms fail closed. Old binary64 decimal tables cannot recover their digits and must be re-imported. Full-range `BIGINT UNSIGNED` storage, indexed comparisons, prepared values, and binary results are covered; mixed signed comparisons and some expression forms remain refused. |
 | `utf8mb4_0900_ai_ci` comparisons | partial | partial | partial | partial | partial | [frozen UCA9 weights](../core/translate/mysql_uca9.rs), [data generator](../core/translate/generate_mysql_uca9.py), [license](../licenses/core/unicode-data-license.md), [collation oracle case](conformance/cases/p0/collation-utf8mb4-0900-ai-ci.json) | New v3 text tables use frozen Unicode 9 primary weights for comparison, sort keys, equality hashes, indexes, uniqueness, and `LIKE`. Explicit `utf8mb4_bin` comparisons use byte order with PAD SPACE. The UCA weight data and schema version are fixed so reopening a new table preserves its ordering. Existing v1/v2 text tables need a rebuild and fail closed; unsupported collation forms also fail closed. |
+| `utf8mb4_unicode_ci` comparisons | partial | partial | partial | partial | partial | [frozen UCA 4.0.0 weights](../core/translate/mysql_uca400.rs), [data generator](../core/translate/generate_mysql_uca400.py), [license](../licenses/core/unicode-data-license.md), [Laravel and Prisma tables](server/src/frontend_adapter/tests/unicode_collation.rs) | A column or table declared `utf8mb4_unicode_ci` compares, sorts, hashes, indexes, keeps keys unique and matches `LIKE` under Unicode 4.0.0 primary weights with PAD SPACE, checked against MySQL's `WEIGHT_STRING()` for every BMP character. `FIELD`, `GREATEST`, `LEAST`, `NULLIF`, and ordering by or comparing a text-answering call over one, are refused. |
 | `SET foreign_key_checks` | yes | yes | n/a | n/a | yes | [`setting reader`](parser/session_settings.rs), [`session variables`](server/src/session_variables.rs), [oracle case](conformance/cases/p0/session-foreign-key-checks.json), [P0 manifest](conformance/Makefile) | The switch is really turned: the engine has the same one, so a row written while it is off may name a parent that is not there. `0`, `1`, `OFF` and `ON` are all taken, under the bare and `SESSION` spellings, and `SELECT @@foreign_key_checks` reads it back. Turning it back on leaves a row written while it was off where it is, which is what MySQL does. A value that is neither is refused where MySQL answers 1231, and `unique_checks` is refused outright. |
 | `AUTO_INCREMENT` / `LAST_INSERT_ID()` | partial | partial | partial | partial | experimental | [`checked parser`](parser/lib.rs), [`schema envelope`](frontend/schema_sql.rs), [`durable range primitive`](../core/storage/auto_increment.rs), [sequential](conformance/cases/p0/auto-increment.json), [parallel](conformance/cases/p0/auto-increment-parallel.json), [restart](conformance/cases/p0/auto-increment-restart.json), [key clause](conformance/cases/p0/create-counted-key-clause.json), [foreign key](conformance/cases/p0/create-counted-foreign-key.json), [bigint](conformance/cases/p0/create-bigint-counter.json) oracle cases | The checked v3 form accepts exactly one `INT`/`INTEGER`/`BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`, with `INT UNSIGNED` and `BIGINT UNSIGNED` spellings. The key may be written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling a dumped schema carries, and the column's attributes may come in any order — Django writes `bigint AUTO_INCREMENT NOT NULL PRIMARY KEY` — as MySQL takes them, measured on 8.4.11. Signed and `INT UNSIGNED` keys use a non-`sqlite_sequence` rowid alias; `BIGINT UNSIGNED` uses a separate `mysql_uint64` primary key, and is creatable, reopenable, and replayable through the identity-backed embedded frontend. Registry-selected embedded sessions reserve one durable contiguous range at execute time for unqualified INSERTs with an explicit non-ID column list and direct literal VALUES rows. Prepared execution additionally accepts bare `?` values in that same omitted-ID `VALUES` shape: preparation does not reserve, and execution rechecks identity and triggers before reserving, injecting, repreparing, binding, and writing. Rollback and failed execution do not reclaim a durable range; the first generated ID is recorded only after a successful write and remains connection-local across failure and rollback, including across `USE` database switches. The checked `SELECT LAST_INSERT_ID()` path reads that live state through embedded and current protocol SELECT paths. Narrow text and prepared protocol INSERT paths return affected rows and the first generated ID in their OK packets. A marked table takes an `ALTER TABLE` that leaves its counted column alone, and the column keeps the type it was declared with across one: measured on 8.4.11, a `bigint` key is still a `bigint` after a column is added, placed, restated, renamed or dropped, and an `int unsigned` one still `int unsigned`. Named or numbered markers, expressions, explicit allocator columns, qualified names, `TEMPORARY`, wider INSERT forms, explicit exhaustion handling, and direct connections without an allocator capability remain gated. |
 | Checked one-table `UPDATE` | partial | partial | experimental | partial | experimental | [`checked parser`](parser/lib.rs), [`frontend affected rows`](frontend/session.rs), [`core changed-row counter`](../core/connection.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | One unqualified table with no alias, joins, `FROM`, optimizer hints, `RETURNING`, or conflict clause. `ORDER BY` and `LIMIT` are supported via a rowid subquery over integer columns; bare `LIMIT` without `ORDER BY` and non-integer ordering are rejected. Assignment values and predicates use the existing conservative DML forms. Text and prepared protocol execution return bounded OK results. The default affected-row count is rows whose stored key or record changed. `CLIENT_FOUND_ROWS` reports predicate-matched rows instead. Core updates this separate success-only counter for both WAL and MVCC execution, without changing SQLite `changes()`. Multi-table and wider expression forms remain rejected. |

@@ -389,6 +389,17 @@ pub trait Dialect: Send + Sync + 'static {
     /// always resolve with SQLite semantics instead.
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::Func>>;
 
+    /// The dialect function to run in place of `name` when its first argument
+    /// carries `collation`, for a function that has to match text the way
+    /// that collation does, as MySQL's `LIKE` does. `None` keeps `name`.
+    fn function_for_collation(
+        &self,
+        _name: &str,
+        _collation: crate::translate::collate::CollationSeq,
+    ) -> Option<String> {
+        None
+    }
+
     /// Execute a dialect scalar function at runtime.
     ///
     /// Receives the connection — unlike extension functions — because

@@ -684,9 +684,29 @@ pub fn translate_expr(
                 }
                 Func::External(_) | Func::Dialect(_) => {
                     let regs = program.alloc_registers(args_count);
+                    let is_dialect = matches!(func_ctx.func, Func::Dialect(_));
+                    let mut first_arg_collation = None;
                     for (i, arg_expr) in args.iter().enumerate() {
+                        if is_dialect && i == 0 {
+                            program.reset_collation();
+                        }
                         translate_expr(program, referenced_tables, arg_expr, regs + i, resolver)?;
+                        if is_dialect && i == 0 {
+                            first_arg_collation = program.curr_collation();
+                        }
                     }
+                    let func_ctx = match (&func_ctx.func, first_arg_collation) {
+                        (Func::Dialect(name), Some(collation)) => {
+                            match resolver.dialect.function_for_collation(name, collation) {
+                                Some(name) => FuncCtx {
+                                    func: Func::Dialect(name),
+                                    arg_count: func_ctx.arg_count,
+                                },
+                                None => func_ctx,
+                            }
+                        }
+                        _ => func_ctx,
+                    };
 
                     // Use shared function call helper
                     let arg_registers: Vec<usize> = (regs..regs + args_count).collect();
