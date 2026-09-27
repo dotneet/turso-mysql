@@ -142,7 +142,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `GROUP BY` an ordinal — `GROUP BY 1` | refused; measured, MySQL groups by the projected column it names |
 | `GROUP BY` a call over words the client wrote — `GROUP BY UPPER(title)` | refused; MySQL groups words under the column's collation and the engine groups the call's answer by its bytes |
 | A column a primary-key grouping decides — `SELECT id, name ... GROUP BY id` | refused; MySQL lets it through as functionally dependent, which is not worked out here |
-| A scalar subquery in a grouped projection | refused; the outer columns it names are not held to the grouping |
+| A scalar subquery naming a column in a grouped projection | refused; the outer columns it names are not held to the grouping. One naming no column, `(SELECT COUNT(*) FROM t)`, is taken |
 | A statement grouping by a call, over any answer but a key call, `COUNT`, `SUM`, `MIN`, `MAX` over a number or words, and `AVG` | refused; MySQL reports the temporary table's column for it, whose shape has not been measured |
 | Renaming what the offered row carries — `VALUES (...) AS offered (a, b)` | refused; the plain row alias is taken and the column list has not been measured |
 | A `CASE` or `IF` branch written as a number with a point — `THEN 1.5 ELSE 0` | refused; MySQL answers a NEWDECIMAL there by a rule of its own. A `DECIMAL` column branch is taken |

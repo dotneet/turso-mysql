@@ -261,6 +261,22 @@ fn grouping_by_a_user_and_a_day_orders_the_way_mysql_does() {
         ])
     );
 
+    // A subquery naming no column answers the same value beside every group.
+    let (_, mut answered) = report(
+        &mut adapter,
+        "SELECT user_id, (SELECT COUNT(*) FROM users) FROM posts GROUP BY user_id",
+    );
+    answered.sort();
+    assert_eq!(
+        answered,
+        rows(&[
+            &[None, Some("4")],
+            &[Some("1"), Some("4")],
+            &[Some("2"), Some("4")],
+            &[Some("3"), Some("4")],
+        ])
+    );
+
     let (_, answered) = report(
         &mut adapter,
         "SELECT user_id, COUNT(*) FROM posts GROUP BY user_id ORDER BY COUNT(*) DESC, user_id",
@@ -298,6 +314,8 @@ fn a_grouped_statement_refuses_what_only_full_group_by_refuses() {
         // would group the call's answer by its bytes.
         "SELECT UPPER(title), COUNT(*) FROM posts GROUP BY UPPER(title)",
         "SELECT UPPER(title) AS u, COUNT(*) FROM posts GROUP BY u",
+        // 1055: the subquery names the outer statement's ungrouped `id`.
+        "SELECT user_id, (SELECT COUNT(*) FROM users u WHERE u.id = posts.id) FROM posts GROUP BY user_id",
     ] {
         assert!(
             matches!(

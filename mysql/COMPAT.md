@@ -1684,7 +1684,8 @@ than assumed. Measured on MySQL 8.4.11:
 
 Each of those is refused here where MySQL answers its error. So are a wildcard
 projection, whose columns cannot be checked against the grouping, a scalar
-subquery in a grouped projection, whose outer columns are not worked out, and
+subquery in a grouped projection naming any column — whose outer columns are not
+worked out; `(SELECT COUNT(*) FROM users)` names none and is taken — and
 the column MySQL lets through because the key it depends on is a primary key —
 `SELECT id, name ... GROUP BY id` — which is not worked out either. A call over
 words the client wrote itself is not taken as a key — `GROUP BY UPPER(title)` —

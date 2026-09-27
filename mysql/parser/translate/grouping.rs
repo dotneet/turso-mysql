@@ -304,8 +304,34 @@ fn reads_only(expr: &Expr, allowed: &dyn Fn(&Expr) -> bool) -> bool {
                     .as_deref()
                     .is_none_or(|result| reads_only(result, allowed))
         }
+        Expr::Subquery(query) => names_no_column(query),
         _ => false,
     }
+}
+
+/// Reports whether a subquery names no column at all — `(SELECT COUNT(*)
+/// FROM users)` — and so answers the same value beside every group.
+///
+/// A subquery naming a column may name the outer statement's, which MySQL
+/// holds to the grouping like any other, and which of the two tables an
+/// unqualified name belongs to is the frontend's to know.
+fn names_no_column(query: &sqlparser::ast::Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    query.with.is_none()
+        && select.selection.is_none()
+        && select.having.is_none()
+        && matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(keys, _) if keys.is_empty())
+        && select.from.iter().all(|source| source.joins.is_empty())
+        && select.projection.iter().all(|item| {
+            matches!(item,
+                SelectItem::UnnamedExpr(Expr::Function(function))
+                | SelectItem::ExprWithAlias { expr: Expr::Function(function), .. }
+                    if static_select_metadata::is_count_call(function)
+                        && matches!(&function.args, sqlparser::ast::FunctionArguments::List(arguments)
+                            if matches!(arguments.args.as_slice(), [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)])))
+        })
 }
 
 /// Reports whether two expressions are one expression written twice.
