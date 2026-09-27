@@ -1835,11 +1835,22 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
     )
     .is_ok());
 
-    for sql in [
-        // Matching one column against another is what a join is for, and that
-        // is equality. Anything else the ON says is a comparison against a
-        // value, which one column against another is not.
+    // One column against another by anything but equality is held to the
+    // rule a WHERE holds it to, which the frontend applies.
+    let ordered = parse_select(
         "SELECT users.id FROM users JOIN accounts ON users.id > accounts.user_id",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ordered.checked_comparisons()[0].rhs(),
+        &CheckedSelectComparisonRhs::Column {
+            qualifier: Some("accounts".to_owned()),
+            name: "user_id".to_owned(),
+        }
+    );
+
+    for sql in [
         // CROSS JOIN takes no ON or USING.
         "SELECT users.id FROM users CROSS JOIN accounts ON users.id = accounts.user_id",
         "SELECT users.id FROM users CROSS JOIN accounts USING (id)",
@@ -2032,8 +2043,17 @@ fn a_comma_join_is_the_cross_join_mysql_means_by_it() {
         mode,
     )
     .unwrap();
+    // The two columns are held to each other by the frontend, which can see
+    // both of their types.
     assert_eq!(
-        with_literal.checked_comparisons()[0].qualifier(),
+        with_literal.checked_comparisons()[0].rhs(),
+        &CheckedSelectComparisonRhs::Column {
+            qualifier: Some("accounts".to_owned()),
+            name: "user_id".to_owned(),
+        }
+    );
+    assert_eq!(
+        with_literal.checked_comparisons()[1].qualifier(),
         Some("accounts")
     );
     // A qualifier naming no table the statement reads is refused.
@@ -3282,13 +3302,20 @@ fn rejects_select_comparison_coercions_and_non_column_operands() {
         // A string is not here: the parser cannot know whether the column
         // is text, so a string against an integer column is refused by the
         // frontend, which can see the column's type.
-        for rhs in ["id", "CAST(1 AS SIGNED)"] {
-            let sql = format!("SELECT id FROM users WHERE id {operator} {rhs}");
-            assert!(
-                parse_select(&sql, SessionSqlMode::default()).is_err(),
-                "expected unsupported comparison form for {sql}"
-            );
-        }
+        let sql = format!("SELECT id FROM users WHERE id {operator} CAST(1 AS SIGNED)");
+        assert!(
+            parse_select(&sql, SessionSqlMode::default()).is_err(),
+            "expected unsupported comparison form for {sql}"
+        );
+        // Another column is taken here and held to the first by the frontend,
+        // which can see both types.
+        let sql = format!("SELECT id FROM users WHERE id {operator} other_id");
+        assert!(matches!(
+            parse_select(&sql, SessionSqlMode::default())
+                .unwrap()
+                .checked_comparisons(),
+            [comparison] if matches!(comparison.rhs(), CheckedSelectComparisonRhs::Column { .. })
+        ));
         for rhs in ["9223372036854775808", "-9223372036854775809"] {
             let sql = format!("SELECT id FROM users WHERE id {operator} {rhs}");
             assert!(parse_select(&sql, SessionSqlMode::default())

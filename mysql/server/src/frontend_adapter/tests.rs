@@ -30672,3 +30672,6 @@ mod time_seconds;
 
 #[cfg(unix)]
 mod decimal_to_whole;
+
+#[cfg(unix)]
+mod column_comparisons;

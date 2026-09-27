@@ -969,13 +969,27 @@ fn comparison_tables(
     source_tables: &[MySqlSelectSource],
     comparison: &CheckedSelectComparison,
 ) -> Result<Vec<MySqlTableName>> {
+    column_tables(
+        source_tables,
+        comparison.qualifier(),
+        comparison.inner_source(),
+    )
+}
+
+/// Returns the tables a column named with this qualifier, or none, may belong
+/// to, nearest first. See `comparison_tables`.
+fn column_tables(
+    source_tables: &[MySqlSelectSource],
+    qualifier: Option<&str>,
+    inner_source: Option<&str>,
+) -> Result<Vec<MySqlTableName>> {
     let named = |reference: &str| {
         source_tables
             .iter()
             .find(|source| source.reference().eq_ignore_ascii_case(reference))
             .map(|source| source.table().clone())
     };
-    if let Some(qualifier) = comparison.qualifier() {
+    if let Some(qualifier) = qualifier {
         return named(qualifier).map(|table| vec![table]).ok_or_else(|| {
             LimboError::InvalidArgument(
                 "SELECT comparison names no table the statement reads".to_string(),
@@ -983,7 +997,7 @@ fn comparison_tables(
         });
     }
     let mut candidates = Vec::new();
-    if let Some(inner) = comparison.inner_source().and_then(named) {
+    if let Some(inner) = inner_source.and_then(named) {
         candidates.push(inner);
     }
     let readable = source_tables
@@ -6002,6 +6016,26 @@ impl MySqlConnection {
     ) -> Result<Vec<BoundTemporalParameter>> {
         let mut bound = Vec::new();
         for comparison in comparisons {
+            if let CheckedSelectComparisonRhs::Column { qualifier, name } = comparison.rhs() {
+                let left = self.compared_column(
+                    column_tables(
+                        source_tables,
+                        comparison.qualifier(),
+                        comparison.inner_source(),
+                    )?,
+                    comparison.column_name(),
+                )?;
+                let right = self.compared_column(
+                    column_tables(
+                        source_tables,
+                        qualifier.as_deref(),
+                        comparison.inner_source(),
+                    )?,
+                    name,
+                )?;
+                refuse_a_column_pair_compared_differently(comparison, name, &left, &right)?;
+                continue;
+            }
             // A call says what it answers, so the value it meets is held to
             // that rather than to a column this would have to find first.
             if let Some(answers) = comparison.answers() {
@@ -6161,19 +6195,27 @@ impl MySqlConnection {
             translated.checked_subquery_comparisons(),
         )?;
         let read = translated.read_tables();
+        let (pairs, comparisons): (Vec<_>, Vec<_>) = translated
+            .checked_comparisons()
+            .iter()
+            .cloned()
+            .partition(|comparison| {
+                matches!(comparison.rhs(), CheckedSelectComparisonRhs::Column { .. })
+            });
+        for pair in &pairs {
+            self.validate_dml_column_pair(translated, pair)?;
+        }
         if read.is_empty() {
-            return self.validate_one_table_comparison_columns(
-                translated.source_table(),
-                translated.checked_comparisons(),
-            );
+            return self
+                .validate_one_table_comparison_columns(translated.source_table(), &comparisons);
         }
         // A joined `DELETE` and an `INSERT ... SELECT` read their tables
         // outright, and every comparison belongs to one of them. A subquery is
         // different: the statement still writes one table it does not read, so
         // a comparison naming none of the subqueries belongs to that one.
         if read.iter().any(|source| !source.subquery()) {
-            self.reject_dml_json_comparisons(read, translated.checked_comparisons())?;
-            self.validate_select_comparison_columns(read, translated.checked_comparisons())?;
+            self.reject_dml_json_comparisons(read, &comparisons)?;
+            self.validate_select_comparison_columns(read, &comparisons)?;
             return Ok(());
         }
         let names_a_subquery = |comparison: &CheckedSelectComparison| {
@@ -6185,14 +6227,50 @@ impl MySqlConnection {
                         .any(|source| source.reference().eq_ignore_ascii_case(name))
                 })
         };
-        let (inner, written): (Vec<_>, Vec<_>) = translated
-            .checked_comparisons()
-            .iter()
-            .cloned()
-            .partition(names_a_subquery);
+        let (inner, written): (Vec<_>, Vec<_>) =
+            comparisons.into_iter().partition(names_a_subquery);
         self.reject_dml_json_comparisons(read, &inner)?;
         self.validate_select_comparison_columns(read, &inner)?;
         self.validate_one_table_comparison_columns(translated.source_table(), &written)
+    }
+
+    /// Holds a DML statement's column compared with another column to a pair
+    /// MySQL and the engine compare alike.
+    ///
+    /// Either column may be the written table's, which the statement writes
+    /// rather than reads — `EXISTS (SELECT 1 FROM child WHERE child.parent_id
+    /// = parent.id)` — so a name no table the statement reads claims is that
+    /// table's.
+    fn validate_dml_column_pair(
+        &self,
+        translated: &TranslatedDml,
+        comparison: &CheckedSelectComparison,
+    ) -> Result<()> {
+        let CheckedSelectComparisonRhs::Column { qualifier, name } = comparison.rhs() else {
+            unreachable!("the caller passes column pairs only");
+        };
+        let written = translated
+            .source_table()
+            .map(MySqlTableName::parse)
+            .transpose()
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let tables = |qualifier: Option<&str>| {
+            let read = translated.read_tables();
+            let names_a_read_table = qualifier.is_some_and(|qualifier| {
+                read.iter()
+                    .any(|source| source.reference().eq_ignore_ascii_case(qualifier))
+            });
+            let mut tables =
+                column_tables(read, qualifier, comparison.inner_source()).unwrap_or_default();
+            if !names_a_read_table {
+                tables.extend(written.clone());
+            }
+            tables
+        };
+        let left =
+            self.compared_column(tables(comparison.qualifier()), comparison.column_name())?;
+        let right = self.compared_column(tables(qualifier.as_deref()), name)?;
+        refuse_a_column_pair_compared_differently(comparison, name, &left, &right)
     }
 
     fn reject_dml_json_comparisons(
@@ -6290,6 +6368,47 @@ impl MySqlConnection {
         table: &MySqlTableName,
         comparison: &CheckedSelectComparison,
     ) -> Result<Option<(String, Option<u8>)>> {
+        Ok(self
+            .compared_column_metadata(table, comparison.column_name())?
+            .map(|column| (column.type_name().to_owned(), column.temporal_precision())))
+    }
+
+    /// Reads one column of a pair compared with each other, from the nearest
+    /// of the tables it may belong to.
+    ///
+    /// The collation is read off the engine's own column as well as off the
+    /// stored MySQL declaration: the engine compares two columns under the
+    /// left one's collation, so the pair is only the one MySQL compares when
+    /// the engine holds both under the same one.
+    fn compared_column(&self, tables: Vec<MySqlTableName>, name: &str) -> Result<ComparedColumn> {
+        for table in tables {
+            let schema = self.inner.current_schema();
+            let Some(stored) = schema.get_btree_table(table.as_str()) else {
+                return Err(LimboError::InvalidArgument(
+                    "a comparison of two columns reads base tables only".to_string(),
+                ));
+            };
+            let Some(column) = self.compared_column_metadata(&table, name)? else {
+                continue;
+            };
+            let (_, engine_column) = stored.get_column(name).ok_or(LimboError::SchemaUpdated)?;
+            return Ok(ComparedColumn {
+                type_name: column.type_name().to_owned(),
+                temporal_precision: column.temporal_precision(),
+                collation_name: column.collation_name(),
+                engine_collation: engine_column.collation(),
+            });
+        }
+        Err(LimboError::SchemaUpdated)
+    }
+
+    /// The stored declaration of the column a comparison names in one table,
+    /// or nothing where that table has no column of that name.
+    fn compared_column_metadata(
+        &self,
+        table: &MySqlTableName,
+        name: &str,
+    ) -> Result<Option<MySqlColumnMetadata>> {
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => error,
             MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
@@ -6302,7 +6421,7 @@ impl MySqlConnection {
         })?;
         let mut matching = columns
             .iter()
-            .filter(|column| column.name().eq_ignore_ascii_case(comparison.column_name()));
+            .filter(|column| column.name().eq_ignore_ascii_case(name));
         let Some(column) = matching.next() else {
             return Ok(None);
         };
@@ -6311,10 +6430,7 @@ impl MySqlConnection {
                 "duplicate SELECT comparison column metadata".to_string(),
             ));
         }
-        Ok(Some((
-            column.type_name().to_owned(),
-            column.temporal_precision(),
-        )))
+        Ok(Some(column.clone()))
     }
 
     fn validate_dml_ordered_columns(
@@ -9023,6 +9139,148 @@ fn sql_mentions_column(sql: &str, column: &str) -> bool {
     regex::Regex::new(&pattern).map_or(true, |pattern| pattern.is_match(sql))
 }
 
+/// One column of a pair compared with each other — `WHERE age > score`.
+struct ComparedColumn {
+    type_name: String,
+    temporal_precision: Option<u8>,
+    collation_name: Option<&'static str>,
+    engine_collation: turso_core::CollationSeq,
+}
+
+/// Refuses a column compared with another column where MySQL and the engine
+/// could answer the comparison differently.
+fn refuse_a_column_pair_compared_differently(
+    comparison: &CheckedSelectComparison,
+    other_name: &str,
+    left: &ComparedColumn,
+    right: &ComparedColumn,
+) -> Result<()> {
+    match column_pair_refusal(left, right, comparison.operator()) {
+        None => Ok(()),
+        Some(reason) => Err(LimboError::InvalidArgument(format!(
+            "SELECT comparison of {} ({}) with {other_name} ({}) is refused: {reason}",
+            comparison.column_name(),
+            left.type_name,
+            right.type_name
+        ))),
+    }
+}
+
+/// Says why MySQL and the engine could answer a comparison of two columns
+/// differently, or nothing when they answer it alike.
+///
+/// Measured on MySQL 8.4.11, which converts one side of a mixed pair to the
+/// other's kind where the engine compares the two as they are stored: an `INT`
+/// equals a `VARCHAR` holding `'2abc'`, a `DATETIME` holding midnight equals a
+/// `DATE` of that day, a `DATETIME` equals a `DATETIME(3)` holding the same
+/// moment, and a `BIGINT` of 9007199254740993 equals a `DOUBLE` of
+/// 9007199254740992, the two being compared as doubles.
+fn column_pair_refusal(
+    left: &ComparedColumn,
+    right: &ComparedColumn,
+    operator: CheckedSelectComparisonOperator,
+) -> Option<&'static str> {
+    let (Some(left_kind), Some(right_kind)) = (compared_kind(left), compared_kind(right)) else {
+        return Some("a comparison of two columns of this type has not been measured");
+    };
+    match (left_kind, right_kind) {
+        (ComparedKind::WholeNumber { .. }, ComparedKind::WholeNumber { .. })
+        | (ComparedKind::Double, ComparedKind::Double)
+        | (ComparedKind::LargeUnsigned, ComparedKind::LargeUnsigned)
+        | (ComparedKind::LargeUnsigned, ComparedKind::WholeNumber { .. })
+        | (ComparedKind::WholeNumber { .. }, ComparedKind::LargeUnsigned)
+        | (ComparedKind::Day, ComparedKind::Day)
+        | (ComparedKind::Year, ComparedKind::Year)
+        | (ComparedKind::Decimal, ComparedKind::Decimal) => None,
+        // MySQL compares a whole number with a double as two doubles, which
+        // is exact up to 2^53 and so is only the engine's exact comparison
+        // for a column that cannot hold more.
+        (
+            ComparedKind::WholeNumber {
+                exact_as_a_double: true,
+            },
+            ComparedKind::Double,
+        )
+        | (
+            ComparedKind::Double,
+            ComparedKind::WholeNumber {
+                exact_as_a_double: true,
+            },
+        ) => None,
+        (ComparedKind::Words, ComparedKind::Words) => {
+            // Measured on 8.4.11: `utf8mb4_0900_ai_ci` against
+            // `utf8mb4_unicode_ci` is 1267, and either against `utf8mb4_bin`
+            // compares under `utf8mb4_bin`. The engine takes the left one.
+            (left.collation_name != right.collation_name
+                || left.engine_collation != right.engine_collation)
+                .then_some("the two columns compare words under different collations")
+        }
+        (ComparedKind::Moment(left_type), ComparedKind::Moment(right_type)) => {
+            (left_type != right_type || left.temporal_precision != right.temporal_precision)
+                .then_some("the two columns hold moments of different types or precisions")
+        }
+        // A span runs past a day and carries a sign, so its stored form reads
+        // in order only for sameness, as it does against a written value.
+        (ComparedKind::Span, ComparedKind::Span) => {
+            if left.temporal_precision != right.temporal_precision {
+                Some("the two columns hold spans of different precisions")
+            } else if !compares_for_sameness(operator) {
+                Some("an ordering comparison of two TIME columns")
+            } else {
+                None
+            }
+        }
+        _ => Some("MySQL converts one of the two columns to the other's type first"),
+    }
+}
+
+/// The kinds of column a pair is compared within.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparedKind {
+    WholeNumber {
+        exact_as_a_double: bool,
+    },
+    /// A `BIGINT UNSIGNED`, which the engine holds as a blob of its own and
+    /// compares exactly against another whole number, as MySQL does: measured
+    /// on 8.4.11 and here, a `BIGINT` of 9223372036854775807 is less than an
+    /// unsigned 9223372036854775808. MySQL compares one with a double by a
+    /// rule not measured here.
+    LargeUnsigned,
+    Double,
+    /// A `DECIMAL`, which the engine compares exactly against another one and
+    /// as a double against a whole number: measured, a `DECIMAL(30,20)` of
+    /// 1.00000000000000000001 equals an `INT` of 1 here and not in MySQL.
+    Decimal,
+    /// A `VARCHAR` or a `TEXT`. A `CHAR` is not one of them: MySQL takes its
+    /// trailing spaces off when it reads one.
+    Words,
+    Day,
+    Moment(&'static str),
+    Span,
+    Year,
+}
+
+fn compared_kind(column: &ComparedColumn) -> Option<ComparedKind> {
+    Some(match column.type_name.as_str() {
+        "BIGINT" => ComparedKind::WholeNumber {
+            exact_as_a_double: false,
+        },
+        "BIGINT UNSIGNED" => ComparedKind::LargeUnsigned,
+        type_name if is_integer_type(type_name) => ComparedKind::WholeNumber {
+            exact_as_a_double: true,
+        },
+        "DOUBLE" | "DOUBLE UNSIGNED" => ComparedKind::Double,
+        "DECIMAL" | "DECIMAL UNSIGNED" => ComparedKind::Decimal,
+        "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => ComparedKind::Words,
+        "DATE" => ComparedKind::Day,
+        "DATETIME" => ComparedKind::Moment("DATETIME"),
+        "TIMESTAMP" => ComparedKind::Moment("TIMESTAMP"),
+        "TIME" => ComparedKind::Span,
+        "YEAR" => ComparedKind::Year,
+        _ => return None,
+    })
+}
+
 /// Answers whether a comparison's right side can meet this column at all.
 ///
 /// A checked comparison names one column and one literal form, and the two have
@@ -9085,6 +9343,9 @@ fn checked_comparison_fits_column(
                 || is_decimal_type(type_name)
                 || (collated && is_text_type(type_name))
         }
+        // Two columns are held to each other by `column_pair_refusal`, which
+        // needs both of them.
+        CheckedSelectComparisonRhs::Column { .. } => false,
     }
 }
 
@@ -9534,6 +9795,7 @@ fn checked_comparison_column_refusal(
         CheckedSelectComparisonRhs::Placeholder { .. } => {
             "a signed integer column, because a parameter carries no type"
         }
+        CheckedSelectComparisonRhs::Column { .. } => "a column of the same kind",
     };
     LimboError::InvalidArgument(format!(
         "SELECT comparison on {column_name} requires {wanted}, found {type_name}"
@@ -9557,7 +9819,12 @@ fn validate_frozen_select_comparison_columns(
             .map_err(|_| LimboError::Corrupt("invalid SELECT schema provenance".to_string()))?
             .ok_or(LimboError::SchemaUpdated)?;
         for comparison in comparisons {
-            if comparison.answers().is_some() {
+            // A pair of columns was held to each other when the statement was
+            // prepared, and both frozen parsers refuse to go on once any table
+            // the statement reads is declared differently.
+            if comparison.answers().is_some()
+                || matches!(comparison.rhs(), CheckedSelectComparisonRhs::Column { .. })
+            {
                 continue;
             }
             refuse_binary_column_like(schema, source_table, comparison)?;
@@ -9588,6 +9855,11 @@ fn validate_frozen_select_comparison_columns(
     for comparison in comparisons {
         if comparison.answers().is_some() {
             continue;
+        }
+        if matches!(comparison.rhs(), CheckedSelectComparisonRhs::Column { .. }) {
+            return Err(LimboError::InvalidArgument(
+                "a comparison of two columns reads base tables only".to_string(),
+            ));
         }
         refuse_binary_column_like(schema, source_table, comparison)?;
         let Some(column) = view.columns.iter().find(|column| {

@@ -930,6 +930,12 @@ pub enum CheckedSelectComparisonRhs {
     Null,
     /// One binary-protocol parameter at the zero-based statement ordinal.
     Placeholder { ordinal: usize },
+    /// Another column. Only the frontend knows both columns' types, and it
+    /// says which pairs MySQL and the engine compare alike.
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
 }
 
 /// What a call answering the moment the statement runs answers.

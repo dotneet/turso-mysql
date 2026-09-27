@@ -1063,15 +1063,22 @@ fn render_join_predicate(
             render_join_predicate(left, render_context.as_deref_mut())?,
             render_join_predicate(right, render_context)?
         )),
+        // Inside a `SELECT` the two columns are recorded and held to each other
+        // below; an `UPDATE` or a `DELETE` has nowhere to record them.
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } if render_join_column(left).is_ok() && render_join_column(right).is_ok() => Ok(format!(
-            "({} = {})",
-            render_join_column(left)?,
-            render_join_column(right)?
-        )),
+        } if render_context.is_none()
+            && render_join_column(left).is_ok()
+            && render_join_column(right).is_ok() =>
+        {
+            Ok(format!(
+                "({} = {})",
+                render_join_column(left)?,
+                render_join_column(right)?
+            ))
+        }
         Expr::BinaryOp { left, op, right } if is_checked_select_comparison_operator(op) => {
             // An `UPDATE` or a `DELETE` renders its own `FROM` without a
             // statement to record the comparison in, so a value there is
@@ -7312,22 +7319,6 @@ fn render_select_predicate(
                 render_select_predicate(right, render_context)?
             ))
         }
-        // A comparison between two qualified columns is what bounds a comma
-        // join, and it is the predicate a written `JOIN ... ON` already takes.
-        // It records no checked comparison: there is no literal to hold to a
-        // column's type.
-        Expr::BinaryOp { left, op, right }
-            if is_checked_select_comparison_operator(op)
-                && names_a_qualified_column(left)
-                && names_a_qualified_column(right) =>
-        {
-            Ok(format!(
-                "({} {} {})",
-                render_join_column(left)?,
-                checked_select_comparison_sql_operator(op),
-                render_join_column(right)?
-            ))
-        }
         // A statement built up in pieces starts its WHERE with a comparison
         // that names no column at all — `WHERE 1 = 1 AND ...` — so the pieces
         // after it can each be written with an AND in front. Measured on MySQL
@@ -7542,10 +7533,6 @@ fn names_a_whole_number(expr: &Expr) -> bool {
         | Expr::Nested(expr) => names_a_whole_number(expr),
         _ => false,
     }
-}
-
-fn names_a_qualified_column(expr: &Expr) -> bool {
-    matches!(expr, Expr::CompoundIdentifier(parts) if parts.len() == 2)
 }
 
 fn reverse_checked_comparison_operator(op: &BinaryOperator) -> Option<BinaryOperator> {
@@ -7826,6 +7813,17 @@ fn render_checked_select_comparison(
         }
         _ => return unsupported("SELECT comparison requires one column"),
     };
+    if let Some((other_qualifier, other_column)) = named_column(rhs_expr) {
+        if named_collation.is_some() {
+            return unsupported("SELECT comparison of two columns under a named collation");
+        }
+        return Ok(render_column_pair_comparison(
+            (qualifier, column),
+            &op_reversed,
+            (other_qualifier, other_column),
+            render_context,
+        ));
+    }
     let column_name = column.value.clone();
     let json_column = render_context.is_json_column(&column_name);
     if json_column && named_collation.is_some() {
@@ -7981,6 +7979,55 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// Reads the column an expression names, qualified or not.
+fn named_column(expr: &Expr) -> Option<(Option<&Ident>, &Ident)> {
+    match expr {
+        Expr::Identifier(column) => Some((None, column)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((Some(&parts[0]), &parts[1])),
+        _ => None,
+    }
+}
+
+/// Renders one column compared with another — `WHERE age > score`.
+///
+/// Nothing is written beside either column. The frontend takes only two
+/// columns that MySQL and the engine compare the same way as they stand: two
+/// words under one collation, which the engine reads off the left column as
+/// MySQL reads it off both, or two numbers or two moments of one kind.
+fn render_column_pair_comparison(
+    (qualifier, column): (Option<&Ident>, &Ident),
+    op: &BinaryOperator,
+    (other_qualifier, other_column): (Option<&Ident>, &Ident),
+    render_context: &mut SelectRenderContext<'_>,
+) -> String {
+    let operator = checked_select_comparison_operator(op).expect("comparison operator guard");
+    let rendered = |qualifier: Option<&Ident>, column: &Ident| match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
+    let comparison = format!(
+        "({} {} {})",
+        rendered(qualifier, column),
+        checked_select_comparison_sql_operator(op),
+        rendered(other_qualifier, other_column)
+    );
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
+            inner_source: None,
+            column_name: column.value.clone(),
+            operator,
+            rhs: CheckedSelectComparisonRhs::Column {
+                qualifier: other_qualifier.map(|qualifier| qualifier.value.clone()),
+                name: other_column.value.clone(),
+            },
+            collated: false,
+            answers: None,
+        });
+    comparison
 }
 
 /// Reads a written day against a column holding a moment as that day's

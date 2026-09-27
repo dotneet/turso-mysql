@@ -419,7 +419,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `TIME(col)` | refused; a `TIME` holds a span running past a day and the engine's reader answers NULL for one, so the two would not agree. `DATE(col)` is taken, being the other spelling of `CAST(col AS DATE)` |
 | A call on both sides of a comparison, or one beside a column — `LOWER(a) = LOWER(b)`, `LOWER(a) = b` | refused; one side has to be a value the comparison reader takes |
 | `(a, b) IN (SELECT ...)` | refused; the row list is written out as `AND` and `OR`, and a subquery has no rows to write out |
-| A join `ON` matching one column against another with anything but equality — `ON a.n > b.n` | refused; matching one column against another is what a join is for and that is equality, and everything else an `ON` says is a comparison against a value |
+| A joined `UPDATE` or `DELETE` whose `ON` equates two columns MySQL converts one of first — `DELETE p FROM p JOIN q ON p.n = q.label` | taken without looking at the two types; a `SELECT` holds the same `ON` to the pairs listed in COMPAT.md and refuses the rest |
+| A column compared with another column MySQL converts first — `WHERE n = label`, `WHERE a = b` under two collations, `WHERE dt = d` | refused; measured, MySQL converts one side to the other's type or answers 1267, where the engine compares the two as stored. See COMPAT.md for the pairs taken |
 | A join `ON` naming a value in an `UPDATE` or a `DELETE` | refused; each renders its own `FROM` with no statement to record the comparison in, so the value would go unchecked |
 | A subquery in a joined `UPDATE`/`DELETE` `WHERE` comparing a qualified column — `WHERE a.id IN (SELECT ...)` | refused; `IN (SELECT ...)` reads only an unqualified column on its left, which a joined statement cannot write |
 | A call as a `LIKE` pattern — `LIKE CONCAT('%', ?)` | refused; the pattern is written or bound, and a client that prepares one can build it before it binds |

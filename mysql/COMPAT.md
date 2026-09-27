@@ -954,6 +954,32 @@ order — which is the engine's own comparison, without the collation a text col
 Taking it needs the renderer to be told a column is binary so it leaves that collation off,
 which is the same channel that tells it a column is text.
 
+A column compared with another column — `WHERE name = email`, `WHERE age > score`,
+`WHERE p.n > r.n` in a comma join, `JOIN r ON p.n > r.n` — is taken in a `SELECT`, an
+`UPDATE` and a `DELETE`, text or prepared, when the two are a pair MySQL and the engine
+compare alike as they are stored: two whole numbers of any width, signed or unsigned; a
+`DOUBLE` with another `DOUBLE` or with a whole number no wider than an `INT`; two `DECIMAL`s
+of any sizes, which both compare exactly; two `DATE`s,
+two `YEAR`s; two `DATETIME`s or two `TIMESTAMP`s of one fractional precision; two `TIME`s of
+one precision compared for sameness; and two `VARCHAR` or `TEXT` columns under one collation,
+which the engine reads off the left column as MySQL reads it off both. Measured on 8.4.11 and
+matched: `name = email` folds case and accents under `utf8mb4_0900_ai_ci` (`'Dan'` is `'dan'`,
+`'é'` is `'E'`) and does not pad (`'a '` is not `'a'`), two `utf8mb4_bin` columns pad and keep
+case, two `utf8mb4_unicode_ci` columns pad and fold, a `BIGINT` of 9223372036854775807 is less
+than a `BIGINT UNSIGNED` of 9223372036854775808. Every other pair is refused, each because
+MySQL converts one side to the other's type first: measured, `utf8mb4_0900_ai_ci` against
+`utf8mb4_unicode_ci` is 1267 and either against `utf8mb4_bin` compares under `utf8mb4_bin`; a
+`CHAR` loses its trailing spaces; an `INT` of 2 equals the word `'2abc'`; a `BIGINT` of
+9007199254740993 equals a `DOUBLE` of 9007199254740992, both read as doubles; a `DATETIME`
+equals a `DATETIME(3)` holding the same moment, a `DATETIME` holding midnight equals the
+`DATE` of that day, and a `TIMESTAMP` equals the `DATETIME` of the same moment. A `DECIMAL`
+with a whole number is refused because the engine compares that pair as two doubles: measured,
+a `DECIMAL(30,20)` of 1.00000000000000000001 equals an `INT` of 1 here and not in MySQL. A pair
+under a written `COLLATE`, a pair over a view, and `FLOAT`, `JSON`, `BLOB`, `ENUM`, `SET` and
+`BIT` columns are refused too. A comma join's `a.x = b.y` and a `SELECT` join's
+`ON a.x = b.y` used to be taken without looking at the two types, and are held to the same rule
+now; the `ON` of a joined `UPDATE` or `DELETE` still is not.
+
 `DATE(col)` reads the day out of a moment, which is the other spelling of
 `CAST(col AS DATE)`. Measured on 8.4.11, both answer a nullable `DATE` of length 10 in the
 binary character set, so they are one thing here and the shorter spelling stands on the left

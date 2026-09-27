@@ -535,24 +535,18 @@ fn decimal_updates_keep_operand_precision_until_assignment() -> Result<()> {
         .is_err());
     connection.execute("CREATE TABLE scalar_join (id INT)")?;
     connection.execute("INSERT INTO scalar_join (id) VALUES (1)")?;
+    // The engine compares a DECIMAL with a whole number as a double, where
+    // MySQL compares the two exactly, so the join itself is refused.
     for sql in [
         "SELECT SQRT(v) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
         "SELECT CAST(v AS SIGNED) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
         "SELECT LENGTH(v) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
         "SELECT b.id FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id ORDER BY ABS(v)",
+        "SELECT COUNT(*) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id",
+        "SELECT b.id FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id ORDER BY b.id",
     ] {
         assert!(connection.prepare_select(sql).is_err(), "{sql}");
     }
-    assert!(connection
-        .prepare_select(
-            "SELECT COUNT(*) FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id"
-        )
-        .is_ok());
-    assert!(connection
-        .prepare_select(
-            "SELECT b.id FROM left_decimal AS a JOIN scalar_join AS b ON a.v = b.id ORDER BY b.id"
-        )
-        .is_ok());
     assert!(connection
         .prepare_select("SELECT v FROM left_decimal UNION SELECT v FROM right_decimal")
         .is_err());
