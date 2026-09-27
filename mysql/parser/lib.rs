@@ -191,10 +191,10 @@ pub use temporal_value::{
 pub use translate::{MySqlCatalogTable, MySqlDerivedColumns, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use view_definition::{
-    mysql_create_view_ddl, render_show_create_written_view_mysql,
-    translated_view_is_kept_as_mysql_prints_it, translated_view_select,
-    view_written_as_mysql_prints_it, written_view_columns, MySqlViewColumnReading,
-    MySqlWrittenView,
+    created_view_name, mysql_create_view_ddl, render_show_create_written_view_mysql,
+    select_reads_rows_as_they_come, translated_view_is_kept_as_mysql_prints_it,
+    translated_view_select, view_written_as_mysql_prints_it, written_view_columns,
+    written_view_definition, MySqlViewColumnReading, MySqlViewSource, MySqlWrittenView,
 };
 pub use written_bytes::{
     base64_length, crc32, first_byte, first_character_code, quoted_for_sql, to_base64,

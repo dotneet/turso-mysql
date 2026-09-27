@@ -2802,26 +2802,23 @@ where
         }
         // Measured on MySQL 8.4.11: a `CREATE VIEW` naming a table or a view
         // that is already there is 1050, before anything else is read.
-        if may_create_a_view_or_trigger(sql) {
-            if let Ok(turso_parser::ast::Stmt::CreateView { view_name, .. }) =
-                turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode())
+        let created_view = may_create_a_view_or_trigger(sql)
+            .then(|| turso_mysql_parser::created_view_name(sql, connection.parser_mode()))
+            .flatten();
+        if let Some(view) = &created_view {
+            if connection
+                .names_a_table(view)
+                .map_err(frontend_error_kind)?
             {
-                let view = MySqlTableName::parse(view_name.name.as_str())
-                    .map_err(|_| FrontendErrorKind::Syntax)?;
-                if connection
-                    .names_a_table(&view)
-                    .map_err(frontend_error_kind)?
-                {
-                    return Err(FrontendErrorKind::DuplicateObject);
-                }
+                return Err(FrontendErrorKind::DuplicateObject);
             }
         }
-        if may_create_a_view_or_trigger(sql)
-            && matches!(
-                turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
-                Ok(turso_parser::ast::Stmt::CreateView { .. }
-                    | turso_parser::ast::Stmt::CreateTrigger { .. })
-            )
+        if created_view.is_some()
+            || (may_create_a_view_or_trigger(sql)
+                && matches!(
+                    turso_mysql_parser::parse_schema_ddl_ast(sql, connection.parser_mode()),
+                    Ok(turso_parser::ast::Stmt::CreateTrigger { .. })
+                ))
         {
             if let Some(username) = self
                 .authorizer
@@ -3846,6 +3843,7 @@ fn execute_prepared_values(
     let source_metadata = prepared_table_result_metadata(
         connection,
         &type_metadata,
+        sql,
         selected_database,
         source_tables,
     )?;
@@ -4386,6 +4384,7 @@ fn prepared_statement_result(
     let source_metadata = prepared_table_result_metadata(
         connection,
         type_metadata,
+        sql,
         selected_database,
         source_tables,
     )?;
@@ -4936,6 +4935,7 @@ fn execute_checked_select_with_timeout(
                 .iter()
                 .flatten()
                 .any(needs_source_columns),
+        Some(sql),
     )?;
 
     let columns = (0..column_count)
@@ -8984,6 +8984,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
 fn prepared_table_result_metadata(
     connection: &MySqlConnection,
     type_metadata: &[MySqlPreparedResultColumnTypeMetadata],
+    sql: Option<&str>,
     selected_database: Option<&str>,
     source_tables: &[MySqlSelectSource],
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
@@ -9012,6 +9013,7 @@ fn prepared_table_result_metadata(
         selected_database,
         source_tables,
         needs_source_columns,
+        sql,
     )
 }
 
@@ -9026,6 +9028,9 @@ fn table_result_metadata_for_references(
     // says so with a source reference, and looking the table up for `SELECT 1`
     // would cost a catalog read for nothing.
     needs_source_columns: bool,
+    // The statement itself, which a view joining tables is reported for only
+    // when it reads the view's rows as they come.
+    sql: Option<&str>,
 ) -> Result<Option<TableResultMetadata>, FrontendErrorKind> {
     if source_tables.is_empty() || (source_references.is_empty() && !needs_source_columns) {
         return Ok(None);
@@ -9066,10 +9071,10 @@ fn table_result_metadata_for_references(
             connection
                 .list_columns(source.table())
                 .map_err(column_metadata_error_kind)?
-        } else if let Some(grouped) =
-            grouped_view_columns(connection, selected_database, source.table())?
+        } else if let Some(written) =
+            written_view_columns(connection, selected_database, source.table(), sql)?
         {
-            view_columns = grouped;
+            view_columns = written;
             Vec::new()
         } else {
             // A view projecting one table's columns reports each the way the
@@ -9110,8 +9115,66 @@ fn table_result_metadata_for_references(
     Ok(Some(metadata))
 }
 
-/// Works out the columns of a view grouping its rows, or nothing for any
-/// other view.
+/// Works out the columns of a view grouping its rows, joining tables or
+/// reading a table under an alias, or nothing for any other view.
+#[cfg(unix)]
+fn written_view_columns(
+    connection: &MySqlConnection,
+    database: &str,
+    view: &MySqlTableName,
+    sql: Option<&str>,
+) -> Result<Option<Vec<ColumnDefinitionConfig>>, FrontendErrorKind> {
+    let Some((written, tables)) = connection
+        .written_view_readings(view)
+        .map_err(column_metadata_error_kind)?
+    else {
+        return Ok(None);
+    };
+    // Measured on MySQL 8.4.11: a `SELECT` sorting the rows of a view joining
+    // tables reports the joined tables as each column's original table, with
+    // no key flags, whenever its plan sorts through a temporary table — and
+    // whether it does depends on which table the plan reads first, which
+    // turns on how many rows each holds. `SELECT * FROM v ORDER BY name` did
+    // and `... ORDER BY title` did not, over the same view.
+    if written.sources().len() > 1
+        && !sql.is_some_and(|sql| {
+            turso_mysql_parser::select_reads_rows_as_they_come(sql, connection.parser_mode())
+        })
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let base_metadata = TableResultMetadata {
+        database: database.to_owned(),
+        tables: written
+            .sources()
+            .iter()
+            .zip(tables)
+            .enumerate()
+            .map(|(at, (source, columns))| SourceTableColumns {
+                source_table: source.table().as_str().to_owned(),
+                // Two of the tables can be one table read twice, so each is
+                // found by its place rather than by its name.
+                table_reference: at.to_string(),
+                branch: 0,
+                subquery: false,
+                columns,
+                catalog_columns: Vec::new(),
+                view_columns: Vec::new(),
+                projected_columns: Vec::new(),
+                outer: source.outer(),
+                derived: None,
+            })
+            .collect(),
+        union: false,
+        group_concat_max_len: connection.group_concat_max_len(),
+    };
+    if written.grouped() {
+        return grouped_view_columns(&base_metadata, &written, database, view).map(Some);
+    }
+    joined_view_columns(&base_metadata, &written, database, view).map(Some)
+}
+
+/// Works out the columns of a view grouping its rows.
 ///
 /// Measured on MySQL 8.4.11, such a view is read out of a table MySQL gathers
 /// the groups into, and each column reports that table's shape: a grouped
@@ -9123,36 +9186,13 @@ fn table_result_metadata_for_references(
 /// that column's shape, nullable and without its keys.
 #[cfg(unix)]
 fn grouped_view_columns(
-    connection: &MySqlConnection,
+    base_metadata: &TableResultMetadata,
+    written: &turso_mysql_parser::MySqlWrittenView,
     database: &str,
     view: &MySqlTableName,
-) -> Result<Option<Vec<ColumnDefinitionConfig>>, FrontendErrorKind> {
+) -> Result<Vec<ColumnDefinitionConfig>, FrontendErrorKind> {
     use turso_mysql_parser::MySqlViewColumnReading;
 
-    let Some((written, columns)) = connection
-        .grouped_view_readings(view)
-        .map_err(column_metadata_error_kind)?
-    else {
-        return Ok(None);
-    };
-    let base = written.table().as_str().to_owned();
-    let base_metadata = TableResultMetadata {
-        database: database.to_owned(),
-        tables: vec![SourceTableColumns {
-            source_table: base.clone(),
-            table_reference: base,
-            branch: 0,
-            subquery: false,
-            columns,
-            catalog_columns: Vec::new(),
-            view_columns: Vec::new(),
-            projected_columns: Vec::new(),
-            outer: false,
-            derived: None,
-        }],
-        union: false,
-        group_concat_max_len: connection.group_concat_max_len(),
-    };
     let key_flags = MYSQL_PRI_KEY_FLAG
         | MYSQL_UNIQUE_KEY_FLAG
         | MYSQL_PART_KEY_FLAG
@@ -9170,7 +9210,7 @@ fn grouped_view_columns(
         .iter()
         .map(|(name, reading)| {
             let mut definition = match reading {
-                MySqlViewColumnReading::Column(column) => {
+                MySqlViewColumnReading::Column { column, .. } => {
                     let mut definition = base_column(name, column)?;
                     definition.flags &= !key_flags;
                     return Ok(definition);
@@ -9196,8 +9236,48 @@ fn grouped_view_columns(
             definition.original_name.clone_from(name);
             Ok(definition)
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+        .collect()
+}
+
+/// Works out the columns of a view joining tables or reading a table under an
+/// alias.
+///
+/// Measured on MySQL 8.4.11: each column reports the column it reads the way
+/// that column's table does — type, length, collation and flags, its keys
+/// among them — under the view's name as its original table and the view's
+/// own name for it as its original name, as a view of one table's columns
+/// does. A column of a table a `LEFT JOIN` can leave missing reports no
+/// `NOT_NULL`, whatever the condition the `SELECT` reading the view carries.
+#[cfg(unix)]
+fn joined_view_columns(
+    base_metadata: &TableResultMetadata,
+    written: &turso_mysql_parser::MySqlWrittenView,
+    database: &str,
+    view: &MySqlTableName,
+) -> Result<Vec<ColumnDefinitionConfig>, FrontendErrorKind> {
+    use turso_mysql_parser::MySqlViewColumnReading;
+
+    written
+        .columns()
+        .iter()
+        .map(|(name, reading)| {
+            let MySqlViewColumnReading::Column { source, column } = reading else {
+                unreachable!("a view that does not group its rows reads only columns");
+            };
+            let table = &base_metadata.tables[*source];
+            let ordinal = table
+                .columns
+                .iter()
+                .position(|declared| declared.name().eq_ignore_ascii_case(column))
+                .ok_or(FrontendErrorKind::Internal)?;
+            let mut definition =
+                base_metadata.table_column_definition(table, ordinal, name.clone(), None)?;
+            database.clone_into(&mut definition.schema);
+            view.as_str().clone_into(&mut definition.original_table);
+            definition.original_name.clone_from(name);
+            Ok(definition)
+        })
+        .collect()
 }
 
 #[cfg(unix)]

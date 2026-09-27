@@ -9,6 +9,13 @@
 use super::*;
 use crate::catalog_tables::{foreign_key_name, indexes_beside_the_primary_key};
 
+/// What each column of a view kept in the text MySQL prints reads, with the
+/// columns of each table it reads, in the order its `FROM` names them.
+pub type MySqlWrittenViewReadings = (
+    turso_mysql_parser::MySqlWrittenView,
+    Vec<Vec<MySqlColumnMetadata>>,
+);
+
 impl MySqlConnection {
     /// Lists user-visible tables and views from the current database catalog.
     ///
@@ -866,7 +873,15 @@ impl MySqlConnection {
         for column in &mut metadata {
             column.key = MySqlColumnKey::None;
             column.default_sql = None;
-            column.default_value = None;
+            // Measured on MySQL 8.4.11: a view reports `0` as the default of
+            // a column its table counts, and no other default.
+            column.default_value = column
+                .extra
+                .eq_ignore_ascii_case("AUTO_INCREMENT")
+                .then(|| MySqlColumnDefault::Integer {
+                    text: "0".to_owned(),
+                    value: 0,
+                });
             column.extra.clear();
         }
         Ok(metadata)
@@ -893,21 +908,17 @@ impl MySqlConnection {
     }
 
     /// Reads what each column of a view grouping its rows reads, with the
-    /// columns of the one table it reads, or nothing for any other view.
+    /// columns of each table it reads, for a view grouping its rows, joining
+    /// tables or reading a table under an alias, or nothing for any other
+    /// view.
     ///
     /// Only the aggregates whose answer MySQL reports in a shape measured
     /// here are taken: a count of anything, and the least or greatest of a
     /// whole-number or `VARCHAR` column.
-    pub fn grouped_view_readings(
+    pub fn written_view_readings(
         &self,
         view: &MySqlTableName,
-    ) -> std::result::Result<
-        Option<(
-            turso_mysql_parser::MySqlWrittenView,
-            Vec<MySqlColumnMetadata>,
-        )>,
-        MySqlColumnMetadataError,
-    > {
+    ) -> std::result::Result<Option<MySqlWrittenViewReadings>, MySqlColumnMetadataError> {
         let schema = self.inner.current_schema();
         let Some(stored) = schema.get_view(view.as_str()) else {
             return Err(MySqlColumnMetadataError::TableNotFound);
@@ -926,12 +937,18 @@ impl MySqlConnection {
         }
         let written = turso_mysql_parser::written_view_columns(decoded.normalized_ddl, mode)
             .map_err(mysql_metadata_parse_error)?;
-        if !written.grouped() {
+        if !written.grouped() && written.reads_one_table_by_its_name() {
             return Ok(None);
         }
-        let columns = self.list_columns(written.table())?;
-        Self::refuse_readings_not_measured(&written, &columns)?;
-        Ok(Some((written, columns)))
+        let tables = written
+            .sources()
+            .iter()
+            .map(|source| self.list_columns(source.table()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if written.grouped() {
+            Self::refuse_readings_not_measured(&written, &tables[0])?;
+        }
+        Ok(Some((written, tables)))
     }
 
     pub(super) fn refuse_readings_not_measured(
@@ -943,7 +960,7 @@ impl MySqlConnection {
         for (_, reading) in written.columns() {
             let read = match reading {
                 MySqlViewColumnReading::Count => continue,
-                MySqlViewColumnReading::Column(column) => (column, false),
+                MySqlViewColumnReading::Column { column, .. } => (column, false),
                 MySqlViewColumnReading::Least(column)
                 | MySqlViewColumnReading::Greatest(column) => (column, true),
                 MySqlViewColumnReading::Sum(_) | MySqlViewColumnReading::Average(_) => {
@@ -1000,6 +1017,13 @@ impl MySqlConnection {
             };
         if canonical != decoded.normalized_ddl {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
+        }
+        if turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement) {
+            let written = turso_mysql_parser::written_view_columns(decoded.normalized_ddl, mode)
+                .map_err(mysql_metadata_parse_error)?;
+            if !written.grouped() && !written.reads_one_table_by_its_name() {
+                return self.joined_view_columns(&written);
+            }
         }
         let Stmt::CreateView {
             temporary,
@@ -1078,6 +1102,43 @@ impl MySqlConnection {
             }
         }
         Ok(metadata)
+    }
+
+    /// Reads the columns of a view joining tables or reading a table under
+    /// an alias, each as its table declares it under the view's name for it.
+    /// A column of a table a `LEFT JOIN` can leave missing may be NULL, as
+    /// MySQL reports it — measured on 8.4.11, `DESCRIBE` answers `YES` for
+    /// a `NOT NULL` column there.
+    fn joined_view_columns(
+        &self,
+        written: &turso_mysql_parser::MySqlWrittenView,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        use turso_mysql_parser::MySqlViewColumnReading;
+
+        let tables = written
+            .sources()
+            .iter()
+            .map(|source| self.list_columns(source.table()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        written
+            .columns()
+            .iter()
+            .map(|(name, reading)| {
+                let MySqlViewColumnReading::Column { source, column } = reading else {
+                    return Err(MySqlColumnMetadataError::CorruptDefinition);
+                };
+                let mut read = tables[*source]
+                    .iter()
+                    .find(|declared| declared.name.eq_ignore_ascii_case(column))
+                    .ok_or(MySqlColumnMetadataError::CorruptDefinition)?
+                    .clone();
+                read.name.clone_from(name);
+                if written.sources()[*source].outer() {
+                    read.nullable = true;
+                }
+                Ok(read)
+            })
+            .collect()
     }
 
     /// The names a base table declares its columns under, or nothing for any

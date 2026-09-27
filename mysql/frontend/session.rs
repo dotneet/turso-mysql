@@ -3643,10 +3643,24 @@ impl MySqlConnection {
             Err(MySqlParseError::Unsupported {
                 feature: "schema statement",
             }) => return self.prepare_non_schema(sql),
-            Err(error) => match parse_auto_increment_create_table(sql, mode) {
-                Ok(checked) => return self.prepare_auto_increment_create_table(checked),
-                Err(_) => return Err(LimboError::ParseError(error.to_string())),
-            },
+            Err(error) => {
+                // A join's column written without its table names the table
+                // that declares it, which only the tables' columns tell; the
+                // text MySQL prints names it.
+                if let Ok(Some(written)) =
+                    turso_mysql_parser::view_written_as_mysql_prints_it(sql, mode, &|table| {
+                        self.declared_column_names(table)
+                    })
+                {
+                    if written != sql {
+                        return self.prepare_schema_with_creator(&written, implicit_index, creator);
+                    }
+                }
+                match parse_auto_increment_create_table(sql, mode) {
+                    Ok(checked) => return self.prepare_auto_increment_create_table(checked),
+                    Err(_) => return Err(LimboError::ParseError(error.to_string())),
+                }
+            }
         };
         if matches!(stmt, Stmt::CreateView { .. }) {
             if let Some(written) =
@@ -3854,9 +3868,23 @@ impl MySqlConnection {
         creator: Option<SchemaSqlCreator>,
     ) -> std::result::Result<(), MySqlReplaceViewError> {
         let engine = |error| MySqlReplaceViewError::Query(MySqlQueryError::Engine(error));
-        parse_create_view_ast(replacement.create_view(), self.parser_mode()).map_err(|error| {
-            MySqlReplaceViewError::Query(MySqlQueryError::Unsupported(error.to_string()))
-        })?;
+        let mode = self.parser_mode();
+        parse_create_view_ast(replacement.create_view(), mode)
+            .or_else(|error| {
+                // A join's column written without its table is read in the
+                // text MySQL prints, which names the table.
+                match turso_mysql_parser::view_written_as_mysql_prints_it(
+                    replacement.create_view(),
+                    mode,
+                    &|table| self.declared_column_names(table),
+                ) {
+                    Ok(Some(written)) => parse_create_view_ast(&written, mode),
+                    _ => Err(error),
+                }
+            })
+            .map_err(|error| {
+                MySqlReplaceViewError::Query(MySqlQueryError::Unsupported(error.to_string()))
+            })?;
         if !self.inner.get_auto_commit() {
             self.inner
                 .prepare("COMMIT")

@@ -331,7 +331,6 @@ fn a_view_with_a_condition_is_kept_the_way_mysql_prints_it() {
         "CREATE VIEW bad AS SELECT id FROM posts WHERE title LIKE 'a%'",
         "CREATE VIEW bad AS SELECT id FROM posts WHERE n IN (1, 2)",
         "CREATE VIEW bad AS SELECT id FROM posts WHERE n = -1",
-        "CREATE VIEW bad AS SELECT id FROM posts p WHERE p.n > 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -531,4 +530,294 @@ fn a_view_grouping_its_rows_reports_the_columns_mysql_reports() {
         columns(&mut adapter, "SELECT c FROM v2")[0].column_length,
         21
     );
+}
+
+/// Tables shaped like the ones MySQL 8.4.11 was measured with: a counted
+/// `INT` key, a counted `BIGINT UNSIGNED` key, a `NOT NULL` word with no
+/// default, a `UNIQUE` word and a `DECIMAL`.
+fn joined_tables(adapter: &mut Adapter) {
+    for sql in [
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(191) UNIQUE, age INT)",
+        "CREATE TABLE articles (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id INT NOT NULL, title VARCHAR(200) NOT NULL, body TEXT, score DECIMAL(8,3))",
+        "CREATE TABLE comments (id INT PRIMARY KEY, article_id BIGINT UNSIGNED, note VARCHAR(50))",
+        "INSERT INTO users (name, email, age) VALUES ('Ann', 'a@x', 30), ('Bob', 'b@x', NULL), ('Cy', NULL, 20)",
+        "INSERT INTO articles (user_id, title, body, score) VALUES (1, 'Hello', 'b1', 1.5), (1, 'Two', NULL, NULL), (2, 'Bobs', 'bb', 2)",
+        "INSERT INTO comments VALUES (1, 1, 'c1'), (2, 1, 'c2'), (3, 3, 'c3')",
+    ] {
+        run(adapter, sql);
+    }
+}
+
+fn sorted_rows(adapter: &mut Adapter, sql: &str) -> Vec<String> {
+    let mut rows = rows(adapter, sql);
+    rows.sort();
+    rows
+}
+
+/// MySQL keeps a view joining tables as the text it prints back: each join in
+/// parentheses of its own with its condition in `on(...)`, and every column
+/// qualified by the name its table is read under. The host and the collation
+/// printed differ as they do for every view.
+#[test]
+fn a_view_joining_tables_is_kept_the_way_mysql_prints_it() {
+    let (directory, mut adapter) = adapter();
+    joined_tables(&mut adapter);
+    let shown = |adapter: &mut Adapter, view: &str| {
+        rows(adapter, &format!("SHOW CREATE VIEW {view}"))[0]
+            .split('|')
+            .nth(1)
+            .unwrap()
+            .to_owned()
+    };
+    for (sql, view, select, expected_rows) in [
+        (
+            "CREATE VIEW v1 AS SELECT u.name, a.title FROM users u JOIN articles a ON a.user_id = u.id",
+            "v1",
+            "select `u`.`name` AS `name`,`a`.`title` AS `title` from (`users` `u` join `articles` `a` on((`a`.`user_id` = `u`.`id`)))",
+            &["Ann|Hello", "Ann|Two", "Bob|Bobs"][..],
+        ),
+        (
+            "CREATE VIEW v2 AS SELECT u.id, u.name AS author, a.title FROM users u LEFT JOIN articles a ON a.user_id = u.id WHERE u.id > 1",
+            "v2",
+            "select `u`.`id` AS `id`,`u`.`name` AS `author`,`a`.`title` AS `title` from (`users` `u` left join `articles` `a` on((`a`.`user_id` = `u`.`id`))) where (`u`.`id` > 1)",
+            &["2|Bob|Bobs", "3|Cy|NULL"],
+        ),
+        (
+            "CREATE VIEW v3 AS SELECT u.name, a.title, c.note FROM users u JOIN articles a ON a.user_id = u.id LEFT JOIN comments c ON c.article_id = a.id",
+            "v3",
+            "select `u`.`name` AS `name`,`a`.`title` AS `title`,`c`.`note` AS `note` from ((`users` `u` join `articles` `a` on((`a`.`user_id` = `u`.`id`))) left join `comments` `c` on((`c`.`article_id` = `a`.`id`)))",
+            &["Ann|Hello|c1", "Ann|Hello|c2", "Ann|Two|NULL", "Bob|Bobs|c3"],
+        ),
+        (
+            "CREATE VIEW v4 AS SELECT name, title FROM users INNER JOIN articles ON user_id = users.id",
+            "v4",
+            "select `users`.`name` AS `name`,`articles`.`title` AS `title` from (`users` join `articles` on((`articles`.`user_id` = `users`.`id`)))",
+            &["Ann|Hello", "Ann|Two", "Bob|Bobs"],
+        ),
+        (
+            "CREATE VIEW v6 AS SELECT u.id AS uid, a.id AS aid, a.user_id AS owner FROM users AS u LEFT OUTER JOIN articles AS a ON u.id = a.user_id AND a.score > 1",
+            "v6",
+            "select `u`.`id` AS `uid`,`a`.`id` AS `aid`,`a`.`user_id` AS `owner` from (`users` `u` left join `articles` `a` on(((`u`.`id` = `a`.`user_id`) and (`a`.`score` > 1))))",
+            &["1|1|1", "2|3|2", "3|NULL|NULL"],
+        ),
+        // One table read under an alias is printed under it too.
+        (
+            "CREATE VIEW p1 AS SELECT id FROM posts p WHERE p.n > 1",
+            "p1",
+            "select `p`.`id` AS `id` from `posts` `p` where (`p`.`n` > 1)",
+            &["1", "2"],
+        ),
+        // What a dump writes, across three lines.
+        (
+            "/*!50001 CREATE ALGORITHM=UNDEFINED */\n/*!50013 DEFINER=`root`@`%` SQL SECURITY DEFINER */\n/*!50001 VIEW `user_articles` AS select `u`.`name` AS `name`,`a`.`title` AS `title` from (`users` `u` join `articles` `a` on((`a`.`user_id` = `u`.`id`))) */",
+            "user_articles",
+            "select `u`.`name` AS `name`,`a`.`title` AS `title` from (`users` `u` join `articles` `a` on((`a`.`user_id` = `u`.`id`)))",
+            &["Ann|Hello", "Ann|Two", "Bob|Bobs"],
+        ),
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(
+            shown(&mut adapter, view),
+            format!("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `{view}` AS {select}"),
+            "{sql}"
+        );
+        assert_eq!(
+            sorted_rows(&mut adapter, &format!("SELECT * FROM {view}")),
+            expected_rows,
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT title FROM v2 WHERE author = 'Bob'"),
+        ["Bobs"]
+    );
+
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT TABLE_NAME, IS_UPDATABLE, VIEW_DEFINITION FROM information_schema.VIEWS WHERE TABLE_NAME IN ('v1', 'v2') ORDER BY TABLE_NAME"
+        ),
+        [
+            "v1|YES|select `u`.`name` AS `name`,`a`.`title` AS `title` from (`probe`.`users` `u` join `probe`.`articles` `a` on((`a`.`user_id` = `u`.`id`)))",
+            "v2|NO|select `u`.`id` AS `id`,`u`.`name` AS `author`,`a`.`title` AS `title` from (`probe`.`users` `u` left join `probe`.`articles` `a` on((`a`.`user_id` = `u`.`id`))) where (`u`.`id` > 1)",
+        ]
+    );
+
+    // A column a `LEFT JOIN` can leave missing may be NULL, a view keeps none
+    // of its tables' keys, and a counted column's default is `0`.
+    assert_eq!(
+        rows(&mut adapter, "SHOW COLUMNS FROM v2"),
+        [
+            "id|int|NO||0|",
+            "author|varchar(100)|NO||NULL|",
+            "title|varchar(200)|YES||NULL|",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COLUMN_NAME, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_NAME = 'v2' ORDER BY ORDINAL_POSITION"
+        ),
+        ["id|NO||0|", "author|NO||NULL|", "title|YES||NULL|"]
+    );
+
+    // Measured on MySQL 8.4.11: a comma is printed as a join, `USING` as the
+    // `ON` it stands for and a `RIGHT JOIN` turned around, none of which is
+    // followed here; a column two tables have is 1052 and two columns named
+    // alike 1060.
+    for sql in [
+        "CREATE VIEW bad AS SELECT u.name, a.title FROM users u, articles a WHERE a.user_id = u.id",
+        "CREATE VIEW bad AS SELECT u.name, a.title FROM users u JOIN articles a USING (id)",
+        "CREATE VIEW bad AS SELECT u.name, a.title FROM users u RIGHT JOIN articles a ON a.user_id = u.id",
+        "CREATE VIEW bad AS SELECT * FROM users u JOIN articles a ON a.user_id = u.id",
+        "CREATE VIEW bad AS SELECT id FROM users u JOIN articles a ON a.user_id = u.id",
+        "CREATE VIEW bad AS SELECT u.id, a.id FROM users u JOIN articles a ON a.user_id = u.id",
+        "CREATE VIEW bad AS SELECT u.name FROM users u JOIN articles a ON a.user_id = 'x'",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(
+        shown(&mut adapter, "v3"),
+        "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `v3` AS select `u`.`name` AS `name`,`a`.`title` AS `title`,`c`.`note` AS `note` from ((`users` `u` join `articles` `a` on((`a`.`user_id` = `u`.`id`))) left join `comments` `c` on((`c`.`article_id` = `a`.`id`)))"
+    );
+    assert_eq!(
+        sorted_rows(&mut adapter, "SELECT note FROM v3 WHERE name = 'Ann'"),
+        ["NULL", "c1", "c2"]
+    );
+}
+
+/// Measured on MySQL 8.4.11, through the text and the binary protocol alike:
+/// a `SELECT` reading a view joining tables as its rows come reports each
+/// column the way its table does, keys included, under the view's name — and
+/// without `NOT_NULL` for a column a `LEFT JOIN` can leave missing, whatever
+/// the `SELECT`'s own condition. Sorting the rows reports the joined tables
+/// instead whenever MySQL sorts through a table of its own, which turns on
+/// the plan, so that is refused.
+#[test]
+fn a_view_joining_tables_reports_the_columns_mysql_reports() {
+    let (_directory, mut adapter) = adapter();
+    joined_tables(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE VIEW v2 AS SELECT u.id, u.name AS author, a.title, a.id AS aid, u.email FROM users u LEFT JOIN articles a ON a.user_id = u.id WHERE u.id > 1",
+    );
+    run(
+        &mut adapter,
+        "CREATE VIEW v6 AS SELECT u.id AS uid, a.id AS aid, a.user_id AS owner FROM users AS u LEFT OUTER JOIN articles AS a ON u.id = a.user_id AND a.score > 1",
+    );
+    let shape = |column: &ColumnDefinitionConfig| {
+        (
+            column.name.clone(),
+            column.original_name.clone(),
+            column.table.clone(),
+            column.original_table.clone(),
+            column.column_type,
+            column.column_length,
+            column.decimals,
+            column.flags & !MYSQL_NUM_FLAG,
+        )
+    };
+    let not_null = MYSQL_NOT_NULL_FLAG;
+    let key = MYSQL_PRI_KEY_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG;
+    let no_default = MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let v2 = [
+        ("id", MYSQL_TYPE_LONG, 11, 0, not_null | key),
+        (
+            "author",
+            MYSQL_TYPE_VAR_STRING,
+            400,
+            0,
+            not_null | no_default,
+        ),
+        ("title", MYSQL_TYPE_VAR_STRING, 800, 0, no_default),
+        ("aid", MYSQL_TYPE_LONGLONG, 20, 0, key | MYSQL_UNSIGNED_FLAG),
+        (
+            "email",
+            MYSQL_TYPE_VAR_STRING,
+            764,
+            0,
+            MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG,
+        ),
+    ];
+    let v6 = [
+        ("uid", MYSQL_TYPE_LONG, 11, 0, not_null | key),
+        ("aid", MYSQL_TYPE_LONGLONG, 20, 0, key | MYSQL_UNSIGNED_FLAG),
+        ("owner", MYSQL_TYPE_LONG, 11, 0, no_default),
+    ];
+    let expected = |view: &str, table: &str, columns: &[(&str, u8, u32, u8, u16)]| {
+        columns
+            .iter()
+            .map(|&(name, kind, length, decimals, flags)| {
+                (
+                    name.to_owned(),
+                    name.to_owned(),
+                    table.to_owned(),
+                    view.to_owned(),
+                    kind,
+                    length,
+                    decimals,
+                    flags,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for (sql, view, table, columns) in [
+        ("SELECT * FROM v2", "v2", "v2", &v2[..]),
+        ("SELECT * FROM v2 WHERE title = 'Bobs'", "v2", "v2", &v2),
+        (
+            "SELECT * FROM v2 WHERE author = 'Bob' LIMIT 5",
+            "v2",
+            "v2",
+            &v2,
+        ),
+        (
+            "SELECT x.author FROM v2 x WHERE x.id > 1",
+            "v2",
+            "x",
+            &v2[1..2],
+        ),
+        ("SELECT * FROM v6", "v6", "v6", &v6),
+        ("SELECT * FROM v6 WHERE aid > 0", "v6", "v6", &v6),
+    ] {
+        assert_eq!(
+            columns_of(&mut adapter, sql)
+                .iter()
+                .map(shape)
+                .collect::<Vec<_>>(),
+            expected(view, table, columns),
+            "{sql}"
+        );
+        let prepared = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(
+            prepared.columns.iter().map(shape).collect::<Vec<_>>(),
+            expected(view, table, columns),
+            "prepared {sql}"
+        );
+        adapter.execute_stmt_close(prepared.statement_id);
+    }
+
+    for sql in [
+        "SELECT * FROM v2 ORDER BY author",
+        "SELECT author, COUNT(*) FROM v2 GROUP BY author",
+        "SELECT DISTINCT author FROM v2",
+        "SELECT MAX(author) FROM v2",
+        "SELECT author FROM v2 WHERE id IN (SELECT id FROM users)",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    // A count reads no column of the view.
+    assert_eq!(rows(&mut adapter, "SELECT COUNT(*) FROM v2"), ["2"]);
+}
+
+fn columns_of(adapter: &mut Adapter, sql: &str) -> Vec<ColumnDefinitionConfig> {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::ResultSet(result)) => result.columns,
+        other => panic!("{sql}: {other:?}"),
+    }
 }

@@ -43,7 +43,7 @@ CREATE TABLE `audit` (
 
 LOCK TABLES `audit` WRITE;
 /*!40000 ALTER TABLE `audit` DISABLE KEYS */;
-INSERT INTO `audit` VALUES (1,'post Hello'),(2,'post It\'s \"quoted\"'),(3,'post Café');
+INSERT INTO `audit` VALUES (1,'Hello'),(2,'It\'s \"quoted\"'),(3,'Café');
 /*!40000 ALTER TABLE `audit` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -105,6 +105,19 @@ SET @saved_cs_client     = @@character_set_client;
 SET character_set_client = @saved_cs_client;
 
 --
+-- Temporary view structure for view `user_posts`
+--
+
+DROP TABLE IF EXISTS `user_posts`;
+/*!50001 DROP VIEW IF EXISTS `user_posts`*/;
+SET @saved_cs_client     = @@character_set_client;
+/*!50503 SET character_set_client = utf8mb4 */;
+/*!50001 CREATE VIEW `user_posts` AS SELECT 
+ 1 AS `name`,
+ 1 AS `title`*/;
+SET character_set_client = @saved_cs_client;
+
+--
 -- Table structure for table `users`
 --
 
@@ -156,6 +169,24 @@ USE `probe`;
 /*!50001 SET character_set_client      = @saved_cs_client */;
 /*!50001 SET character_set_results     = @saved_cs_results */;
 /*!50001 SET collation_connection      = @saved_col_connection */;
+
+--
+-- Final view structure for view `user_posts`
+--
+
+/*!50001 DROP VIEW IF EXISTS `user_posts`*/;
+/*!50001 SET @saved_cs_client          = @@character_set_client */;
+/*!50001 SET @saved_cs_results         = @@character_set_results */;
+/*!50001 SET @saved_col_connection     = @@collation_connection */;
+/*!50001 SET character_set_client      = latin1 */;
+/*!50001 SET character_set_results     = latin1 */;
+/*!50001 SET collation_connection      = latin1_swedish_ci */;
+/*!50001 CREATE ALGORITHM=UNDEFINED */
+/*!50013 DEFINER=`dump_owner`@`%` SQL SECURITY DEFINER */
+/*!50001 VIEW `user_posts` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`))) */;
+/*!50001 SET character_set_client      = @saved_cs_client */;
+/*!50001 SET character_set_results     = @saved_cs_results */;
+/*!50001 SET collation_connection      = @saved_col_connection */;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
 
 /*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
@@ -166,4 +197,4 @@ USE `probe`;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2026-09-27 14:26:46
+-- Dump completed on 2026-09-27 23:28:58

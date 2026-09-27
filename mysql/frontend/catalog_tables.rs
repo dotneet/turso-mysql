@@ -376,11 +376,19 @@ impl InternalVirtualTable for InformationSchemaViews {
             let definition = turso_mysql_parser::parse_schema_ddl_ast(decoded.normalized_ddl, mode)
                 .ok()
                 .and_then(|statement| {
-                    turso_mysql_parser::render_view_definition_mysql(
-                        &statement,
-                        &self.database,
-                        &|table, column| stored_column_name(&schema, table, column),
-                    )
+                    if turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement) {
+                        turso_mysql_parser::written_view_definition(
+                            decoded.normalized_ddl,
+                            mode,
+                            &self.database,
+                        )
+                    } else {
+                        turso_mysql_parser::render_view_definition_mysql(
+                            &statement,
+                            &self.database,
+                            &|table, column| stored_column_name(&schema, table, column),
+                        )
+                    }
                     .ok()
                 });
             rows.push(ViewRow {

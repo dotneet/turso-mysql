@@ -3,12 +3,12 @@
 //! MySQL keeps a view as the text it prints in `SHOW CREATE VIEW`: every
 //! column qualified by its table and named with an `AS`, keywords in lower
 //! case, and each comparison and each run of `AND` or `OR` in parentheses of
-//! its own. A view whose `SELECT` carries a condition, groups its rows or
-//! aggregates them is kept here in that same text, so what `SHOW CREATE VIEW`
-//! prints is what was stored.
+//! its own. A view whose `SELECT` carries a condition, groups its rows,
+//! aggregates them, joins tables or names a table under an alias is kept here
+//! in that same text, so what `SHOW CREATE VIEW` prints is what was stored.
 
 use super::*;
-use sqlparser::ast::Query;
+use sqlparser::ast::{JoinConstraint, JoinOperator, Query, TableWithJoins};
 
 /// Names the columns a base table declares, or nothing for any other name.
 pub type DeclaredColumns<'a> = dyn Fn(&MySqlTableName) -> Option<Vec<String>> + 'a;
@@ -18,7 +18,8 @@ pub type DeclaredColumns<'a> = dyn Fn(&MySqlTableName) -> Option<Vec<String>> + 
 ///
 /// `declared_columns` names the columns a table declares, which is how MySQL
 /// writes a column however the statement spelled it: measured on 8.4.11,
-/// `SELECT ID FROM posts` is kept as `` `posts`.`id` AS `ID` ``.
+/// `SELECT ID FROM posts` is kept as `` `posts`.`id` AS `ID` ``, and a column
+/// a join names without its table is kept under the table that has it.
 pub fn view_written_as_mysql_prints_it(
     sql: &str,
     mode: SessionSqlMode,
@@ -47,6 +48,23 @@ pub fn view_written_as_mysql_prints_it(
             Written::AsMySqlPrintsIt
         )?
     )))
+}
+
+/// Reads the name a `CREATE VIEW` makes, before anything else in it is read.
+///
+/// A view joining tables can name a column without its table, which only
+/// the tables' own columns resolve, so whether the rest is taken is found out
+/// later, once they are known.
+pub fn created_view_name(sql: &str, mode: SessionSqlMode) -> Option<MySqlTableName> {
+    let dump_ddl = parse_optional_mysqldump_ddl(sql).ok()?;
+    let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
+    let Ok(Statement::CreateView(view)) = parse_one_statement(sql, mode) else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(name)] = view.name.0.as_slice() else {
+        return None;
+    };
+    MySqlTableName::parse(&name.value).ok()
 }
 
 /// The MySQL DDL a view is kept under.
@@ -99,19 +117,153 @@ pub fn render_show_create_written_view_mysql(
     ))
 }
 
-/// What each column of a view kept in the text MySQL prints reads, and
-/// whether the view groups its rows.
+/// The definition `information_schema.VIEWS` reads a view kept in the text
+/// MySQL prints back as, and whether MySQL can update through it.
+///
+/// Measured on MySQL 8.4.11: every table is named in full,
+/// `` `probe`.`posts` ``, and so is every column of a table read under its own
+/// name, `` `probe`.`posts`.`id` ``, where a column of a table read under an
+/// alias keeps the alias, `` `p`.`id` ``. A view grouping or aggregating its
+/// rows, or reading one of its tables through a `LEFT JOIN`, cannot be
+/// updated through; one reading its tables' columns through a condition or an
+/// inner join can.
+pub fn written_view_definition(
+    sql: &str,
+    mode: SessionSqlMode,
+    database: &str,
+) -> Result<(String, bool), ParseError> {
+    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+        return Err(ParseError::ExpectedCreateView);
+    };
+    let definition = view_body(
+        &view.query,
+        mode,
+        None,
+        Written::AsInformationSchemaPrintsIt { database },
+    )?;
+    let readings = written_view_columns(sql, mode)?;
+    let updatable = !readings.grouped()
+        && readings.sources().iter().all(|source| !source.outer)
+        && readings
+            .columns()
+            .iter()
+            .all(|(_, reading)| matches!(reading, MySqlViewColumnReading::Column { .. }));
+    Ok((definition, updatable))
+}
+
+/// Reports whether a `SELECT` reads its one table's rows as they come: its
+/// columns as they are, under a condition reading no other table, perhaps
+/// cut short by a `LIMIT`.
+///
+/// Measured on MySQL 8.4.11, that is the `SELECT` a view joining tables is
+/// reported the same way for however MySQL plans it. Sorting, grouping,
+/// `DISTINCT` or an aggregate can have MySQL gather the rows in a temporary
+/// table first, which changes the columns it reports, and whether it does
+/// depends on the plan.
+pub fn select_reads_rows_as_they_come(sql: &str, mode: SessionSqlMode) -> bool {
+    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+        return false;
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.fetch.is_some()
+        || query.for_clause.is_some()
+        || query.settings.is_some()
+        || query.format_clause.is_some()
+        || !query.pipe_operators.is_empty()
+    {
+        return false;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    let [from] = select.from.as_slice() else {
+        return false;
+    };
+    matches!(select.flavor, SelectFlavor::Standard)
+        && select.distinct.is_none()
+        && select.top.is_none()
+        && select.into.is_none()
+        && select.having.is_none()
+        && select.named_window.is_empty()
+        && select.qualify.is_none()
+        && matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if exprs.is_empty() && modifiers.is_empty())
+        && from.joins.is_empty()
+        && matches!(from.relation, TableFactor::Table { .. })
+        && select.projection.iter().all(|item| match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+            }
+            _ => false,
+        })
+        && select
+            .selection
+            .as_ref()
+            .is_none_or(condition_reads_no_other_table)
+}
+
+/// Reports whether a condition reads only the columns of the table it
+/// stands over and written values: no subquery, and nothing this does not
+/// look into.
+fn condition_reads_no_other_table(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotFalse(inner) => condition_reads_no_other_table(inner),
+        Expr::BinaryOp { left, right, .. } => {
+            condition_reads_no_other_table(left) && condition_reads_no_other_table(right)
+        }
+        Expr::InList { expr, list, .. } => {
+            condition_reads_no_other_table(expr) && list.iter().all(condition_reads_no_other_table)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => [expr, low, high]
+            .into_iter()
+            .all(|part| condition_reads_no_other_table(part)),
+        Expr::Like {
+            expr,
+            pattern,
+            escape_char: None,
+            ..
+        } => condition_reads_no_other_table(expr) && condition_reads_no_other_table(pattern),
+        _ => false,
+    }
+}
+
+/// What each column of a view kept in the text MySQL prints reads, the
+/// tables it reads them from, and whether it groups its rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlWrittenView {
-    table: MySqlTableName,
+    sources: Vec<MySqlViewSource>,
+    renames_a_table: bool,
     grouped: bool,
     columns: Vec<(String, MySqlViewColumnReading)>,
 }
 
 impl MySqlWrittenView {
-    /// Returns the one table the view reads.
+    /// Returns the first table the view reads, which is the only one a view
+    /// grouping its rows reads.
     pub fn table(&self) -> &MySqlTableName {
-        &self.table
+        &self.sources[0].table
+    }
+
+    /// Returns every table the view reads, in the order its `FROM` names them.
+    pub fn sources(&self) -> &[MySqlViewSource] {
+        &self.sources
+    }
+
+    /// Reports whether the view reads one table under its own name, which
+    /// is the view whose columns the engine's own statement already names.
+    pub fn reads_one_table_by_its_name(&self) -> bool {
+        self.sources.len() == 1 && !self.renames_a_table
     }
 
     /// Reports whether the view groups its rows, by a `GROUP BY` or by an
@@ -127,11 +279,34 @@ impl MySqlWrittenView {
     }
 }
 
+/// One table a view reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlViewSource {
+    table: MySqlTableName,
+    outer: bool,
+}
+
+impl MySqlViewSource {
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Reports whether a `LEFT JOIN` can leave this table's row missing, which
+    /// is what takes `NOT NULL` off its columns.
+    pub const fn outer(&self) -> bool {
+        self.outer
+    }
+}
+
 /// What one column of a view reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlViewColumnReading {
-    /// A column of the table, named as the table declares it.
-    Column(String),
+    /// A column of one of the view's tables, counted among
+    /// [`MySqlWrittenView::sources`] and named as that table declares it.
+    Column {
+        source: usize,
+        column: String,
+    },
     /// `COUNT(*)`, `COUNT(col)` or `COUNT(DISTINCT col)`.
     Count,
     Sum(String),
@@ -148,9 +323,9 @@ pub fn written_view_columns(
     let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
         return Err(ParseError::ExpectedCreateView);
     };
-    let (select, table) = one_table_select(&view.query)?;
+    let (select, from) = view_select(&view.query)?;
     let body = ViewBody {
-        table: &table,
+        from: &from,
         declared: None,
         mode,
         written: Written::AsMySqlPrintsIt,
@@ -160,7 +335,10 @@ pub fn written_view_columns(
     for item in &select.projection {
         let (expr, alias) = projected(item)?;
         let reading = match body.written_column(expr) {
-            Some(column) => MySqlViewColumnReading::Column(column.value.clone()),
+            Some((source, column)) => MySqlViewColumnReading::Column {
+                source,
+                column: column.value.clone(),
+            },
             None => {
                 grouped = true;
                 let (function, argument) = aggregate(expr)?;
@@ -170,6 +348,7 @@ pub fn written_view_columns(
                             .ok_or(ParseError::Unsupported {
                                 feature: "CREATE VIEW aggregate over something other than a column",
                             })?
+                            .1
                             .value
                             .clone(),
                     ),
@@ -187,20 +366,32 @@ pub fn written_view_columns(
         };
         let name = match (alias, &reading) {
             (Some(alias), _) => alias.value.clone(),
-            (None, MySqlViewColumnReading::Column(column)) => column.clone(),
+            (None, MySqlViewColumnReading::Column { column, .. }) => column.clone(),
             (None, _) => return unsupported("CREATE VIEW aggregate without a name"),
         };
         columns.push((name, reading));
     }
+    if grouped && !from.is_one_table_by_its_name() {
+        return unsupported("CREATE VIEW grouping the rows of a join or of a renamed table");
+    }
     Ok(MySqlWrittenView {
-        table,
+        sources: from
+            .sources
+            .iter()
+            .map(|source| MySqlViewSource {
+                table: source.table.clone(),
+                outer: source.outer,
+            })
+            .collect(),
+        renames_a_table: from.sources.iter().any(|source| source.alias.is_some()),
         grouped,
         columns,
     })
 }
 
 /// Reports whether a view is kept in the text MySQL prints: one whose
-/// `SELECT` carries a condition, groups its rows or aggregates them.
+/// `SELECT` carries a condition, groups its rows, aggregates them, joins
+/// tables or reads a table under an alias.
 pub(crate) fn kept_as_mysql_prints_it(query: &Query) -> bool {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return false;
@@ -217,6 +408,11 @@ pub(crate) fn kept_as_mysql_prints_it(query: &Query) -> bool {
                     }
             )
         })
+        || select.from.len() > 1
+        || select.from.iter().any(|from| {
+            !from.joins.is_empty()
+                || !matches!(from.relation, TableFactor::Table { alias: None, .. })
+        })
 }
 
 /// Reports whether a translated view is kept in the text MySQL prints.
@@ -228,6 +424,7 @@ pub fn translated_view_is_kept_as_mysql_prints_it(statement: &Stmt) -> bool {
         columns,
         where_clause,
         group_by,
+        from,
         ..
     } = &select.body.select
     else {
@@ -245,14 +442,22 @@ pub fn translated_view_is_kept_as_mysql_prints_it(statement: &Stmt) -> bool {
                     )
             )
         })
+        || from.as_ref().is_some_and(|from| {
+            !from.joins.is_empty()
+                || matches!(from.select.as_ref(), SelectTable::Table(_, Some(_), _))
+        })
 }
 
-/// Which of the two texts a view's `SELECT` is written into.
+/// Which of the texts a view's `SELECT` is written into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Written {
+pub(crate) enum Written<'a> {
     /// As MySQL prints it back: `` `t`.`c` ``, `count(0)`, `group by`.
     AsMySqlPrintsIt,
-    /// As the `SELECT` translator reads it: each column bare, `COUNT(*)`.
+    /// As `information_schema.VIEWS` prints it back, every table named with
+    /// its database: `` `db`.`t`.`c` ``.
+    AsInformationSchemaPrintsIt { database: &'a str },
+    /// As the `SELECT` translator reads it: `COUNT(*)`, and each column bare
+    /// when the view reads one table under its own name.
     ForTheTranslator,
 }
 
@@ -265,19 +470,24 @@ pub(crate) fn view_body(
     query: &Query,
     mode: SessionSqlMode,
     declared_columns: Option<&DeclaredColumns<'_>>,
-    written: Written,
+    written: Written<'_>,
 ) -> Result<String, ParseError> {
-    let (select, table) = one_table_select(query)?;
+    let (select, from) = view_select(query)?;
     let declared = match declared_columns {
-        Some(declared_columns) => {
-            Some(declared_columns(&table).ok_or(ParseError::Unsupported {
-                feature: "CREATE VIEW over something other than a base table",
-            })?)
-        }
+        Some(declared_columns) => Some(
+            from.sources
+                .iter()
+                .map(|source| {
+                    declared_columns(&source.table).ok_or(ParseError::Unsupported {
+                        feature: "CREATE VIEW over something other than a base table",
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         None => None,
     };
     let body = ViewBody {
-        table: &table,
+        from: &from,
         declared: declared.as_deref(),
         mode,
         written,
@@ -290,21 +500,34 @@ pub(crate) fn view_body(
     if columns.is_empty() {
         return unsupported("CREATE VIEW without projections");
     }
-    let mut text = format!(
-        "select {} from {}",
-        columns.join(","),
-        quoted_name(table.as_str())
-    );
+    let names = select
+        .projection
+        .iter()
+        .map(|item| body.column_name(item))
+        .collect::<Result<Vec<_>, _>>()?;
+    // MySQL answers 1060 for a view naming two columns alike.
+    for (at, name) in names.iter().enumerate() {
+        if names[..at]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            return unsupported("CREATE VIEW naming two columns alike");
+        }
+    }
+    let mut text = format!("select {} from {}", columns.join(","), body.written_from()?);
     if let Some(condition) = &select.selection {
         text.push_str(" where ");
         text.push_str(&body.condition(condition)?);
     }
     let grouping = group_by_columns(select)?;
     if !grouping.is_empty() {
+        if !from.is_one_table_by_its_name() {
+            return unsupported("CREATE VIEW grouping the rows of a join or of a renamed table");
+        }
         let grouping = grouping
             .iter()
             .map(|expr| match body.written_column(expr) {
-                Some(column) => body.column(column),
+                Some((source, column)) => body.column(source, column),
                 None => unsupported("CREATE VIEW grouping by something other than a column"),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -314,11 +537,9 @@ pub(crate) fn view_body(
     Ok(text)
 }
 
-/// Reads a view's `SELECT` over one table, refusing every clause whose
-/// printing has not been measured.
-fn one_table_select(
-    query: &Query,
-) -> Result<(&sqlparser::ast::Select, MySqlTableName), ParseError> {
+/// Reads a view's `SELECT` and the tables its `FROM` reads, refusing every
+/// clause whose printing has not been measured.
+fn view_select(query: &Query) -> Result<(&sqlparser::ast::Select, ViewFrom<'_>), ParseError> {
     if query.with.is_some()
         || query.order_by.is_some()
         || query.limit_clause.is_some()
@@ -356,15 +577,97 @@ fn one_table_select(
     {
         return unsupported("CREATE VIEW SELECT feature");
     }
+    // Measured on MySQL 8.4.11, a comma between two tables is printed
+    // `` (`a` join `b`) `` by `SHOW CREATE VIEW` and `` `a` join `b` `` by
+    // `information_schema.VIEWS`, which has not been followed further.
     let [from] = select.from.as_slice() else {
         return unsupported("CREATE VIEW FROM clause");
     };
-    if !from.joins.is_empty() {
-        return unsupported("CREATE VIEW JOIN");
+    let mut view_from = ViewFrom {
+        sources: Vec::new(),
+        joins: Vec::new(),
+    };
+    view_from.gather(from)?;
+    for (at, source) in view_from.sources.iter().enumerate() {
+        // MySQL answers 1066 for two tables read under one name.
+        if view_from.sources[..at]
+            .iter()
+            .any(|earlier| earlier.reference().eq_ignore_ascii_case(source.reference()))
+        {
+            return unsupported("CREATE VIEW reading two tables under one name");
+        }
     }
+    Ok((select, view_from))
+}
+
+/// The tables a view reads, in the order its `FROM` names them, and what
+/// each table after the first is joined on.
+struct ViewFrom<'q> {
+    sources: Vec<ViewSource>,
+    /// The join bringing in `sources[at + 1]` is `joins[at]`.
+    joins: Vec<ViewJoin<'q>>,
+}
+
+struct ViewSource {
+    table: MySqlTableName,
+    alias: Option<String>,
+    outer: bool,
+}
+
+impl ViewSource {
+    /// The name the view's columns are qualified by.
+    fn reference(&self) -> &str {
+        self.alias.as_deref().unwrap_or(self.table.as_str())
+    }
+}
+
+struct ViewJoin<'q> {
+    left: bool,
+    on: &'q Expr,
+}
+
+impl<'q> ViewFrom<'q> {
+    /// Reads the tables of one `FROM` entry, left to right. MySQL prints a
+    /// join of three tables as the join of the first two joined to the
+    /// third, `` ((`a` join `b` on(...)) join `c` on(...)) ``, which reads
+    /// back as a join nested on the left.
+    fn gather(&mut self, from: &'q TableWithJoins) -> Result<(), ParseError> {
+        match &from.relation {
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias: None,
+            } if !table_with_joins.joins.is_empty() => self.gather(table_with_joins)?,
+            relation => self.sources.push(view_source(relation, false)?),
+        }
+        for join in &from.joins {
+            if join.global {
+                return unsupported("CREATE VIEW JOIN form");
+            }
+            // A `RIGHT JOIN` is printed turned around into a `LEFT JOIN`, and
+            // `USING` as the `ON` it stands for, both measured on 8.4.11 and
+            // neither followed here.
+            let (left, on) = match &join.join_operator {
+                JoinOperator::Join(JoinConstraint::On(on))
+                | JoinOperator::Inner(JoinConstraint::On(on)) => (false, on),
+                JoinOperator::Left(JoinConstraint::On(on))
+                | JoinOperator::LeftOuter(JoinConstraint::On(on)) => (true, on),
+                _ => return unsupported("CREATE VIEW JOIN form"),
+            };
+            self.sources.push(view_source(&join.relation, left)?);
+            self.joins.push(ViewJoin { left, on });
+        }
+        Ok(())
+    }
+
+    fn is_one_table_by_its_name(&self) -> bool {
+        matches!(self.sources.as_slice(), [source] if source.alias.is_none())
+    }
+}
+
+fn view_source(relation: &TableFactor, outer: bool) -> Result<ViewSource, ParseError> {
     let TableFactor::Table {
         name,
-        alias: None,
+        alias,
         args: None,
         with_hints,
         version: None,
@@ -373,7 +676,7 @@ fn one_table_select(
         json_path: None,
         sample: None,
         index_hints,
-    } = &from.relation
+    } = relation
     else {
         return unsupported("CREATE VIEW table source");
     };
@@ -383,7 +686,18 @@ fn one_table_select(
     let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
         return unsupported("CREATE VIEW over a qualified table");
     };
-    Ok((select, MySqlTableName::parse(&table.value)?))
+    let alias = match alias {
+        None => None,
+        Some(alias) if alias.columns.is_empty() && alias.at.is_none() => {
+            Some(alias.name.value.clone())
+        }
+        Some(_) => return unsupported("CREATE VIEW table alias form"),
+    };
+    Ok(ViewSource {
+        table: MySqlTableName::parse(&table.value)?,
+        alias,
+        outer,
+    })
 }
 
 fn group_by_columns(select: &sqlparser::ast::Select) -> Result<&[Expr], ParseError> {
@@ -483,10 +797,11 @@ fn aggregate(expr: &Expr) -> Result<(Aggregate, Option<&Expr>), ParseError> {
 
 /// What writing one view's `SELECT` needs to know.
 struct ViewBody<'a> {
-    table: &'a MySqlTableName,
-    declared: Option<&'a [String]>,
+    from: &'a ViewFrom<'a>,
+    /// The columns each table declares, in the order of `from.sources`.
+    declared: Option<&'a [Vec<String>]>,
     mode: SessionSqlMode,
-    written: Written,
+    written: Written<'a>,
 }
 
 impl ViewBody<'_> {
@@ -496,13 +811,16 @@ impl ViewBody<'_> {
     /// written as, spacing and all.
     fn projected_column(&self, item: &SelectItem) -> Result<String, ParseError> {
         let (expr, alias) = projected(item)?;
-        if let Some(column) = self.written_column(expr) {
+        if let Some((source, column)) = self.written_column(expr) {
             let name = alias.unwrap_or(column);
             return Ok(format!(
                 "{} AS {}",
-                self.column(column)?,
+                self.column(source, column)?,
                 quoted_name(&name.value)
             ));
+        }
+        if !self.from.is_one_table_by_its_name() {
+            return unsupported("CREATE VIEW aggregating the rows of a join or of a renamed table");
         }
         let Some(alias) = alias else {
             return unsupported("CREATE VIEW aggregate without a name");
@@ -514,6 +832,16 @@ impl ViewBody<'_> {
         ))
     }
 
+    /// The name one result column answers under.
+    fn column_name(&self, item: &SelectItem) -> Result<String, ParseError> {
+        let (expr, alias) = projected(item)?;
+        match (alias, self.written_column(expr)) {
+            (Some(alias), _) => Ok(alias.value.clone()),
+            (None, Some((_, column))) => Ok(column.value.clone()),
+            (None, None) => unsupported("CREATE VIEW aggregate without a name"),
+        }
+    }
+
     /// Writes an aggregate: measured on MySQL 8.4.11, `COUNT(*)` is printed
     /// `count(0)` and the rest by their names in lower case over their
     /// qualified column, `count(distinct ...)` among them.
@@ -521,14 +849,14 @@ impl ViewBody<'_> {
         let (function, argument) = aggregate(expr)?;
         let argument = match argument {
             Some(argument) => match self.written_column(argument) {
-                Some(column) => Some(self.column(column)?),
+                Some((source, column)) => Some(self.column(source, column)?),
                 None => {
                     return unsupported("CREATE VIEW aggregate over something other than a column")
                 }
             },
             None => None,
         };
-        let prints = self.written == Written::AsMySqlPrintsIt;
+        let prints = self.written != Written::ForTheTranslator;
         Ok(match (function, argument) {
             (Aggregate::Count { .. }, None) if prints => "count(0)".to_owned(),
             (Aggregate::Count { .. }, None) => "COUNT(*)".to_owned(),
@@ -556,28 +884,51 @@ impl ViewBody<'_> {
         })
     }
 
-    /// Reads the column an expression names, refusing a qualifier naming any
-    /// table but the view's own.
-    fn written_column<'e>(&self, expr: &'e Expr) -> Option<&'e Ident> {
+    /// Reads the column an expression names and which of the view's tables
+    /// has it.
+    ///
+    /// A qualifier has to be the name the table is read under — its alias
+    /// when it has one, as in MySQL, which answers 1054 for the table's own
+    /// name then. A bare column in a view of one table is that table's; in a
+    /// join it is the one table's that declares it, and without the declared
+    /// columns to tell, as when reading text MySQL printed, where every column
+    /// is qualified, it names none.
+    fn written_column<'e>(&self, expr: &'e Expr) -> Option<(usize, &'e Ident)> {
         match expr {
-            Expr::Identifier(column) => Some(column),
-            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
-                [qualifier, column]
-                    if qualifier.value.eq_ignore_ascii_case(self.table.as_str()) =>
-                {
-                    Some(column)
+            Expr::Identifier(column) if self.from.sources.len() == 1 => Some((0, column)),
+            Expr::Identifier(column) => {
+                let declared = self.declared?;
+                let mut having = declared.iter().enumerate().filter(|(_, columns)| {
+                    columns
+                        .iter()
+                        .any(|declared| declared.eq_ignore_ascii_case(&column.value))
+                });
+                let (source, _) = having.next()?;
+                // MySQL answers 1052 for a column two of the tables have.
+                if having.next().is_some() {
+                    return None;
                 }
+                Some((source, column))
+            }
+            Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+                [qualifier, column] => self
+                    .from
+                    .sources
+                    .iter()
+                    .position(|source| source.reference().eq_ignore_ascii_case(&qualifier.value))
+                    .map(|source| (source, column)),
                 _ => None,
             },
             _ => None,
         }
     }
 
-    /// Writes a column: qualified by its table, as MySQL prints it, or bare,
-    /// as the translator reads the one table a view reads.
-    fn column(&self, column: &Ident) -> Result<String, ParseError> {
+    /// Writes a column: qualified by the name its table is read under, as
+    /// MySQL prints it, or bare, as the translator reads the one table a view
+    /// reads under its own name.
+    fn column(&self, source: usize, column: &Ident) -> Result<String, ParseError> {
         let declared = match self.declared {
-            Some(declared) => declared
+            Some(declared) => declared[source]
                 .iter()
                 .find(|declared| declared.eq_ignore_ascii_case(&column.value))
                 .ok_or(ParseError::Unsupported {
@@ -586,14 +937,80 @@ impl ViewBody<'_> {
                 .as_str(),
             None => column.value.as_str(),
         };
+        let read = &self.from.sources[source];
         Ok(match self.written {
-            Written::AsMySqlPrintsIt => format!(
-                "{}.{}",
-                quoted_name(self.table.as_str()),
+            Written::AsMySqlPrintsIt => {
+                format!(
+                    "{}.{}",
+                    quoted_name(read.reference()),
+                    quoted_name(declared)
+                )
+            }
+            Written::AsInformationSchemaPrintsIt { database } if read.alias.is_none() => format!(
+                "{}.{}.{}",
+                quoted_name(database),
+                quoted_name(read.table.as_str()),
                 quoted_name(declared)
             ),
-            Written::ForTheTranslator => quoted_name(declared),
+            Written::AsInformationSchemaPrintsIt { .. } => {
+                format!(
+                    "{}.{}",
+                    quoted_name(read.reference()),
+                    quoted_name(declared)
+                )
+            }
+            Written::ForTheTranslator if self.from.is_one_table_by_its_name() => {
+                quoted_name(declared)
+            }
+            Written::ForTheTranslator => {
+                format!(
+                    "{}.{}",
+                    quoted_name(read.reference()),
+                    quoted_name(declared)
+                )
+            }
         })
+    }
+
+    /// Writes the `FROM`: measured on MySQL 8.4.11, a table read under an
+    /// alias is `` `posts` `p` ``, and each join stands in parentheses of its
+    /// own with its condition in `on(...)` —
+    /// `` ((`a` join `b` on((...))) left join `c` on((...))) ``. The
+    /// translator reads the same joins left to right without them.
+    fn written_from(&self) -> Result<String, ParseError> {
+        let mut text = self.table(0);
+        for (at, join) in self.from.joins.iter().enumerate() {
+            let table = self.table(at + 1);
+            let on = self.condition(join.on)?;
+            text = match (self.written, join.left) {
+                (Written::ForTheTranslator, false) => format!("{text} JOIN {table} ON {on}"),
+                (Written::ForTheTranslator, true) => format!("{text} LEFT JOIN {table} ON {on}"),
+                (_, false) => format!("({text} join {table} on({on}))"),
+                (_, true) => format!("({text} left join {table} on({on}))"),
+            };
+        }
+        Ok(text)
+    }
+
+    fn table(&self, source: usize) -> String {
+        let read = &self.from.sources[source];
+        let table = match self.written {
+            Written::AsInformationSchemaPrintsIt { database } => {
+                format!(
+                    "{}.{}",
+                    quoted_name(database),
+                    quoted_name(read.table.as_str())
+                )
+            }
+            _ => quoted_name(read.table.as_str()),
+        };
+        match (&read.alias, self.written) {
+            (None, _) => table,
+            (Some(alias), Written::ForTheTranslator) => {
+                format!("{table} AS {}", quoted_name(alias))
+            }
+            (Some(alias), _) => format!("{table} {}", quoted_name(alias)),
+        }
     }
 
     /// Writes a condition: measured on MySQL 8.4.11, each comparison stands
@@ -644,8 +1061,8 @@ impl ViewBody<'_> {
     }
 
     fn operand(&self, expr: &Expr) -> Result<String, ParseError> {
-        if let Some(column) = self.written_column(expr) {
-            return self.column(column);
+        if let Some((source, column)) = self.written_column(expr) {
+            return self.column(source, column);
         }
         let Expr::Value(value) = expr else {
             return unsupported("CREATE VIEW condition operand");
@@ -726,6 +1143,8 @@ mod tests {
         match table.as_str() {
             "posts" => Some(["id", "user_id", "n", "title"].map(str::to_owned).to_vec()),
             "keyed" => Some(["id", "code", "grp", "amount"].map(str::to_owned).to_vec()),
+            "users" => Some(["id", "name", "email", "age"].map(str::to_owned).to_vec()),
+            "comments" => Some(["id", "post_id", "note"].map(str::to_owned).to_vec()),
             _ => None,
         }
     }
@@ -780,7 +1199,10 @@ mod tests {
             [
                 (
                     "grp".to_owned(),
-                    MySqlViewColumnReading::Column("grp".to_owned())
+                    MySqlViewColumnReading::Column {
+                        source: 0,
+                        column: "grp".to_owned()
+                    }
                 ),
                 (
                     "s".to_owned(),
@@ -808,6 +1230,165 @@ mod tests {
 
     fn written(sql: &str) -> Option<String> {
         view_written_as_mysql_prints_it(sql, SessionSqlMode::default(), &declared).unwrap()
+    }
+
+    /// Each expectation is what MySQL 8.4.11 printed for the same statement,
+    /// through `SHOW CREATE VIEW` and through `information_schema.VIEWS`.
+    #[test]
+    fn a_view_joining_tables_is_written_the_way_mysql_prints_it() {
+        for (sql, expected, translated, definition, updatable) in [
+            (
+                "CREATE VIEW v1 AS SELECT u.name, p.title FROM users u JOIN posts p ON p.user_id = u.id",
+                "CREATE VIEW `v1` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`)))",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title` from `users` AS `u` JOIN `posts` AS `p` ON (`p`.`user_id` = `u`.`id`)",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title` from (`probe`.`users` `u` join `probe`.`posts` `p` on((`p`.`user_id` = `u`.`id`)))",
+                true,
+            ),
+            (
+                "CREATE VIEW v2 AS SELECT u.id, u.name AS author, p.title FROM users u LEFT JOIN posts p ON p.user_id = u.id WHERE u.id > 1",
+                "CREATE VIEW `v2` AS select `u`.`id` AS `id`,`u`.`name` AS `author`,`p`.`title` AS `title` from (`users` `u` left join `posts` `p` on((`p`.`user_id` = `u`.`id`))) where (`u`.`id` > 1)",
+                "select `u`.`id` AS `id`,`u`.`name` AS `author`,`p`.`title` AS `title` from `users` AS `u` LEFT JOIN `posts` AS `p` ON (`p`.`user_id` = `u`.`id`) where (`u`.`id` > 1)",
+                "select `u`.`id` AS `id`,`u`.`name` AS `author`,`p`.`title` AS `title` from (`probe`.`users` `u` left join `probe`.`posts` `p` on((`p`.`user_id` = `u`.`id`))) where (`u`.`id` > 1)",
+                false,
+            ),
+            (
+                "CREATE VIEW v3 AS SELECT u.name, p.title, c.note FROM users u JOIN posts p ON p.user_id = u.id LEFT JOIN comments c ON c.post_id = p.id",
+                "CREATE VIEW `v3` AS select `u`.`name` AS `name`,`p`.`title` AS `title`,`c`.`note` AS `note` from ((`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`))) left join `comments` `c` on((`c`.`post_id` = `p`.`id`)))",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title`,`c`.`note` AS `note` from `users` AS `u` JOIN `posts` AS `p` ON (`p`.`user_id` = `u`.`id`) LEFT JOIN `comments` AS `c` ON (`c`.`post_id` = `p`.`id`)",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title`,`c`.`note` AS `note` from ((`probe`.`users` `u` join `probe`.`posts` `p` on((`p`.`user_id` = `u`.`id`))) left join `probe`.`comments` `c` on((`c`.`post_id` = `p`.`id`)))",
+                false,
+            ),
+            (
+                "CREATE VIEW v4 AS SELECT users.name, posts.title FROM users INNER JOIN posts ON posts.user_id = users.id",
+                "CREATE VIEW `v4` AS select `users`.`name` AS `name`,`posts`.`title` AS `title` from (`users` join `posts` on((`posts`.`user_id` = `users`.`id`)))",
+                "select `users`.`name` AS `name`,`posts`.`title` AS `title` from `users` JOIN `posts` ON (`posts`.`user_id` = `users`.`id`)",
+                "select `probe`.`users`.`name` AS `name`,`probe`.`posts`.`title` AS `title` from (`probe`.`users` join `probe`.`posts` on((`probe`.`posts`.`user_id` = `probe`.`users`.`id`)))",
+                true,
+            ),
+            (
+                "CREATE VIEW v5 AS SELECT name, title FROM users JOIN posts ON user_id = users.id",
+                "CREATE VIEW `v5` AS select `users`.`name` AS `name`,`posts`.`title` AS `title` from (`users` join `posts` on((`posts`.`user_id` = `users`.`id`)))",
+                "select `users`.`name` AS `name`,`posts`.`title` AS `title` from `users` JOIN `posts` ON (`posts`.`user_id` = `users`.`id`)",
+                "select `probe`.`users`.`name` AS `name`,`probe`.`posts`.`title` AS `title` from (`probe`.`users` join `probe`.`posts` on((`probe`.`posts`.`user_id` = `probe`.`users`.`id`)))",
+                true,
+            ),
+            (
+                "CREATE VIEW v6 AS SELECT u.id AS uid, p.id AS pid, p.n FROM users AS u LEFT OUTER JOIN posts AS p ON u.id = p.user_id AND p.n > 1",
+                "CREATE VIEW `v6` AS select `u`.`id` AS `uid`,`p`.`id` AS `pid`,`p`.`n` AS `n` from (`users` `u` left join `posts` `p` on(((`u`.`id` = `p`.`user_id`) and (`p`.`n` > 1))))",
+                "select `u`.`id` AS `uid`,`p`.`id` AS `pid`,`p`.`n` AS `n` from `users` AS `u` LEFT JOIN `posts` AS `p` ON ((`u`.`id` = `p`.`user_id`) and (`p`.`n` > 1))",
+                "select `u`.`id` AS `uid`,`p`.`id` AS `pid`,`p`.`n` AS `n` from (`probe`.`users` `u` left join `probe`.`posts` `p` on(((`u`.`id` = `p`.`user_id`) and (`p`.`n` > 1))))",
+                false,
+            ),
+            (
+                "CREATE VIEW v8 AS SELECT u.name, p.title FROM users u JOIN posts p ON p.user_id = u.id JOIN comments c ON c.post_id = p.id WHERE c.note <> 'x' AND u.age IS NOT NULL",
+                "CREATE VIEW `v8` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from ((`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`))) join `comments` `c` on((`c`.`post_id` = `p`.`id`))) where ((`c`.`note` <> 'x') and (`u`.`age` is not null))",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title` from `users` AS `u` JOIN `posts` AS `p` ON (`p`.`user_id` = `u`.`id`) JOIN `comments` AS `c` ON (`c`.`post_id` = `p`.`id`) where ((`c`.`note` <> 'x') and (`u`.`age` is not null))",
+                "select `u`.`name` AS `name`,`p`.`title` AS `title` from ((`probe`.`users` `u` join `probe`.`posts` `p` on((`p`.`user_id` = `u`.`id`))) join `probe`.`comments` `c` on((`c`.`post_id` = `p`.`id`))) where ((`c`.`note` <> 'x') and (`u`.`age` is not null))",
+                true,
+            ),
+            (
+                "CREATE VIEW w4 AS SELECT id FROM posts p WHERE p.user_id = 1",
+                "CREATE VIEW `w4` AS select `p`.`id` AS `id` from `posts` `p` where (`p`.`user_id` = 1)",
+                "select `p`.`id` AS `id` from `posts` AS `p` where (`p`.`user_id` = 1)",
+                "select `p`.`id` AS `id` from `probe`.`posts` `p` where (`p`.`user_id` = 1)",
+                true,
+            ),
+            (
+                "CREATE VIEW w3 AS SELECT p.id FROM posts p",
+                "CREATE VIEW `w3` AS select `p`.`id` AS `id` from `posts` `p`",
+                "select `p`.`id` AS `id` from `posts` AS `p`",
+                "select `p`.`id` AS `id` from `probe`.`posts` `p`",
+                true,
+            ),
+            (
+                "CREATE VIEW w1 AS SELECT id, title FROM posts WHERE user_id > 1",
+                "CREATE VIEW `w1` AS select `posts`.`id` AS `id`,`posts`.`title` AS `title` from `posts` where (`posts`.`user_id` > 1)",
+                "select `id` AS `id`,`title` AS `title` from `posts` where (`user_id` > 1)",
+                "select `probe`.`posts`.`id` AS `id`,`probe`.`posts`.`title` AS `title` from `probe`.`posts` where (`probe`.`posts`.`user_id` > 1)",
+                true,
+            ),
+            (
+                "CREATE VIEW w2 AS SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id",
+                "CREATE VIEW `w2` AS select `posts`.`user_id` AS `user_id`,count(0) AS `c` from `posts` group by `posts`.`user_id`",
+                "select `user_id` AS `user_id`,COUNT(*) AS `c` from `posts` group by `user_id`",
+                "select `probe`.`posts`.`user_id` AS `user_id`,count(0) AS `c` from `probe`.`posts` group by `probe`.`posts`.`user_id`",
+                false,
+            ),
+        ] {
+            let written = written(sql).unwrap_or_else(|| panic!("{sql}"));
+            assert_eq!(written, expected, "{sql}");
+            assert_eq!(self::written(&written).as_deref(), Some(expected));
+            let mode = SessionSqlMode::default();
+            assert_eq!(translated_view_select(&written, mode).unwrap(), translated);
+            assert_eq!(
+                written_view_definition(&written, mode, "probe").unwrap(),
+                (definition.to_owned(), updatable),
+                "{sql}"
+            );
+        }
+
+        let dumped = "/*!50001 CREATE ALGORITHM=UNDEFINED */\n/*!50013 DEFINER=`root`@`%` SQL SECURITY DEFINER */\n/*!50001 VIEW `user_posts` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`))) */";
+        assert_eq!(
+            written(dumped).as_deref(),
+            Some("CREATE VIEW `user_posts` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`)))")
+        );
+
+        let readings = written_view_columns(
+            "CREATE VIEW `v2` AS select `u`.`id` AS `id`,`u`.`name` AS `author`,`p`.`title` AS `title` from (`users` `u` left join `posts` `p` on((`p`.`user_id` = `u`.`id`))) where (`u`.`id` > 1)",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(!readings.grouped());
+        assert!(!readings.reads_one_table_by_its_name());
+        assert_eq!(
+            readings
+                .sources()
+                .iter()
+                .map(|source| (source.table().as_str(), source.outer()))
+                .collect::<Vec<_>>(),
+            [("users", false), ("posts", true)]
+        );
+        assert_eq!(
+            readings.columns()[1],
+            (
+                "author".to_owned(),
+                MySqlViewColumnReading::Column {
+                    source: 0,
+                    column: "name".to_owned()
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_join_mysql_prints_by_rules_not_measured_is_refused() {
+        for sql in [
+            // MySQL prints a comma as a join, `USING` as the `ON` it stands
+            // for, and a `RIGHT JOIN` turned around.
+            "CREATE VIEW v AS SELECT u.name, p.title FROM users u, posts p WHERE p.user_id = u.id",
+            "CREATE VIEW v AS SELECT u.name, p.title FROM users u JOIN posts p USING (id)",
+            "CREATE VIEW v AS SELECT u.name, p.title FROM users u RIGHT JOIN posts p ON p.user_id = u.id",
+            "CREATE VIEW v AS SELECT u.name, p.title FROM users u CROSS JOIN posts p",
+            "CREATE VIEW v AS SELECT u.name, p.title FROM users u NATURAL JOIN posts p",
+            "CREATE VIEW v AS SELECT u.name FROM users u JOIN (posts p JOIN comments c ON c.post_id = p.id) ON p.user_id = u.id",
+            // 1052, 1060, 1066 and 1054 in MySQL.
+            "CREATE VIEW v AS SELECT id FROM users u JOIN posts p ON p.user_id = u.id",
+            "CREATE VIEW v AS SELECT u.id, p.id FROM users u JOIN posts p ON p.user_id = u.id",
+            "CREATE VIEW v AS SELECT users.id FROM users JOIN users ON users.id = users.id",
+            "CREATE VIEW v AS SELECT posts.id FROM posts p",
+            "CREATE VIEW v AS SELECT u.missing FROM users u JOIN posts p ON p.user_id = u.id",
+            // Not measured.
+            "CREATE VIEW v AS SELECT * FROM users u JOIN posts p ON p.user_id = u.id",
+            "CREATE VIEW v AS SELECT u.name, COUNT(*) AS c FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.name",
+            "CREATE VIEW v AS SELECT COUNT(*) AS c FROM posts p",
+            "CREATE VIEW v AS SELECT u.name FROM users u JOIN plain x ON x.id = u.id",
+            "CREATE VIEW v AS SELECT u.name FROM users u JOIN posts p ON p.user_id = u.id ORDER BY u.name",
+        ] {
+            assert!(
+                view_written_as_mysql_prints_it(sql, SessionSqlMode::default(), &declared).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     /// Each expectation is what MySQL 8.4.11 printed for the same statement.
@@ -873,7 +1454,6 @@ mod tests {
             "CREATE VIEW v AS SELECT id FROM posts WHERE n = ?",
             "CREATE VIEW v AS SELECT id FROM posts WHERE missing = 1",
             "CREATE VIEW v AS SELECT other.id FROM posts WHERE n = 1",
-            "CREATE VIEW v AS SELECT id FROM posts p WHERE p.n = 1",
             "CREATE VIEW v AS SELECT id FROM plain WHERE id = 1",
             "CREATE VIEW v AS SELECT id + 1 AS i FROM posts WHERE n = 1",
             "CREATE VIEW v AS SELECT id FROM posts WHERE n = 1 ORDER BY id",

@@ -5,8 +5,10 @@
 //! --single-transaction --databases probe` from MySQL 8.4.11, of a schema with
 //! counted tables, a foreign key, `JSON`, `DECIMAL` defaults, a
 //! `utf8mb4_unicode_ci` table beside `utf8mb4_0900_ai_ci` ones, a trigger, and
-//! a view created by a latin1 client. Every expectation here was measured by
-//! restoring that same file there.
+//! a view of one table and a view joining two, both created by a latin1
+//! client. Its objects were made by an account `dump_owner`@`%`, which is the
+//! `DEFINER` the dump names. Every expectation here was measured by restoring
+//! that same file there.
 
 use super::*;
 
@@ -169,14 +171,14 @@ fn a_standard_dump_restores_every_row_it_holds() {
             ]),
         ]
     );
-    // The trigger was made after the rows, so restoring them wrote nothing
-    // more into the audit table.
+    // The dump makes the trigger after the rows, so restoring them wrote
+    // nothing more into the audit table.
     assert_eq!(
         rows(&mut adapter, "SELECT * FROM audit ORDER BY id"),
         [
-            row(&[Some("1"), Some("post Hello")]),
-            row(&[Some("2"), Some("post It's \"quoted\"")]),
-            row(&[Some("3"), Some("post Café")]),
+            row(&[Some("1"), Some("Hello")]),
+            row(&[Some("2"), Some("It's \"quoted\"")]),
+            row(&[Some("3"), Some("Café")]),
         ]
     );
     assert_eq!(
@@ -185,6 +187,16 @@ fn a_standard_dump_restores_every_row_it_holds() {
             row(&[Some("1"), Some("Ann")]),
             row(&[Some("2"), Some("Bob")]),
             row(&[Some("3"), Some("Émile")]),
+        ]
+    );
+    let mut joined = rows(&mut adapter, "SELECT * FROM user_posts");
+    joined.sort();
+    assert_eq!(
+        joined,
+        [
+            row(&[Some("Ann"), Some("Hello")]),
+            row(&[Some("Ann"), Some("It's \"quoted\"")]),
+            row(&[Some("Émile"), Some("Café")]),
         ]
     );
 }
@@ -272,6 +284,14 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
     assert_eq!(
         adapter.execute_query("UPDATE posts SET user_id = 99 WHERE id = 2"),
         Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    // The view over a join prints the text the dump restored it from, as
+    // MySQL's does.
+    assert_eq!(
+        rows(&mut adapter, "SHOW CREATE VIEW user_posts")[0][1].as_deref(),
+        Some(
+            "CREATE ALGORITHM=UNDEFINED DEFINER=`dump_owner`@`%` SQL SECURITY DEFINER VIEW `user_posts` AS select `u`.`name` AS `name`,`p`.`title` AS `title` from (`users` `u` join `posts` `p` on((`p`.`user_id` = `u`.`id`)))"
+        )
     );
     let triggers = rows(&mut adapter, "SHOW TRIGGERS");
     assert_eq!(triggers.len(), 1);
