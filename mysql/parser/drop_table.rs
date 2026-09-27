@@ -8,14 +8,16 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 /// One checked `DROP TABLE` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlDropTableCommand {
-    table: MySqlTableName,
+    tables: Vec<MySqlTableName>,
     if_exists: bool,
 }
 
 impl MySqlDropTableCommand {
-    /// Returns the canonical unqualified table name targeted by the command.
-    pub fn table(&self) -> &MySqlTableName {
-        &self.table
+    /// Returns the canonical unqualified table names targeted by the command,
+    /// in the order it named them. Laravel's `migrate:fresh` names every
+    /// table in one statement.
+    pub fn tables(&self) -> &[MySqlTableName] {
+        &self.tables
     }
 
     /// Returns whether the command used `IF EXISTS`.
@@ -26,9 +28,9 @@ impl MySqlDropTableCommand {
 
 /// Parses one strict, unqualified `DROP TABLE` command.
 ///
-/// An optional single semicolon is accepted. Comments, qualified names,
-/// multiple names, and every clause other than `IF EXISTS` are rejected once
-/// the statement starts with `DROP TABLE`.
+/// An optional single semicolon is accepted. Comments, qualified names, and
+/// every clause other than `IF EXISTS` are rejected once the statement starts
+/// with `DROP TABLE`.
 pub fn parse_optional_drop_table(
     sql: &str,
     mode: SessionSqlMode,
@@ -71,11 +73,20 @@ pub fn parse_optional_drop_table(
     } else {
         false
     };
-    let table = consume_admin_table_name(&tokens, &mut cursor)?;
-    if table.as_str().starts_with("sqlite_") || table.as_str().starts_with("__turso_internal_") {
-        return Err(ParseError::Unsupported {
-            feature: "internal table name",
-        });
+    let mut tables = Vec::new();
+    loop {
+        let table = consume_admin_table_name(&tokens, &mut cursor)?;
+        if table.as_str().starts_with("sqlite_") || table.as_str().starts_with("__turso_internal_")
+        {
+            return Err(ParseError::Unsupported {
+                feature: "internal table name",
+            });
+        }
+        tables.push(table);
+        if !matches!(tokens.get(cursor), Some(AdminToken::Comma)) {
+            break;
+        }
+        cursor += 1;
     }
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
@@ -83,7 +94,7 @@ pub fn parse_optional_drop_table(
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlDropTableCommand { table, if_exists }))
+    Ok(Some(MySqlDropTableCommand { tables, if_exists }))
 }
 
 #[cfg(test)]
@@ -99,9 +110,21 @@ mod tests {
             let command = parse_optional_drop_table(sql, SessionSqlMode::default())
                 .unwrap()
                 .unwrap();
-            assert_eq!(command.table().as_str(), table);
+            assert_eq!(command.tables()[0].as_str(), table);
             assert_eq!(command.if_exists(), if_exists);
         }
+        let command =
+            parse_optional_drop_table("drop table `users`,`posts`", SessionSqlMode::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            command
+                .tables()
+                .iter()
+                .map(MySqlTableName::as_str)
+                .collect::<Vec<_>>(),
+            ["users", "posts"]
+        );
     }
 
     #[test]
@@ -110,7 +133,8 @@ mod tests {
             "DROP TABLE IF x",
             "DROP TABLE IF NOT EXISTS x",
             "DROP TABLE db.x",
-            "DROP TABLE a, b",
+            "DROP TABLE a,",
+            "DROP TABLE a, db.b",
             "DROP TABLE x CASCADE",
             "DROP TABLE x RESTRICT",
             "DROP TABLE x; SELECT 1",

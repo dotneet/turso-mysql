@@ -381,6 +381,8 @@ pub enum FrontendErrorKind {
     SerializationFailure,
     /// A level for the next transaction was set inside a transaction.
     TransactionCharacteristicsInProgress,
+    /// A statement named one table twice.
+    NotUniqueTable,
     /// A named lock was named with nothing, or with `NULL`.
     IncorrectUserLockName,
     /// A named lock was named with more than 64 characters.
@@ -442,6 +444,8 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             b"Transaction characteristics can't be changed while a transaction is in progress"
                 .as_slice(),
         ),
+        // Measured on MySQL 8.4.11: `DROP TABLE t, t`.
+        FrontendErrorKind::NotUniqueTable => (1066, *b"42000", b"Not unique table/alias".as_slice()),
         // Measured on MySQL 8.4.11. MySQL's messages name the lock, where these
         // stay fixed as every other one does.
         FrontendErrorKind::IncorrectUserLockName => (
@@ -2478,6 +2482,7 @@ mod tests {
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
             (FrontendErrorKind::SerializationFailure, 1213, *b"40001"),
             (FrontendErrorKind::IncorrectUserLockName, 3057, *b"42000"),
+            (FrontendErrorKind::NotUniqueTable, 1066, *b"42000"),
             (FrontendErrorKind::UserLockNameTooLong, 4163, *b"42000"),
             (FrontendErrorKind::UserLockDeadlock, 3058, *b"HY000"),
             (

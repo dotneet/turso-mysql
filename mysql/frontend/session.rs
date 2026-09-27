@@ -4340,44 +4340,82 @@ impl MySqlConnection {
                 .map_err(MySqlDropTableError::Engine)?;
         }
         let tables = self.list_tables().map_err(MySqlDropTableError::Engine)?;
-        match tables
-            .iter()
-            .find(|table| table.name() == command.table().as_str())
-        {
-            None if command.if_exists() => {
-                return Ok(MySqlDropTableResult { dropped: false });
+        let mut present = Vec::with_capacity(command.tables().len());
+        let mut missing = Vec::new();
+        for named in command.tables() {
+            if present.contains(named) {
+                return Err(MySqlDropTableError::NamedTwice);
             }
-            None => return Err(MySqlDropTableError::MissingTable),
-            Some(table) if table.kind() != MySqlTableKind::BaseTable => {
-                if command.if_exists() {
-                    return Ok(MySqlDropTableResult { dropped: false });
+            match tables.iter().find(|table| table.name() == named.as_str()) {
+                Some(table) if table.kind() == MySqlTableKind::BaseTable => {
+                    present.push(named.clone());
                 }
-                return Err(MySqlDropTableError::MissingTable);
+                _ => missing.push(named.as_str().to_owned()),
             }
-            Some(_) => {}
         }
-        let stmt = Stmt::DropTable {
-            if_exists: false,
-            tbl_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
-                command.table().as_str().to_owned(),
-            )),
-        };
-        let sql = format!(
-            "DROP TABLE \"{}\"",
-            command.table().as_str().replace('"', "\"\"")
-        );
-        let result = self
-            .inner
-            .prepare_translated_stmt(stmt, &sql)
-            .and_then(|mut statement| statement.run_ignore_rows())
-            .map_err(MySqlDropTableError::Engine);
+        // Measured on MySQL 8.4.11: a statement naming a table that is not
+        // there drops none of the others, and `IF EXISTS` drops the ones that
+        // are and notes each one that is not.
+        if !missing.is_empty() && !command.if_exists() {
+            return Err(MySqlDropTableError::MissingTable);
+        }
+        let mut result = Ok(());
+        for table in self.children_before_parents(present) {
+            let stmt = Stmt::DropTable {
+                if_exists: false,
+                tbl_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    table.as_str().to_owned(),
+                )),
+            };
+            let sql = format!("DROP TABLE \"{}\"", table.as_str().replace('"', "\"\""));
+            result = self
+                .inner
+                .prepare_translated_stmt(stmt, &sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlDropTableError::Engine);
+            if result.is_err() {
+                break;
+            }
+        }
         if !self.inner.get_auto_commit() {
             self.inner
                 .prepare("ROLLBACK")
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlDropTableError::Engine)?;
         }
-        result.map(|_| MySqlDropTableResult { dropped: true })
+        result.map(|()| MySqlDropTableResult { missing })
+    }
+
+    /// Orders tables dropped together so that a table goes before any table
+    /// its foreign keys name, since MySQL drops a parent and its child in one
+    /// statement whatever order it names them in.
+    fn children_before_parents(&self, mut remaining: Vec<MySqlTableName>) -> Vec<MySqlTableName> {
+        let schema = self.inner.current_schema();
+        let parents_of = |table: &MySqlTableName| -> Vec<String> {
+            schema
+                .get_btree_table(table.as_str())
+                .map(|table| {
+                    table
+                        .foreign_keys
+                        .iter()
+                        .map(|key| key.parent_table.to_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut ordered = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let unreferenced = remaining.iter().position(|candidate| {
+                !remaining.iter().any(|other| {
+                    other != candidate
+                        && parents_of(other).contains(&candidate.as_str().to_lowercase())
+                })
+            });
+            // Tables naming each other in a ring have no first one; the engine
+            // then answers for the order they were named in.
+            ordered.push(remaining.remove(unreferenced.unwrap_or(0)));
+        }
+        ordered
     }
 
     /// Empties one checked table, committing before and after like MySQL's DDL.

@@ -2986,6 +2986,39 @@ pub fn parse_optional_autocommit_setting(
     Ok(Some(MySqlAutocommitSetting { enabled }))
 }
 
+/// Reports whether a statement carries no parameter and answers no rows —
+/// a schema change, a session setting or a lock — judged by the word it begins
+/// with.
+///
+/// A client that prepares every statement, as Laravel does, prepares these
+/// too, and one the checked prepared path does not take can still be run the
+/// way the text path runs it: there is nothing to bind and no column to
+/// describe before it runs. A write is left out: the checked prepared path
+/// takes every write the text path does, so one it refuses is refused as it is
+/// prepared.
+pub fn answers_no_rows_and_binds_nothing(sql: &str, mode: SessionSqlMode) -> bool {
+    let Ok(tokens) = Tokenizer::new(&SessionMySqlDialect::new(mode), sql).tokenize() else {
+        return false;
+    };
+    if tokens
+        .iter()
+        .any(|token| matches!(token, Token::Placeholder(_)))
+    {
+        return false;
+    }
+    let Some(first) = tokens
+        .iter()
+        .find(|token| !matches!(token, Token::Whitespace(_)))
+    else {
+        return false;
+    };
+    [
+        "ALTER", "CREATE", "DROP", "RENAME", "TRUNCATE", "SET", "LOCK", "UNLOCK", "FLUSH",
+    ]
+    .iter()
+    .any(|keyword| is_unquoted_word(first, keyword))
+}
+
 /// Parses exactly one transaction-control command without options.
 pub fn parse_transaction_command(
     sql: &str,

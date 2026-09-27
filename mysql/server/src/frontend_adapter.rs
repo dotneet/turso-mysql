@@ -213,6 +213,9 @@ struct DatabasePreparedStatement {
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
     catalog_query: Option<GormInformationSchemaPreparedQuery>,
+    /// A statement with no parameters and no rows that the checked prepared
+    /// path does not take, run through the text path when it is executed.
+    runs_as_text: Option<String>,
 }
 
 #[cfg(unix)]
@@ -1047,6 +1050,7 @@ where
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
                 catalog_query: Some(query),
+                runs_as_text: None,
             },
         );
         Ok(PreparedStatementResult {
@@ -1748,76 +1752,24 @@ where
         {
             return self.prepare_gorm_catalog_query(query);
         }
-        let selected_database = self
-            .session
-            .selected_database()
-            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
-            .to_owned();
-        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
-        if matches!(visibility, CatalogVisibility::GrantedTables)
-            && source_tables
-                .iter()
-                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
-        {
-            return Err(FrontendErrorKind::AccessDenied);
-        }
-        let connection = self
-            .session
-            .connection()
-            .map_err(database_error_kind)?
-            .clone();
-        let metadata = connection
-            .prepare_checked_statement(sql)
-            .map_err(prepared_statement_error)?;
-        let Some(type_metadata) =
-            connection.prepared_statement_result_column_type_metadata(metadata.statement_id)
-        else {
-            connection.remove_prepared_statement(metadata.statement_id);
-            return Err(FrontendErrorKind::Internal);
-        };
-        let connection_statement_id = metadata.statement_id;
-        let Some(statement_id) = self.prepared_statements.next_statement_id else {
-            connection.remove_prepared_statement(connection_statement_id);
-            return Err(FrontendErrorKind::Internal);
-        };
-        let result = prepared_statement_result(
-            &connection,
-            MySqlPreparedStatementMetadata {
-                statement_id,
-                ..metadata
-            },
-            &type_metadata,
-            Some(sql),
-            Some(&selected_database),
-            &source_tables,
+        let written = write_the_current_database_in(
+            sql,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
         )
-        .and_then(|mut result| {
-            apply_raw_column_collations(
-                &connection,
-                &mut result.columns,
-                self.session_variables.raw_character_set_results(),
-            )?;
-            Ok(result)
-        });
-        if result.is_err() {
-            connection.remove_prepared_statement(connection_statement_id);
-            return result;
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = written.as_deref().unwrap_or(sql);
+        match self.prepare_checked_database_statement(sql) {
+            Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
+                if turso_mysql_parser::answers_no_rows_and_binds_nothing(
+                    sql,
+                    self.session.session_sql_mode(),
+                ) =>
+            {
+                self.prepare_text_statement(sql)
+            }
+            prepared => prepared,
         }
-        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
-        self.prepared_statements.statements.insert(
-            statement_id,
-            DatabasePreparedStatement {
-                database: selected_database,
-                source_tables,
-                read_only_select: parse_select(sql, self.session.session_sql_mode())
-                    .is_ok_and(|select| !select.locks_rows()),
-                connection,
-                connection_statement_id,
-                parameter_types: None,
-                catalog_query: None,
-            },
-        );
-        result
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
@@ -2546,6 +2498,134 @@ where
         Ok(result)
     }
 
+    /// Prepares one statement through the checked prepared path.
+    fn prepare_checked_database_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        let (source_tables, visibility) = self.authorize_query_text(&selected_database, sql)?;
+        if matches!(visibility, CatalogVisibility::GrantedTables)
+            && source_tables
+                .iter()
+                .any(|source| source.catalog() == Some(MySqlCatalogTable::Views))
+        {
+            return Err(FrontendErrorKind::AccessDenied);
+        }
+        let connection = self
+            .session
+            .connection()
+            .map_err(database_error_kind)?
+            .clone();
+        let metadata = connection
+            .prepare_checked_statement(sql)
+            .map_err(prepared_statement_error)?;
+        let Some(type_metadata) =
+            connection.prepared_statement_result_column_type_metadata(metadata.statement_id)
+        else {
+            connection.remove_prepared_statement(metadata.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        let connection_statement_id = metadata.statement_id;
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            connection.remove_prepared_statement(connection_statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        let result = prepared_statement_result(
+            &connection,
+            MySqlPreparedStatementMetadata {
+                statement_id,
+                ..metadata
+            },
+            &type_metadata,
+            Some(sql),
+            Some(&selected_database),
+            &source_tables,
+        )
+        .and_then(|mut result| {
+            apply_raw_column_collations(
+                &connection,
+                &mut result.columns,
+                self.session_variables.raw_character_set_results(),
+            )?;
+            Ok(result)
+        });
+        if result.is_err() {
+            connection.remove_prepared_statement(connection_statement_id);
+            return result;
+        }
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                database: selected_database,
+                source_tables,
+                read_only_select: parse_select(sql, self.session.session_sql_mode())
+                    .is_ok_and(|select| !select.locks_rows()),
+                connection,
+                connection_statement_id,
+                parameter_types: None,
+                catalog_query: None,
+                runs_as_text: None,
+            },
+        );
+        result
+    }
+
+    /// Retains a statement with no parameters and no rows that the checked
+    /// prepared path does not take — Laravel prepares every statement,
+    /// `CREATE TABLE` included — to be run through the text path when it is
+    /// executed, which is what executing it means.
+    fn prepare_text_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        let connection = self
+            .session
+            .connection()
+            .map_err(database_error_kind)?
+            .clone();
+        // An engine-owned statement holds this one's place in the same
+        // prepared-statement quota and lifecycle as any other.
+        let reserved = connection
+            .prepare_checked_statement("SELECT 1")
+            .map_err(prepared_statement_error)?;
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            connection.remove_prepared_statement(reserved.statement_id);
+            return Err(FrontendErrorKind::Internal);
+        };
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                database,
+                source_tables: Vec::new(),
+                read_only_select: false,
+                connection,
+                connection_statement_id: reserved.statement_id,
+                parameter_types: None,
+                catalog_query: None,
+                runs_as_text: Some(sql.to_owned()),
+            },
+        );
+        Ok(PreparedStatementResult {
+            statement_id,
+            parameters: Vec::new(),
+            columns: Vec::new(),
+            warnings: 0,
+            status_flags: self.status_flags(),
+        })
+    }
+
     fn execute_prepared_statement_command(
         &mut self,
         statement_id: u32,
@@ -2559,6 +2639,20 @@ where
             .is_some()
         {
             return self.execute_gorm_catalog_query(statement_id, parameter_payload);
+        }
+        if let Some(sql) = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .and_then(|statement| statement.runs_as_text.clone())
+        {
+            self.pending_long_data.take_statement(statement_id);
+            return match self.execute_query_statement(&sql)? {
+                CommandExecutionResult::Ok(result) => {
+                    Ok(PreparedStatementExecutionResult::Ok(result))
+                }
+                CommandExecutionResult::ResultSet(_) => Err(FrontendErrorKind::Internal),
+            };
         }
         let (database, source_tables, read_only_select) = self
             .prepared_statements
@@ -2716,18 +2810,20 @@ fn execute_checked_query(
             .drop_table(&command)
             .map_err(|error| match error {
                 MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
+                MySqlDropTableError::NamedTwice => FrontendErrorKind::NotUniqueTable,
                 MySqlDropTableError::Engine(error) => frontend_error_kind(error),
             })?;
-        let noted = !result.dropped && sql_notes;
-        if noted {
-            raised.push(MySqlWarning::unknown_table(
-                selected_database,
-                command.table().as_str(),
-            ));
+        // Measured on MySQL 8.4.11: one note for each table an `IF EXISTS`
+        // named that was not there.
+        let noted = if sql_notes { result.missing.len() } else { 0 };
+        if sql_notes {
+            for table in &result.missing {
+                raised.push(MySqlWarning::unknown_table(selected_database, table));
+            }
         }
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
-            warnings: u16::from(noted),
+            warnings: u16::try_from(noted).unwrap_or(u16::MAX),
             ..CommandOkResult::default()
         }));
     }

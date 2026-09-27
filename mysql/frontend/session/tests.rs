@@ -3937,12 +3937,11 @@ fn dropped_table_stays_absent_after_reopen() -> Result<()> {
     )
     .unwrap()
     .expect("DROP TABLE must be recognized");
-    assert!(
-        connection
-            .drop_table(&command)
-            .map_err(|error| LimboError::InternalError(error.to_string()))?
-            .dropped
-    );
+    assert!(connection
+        .drop_table(&command)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .missing
+        .is_empty());
     connection.close()?;
     drop(connection);
     drop(db);
