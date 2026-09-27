@@ -94,12 +94,11 @@ impl MySqlCatalogTable {
     /// Answers whether this table holds every column MySQL gives it, which is
     /// what a wildcard over it asks for.
     ///
-    /// `TABLES` and `VIEWS` leave out columns this server has nothing true to
-    /// answer with — storage statistics, times, and a view's definition as
-    /// MySQL rewrites it — so a wildcard over either would answer a row
-    /// narrower than MySQL's.
+    /// `TABLES` leaves out columns this server has nothing true to answer
+    /// with — storage statistics and times — so a wildcard over it would
+    /// answer a row narrower than MySQL's.
     pub const fn answers_every_column(self) -> bool {
-        !matches!(self, Self::Tables | Self::Views)
+        !matches!(self, Self::Tables)
     }
 
     /// The columns this table answers, in the order MySQL declares them, each
@@ -117,9 +116,12 @@ impl MySqlCatalogTable {
                 ("TABLE_COMMENT", "TEXT"),
             ],
             Self::Views => &[
+                ("TABLE_CATALOG", "TEXT"),
                 ("TABLE_SCHEMA", "TEXT"),
                 ("TABLE_NAME", "TEXT"),
+                ("VIEW_DEFINITION", "TEXT"),
                 ("CHECK_OPTION", "TEXT"),
+                ("IS_UPDATABLE", "TEXT"),
                 ("DEFINER", "TEXT"),
                 ("SECURITY_TYPE", "TEXT"),
                 ("CHARACTER_SET_CLIENT", "TEXT"),

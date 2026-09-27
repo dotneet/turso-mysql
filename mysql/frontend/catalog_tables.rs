@@ -334,9 +334,12 @@ impl InternalVirtualTable for InformationSchemaViews {
     fn sql(&self) -> String {
         format!(
             "CREATE TABLE {INFORMATION_SCHEMA_VIEWS} (\
+             TABLE_CATALOG TEXT COLLATE MYSQL_UCA9_AI_CI, \
              TABLE_SCHEMA TEXT COLLATE MYSQL_UCA9_AI_CI, \
              TABLE_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             VIEW_DEFINITION TEXT COLLATE MYSQL_UCA9_AI_CI, \
              CHECK_OPTION TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             IS_UPDATABLE TEXT COLLATE MYSQL_UCA9_AI_CI, \
              DEFINER TEXT COLLATE MYSQL_UCA9_AI_CI, \
              SECURITY_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI, \
              CHARACTER_SET_CLIENT TEXT COLLATE MYSQL_UCA9_AI_CI, \
@@ -366,9 +369,27 @@ impl InternalVirtualTable for InformationSchemaViews {
                 .creator()
                 .map_err(|error| LimboError::Corrupt(error.to_string()))?
                 .ok_or_else(|| LimboError::ParseError("view has no creator metadata".into()))?;
-            rows.push((name.clone(), creator));
+            let mode = turso_mysql_parser::SessionSqlMode {
+                ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+                no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+            };
+            let definition = turso_mysql_parser::parse_schema_ddl_ast(decoded.normalized_ddl, mode)
+                .ok()
+                .and_then(|statement| {
+                    turso_mysql_parser::render_view_definition_mysql(
+                        &statement,
+                        &self.database,
+                        &|table, column| stored_column_name(&schema, table, column),
+                    )
+                    .ok()
+                });
+            rows.push(ViewRow {
+                name: name.clone(),
+                creator,
+                definition,
+            });
         }
-        rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        rows.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         Ok(Arc::new(RwLock::new(InformationSchemaViewsCursor {
             database: self.database.clone(),
             rows,
@@ -385,9 +406,36 @@ impl InternalVirtualTable for InformationSchemaViews {
     }
 }
 
+/// How `table` spells `column`, when a table of exactly that name has it.
+fn stored_column_name(
+    schema: &turso_core::schema::Schema,
+    table: &str,
+    column: &str,
+) -> Option<String> {
+    let btree = schema.get_btree_table(table)?;
+    if btree.name != table {
+        return None;
+    }
+    btree
+        .columns()
+        .iter()
+        .filter_map(|stored| stored.name.as_deref())
+        .find(|stored| stored.eq_ignore_ascii_case(column))
+        .map(str::to_owned)
+}
+
+/// One view, which is one row of `information_schema.VIEWS`.
+struct ViewRow {
+    name: String,
+    creator: crate::schema_sql::SchemaSqlCreator,
+    /// The view's definition as MySQL writes it back, and whether it can be
+    /// updated through, where this knows how MySQL writes it.
+    definition: Option<(String, bool)>,
+}
+
 struct InformationSchemaViewsCursor {
     database: String,
-    rows: Vec<(String, crate::schema_sql::SchemaSqlCreator)>,
+    rows: Vec<ViewRow>,
     position: i64,
 }
 
@@ -402,15 +450,26 @@ impl InternalVirtualTableCursor for InformationSchemaViewsCursor {
     }
 
     fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
-        let (name, creator) = &self.rows[self.position as usize];
+        let row = &self.rows[self.position as usize];
+        let definition = || {
+            row.definition.as_ref().ok_or_else(|| {
+                LimboError::ParseError(format!(
+                    "how MySQL writes the view {} back has not been measured",
+                    row.name
+                ))
+            })
+        };
         let value = match column {
-            0 => self.database.clone(),
-            1 => name.clone(),
-            2 => "NONE".to_owned(),
-            3 => format!("{}@%", creator.username),
-            4 => "DEFINER".to_owned(),
-            5 => creator.character_set_client.clone(),
-            6 => creator.collation_connection.clone(),
+            0 => "def".to_owned(),
+            1 => self.database.clone(),
+            2 => row.name.clone(),
+            3 => definition()?.0.clone(),
+            4 => "NONE".to_owned(),
+            5 => if definition()?.1 { "YES" } else { "NO" }.to_owned(),
+            6 => format!("{}@%", row.creator.username),
+            7 => "DEFINER".to_owned(),
+            8 => row.creator.character_set_client.clone(),
+            9 => row.creator.collation_connection.clone(),
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.VIEWS has no column {column}"

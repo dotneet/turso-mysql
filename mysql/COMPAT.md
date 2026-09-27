@@ -3197,10 +3197,21 @@ connection for the table to be scanned on.
 row: stored procedures and functions are refused here, so no database holds
 one.
 
-A wildcard is answered over every one of these tables but `TABLES` and
-`VIEWS`, each of which answers all of MySQL's columns in the order MySQL
-declares them; those two leave out columns this server has nothing true to
-answer with. A wildcard over one of them may stand in a derived table's body
+A wildcard is answered over every one of these tables but `TABLES`, each of
+which answers all of MySQL's columns in the order MySQL declares them; `TABLES`
+leaves out columns this server has nothing true to answer with.
+
+`information_schema.VIEWS` answers MySQL's ten columns. Measured on 8.4.11,
+`VIEW_DEFINITION` is the query as MySQL writes it back: every column in full
+under the spelling its table stores and the name the view answers,
+`` select `db`.`t`.`id` AS `ID` from `db`.`t` ``, and a view of written values
+`` select 1 AS `one` ``. `IS_UPDATABLE` is `YES` for a view over one table's
+columns and `NO` for one of written values. A view whose column its table no
+longer has is refused when its definition is read, and one stored without the
+account that made it is refused whenever `VIEWS` is read, as `SHOW CREATE VIEW`
+refuses it.
+
+A wildcard over one of them may stand in a derived table's body
 too, whose columns are then that table's, and that body may be a `UNION` of
 branches that each read the same columns of the same table — which is how
 TypeORM's `loadTables` reads one table's rows a branch — as may a whole

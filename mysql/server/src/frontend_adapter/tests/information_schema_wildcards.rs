@@ -9,7 +9,7 @@ use super::*;
 type Adapter = AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>;
 
 fn adapter() -> (tempfile::TempDir, Adapter) {
-    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("app"));
     let (directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
         .build(AuthenticatedPrincipal::from_account_id_for_testing(
@@ -1277,5 +1277,102 @@ fn a_counted_key_is_never_null_in_the_index_listings() {
              WHERE TABLE_NAME = 'users' AND INDEX_NAME = 'PRIMARY'",
         ),
         [row(&[Some("")])]
+    );
+}
+
+/// `information_schema.VIEWS` answers all ten of MySQL's columns. Measured on
+/// MySQL 8.4.11: a view's definition is written back with every column in full
+/// under the spelling its table stores and the name it answers, and a view
+/// over one table's columns is updatable where one of written values only is
+/// not. The collation is the one this server records for every view's
+/// creating connection.
+#[test]
+fn a_wildcard_over_the_views_answers_their_definitions() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE VIEW v AS SELECT id, email FROM users",
+        "CREATE VIEW vc AS SELECT 1 AS one, 1 AS two",
+        "CREATE VIEW vu AS SELECT ID, Email FROM users",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let read = read(
+        &mut adapter,
+        "SELECT * FROM information_schema.VIEWS WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
+    );
+    assert_eq!(
+        names(&read),
+        [
+            "TABLE_CATALOG",
+            "TABLE_SCHEMA",
+            "TABLE_NAME",
+            "VIEW_DEFINITION",
+            "CHECK_OPTION",
+            "IS_UPDATABLE",
+            "DEFINER",
+            "SECURITY_TYPE",
+            "CHARACTER_SET_CLIENT",
+            "COLLATION_CONNECTION",
+        ]
+    );
+    let answered = read
+        .rows
+        .iter()
+        .map(|row| {
+            [0, 1, 2, 3, 4, 5, 7, 8, 9]
+                .iter()
+                .map(|at| {
+                    row[*at]
+                        .as_ref()
+                        .map(|value| String::from_utf8(value.clone()).unwrap())
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        answered,
+        [
+            row(&[
+                Some("def"),
+                Some("reports"),
+                Some("v"),
+                Some(
+                    "select `reports`.`users`.`id` AS `id`,`reports`.`users`.`email` AS `email` \
+                     from `reports`.`users`"
+                ),
+                Some("NONE"),
+                Some("YES"),
+                Some("DEFINER"),
+                Some("utf8mb4"),
+                Some("utf8mb4_general_ci"),
+            ]),
+            row(&[
+                Some("def"),
+                Some("reports"),
+                Some("vc"),
+                Some("select 1 AS `one`,1 AS `two`"),
+                Some("NONE"),
+                Some("NO"),
+                Some("DEFINER"),
+                Some("utf8mb4"),
+                Some("utf8mb4_general_ci"),
+            ]),
+            row(&[
+                Some("def"),
+                Some("reports"),
+                Some("vu"),
+                Some(
+                    "select `reports`.`users`.`id` AS `ID`,`reports`.`users`.`email` AS `Email` \
+                     from `reports`.`users`"
+                ),
+                Some("NONE"),
+                Some("YES"),
+                Some("DEFINER"),
+                Some("utf8mb4"),
+                Some("utf8mb4_general_ci"),
+            ]),
+        ]
     );
 }

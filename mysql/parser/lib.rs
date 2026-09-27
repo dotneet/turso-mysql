@@ -133,7 +133,8 @@ pub use mysql_ddl::{
     render_create_table_mysql_with_mode, render_create_trigger_mysql,
     render_create_trigger_mysql_with_mode, render_create_view_mysql,
     render_create_view_mysql_with_mode, render_show_create_trigger_mysql,
-    render_show_create_view_mysql, stored_character_length, stored_temporal_precision,
+    render_show_create_view_mysql, render_view_definition_mysql, stored_character_length,
+    stored_temporal_precision,
 };
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use number_format::{format_number, format_written_decimal, truncate_number};

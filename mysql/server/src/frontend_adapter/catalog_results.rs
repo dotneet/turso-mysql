@@ -1007,9 +1007,25 @@ pub(super) fn information_schema_routines_columns() -> Vec<ColumnDefinitionConfi
     .collect()
 }
 
-/// The five dump-facing VIEWS attributes plus the two columns used to find a row.
+/// Every column of `information_schema.VIEWS`, in the order MySQL declares
+/// them.
+///
+/// The seven a dump client reads keep the shapes measured for it; the other
+/// three were measured on MySQL 8.4.11 through `SELECT *`.
 pub(super) fn information_schema_views_columns() -> Vec<ColumnDefinitionConfig> {
     let fields = [
+        (
+            "TABLE_CATALOG",
+            "information_schema",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_UNIQUE_KEY_FLAG
+                | MYSQL_BINARY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+            0,
+        ),
         (
             "TABLE_SCHEMA",
             "information_schema",
@@ -1027,10 +1043,26 @@ pub(super) fn information_schema_views_columns() -> Vec<ColumnDefinitionConfig> 
             0,
         ),
         (
+            "VIEW_DEFINITION",
+            "",
+            MYSQL_TYPE_BLOB,
+            u32::MAX,
+            MYSQL_BINARY_FLAG,
+            31,
+        ),
+        (
             "CHECK_OPTION",
             "information_schema",
             MYSQL_TYPE_STRING,
             32,
+            MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
+            0,
+        ),
+        (
+            "IS_UPDATABLE",
+            "information_schema",
+            MYSQL_TYPE_STRING,
+            12,
             MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
             0,
         ),

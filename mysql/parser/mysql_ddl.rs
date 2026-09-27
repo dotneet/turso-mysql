@@ -192,6 +192,71 @@ pub fn render_create_view_mysql_with_mode(
     ))
 }
 
+/// The definition `information_schema.VIEWS` reads one accepted view back as,
+/// and whether MySQL can update through it.
+///
+/// Measured on MySQL 8.4.11: a column is written in full under the spelling
+/// its table stores, answering the name the view was written with,
+/// `select `db`.`t`.`id` AS `ID` from `db`.`t``, and such a view is
+/// updatable; one of written values only, `select 1 AS `one``, is not.
+/// `stored_column(table, column)` answers how the table spells the column,
+/// or `None` when the view no longer names a column of a table.
+pub fn render_view_definition_mysql(
+    statement: &Stmt,
+    database: &str,
+    stored_column: &dyn Fn(&str, &str) -> Option<String>,
+) -> Result<(String, bool), ParseError> {
+    let Stmt::CreateView { select, .. } = statement else {
+        return Err(ParseError::ExpectedCreateView);
+    };
+    render_create_view_mysql(statement)?;
+    let OneSelect::Select { columns, from, .. } = &select.body.select else {
+        return unsupported("VIEW_DEFINITION query");
+    };
+    let Some(from) = from else {
+        // `render_create_view_mysql` accepts only `1 AS name` here.
+        let columns = columns
+            .iter()
+            .map(|column| match column {
+                ResultColumn::Expr(_, Some(alias)) => {
+                    Ok(format!("1 AS {}", render_mysql_name(alias.name())))
+                }
+                _ => unsupported("VIEW_DEFINITION projection"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok((format!("select {}", columns.join(",")), false));
+    };
+    let SelectTable::Table(source, _, _) = from.select.as_ref() else {
+        return unsupported("VIEW_DEFINITION source");
+    };
+    let table = source.name.as_str();
+    let source = format!(
+        "{}.{}",
+        render_mysql_name(&TursoName::exact(database.to_owned())),
+        render_mysql_name(&source.name)
+    );
+    let columns = columns
+        .iter()
+        .map(|column| {
+            let ResultColumn::Expr(expr, _) = column else {
+                return unsupported("VIEW_DEFINITION projection");
+            };
+            let (TursoExpr::Name(name) | TursoExpr::Id(name)) = expr.as_ref() else {
+                return unsupported("VIEW_DEFINITION projection");
+            };
+            let Some(stored) = stored_column(table, name.as_str()) else {
+                return unsupported("VIEW_DEFINITION over a missing column");
+            };
+            Ok(format!(
+                "{source}.{} AS {}",
+                render_mysql_name(&TursoName::exact(stored)),
+                render_mysql_name(name)
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((format!("select {} from {source}", columns.join(",")), true))
+}
+
 /// Prints the accepted direct-projection view the way `SHOW CREATE TABLE` does.
 pub fn render_show_create_view_mysql(
     statement: &Stmt,

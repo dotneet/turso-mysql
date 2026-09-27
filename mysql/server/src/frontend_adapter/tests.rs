@@ -18886,13 +18886,13 @@ fn dump_metadata_columns_match_mysql_8_4_wire_shapes() {
     assert_eq!(triggers.columns[5].decimals, 2);
 
     let views = catalog_results::information_schema_views_columns();
-    assert_eq!(views[2].name, "CHECK_OPTION");
-    assert_eq!(views[2].column_type, MYSQL_TYPE_STRING);
-    assert_eq!(views[2].column_length, 32);
-    assert_eq!(views[3].name, "DEFINER");
-    assert_eq!(views[3].column_length, 1152);
-    assert_eq!(views[4].schema, "");
-    assert_eq!(views[4].decimals, 31);
+    assert_eq!(views[4].name, "CHECK_OPTION");
+    assert_eq!(views[4].column_type, MYSQL_TYPE_STRING);
+    assert_eq!(views[4].column_length, 32);
+    assert_eq!(views[6].name, "DEFINER");
+    assert_eq!(views[6].column_length, 1152);
+    assert_eq!(views[7].schema, "");
+    assert_eq!(views[7].decimals, 31);
 }
 
 #[cfg(unix)]
