@@ -2563,9 +2563,6 @@ fn the_radix_writings_and_the_readings_by_place_render_to_the_dialect() {
         "SELECT ELT(n, name) FROM bo",
         "SELECT ELT(n) FROM bo",
         "SELECT FIELD(name) FROM bo",
-        // The thing read has to be a column.
-        "SELECT BIN(1) FROM bo",
-        "SELECT FIELD('a', 'a', 'b') FROM bo",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),

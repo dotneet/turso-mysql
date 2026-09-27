@@ -464,6 +464,136 @@ fn a_written_value_stands_beside_columns_under_its_alias() {
     assert_eq!(names, ["x", "y", "id"]);
 }
 
+/// Measured: each call over written values alone answers what MySQL works out
+/// for it, named after the call as written.
+#[test]
+fn a_call_over_written_values_alone_is_worked_out_in_full() {
+    let (_directory, mut adapter) = adapter();
+    let sql = "SELECT HEX(255), BIN(5), OCT(8), HEX(-1), HEX('abc'), HEX('日'), BIN(-1), OCT(-8)";
+    assert_eq!(
+        row(&mut adapter, sql),
+        [
+            "FF",
+            "101",
+            "10",
+            "FFFFFFFFFFFFFFFF",
+            "616263",
+            "E697A5",
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "1777777777777777777770"
+        ]
+    );
+    let text = |name: &str, length| {
+        (
+            name.to_owned(),
+            MYSQL_TYPE_VAR_STRING,
+            length,
+            NOT_FIXED_DECIMALS,
+            0,
+            TEXT,
+        )
+    };
+    assert_eq!(
+        shapes(&mut adapter, sql),
+        [
+            text("HEX(255)", 64),
+            text("BIN(5)", 260),
+            text("OCT(8)", 260),
+            text("HEX(-1)", 64),
+            text("HEX('abc')", 96),
+            text("HEX('日')", 32),
+            text("BIN(-1)", 260),
+            text("OCT(-8)", 260),
+        ]
+    );
+
+    let sql = "SELECT CHAR(65), CHAR(65, 66), CHAR(256)";
+    assert_eq!(
+        result(&mut adapter, sql).rows,
+        [[Some(b"A".to_vec()), Some(b"AB".to_vec()), Some(vec![1, 0])]]
+    );
+    let lengths: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(_, column_type, length, decimals, flags, character_set)| {
+            assert_eq!(
+                (column_type, decimals, flags, character_set),
+                (
+                    MYSQL_TYPE_VAR_STRING,
+                    NOT_FIXED_DECIMALS,
+                    MYSQL_BINARY_FLAG,
+                    BINARY
+                )
+            );
+            length
+        })
+        .collect();
+    assert_eq!(lengths, [4, 8, 4]);
+    assert_eq!(
+        binary_row(&mut adapter, "SELECT CHAR(256)"),
+        [BinaryResultValue::Blob(vec![1, 0])]
+    );
+
+    // A word is found among the ones after it without regard to case.
+    let sql = "SELECT ASCII('a'), ORD('é'), ASCII(''), FIELD('B', 'a', 'b'), FIELD('x', 'a'), ELT(2, 'a', 'bb'), ELT(3, 'a', 'b')";
+    assert_eq!(
+        row(&mut adapter, sql),
+        ["97", "50089", "0", "2", "0", "bb", "NULL"]
+    );
+    let whole = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+    let kinds: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(_, column_type, length, _, flags, _)| (column_type, length, flags))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (MYSQL_TYPE_LONGLONG, 3, whole),
+            (MYSQL_TYPE_LONGLONG, 21, whole),
+            (MYSQL_TYPE_LONGLONG, 3, whole),
+            (MYSQL_TYPE_LONGLONG, 3, whole),
+            (MYSQL_TYPE_LONGLONG, 3, whole),
+            (MYSQL_TYPE_VAR_STRING, 8, 0),
+            (MYSQL_TYPE_VAR_STRING, 4, 0),
+        ]
+    );
+
+    // The places asked for held to the ones written, and a zero written
+    // before the point counting as a digit where an empty whole part does not.
+    let sql = "SELECT TRUNCATE(1.567, 2), TRUNCATE(1.567, 0), TRUNCATE(-1.567, 1), TRUNCATE(1.5, 3), TRUNCATE(0.567, 2), TRUNCATE(.567, 2), TRUNCATE(-0.001, 2), TRUNCATE(1567, -2), TRUNCATE(-1567, -2), TRUNCATE(1567, -20)";
+    assert_eq!(
+        row(&mut adapter, sql),
+        ["1.56", "1", "-1.5", "1.5", "0.56", "0.56", "0.00", "1500", "-1500", "0"]
+    );
+    let kinds: Vec<_> = shapes(&mut adapter, sql)
+        .into_iter()
+        .map(|(_, column_type, length, decimals, flags, _)| {
+            assert_eq!(flags, DECIMAL);
+            (column_type, length, decimals)
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            (MYSQL_TYPE_NEWDECIMAL, 5, 2),
+            (MYSQL_TYPE_NEWDECIMAL, 2, 0),
+            (MYSQL_TYPE_NEWDECIMAL, 4, 1),
+            (MYSQL_TYPE_NEWDECIMAL, 4, 1),
+            (MYSQL_TYPE_NEWDECIMAL, 5, 2),
+            (MYSQL_TYPE_NEWDECIMAL, 4, 2),
+            (MYSQL_TYPE_NEWDECIMAL, 5, 2),
+            (MYSQL_TYPE_LONGLONG, 21, 0),
+            (MYSQL_TYPE_LONGLONG, 21, 0),
+            (MYSQL_TYPE_LONGLONG, 21, 0),
+        ]
+    );
+
+    // A word outside ASCII compares by weights of the collation's own, and
+    // `CONV` reads digits by rules not followed here.
+    for sql in ["SELECT FIELD('é', 'e')", "SELECT CONV(255, 10, 16)"] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 /// Only the statement's own result reports the shape a written value answers,
 /// so the value is worked out nowhere else. A written number beside a column
 /// in a condition is read the way it always was.

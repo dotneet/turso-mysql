@@ -1,6 +1,7 @@
 //! Values a projection writes out in full: a number with a point or an
-//! exponent, a hexadecimal or bit literal, and a cast or a `CONVERT` of a
-//! written value.
+//! exponent, a hexadecimal or bit literal, a cast or a `CONVERT` of a written
+//! value, and a few calls over written values alone — `HEX(255)`,
+//! `CHAR(65)`, `FIELD('b', 'a', 'b')`, `TRUNCATE(1.567, 2)`.
 //!
 //! Each is worked out here, before the statement runs, into the text MySQL
 //! answers, because the engine would answer a different one — it prints `0.10`
@@ -40,8 +41,15 @@ pub enum WrittenValue {
     Moment,
     /// A cast of a written document to `JSON`.
     Json,
-    /// A written word cast to `CHAR` or converted to utf8mb4.
+    /// A written word cast to `CHAR` or converted to utf8mb4, and the text
+    /// `HEX`, `BIN`, `OCT` and `ELT` answer over written values.
     Text { characters: u32 },
+    /// The binary string `CHAR` answers, four bytes reserved for each number
+    /// it was given.
+    BinaryWord { length: u32 },
+    /// A whole number `ASCII`, `ORD`, `FIELD` or `TRUNCATE` answers over
+    /// written values, which cannot be null.
+    WholeNumber { length: u32 },
 }
 
 /// Reads a written value, answering its shape and the SQL the engine answers
@@ -73,6 +81,7 @@ pub(crate) fn read_written_value(expr: &Expr) -> Option<(WrittenValue, String)> 
             format: None,
             array: false,
         } => written_cast(cast, data_type),
+        Expr::Function(function) => written_call(function),
         Expr::Convert {
             is_try: false,
             expr: converted,
@@ -89,6 +98,235 @@ pub(crate) fn read_written_value(expr: &Expr) -> Option<(WrittenValue, String)> 
         },
         _ => None,
     }
+}
+
+/// Reads a call over written values alone that this works out in full.
+///
+/// Measured on MySQL 8.4.11: `HEX(n)` writes a whole number's 64 bits in
+/// hexadecimal, `HEX(-1)` being `FFFFFFFFFFFFFFFF`, as a `VAR_STRING` of 64,
+/// and a word's bytes as eight times its characters; `BIN` and `OCT` write the
+/// same bits in their radix as one of 260; `CHAR(65, 66)` answers the bytes of
+/// each number as a binary string of four bytes to the number; `ASCII` and
+/// `ORD` read the first byte and the first character as a `LONGLONG` of 3 and
+/// of 21; `FIELD` finds a word among the ones after it without regard to case
+/// as one of 3, and `ELT` reads one out by its place; `TRUNCATE` cuts a number
+/// to the places it names. None of them reads a column, so none can be null
+/// apart from `ELT` past its last word.
+fn written_call(function: &sqlparser::ast::Function) -> Option<(WrittenValue, String)> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || function.over.is_some()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || function.uses_odbc_syntax
+        || function.parameters != sqlparser::ast::FunctionArguments::None
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let values = arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                Some(expr)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let named = |candidate: &str| name.value.eq_ignore_ascii_case(candidate);
+    if named("HEX") || named("BIN") || named("OCT") {
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        if let (true, Some(word)) = (named("HEX"), written_word(value)) {
+            let hexadecimal = word
+                .bytes()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<String>();
+            let characters = u32::try_from(word.chars().count()).ok()?.checked_mul(8)?;
+            return Some((WrittenValue::Text { characters }, quoted(&hexadecimal)));
+        }
+        let bits = written_whole_number_bits(value)?;
+        let (written, characters) = if named("HEX") {
+            (format!("{bits:X}"), 16)
+        } else if named("BIN") {
+            (format!("{bits:b}"), 65)
+        } else {
+            (format!("{bits:o}"), 65)
+        };
+        return Some((WrittenValue::Text { characters }, quoted(&written)));
+    }
+    if named("CHAR") {
+        if values.is_empty() {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        for value in &values {
+            let number = u32::try_from(crate::translate::direct_signed_integer(value)?).ok()?;
+            let written = number.to_be_bytes();
+            let first = written
+                .iter()
+                .position(|byte| *byte != 0)
+                .unwrap_or(written.len() - 1);
+            bytes.extend_from_slice(&written[first..]);
+        }
+        let hexadecimal = bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        let length = u32::try_from(values.len()).ok()?.checked_mul(4)?;
+        return Some((
+            WrittenValue::BinaryWord { length },
+            format!("x'{hexadecimal}'"),
+        ));
+    }
+    if named("ASCII") || named("ORD") {
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        let word = written_word(value)?;
+        let (answer, length) = if named("ASCII") {
+            (crate::first_byte(word.as_bytes()), 3)
+        } else {
+            (crate::first_character_code(word), 21)
+        };
+        return Some((WrittenValue::WholeNumber { length }, answer.to_string()));
+    }
+    if named("FIELD") {
+        let [looked_for, choices @ ..] = values.as_slice() else {
+            return None;
+        };
+        if choices.is_empty() {
+            return None;
+        }
+        // Only words written in ASCII: they compare without regard to case
+        // under the connection's collation, which for ASCII is the case fold
+        // alone, where a letter outside it has accents and weights of its own.
+        let looked_for = written_word(looked_for).filter(|word| word.is_ascii())?;
+        let mut found = 0;
+        for (place, choice) in choices.iter().enumerate() {
+            let choice = written_word(choice).filter(|word| word.is_ascii())?;
+            if found == 0 && choice.eq_ignore_ascii_case(looked_for) {
+                found = place + 1;
+            }
+        }
+        return Some((WrittenValue::WholeNumber { length: 3 }, found.to_string()));
+    }
+    if named("ELT") {
+        let [place, choices @ ..] = values.as_slice() else {
+            return None;
+        };
+        let place = crate::translate::direct_signed_integer(place)?;
+        let choices = choices
+            .iter()
+            .map(|choice| written_word(choice))
+            .collect::<Option<Vec<_>>>()?;
+        if choices.is_empty() {
+            return None;
+        }
+        let characters = choices
+            .iter()
+            .map(|choice| choice.chars().count())
+            .max()
+            .and_then(|widest| u32::try_from(widest).ok())?;
+        let chosen = usize::try_from(place)
+            .ok()
+            .and_then(|place| place.checked_sub(1))
+            .and_then(|at| choices.get(at));
+        return Some((
+            WrittenValue::Text { characters },
+            chosen.map_or_else(|| "NULL".to_owned(), |chosen| quoted(chosen)),
+        ));
+    }
+    if named("TRUNCATE") {
+        let [number, places] = values.as_slice() else {
+            return None;
+        };
+        let places = crate::translate::direct_signed_integer(places)?;
+        return written_truncation(number, places);
+    }
+    None
+}
+
+/// Reads a written word, which is what most of these calls read.
+fn written_word(expr: &Expr) -> Option<&str> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    match &value.value {
+        Value::SingleQuotedString(word) | Value::DoubleQuotedString(word) => Some(word),
+        _ => None,
+    }
+}
+
+/// The 64 bits of a written whole number, a negative one as its two's
+/// complement, which is how MySQL reads one for `HEX`, `BIN` and `OCT`.
+fn written_whole_number_bits(expr: &Expr) -> Option<u64> {
+    if let Some(number) = crate::translate::direct_signed_integer(expr) {
+        return Some(number as u64);
+    }
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    let Value::Number(digits, false) = &value.value else {
+        return None;
+    };
+    digits.parse::<u64>().ok()
+}
+
+/// `TRUNCATE` over a written number. Measured on MySQL 8.4.11: over a whole
+/// number it answers a `LONGLONG` of 21, `TRUNCATE(1567, -2)` being 1500, and
+/// over a number with a point a `NEWDECIMAL` whose places are the ones asked
+/// for held to the ones written — `TRUNCATE(1.567, 2)` is 1.56 with a length
+/// of 5 and `TRUNCATE(1.5, 3)` 1.5 with one of 4. A count left of the point
+/// over a number with a point is not taken.
+fn written_truncation(number: &Expr, places: i64) -> Option<(WrittenValue, String)> {
+    if let Some(whole) = crate::translate::direct_signed_integer(number) {
+        let cut = match u32::try_from(-places) {
+            Ok(digits) if places < 0 => {
+                let unit = 10i64.checked_pow(digits).unwrap_or(i64::MAX);
+                whole / unit * unit
+            }
+            _ => whole,
+        };
+        return Some((WrittenValue::WholeNumber { length: 21 }, cut.to_string()));
+    }
+    let places = u32::try_from(places).ok()?;
+    let decimal = written_decimal(number)?;
+    let (whole, fraction) = (decimal.whole.clone(), decimal.fraction.clone());
+    if (whole.len() > 1 && whole.starts_with('0')) || fraction.is_empty() {
+        return None;
+    }
+    let scale = places.min(u32::try_from(fraction.len()).ok()?);
+    let cut = Decimal {
+        negative: decimal.negative,
+        whole: whole.clone(),
+        fraction: fraction[..scale as usize].to_owned(),
+    };
+    // Measured: a zero written before the point counts as a digit and an
+    // empty whole part as none — `TRUNCATE(0.567, 2)` reports 5 and
+    // `TRUNCATE(.567, 2)` 4.
+    let precision = u32::try_from(whole.len()).ok()? + scale;
+    if precision == 0 || precision > DECIMAL_MOST_DIGITS {
+        return None;
+    }
+    Some((
+        WrittenValue::Decimal {
+            precision,
+            scale,
+            not_null: true,
+        },
+        quoted(&cut.written()),
+    ))
 }
 
 /// `CONVERT(x USING utf8mb4)` names the one character set this server speaks.

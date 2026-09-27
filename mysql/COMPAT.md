@@ -876,6 +876,19 @@ answers a different one. Measured on 8.4.11:
   refused, which MySQL answers 3141 for.
 - `CAST('<word>' AS CHAR)` and `CONVERT('<word>' USING utf8mb4)` answer the word as a
   `VAR_STRING` four bytes to each character, nullable.
+- A few calls over written values alone: `HEX(n)` writes a whole number's 64
+  bits, `HEX(-1)` being `FFFFFFFFFFFFFFFF`, as a `VAR_STRING` of 64, and
+  `HEX('word')` its bytes, eight times its characters wide; `BIN` and `OCT`
+  write the same bits as one of 260; `CHAR(65, 66)` answers the bytes of each
+  number as a binary string reserving four bytes to the number, nullable with
+  the binary flag; `ASCII` and `ORD` read a word's first byte and first
+  character as a NOT NULL `LONGLONG` of 3 and of 21; `FIELD` finds an ASCII word
+  among the ones after it without regard to case as one of 3, and `ELT` reads
+  one out by its place, NULL past the last; `TRUNCATE` cuts a number with a
+  point to the places asked for held to the ones written — `TRUNCATE(1.567, 2)`
+  is a `NEWDECIMAL` 1.56 of 5 — and a whole number left of the point, a
+  `LONGLONG` of 21. `FIELD` over a word outside ASCII, which compares by the
+  collation's own weights, and `CONV` are refused.
 
 Each of these, and each cast of `NULL` to the same types, is taken only where it stands in
 the statement's own result. In a subquery, a derived table or a branch of a `UNION` it is

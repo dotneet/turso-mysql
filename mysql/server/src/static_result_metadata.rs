@@ -152,6 +152,20 @@ fn written_value_metadata(written: WrittenValue) -> StaticResultColumnMetadata {
             flags: 0,
             decimals: NOT_FIXED_DECIMALS,
         },
+        WrittenValue::BinaryWord { length } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_VAR_STRING,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: length,
+            flags: MYSQL_BINARY_FLAG,
+            decimals: NOT_FIXED_DECIMALS,
+        },
+        WrittenValue::WholeNumber { length } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_LONGLONG,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: length,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            decimals: 0,
+        },
     }
 }
 
