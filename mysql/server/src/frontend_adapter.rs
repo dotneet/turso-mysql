@@ -73,11 +73,12 @@ use turso_mysql_parser::{
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     renamed_tables, select_projection_origins, table_comment_change, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
-    ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
-    MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
-    MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
-    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
+    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
+    GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
+    MySqlDatabaseName, MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
+    MySqlLikePattern, MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource,
+    MySqlTableName, ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_engines,
@@ -5290,43 +5291,153 @@ impl TableResultMetadata {
         Ok(Some(definition))
     }
 
-    /// Finishes a `CASE` or `IF` whose every branch is a whole number.
+    /// Finishes a `CASE` or `IF` naming a column or answering whole numbers,
+    /// and an `IFNULL` or `COALESCE` falling one column back onto another.
     ///
-    /// Measured on MySQL 8.4.11: it answers a `LONGLONG` as wide as its widest
-    /// branch plus one for the sign — `THEN 1 ELSE 0` reports 2,
-    /// `THEN 100 ELSE -5` reports 4, and `THEN n ELSE 0` over an `INT` reports
-    /// 11, which is the `INT`'s ten digits and the sign. It carries the binary
-    /// and numeric flags, no decimal places, and NOT NULL only when every
-    /// branch is NOT NULL and a row cannot fall past them all.
-    fn numeric_branches_column_definition(
+    /// Measured on MySQL 8.4.11, the answer is the kind every branch shares
+    /// and as wide as the widest of them. A `CASE` is NOT NULL only when every
+    /// branch is and a row cannot fall past them all; an `IFNULL` or a
+    /// `COALESCE` is NOT NULL when any one of its columns is.
+    fn branches_column_definition(
         source_metadata: Option<&Self>,
         name: String,
-        branches: &[ArithmeticOperand],
+        branches: &[Branch],
         may_be_null: bool,
+        falls_back: bool,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
-        let mut precision = 0;
-        let mut not_null = !may_be_null;
+        let answer = Self::branches_answer(source_metadata, branches)?;
+        let not_null = if falls_back {
+            answer.any_not_null
+        } else {
+            !may_be_null && answer.all_not_null
+        };
+        Ok(answer.kind.column_definition(name, not_null))
+    }
+
+    /// Finishes `SUM`, `AVG`, `MIN` or `MAX` over a `CASE` or `IF`.
+    ///
+    /// Measured on MySQL 8.4.11: each answers the shape it gives a column of
+    /// the kind the `CASE` answers. `SUM` widens the `CASE`'s precision by 22
+    /// and keeps its scale, `AVG` widens both by 4, and both answer a
+    /// NEWDECIMAL over whole numbers — `SUM(CASE WHEN ... THEN 1 ELSE 0 END)`
+    /// reports 24 and `AVG` of it 7 with 4 places. Over a `DOUBLE` all of
+    /// them answer a `DOUBLE`. `MIN` and `MAX` answer the `CASE`'s own shape.
+    /// Every one of them is nullable, since there may be no row at all.
+    fn aggregate_over_branches_definition(
+        source_metadata: Option<&Self>,
+        name: String,
+        kind: ColumnAggregateKind,
+        branches: &turso_mysql_parser::StaticSelectMetadata,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        // A `CASE` of written words alone is summed and compared by a
+        // coercion or a collation, neither of which has been measured.
+        let turso_mysql_parser::StaticSelectMetadata::Branches { branches, .. } = branches else {
+            return Err(FrontendErrorKind::Unsupported);
+        };
+        let answer = Self::branches_answer(source_metadata, branches)?;
+        let kind = match (kind, answer.kind) {
+            (ColumnAggregateKind::Sum, BranchesKind::WholeNumber { precision, .. }) => {
+                BranchesKind::Decimal {
+                    precision: (precision + 22).min(MYSQL_MAX_DECIMAL_PRECISION),
+                    scale: 0,
+                }
+            }
+            (ColumnAggregateKind::Sum, BranchesKind::Decimal { precision, scale }) => {
+                BranchesKind::Decimal {
+                    precision: (precision + 22).min(MYSQL_MAX_DECIMAL_PRECISION),
+                    scale,
+                }
+            }
+            (ColumnAggregateKind::Avg, BranchesKind::WholeNumber { precision, .. }) => {
+                BranchesKind::Decimal {
+                    precision: (precision + 4).min(MYSQL_MAX_DECIMAL_PRECISION),
+                    scale: 4,
+                }
+            }
+            (ColumnAggregateKind::Avg, BranchesKind::Decimal { precision, scale }) => {
+                BranchesKind::Decimal {
+                    precision: (precision + 4).min(MYSQL_MAX_DECIMAL_PRECISION),
+                    scale: (scale + 4).min(MYSQL_MAX_DECIMAL_SCALE),
+                }
+            }
+            (
+                ColumnAggregateKind::Sum | ColumnAggregateKind::Avg | ColumnAggregateKind::MinMax,
+                BranchesKind::Double,
+            ) => BranchesKind::Double,
+            (ColumnAggregateKind::MinMax, whole @ BranchesKind::WholeNumber { .. }) => whole,
+            // MySQL compares words under a collation and a `DECIMAL` as a
+            // number, and the engine would compare either as the words they
+            // are written as.
+            _ => return Err(FrontendErrorKind::Unsupported),
+        };
+        Ok(kind.column_definition(name, false))
+    }
+
+    fn branches_answer(
+        source_metadata: Option<&Self>,
+        branches: &[Branch],
+    ) -> Result<BranchesAnswer, FrontendErrorKind> {
+        let mut shapes = Vec::with_capacity(branches.len());
+        let mut text_collation = None;
         for branch in branches {
-            let shape = Self::arithmetic_operand_shape(source_metadata, branch)?;
-            // A branch carrying a scale answers a NEWDECIMAL and a float
-            // branch a DOUBLE, neither of which has been measured here.
-            if shape.decimal || shape.float || shape.scale > 0 {
+            let shape = match branch {
+                Branch::WholeNumber { digit_count } => (
+                    BranchesKind::WholeNumber {
+                        column_type: MYSQL_TYPE_LONGLONG,
+                        length: digit_count + 1,
+                        precision: *digit_count,
+                    },
+                    true,
+                ),
+                Branch::Word { characters } => (
+                    BranchesKind::Text {
+                        characters: *characters,
+                    },
+                    true,
+                ),
+                Branch::Column { column_name } => {
+                    let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+                    let (table, ordinal) = source_metadata.column_named(column_name)?;
+                    let source = table
+                        .columns
+                        .get(ordinal)
+                        // An `information_schema` table names its columns
+                        // itself, and a CASE over one has not been measured.
+                        .ok_or(FrontendErrorKind::Unsupported)?;
+                    let kind = branch_column_kind(source)?;
+                    if matches!(kind, BranchesKind::Text { .. }) {
+                        // Two columns of words under different collations are
+                        // 1267 in MySQL.
+                        let collation = source.collation_name();
+                        if text_collation.get_or_insert(collation) != &collation {
+                            return Err(FrontendErrorKind::Unsupported);
+                        }
+                    }
+                    (kind, !source.nullable() && !table.outer)
+                }
+            };
+            shapes.push(shape);
+        }
+        let kind = shapes
+            .iter()
+            .map(|(kind, _)| *kind)
+            .try_fold(None, |shared: Option<BranchesKind>, kind| {
+                Ok(Some(match shared {
+                    None => kind,
+                    Some(shared) => shared.widened_by(kind)?,
+                }))
+            })?
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        if let BranchesKind::Decimal { precision, .. } = kind {
+            if precision > MYSQL_MAX_DECIMAL_PRECISION {
                 return Err(FrontendErrorKind::Unsupported);
             }
-            precision = precision.max(shape.precision);
-            not_null = not_null && shape.not_null;
         }
-        if precision == 0 {
-            return Err(FrontendErrorKind::Unsupported);
-        }
-        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
-        definition.column_length = precision + 1;
-        definition.decimals = 0;
-        set_column_flags(
-            &mut definition,
-            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
-        );
-        Ok(definition)
+        Ok(BranchesAnswer {
+            kind,
+            all_not_null: shapes.iter().all(|(_, not_null)| *not_null),
+            any_not_null: shapes.iter().any(|(_, not_null)| *not_null),
+        })
     }
 
     fn arithmetic_operand_shape(
@@ -5453,6 +5564,190 @@ impl TableResultMetadata {
             }
         }
     }
+}
+
+/// What a `CASE`, `IF`, `IFNULL` or `COALESCE` answers, and whether its
+/// branches can be null.
+#[cfg(unix)]
+struct BranchesAnswer {
+    kind: BranchesKind,
+    all_not_null: bool,
+    any_not_null: bool,
+}
+
+/// The kind of value a `CASE`, `IF`, `IFNULL` or `COALESCE` answers.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchesKind {
+    /// A whole number, reported as the widest integer type among the
+    /// branches, as long as the longest of them. `precision` counts digits.
+    WholeNumber {
+        column_type: u8,
+        length: u32,
+        precision: u32,
+    },
+    Decimal {
+        precision: u32,
+        scale: u32,
+    },
+    Double,
+    /// Words, as many characters as the longest branch can hold.
+    Text {
+        characters: u32,
+    },
+}
+
+#[cfg(unix)]
+impl BranchesKind {
+    /// The kind two branches share, measured on MySQL 8.4.11.
+    ///
+    /// Whole numbers answer the wider integer type — a written number counts
+    /// as a `BIGINT` — as long as the longer branch: `CASE ... THEN age ELSE
+    /// small END` over an `INT` and a `SMALLINT` is a LONG of 11, and
+    /// `THEN 5 ELSE small` a LONGLONG of 6. A `DECIMAL` beside a whole number
+    /// or another `DECIMAL` keeps the most digits before the point and the
+    /// most after it: a `DECIMAL(10,2)` beside an `INT` is a NEWDECIMAL of 14
+    /// with 2 places. A `DOUBLE` beside any number answers a `DOUBLE`. Words
+    /// only go with words; a word beside a number is a coercion that has not
+    /// been measured.
+    fn widened_by(self, other: Self) -> Result<Self, FrontendErrorKind> {
+        Ok(match (self, other) {
+            (Self::Text { characters }, Self::Text { characters: other }) => Self::Text {
+                characters: characters.max(other),
+            },
+            (Self::Text { .. }, _) | (_, Self::Text { .. }) => {
+                return Err(FrontendErrorKind::Unsupported)
+            }
+            (Self::Double, _) | (_, Self::Double) => Self::Double,
+            (
+                Self::WholeNumber {
+                    column_type,
+                    length,
+                    precision,
+                },
+                Self::WholeNumber {
+                    column_type: other_type,
+                    length: other_length,
+                    precision: other_precision,
+                },
+            ) => Self::WholeNumber {
+                column_type: if integer_type_rank(other_type) > integer_type_rank(column_type) {
+                    other_type
+                } else {
+                    column_type
+                },
+                length: length.max(other_length),
+                precision: precision.max(other_precision),
+            },
+            (left, right) => {
+                let (left_digits, left_scale) = left.digits_before_and_after_the_point();
+                let (right_digits, right_scale) = right.digits_before_and_after_the_point();
+                let scale = left_scale.max(right_scale);
+                Self::Decimal {
+                    precision: left_digits.max(right_digits) + scale,
+                    scale,
+                }
+            }
+        })
+    }
+
+    fn digits_before_and_after_the_point(self) -> (u32, u32) {
+        match self {
+            Self::WholeNumber { precision, .. } => (precision, 0),
+            Self::Decimal { precision, scale } => (precision - scale, scale),
+            Self::Double | Self::Text { .. } => {
+                unreachable!("only whole numbers and decimals are counted in digits")
+            }
+        }
+    }
+
+    fn column_definition(self, name: String, not_null: bool) -> ColumnDefinitionConfig {
+        let not_null_flag = if not_null { MYSQL_NOT_NULL_FLAG } else { 0 };
+        let mut definition = match self {
+            Self::Text { characters } => {
+                return text_call_definition(
+                    name,
+                    characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+                    not_null,
+                );
+            }
+            Self::WholeNumber {
+                column_type,
+                length,
+                ..
+            } => {
+                let mut definition = column_definition(name, column_type);
+                definition.column_length = length;
+                definition.decimals = 0;
+                definition
+            }
+            Self::Decimal { precision, scale } => {
+                let mut definition = column_definition(name, MYSQL_TYPE_NEWDECIMAL);
+                definition.column_length = precision + 1 + u32::from(scale > 0);
+                definition.decimals = scale as u8;
+                definition
+            }
+            Self::Double => {
+                let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+                definition.column_length = 23;
+                definition.decimals = NOT_FIXED_DECIMALS;
+                definition
+            }
+        };
+        set_column_flags(
+            &mut definition,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | not_null_flag,
+        );
+        definition
+    }
+}
+
+/// Orders the integer types from narrowest to widest.
+#[cfg(unix)]
+fn integer_type_rank(column_type: u8) -> u8 {
+    match column_type {
+        MYSQL_TYPE_TINY => 0,
+        MYSQL_TYPE_SHORT => 1,
+        MYSQL_TYPE_INT24 => 2,
+        MYSQL_TYPE_LONG => 3,
+        MYSQL_TYPE_LONGLONG => 4,
+        _ => unreachable!("only integer types are ranked"),
+    }
+}
+
+/// The kind of value one column contributes as a branch.
+///
+/// An unsigned column is refused: measured on MySQL 8.4.11, a `BIGINT
+/// UNSIGNED` beside a written number answers a NEWDECIMAL, and a `TINYINT
+/// UNSIGNED` beside a `TINYINT` a SHORT, each a rule of its own. So is a
+/// `FLOAT`, a `TEXT` and anything holding a moment.
+#[cfg(unix)]
+fn branch_column_kind(source: &MySqlColumnMetadata) -> Result<BranchesKind, FrontendErrorKind> {
+    let whole = |column_type, length, precision| BranchesKind::WholeNumber {
+        column_type,
+        length,
+        precision,
+    };
+    Ok(match source.type_name() {
+        // Measured: a `TINYINT(1)` answers a TINY of 4 here, as any `TINYINT`
+        // does, though on its own it reports 1.
+        "TINYINT" | "BOOLEAN" => whole(MYSQL_TYPE_TINY, 4, 3),
+        "SMALLINT" => whole(MYSQL_TYPE_SHORT, 6, 5),
+        "MEDIUMINT" => whole(MYSQL_TYPE_INT24, 9, 8),
+        "INT" | "INTEGER" => whole(MYSQL_TYPE_LONG, 11, 10),
+        "BIGINT" => whole(MYSQL_TYPE_LONGLONG, 20, 19),
+        "DECIMAL" => {
+            let (precision, scale) = source.decimal_size().ok_or(FrontendErrorKind::Internal)?;
+            BranchesKind::Decimal { precision, scale }
+        }
+        "DOUBLE" => BranchesKind::Double,
+        "VARCHAR" | "CHAR" => BranchesKind::Text {
+            characters: source
+                .character_length()
+                .ok_or(FrontendErrorKind::Internal)?,
+        },
+        _ => return Err(FrontendErrorKind::Unsupported),
+    })
 }
 
 /// The precision and nullability one arithmetic operand contributes.
@@ -7050,9 +7345,12 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
             needs_source_columns(inner)
         }
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => shape.names_a_column(),
-        turso_mysql_parser::StaticSelectMetadata::NumericBranches { branches, .. } => branches
+        turso_mysql_parser::StaticSelectMetadata::Branches { branches, .. } => branches
             .iter()
-            .any(|branch| matches!(branch, ArithmeticOperand::Column { .. })),
+            .any(|branch| matches!(branch, Branch::Column { .. })),
+        turso_mysql_parser::StaticSelectMetadata::AggregateOverBranches { branches, .. } => {
+            needs_source_columns(branches)
+        }
         turso_mysql_parser::StaticSelectMetadata::ScalarCall { columns, .. } => !columns.is_empty(),
         _ => false,
     }
@@ -7143,15 +7441,25 @@ fn aggregate_column_definition(
         turso_mysql_parser::StaticSelectMetadata::Arithmetic(shape) => {
             TableResultMetadata::arithmetic_column_definition(source_metadata, name, shape)
         }
-        turso_mysql_parser::StaticSelectMetadata::NumericBranches {
+        turso_mysql_parser::StaticSelectMetadata::Branches {
             branches,
             may_be_null,
-        } => TableResultMetadata::numeric_branches_column_definition(
+            falls_back,
+        } => TableResultMetadata::branches_column_definition(
             source_metadata,
             name,
             branches,
             *may_be_null,
+            *falls_back,
         ),
+        turso_mysql_parser::StaticSelectMetadata::AggregateOverBranches { kind, branches } => {
+            TableResultMetadata::aggregate_over_branches_definition(
+                source_metadata,
+                name,
+                *kind,
+                branches,
+            )
+        }
         turso_mysql_parser::StaticSelectMetadata::ScalarCall {
             function,
             columns,

@@ -73,16 +73,41 @@ pub enum StaticSelectMetadata {
     /// aggregate answers — never null, which is why it is written, and widened
     /// to a `BIGINT` when the aggregate answers any whole number.
     DefaultedAggregate(Box<StaticSelectMetadata>),
-    /// A `CASE` or `IF` whose every branch is a whole number, which answers a
-    /// `LONGLONG` as wide as its widest branch.
+    /// A `CASE` or `IF` whose branches are whole numbers or name a column, or
+    /// an `IFNULL` or `COALESCE` falling one column back onto another. The
+    /// answer is a rule over every branch: the kind they share and the widest
+    /// of them.
     ///
     /// Like `Arithmetic` this is finished by the server, because a column
-    /// branch's precision lives in the table.
-    NumericBranches {
-        branches: Vec<ArithmeticOperand>,
-        /// Whether a row can answer NULL: no `ELSE`, or a `NULL` branch.
+    /// branch's type lives in the table.
+    Branches {
+        branches: Vec<Branch>,
+        /// Whether a row can answer NULL whatever its branches hold: a `CASE`
+        /// with no `ELSE`, or a `NULL` branch.
         may_be_null: bool,
+        /// Whether this answers its first argument that is not NULL, as
+        /// `IFNULL` and `COALESCE` do, rather than the branch a condition
+        /// picks.
+        falls_back: bool,
     },
+    /// `SUM`, `AVG`, `MIN` or `MAX` over a `CASE` or `IF`, which is how a
+    /// report counts or totals the rows that meet a condition. Its shape is
+    /// the one the aggregate gives the column the `CASE` answers.
+    AggregateOverBranches {
+        kind: ColumnAggregateKind,
+        branches: Box<StaticSelectMetadata>,
+    },
+}
+
+/// One thing a `CASE`, `IF`, `IFNULL` or `COALESCE` can answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Branch {
+    /// A written whole number, as many digits long as it was written.
+    WholeNumber { digit_count: u32 },
+    /// A written word, as many characters long as it spells.
+    Word { characters: u32 },
+    /// A column, whose type lives in the table.
+    Column { column_name: String },
 }
 
 /// One integer arithmetic expression, whose result type is a rule over its
@@ -439,11 +464,18 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             conditions,
             else_result,
             ..
-        } => classify_branches(
-            operand.as_deref(),
-            conditions.iter().map(|when| &when.result),
-            else_result.as_deref(),
-        ),
+        } => {
+            if let Some(operand) = operand {
+                compared_against_written_values(
+                    operand,
+                    conditions.iter().map(|when| &when.condition),
+                )?;
+            }
+            classify_branches(
+                conditions.iter().map(|when| &when.result),
+                else_result.as_deref(),
+            )
+        }
         Expr::Substring {
             expr,
             substring_from,
@@ -490,6 +522,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
                 column_name: column.value.clone(),
                 kind,
             })
+            .or_else(|| aggregate_over_branches(function))
             .or_else(|| scalar_call(function)),
         _ => None,
     }
@@ -765,89 +798,204 @@ fn decimal_literal_shape(written: &str) -> Option<(u32, u32)> {
     Some((precision, scale))
 }
 
-/// Classifies a `CASE` or an `IF`, whose answer is as wide as its widest
-/// branch.
+/// Classifies a `CASE` or an `IF`, whose answer is a rule over its branches.
 ///
 /// Measured on MySQL 8.4.11: `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` answers a
 /// `VAR_STRING` of length 4 — one character, four bytes each — and is NOT NULL.
-/// Every branch has to be a string literal, or `NULL`, for that width to be
-/// knowable.
+/// A branch is a written word, a written whole number, a column or `NULL`; a
+/// written number with a point answers a NEWDECIMAL by a rule of its own, and
+/// an aggregate or arithmetic in a branch has not been measured.
 ///
 /// Two things make the answer nullable, both measured: no `ELSE`, because a row
 /// matching nothing answers NULL, and a `NULL` branch. Either way the width is
-/// still the widest string branch — `CASE WHEN n < 3 THEN 'low' END` and
+/// still the widest branch — `CASE WHEN n < 3 THEN 'low' END` and
 /// `... THEN 'low' ELSE NULL END` both answer length 3 with no `NOT_NULL` flag.
 pub(super) fn classify_branches<'a>(
-    operand: Option<&Expr>,
     results: impl Iterator<Item = &'a Expr>,
     else_result: Option<&'a Expr>,
 ) -> Option<StaticSelectMetadata> {
-    // A `CASE col WHEN ...` compares its operand, which raises the coercion
-    // question a `WHERE` comparison raises and has not been measured here.
-    if operand.is_some() {
-        return None;
-    }
-    let mut characters = 0u32;
-    let mut words = 0usize;
-    let mut numbers = Vec::new();
-    let mut nullable = else_result.is_none();
+    let mut branches = Vec::new();
+    let mut may_be_null = else_result.is_none();
     for result in results.chain(else_result) {
         if matches!(result, Expr::Value(value) if matches!(value.value, Value::Null)) {
-            nullable = true;
+            may_be_null = true;
             continue;
         }
-        match result {
-            Expr::Value(value) => match &value.value {
-                Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
-                    characters = characters.max(text.chars().count() as u32);
-                    words += 1;
-                }
-                _ => numbers.push(numeric_branch(result)?),
-            },
-            _ => numbers.push(numeric_branch(result)?),
-        }
+        branches.push(branch(result)?);
     }
-    // A word branch beside a number branch is a coercion, which has not been
-    // measured.
-    if words > 0 && !numbers.is_empty() {
+    let words = branches
+        .iter()
+        .filter(|branch| matches!(branch, Branch::Word { .. }))
+        .count();
+    let names_a_column = branches
+        .iter()
+        .any(|branch| matches!(branch, Branch::Column { .. }));
+    // Every branch was NULL, so there is nothing to take a shape from.
+    if branches.is_empty() {
         return None;
     }
-    if !numbers.is_empty() {
-        return Some(StaticSelectMetadata::NumericBranches {
-            branches: numbers,
-            may_be_null: nullable,
+    if words == branches.len() {
+        let characters = branches
+            .iter()
+            .map(|branch| match branch {
+                Branch::Word { characters } => *characters,
+                _ => unreachable!("every branch was counted as a word"),
+            })
+            .max()
+            .expect("there is at least one branch");
+        // An empty word is no width to answer with.
+        if characters == 0 {
+            return None;
+        }
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::Branches,
+            columns: Vec::new(),
+            literal_characters: characters,
+            not_null: !may_be_null,
         });
     }
-    // Every branch was NULL, so there is no width to answer with.
-    if characters == 0 {
+    // A written word beside a written number is a coercion, which has not been
+    // measured. Beside a column it is left to the server, which takes it only
+    // when the column holds words too.
+    if words > 0 && !names_a_column {
         return None;
     }
-    Some(StaticSelectMetadata::ScalarCall {
-        function: ScalarFunction::Branches,
-        columns: Vec::new(),
-        literal_characters: characters,
-        not_null: !nullable,
+    Some(StaticSelectMetadata::Branches {
+        branches,
+        may_be_null,
+        falls_back: false,
     })
 }
 
-/// One branch of a `CASE` or `IF` that answers a whole number.
-///
-/// Measured on MySQL 8.4.11, a numeric `CASE` answers a `LONGLONG` as wide as
-/// its widest branch plus one for the sign: `THEN 1 ELSE 0` reports 2,
-/// `THEN 100 ELSE -5` reports 4, and `THEN n ELSE 0` over an `INT` reports 11,
-/// which is the `INT`'s own ten digits and the sign. `IF` answers the same,
-/// being the call spelling of the same thing.
-///
-/// A branch is a written number or a column and nothing else. An aggregate or
-/// arithmetic in a branch has not been measured, and neither has a branch
-/// carrying a scale — `THEN 1.5 ELSE 0` answers a NEWDECIMAL rather than this.
-fn numeric_branch(expr: &Expr) -> Option<ArithmeticOperand> {
-    match classify_arithmetic_operand(expr)? {
-        operand @ (ArithmeticOperand::Literal { .. } | ArithmeticOperand::Column { .. }) => {
-            Some(operand)
+/// Reads one branch of a `CASE`, `IF`, `IFNULL` or `COALESCE`.
+fn branch(expr: &Expr) -> Option<Branch> {
+    match expr {
+        Expr::Identifier(column) => Some(Branch::Column {
+            column_name: column.value.clone(),
+        }),
+        Expr::Nested(inner) => branch(inner),
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) | Value::DoubleQuotedString(text) => {
+                Some(Branch::Word {
+                    characters: u32::try_from(text.chars().count()).ok()?,
+                })
+            }
+            _ => whole_number_branch(expr),
+        },
+        _ => whole_number_branch(expr),
+    }
+}
+
+/// A written whole number, signed or not. A number carrying a point is not
+/// one: measured, `THEN 1.5 ELSE 0` answers a NEWDECIMAL rather than this.
+fn whole_number_branch(expr: &Expr) -> Option<Branch> {
+    match classify_static_select_expr(expr)? {
+        StaticSelectMetadata::Integer { digit_count, .. } => {
+            Some(Branch::WholeNumber { digit_count })
         }
         _ => None,
     }
+}
+
+/// Holds `CASE col WHEN v1 THEN ... WHEN v2 THEN ...` to what it is the same
+/// as: `CASE WHEN col = v1 THEN ... WHEN col = v2 THEN ...`.
+///
+/// MySQL compares the operand against every `WHEN` value by one rule chosen
+/// over all of them together, where the spelled-out form chooses one for each
+/// comparison on its own. The two agree when every value is of one kind, so
+/// the values have to be all written words or all written whole numbers. Each
+/// comparison is then rendered and checked the way a `WHERE` comparison is.
+fn compared_against_written_values<'a>(
+    operand: &Expr,
+    values: impl Iterator<Item = &'a Expr>,
+) -> Option<()> {
+    if !matches!(operand, Expr::Identifier(_)) {
+        return None;
+    }
+    let mut words = 0usize;
+    let mut numbers = 0usize;
+    for value in values {
+        match branch(value)? {
+            Branch::Word { .. } => words += 1,
+            Branch::WholeNumber { .. } => numbers += 1,
+            Branch::Column { .. } => return None,
+        }
+    }
+    (words == 0 || numbers == 0).then_some(())
+}
+
+/// Classifies `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` over one `CASE` or `IF`.
+///
+/// `SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)` is how a report
+/// counts the rows meeting a condition. Measured on MySQL 8.4.11, a `COUNT`
+/// of one answers what any `COUNT` answers, and the others answer the shape
+/// they give a column of the kind the `CASE` answers.
+pub(super) fn aggregate_over_branches(
+    function: &sqlparser::ast::Function,
+) -> Option<StaticSelectMetadata> {
+    let (kind, argument) = aggregated_branches(function)?;
+    let branches = classify_static_select_expr(argument)?;
+    if !matches!(
+        branches,
+        StaticSelectMetadata::Branches { .. }
+            | StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::Branches,
+                ..
+            }
+    ) {
+        return None;
+    }
+    let Some(kind) = kind else {
+        return Some(StaticSelectMetadata::Count);
+    };
+    Some(StaticSelectMetadata::AggregateOverBranches {
+        kind,
+        branches: Box::new(branches),
+    })
+}
+
+/// Reads an aggregate over one `CASE` or `IF`: which aggregate it is — `None`
+/// for a `COUNT` — and the expression it aggregates.
+pub(crate) fn aggregated_branches(
+    function: &sqlparser::ast::Function,
+) -> Option<(Option<ColumnAggregateKind>, &Expr)> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some() || has_aggregate_modifiers(function) {
+        return None;
+    }
+    let kind = if name.value.eq_ignore_ascii_case("COUNT") {
+        None
+    } else if name.value.eq_ignore_ascii_case("SUM") {
+        Some(ColumnAggregateKind::Sum)
+    } else if name.value.eq_ignore_ascii_case("AVG") {
+        Some(ColumnAggregateKind::Avg)
+    } else if name.value.eq_ignore_ascii_case("MIN") || name.value.eq_ignore_ascii_case("MAX") {
+        Some(ColumnAggregateKind::MinMax)
+    } else {
+        return None;
+    };
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(argument))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let is_a_condition = match argument {
+        Expr::Case { .. } => true,
+        Expr::Function(inner) => {
+            matches!(inner.name.0.as_slice(), [sqlparser::ast::ObjectNamePart::Identifier(name)]
+                if name.quote_style.is_none() && name.value.eq_ignore_ascii_case("IF"))
+        }
+        _ => false,
+    };
+    is_a_condition.then_some((kind, argument))
 }
 
 /// Classifies a scalar subquery in a projection.
@@ -1366,6 +1514,39 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
+    // `COALESCE(nickname, name)` falls one column back onto another. Measured
+    // on MySQL 8.4.11 it answers the rule a `CASE` over the same columns
+    // answers, and is NOT NULL when any one of them is.
+    if named(&["IFNULL", "COALESCE"])
+        && arguments.args.len() >= 2
+        && (named(&["COALESCE"]) || arguments.args.len() == 2)
+        && arguments.args.iter().all(|argument| {
+            matches!(
+                argument,
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    Expr::Identifier(_)
+                ))
+            )
+        })
+    {
+        let branches = arguments
+            .args
+            .iter()
+            .map(|argument| match argument {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    Expr::Identifier(column),
+                )) => Branch::Column {
+                    column_name: column.value.clone(),
+                },
+                _ => unreachable!("every argument was checked to be a column"),
+            })
+            .collect();
+        return Some(StaticSelectMetadata::Branches {
+            branches,
+            may_be_null: false,
+            falls_back: true,
+        });
+    }
     // `IFNULL(column, literal)` cannot be null, which is the whole reason a
     // client writes it, so the second argument has to be one that is not.
     if named(&["IFNULL", "COALESCE"]) {
@@ -1437,7 +1618,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         else {
             return None;
         };
-        return classify_branches(None, std::iter::once(then_result), Some(else_result));
+        return classify_branches(std::iter::once(then_result), Some(else_result));
     }
     // `CONCAT` is as wide as its arguments laid end to end, so every one of
     // them counts: a column contributes its own width and a string literal the

@@ -260,6 +260,7 @@ pub(crate) struct RenderedSelect {
     pub(crate) json_reading_columns: Vec<String>,
     pub(crate) orders_a_bare_column: bool,
     pub(crate) checks_type_sensitive_expression: bool,
+    pub(crate) renders_a_condition_without_column_types: bool,
     pub(crate) orders_wildcard_ordinal: bool,
     pub(crate) compares_a_placeholder: bool,
     pub(crate) counts_distinct_column: bool,
@@ -443,6 +444,8 @@ pub(crate) fn translate_select_query(
         json_reading_columns: render_context.json_reading_columns,
         orders_a_bare_column: render_context.orders_a_bare_column,
         checks_type_sensitive_expression: render_context.checks_type_sensitive_expression,
+        renders_a_condition_without_column_types: render_context
+            .renders_a_condition_without_column_types,
         orders_wildcard_ordinal: render_context.orders_wildcard_ordinal,
         compares_a_placeholder: render_context.compares_a_placeholder,
         counts_distinct_column: render_context.counts_distinct_column,
@@ -1338,6 +1341,7 @@ fn names_an_aggregate(expr: &Expr) -> bool {
 fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
     static_select_metadata::is_count_call(function)
         || static_select_metadata::column_aggregate_argument(function).is_some()
+        || static_select_metadata::aggregate_over_branches(function).is_some()
         || matches!(
             static_select_metadata::scalar_call(function),
             Some(StaticSelectMetadata::DefaultedAggregate(_))
@@ -1795,6 +1799,13 @@ fn order_expression_uses_decimal(expr: &Expr, decimal_columns: &[(String, u32)])
         Some(StaticSelectMetadata::ColumnAggregate { column_name, .. }) => {
             names_decimal(&column_name)
         }
+        // An average over a `CASE` answers a `DECIMAL` however whole its
+        // branches are, written out as the engine's `DECIMAL` average writes
+        // it.
+        Some(StaticSelectMetadata::AggregateOverBranches {
+            kind: ColumnAggregateKind::Avg,
+            ..
+        }) => true,
         _ => false,
     }
 }
@@ -3543,6 +3554,11 @@ fn render_update_assignment_value(
             if !reads_only_unassigned_columns(value, assigned) {
                 return unsupported("UPDATE assignment reading a column it has already assigned");
             }
+            // What MySQL writes for a `CASE` falling back onto a column of
+            // words, or for an aggregate, has not been measured.
+            if written_only_as_a_reading(value) {
+                return unsupported("UPDATE assignment of an unmeasured conditional");
+            }
             render_select_expr(value, render_context)
         }
         // `SET n = (SELECT MAX(m) FROM other)` takes one value out of another
@@ -3668,6 +3684,40 @@ fn reads_only_unassigned_columns(expr: &Expr, assigned: &[String]) -> bool {
         }
         Expr::Floor { expr, .. } | Expr::Ceil { expr, .. } => {
             reads_only_unassigned_columns(expr, assigned)
+        }
+        _ => false,
+    }
+}
+
+/// Reports whether a value is a conditional this reads in a projection and has
+/// not measured being written into a column: one falling back onto another
+/// column, one comparing an operand, one with a word beside a column, or an
+/// aggregate over one.
+fn written_only_as_a_reading(value: &Expr) -> bool {
+    if let Expr::Function(function) = value {
+        if static_select_metadata::aggregated_branches(function).is_some() {
+            return true;
+        }
+    }
+    if matches!(
+        value,
+        Expr::Case {
+            operand: Some(_),
+            ..
+        }
+    ) {
+        return true;
+    }
+    match static_select_metadata::classify_static_select_expr(value) {
+        Some(StaticSelectMetadata::Branches {
+            branches,
+            falls_back,
+            ..
+        }) => {
+            falls_back
+                || branches
+                    .iter()
+                    .any(|branch| matches!(branch, static_select_metadata::Branch::Word { .. }))
         }
         _ => false,
     }
@@ -3937,6 +3987,10 @@ pub(crate) struct SelectRenderContext<'a> {
     moment_columns: &'a [String],
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
+    /// Whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column was
+    /// written before the kinds of its columns were known. Its rendering
+    /// depends on them, so a statement ending up that way is refused.
+    renders_a_condition_without_column_types: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
@@ -3983,6 +4037,7 @@ impl<'a> SelectRenderContext<'a> {
             subquery_tables: Vec::new(),
             orders_a_bare_column: false,
             checks_type_sensitive_expression: false,
+            renders_a_condition_without_column_types: false,
             orders_wildcard_ordinal: false,
             compares_a_placeholder: false,
             counts_distinct_column: false,
@@ -4074,7 +4129,8 @@ fn render_select_item(
         // expression, so the engine's own spelling has to be aliased away.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
             if static_select_metadata::scalar_call(function).is_some()
-                || static_select_metadata::classify_window_call(function).is_some() =>
+                || static_select_metadata::classify_window_call(function).is_some()
+                || static_select_metadata::aggregate_over_branches(function).is_some() =>
         {
             let name = source_text(render_context.source, expr)
                 .ok_or(ParseError::Unsupported {
@@ -4522,6 +4578,11 @@ fn render_select_expr(
         {
             Ok(render_aggregate_call(function, render_context))
         }
+        Expr::Function(function)
+            if static_select_metadata::aggregate_over_branches(function).is_some() =>
+        {
+            render_aggregate_over_branches(function, render_context)
+        }
         // MySQL writes a column out, reads a whole number out of it, or reads
         // the day or the moment out of it. Each is spelled here as what the
         // engine answers the same value with. Which targets those are is the
@@ -4641,26 +4702,31 @@ fn render_select_expr(
         }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
         Expr::Case {
-            operand: None,
+            operand,
             conditions,
             else_result,
             ..
         } if static_select_metadata::classify_static_select_expr(expr).is_some() => {
-            let mut rendered = "CASE".to_owned();
+            let answer = conditional_answer(expr, render_context);
+            let mut arms = Vec::with_capacity(conditions.len());
             for when in conditions {
-                rendered.push_str(" WHEN ");
-                rendered.push_str(&render_select_predicate(&when.condition, render_context)?);
-                rendered.push_str(" THEN ");
-                rendered.push_str(&render_select_expr(&when.result, render_context)?);
+                // `CASE col WHEN v` is `CASE WHEN col = v`, and is written that
+                // way so the comparison is checked and collated as one in a
+                // `WHERE` is.
+                let condition = match operand {
+                    Some(operand) => render_select_predicate(
+                        &Expr::BinaryOp {
+                            left: operand.clone(),
+                            op: BinaryOperator::Eq,
+                            right: Box::new(when.condition.clone()),
+                        },
+                        render_context,
+                    )?,
+                    None => render_select_predicate(&when.condition, render_context)?,
+                };
+                arms.push((condition, &when.result));
             }
-            // Both engines answer NULL for a row that matches nothing, so a
-            // missing ELSE is written as a missing ELSE.
-            if let Some(else_result) = else_result {
-                rendered.push_str(" ELSE ");
-                rendered.push_str(&render_select_expr(else_result, render_context)?);
-            }
-            rendered.push_str(" END");
-            Ok(rendered)
+            render_picked_branches(arms, else_result.as_deref(), answer, render_context)
         }
         // The engine's `substr` reads a place of 0, or one before the start,
         // as the start, where MySQL answers nothing: measured on 8.4.11,
@@ -5378,6 +5444,11 @@ fn render_scalar_call(
     ) {
         render_context.checks_type_sensitive_expression = true;
     }
+    if let Some(branches @ StaticSelectMetadata::Branches { .. }) =
+        static_select_metadata::scalar_call(function)
+    {
+        return render_branches_call(name, function, &branches, render_context);
+    }
     let has_decimal_argument = match &function.args {
         FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
             matches!(argument,
@@ -6053,6 +6124,230 @@ fn render_scalar_call(
         unreachable!("a checked scalar call was already recognized");
     };
     Ok(format!("{engine}({})", single_column_argument(function)))
+}
+
+/// How the answer of a `CASE`, `IF`, `IFNULL` or `COALESCE` is written for the
+/// engine, which depends on the kind of number its columns hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalAnswer {
+    /// Whole numbers or words, which the engine answers as MySQL does.
+    AsWritten,
+    /// A `DOUBLE` column among the branches makes the answer a `DOUBLE`, so a
+    /// whole number branch has to come back as one too.
+    Double,
+    /// A `DECIMAL` column among the branches makes the answer a `DECIMAL`
+    /// with the largest scale among them.
+    Decimal { scale: u32 },
+}
+
+/// Works out how a conditional's answer is written, from the columns its
+/// branches name.
+///
+/// Only a second rendering knows what the columns hold. The first one answers
+/// as written and says so, and a statement whose final rendering still did not
+/// know is refused.
+fn conditional_answer(
+    expr: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> ConditionalAnswer {
+    let Some(StaticSelectMetadata::Branches { branches, .. }) =
+        static_select_metadata::classify_static_select_expr(expr)
+    else {
+        return ConditionalAnswer::AsWritten;
+    };
+    let columns = branches
+        .iter()
+        .filter_map(|branch| match branch {
+            static_select_metadata::Branch::Column { column_name } => Some(column_name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if columns.is_empty() {
+        return ConditionalAnswer::AsWritten;
+    }
+    render_context.checks_type_sensitive_expression = true;
+    if render_context.table_columns.is_empty() {
+        render_context.renders_a_condition_without_column_types = true;
+        return ConditionalAnswer::AsWritten;
+    }
+    if columns.iter().any(|column| {
+        render_context
+            .real_columns
+            .iter()
+            .any(|real| real.eq_ignore_ascii_case(column))
+    }) {
+        return ConditionalAnswer::Double;
+    }
+    columns
+        .iter()
+        .filter_map(|column| {
+            render_context
+                .decimal_columns
+                .iter()
+                .find(|(decimal, _)| decimal.eq_ignore_ascii_case(column))
+                .map(|(_, scale)| *scale)
+        })
+        .max()
+        .map_or(ConditionalAnswer::AsWritten, |scale| {
+            ConditionalAnswer::Decimal { scale }
+        })
+}
+
+/// Writes a `CASE` whose conditions are already written.
+///
+/// Measured on MySQL 8.4.11, a `CASE` answering a `DECIMAL` answers each
+/// branch at its own scale rather than at the answer's: `THEN balance ELSE 0`
+/// over a `DECIMAL(10,2)` answers `10.50` and `0`, in both protocols, and an
+/// `INT` branch beside it answers `30`. Each branch is written out as the text
+/// it is, which is what the engine's `DECIMAL` already reads as.
+fn render_picked_branches(
+    arms: Vec<(String, &Expr)>,
+    else_result: Option<&Expr>,
+    answer: ConditionalAnswer,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let mut rendered = "CASE".to_owned();
+    for (condition, result) in arms {
+        rendered.push_str(" WHEN ");
+        rendered.push_str(&condition);
+        rendered.push_str(" THEN ");
+        rendered.push_str(&render_branch(result, answer, render_context)?);
+    }
+    // Both engines answer NULL for a row that matches nothing, so a missing
+    // ELSE is written as a missing ELSE.
+    if let Some(else_result) = else_result {
+        rendered.push_str(" ELSE ");
+        rendered.push_str(&render_branch(else_result, answer, render_context)?);
+    }
+    rendered.push_str(" END");
+    Ok(match answer {
+        ConditionalAnswer::Double => format!("CAST({rendered} AS REAL)"),
+        ConditionalAnswer::AsWritten | ConditionalAnswer::Decimal { .. } => rendered,
+    })
+}
+
+fn render_branch(
+    expr: &Expr,
+    answer: ConditionalAnswer,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let rendered = render_select_expr(expr, render_context)?;
+    if matches!(answer, ConditionalAnswer::Decimal { .. })
+        && decimal_operand_scale(expr, render_context.decimal_columns).is_none()
+    {
+        return Ok(format!("CAST({rendered} AS TEXT)"));
+    }
+    Ok(rendered)
+}
+
+/// Writes an `IF`, an `IFNULL` or a `COALESCE` that names a column or answers
+/// whole numbers.
+///
+/// Measured on MySQL 8.4.11, `IFNULL` and `COALESCE` answering a `DECIMAL`
+/// answer every value at the answer's scale — `IFNULL(age, balance)` over an
+/// `INT` and a `DECIMAL(10,2)` answers `30.00` — where a `CASE` does not.
+fn render_branches_call(
+    name: &Ident,
+    function: &sqlparser::ast::Function,
+    branches: &StaticSelectMetadata,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let answer = conditional_answer(&Expr::Function(function.clone()), render_context);
+    let FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a checked scalar call was checked to have an argument list");
+    };
+    let arguments = arguments
+        .args
+        .iter()
+        .map(|argument| match argument {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                expr
+            }
+            _ => unreachable!("a checked conditional was checked to take plain arguments"),
+        })
+        .collect::<Vec<_>>();
+    if name.value.eq_ignore_ascii_case("IF") {
+        let [condition, then_result, else_result] = arguments.as_slice() else {
+            unreachable!("IF was checked to take three arguments");
+        };
+        let condition = render_select_predicate(condition, render_context)?;
+        return render_picked_branches(
+            vec![(condition, then_result)],
+            Some(else_result),
+            answer,
+            render_context,
+        );
+    }
+    assert!(
+        matches!(
+            branches,
+            StaticSelectMetadata::Branches {
+                falls_back: true,
+                ..
+            }
+        ),
+        "only IF picks a branch among the checked calls"
+    );
+    let values = arguments
+        .into_iter()
+        .map(|argument| render_select_expr(argument, render_context))
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    Ok(match answer {
+        ConditionalAnswer::AsWritten => format!("coalesce({values})"),
+        ConditionalAnswer::Double => format!("CAST(coalesce({values}) AS REAL)"),
+        ConditionalAnswer::Decimal { scale } => {
+            format!("mysql_decimal_round(coalesce({values}), {scale})")
+        }
+    })
+}
+
+/// Writes `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` over a `CASE` or `IF`.
+///
+/// Measured on MySQL 8.4.11, `SUM` and `AVG` over a `CASE` answering a
+/// `DECIMAL` answer at the `CASE`'s scale whatever the rows held —
+/// `SUM(CASE WHEN id > 100 THEN balance ELSE 0 END)` over no matching row is
+/// `0.00` — so every value is brought to that scale before it is added. `AVG`
+/// over whole numbers answers four places exactly, which the engine's
+/// `DECIMAL` average does and its own average does not. `MIN` and `MAX` over
+/// a `DECIMAL` are refused: the engine would compare the written values as
+/// words.
+fn render_aggregate_over_branches(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let (kind, argument) = static_select_metadata::aggregated_branches(function)
+        .expect("the caller checked the aggregate reads a CASE");
+    let answer = conditional_answer(argument, render_context);
+    let values = render_select_expr(argument, render_context)?;
+    let Some(kind) = kind else {
+        return Ok(format!("count({values})"));
+    };
+    Ok(match (kind, answer) {
+        (ColumnAggregateKind::Sum, ConditionalAnswer::Decimal { scale }) => {
+            format!("mysql_decimal_sum(mysql_decimal_round({values}, {scale}))")
+        }
+        (ColumnAggregateKind::Sum, _) => format!("sum({values})"),
+        (ColumnAggregateKind::Avg, ConditionalAnswer::Decimal { scale }) => {
+            format!("mysql_decimal_avg(mysql_decimal_round({values}, {scale}))")
+        }
+        (ColumnAggregateKind::Avg, ConditionalAnswer::Double) => format!("avg({values})"),
+        (ColumnAggregateKind::Avg, ConditionalAnswer::AsWritten) => {
+            format!("mysql_decimal_avg({values})")
+        }
+        (ColumnAggregateKind::MinMax, ConditionalAnswer::Decimal { .. }) => {
+            return unsupported("SELECT MIN or MAX over a CASE answering a DECIMAL");
+        }
+        (ColumnAggregateKind::MinMax, _) => {
+            format!("{}({values})", function.name.to_string().to_lowercase())
+        }
+        (
+            ColumnAggregateKind::Concatenated
+            | ColumnAggregateKind::DeviatesBySample
+            | ColumnAggregateKind::CollectsIntoJson,
+            _,
+        ) => unreachable!("only COUNT, SUM, AVG, MIN and MAX are read over a CASE"),
+    })
 }
 
 /// Names the reading that answers a MySQL JSON call the engine has none for.

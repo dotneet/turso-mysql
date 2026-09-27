@@ -4979,13 +4979,13 @@ fn scalar_calls_answer_the_shape_mysql_answers() {
     assert_eq!(unmatched.rows, vec![vec![None]]);
 
     // Every branch NULL leaves no width to answer with, and a `CASE col WHEN`
-    // compares its operand, which raises a coercion question this has not
-    // measured.
+    // whose values are of two kinds compares by a rule chosen over all of
+    // them together.
     assert!(adapter
         .execute_query("SELECT CASE WHEN n > 1 THEN NULL ELSE NULL END FROM s")
         .is_err());
     assert!(adapter
-        .execute_query("SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s")
+        .execute_query("SELECT CASE n WHEN 1 THEN 'y' WHEN '2' THEN 'z' END FROM s")
         .is_err());
 
     // MySQL takes these over a number by coercing it, which has not been
@@ -25755,9 +25755,9 @@ fn a_case_answers_the_number_its_widest_branch_holds() {
     );
 
     for sql in [
-        // A branch carrying a scale answers a NEWDECIMAL rather than this.
+        // A written branch carrying a scale answers a NEWDECIMAL by a rule
+        // of its own.
         "SELECT CASE WHEN n > 15 THEN 1.5 ELSE 0 END FROM c",
-        "SELECT CASE WHEN n > 15 THEN d ELSE 0 END FROM c",
         // A word branch beside a number branch is a coercion.
         "SELECT CASE WHEN n > 15 THEN 1 ELSE 'a' END FROM c",
     ] {
@@ -30634,3 +30634,6 @@ mod counted_inserts;
 
 #[cfg(unix)]
 mod mysqldump_restore;
+
+#[cfg(unix)]
+mod conditional_expressions;

@@ -149,8 +149,8 @@ pub use show_triggers::{
     MySqlShowCreateTriggerCommand, MySqlShowTriggersCommand,
 };
 pub use static_select_metadata::{
-    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ScalarFunction,
-    StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
+    ScalarFunction, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
 };
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
@@ -882,6 +882,7 @@ pub struct TranslatedSelect {
     reads_table: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
+    renders_a_condition_without_column_types: bool,
     orders_wildcard_ordinal: bool,
     compares_a_placeholder: bool,
     counts_distinct_column: bool,
@@ -1475,6 +1476,13 @@ impl TranslatedSelect {
 
     pub fn checks_type_sensitive_expression(&self) -> bool {
         self.checks_type_sensitive_expression
+    }
+
+    /// Reports whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column
+    /// was written without knowing what kinds of values its columns hold,
+    /// which decides how it has to be written.
+    pub fn renders_a_condition_without_column_types(&self) -> bool {
+        self.renders_a_condition_without_column_types
     }
 
     /// Reports whether this statement's rendering depends on a column's type.
@@ -4014,6 +4022,7 @@ fn parse_select_inner(
         parameter_count,
         orders_a_bare_column,
         checks_type_sensitive_expression,
+        renders_a_condition_without_column_types,
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,
@@ -4041,6 +4050,7 @@ fn parse_select_inner(
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,
         checks_type_sensitive_expression,
+        renders_a_condition_without_column_types,
         orders_wildcard_ordinal,
         compares_a_placeholder,
         counts_distinct_column,

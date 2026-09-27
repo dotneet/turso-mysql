@@ -42,14 +42,20 @@ pick up.
 
 ### Conditional expressions
 
-`CASE WHEN ... THEN ... ELSE ... END` and `IF(cond, a, b)` work over string
-literal branches. What is left:
+`CASE`, `IF`, `IFNULL` and `COALESCE` work over written words and whole
+numbers and over columns of one kind, and `COUNT`, `SUM`, `AVG`, `MIN` and
+`MAX` over a `CASE`. What is left:
 
 | Form | State |
 |---|---|
-| `CASE col WHEN v THEN ...` | refused; it compares its operand, which raises the coercion question a `WHERE` comparison raises, unmeasured |
-| Branches that are not string literals or `NULL` | refused; no width to answer with |
-| A `CASE` whose every branch is `NULL` | refused; the same, there is no width left |
+| `CASE col WHEN v THEN ...` over values of two kinds, or an operand that is not a column | refused; MySQL compares by one rule chosen over every value together |
+| A word beside a number, or an unsigned column beside anything | refused; measured, each answers a type of its own (`COALESCE(name, age)` a `VAR_STRING`, `utiny`/`tiny` a `SHORT` of 4) |
+| A `TEXT`, `FLOAT` or temporal column in a branch | refused; unmeasured |
+| A written number with a point in a branch | refused; `THEN 1.5 ELSE 0` answers a `NEWDECIMAL` by a rule of its own |
+| `MIN`/`MAX` over a `CASE` answering a `DECIMAL` or words, ordering by `AVG` over a `CASE` | refused; the engine would compare the written values as words |
+| A `CASE` over columns in a join | refused; its column types are read off one table |
+| Grouped `SUM`/`COUNT`/`MIN`/`MAX` over a `CASE` | taken, but reports the binary flag MySQL drops under a `GROUP BY` — the same as over a plain column |
+| A `CASE` whose every branch is `NULL` | refused; there is no width left |
 
 ### Waiting on a column type
 
@@ -64,7 +70,6 @@ literal branches. What is left:
 | `IFNULL` / `COALESCE` falling a written word back onto a `TEXT` column | refused; measured, MySQL reports four times the column's own width there, a rule of its own |
 | `NULLIF` over two columns of words, or a number against a word | refused; MySQL reads a word as a number and compares two words without regard to case, where the engine compares them by their kinds |
 | `GREATEST`, `LEAST`, `NULLIF` and `MD5` over written values alone, naming no column | refused; each answers a shape read off the column it names, and there is none |
-| `IFNULL` / `COALESCE` falling a column back onto another column | refused; only a written number and a written word have been measured |
 | `CAST(col AS CHAR)` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; conversion through the engine's generic text cast has not been verified against MySQL's numeric formatting |
 | `CAST(col AS CHAR)` over a `TEXT` | refused; MySQL answers a `MEDIUM_BLOB` of 1048560 for one, a shape this does not write |
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |

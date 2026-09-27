@@ -1277,15 +1277,17 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         // MySQL's bare side is `TRIM(LEADING FROM v)`, which the parser
         // library does not read; what it does read is not MySQL.
         "SELECT TRIM(LEADING v) FROM s",
-        // A branch that is not a string literal or NULL has no width, and a
-        // CASE whose every branch is NULL has none left.
+        // A CASE whose every branch is NULL has no width left, and a written
+        // word beside a written number is a coercion.
         "SELECT CASE WHEN n > 1 THEN NULL ELSE NULL END FROM s",
-        "SELECT CASE WHEN n > 1 THEN v ELSE 'n' END FROM s",
-        // A `CASE col WHEN` compares its operand, which raises the
-        // coercion question a WHERE comparison raises.
-        "SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s",
+        "SELECT CASE WHEN n > 1 THEN 1 ELSE 'n' END FROM s",
+        // `CASE col WHEN` compares by one rule chosen over every value, which
+        // is the rule each comparison on its own chooses only when the values
+        // are of one kind.
+        "SELECT CASE n WHEN 1 THEN 'y' WHEN '2' THEN 'z' END FROM s",
+        "SELECT CASE n WHEN v THEN 'y' END FROM s",
+        "SELECT CASE n + 1 WHEN 1 THEN 'y' END FROM s",
         // A fallback that can be null defeats the point of IFNULL.
-        "SELECT IFNULL(n, v) FROM s",
         "SELECT IFNULL(n, NULL) FROM s",
         // REPLACE requires a column and two string literals.
         "SELECT REPLACE(v, v, 'XY') FROM s",
@@ -1313,6 +1315,41 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
             "{sql}"
         );
     }
+}
+
+/// A `CASE` naming a column and `IFNULL` over two columns are written by what
+/// their columns hold, which only a second reading with the table's column
+/// types knows. The first one says so.
+#[test]
+fn a_condition_over_a_column_waits_for_the_column_types() {
+    for sql in [
+        "SELECT CASE WHEN n > 1 THEN v ELSE 'n' END FROM s",
+        "SELECT IFNULL(n, v) FROM s",
+        "SELECT COALESCE(n, v, w) FROM s",
+        "SELECT SUM(CASE WHEN n > 1 THEN m ELSE 0 END) FROM s",
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert!(
+            translated.renders_a_condition_without_column_types(),
+            "{sql}"
+        );
+        assert!(translated.needs_column_types(), "{sql}");
+    }
+    // `CASE col WHEN` over written values is `CASE WHEN col = value`, which
+    // needs no column type to be written.
+    let translated = parse_select(
+        "SELECT CASE n WHEN 1 THEN 'y' ELSE 'n' END FROM s",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert!(!translated.renders_a_condition_without_column_types());
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "SELECT CASE WHEN (\"n\" = 1) THEN 'y' ELSE 'n' END ",
+            "AS \"CASE n WHEN 1 THEN 'y' ELSE 'n' END\" FROM \"s\""
+        )
+    );
 }
 
 #[test]

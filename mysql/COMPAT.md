@@ -548,16 +548,67 @@ projection answers to is 1054, as it is there.
 `CASE WHEN n > 15 THEN 1 ELSE 0 END` is how a query answers a flag, and `IF(n > 15, 1, 0)` is
 the call spelling of the same thing. Both are taken, in a projection and in a `SET` alike, so
 `UPDATE t SET active = CASE ... END` writes what the same branches read. The answer's shape is
-a rule over its branches rather than a type of its own, measured on 8.4.11: a `LONGLONG` as
-wide as its widest branch plus one for the sign — `THEN 1 ELSE 0` reports 2, `THEN 100 ELSE -5`
+a rule over its branches rather than a type of its own, measured on 8.4.11: over written
+numbers, a `LONGLONG` as wide as its widest branch plus one for the sign — `THEN 1 ELSE 0` reports 2, `THEN 100 ELSE -5`
 reports 4, `THEN n ELSE 0` over an `INT` reports 11, which is the `INT`'s own ten digits and
 the sign, and `IF(c, n, big)` reports 20. It carries the binary and numeric flags and no
 decimal places, and is NOT NULL only when every branch is and there is an `ELSE` for a row to
 fall to — measured, a `CASE` with no `ELSE` is nullable whatever its branches hold.
 
-A branch is a written number or a column and nothing else. A branch carrying a scale is
-refused: measured, `THEN 1.5 ELSE 0` answers a NEWDECIMAL, which is a rule of its own. So is a
-word branch beside a number branch, which is a coercion.
+A branch is a written number, a written word, a column or `NULL`. The answer is the kind every
+branch shares and as wide as the widest, measured on 8.4.11 over both protocols:
+
+- Whole numbers answer the widest integer type among them, a written number counting as a
+  `BIGINT`, as long as the longest: `THEN age ELSE small` over an `INT` and a `SMALLINT` is a
+  `LONG` of 11, `THEN small ELSE tiny` a `SHORT` of 6, `THEN 5 ELSE small` a `LONGLONG` of 6.
+  A `TINYINT(1)` counts as the `TINYINT` it is, 4 wide.
+- A `DECIMAL` beside whole numbers or other `DECIMAL`s answers a `NEWDECIMAL` with the most
+  digits before the point and the most after it: a `DECIMAL(10,2)` beside an `INT` reports 14
+  with 2 places, beside a `DECIMAL(6,3)` 13 with 3. Each row answers its branch at that
+  branch's own scale, not the answer's: `THEN balance ELSE 0` answers `10.50` and `0`, and
+  `THEN fee ELSE balance` answers `1.125` and `0.00`. Each branch is written out as the text
+  it is, so the engine answers the same.
+- A `DOUBLE` beside any number answers a `DOUBLE` of 23 with not-fixed decimals, and a whole
+  number branch comes back as a double — `0` over the text protocol, 0.0 over the binary one.
+- Words, and `VARCHAR` and `CHAR` columns of one collation, answer a `VAR_STRING` four bytes a
+  character of the longest: `THEN name ELSE 'minor'` over a `VARCHAR(100)` reports 400, and a
+  `CHAR(5)` beside a `VARCHAR(30)` 120.
+
+`CASE col WHEN 'a' THEN ...` is written as `CASE WHEN col = 'a' THEN ...`, so each comparison
+is checked and collated the way a `WHERE` comparison is: measured, `CASE status WHEN 'ACTIVE'`
+matches `active`. MySQL compares the operand by one rule chosen over every `WHEN` value
+together, which is the rule each comparison chooses on its own only when the values are all of
+one kind, so they have to be all written words or all written whole numbers, and the operand a
+column.
+
+`IFNULL(nickname, name)` and `COALESCE(a, b, c)` over columns alone answer what a `CASE` over
+the same columns answers, and are NOT NULL when any one of the columns is. One thing differs,
+measured: a `DECIMAL` answer brings every value to its scale, so `IFNULL(age, balance)` answers
+`30.00` and `COALESCE(fee, balance)` `7.000`.
+
+`SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END)` is how a report counts the rows meeting a
+condition, and `COUNT`, `SUM`, `AVG`, `MIN` and `MAX` are taken over a `CASE` or an `IF`.
+Measured: `COUNT` answers what any `COUNT` answers; `SUM` answers a `NEWDECIMAL` 22 digits wider
+than the `CASE` at its scale — 24 over `THEN 1 ELSE 0`, 34 with 2 places over a
+`DECIMAL(10,2)` — and `AVG` one 4 digits and 4 places wider, `0.7500` over the same flags. Both
+answer at the `CASE`'s scale whatever the rows held: `SUM(CASE WHEN ... THEN balance ELSE 0
+END)` over no matching row is `0.00`, so each value is brought to that scale before it is
+added. Over a `DOUBLE` all of them answer a `DOUBLE`. `MIN` and `MAX` answer the `CASE`'s own
+shape and are taken over whole numbers and doubles.
+
+Refused, each answering by a rule not measured here: a word beside a number, which is a
+coercion; an unsigned column beside anything — a `BIGINT UNSIGNED` beside a written number
+answers a `NEWDECIMAL`, a `TINYINT UNSIGNED` beside a `TINYINT` a `SHORT` of 4; a `TEXT`, a
+`FLOAT` and a column holding a moment; a written number carrying a scale — `THEN 1.5 ELSE 0`
+answers a `NEWDECIMAL` by a rule of its own; `MIN` and `MAX` over a `DECIMAL` or words, which
+the engine would compare as the words they are written as; ordering by an `AVG` over a `CASE`,
+for the same reason; a column read through a join, whose type this reads off one table only;
+and `IFNULL` or `COALESCE` over a column and anything else but a written number or word, and
+any of the new forms written into a column by an `UPDATE`.
+
+One difference: grouped by a `GROUP BY`, MySQL drops the binary flag from `SUM`, `COUNT`, `MIN`
+and `MAX` and keeps it on `AVG`; this reports the flag as it does for an ungrouped aggregate,
+as it already does for an aggregate over a plain column.
 
 An integer column takes the display width a dump or an ORM writes it with —
 `id INT(11)`, `active TINYINT(1)`, `n BIGINT(20) UNSIGNED` — which is the spelling most real
@@ -917,15 +968,13 @@ reports 8. A `CASE` is as wide as its widest branch:
 `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
 `IF(n > 1, 'y', 'n')` reports the same, measured identically.
 
-Every branch of a `CASE` has to be a string literal or `NULL`, for the width to
-be knowable. Two things drop the `NOT_NULL` flag, both measured on 8.4.11: no
+Two things drop the `NOT_NULL` flag from a `CASE`, both measured on 8.4.11: no
 `ELSE`, because a row matching nothing answers NULL, and a `NULL` branch. The
-width is the widest string branch either way — `CASE WHEN n < 3 THEN 'low' END`
+width is the widest branch either way — `CASE WHEN n < 3 THEN 'low' END`
 and `... THEN 'low' ELSE NULL END` both report 3 characters and no flag. A
 `CASE` whose every branch is NULL is refused, since there is no width left to
-answer with. A `CASE col WHEN ...` is refused: it
-compares its operand, which raises the coercion question a `WHERE` comparison
-raises and has not been measured here. The `WHEN` predicate itself goes through
+answer with. A branch naming a column, and `CASE col WHEN`, answer by the rules
+given with the numeric `CASE` above. The `WHEN` predicate itself goes through
 the same checked path a `WHERE` does, so a comparison inside it is validated
 against the column's type.
 
@@ -4459,6 +4508,8 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |
 | A `CASE` or `IF` whose branches are numbers | partial | partial | n/a | n/a | partial | [`branch classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-numeric-branches.json), [P0 manifest](conformance/Makefile) | Taken in a projection and in a `SET`. The answer is a `LONGLONG` as wide as its widest branch plus one for the sign, NOT NULL only when every branch is and there is an `ELSE`. A branch carrying a scale, and a word branch beside a number branch, are refused. |
+| A `CASE`, `IF`, `IFNULL` or `COALESCE` over columns, and `CASE col WHEN` | partial | partial | partial | partial | partial | [`branch classifier`](parser/static_select_metadata.rs), [`branch renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [adapter tests](server/src/frontend_adapter/tests/conditional_expressions.rs) | The kind every branch shares — the widest integer type, a `DECIMAL` with the most digits either side of the point, a `DOUBLE`, or a `VAR_STRING` four bytes a character — measured on 8.4.11 over both protocols. A `CASE` answers each `DECIMAL` branch at its own scale and `IFNULL`/`COALESCE` at the answer's. Needs the one table's column types; unsigned, `TEXT`, `FLOAT` and temporal columns, a word beside a number, a join, and an `UPDATE` writing one of the new forms are refused. |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` over a `CASE` or `IF` | partial | partial | partial | partial | partial | [`aggregate renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [adapter tests](server/src/frontend_adapter/tests/conditional_expressions.rs) | `SUM` and `AVG` answer a `NEWDECIMAL` 22 and 4 digits wider than the `CASE` at its scale, or a `DOUBLE`; `MIN` and `MAX` the `CASE`'s own shape over whole numbers and doubles. `MIN`/`MAX` over a `DECIMAL` or words, and ordering by an `AVG` of one, are refused. Grouped, MySQL drops the binary flag from `SUM`, `COUNT`, `MIN` and `MAX`, which this does not. |
 | An integer column's display width — `INT(11)`, `TINYINT(1)` | yes | yes | n/a | n/a | yes | [`column renderer`](parser/lib.rs), [oracle case](conformance/cases/p0/create-table-display-width.json), [P0 manifest](conformance/Makefile) | Taken and dropped, which is what MySQL 8.4 does with one; the counted column takes one too. `TINYINT(1)` is kept and is the same stored type as `BOOLEAN`, reporting a length of 1 where `TINYINT` reports 4. MySQL's warning 1681 is not raised. |
 | `INSERT` writing an `AUTO_INCREMENT` column its own ids | partial | partial | n/a | n/a | partial | [`written ids`](../mysql/frontend/session.rs), [oracle case](conformance/cases/p0/insert-written-auto-increment.json), [P0 manifest](conformance/Makefile) | The counter is raised past the highest id written, so a later counted row never repeats one. Measured and matched: rows out of order, an id below the counter, a negative id, the reported id being the last row's, and `LAST_INSERT_ID()` staying as it stood. A written 0 or NULL asks the counter for the next number, the way leaving the column out does, and a statement whose every row asks that way is numbered from one reserved range and reports the first of it. A statement mixing a row that names its own number with one that asks is refused, MySQL moving the counter row by row there. |
 | `INSERT ... VALUES` with `DEFAULT` | partial | partial | n/a | n/a | partial | [`assignment renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/insert-default-value.json), [P0 manifest](conformance/Makefile) | `DEFAULT` and `DEFAULT(col)` naming that same column ask for the column's own default, and are rendered by leaving the column out — measured, MySQL answers the same value, the same NULL and the same 1364 for both. An `AUTO_INCREMENT` column counts on. Every column of a counted table given `DEFAULT` is the row of defaults, which takes the next number like any other row. `DEFAULT` in one row and a value in another is refused, so is `DEFAULT` beside `ON DUPLICATE KEY UPDATE`, and so is `SET n = DEFAULT` on an `UPDATE`. |
