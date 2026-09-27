@@ -134,7 +134,10 @@ boolean literal.
 | `GROUP_CONCAT(col ORDER BY ...)` | refused; the engine's translator drops an aggregate's own `ORDER BY` (`core/translate/expr/translator.rs`), so the rows would be joined in whatever order they were read and the answer would differ silently |
 | An index hint on an `UPDATE` or `DELETE` target | refused; the hint is dropped for a `SELECT` but that shape has not been measured |
 | `EXTRACT(WEEK FROM ...)` and `EXTRACT(QUARTER FROM ...)` | refused; MySQL counts a week by rules of its own and the engine has no quarter, and neither has been measured |
-| A calendar reading over something that is not a column — `QUARTER(NOW())` | refused; every reading here names a column, which is what its reported shape is worked out from |
+| A calendar reading over something that is not a column — `QUARTER(NOW())` | refused; every reading here but `WEEK`, `DAYNAME` and `MONTHNAME` names a column, which is what its reported shape is worked out from |
+| `WEEK` with a mode that is not a written number from 0 through 7 — `WEEK(d, 8)`, `WEEK(d, ?)` | refused; MySQL counts by the mode's last three bits and reads a word or a bound value by rules of its own |
+| `YEARWEEK`, `TIME_FORMAT`, `CONVERT_TZ` in a projection | refused; not measured beyond `YEARWEEK`'s shape, a LONGLONG of 7 |
+| The bare `UTC_TIMESTAMP`, `UTC_DATE` and `UTC_TIME`, with no parentheses | read as a column name, where MySQL reads the clock |
 | A `LIKE` `ESCAPE` naming more than one character — `ESCAPE '!!'` | refused; MySQL takes one character there |
 | A `LIKE` pattern with a piece holding nothing — `LIKE CONCAT('%', NULL, '%')` | refused; MySQL answers no rows for it, but written this way it is not a pattern at all |
 | A `LIKE` pattern binding more than one piece — `LIKE CONCAT(?, ?)` | refused; a checked comparison records one bound value |

@@ -5487,6 +5487,16 @@ fn scalar_call_column_definition(
     {
         return Ok(counted_between_definition(name, function));
     }
+    // Measured: `DAYNAME(NOW())` and `WEEK(NOW())` report what the same call
+    // over a column reports.
+    if columns.is_empty()
+        && matches!(
+            function,
+            ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek
+        )
+    {
+        return Ok(calendar_name_or_week_definition(name, function));
+    }
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
@@ -5579,6 +5589,25 @@ fn scalar_call_column_definition(
             }
         }
         return Ok(counted_between_definition(name, function));
+    }
+    if matches!(
+        function,
+        ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek
+    ) {
+        let [column_name] = columns else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        let (table, ordinal) = source_metadata.column_named(column_name)?;
+        let source = table
+            .columns
+            .get(ordinal)
+            // An `information_schema` table names its columns itself, and an
+            // aggregate or a call over one of them has not been measured.
+            .ok_or(FrontendErrorKind::Unsupported)?;
+        if !matches!(source.type_name(), "DATE" | "DATETIME" | "TIMESTAMP") {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        return Ok(calendar_name_or_week_definition(name, function));
     }
     // Every call past here reads one column and answers its shape. `NULLIF`
     // is the one that may name a second: it compares the two and answers the
@@ -6206,6 +6235,9 @@ fn scalar_call_column_definition(
         ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween => {
             unreachable!("the counts between two moments were answered above")
         }
+        ScalarFunction::NamesTheDayOrMonth | ScalarFunction::ReadsTheWeek => {
+            unreachable!("the calendar names and the week were answered above")
+        }
         ScalarFunction::ShiftsByWholeDays | ScalarFunction::ShiftsByTime => {
             unreachable!("the shifts were answered above")
         }
@@ -6293,6 +6325,26 @@ fn epoch_call_definition(
         &mut definition,
         MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
     );
+    definition
+}
+
+/// Measured on MySQL 8.4.11: `DAYNAME` and `MONTHNAME` report a VAR_STRING of
+/// 36 in utf8mb4 with the not-fixed decimals value — nine characters, the
+/// longest name — and `WEEK` a LONGLONG of 3, each nullable whatever it reads.
+#[cfg(unix)]
+fn calendar_name_or_week_definition(
+    name: String,
+    function: ScalarFunction,
+) -> ColumnDefinitionConfig {
+    if function == ScalarFunction::NamesTheDayOrMonth {
+        let mut definition = text_call_definition(name, 36, false);
+        definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        return definition;
+    }
+    let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+    definition.column_length = 3;
+    definition.decimals = 0;
+    set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
     definition
 }
 

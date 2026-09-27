@@ -581,3 +581,193 @@ fn a_written_moment_is_shifted_into_a_word() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+fn days_around_new_year(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) {
+    run(
+        adapter,
+        "CREATE TABLE wk (id INT NOT NULL PRIMARY KEY, d DATE, label VARCHAR(8))",
+    );
+    run(
+        adapter,
+        concat!(
+            "INSERT INTO wk (id, d) VALUES (1, '2024-01-01'), (2, '2024-12-29'), ",
+            "(3, '2024-12-30'), (4, '2024-12-31'), (5, '2025-01-01'), (6, '2026-01-01'), ",
+            "(7, '2026-01-04'), (8, '2027-01-01'), (9, '2027-01-03'), (10, '2020-12-31'), ",
+            "(11, '2021-01-03'), (12, '2023-01-01'), (13, NULL), (14, '2024-02-29')"
+        ),
+    );
+}
+
+/// `WEEK` numbers a week by one of MySQL's eight countings, and `DAYNAME` and
+/// `MONTHNAME` name the day and the month, which is how a report groups rows
+/// by week or labels them.
+#[test]
+fn week_dayname_and_monthname_read_the_calendar_the_way_mysql_does() {
+    let (_directory, mut adapter) = adapter();
+    days_around_new_year(&mut adapter);
+    for (call, answers) in [
+        ("WEEK(d)", "0 52 52 52 0 0 1 0 1 52 1 1 NULL 8"),
+        ("WEEK(d, 0)", "0 52 52 52 0 0 1 0 1 52 1 1 NULL 8"),
+        ("WEEK(d, 1)", "1 52 53 53 1 1 1 0 0 53 0 0 NULL 9"),
+        ("WEEK(d, 2)", "53 52 52 52 52 52 1 52 1 52 1 1 NULL 8"),
+        ("WEEK(d, 3)", "1 52 1 1 1 1 1 53 53 53 53 52 NULL 9"),
+        ("WEEK(d, 4)", "1 53 53 53 1 0 1 0 1 53 1 1 NULL 9"),
+        ("WEEK(d, 5)", "1 52 53 53 0 0 0 0 0 52 0 0 NULL 9"),
+        ("WEEK(d, 6)", "1 1 1 1 1 53 1 52 1 53 1 1 NULL 9"),
+        ("WEEK(d, 7)", "1 52 53 53 53 52 52 52 52 52 52 52 NULL 9"),
+        (
+            "DAYNAME(d)",
+            "Monday Sunday Monday Tuesday Wednesday Thursday Sunday Friday Sunday Thursday Sunday Sunday NULL Thursday",
+        ),
+        (
+            "MONTHNAME(d)",
+            "January December December December January January January January January December January January NULL February",
+        ),
+    ] {
+        let sql = format!("SELECT {call} FROM wk ORDER BY id");
+        assert_eq!(column(&mut adapter, &sql).join(" "), answers, "{sql}");
+    }
+    assert_eq!(
+        shapes(
+            &mut adapter,
+            "SELECT WEEK(d), WEEK(d, 3), DAYNAME(d), MONTHNAME(d), DAYNAME(NOW()), WEEK(NOW()) FROM wk"
+        ),
+        [
+            (MYSQL_TYPE_LONGLONG, 3, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (MYSQL_TYPE_LONGLONG, 3, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+            (MYSQL_TYPE_VAR_STRING, 36, NOT_FIXED_DECIMALS, 0),
+            (MYSQL_TYPE_VAR_STRING, 36, NOT_FIXED_DECIMALS, 0),
+            (MYSQL_TYPE_VAR_STRING, 36, NOT_FIXED_DECIMALS, 0),
+            (MYSQL_TYPE_LONGLONG, 3, 0, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG),
+        ]
+    );
+    assert_eq!(
+        selected(&mut adapter, "SELECT DAYNAME(d) FROM wk").columns[0].character_set,
+        u16::from(DEFAULT_UTF8MB4_COLLATION)
+    );
+
+    // A name is compared without regard to case, and a week as a number.
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM wk WHERE DAYNAME(d) = 'sunday' ORDER BY id"
+        )
+        .join(" "),
+        "2 7 9 11 12"
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM wk WHERE WEEK(d, 3) = 1 ORDER BY id"
+        )
+        .join(" "),
+        "1 3 4 5 6 7"
+    );
+    let (_, binary) = prepared_rows(
+        &mut adapter,
+        "SELECT WEEK(d, 1), DAYNAME(d) FROM wk WHERE id = ?",
+        &one_number(3),
+    );
+    assert_eq!(
+        binary,
+        [[
+            BinaryResultValue::Integer(53),
+            BinaryResultValue::Text("Monday".to_owned())
+        ]]
+    );
+
+    // Measured, MySQL takes any mode and counts by its last three bits, and
+    // coerces a word; a bound mode is read by the type the client sent.
+    for sql in [
+        "SELECT WEEK(d, 8) FROM wk",
+        "SELECT WEEK(d, ?) FROM wk",
+        "SELECT WEEK(d, id) FROM wk",
+        "SELECT DAYNAME(label) FROM wk",
+        "SELECT MONTHNAME('2024-02-30') FROM wk",
+        "SELECT DAYNAME(CURTIME()) FROM wk",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
+/// `UTC_TIMESTAMP()`, `UTC_DATE()` and `UTC_TIME()` read the clock in UTC and
+/// `SYSDATE()` reads it as it runs. Measured, each reports the shape `NOW()`,
+/// `CURDATE()` or `CURTIME()` reports — NOT NULL — and this server's clock
+/// reads UTC, so each answers what its relative answers. A session in another
+/// zone is refused them, as it is `NOW()`.
+#[test]
+fn the_utc_readings_and_sysdate_read_the_clock_like_now() {
+    let (_directory, mut adapter) = adapter();
+    days_around_new_year(&mut adapter);
+    assert_eq!(
+        shapes(
+            &mut adapter,
+            "SELECT UTC_TIMESTAMP(), UTC_DATE(), UTC_TIME(), SYSDATE() FROM wk"
+        ),
+        [
+            (
+                MYSQL_TYPE_DATETIME,
+                19,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_DATE,
+                10,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_TIME,
+                8,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+            (
+                MYSQL_TYPE_DATETIME,
+                19,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG
+            ),
+        ]
+    );
+    let [utc_day, today] = rows(
+        &mut adapter,
+        "SELECT UTC_DATE(), CURDATE() FROM wk WHERE id = 1",
+    )
+    .remove(0)
+    .try_into()
+    .unwrap();
+    assert_eq!(utc_day, today);
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT id FROM wk WHERE d < UTC_DATE() + INTERVAL 100 YEAR ORDER BY id"
+        )
+        .join(" "),
+        "1 2 3 4 5 6 7 8 9 10 11 12 14"
+    );
+    assert!(column(
+        &mut adapter,
+        "SELECT id FROM wk WHERE d < UTC_DATE() - INTERVAL 100 YEAR"
+    )
+    .is_empty());
+    // 2024-01-01 lies at least 1000 days before the day this was written.
+    let days: i64 = column(
+        &mut adapter,
+        "SELECT DATEDIFF(UTC_TIMESTAMP(), d) FROM wk WHERE id = 1",
+    )[0]
+    .parse()
+    .unwrap();
+    assert!(days >= 1000, "{days}");
+
+    run(&mut adapter, "SET time_zone = '+09:00'");
+    for sql in [
+        "SELECT UTC_TIMESTAMP() FROM wk",
+        "SELECT UTC_DATE() FROM wk",
+        "SELECT SYSDATE() FROM wk",
+        "SELECT NOW() FROM wk",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

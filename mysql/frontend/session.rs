@@ -9277,6 +9277,9 @@ fn uses_session_local_clock(sql: &str) -> bool {
                 "LOCALTIME",
                 "LOCALTIMESTAMP",
                 "SYSDATE",
+                "UTC_TIMESTAMP",
+                "UTC_DATE",
+                "UTC_TIME",
                 "FROM_UNIXTIME",
                 "UNIX_TIMESTAMP",
             ]

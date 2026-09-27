@@ -5237,10 +5237,13 @@ fn render_scalar_call(
         "length"
     } else if name.value.eq_ignore_ascii_case("NOW")
         || name.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        || name.value.eq_ignore_ascii_case("UTC_TIMESTAMP")
+        || name.value.eq_ignore_ascii_case("SYSDATE")
     {
         return Ok("datetime('now')".to_owned());
     } else if name.value.eq_ignore_ascii_case("CURDATE")
         || name.value.eq_ignore_ascii_case("CURRENT_DATE")
+        || name.value.eq_ignore_ascii_case("UTC_DATE")
     {
         // The engine writes `date('now')` as `YYYY-MM-DD`, which is the form
         // MySQL answers and the form a DATE column holds.
@@ -5251,8 +5254,39 @@ fn render_scalar_call(
         return Ok(format!("date({})", single_column_argument(function)));
     } else if name.value.eq_ignore_ascii_case("CURTIME")
         || name.value.eq_ignore_ascii_case("CURRENT_TIME")
+        || name.value.eq_ignore_ascii_case("UTC_TIME")
     {
         return Ok("time('now')".to_owned());
+    } else if name.value.eq_ignore_ascii_case("DAYNAME")
+        || name.value.eq_ignore_ascii_case("MONTHNAME")
+    {
+        // `DATE_FORMAT` writes the same two names with `%W` and `%M`.
+        let specifier = if name.value.eq_ignore_ascii_case("DAYNAME") {
+            "%W"
+        } else {
+            "%M"
+        };
+        return Ok(format!(
+            "mysql_date_format({}, '{specifier}')",
+            moment_argument(function, render_context)?
+        ));
+    } else if name.value.eq_ignore_ascii_case("WEEK") {
+        // Measured on MySQL 8.4.11: a `WEEK` with no mode counts by mode 0,
+        // the default `default_week_format` names.
+        let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+            unreachable!("a checked scalar call was checked to have an argument list");
+        };
+        let mode = match arguments.args.get(1) {
+            Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                mode,
+            ))) => static_select_metadata::week_mode(mode)
+                .expect("a checked WEEK was checked to name a mode from 0 through 7"),
+            _ => 0,
+        };
+        return Ok(format!(
+            "mysql_week({}, {mode})",
+            moment_argument(function, render_context)?
+        ));
     } else if name.value.eq_ignore_ascii_case("QUARTER") {
         // The engine has no quarter of its own, so it is counted off the
         // month: January through March answer 1, and December answers 4.

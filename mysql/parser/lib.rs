@@ -90,7 +90,7 @@ pub use create_table_as_select::{
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
 pub use current_database::write_the_current_database_in;
-pub use date_format::{format_moment, format_width};
+pub use date_format::{format_moment, format_width, week_number};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use dump_ddl::{
@@ -940,13 +940,18 @@ impl CheckedComparisonNow {
                 .iter()
                 .any(|candidate| name.value.eq_ignore_ascii_case(candidate))
         };
-        if named(&["CURDATE", "CURRENT_DATE"]) {
+        // `UTC_DATE`, `UTC_TIMESTAMP` and `UTC_TIME` read the clock in UTC,
+        // and `SYSDATE` reads it as it runs rather than as the statement
+        // began. Measured on MySQL 8.4.11, each answers the shape its local
+        // or statement-start relative answers, and this server's own clock
+        // reads UTC once for each call.
+        if named(&["CURDATE", "CURRENT_DATE", "UTC_DATE"]) {
             return Some(Self::Day);
         }
-        if named(&["NOW", "CURRENT_TIMESTAMP"]) {
+        if named(&["NOW", "CURRENT_TIMESTAMP", "UTC_TIMESTAMP", "SYSDATE"]) {
             return Some(Self::Moment);
         }
-        named(&["CURTIME", "CURRENT_TIME"]).then_some(Self::TimeOfDay)
+        named(&["CURTIME", "CURRENT_TIME", "UTC_TIME"]).then_some(Self::TimeOfDay)
     }
 
     /// The engine call answering the same value in the same form.

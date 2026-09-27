@@ -457,6 +457,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_DATEDIFF) {
             return Ok(Some(Func::Dialect(MYSQL_DATEDIFF.to_string())));
         }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_WEEK) {
+            return Ok(Some(Func::Dialect(MYSQL_WEEK.to_string())));
+        }
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_MD5) {
             return Ok(Some(Func::Dialect(MYSQL_MD5.to_string())));
         }
@@ -1008,6 +1011,27 @@ impl Dialect for MySqlDialect {
                 },
             );
         }
+        if name.eq_ignore_ascii_case(MYSQL_WEEK) {
+            let [moment, mode] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let Value::Numeric(Numeric::Integer(mode @ 0..=7)) = mode else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes a mode from 0 through 7"
+                )));
+            };
+            let Value::Text(moment) = moment else {
+                return Ok(Value::Null);
+            };
+            return Ok(
+                match turso_mysql_parser::week_number(moment.as_str(), *mode as u32) {
+                    Some(week) => Value::from_i64(i64::from(week)),
+                    None => Value::Null,
+                },
+            );
+        }
         if MYSQL_JSON_READINGS
             .iter()
             .any(|reading| name.eq_ignore_ascii_case(reading))
@@ -1054,6 +1078,9 @@ pub(crate) const MYSQL_SHIFT_MOMENT: &str = "mysql_shift_moment";
 /// `unixepoch` drops the fraction of a second.
 pub(crate) const MYSQL_TIMESTAMPDIFF: &str = "mysql_timestampdiff";
 pub(crate) const MYSQL_DATEDIFF: &str = "mysql_datediff";
+/// Numbering a moment's week the way `WEEK` does, in one of its eight modes.
+/// The engine's `strftime` has two week numberings, neither of them MySQL's.
+pub(crate) const MYSQL_WEEK: &str = "mysql_week";
 /// Writes the thirty-two hexadecimal characters `MD5` answers. The engine
 /// keeps its digests in an extension this frontend does not register.
 pub(crate) const MYSQL_MD5: &str = "mysql_md5";

@@ -340,6 +340,15 @@ comparison MySQL makes. Each meets that column and no other: a day against a `DA
 refused for the reason a written day is, since MySQL reads it as that day's midnight. The
 engine reads all three in UTC, which is the one zone these sessions run in.
 
+`UTC_DATE()`, `UTC_TIMESTAMP()` and `UTC_TIME()` read the clock in UTC, and `SYSDATE()` reads
+it as the call runs rather than as the statement began. Measured on 8.4.11, each reports the
+shape its relative reports — a NOT NULL `DATE` of 10, `DATETIME` of 19 and `TIME` of 8 — and
+this server's clock reads UTC, so each is read wherever `CURDATE()`, `NOW()` and `CURTIME()`
+are, and answers what they answer. A session in another zone is refused all four, as it is
+`NOW()`: MySQL writes a UTC reading into a `TIMESTAMP` as a moment of the session's own zone,
+which this does not convert. The bare `UTC_TIMESTAMP` spelling, without parentheses, is read
+as a column name.
+
 The same three readings are written as values, which is how a row records when it was made:
 `INSERT INTO t (created_at) VALUES (NOW())`, `INSERT ... SET d = CURRENT_DATE`, an
 `ON DUPLICATE KEY UPDATE updated_at = NOW()`, and `UPDATE t SET dt = NOW()` all write it.
@@ -1538,6 +1547,19 @@ spelling are taken; `EXTRACT(WEEK FROM ...)` and `EXTRACT(QUARTER FROM ...)`
 are refused, MySQL counting those by rules of its own. Each reading says what
 it answers, so `WHERE QUARTER(d) = 4` and `WHERE LAST_DAY(d) = '2024-03-31'`
 are held to that rather than to a column's declared type.
+
+`WEEK(d)` and `WEEK(d, mode)` number the week a day falls in, and `DAYNAME(d)`
+and `MONTHNAME(d)` name its day and its month. Each reads a date column, a
+reading of the clock or a moment written out as a word. `WEEK` is MySQL's own
+reckoning, which `DATE_FORMAT`'s `%U`, `%u`, `%V` and `%v` already follow;
+measured on 8.4.11 over thirteen days around six new years, in every
+mode from 0 through 7, and matched — the first of January 2026 is week 0 in
+mode 0 and week 52 in mode 2. A mode is a written number from 0 through 7:
+MySQL takes any other by its last three bits, `WEEK(d, 8)` being `WEEK(d, 0)`,
+and reads a word or a bound value by rules of its own, and those are refused.
+The shapes are measured too: `WEEK` a LONGLONG of 3, and `DAYNAME` and
+`MONTHNAME` a `VAR_STRING` of 36 in utf8mb4, all nullable. A name is compared
+without regard to case — `WHERE DAYNAME(d) = 'sunday'` finds the Sundays.
 
 A `LIKE` pattern may be written in pieces — `LIKE CONCAT('%', ?, '%')` is how
 a search filter wraps the value it binds in wildcards, and
@@ -4082,6 +4104,8 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `DATE_FORMAT(NOW(), ...)` / `STR_TO_DATE('...', ...)` — a moment that is not a column | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-moment-argument.json), [P0 manifest](conformance/Makefile) | A clock reading and a moment written out as a word stand where a column stands. Both report exactly what the column form reports: the shape comes from the format. `NOW`, `CURRENT_TIMESTAMP`, `CURDATE` and `CURRENT_DATE` are the readings taken; a `STR_TO_DATE` reads text, so it takes a word and not a reading. |
 | `TIMESTAMPDIFF(<unit>, a, b)` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-timestampdiff.json), [P0 manifest](conformance/Makefile) | Whole units from the first moment to the second, to the microsecond, with a month counted by the calendar — every unit from MICROSECOND to YEAR. Each moment is a date column, `NOW()` or `CURDATE()`, or a written moment; `DATEDIFF` takes the same. A whole number of length 21, where `DATEDIFF` reports 9. A bound `?`, a word naming no moment and `CURTIME()` are refused. |
 | `USE` / `FORCE` / `IGNORE INDEX` | partial | partial | n/a | n/a | partial | [`table source renderer`](parser/translate.rs), [`hint validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-index-hint.json), [P0 manifest](conformance/Makefile) | Dropped: a hint says which key to plan with and nothing about which rows come back. The keys it names are checked against the table, because one naming a key the table has not got is 1176 in MySQL. Both spellings, a `FOR` scope, several keys at once, an alias and either side of a join are covered. A hint on an `UPDATE` or `DELETE` target is still refused. |
+| `WEEK`, `DAYNAME`, `MONTHNAME` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`week numbering`](parser/date_format.rs), [`result metadata`](server/src/frontend_adapter.rs), [adapter tests](server/src/frontend_adapter/tests/date_arithmetic.rs) | Over a date column, a clock reading or a written moment. `WEEK` takes a written mode from 0 through 7, every one measured around six new years. |
+| `UTC_DATE()`, `UTC_TIMESTAMP()`, `UTC_TIME()`, `SYSDATE()` | partial | partial | n/a | n/a | partial | [`clock reader`](parser/lib.rs), [adapter tests](server/src/frontend_adapter/tests/date_arithmetic.rs) | Read wherever `CURDATE()`, `NOW()` and `CURTIME()` are, with their measured shapes. Refused in a session of another zone, as `NOW()` is. |
 | `QUARTER`, `WEEKDAY`, `DAYOFWEEK`, `DAYOFYEAR`, `DAYOFMONTH`, `LAST_DAY`, `EXTRACT` | partial | partial | n/a | n/a | partial | [`call classifier`](parser/static_select_metadata.rs), [`call renderer`](parser/translate.rs), [`result metadata`](server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-calendar-readings.json), [P0 manifest](conformance/Makefile) | The engine has none of these by name, so each is counted off what it does have. Every value and every reported shape is pinned to the 8.4.11 golden, `EXTRACT(YEAR FROM ...)` included, which reports a whole number of length 5 where `YEAR` reports a YEAR of length 4. |
 | `LIKE CONCAT('%', ?, '%')` — a pattern written in pieces | partial | partial | n/a | n/a | partial | [`LIKE renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-like-concat-pattern.json), [P0 manifest](conformance/Makefile) | The pieces spell one pattern, and written ones are joined into it. A bound piece stays a piece and the join is left to the engine. A piece naming a column and a second bound piece are refused. Backslash escapes are read by the dedicated UCA9 LIKE matcher. |
 | `WHERE n = (SELECT MAX(n) FROM t)` — a comparison against a subquery | partial | partial | n/a | n/a | partial | [`comparison renderer`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-scalar-subquery-comparison.json), [P0 manifest](conformance/Makefile) | A `MIN` or `MAX` over one implicit group, held to the same kind rule `IN (SELECT ...)` holds its columns to, and a `COUNT` against a whole number written out. A plain-column projection is refused: MySQL answers 1242 over many rows where the engine takes the first. `SUM` and `AVG` are refused for their rounding. |

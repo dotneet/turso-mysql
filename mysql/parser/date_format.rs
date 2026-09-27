@@ -27,6 +27,17 @@ pub fn format_moment(written: &str, format: &str) -> Option<String> {
     Some(out)
 }
 
+/// The week `WEEK(written, mode)` answers, or nothing when the value names no
+/// moment.
+///
+/// Each of MySQL's eight modes is one of the countings `DATE_FORMAT`'s `%U`,
+/// `%u`, `%V` and `%v` use, or the same counting with a week that starts on
+/// the other day, so all eight are [`week`] asked for by number.
+pub fn week_number(written: &str, mode: u32) -> Option<u32> {
+    assert!(mode <= 7, "WEEK takes a mode from 0 through 7");
+    Some(week(&read_moment(written)?, mode).0)
+}
+
 /// How many characters MySQL reserves in a result column for one specifier.
 ///
 /// Measured on 8.4.11 by reading the column width back one specifier at a
@@ -244,7 +255,37 @@ fn week(moment: &Moment, mode: u32) -> (u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_moment, format_width};
+    use super::{format_moment, format_width, week_number};
+
+    /// Measured on MySQL 8.4.11 around the turn of six years, in all eight
+    /// modes.
+    #[test]
+    fn a_week_is_numbered_the_way_mysql_numbers_it() {
+        for (day, weeks) in [
+            ("2024-01-01", [0, 1, 53, 1, 1, 1, 1, 1]),
+            ("2024-12-29", [52, 52, 52, 52, 53, 52, 1, 52]),
+            ("2024-12-30", [52, 53, 52, 1, 53, 53, 1, 53]),
+            ("2024-12-31", [52, 53, 52, 1, 53, 53, 1, 53]),
+            ("2025-01-01", [0, 1, 52, 1, 1, 0, 1, 53]),
+            ("2026-01-01", [0, 1, 52, 1, 0, 0, 53, 52]),
+            ("2026-01-04", [1, 1, 1, 1, 1, 0, 1, 52]),
+            ("2027-01-01", [0, 0, 52, 53, 0, 0, 52, 52]),
+            ("2027-01-03", [1, 0, 1, 53, 1, 0, 1, 52]),
+            ("2020-12-31", [52, 53, 52, 53, 53, 52, 53, 52]),
+            ("2021-01-03", [1, 0, 1, 53, 1, 0, 1, 52]),
+            ("2023-01-01", [1, 0, 1, 52, 1, 0, 1, 52]),
+            ("2024-02-29", [8, 9, 8, 9, 9, 9, 9, 9]),
+        ] {
+            for (mode, week) in weeks.into_iter().enumerate() {
+                assert_eq!(
+                    week_number(day, mode as u32),
+                    Some(week),
+                    "WEEK('{day}', {mode})"
+                );
+            }
+        }
+        assert_eq!(week_number("2024-02-30", 0), None);
+    }
 
     /// Every reading measured on MySQL 8.4.11.
     #[test]

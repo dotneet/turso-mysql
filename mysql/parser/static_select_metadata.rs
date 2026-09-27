@@ -171,6 +171,11 @@ pub enum ScalarFunction {
     ReadsADayOfTheWeek,
     /// `DAYOFYEAR`, which answers 1 to 366.
     ReadsTheDayOfTheYear,
+    /// `WEEK`, which answers 0 to 53.
+    ReadsTheWeek,
+    /// `DAYNAME` and `MONTHNAME`, which answer the English name of a day of
+    /// the week or of a month.
+    NamesTheDayOrMonth,
     /// `LAST_DAY`, which answers the day the month ends on.
     ReadsTheLastDay,
     /// `EXTRACT(YEAR FROM ...)`, which answers a whole number where `YEAR`
@@ -1138,7 +1143,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
         sqlparser::ast::FunctionArguments::Subquery(_) => false,
     };
-    if named(&["NOW", "CURRENT_TIMESTAMP"]) {
+    if named(&["NOW", "CURRENT_TIMESTAMP", "UTC_TIMESTAMP", "SYSDATE"]) {
         return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Now,
             columns: Vec::new(),
@@ -1179,7 +1184,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: true,
         });
     }
-    if named(&["CURDATE", "CURRENT_DATE"]) {
+    if named(&["CURDATE", "CURRENT_DATE", "UTC_DATE"]) {
         return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::Today,
             columns: Vec::new(),
@@ -1187,7 +1192,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: true,
         });
     }
-    if named(&["CURTIME", "CURRENT_TIME"]) {
+    if named(&["CURTIME", "CURRENT_TIME", "UTC_TIME"]) {
         return takes_nothing.then(|| StaticSelectMetadata::ScalarCall {
             function: ScalarFunction::TimeOfDay,
             columns: Vec::new(),
@@ -2180,6 +2185,38 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             not_null: false,
         });
     }
+    // `DAYNAME(d)` and `MONTHNAME(d)` name the day of the week and the month
+    // a moment falls in, and `WEEK(d)` numbers its week, by the counting a
+    // written mode from 0 through 7 names. Each reads a moment the counts
+    // above read.
+    if named(&["DAYNAME", "MONTHNAME", "WEEK"]) {
+        let (moment, mode) = match arguments.args.as_slice() {
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(moment))] => {
+                (moment, None)
+            }
+            [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(moment)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(mode))]
+                if named(&["WEEK"]) =>
+            {
+                (moment, Some(mode))
+            }
+            _ => return None,
+        };
+        if let Some(mode) = mode {
+            week_mode(mode)?;
+        }
+        let mut columns = Vec::new();
+        counted_moment(moment, &mut columns)?;
+        return Some(StaticSelectMetadata::ScalarCall {
+            function: if named(&["WEEK"]) {
+                ScalarFunction::ReadsTheWeek
+            } else {
+                ScalarFunction::NamesTheDayOrMonth
+            },
+            columns,
+            literal_characters: 0,
+            not_null: false,
+        });
+    }
     let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
         Expr::Identifier(column),
     ))] = arguments.args.as_slice()
@@ -2284,7 +2321,8 @@ fn classify_extract(
 /// Reports whether a call reads the clock and takes nothing.
 ///
 /// `NOW()` and `CURDATE()` each answer a moment of their own, which is a
-/// moment a call over one can be given.
+/// moment a call over one can be given. `CURTIME()` answers a time of day,
+/// which is a span rather than a moment.
 fn names_a_clock_reading(function: &sqlparser::ast::Function) -> bool {
     let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
         return false;
@@ -2292,15 +2330,10 @@ fn names_a_clock_reading(function: &sqlparser::ast::Function) -> bool {
     if name.quote_style.is_some() || !is_plain_aggregate(function) {
         return false;
     }
-    let takes_nothing = match &function.args {
-        sqlparser::ast::FunctionArguments::None => true,
-        sqlparser::ast::FunctionArguments::List(arguments) => arguments.args.is_empty(),
-        sqlparser::ast::FunctionArguments::Subquery(_) => false,
-    };
-    takes_nothing
-        && ["NOW", "CURRENT_TIMESTAMP", "CURDATE", "CURRENT_DATE"]
-            .iter()
-            .any(|reading| name.value.eq_ignore_ascii_case(reading))
+    matches!(
+        CheckedComparisonNow::read(function),
+        Some(CheckedComparisonNow::Day | CheckedComparisonNow::Moment)
+    )
 }
 
 /// Reads one moment `TIMESTAMPDIFF` or `DATEDIFF` counts from or to, and
@@ -2326,6 +2359,21 @@ fn counted_moment(expr: &Expr, columns: &mut Vec<String>) -> Option<()> {
         _ => return None,
     }
     Some(())
+}
+
+/// Reads the written mode a `WEEK` counts by.
+///
+/// Measured on MySQL 8.4.11, a mode past 7 counts as its last three bits —
+/// `WEEK(d, 8)` is `WEEK(d, 0)` and `WEEK(d, -1)` is `WEEK(d, 7)` — and a NULL
+/// one as 0; only the eight named ones are taken.
+pub(super) fn week_mode(mode: &Expr) -> Option<u32> {
+    let Expr::Value(value) = mode else {
+        return None;
+    };
+    let Value::Number(digits, false) = &value.value else {
+        return None;
+    };
+    digits.parse::<u32>().ok().filter(|mode| *mode <= 7)
 }
 
 /// Names the unit a `TIMESTAMPDIFF` counts in, the way the rendered call
@@ -2658,9 +2706,9 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
         return None;
     };
     Some(match function {
-        ScalarFunction::KeepsTextShape | ScalarFunction::CastsToText => {
-            CheckedComparisonAnswer::Text
-        }
+        ScalarFunction::KeepsTextShape
+        | ScalarFunction::CastsToText
+        | ScalarFunction::NamesTheDayOrMonth => CheckedComparisonAnswer::Text,
         ScalarFunction::CountsText
         | ScalarFunction::ReadsTheYear
         | ScalarFunction::ReadsAMonthOrDay
@@ -2671,6 +2719,7 @@ pub(super) fn comparison_answer(expr: &Expr) -> Option<crate::CheckedComparisonA
         | ScalarFunction::ReadsTheQuarter
         | ScalarFunction::ReadsADayOfTheWeek
         | ScalarFunction::ReadsTheDayOfTheYear
+        | ScalarFunction::ReadsTheWeek
         | ScalarFunction::ReadsTheYearAsANumber
         | ScalarFunction::FindsThePlace
         | ScalarFunction::CastsToWholeNumber => CheckedComparisonAnswer::WholeNumber,
