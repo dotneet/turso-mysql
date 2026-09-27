@@ -394,6 +394,9 @@ pub(crate) struct RenderedSelect {
     /// can hold each to the whole number a row count has to be.
     pub(crate) row_count_parameters: Vec<usize>,
     pub(crate) parameter_count: usize,
+    /// Whether a `GROUP_CONCAT` is rendered, whose cut this rendering warns
+    /// about rather than fails on.
+    pub(crate) concatenates_groups: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -629,6 +632,7 @@ pub(crate) fn translate_select_query(
         locks_rows,
         row_count_parameters,
         parameter_count: render_context.parameter_count,
+        concatenates_groups: render_context.group_concat_calls > 0,
     })
 }
 
@@ -2535,6 +2539,12 @@ pub(crate) fn translate_insert(
             return unsupported("INSERT SELECT with ON DUPLICATE KEY UPDATE");
         }
         let rendered = match typed_select {
+            // The SELECT was rendered as a bare one, which warns about a cut
+            // `GROUP_CONCAT`; a statement writing the cut value has to fail
+            // instead, so the pair is refused rather than written short.
+            Some(select) if select.concatenates_groups => {
+                return unsupported("INSERT SELECT with a GROUP_CONCAT needing column types");
+            }
             Some(select) => RenderedCopy {
                 sqlite_sql: select.sqlite_sql.clone(),
                 source_tables: select.source_tables.clone(),

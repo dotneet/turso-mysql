@@ -920,6 +920,9 @@ impl BoundAutoIncrementInsert {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslatedSelect {
     pub sqlite_sql: String,
+    /// Whether a `GROUP_CONCAT` is rendered, whose cut this rendering warns
+    /// about rather than fails on.
+    concatenates_groups: bool,
     collation_sensitive_call_columns: Vec<String>,
     json_reading_columns: Vec<String>,
     reads_table: bool,
@@ -4281,6 +4284,7 @@ fn parse_select_inner(
         compares_a_written_number,
         compares_a_large_decimal_integer,
         checked_subquery_comparisons,
+        concatenates_groups,
     } = translate_select_query(
         &query,
         sql,
@@ -4319,6 +4323,7 @@ fn parse_select_inner(
         locks_rows,
         row_count_parameters,
         parameter_count,
+        concatenates_groups,
     })
 }
 

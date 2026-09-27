@@ -391,6 +391,18 @@ fn writing_a_cut_value_fails_the_statement() {
         Err(FrontendErrorKind::GroupConcatCut)
     ));
     assert_eq!(rows(&mut adapter, "SELECT COUNT(*) FROM sink"), [["0"]]);
+    // A copy whose SELECT has to know its column types is rendered as a bare
+    // SELECT, which only warns about a cut, so it is refused rather than
+    // allowed to write the cut value.
+    assert!(adapter
+        .execute_query("INSERT INTO sink (s) SELECT GROUP_CONCAT(b) FROM f GROUP BY g ORDER BY g")
+        .is_err());
+    assert!(adapter
+        .execute_stmt_prepare(
+            "INSERT INTO sink (s) SELECT GROUP_CONCAT(b) FROM f WHERE g > ? GROUP BY g"
+        )
+        .is_err());
+    assert_eq!(rows(&mut adapter, "SELECT COUNT(*) FROM sink"), [["0"]]);
     run(&mut adapter, "SET SESSION group_concat_max_len = 1024");
     run(
         &mut adapter,
