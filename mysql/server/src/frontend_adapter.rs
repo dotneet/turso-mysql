@@ -101,7 +101,7 @@ use crate::{
     PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
     StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_COMMAND_PAYLOAD_LENGTH,
     MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
-    MAX_TEXT_ROW_VALUE_LENGTH, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
+    MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -3577,6 +3577,13 @@ fn binary_result_value(
         MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_YEAR => {
             Ok(BinaryResultValue::Integer(value))
         }
+        // A BIT crosses as the bytes that hold its bits, length-encoded, the
+        // same bytes the text protocol sends.
+        MySqlPreparedValue::Integer(value) if column_type == MYSQL_TYPE_BIT => {
+            Ok(BinaryResultValue::Blob(vec![
+                bit_byte(value).map_err(|_| FrontendErrorKind::Internal)?
+            ]))
+        }
         // A JSON column crosses the same way a BLOB does — measured on MySQL
         // 8.4.11, the document's own bytes, length-encoded, and the same over
         // both protocols.
@@ -4465,6 +4472,16 @@ impl TableResultMetadata {
             if found.is_some() {
                 return Err(FrontendErrorKind::Unsupported);
             }
+            // Every reader of a named column answers a call, an aggregate or
+            // arithmetic over it, and none of those has been measured over a
+            // BIT, whose value crosses as a byte rather than as a number.
+            if table
+                .columns
+                .get(ordinal)
+                .is_some_and(|column| column.type_name() == "BIT")
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
             found = Some((table, ordinal));
         }
         found.ok_or(FrontendErrorKind::UnknownColumn)
@@ -4968,6 +4985,13 @@ impl TableResultMetadata {
         }
         if turso_mysql_parser::set_members(source.type_name()).is_some() {
             definition.flags |= MYSQL_SET_FLAG;
+        }
+        if source.type_name() == "BIT" {
+            // Measured on MySQL 8.4.11: a `bit(1)` reports a length of 1, the
+            // binary collation and the unsigned flag, and no binary flag.
+            definition.column_length = 1;
+            definition.character_set = MYSQL_BINARY_COLLATION;
+            definition.flags |= MYSQL_UNSIGNED_FLAG;
         }
         if source.type_name() == "YEAR" {
             // Measured: a YEAR carries the flags of a number rather than of a
@@ -7575,6 +7599,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("YEAR") {
         return Some(MYSQL_TYPE_YEAR);
     }
+    if name.eq_ignore_ascii_case("BIT") {
+        return Some(MYSQL_TYPE_BIT);
+    }
     if name.eq_ignore_ascii_case("JSON") {
         return Some(MYSQL_TYPE_JSON);
     }
@@ -8059,6 +8086,10 @@ enum TextValueRendering {
     /// A `YEAR`, which MySQL writes in four digits: measured on 8.4.11, the
     /// zero year reads back as `0000`.
     Year,
+    /// A `BIT(1)`, which MySQL sends as the byte that holds its bit rather
+    /// than as a number: measured on 8.4.11, `b'1'` crosses as the one byte
+    /// 0x01.
+    Bit,
 }
 
 impl TextValueRendering {
@@ -8069,6 +8100,7 @@ impl TextValueRendering {
             MYSQL_TYPE_NEWDECIMAL if is_exact_decimal_column(column) => Self::ExactDecimal,
             MYSQL_TYPE_NEWDECIMAL => Self::Scaled(column.decimals),
             MYSQL_TYPE_YEAR => Self::Year,
+            MYSQL_TYPE_BIT => Self::Bit,
             MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG
             | MYSQL_TYPE_LONGLONG => Self::Integer,
             _ => Self::Engine,
@@ -8175,6 +8207,9 @@ fn value_to_text_ref(
             if rendering == TextValueRendering::Year {
                 return Ok(Some(format!("{integer:04}").into_bytes()));
             }
+            if rendering == TextValueRendering::Bit {
+                return Ok(Some(vec![bit_byte(*integer)?]));
+            }
             Ok(Some(value.to_string().into_bytes()))
         }
         Value::Text(text) => {
@@ -8189,6 +8224,19 @@ fn value_to_text_ref(
             }
             Ok(Some(blob.to_vec()))
         }
+    }
+}
+
+/// The byte a `BIT(1)` crosses the wire as. The column takes nothing but 0
+/// and 1, so any other number read out of one is a stored value this frontend
+/// never wrote.
+fn bit_byte(value: i64) -> Result<u8, LimboError> {
+    match value {
+        0 => Ok(0),
+        1 => Ok(1),
+        _ => Err(LimboError::Corrupt(format!(
+            "a BIT(1) column holds {value}, which is not a bit"
+        ))),
     }
 }
 

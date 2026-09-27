@@ -635,6 +635,8 @@ fn render_mysql_type(data_type: Option<&TursoType>) -> Result<String, ParseError
         "TIME"
     } else if data_type.name.eq_ignore_ascii_case("YEAR") {
         "YEAR"
+    } else if data_type.name.eq_ignore_ascii_case("BIT") {
+        "BIT(1)"
     } else if data_type.name.eq_ignore_ascii_case("JSON") {
         "JSON"
     } else if let Some(members) = super::set_members(&data_type.name) {

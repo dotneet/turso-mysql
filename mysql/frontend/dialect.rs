@@ -152,12 +152,13 @@ impl Dialect for MySqlDialect {
         // stores the document `1e15` as the integer 1000000000000000, a `SET`
         // written as the bits `'3'` has to stay text long enough to be told
         // from a member spelled `3`, a `YEAR` written as `'0'` is 2000 where
-        // the number 0 is the zero year, and a `VARBINARY` holding `'007'`
-        // would otherwise read back as `7`.
+        // the number 0 is the zero year, a `VARBINARY` holding `'007'`
+        // would otherwise read back as `7`, and a `BIT` written `'1'`, which
+        // MySQL refuses, would be taken as the number 1.
         for column in table.columns_mut().iter_mut() {
             let holds_text = matches!(
                 column.ty_str.to_ascii_uppercase().as_str(),
-                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" | "VARBINARY"
+                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" | "VARBINARY" | "BIT"
             ) || turso_mysql_parser::enum_members(&column.ty_str).is_some()
                 || turso_mysql_parser::set_members(&column.ty_str).is_some();
             if holds_text {
@@ -2045,6 +2046,10 @@ pub(crate) fn check_mysql_assignment(
             reject_overlong_binary(table_name, column_index, length, value)?;
             continue;
         }
+        if spec.is_bit(column_index) {
+            reject_what_one_bit_cannot_hold(table_name, column_index, value)?;
+            continue;
+        }
         if let Some(length) = spec.character_length(column_index) {
             let stored = text_column_value(
                 table_name,
@@ -2338,6 +2343,28 @@ fn reject_overlong_binary(
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: format!("VARBINARY({length})"),
+    }
+    .into())
+}
+
+/// Refuses a value a `BIT(1)` column cannot hold.
+///
+/// Measured on MySQL 8.4.11: 0, 1, `TRUE` and `FALSE` are stored, and 2, -1,
+/// 1.5, `'1'` and `'a'` all answer 1406 — a word is its bytes, and the byte of
+/// `'1'` is wider than one bit. The empty word, which MySQL stores as 0, is
+/// refused the same way here.
+fn reject_what_one_bit_cannot_hold(
+    table_name: &str,
+    column_index: usize,
+    value: &Value,
+) -> Result<()> {
+    if matches!(value, Value::Numeric(Numeric::Integer(0 | 1))) {
+        return Ok(());
+    }
+    Err(AssignmentError::TooLong {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "BIT(1)".to_string(),
     }
     .into())
 }

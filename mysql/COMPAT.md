@@ -667,6 +667,20 @@ keeps nothing of the spelling. Measured on 8.4.11 and matched: each prints as
 `DOUBLE` because MySQL's `REAL_AS_FLOAT` mode is off, which it is by default and
 in the one mode this server runs in.
 
+`BIT` and `BIT(1)` hold one bit, which is what Hibernate 6 maps a Java `Boolean`
+to on MySQL. Measured on 8.4.11 and matched: `bit` is `bit(1)` in `SHOW CREATE
+TABLE`, `SHOW COLUMNS` and `information_schema.COLUMNS` (`DATA_TYPE` `bit`,
+`NUMERIC_PRECISION` 1, `NUMERIC_SCALE` NULL); a default is written 0, 1,
+`FALSE`, `TRUE`, `b'0'` or `b'1'` and printed as the bit literal, unquoted, in
+all three; 0, 1, `TRUE` and `FALSE` are stored and 2, -1 and the word `'1'` are
+1406; `c = 1`, `c = TRUE`, `c <> 0` and `c IN (0)` find the rows holding those
+bits and `c = 2` finds none. A result column reports the BIT type, a length of
+1, the binary collation and the unsigned flag, and its value crosses the text
+protocol as the one byte holding the bit, 0x00 or 0x01. The binary protocol
+sends the same byte length-encoded, which is the form the protocol gives a
+BIT; that one was not measured, no client on the oracle's host speaking it.
+The engine holds the bit as the integer 0 or 1.
+
 A column declared `NOT NULL DEFAULT NULL`, in either order, is refused, as MySQL
 refuses it with 1067.
 

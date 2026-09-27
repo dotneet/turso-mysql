@@ -4869,6 +4869,52 @@ fn a_default_change_is_a_modify_of_the_column_with_its_new_default() {
     }
 }
 
+/// Measured on MySQL 8.4.11: `bit` is `bit(1)`, and its default is written
+/// 0, 1, `FALSE`, `TRUE`, `b'0'` or `b'1'`; 2, `b'10'` and the word `'1'` are
+/// 1067.
+#[test]
+fn a_bit_holds_one_bit_as_the_integer_it_is() {
+    let stored = |declared: &str| {
+        parse_create_table(
+            &format!("CREATE TABLE t (v {declared})"),
+            SessionSqlMode::default(),
+        )
+        .map(|translated| translated.as_sql().to_owned())
+    };
+    for (declared, expected) in [
+        ("BIT", "\"v\" BIT"),
+        ("BIT(1) NOT NULL", "\"v\" BIT NOT NULL"),
+        ("BIT DEFAULT b'1'", "\"v\" BIT DEFAULT 1"),
+        ("BIT DEFAULT b'0'", "\"v\" BIT DEFAULT 0"),
+        ("BIT DEFAULT 1", "\"v\" BIT DEFAULT 1"),
+        ("BIT DEFAULT FALSE", "\"v\" BIT DEFAULT 0"),
+        ("BIT DEFAULT NULL", "\"v\" BIT DEFAULT NULL"),
+    ] {
+        let stored = stored(declared).unwrap_or_else(|error| panic!("{declared}: {error}"));
+        assert!(stored.contains(expected), "{declared}: {stored}");
+    }
+    for declared in [
+        "BIT(8)",
+        "BIT(0)",
+        "BIT DEFAULT 2",
+        "BIT DEFAULT b'10'",
+        "BIT DEFAULT '1'",
+        "BIT DEFAULT ''",
+        "BIT DEFAULT x'01'",
+    ] {
+        assert!(stored(declared).is_err(), "{declared}");
+    }
+    let statement = parse_create_table_ast(
+        "CREATE TABLE t (v BIT NOT NULL DEFAULT b'1')",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        render_create_table_mysql_with_mode(&statement, SessionSqlMode::default()).unwrap(),
+        "CREATE TABLE `t` (`v` BIT(1) NOT NULL DEFAULT 1)"
+    );
+}
+
 #[test]
 fn preserves_explicit_nullable_mediumint_through_checked_rendering() {
     let create = "CREATE TABLE `numbers` (`value` MEDIUMINT NULL)";

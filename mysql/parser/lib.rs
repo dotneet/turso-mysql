@@ -1316,6 +1316,7 @@ pub struct MySqlNumericSpec {
     times: Vec<bool>,
     temporal_precisions: Vec<Option<u8>>,
     years: Vec<bool>,
+    bits: Vec<bool>,
     enums: Vec<Option<Vec<String>>>,
     sets: Vec<Option<Vec<String>>>,
     jsons: Vec<bool>,
@@ -1374,6 +1375,11 @@ impl MySqlNumericSpec {
     /// Reports whether a stored column position holds a `YEAR`.
     pub fn is_year(&self, index: usize) -> bool {
         self.years.get(index).copied().unwrap_or(false)
+    }
+
+    /// Reports whether a stored column position holds a `BIT(1)`.
+    pub fn is_bit(&self, index: usize) -> bool {
+        self.bits.get(index).copied().unwrap_or(false)
     }
 
     /// Returns the members an `ENUM` column lists, if the position holds one.
@@ -4666,6 +4672,11 @@ pub fn parse_mysql_numeric_spec(
                     if arguments.is_empty() && names_the_year_type(name))
             })
             .collect(),
+        bits: table
+            .columns
+            .iter()
+            .map(|column| matches!(column.data_type, DataType::Bit(_)))
+            .collect(),
         enums: table
             .columns
             .iter()
@@ -6621,6 +6632,13 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::DoublePrecision | DataType::Real | DataType::Float8 => "DOUBLE".to_owned(),
         DataType::DoublePrecisionUnsigned | DataType::RealUnsigned => "DOUBLE UNSIGNED".to_owned(),
         DataType::Float4 => "FLOAT".to_owned(),
+        // Hibernate maps a Java `Boolean` to `bit`, which MySQL reads as
+        // `bit(1)`: measured on 8.4.11, both print `bit(1)`. The engine holds
+        // the one bit as the integer 0 or 1, and it crosses the wire as the
+        // byte MySQL sends for it. A wider one holds a number of its own
+        // width, which is not taken.
+        DataType::Bit(None | Some(1)) => "BIT".to_owned(),
+        DataType::Bit(_) => return unsupported("BIT wider than one bit"),
         // MySQL stores BOOLEAN and BOOL as TINYINT and reports both as
         // `tinyint(1)`. The name is kept so that the display width survives a
         // round trip; the value is a TINYINT's and is checked as one.
@@ -7023,6 +7041,9 @@ fn render_column_option(
                     moment_with_fraction_sql(digits as u8)
                 )));
             }
+            if matches!(data_type, DataType::Bit(_)) {
+                return Ok(Some(format!("DEFAULT {}", bit_default(expr)?)));
+            }
             if let Some(range) = whole_number_range_of(data_type) {
                 let integer = whole_number_default(expr, range)?;
                 // The engine holds a BIGINT UNSIGNED in a type of its own that
@@ -7119,6 +7140,35 @@ fn render_column_option(
         ColumnOption::Comment(_) if option.name.is_none() => Ok(None),
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
+    }
+}
+
+/// The engine default of a `BIT(1)` column, the integer its bit is.
+///
+/// Measured on MySQL 8.4.11: `DEFAULT 0`, `1`, `FALSE`, `TRUE`, `b'0'`,
+/// `b'1'` and `x'01'` are taken and print as `b'0'` or `b'1'`, and `DEFAULT 2`,
+/// `b'10'` and `'1'` — a word, whose byte is wider than the one bit — are
+/// 1067. A word is refused here, `''` included, which MySQL takes as `b'0'`,
+/// and so is a hexadecimal one.
+fn bit_default(expr: &Expr) -> Result<&'static str, ParseError> {
+    let Expr::Value(value) = expr else {
+        return unsupported("BIT DEFAULT expression");
+    };
+    match &value.value {
+        Value::Null => Ok("NULL"),
+        Value::Number(digits, false) | Value::SingleQuotedByteStringLiteral(digits)
+            if digits == "0" =>
+        {
+            Ok("0")
+        }
+        Value::Number(digits, false) | Value::SingleQuotedByteStringLiteral(digits)
+            if digits == "1" =>
+        {
+            Ok("1")
+        }
+        Value::Boolean(false) => Ok("0"),
+        Value::Boolean(true) => Ok("1"),
+        _ => unsupported("BIT DEFAULT other than 0 or 1"),
     }
 }
 

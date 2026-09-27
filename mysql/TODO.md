@@ -417,6 +417,12 @@ speaks; anything measured here from now on has to pass that flag.
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
 | A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
 | `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
+| `BIT` and `BIT(1)` | works: written 0, 1, `TRUE` or `FALSE`, read back as the one byte MySQL sends over both protocols, compared against a written number, and printed `bit(1)` with a `b'0'` or `b'1'` default |
+| `BIT(n)` wider than one bit | refused; it holds an n-bit number and crosses as ceil(n/8) bytes, which has not been measured |
+| A bit literal or a word written into a `BIT(1)`, or compared against one — `b'1'`, `x'01'`, `''` | refused; measured, MySQL takes `b'1'` and `x'01'` as the bit and `''` as 0, and answers 1406 for any other word |
+| A `?` compared against a `BIT(1)` column | refused; nothing says what kind of value it is until it binds, and a bound word would compare by its kind rather than as MySQL compares it |
+| A call, an aggregate or arithmetic over a `BIT(1)` column — `c + 0`, `MAX(c)`, `IFNULL(c, 0)` | refused; the shape each answers has not been measured |
+| `DEFAULT x'01'` or `DEFAULT ''` on a `BIT(1)` | refused; measured, MySQL takes both and prints `b'1'` and `b'0'` |
 | A temporal precision above 6 | refused; precision 0 through 6 is supported for stored values, protocol results, and `DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP(n)` at the column's own precision |
 | Non-UTC TIMESTAMP queries beyond direct projection from one unfiltered base table | refused; joins, filters, ordering and expressions need conversion before the engine evaluates them |
 | Non-UTC `UPDATE` or `DELETE` on a table with TIMESTAMP, or TIMESTAMP `INSERT ... SELECT` | refused; these paths cannot yet convert every value safely |

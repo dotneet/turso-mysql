@@ -1082,6 +1082,7 @@ fn information_schema_column_sizes(
             b"bigint" => Some(19),
             b"float" => Some(12),
             b"double" => Some(22),
+            b"bit" => Some(1),
             _ => None,
         }
     };
@@ -2075,6 +2076,13 @@ pub(super) fn show_column_default_value(
         return Ok(Some(
             turso_mysql::show_create_table::the_moment(column.temporal_precision()).into_bytes(),
         ));
+    }
+    if column.type_name() == "BIT" {
+        if let Some(default @ MySqlColumnDefault::Integer { .. }) = column.default_value() {
+            return turso_mysql::show_create_table::bit_literal(default)
+                .map(|literal| Some(literal.as_bytes().to_vec()))
+                .ok_or(FrontendErrorKind::Internal);
+        }
     }
     show_default_at_scale(column.default_value(), column.decimal_size())
 }

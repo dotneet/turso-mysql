@@ -249,6 +249,10 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
     };
     Some(match default {
         MySqlColumnDefault::Null => " DEFAULT NULL".to_owned(),
+        // Measured on MySQL 8.4.11: a bit prints as a bit literal, unquoted.
+        MySqlColumnDefault::Integer { .. } if column.type_name() == "BIT" => {
+            format!(" DEFAULT {}", bit_literal(default)?)
+        }
         // A written number belongs to a column that holds one, and MySQL
         // prints it at that column's own scale.
         MySqlColumnDefault::Integer { text, .. } | MySqlColumnDefault::Number(text) => {
@@ -281,6 +285,17 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
             }
         }
     })
+}
+
+/// The default of a `BIT(1)` column as MySQL writes it, `b'0'` or `b'1'`, the
+/// same in `SHOW CREATE TABLE`, `SHOW COLUMNS` and
+/// `information_schema.COLUMNS`; `None` for a default no bit holds.
+pub fn bit_literal(default: &MySqlColumnDefault) -> Option<&'static str> {
+    match default {
+        MySqlColumnDefault::Integer { value: 0, .. } => Some("b'0'"),
+        MySqlColumnDefault::Integer { value: 1, .. } => Some("b'1'"),
+        _ => None,
+    }
 }
 
 /// One written number at the scale its column holds values at.
@@ -364,6 +379,7 @@ pub fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
         "DATE" => Some("date".to_owned()),
         "TIME" => Some("time".to_owned()),
         "YEAR" => Some("year".to_owned()),
+        "BIT" => Some("bit(1)".to_owned()),
         // Measured on MySQL 8.4.11: a nullable TIMESTAMP prints its NULL, where
         // a nullable DATETIME prints only the DEFAULT.
         "TIMESTAMP" => Some("timestamp".to_owned()),

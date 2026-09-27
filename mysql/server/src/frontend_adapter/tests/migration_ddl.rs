@@ -547,3 +547,195 @@ fn double_precision_and_real_are_doubles() {
         );
     }
 }
+
+fn raw_rows(adapter: &mut Adapter, sql: &str) -> Vec<Vec<Option<Vec<u8>>>> {
+    let result = adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    let CommandExecutionResult::ResultSet(result) = result else {
+        panic!("{sql} must return a result set");
+    };
+    result.rows
+}
+
+/// The null bitmap, the new-parameters flag and one TINY parameter, which is
+/// how Connector/J binds a Java `boolean` on the server.
+fn one_tiny(value: u8) -> Vec<u8> {
+    vec![0, 1, MYSQL_TYPE_TINY, 0, value]
+}
+
+/// Hibernate 6 maps a Java `Boolean` to `bit` on MySQL, and writes and reads it
+/// as 0 and 1.
+#[test]
+fn a_hibernate_boolean_is_a_bit() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "create table settings (id bigint not null auto_increment, active bit not null, flag bit(1) default b'1', spare bit default 0, primary key (id)) engine=InnoDB",
+    );
+    run(
+        &mut adapter,
+        "insert into settings (active) values (1), (0), (TRUE), (FALSE)",
+    );
+    let statement = adapter
+        .execute_stmt_prepare("insert into settings (active, spare) values (?, ?)")
+        .unwrap();
+    let mut payload = vec![0, 1, MYSQL_TYPE_TINY, 0, MYSQL_TYPE_LONGLONG, 0, 1];
+    payload.extend_from_slice(&1_i64.to_le_bytes());
+    adapter
+        .execute_stmt_execute(statement.statement_id, &payload)
+        .unwrap();
+    run(
+        &mut adapter,
+        "update settings set active = true where id = 2",
+    );
+
+    // Measured on MySQL 8.4.11: a bit crosses the text protocol as the one
+    // byte that holds it, a `bit(1)` column reporting the BIT type, a length
+    // of 1, the binary collation and the unsigned flag.
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query("select active, flag, spare from settings order by id")
+        .unwrap()
+    else {
+        panic!("a SELECT answers rows");
+    };
+    let column = &result.columns[0];
+    assert_eq!(column.column_type, MYSQL_TYPE_BIT);
+    assert_eq!(column.column_length, 1);
+    assert_eq!(column.character_set, MYSQL_BINARY_COLLATION);
+    assert_eq!(
+        column.flags & (MYSQL_UNSIGNED_FLAG | MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG),
+        MYSQL_UNSIGNED_FLAG | MYSQL_NOT_NULL_FLAG
+    );
+    let bits = |byte: u8| Some(vec![byte]);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![bits(1), bits(1), bits(0)],
+            vec![bits(1), bits(1), bits(0)],
+            vec![bits(1), bits(1), bits(0)],
+            vec![bits(0), bits(1), bits(0)],
+            vec![bits(1), bits(1), bits(1)],
+        ]
+    );
+
+    // The binary protocol sends the same byte, length-encoded.
+    let statement = adapter
+        .execute_stmt_prepare("select active from settings where id = 4")
+        .unwrap();
+    assert_eq!(statement.columns[0].column_type, MYSQL_TYPE_BIT);
+    let PreparedStatementExecutionResult::ResultSet(binary) = adapter
+        .execute_stmt_execute(statement.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("a prepared SELECT answers rows");
+    };
+    assert_eq!(binary.rows, vec![vec![BinaryResultValue::Blob(vec![0])]]);
+
+    for (sql, expected) in [
+        (
+            "select id from settings where active = 1 order by id",
+            ["1", "2", "3", "5"].as_slice(),
+        ),
+        (
+            "select id from settings where active = true order by id",
+            &["1", "2", "3", "5"],
+        ),
+        (
+            "select id from settings where active = 0 order by id",
+            &["4"],
+        ),
+        (
+            "select id from settings where active = false order by id",
+            &["4"],
+        ),
+        (
+            "select id from settings where active <> 0 order by id",
+            &["1", "2", "3", "5"],
+        ),
+        (
+            "select id from settings where active in (0) order by id",
+            &["4"],
+        ),
+        ("select id from settings where active = 2 order by id", &[]),
+    ] {
+        let found = rows(&mut adapter, sql)
+            .into_iter()
+            .map(|row| row[0].clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(found, expected, "{sql}");
+    }
+
+    // Measured: 2, -1, 1.5 and a word are each 1406, a byte of `'1'` being
+    // wider than the one bit.
+    for sql in [
+        "insert into settings (active) values (2)",
+        "insert into settings (active) values (-1)",
+        "insert into settings (active) values ('1')",
+        "update settings set active = 2 where id = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    let statement = adapter
+        .execute_stmt_prepare("insert into settings (active) values (?)")
+        .unwrap();
+    assert!(adapter
+        .execute_stmt_execute(statement.statement_id, &one_tiny(2))
+        .is_err());
+    // A bound value compared against a bit is refused: nothing says what kind
+    // of value it is until it binds.
+    assert!(adapter
+        .execute_stmt_prepare("select id from settings where active = ?")
+        .is_err());
+
+    // A call or an aggregate over a bit has not been measured.
+    for sql in [
+        "select active + 0 from settings",
+        "select max(active) from settings",
+        "select ifnull(flag, 0) from settings",
+        // Taken by MySQL; a bit written as a bit literal is not read here.
+        "insert into settings (active) values (b'1')",
+        "select id from settings where active = b'1'",
+        "create table wide (b bit(8))",
+        "create table defaulted (b bit default 2)",
+        "create table defaulted (b bit default '1')",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    let expected_columns = [
+        "  `active` bit(1) NOT NULL,\n",
+        "  `flag` bit(1) DEFAULT b'1',\n",
+        "  `spare` bit(1) DEFAULT b'0',\n",
+    ];
+    for reopen in [false, true] {
+        if reopen {
+            adapter = reopened(&directory, adapter);
+        }
+        let adapter = &mut adapter;
+        let printed = printed_table(adapter, "settings");
+        for line in expected_columns {
+            assert!(printed.contains(line), "{printed}");
+        }
+        let shown = rows(adapter, "SHOW COLUMNS FROM settings");
+        assert_eq!(shown[1][1].as_deref(), Some("bit(1)"));
+        assert_eq!(shown[2][4].as_deref(), Some("b'1'"));
+        assert_eq!(
+            rows(
+                adapter,
+                "SELECT COLUMN_NAME, COLUMN_DEFAULT, DATA_TYPE, COLUMN_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE \
+                 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'settings' \
+                 ORDER BY ORDINAL_POSITION"
+            )[1..],
+            [
+                vec![Some("active".to_owned()), None, Some("bit".to_owned()), Some("bit(1)".to_owned()), Some("1".to_owned()), None],
+                vec![Some("flag".to_owned()), Some("b'1'".to_owned()), Some("bit".to_owned()), Some("bit(1)".to_owned()), Some("1".to_owned()), None],
+                vec![Some("spare".to_owned()), Some("b'0'".to_owned()), Some("bit".to_owned()), Some("bit(1)".to_owned()), Some("1".to_owned()), None],
+            ]
+        );
+        assert_eq!(
+            raw_rows(adapter, "select active from settings where id = 5"),
+            vec![vec![Some(vec![1])]]
+        );
+    }
+}

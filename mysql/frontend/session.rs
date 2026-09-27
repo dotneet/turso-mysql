@@ -8266,6 +8266,7 @@ fn mysql_column_metadata(
             "DATE" => "DATE",
             "TIME" => "TIME",
             "YEAR" => "YEAR",
+            "BIT" => "BIT",
             "JSON" => "JSON",
             _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),
         }
@@ -8578,6 +8579,11 @@ fn comparison_meets_the_stored_form(
                 && turso_mysql_parser::year_from_number(*number)
                     .is_some_and(|year| i64::from(year) == *number)
         }
+        // A bit is held as the number 0 or 1, and MySQL compares one against a
+        // number as that number: measured on 8.4.11, `c = 1`, `c = TRUE`,
+        // `c <> 0` and `c IN (0)` find the rows holding those bits, and
+        // `c = 2` finds none.
+        ("BIT", CheckedSelectComparisonRhs::SignedInteger(_)) => ordered,
         // A real is held as a number and compared as one, which is what MySQL
         // compares it as.
         (_, CheckedSelectComparisonRhs::SignedInteger(_)) if is_real_type(type_name) => ordered,
@@ -8805,7 +8811,7 @@ fn select_comparison_fits_column(
 fn stores_a_canonical_form(type_name: &str) -> bool {
     matches!(
         type_name,
-        "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR"
+        "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR" | "BIT"
     ) || is_real_type(type_name)
         || turso_mysql_parser::enum_members(type_name).is_some()
         || turso_mysql_parser::set_members(type_name).is_some()
