@@ -62,15 +62,97 @@ impl MySqlTableCollation {
     }
 }
 
+/// The table options the engine has nowhere to keep, which end the stored
+/// `CREATE TABLE` of a table and are carried across every rewrite of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MySqlTableOptions {
+    pub collation: MySqlTableCollation,
+    /// The table's `COMMENT`, `None` where it has none or an empty one.
+    pub comment: Option<String>,
+}
+
+impl MySqlTableOptions {
+    /// What ends the stored `CREATE TABLE` of a table with these options, in
+    /// the order MySQL prints them: the collation, then the comment.
+    pub fn written(&self) -> String {
+        match &self.comment {
+            Some(comment) => format!(
+                "{} COMMENT={}",
+                self.collation.table_option(),
+                super::quoted_mysql_text(comment)
+            ),
+            None => self.collation.table_option().to_owned(),
+        }
+    }
+}
+
 /// The collation one `CREATE TABLE` gives its table.
 pub fn table_collation_of(
     create_sql: &str,
     mode: SessionSqlMode,
 ) -> Result<MySqlTableCollation, ParseError> {
+    Ok(table_options_of(create_sql, mode)?.collation)
+}
+
+/// The options one `CREATE TABLE` gives its table that the engine does not
+/// keep.
+pub fn table_options_of(
+    create_sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlTableOptions, ParseError> {
     let Statement::CreateTable(table) = parse_one_statement(create_sql, mode)? else {
         return Err(ParseError::ExpectedCreateTable);
     };
-    Ok(super::check_table_options(&table.table_options)?.collation)
+    Ok(super::check_table_options(&table.table_options)?.kept())
+}
+
+/// Reads an `ALTER TABLE` that changes the table's comment and does nothing
+/// else — Laravel's `alter table t comment = 'x'` and Rails' `ALTER TABLE t
+/// COMMENT 'x'` — as the table and the comment it is to have, `None` for an
+/// empty one.
+///
+/// `sqlparser` reads no table option in an `ALTER TABLE`, so the words are read
+/// here. Answers `None` for any other statement, a comment beside some other
+/// operation among them, which is left to fail where it is read.
+pub fn table_comment_change(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<(super::MySqlTableName, Option<String>)>, ParseError> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+        return Ok(None);
+    };
+    let mut words = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+    let named = |token: Option<&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next(), "ALTER") || !named(words.next(), "TABLE") {
+        return Ok(None);
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return Ok(None);
+    };
+    if !named(words.next(), "COMMENT") {
+        return Ok(None);
+    }
+    let comment = match words.next() {
+        Some(Token::Eq) => words.next(),
+        written => written,
+    };
+    let Some(Token::SingleQuotedString(comment)) = comment else {
+        return Ok(None);
+    };
+    if words.next().is_some() {
+        return Ok(None);
+    }
+    let table =
+        super::MySqlTableName::parse(&table.value).map_err(|_| ParseError::Unsupported {
+            feature: "ALTER TABLE name",
+        })?;
+    Ok(Some((table, super::checked_table_comment(comment)?)))
 }
 
 /// Writes the collation a new table declares onto each of its text columns
@@ -279,6 +361,56 @@ mod tests {
             .unwrap(),
             "CREATE TABLE _prisma_migrations (\n    id VARCHAR(36) PRIMARY KEY NOT NULL COLLATE utf8mb4_unicode_ci,\n    logs TEXT COLLATE utf8mb4_unicode_ci\n) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
         );
+    }
+
+    /// Measured on MySQL 8.4.11: the comment is printed after the collation,
+    /// quoted the way a column's comment is, and an empty one is not printed.
+    #[test]
+    fn a_table_comment_is_kept_after_the_collation() {
+        let options = |sql: &str| table_options_of(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(
+            options("CREATE TABLE t (id INT) COMMENT='it''s a \\\\ back'").written(),
+            " COMMENT='it''s a \\\\ back'"
+        );
+        assert_eq!(
+            options("CREATE TABLE t (id INT) COLLATE=utf8mb4_unicode_ci COMMENT 'x'").written(),
+            " COLLATE=utf8mb4_unicode_ci COMMENT='x'"
+        );
+        assert_eq!(options("CREATE TABLE t (id INT) COMMENT=''").comment, None);
+        assert!(table_options_of(
+            &format!("CREATE TABLE t (id INT) COMMENT='{}'", "x".repeat(2049)),
+            SessionSqlMode::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_alter_changing_only_the_comment_is_read() {
+        let changed = |sql: &str| {
+            table_comment_change(sql, SessionSqlMode::default())
+                .unwrap()
+                .map(|(table, comment)| (table.as_str().to_owned(), comment))
+        };
+        assert_eq!(
+            changed("alter table `users` comment = 'Users'"),
+            Some(("users".to_owned(), Some("Users".to_owned())))
+        );
+        assert_eq!(
+            changed("ALTER TABLE users COMMENT 'it''s';"),
+            Some(("users".to_owned(), Some("it's".to_owned())))
+        );
+        assert_eq!(
+            changed("ALTER TABLE users COMMENT ''"),
+            Some(("users".to_owned(), None))
+        );
+        for sql in [
+            "ALTER TABLE users COMMENT 'x', ADD COLUMN n INT",
+            "ALTER TABLE users ADD COLUMN n INT COMMENT 'x'",
+            "ALTER TABLE db.users COMMENT 'x'",
+            "CREATE TABLE users (id INT) COMMENT 'x'",
+        ] {
+            assert_eq!(changed(sql), None, "{sql}");
+        }
     }
 
     #[test]

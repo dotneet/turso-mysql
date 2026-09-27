@@ -72,8 +72,8 @@ use turso_mysql_parser::{
     parse_optional_show_columns, parse_optional_show_create_table,
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
-    renamed_tables, select_projection_origins, ArithmeticOperand, ArithmeticOperator,
-    ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
+    renamed_tables, select_projection_origins, table_comment_change, ArithmeticOperand,
+    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
     ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
     MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
     MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
@@ -2197,6 +2197,7 @@ where
                     rows: counted,
                     auto_increment: None,
                     collation: table.collation().unwrap_or_default().name(),
+                    comment: table.comment().unwrap_or_default().to_owned(),
                 });
             }
             return show_table_status_result_to_execution_result(rows, self.status_flags());
@@ -2916,6 +2917,20 @@ fn execute_checked_query(
         }
         Ok(false) => {}
         Err(_) => return Err(FrontendErrorKind::Unsupported),
+    }
+    if let Some((table, comment)) = table_comment_change(sql, connection.parser_mode())
+        .map_err(|_| FrontendErrorKind::Unsupported)?
+    {
+        connection
+            .execute_table_comment(&table, comment)
+            .map_err(|error| match error {
+                MySqlQueryError::MissingTable => FrontendErrorKind::MissingObject,
+                error => frontend_query_error(error),
+            })?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
     }
     if let Some(pairs) = renamed_tables(sql) {
         connection

@@ -6,7 +6,7 @@
 //! spaces of indent, `,\n` between items, no trailing newline, lower-case type
 //! names, and DEFAULT literals in single quotes even when they are numbers.
 
-use turso_mysql_parser::MySqlTableCollation;
+use turso_mysql_parser::{MySqlTableCollation, MySqlTableOptions};
 
 use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
 
@@ -16,7 +16,7 @@ use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
 /// which it leaves out entirely while the counter is still at one.
 pub fn render_create_table(
     table: &str,
-    collation: MySqlTableCollation,
+    options: &MySqlTableOptions,
     columns: &[MySqlColumnMetadata],
     indexes: &[MySqlIndexEntry],
     foreign_keys: &[MySqlForeignKey],
@@ -27,7 +27,7 @@ pub fn render_create_table(
     }
     let mut items = Vec::with_capacity(columns.len() + 1);
     for column in columns {
-        items.push(render_column(column, collation)?);
+        items.push(render_column(column, options.collation)?);
     }
     items.extend(render_keys(indexes));
     items.extend(
@@ -43,11 +43,22 @@ pub fn render_create_table(
     let counter = next_auto_increment
         .map(|next| format!(" AUTO_INCREMENT={next}"))
         .unwrap_or_default();
-    // Measured on MySQL 8.4.11: the collation is printed whatever it is.
+    // Measured on MySQL 8.4.11: the collation is printed whatever it is, and
+    // the comment after it, where the table has one.
+    let comment = options
+        .comment
+        .as_deref()
+        .map(|comment| {
+            format!(
+                " COMMENT={}",
+                turso_mysql_parser::quoted_mysql_text(comment)
+            )
+        })
+        .unwrap_or_default();
     Some(format!(
-        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET=utf8mb4 COLLATE={}",
+        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET=utf8mb4 COLLATE={}{comment}",
         quoted(table),
-        collation.name()
+        options.collation.name()
     ))
 }
 

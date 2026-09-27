@@ -72,9 +72,9 @@ impl MySqlConnection {
                     ));
                 }
             };
-            let collation = match kind {
+            let options = match kind {
                 MySqlTableKind::BaseTable => Some(
-                    crate::schema_sql::stored_table_collation(stored.to_text().unwrap_or_default())
+                    crate::schema_sql::stored_table_options(stored.to_text().unwrap_or_default())
                         .map_err(|error| LimboError::Corrupt(error.to_string()))?,
                 ),
                 MySqlTableKind::View => None,
@@ -82,7 +82,7 @@ impl MySqlConnection {
             tables.push(MySqlTable {
                 name: name.to_owned(),
                 kind,
-                collation,
+                options,
             });
         }
         tables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
@@ -153,15 +153,15 @@ impl MySqlConnection {
         })?;
         let indexes = self.list_indexes(table)?;
         let next_auto_increment = self.next_auto_increment_value(table)?;
-        let collation = match self.inner.current_schema().table_sql(table.as_str()) {
-            Some(stored) => crate::schema_sql::stored_table_collation(stored).map_err(|error| {
+        let options = match self.inner.current_schema().table_sql(table.as_str()) {
+            Some(stored) => crate::schema_sql::stored_table_options(stored).map_err(|error| {
                 MySqlShowCreateTableError::Engine(LimboError::Corrupt(error.to_string()))
             })?,
             None => Default::default(),
         };
         let create_statement = crate::show_create_table::render_create_table(
             table.as_str(),
-            collation,
+            &options,
             &columns,
             &indexes,
             &foreign_keys,

@@ -9,7 +9,7 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_table_ast, render_counted_create_table_mysql_with_mode,
     render_create_index_mysql_with_mode, render_create_table_mysql_with_mode,
-    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, table_collation_of,
+    render_create_trigger_mysql_with_mode, render_create_view_mysql_with_mode, table_options_of,
     SessionSqlMode,
 };
 
@@ -482,8 +482,8 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
         // table was declared with is carried over from what it replaces.
         .and_then(|rendered| match kind {
             SchemaSqlKind::Table => {
-                let collation = table_collation_of(decoded.normalized_ddl, mode)?;
-                Ok(format!("{rendered}{}", collation.table_option()))
+                let options = table_options_of(decoded.normalized_ddl, mode)?;
+                Ok(format!("{rendered}{}", options.written()))
             }
             _ => Ok(rendered),
         })
@@ -529,6 +529,68 @@ impl turso_core::SchemaSqlFormatter for CreatorSchemaSqlFormatter {
             previous_sql,
             stmt,
         )
+    }
+}
+
+/// Writes one table's schema again with another `COMMENT`, which is how an
+/// `ALTER TABLE t COMMENT = '...'` changes it.
+///
+/// The engine keeps no comment, so the comment lives at the end of the stored
+/// MySQL `CREATE TABLE` and is carried across every rewrite of it; this
+/// replaces it in the rewrite of the one table named, and leaves every other
+/// row the statement rewrites as the session's own formatter writes it.
+pub struct TableCommentSchemaSqlFormatter {
+    pub context: SchemaSqlSessionContext,
+    pub table: String,
+    pub comment: Option<String>,
+}
+
+impl turso_core::SchemaSqlFormatter for TableCommentSchemaSqlFormatter {
+    fn format_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        input: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> turso_core::Result<String> {
+        turso_core::SchemaSqlFormatter::format_schema_sql(&self.context, kind, input, stmt)
+    }
+
+    fn format_rewritten_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        previous_sql: &str,
+        stmt: &turso_parser::ast::Stmt,
+    ) -> turso_core::Result<String> {
+        let rewritten = turso_core::SchemaSqlFormatter::format_rewritten_schema_sql(
+            &self.context,
+            kind,
+            previous_sql,
+            stmt,
+        )?;
+        let turso_parser::ast::Stmt::CreateTable { tbl_name, .. } = stmt else {
+            return Ok(rewritten);
+        };
+        if kind != SchemaSqlKind::Table || !tbl_name.name.as_str().eq_ignore_ascii_case(&self.table)
+        {
+            return Ok(rewritten);
+        }
+        let decoded = decode_persisted_schema_sql(kind, &rewritten)?.ok_or_else(|| {
+            turso_core::LimboError::Corrupt("MySQL table rewrite lost its schema envelope".into())
+        })?;
+        let mode = parser_sql_mode(decoded.context.sql_mode);
+        let carried = table_options_of(decoded.normalized_ddl, mode)
+            .map_err(|error| turso_core::LimboError::Corrupt(error.to_string()))?;
+        let Some(definition) = decoded.normalized_ddl.strip_suffix(&carried.written()) else {
+            return Err(turso_core::LimboError::Corrupt(
+                "stored MySQL table does not end with its own options".into(),
+            ));
+        };
+        let changed = turso_mysql_parser::MySqlTableOptions {
+            comment: self.comment.clone(),
+            ..carried
+        };
+        reencode_schema_sql(decoded, &format!("{definition}{}", changed.written()))
+            .map_err(schema_sql_error_to_limbo)
     }
 }
 
@@ -674,15 +736,16 @@ pub fn decode_schema_sql(
     Ok(decoded)
 }
 
-/// The collation one stored table was declared with. A table stored before
-/// this frontend marked its rows has the default.
-pub fn stored_table_collation(
+/// The collation and comment one stored table was declared with. A table
+/// stored before this frontend marked its rows has the default collation and
+/// no comment.
+pub fn stored_table_options(
     stored: &str,
-) -> Result<turso_mysql_parser::MySqlTableCollation, SchemaSqlError> {
+) -> Result<turso_mysql_parser::MySqlTableOptions, SchemaSqlError> {
     let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, stored)? else {
         return Ok(Default::default());
     };
-    table_collation_of(
+    table_options_of(
         decoded.normalized_ddl,
         parser_sql_mode(decoded.context.sql_mode),
     )

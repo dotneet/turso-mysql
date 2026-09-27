@@ -324,11 +324,11 @@ pub(super) fn information_schema_tables_result_to_execution_result(
             table
                 .collation()
                 .map(|collation| collation.name().as_bytes().to_vec()),
-            Some(if base_table {
-                Vec::new()
-            } else {
-                b"VIEW".to_vec()
-            }),
+            Some(
+                table
+                    .comment()
+                    .map_or(b"VIEW".to_vec(), |comment| comment.as_bytes().to_vec()),
+            ),
         ];
         // The row holds what the query named, in the order it named it.
         let row = projected
@@ -1458,7 +1458,7 @@ pub(super) fn show_table_status_result_to_execution_result(
                 Some(row.collation.as_bytes().to_vec()),
                 None,
                 Some(Vec::new()),
-                Some(Vec::new()),
+                Some(row.comment.into_bytes()),
             ]
         })
         .collect::<Vec<_>>();
@@ -1480,6 +1480,8 @@ pub(super) struct ShowTableStatusRow {
     pub auto_increment: Option<u64>,
     /// The collation the table was declared with.
     pub collation: &'static str,
+    /// The table's `COMMENT`, empty where it has none.
+    pub comment: String,
 }
 
 /// The eighteen columns, with the shapes measured on MySQL 8.4.11.

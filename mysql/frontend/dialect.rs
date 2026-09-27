@@ -14,7 +14,7 @@ use turso_mysql_parser::{
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
     render_create_table_mysql_with_mode, render_create_trigger_mysql_with_mode,
-    render_create_view_mysql_with_mode, table_collation_of, SessionSqlMode,
+    render_create_view_mysql_with_mode, table_options_of, SessionSqlMode,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -216,8 +216,8 @@ impl Dialect for MySqlDialect {
         let mode = session_sql_mode(decoded.context.sql_mode);
         let normalized = render_create_table_mysql_with_mode(&stmt, mode)
             .and_then(|rendered| {
-                let collation = table_collation_of(decoded.normalized_ddl, mode)?;
-                Ok(format!("{rendered}{}", collation.table_option()))
+                let options = table_options_of(decoded.normalized_ddl, mode)?;
+                Ok(format!("{rendered}{}", options.written()))
             })
             .map_err(|error| {
                 LimboError::Corrupt(format!("cannot replay MySQL table SQL: {error}"))

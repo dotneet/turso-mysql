@@ -155,7 +155,8 @@ pub use static_select_metadata::{
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column,
-    create_table_with_its_collation_on_each_text_column, table_collation_of, MySqlTableCollation,
+    create_table_with_its_collation_on_each_text_column, table_collation_of, table_comment_change,
+    table_options_of, MySqlTableCollation, MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
@@ -180,13 +181,13 @@ use std::{fmt, num::NonZeroUsize};
 use sqlparser::{
     ast::{
         AlterColumnOperation, AlterTable, AlterTableOperation, BinaryOperator, CharLengthUnits,
-        CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateIndex, CreateTable,
-        CreateTableOptions, CreateTrigger, CreateView, DataType, Delete, ExactNumberInfo, Expr,
-        FromTable, FunctionArguments, HiveDistributionStyle, Ident, IndexColumn, Insert,
-        NullsDistinctOption, ObjectName, ObjectNamePart, PrimaryKeyConstraint, RenameTableNameKind,
-        SelectFlavor, SelectItem, SetExpr, SqlOption, Statement, TableConstraint, TableFactor,
-        TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject, TriggerObjectKind,
-        TriggerPeriod, UnaryOperator, Update, Value,
+        CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CommentDef, CreateIndex,
+        CreateTable, CreateTableOptions, CreateTrigger, CreateView, DataType, Delete,
+        ExactNumberInfo, Expr, FromTable, FunctionArguments, HiveDistributionStyle, Ident,
+        IndexColumn, Insert, NullsDistinctOption, ObjectName, ObjectNamePart, PrimaryKeyConstraint,
+        RenameTableNameKind, SelectFlavor, SelectItem, SetExpr, SqlOption, Statement,
+        TableConstraint, TableFactor, TableObject, TriggerEvent as SqlTriggerEvent, TriggerObject,
+        TriggerObjectKind, TriggerPeriod, UnaryOperator, Update, Value,
     },
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
@@ -5501,14 +5502,12 @@ fn render_auto_increment_mysql_ddl(
             .collect::<Result<Vec<_>, ParseError>>()?,
     );
     let temporary = if table.temporary { "TEMPORARY " } else { "" };
-    let collation = check_table_options(&table.table_options)?
-        .collation
-        .table_option();
+    let options = check_table_options(&table.table_options)?.kept().written();
     // `IF NOT EXISTS` says what to do about a table that is already there, not
     // what the table is, and MySQL never prints it back, so it is left out of
     // the stored DDL.
     Ok(format!(
-        "CREATE {temporary}TABLE {} ({}){collation}",
+        "CREATE {temporary}TABLE {} ({}){options}",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))
@@ -6304,6 +6303,12 @@ pub(crate) fn check_table_options(
                 checked.collation = collation;
                 "COLLATE"
             }
+            // Measured on MySQL 8.4.11: the comment is printed last, after
+            // the collation, and an empty one is not printed at all.
+            SqlOption::Comment(CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment)) => {
+                checked.comment = checked_table_comment(comment)?;
+                "COMMENT"
+            }
             _ => return unsupported("CREATE TABLE option"),
         };
         if written.contains(&named) {
@@ -6319,6 +6324,29 @@ pub(crate) fn check_table_options(
 pub(crate) struct CheckedTableOptions {
     pub(crate) starts_the_counter_at: Option<u64>,
     pub(crate) collation: MySqlTableCollation,
+    pub(crate) comment: Option<String>,
+}
+
+impl CheckedTableOptions {
+    /// The options the stored `CREATE TABLE` of this table ends with.
+    pub(crate) fn kept(&self) -> MySqlTableOptions {
+        MySqlTableOptions {
+            collation: self.collation,
+            comment: self.comment.clone(),
+        }
+    }
+}
+
+/// A table comment as it is kept, `None` for an empty one.
+///
+/// Measured on MySQL 8.4.11: an empty comment is not printed and reads back
+/// as the empty string, the same as a table given none. MySQL answers 1628 for
+/// a comment longer than 2048 characters, which is refused here.
+pub(crate) fn checked_table_comment(comment: &str) -> Result<Option<String>, ParseError> {
+    if comment.chars().count() > 2048 {
+        return unsupported("table COMMENT longer than 2048 characters");
+    }
+    Ok((!comment.is_empty()).then(|| comment.to_owned()))
 }
 
 /// The number a `AUTO_INCREMENT=<n>` table option names.

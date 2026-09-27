@@ -343,11 +343,9 @@ pub(crate) fn render_mysql_create_table(
     // `SHOW CREATE TABLE` never prints `IF NOT EXISTS` — measured, a table
     // written with it prints back without it — so the words are read and left
     // out of what is stored.
-    let collation = check_table_options(&table.table_options)?
-        .collation
-        .table_option();
+    let options = check_table_options(&table.table_options)?.kept().written();
     Ok(format!(
-        "CREATE {temporary}TABLE {} ({}){engine}{collation}",
+        "CREATE {temporary}TABLE {} ({}){engine}{options}",
         render_mysql_object_name(&table.name)?,
         definitions.join(", ")
     ))

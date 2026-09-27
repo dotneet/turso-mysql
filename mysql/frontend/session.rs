@@ -344,8 +344,9 @@ pub enum MySqlTableKind {
 pub struct MySqlTable {
     name: String,
     kind: MySqlTableKind,
-    /// The collation a base table was declared with. A view has none.
-    collation: Option<turso_mysql_parser::MySqlTableCollation>,
+    /// The collation and comment a base table was declared with. A view
+    /// has neither.
+    options: Option<turso_mysql_parser::MySqlTableOptions>,
 }
 
 /// The key classification available in the initial MySQL column metadata slice.
@@ -541,8 +542,16 @@ impl MySqlTable {
 
     /// Returns the collation a base table was declared with, or `None` for a
     /// view.
-    pub const fn collation(&self) -> Option<turso_mysql_parser::MySqlTableCollation> {
-        self.collation
+    pub fn collation(&self) -> Option<turso_mysql_parser::MySqlTableCollation> {
+        self.options.as_ref().map(|options| options.collation)
+    }
+
+    /// Returns the comment a base table was declared with, empty where it has
+    /// none, or `None` for a view.
+    pub fn comment(&self) -> Option<&str> {
+        self.options
+            .as_ref()
+            .map(|options| options.comment.as_deref().unwrap_or_default())
     }
 }
 
@@ -3263,8 +3272,8 @@ impl MySqlConnection {
             // statement declares is written after what the engine keeps.
             Stmt::CreateTable { .. } => render_create_table_mysql_with_mode(&stmt, mode)
                 .and_then(|rendered| {
-                    let collation = turso_mysql_parser::table_collation_of(sql, mode)?;
-                    Ok(format!("{rendered}{}", collation.table_option()))
+                    let options = turso_mysql_parser::table_options_of(sql, mode)?;
+                    Ok(format!("{rendered}{}", options.written()))
                 })
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
             Stmt::CreateIndex { .. } => render_create_index_mysql_with_mode(&stmt, mode)
@@ -3637,7 +3646,7 @@ impl MySqlConnection {
                 continue;
             }
             let sql = sql.to_string();
-            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, sql.trim_matches('\''))
+            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, &sql)
                 .map_err(|error| LimboError::Corrupt(error.to_string()))?
             else {
                 return Ok(None);
@@ -3842,6 +3851,82 @@ impl MySqlConnection {
         let mut query = capability.allocator.peek_high_water(table.key)?;
         let high_water = capability.io.block(|| query.step())?;
         Ok((high_water > 0).then_some(high_water))
+    }
+
+    /// Runs one `ALTER TABLE t COMMENT = '...'`, `None` taking the comment
+    /// away.
+    ///
+    /// The comment lives at the end of the stored MySQL `CREATE TABLE`, which
+    /// the engine writes again whenever it changes the table. So the engine is
+    /// asked for the one change that alters nothing — a column renamed to its
+    /// own name — and the table is written back with the new comment.
+    pub fn execute_table_comment(
+        &self,
+        table: &MySqlTableName,
+        comment: Option<String>,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        let Some(btree) = schema.get_btree_table(table.as_str()) else {
+            return Err(MySqlQueryError::MissingTable);
+        };
+        let first_column = btree
+            .columns()
+            .first()
+            .and_then(|column| column.name.clone())
+            .ok_or_else(|| {
+                MySqlQueryError::Engine(LimboError::Corrupt(
+                    "a stored table has no columns".to_string(),
+                ))
+            })?;
+        let body = AlterTableBody::RenameColumn {
+            old: turso_parser::ast::Name::exact(first_column.clone()),
+            new: turso_parser::ast::Name::exact(first_column),
+        };
+        // The rename rewrites what names the column as well as the table, as
+        // every other `ALTER TABLE` does, and is held to the same rules.
+        self.reject_alter_with_marked_trigger()
+            .and_then(|()| self.reject_alter_with_marked_view(&body))
+            .map_err(MySqlQueryError::Engine)?;
+        let stmt = Stmt::AlterTable(turso_parser::ast::AlterTable {
+            name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                btree.name.clone(),
+            )),
+            body,
+        });
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser {
+                mode: self.parser_mode(),
+            }))
+            .with_schema_sql_formatter(Arc::new(
+                crate::schema_sql::TableCommentSchemaSqlFormatter {
+                    context: self.schema_context,
+                    table: btree.name.clone(),
+                    comment,
+                },
+            ));
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_internal("BEGIN")?;
+        let applied = self
+            .inner
+            .prepare_translated_stmt_with_options(
+                stmt,
+                &format!("ALTER TABLE {} COMMENT", mysql_quoted(table.as_str())),
+                &options,
+            )
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine);
+        if applied.is_err() {
+            self.run_internal("ROLLBACK")?;
+            return applied;
+        }
+        self.run_internal("COMMIT")?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
     }
 
     /// Runs one `RENAME TABLE`, renaming every pair it names or none of them.
@@ -7462,7 +7547,7 @@ impl MySqlConnection {
                 continue;
             }
             let sql = sql.to_string();
-            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, sql.trim_matches('\''))
+            let Some(decoded) = decode_schema_sql(SchemaSqlKind::Table, &sql)
                 .map_err(|error| LimboError::Corrupt(error.to_string()))?
             else {
                 return Ok(None);
@@ -7512,7 +7597,7 @@ impl MySqlConnection {
                 name,
                 definition,
                 key,
-                stored_sql: sql.trim_matches('\'').to_owned(),
+                stored_sql: sql,
             }));
         }
         Ok(None)

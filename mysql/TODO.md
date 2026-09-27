@@ -182,8 +182,9 @@ boolean literal.
 
 | Form | State |
 |---|---|
-| `RENAME INDEX` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` does not read it, so it is read by its own words and only on its own. Measured, MySQL takes it beside anything else |
-| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / the index operations, `RENAME INDEX` among them | refused |
+| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / the index operations, `RENAME INDEX` among them | refused |
+| `RENAME INDEX` or a table `COMMENT` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` reads neither, so each is read by its own words and only on its own. Measured, MySQL takes both beside anything else |
+| `ALTER TABLE t COMMENT = '...'` while the database holds a view or a trigger | refused; the comment is written by an engine `ALTER TABLE`, which is refused then as every other `ALTER TABLE` is |
 | `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` beside any other operation | refused; each is written as a `MODIFY COLUMN` of the column it names, and only a statement made of them alone is |
 | `ALTER COLUMN c DROP DEFAULT` on a column that may hold NULL | refused; measured, MySQL takes it and then prints the column with no `DEFAULT` at all — `` `a` int, `` — where a nullable column with no default of its own prints `DEFAULT NULL` here |
 | `ALTER COLUMN ... SET DEFAULT` or `DROP DEFAULT` on a `DECIMAL` column | refused; the change is a `MODIFY COLUMN`, and a `DECIMAL` column restated by one is read back as a column no `SELECT` takes (see below) |
@@ -195,7 +196,8 @@ boolean literal.
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
 | A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
-| `ROW_FORMAT`, `COMMENT` and every other table option | refused; measured, MySQL prints `ROW_FORMAT` back, and none of the rest has been measured |
+| `ROW_FORMAT` and every other table option but the engine, character set, collation, `AUTO_INCREMENT` and `COMMENT` | refused; measured, MySQL prints `ROW_FORMAT` back, and none of the rest has been measured |
+| A table `COMMENT` longer than 2048 characters, or written in double quotes | refused; MySQL answers 1628 for the first and takes the second |
 | `AUTO_INCREMENT=<n>` naming a start past what the column holds | refused; measured, MySQL creates the table and answers 1467 for the first row, so this refuses the statement instead of storing a mark no row could take |
 | `AUTO_INCREMENT=<n>` naming anything but a plain whole number | refused; measured, `-5` and `'7'` are each 1064 and `1.5` is rounded down, a rule this does not repeat |
 | `ALTER TABLE ... AUTO_INCREMENT=<n>` | refused; measured, MySQL raises the counter to it and ignores one below the mark it already has, which is what the allocator's own advance does — the `ALTER TABLE` path has not been given it |
@@ -231,7 +233,6 @@ boolean literal.
 | A word ending in a bare `e`, or with a tab around it, as the default of an integer column — `INT DEFAULT '1e'`, `INT DEFAULT '\t7'` | refused; measured, MySQL takes both, reading `'1e'` as `1` and skipping a tab where it refuses a newline |
 | A default on a `DOUBLE` or `FLOAT` that MySQL prints as some other number — `DOUBLE DEFAULT 1.50`, `'1.50'`, `' 1'`, `'1e2'` | refused; measured, MySQL prints the number the column holds (`'1.5'`, `'1'`, `'100'`) and the engine keeps what was written. A number or word MySQL prints back unchanged, `0`, `'0'` or `'1.5'`, is taken |
 | Column `COMMENT` on a table with no key of its own, or in any `ALTER TABLE` | refused; the words live in the stored MySQL DDL, which only the keyed `CREATE TABLE` paths render from the statement as written |
-| A table `COMMENT` | refused; the table-level one has not been measured, and this prints one trailer whatever a table holds |
 | Column `CHARACTER SET` other than `utf8mb4`, or `COLLATE` other than `utf8mb4_0900_ai_ci` / `utf8mb4_bin` / `utf8mb4_unicode_ci` | refused; other collations have different comparison rules |
 | `FIELD`, `GREATEST`, `LEAST` or `NULLIF` over a `utf8mb4_unicode_ci` column, or ordering by or comparing a text-answering call over a `utf8mb4_unicode_ci` or `utf8mb4_bin` column — `ORDER BY LOWER(name)` | refused; each compares under `utf8mb4_0900_ai_ci`'s weights and needs the column's collation passed through |
 | An explicit `COLLATE utf8mb4_unicode_ci` inside a query — `ORDER BY name COLLATE utf8mb4_unicode_ci`, `name = 'a' COLLATE utf8mb4_unicode_ci` | refused; the query renderer names only `utf8mb4_0900_ai_ci` and `utf8mb4_bin` |

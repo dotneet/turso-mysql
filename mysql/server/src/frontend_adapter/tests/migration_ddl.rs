@@ -215,7 +215,7 @@ fn rename_table_renames_every_pair_in_order_or_none_of_them() {
     );
     run(
         &mut adapter,
-        "CREATE TABLE notes (id INT NOT NULL PRIMARY KEY, body TEXT)",
+        "CREATE TABLE notes (id INT NOT NULL PRIMARY KEY, body TEXT) COMMENT='notes table'",
     );
     run(&mut adapter, "INSERT INTO notes VALUES (1, 'n')");
 
@@ -236,7 +236,7 @@ fn rename_table_renames_every_pair_in_order_or_none_of_them() {
         "  `id` int NOT NULL,\n",
         "  `body` text,\n",
         "  PRIMARY KEY (`id`)\n",
-        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='notes table'"
     );
     let expected_notes = concat!(
         "CREATE TABLE `notes` (\n",
@@ -418,4 +418,82 @@ fn alter_column_sets_and_drops_a_default() {
 
     let mut adapter = reopened(&directory, adapter);
     assert!(printed_table(&mut adapter, "s1").contains("  `b` int NOT NULL,\n"));
+}
+
+/// Laravel's `comment()` on a table writes `alter table t comment = 'x'` and
+/// Rails writes `ALTER TABLE t COMMENT 'x'`.
+#[test]
+fn a_table_keeps_its_comment() {
+    let (directory, mut adapter) = adapter();
+    run(&mut adapter, "CREATE TABLE c1 (id INT) COMMENT='hello'");
+    run(
+        &mut adapter,
+        "CREATE TABLE c2 (id INT NOT NULL PRIMARY KEY) ENGINE=InnoDB COMMENT 'it''s a \\\\ back' DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE c3 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) COMMENT=''",
+    );
+    run(&mut adapter, "alter table `c3` comment = 'x'");
+    run(&mut adapter, "ALTER TABLE c1 COMMENT 'y'");
+    run(&mut adapter, "ALTER TABLE c1 ADD COLUMN n INT");
+    run(&mut adapter, "CREATE INDEX c1_n ON c1 (n)");
+
+    let expected_c1 = concat!(
+        "CREATE TABLE `c1` (\n",
+        "  `id` int DEFAULT NULL,\n",
+        "  `n` int DEFAULT NULL,\n",
+        "  KEY `c1_n` (`n`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='y'"
+    );
+    let expected_c2 = concat!(
+        "CREATE TABLE `c2` (\n",
+        "  `id` int NOT NULL,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='it''s a \\\\ back'"
+    );
+    let expected_c3 = concat!(
+        "CREATE TABLE `c3` (\n",
+        "  `id` int NOT NULL AUTO_INCREMENT,\n",
+        "  `n` int DEFAULT NULL,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='x'"
+    );
+    for reopen in [false, true] {
+        if reopen {
+            adapter = reopened(&directory, adapter);
+        }
+        let adapter = &mut adapter;
+        assert_eq!(printed_table(adapter, "c1"), expected_c1);
+        assert_eq!(printed_table(adapter, "c2"), expected_c2);
+        assert_eq!(printed_table(adapter, "c3"), expected_c3);
+        assert_eq!(
+            rows(
+                adapter,
+                "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'c%' ORDER BY TABLE_NAME"
+            ),
+            vec![
+                some(&["c1", "y"]),
+                some(&["c2", "it's a \\ back"]),
+                some(&["c3", "x"]),
+            ]
+        );
+        let status = rows(adapter, "SHOW TABLE STATUS LIKE 'c%'");
+        assert_eq!(
+            status
+                .iter()
+                .map(|row| row[17].clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["y", "it's a \\ back", "x"]
+        );
+    }
+
+    run(&mut adapter, "ALTER TABLE c1 COMMENT ''");
+    assert!(printed_table(&mut adapter, "c1").ends_with("COLLATE=utf8mb4_0900_ai_ci"));
+    run(&mut adapter, "INSERT INTO c3 (n) VALUES (1)");
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, n FROM c3"),
+        vec![some(&["1", "1"])]
+    );
 }
