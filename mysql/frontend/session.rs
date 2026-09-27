@@ -32,6 +32,7 @@ use turso_mysql_parser::{
     MySqlCreateTableWithKeys, MySqlDropTableCommand, MySqlSelectSource, MySqlTableName,
     MySqlTransactionCommand, MySqlTruncateTableCommand, ParseError as MySqlParseError,
     SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml,
+    WrittenZero,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -65,6 +66,9 @@ pub struct MySqlConnection {
     /// the write transaction it opened.
     tables_locked: Arc<Mutex<bool>>,
     transaction_isolation: Arc<Mutex<TransactionIsolation>>,
+    /// What a 0 written into a counted column means under the session's
+    /// `sql_mode`.
+    written_zero: Arc<Mutex<WrittenZero>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
 }
@@ -1150,6 +1154,7 @@ impl MySqlConnection {
             read_only_transaction: Arc::new(Mutex::new(false)),
             tables_locked: Arc::new(Mutex::new(false)),
             transaction_isolation: Arc::new(Mutex::new(TransactionIsolation::default())),
+            written_zero: Arc::new(Mutex::new(WrittenZero::AsksForTheNextNumber)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
         })
@@ -1997,7 +2002,7 @@ impl MySqlConnection {
         })?;
         let bound = insert
             .clone()
-            .bind_allocator_table(&table.definition)
+            .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| {
                 MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
                     error.to_string(),
@@ -2438,7 +2443,7 @@ impl MySqlConnection {
         let bound = insert
             .insert
             .clone()
-            .bind_allocator_table(&table.definition)
+            .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         if let Some(result) = self.execute_high_water_mixed_insert(
             &insert.sql,
@@ -5878,7 +5883,7 @@ impl MySqlConnection {
                     self.check_write_deadline(deadline)?;
                     let bound = insert
                         .clone()
-                        .bind_allocator_table(&table.definition)
+                        .bind_allocator_table_with(&table.definition, self.written_zero())
                         .map_err(|error| {
                             MySqlQueryError::Engine(LimboError::ParseError(error.to_string()))
                         })?;
@@ -6360,7 +6365,7 @@ impl MySqlConnection {
     ) -> Result<()> {
         let bound = insert
             .clone()
-            .bind_allocator_table(&table.definition)
+            .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         if self
             .execute_high_water_mixed_insert(
@@ -6390,7 +6395,7 @@ impl MySqlConnection {
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
         let bound = insert
-            .bind_allocator_table(&table.definition)
+            .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let reserved = self.reserve_insert_row_ids(&bound, &table, &[], deadline)?;
         self.check_write_deadline(deadline)
@@ -6448,7 +6453,7 @@ impl MySqlConnection {
     ) -> Result<MySqlWriteResult> {
         self.reject_insert_target_triggers(&table.name)?;
         let bound = insert
-            .bind_allocator_table(&table.definition)
+            .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         if !bound.rowwise_conflicts()
             || bound
@@ -6832,7 +6837,10 @@ impl MySqlConnection {
                 }
                 AutoIncrementRowValue::Parameter(ordinal) => match values.get(*ordinal) {
                     Some(Value::Null) => Ok(InsertAutoIncrementValue::Generated),
-                    Some(value) if value.as_int() == Some(0) => {
+                    Some(value)
+                        if value.as_int() == Some(0)
+                            && self.written_zero() == WrittenZero::AsksForTheNextNumber =>
+                    {
                         Ok(InsertAutoIncrementValue::Generated)
                     }
                     Some(value) if value.as_int().is_some() => Ok(
@@ -6847,11 +6855,13 @@ impl MySqlConnection {
                                 "AUTO_INCREMENT parameter must be an unsigned integer".to_string(),
                             )
                         })?;
-                        Ok(if id == 0 {
-                            InsertAutoIncrementValue::Generated
-                        } else {
-                            InsertAutoIncrementValue::Explicit(id)
-                        })
+                        Ok(
+                            if id == 0 && self.written_zero() == WrittenZero::AsksForTheNextNumber {
+                                InsertAutoIncrementValue::Generated
+                            } else {
+                                InsertAutoIncrementValue::Explicit(id)
+                            },
+                        )
                     }
                     _ => Err(LimboError::InvalidArgument(
                         "AUTO_INCREMENT parameter must be an integer or NULL".to_string(),
@@ -6859,6 +6869,10 @@ impl MySqlConnection {
                 },
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    fn written_zero(&self) -> WrittenZero {
+        *self.written_zero.lock().unwrap()
     }
 
     fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {

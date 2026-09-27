@@ -30580,3 +30580,6 @@ fn a_prepared_select_reads_a_json_column() {
 
 #[cfg(unix)]
 mod transaction_isolation;
+
+#[cfg(unix)]
+mod connection_settings;

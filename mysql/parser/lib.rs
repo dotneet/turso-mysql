@@ -122,8 +122,8 @@ pub use session_queries::{
     MySqlSystemVariableRead, MySqlUserVariableQuery, MySqlUserVariableRead,
 };
 pub use session_settings::{
-    parse_optional_session_setting, parse_optional_user_variable_assignment, MySqlSessionSetting,
-    MySqlUserVariableAssignment, MySqlUserVariableValue,
+    parse_optional_session_settings, parse_optional_user_variable_assignment, MySqlSessionSetting,
+    MySqlUserVariableAssignment, MySqlUserVariableValue, SqlModeValue,
 };
 pub use session_variables::parse_optional_session_sql_notes;
 pub use shift_moment::shifted_moment;
@@ -380,6 +380,17 @@ enum AutoIncrementSourceValue {
     Parameter(usize),
 }
 
+/// What a 0 written into a counted column means.
+///
+/// Measured on MySQL 8.4.11: it asks for the next number, as NULL does, unless
+/// the session's `sql_mode` names `NO_AUTO_VALUE_ON_ZERO`, when it is stored
+/// as 0 — and a second one is a duplicate key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenZero {
+    AsksForTheNextNumber,
+    Stored,
+}
+
 /// What one VALUES row asks the allocator to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoIncrementRowValue {
@@ -419,6 +430,16 @@ impl CheckedAutoIncrementInsert {
     pub fn bind_allocator_table(
         self,
         table: &CheckedAutoIncrementCreateTable,
+    ) -> Result<BoundAutoIncrementInsert, ParseError> {
+        self.bind_allocator_table_with(table, WrittenZero::AsksForTheNextNumber)
+    }
+
+    /// Binds the allocator column, reading a written 0 the way the session's
+    /// `sql_mode` says to.
+    pub fn bind_allocator_table_with(
+        self,
+        table: &CheckedAutoIncrementCreateTable,
+        written_zero: WrittenZero,
     ) -> Result<BoundAutoIncrementInsert, ParseError> {
         if !self
             .table_name
@@ -463,10 +484,13 @@ impl CheckedAutoIncrementInsert {
                 .iter()
                 .map(|row| match row[at] {
                     AutoIncrementSourceValue::Written(
-                        CheckedInsertValue::Default
-                        | CheckedInsertValue::Null
-                        | CheckedInsertValue::SignedInteger(0),
+                        CheckedInsertValue::Default | CheckedInsertValue::Null,
                     ) => Ok(AutoIncrementRowValue::Generated),
+                    AutoIncrementSourceValue::Written(CheckedInsertValue::SignedInteger(0))
+                        if written_zero == WrittenZero::AsksForTheNextNumber =>
+                    {
+                        Ok(AutoIncrementRowValue::Generated)
+                    }
                     AutoIncrementSourceValue::Written(CheckedInsertValue::SignedInteger(id)) => {
                         Ok(AutoIncrementRowValue::Explicit(id as i128))
                     }

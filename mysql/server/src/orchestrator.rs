@@ -349,6 +349,14 @@ where
         Ok(OrchestratorEvent::Closed)
     }
 
+    /// Returns the idle time the authenticated session asked for in place of
+    /// the runtime's own, if it asked for one.
+    pub fn session_wait_timeout(&self) -> Option<std::time::Duration> {
+        self.executor
+            .as_ref()
+            .and_then(crate::CommandExecutor::session_wait_timeout)
+    }
+
     /// Returns the oldest unsent response bytes, if any.
     pub fn front_write(&self) -> Option<&[u8]> {
         self.write_queue.front()

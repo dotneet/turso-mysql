@@ -317,7 +317,8 @@ fn run_inner(
                         }
                         // A complete, flushed command marks the start of a new
                         // idle period. Partial packets never extend this deadline.
-                        read_deadline = Instant::now() + idle_timeout;
+                        read_deadline = Instant::now()
+                            + orchestrator.session_wait_timeout().unwrap_or(idle_timeout);
                     }
                     OrchestratorEvent::AwaitingClientFrame => {}
                     OrchestratorEvent::Closing | OrchestratorEvent::Closed => return Ok(()),

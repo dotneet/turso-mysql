@@ -46,6 +46,16 @@ pub enum MySqlSessionSetting {
     ///
     /// The `GLOBAL` scope is not one of these: it changes what other sessions
     /// get, which is not a thing this server can honestly accept.
+    /// `SET sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')` and the
+    /// other spellings that work the value out from the current one, which
+    /// is how Rails opens every connection.
+    SqlModeExpression(SqlModeValue),
+    /// `SET wait_timeout = <n>`, or `DEFAULT` for the server's own.
+    WaitTimeout(Option<u64>),
+    /// `SET sql_auto_is_null = 0` or `= 1`.
+    SqlAutoIsNull(bool),
+    /// `SET sql_safe_updates = 0` or `= 1`.
+    SqlSafeUpdates(bool),
     TransactionIsolationLevel {
         level: String,
         /// Whether the level holds for the next transaction alone. Measured
@@ -56,15 +66,18 @@ pub enum MySqlSessionSetting {
     },
 }
 
-/// Parses one supported `SET` of a session variable.
+/// Parses one supported `SET` of session variables.
 ///
-/// Returns `None` for anything that is not one of these, so the statement's own
-/// parser keeps it. A versioned comment around the statement, which is how
-/// `mysqldump` writes every one of them, is read the way MySQL reads it.
-pub fn parse_optional_session_setting(
+/// One `SET` may assign several, separated by commas — Rails opens with
+/// `SET NAMES utf8mb4, @@SESSION.sql_mode = ..., @@SESSION.wait_timeout = ...`
+/// — and they come back in the order written. Returns `None` for anything
+/// that is not one of these, so the statement's own parser keeps it. A
+/// versioned comment around the statement, which is how `mysqldump` writes
+/// every one of them, is read the way MySQL reads it.
+pub fn parse_optional_session_settings(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Option<MySqlSessionSetting>, ParseError> {
+) -> Result<Option<Vec<MySqlSessionSetting>>, ParseError> {
     let Some(body) = statement_body(sql) else {
         return Ok(None);
     };
@@ -72,10 +85,11 @@ pub fn parse_optional_session_setting(
     if !scanner.take_keyword("SET") {
         return Ok(None);
     }
-    // `SESSION` and `LOCAL` both name the session, which is also the default.
+    // `SET TRANSACTION ISOLATION LEVEL <level>` is its own statement, with no
+    // other assignment beside it. With no scope word it names the next
+    // transaction rather than the session.
+    let restore = scanner.cursor;
     let scoped = scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL");
-    // `SET TRANSACTION ISOLATION LEVEL <level>` is its own statement too. With
-    // no scope word it names the next transaction rather than the session.
     if scanner.take_keyword("TRANSACTION") {
         if !scanner.take_keyword("ISOLATION") || !scanner.take_keyword("LEVEL") {
             return Ok(None);
@@ -86,11 +100,102 @@ pub fn parse_optional_session_setting(
         if !scanner.at_end() {
             return Err(ParseError::TrailingAdminCommandTokens);
         }
-        return Ok(Some(MySqlSessionSetting::TransactionIsolationLevel {
+        return Ok(Some(vec![MySqlSessionSetting::TransactionIsolationLevel {
             level,
             next_transaction_only: !scoped,
-        }));
+        }]));
     }
+    scanner.cursor = restore;
+    // Measured on MySQL 8.4.11: a scope word holds for the assignments after
+    // it until another one is written — `SET GLOBAL a = 0, b = 0` sets both
+    // globally.
+    let mut scope = AssignmentScope::Default;
+    let mut settings = Vec::new();
+    loop {
+        if scanner.take_keyword("GLOBAL")
+            || scanner.take_keyword("PERSIST")
+            || scanner.take_keyword("PERSIST_ONLY")
+        {
+            scope = AssignmentScope::Global;
+        } else if scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL") {
+            scope = AssignmentScope::Session;
+        }
+        let Some(setting) = take_one_session_setting(&mut scanner, scope, mode)? else {
+            return Ok(None);
+        };
+        settings.push(setting);
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    if !scanner.at_end() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(settings))
+}
+
+/// The scope an assignment names, by a word before it or by `@@scope.`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentScope {
+    Default,
+    Session,
+    Global,
+}
+
+/// A variable name as an assignment wrote it.
+struct WrittenVariable {
+    name: String,
+    scope: AssignmentScope,
+    /// Whether it was written with the two `@@` signs.
+    signed: bool,
+}
+
+/// A `sql_mode` value worked out from the one in force.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqlModeValue {
+    Literal(String),
+    /// `@@sql_mode` or `@@SESSION.sql_mode`: the session's value.
+    Current,
+    /// `DEFAULT` or `@@GLOBAL.sql_mode`: the value a new session starts with.
+    Default,
+    Concat(Vec<SqlModeValue>),
+    Replace(Box<SqlModeValue>, Box<SqlModeValue>, Box<SqlModeValue>),
+}
+
+impl SqlModeValue {
+    /// Works the value out, given the session's value and a new session's.
+    pub fn evaluate(&self, current: &str, default: &str) -> String {
+        match self {
+            Self::Literal(value) => value.clone(),
+            Self::Current => current.to_owned(),
+            Self::Default => default.to_owned(),
+            Self::Concat(parts) => parts
+                .iter()
+                .map(|part| part.evaluate(current, default))
+                .collect(),
+            Self::Replace(text, from, to) => {
+                let from = from.evaluate(current, default);
+                let text = text.evaluate(current, default);
+                if from.is_empty() {
+                    return text;
+                }
+                text.replace(&from, &to.evaluate(current, default))
+            }
+        }
+    }
+
+    /// The modes the value names, in the order written.
+    pub fn named_modes(&self, current: &str, default: &str) -> Vec<String> {
+        named_sql_modes(&self.evaluate(current, default))
+    }
+}
+
+/// Reads one assignment of a `SET`, or `NAMES`.
+fn take_one_session_setting(
+    scanner: &mut Scanner<'_>,
+    scope: AssignmentScope,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlSessionSetting>, ParseError> {
     // `SET NAMES` is its own statement, not an assignment.
     if scanner.take_keyword("NAMES") {
         let Some(character_set) = scanner.take_charset_name(mode) else {
@@ -104,18 +209,34 @@ pub fn parse_optional_session_setting(
         } else {
             None
         };
-        if !scanner.at_end() {
-            return Err(ParseError::TrailingAdminCommandTokens);
-        }
         return Ok(Some(MySqlSessionSetting::Names {
             character_set,
             collation,
         }));
     }
-    let unscoped_system_variable = !scoped && scanner.at_unscoped_system_variable();
-    let Some(name) = scanner.take_variable_name() else {
+    let Some(WrittenVariable {
+        name,
+        scope: written_scope,
+        signed,
+    }) = scanner.take_written_variable()
+    else {
         return Ok(None);
     };
+    let scope = match written_scope {
+        AssignmentScope::Default => scope,
+        written => written,
+    };
+    // Nothing a client does here can change another session, so a global
+    // assignment is refused rather than taken as the session's.
+    if scope == AssignmentScope::Global {
+        return Err(ParseError::Unsupported {
+            feature: "SET of a GLOBAL variable",
+        });
+    }
+    // `SET @@transaction_isolation`, with the signs and no scope, names the
+    // next transaction alone; every other spelling names the session.
+    let unscoped_system_variable = scope == AssignmentScope::Default && signed;
+    let _ = scanner.take_byte(b':');
     if !scanner.take_byte(b'=') {
         return Ok(None);
     }
@@ -128,13 +249,36 @@ pub fn parse_optional_session_setting(
             next_transaction_only: unscoped_system_variable,
         }
     } else if name.eq_ignore_ascii_case("sql_mode") {
-        if let Some(value) = scanner.take_string(mode) {
-            MySqlSessionSetting::SqlMode(named_sql_modes(&value))
-        } else if let Some(name) = scanner.take_user_variable_reference() {
+        if let Some(name) = scanner.take_user_variable_reference() {
             MySqlSessionSetting::SqlModeFromUserVariable(name)
+        } else if let Some(value) = scanner.take_sql_mode_value(mode) {
+            match value {
+                SqlModeValue::Literal(value) => {
+                    MySqlSessionSetting::SqlMode(named_sql_modes(&value))
+                }
+                expression => MySqlSessionSetting::SqlModeExpression(expression),
+            }
         } else {
             return Ok(None);
         }
+    } else if name.eq_ignore_ascii_case("wait_timeout") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::WaitTimeout(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::WaitTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("sql_auto_is_null") {
+        let Some(value) = scanner.take_switch() else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::SqlAutoIsNull(value)
+    } else if name.eq_ignore_ascii_case("sql_safe_updates") {
+        let Some(value) = scanner.take_switch() else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::SqlSafeUpdates(value)
     } else if name.eq_ignore_ascii_case("time_zone") {
         let Some(value) = scanner.take_string(mode) else {
             return Ok(None);
@@ -193,9 +337,6 @@ pub fn parse_optional_session_setting(
     } else {
         return Ok(None);
     };
-    if !scanner.at_end() {
-        return Err(ParseError::TrailingAdminCommandTokens);
-    }
     Ok(Some(setting))
 }
 
@@ -399,29 +540,25 @@ impl<'a> Scanner<'a> {
     }
 
     /// Reads a variable name, with or without the `@@` and a scope prefix.
-    /// Reports whether the next word is `@@name` with no scope after the two
-    /// signs, which for `transaction_isolation` names the next transaction.
-    fn at_unscoped_system_variable(&mut self) -> bool {
-        self.skip_spaces();
-        let rest = &self.sql[self.cursor..];
-        let Some(name) = rest.strip_prefix("@@") else {
-            return false;
-        };
-        !["SESSION.", "LOCAL.", "GLOBAL."].iter().any(|scope| {
-            name.len() >= scope.len() && name[..scope.len()].eq_ignore_ascii_case(scope)
-        })
-    }
-
-    fn take_variable_name(&mut self) -> Option<String> {
+    fn take_written_variable(&mut self) -> Option<WrittenVariable> {
         self.skip_spaces();
         let mut cursor = self.cursor;
-        if self.sql[cursor..].starts_with("@@") {
+        let mut scope = AssignmentScope::Default;
+        let signed = self.sql[cursor..].starts_with("@@");
+        if signed {
             cursor += 2;
-            for scope in ["SESSION.", "LOCAL.", "GLOBAL."] {
-                if self.sql[cursor..].len() >= scope.len()
-                    && self.sql[cursor..cursor + scope.len()].eq_ignore_ascii_case(scope)
+            for (written, named) in [
+                ("SESSION.", AssignmentScope::Session),
+                ("LOCAL.", AssignmentScope::Session),
+                ("GLOBAL.", AssignmentScope::Global),
+                ("PERSIST.", AssignmentScope::Global),
+                ("PERSIST_ONLY.", AssignmentScope::Global),
+            ] {
+                if self.sql[cursor..].len() >= written.len()
+                    && self.sql[cursor..cursor + written.len()].eq_ignore_ascii_case(written)
                 {
-                    cursor += scope.len();
+                    cursor += written.len();
+                    scope = named;
                     break;
                 }
             }
@@ -432,7 +569,71 @@ impl<'a> Scanner<'a> {
         }
         let name = self.sql[cursor..end].to_owned();
         self.cursor = end;
-        Some(name)
+        Some(WrittenVariable {
+            name,
+            scope,
+            signed,
+        })
+    }
+
+    /// Reads a switch written `0`, `1`, `OFF` or `ON`.
+    fn take_switch(&mut self) -> Option<bool> {
+        match self.take_unsigned() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            Some(_) => None,
+            None if self.take_keyword("ON") => Some(true),
+            None if self.take_keyword("OFF") => Some(false),
+            None => None,
+        }
+    }
+
+    /// Reads a `sql_mode` value: a string, `DEFAULT`, the current value read
+    /// through `@@sql_mode`, or `CONCAT` and `REPLACE` over those.
+    fn take_sql_mode_value(&mut self, mode: SessionSqlMode) -> Option<SqlModeValue> {
+        self.skip_spaces();
+        if let Some(value) = self.take_string(mode) {
+            return Some(SqlModeValue::Literal(value));
+        }
+        if self.sql[self.cursor..].starts_with("@@") {
+            let WrittenVariable { name, scope, .. } = self.take_written_variable()?;
+            if !name.eq_ignore_ascii_case("sql_mode") {
+                return None;
+            }
+            return Some(if scope == AssignmentScope::Global {
+                SqlModeValue::Default
+            } else {
+                SqlModeValue::Current
+            });
+        }
+        if self.take_keyword("DEFAULT") {
+            return Some(SqlModeValue::Default);
+        }
+        let restore = self.cursor;
+        let concat = self.take_keyword("CONCAT");
+        if !concat && !self.take_keyword("REPLACE") {
+            return None;
+        }
+        if !self.take_byte(b'(') {
+            self.cursor = restore;
+            return None;
+        }
+        let mut arguments = vec![self.take_sql_mode_value(mode)?];
+        while self.take_byte(b',') {
+            arguments.push(self.take_sql_mode_value(mode)?);
+        }
+        if !self.take_byte(b')') {
+            return None;
+        }
+        if concat {
+            return Some(SqlModeValue::Concat(arguments));
+        }
+        let [text, from, to] = <[SqlModeValue; 3]>::try_from(arguments).ok()?;
+        Some(SqlModeValue::Replace(
+            Box::new(text),
+            Box::new(from),
+            Box::new(to),
+        ))
     }
 
     fn word_end(&self, from: usize) -> usize {
@@ -641,7 +842,14 @@ mod tests {
     use super::*;
 
     fn parse(sql: &str) -> Option<MySqlSessionSetting> {
-        parse_optional_session_setting(sql, SessionSqlMode::default()).unwrap()
+        parse_all(sql).map(|mut settings| {
+            assert_eq!(settings.len(), 1, "{sql}");
+            settings.remove(0)
+        })
+    }
+
+    fn parse_all(sql: &str) -> Option<Vec<MySqlSessionSetting>> {
+        parse_optional_session_settings(sql, SessionSqlMode::default()).unwrap()
     }
 
     #[test]
@@ -849,9 +1057,15 @@ mod tests {
             );
         }
 
+        // GLOBAL changes what other sessions get, which is refused.
+        assert!(matches!(
+            parse_optional_session_settings(
+                "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                SessionSqlMode::default()
+            ),
+            Err(ParseError::Unsupported { .. })
+        ));
         for sql in [
-            // GLOBAL changes what other sessions get, which is not one of these.
-            "SET GLOBAL TRANSACTION ISOLATION LEVEL REPEATABLE READ",
             // Not a level MySQL has.
             "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE",
@@ -971,12 +1185,133 @@ mod tests {
 
     #[test]
     fn refuses_a_setting_with_more_after_it() {
-        for sql in [
+        assert!(parse_optional_session_settings(
             "SET sql_mode = '' extra",
-            "SET time_zone = '+00:00' , x = 1",
+            SessionSqlMode::default()
+        )
+        .is_err());
+        // A variable this reader does not know leaves the whole statement to
+        // the other readers, which refuse it.
+        assert_eq!(parse_all("SET time_zone = '+00:00' , x = 1"), None);
+    }
+
+    /// Rails opens every connection with one `SET` of three assignments, and
+    /// Laravel with two; each comes back in the order written.
+    #[test]
+    fn reads_several_assignments_in_one_set() {
+        let rails = "SET NAMES utf8mb4,  @@SESSION.sql_mode = CONCAT(CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), ',NO_AUTO_VALUE_ON_ZERO'),  @@SESSION.wait_timeout = 2147483";
+        let settings = parse_all(rails).unwrap();
+        assert_eq!(settings.len(), 3);
+        assert_eq!(
+            settings[0],
+            MySqlSessionSetting::Names {
+                character_set: "utf8mb4".to_owned(),
+                collation: None,
+            }
+        );
+        let MySqlSessionSetting::SqlModeExpression(sql_mode) = &settings[1] else {
+            panic!("{:?}", settings[1]);
+        };
+        assert_eq!(
+            sql_mode.named_modes("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES", ""),
+            [
+                "ONLY_FULL_GROUP_BY",
+                "STRICT_TRANS_TABLES",
+                "STRICT_ALL_TABLES",
+                "NO_AUTO_VALUE_ON_ZERO"
+            ]
+        );
+        assert_eq!(
+            settings[2],
+            MySqlSessionSetting::WaitTimeout(Some(2_147_483))
+        );
+
+        let laravel = "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', SESSION sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES';";
+        assert_eq!(
+            parse_all(laravel),
+            Some(vec![
+                MySqlSessionSetting::Names {
+                    character_set: "utf8mb4".to_owned(),
+                    collation: Some("utf8mb4_unicode_ci".to_owned()),
+                },
+                MySqlSessionSetting::SqlMode(vec![
+                    "ONLY_FULL_GROUP_BY".to_owned(),
+                    "STRICT_TRANS_TABLES".to_owned()
+                ]),
+            ])
+        );
+
+        assert_eq!(
+            parse_all("SET foreign_key_checks=1, sql_safe_updates=0"),
+            Some(vec![
+                MySqlSessionSetting::ForeignKeyChecks(true),
+                MySqlSessionSetting::SqlSafeUpdates(false),
+            ])
+        );
+        assert_eq!(
+            parse("SET SQL_AUTO_IS_NULL = 0"),
+            Some(MySqlSessionSetting::SqlAutoIsNull(false))
+        );
+        assert_eq!(
+            parse("SET @@SESSION.wait_timeout = DEFAULT"),
+            Some(MySqlSessionSetting::WaitTimeout(None))
+        );
+    }
+
+    /// Rails without strict mode takes the strict modes out with `REPLACE`.
+    /// Measured on MySQL 8.4.11: a `REPLACE` of text that is not there leaves
+    /// the value alone, and the empty entries it leaves are dropped.
+    #[test]
+    fn works_out_a_sql_mode_from_the_one_in_force() {
+        let Some(MySqlSessionSetting::SqlModeExpression(value)) = parse(
+            "SET @@SESSION.sql_mode = CONCAT(REPLACE(REPLACE(REPLACE(@@sql_mode, 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), 'TRADITIONAL', ''), ',NO_AUTO_VALUE_ON_ZERO')",
+        ) else {
+            panic!("the expression must be read");
+        };
+        assert_eq!(
+            value.named_modes("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_DATE", ""),
+            [
+                "ONLY_FULL_GROUP_BY",
+                "NO_ZERO_DATE",
+                "NO_AUTO_VALUE_ON_ZERO"
+            ]
+        );
+        let Some(MySqlSessionSetting::SqlModeExpression(value)) = parse("SET sql_mode = DEFAULT")
+        else {
+            panic!("DEFAULT must be read");
+        };
+        assert_eq!(
+            value.named_modes("ANSI_QUOTES", "STRICT_TRANS_TABLES"),
+            ["STRICT_TRANS_TABLES"]
+        );
+        let Some(MySqlSessionSetting::SqlModeExpression(value)) =
+            parse("SET sql_mode = CONCAT(@@GLOBAL.sql_mode, ',ANSI_QUOTES')")
+        else {
+            panic!("the global value must be read");
+        };
+        assert_eq!(
+            value.named_modes("NO_ZERO_DATE", "STRICT_TRANS_TABLES"),
+            ["STRICT_TRANS_TABLES", "ANSI_QUOTES"]
+        );
+    }
+
+    /// Measured on MySQL 8.4.11: a scope word holds for the assignments after
+    /// it, so `SET GLOBAL a = 0, b = 0` sets both globally. Nothing here can
+    /// change another session, so every global assignment is refused.
+    #[test]
+    fn refuses_a_global_assignment_wherever_it_is_written() {
+        for sql in [
+            "SET GLOBAL sql_notes = 0",
+            "SET @@GLOBAL.sql_mode = ''",
+            "SET SESSION foreign_key_checks = 0, GLOBAL wait_timeout = 10",
+            "SET GLOBAL wait_timeout = 10, foreign_key_checks = 0",
+            "SET PERSIST wait_timeout = 10",
         ] {
             assert!(
-                parse_optional_session_setting(sql, SessionSqlMode::default()).is_err(),
+                matches!(
+                    parse_optional_session_settings(sql, SessionSqlMode::default()),
+                    Err(ParseError::Unsupported { .. })
+                ),
                 "{sql}"
             );
         }

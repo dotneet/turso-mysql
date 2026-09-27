@@ -258,6 +258,10 @@ impl CommandExecutor for MySqlCommandAdapter {
         connection_status_flags(&self.connection)
     }
 
+    fn session_wait_timeout(&self) -> Option<Duration> {
+        self.session_variables.wait_timeout()
+    }
+
     fn no_backslash_escapes(&self) -> bool {
         self.connection.parser_mode().no_backslash_escapes
     }
@@ -1665,6 +1669,10 @@ where
 
     fn binary_result_charset(&self) -> bool {
         self.session_variables.binary_character_set_results()
+    }
+
+    fn session_wait_timeout(&self) -> Option<Duration> {
+        self.session_variables.wait_timeout()
     }
 
     fn execute_init_db(
@@ -3738,14 +3746,24 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
 /// Readies a connection for one statement from the client.
 ///
 /// A `READ COMMITTED` transaction reads what is committed as each statement
-/// starts, and a transaction the statement begins takes the level the session
-/// asked for, so both are settled here rather than by each statement.
+/// starts, a transaction the statement begins takes the level the session
+/// asked for, and a 0 written into a counted column means what the session's
+/// `sql_mode` says, so all three are settled here rather than by each
+/// statement.
 fn prepare_for_client_statement(
     connection: &MySqlConnection,
     session_variables: &crate::session_variables::MySqlSessionVariables,
 ) -> Result<(), FrontendErrorKind> {
+    let written_zero = if session_variables.no_auto_value_on_zero() {
+        turso_mysql_parser::WrittenZero::Stored
+    } else {
+        turso_mysql_parser::WrittenZero::AsksForTheNextNumber
+    };
     connection
-        .prepare_for_client_statement(session_variables.isolation_for_next_transaction())
+        .prepare_for_client_statement(
+            session_variables.isolation_for_next_transaction(),
+            written_zero,
+        )
         .map_err(frontend_query_error)
 }
 

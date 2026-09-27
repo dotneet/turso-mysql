@@ -1972,7 +1972,32 @@ reads the variable and writes it back is taken: `STRICT_TRANS_TABLES` and
 `NO_ENGINE_SUBSTITUTION` because `InnoDB` is the only engine and is what
 `SHOW CREATE TABLE` reports, `ONLY_FULL_GROUP_BY` because `GROUP BY` enforces
 it, and `ERROR_FOR_DIVISION_BY_ZERO` because division never reaches a write.
-Every other mode is refused rather than quietly ignored.
+`NO_AUTO_VALUE_ON_ZERO` changes what this server does, and is kept: measured
+on 8.4.11, a 0 written into a counted column is stored as 0 under it — a second
+one is a duplicate key — while NULL still takes the next number; without it, a
+0 takes the next number as NULL does. Every other mode is refused rather than
+quietly ignored.
+
+The value may be worked out from the one in force, which is how Rails opens
+every connection: `CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')`, `REPLACE` over
+it, `@@GLOBAL.sql_mode` or `DEFAULT` for what a new session starts with, and
+any nesting of those. Measured on 8.4.11, a `REPLACE` of text that is not
+there leaves the value alone and the empty entries it leaves are dropped.
+
+One `SET` may make several assignments separated by commas — Rails sends
+`SET NAMES utf8mb4, @@SESSION.sql_mode = ..., @@SESSION.wait_timeout = ...` —
+and, measured on 8.4.11, when one of them fails none takes effect, which is
+what happens here. A scope word holds for the assignments after it until
+another is written, so `SET GLOBAL a = 0, b = 0` sets both globally there;
+nothing here can change another session, so a global assignment, written as a
+word or as `@@GLOBAL.`, is refused.
+
+`SET wait_timeout` takes one second through a year, the range measured on
+8.4.11, and the connection keeps that idle time in place of the server's own
+until the session sets `DEFAULT` or resets. MySQL clamps a value past either
+end with a warning where this refuses it. `SET sql_auto_is_null = 0` and `SET
+sql_safe_updates = 0` are taken, being what this server does; 1 asks for a
+rule it does not have and is refused.
 
 `SET time_zone` takes `UTC`, `SYSTEM` and fixed offsets from `-13:59` through
 `+14:00`, the limits measured on MySQL 8.4.11. A `TIMESTAMP` value written by
@@ -3117,15 +3142,17 @@ which value answers: `@@name`, `@@session.name` and `@@local.name` read what thi
 using, and `@@global.name` reads what a new session would start from, since nothing here can
 change a global value. Measured on 8.4.11: a session that turns `autocommit` and
 `foreign_key_checks` off and adds `ANSI_QUOTES` to its `sql_mode` reads all three back unchanged
-under `@@global.`. `@@sql_mode` is not a setting here — the
-modes MySQL's own default names are the ones this enforces, and a client asking for another is
-refused rather than told it took effect — so the answer is that list, with `ANSI_QUOTES` and
-`NO_BACKSLASH_ESCAPES` added when the session was opened with them. MySQL writes the modes in
-an order of its own rather than the order they were set in, measured, and so does this.
+under `@@global.`. `@@sql_mode` answers the modes MySQL's own default names, which are the ones
+this enforces, with `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` added when the session was opened
+with them, and `STRICT_ALL_TABLES` and `NO_AUTO_VALUE_ON_ZERO` when the session named them.
+MySQL writes the modes in an order of its own rather than the order they were set in, measured,
+and so does this. `@@wait_timeout` reads the idle time the session asked for, and
+`@@global.wait_timeout` the server's own. `@@sql_auto_is_null` and `@@sql_safe_updates` read 0,
+and `@@default_storage_engine` reads `InnoDB`.
 
 Their shapes are measured on 8.4.11: a word answers the same `VAR_STRING` of length 87380 with
 31 decimals and no flags that `@@version` does; `@@autocommit`, `@@sql_notes` and
-`@@foreign_key_checks` answer a `LONGLONG` of length 1 carrying the binary and numeric flags; and `@@max_allowed_packet` and
+`@@foreign_key_checks`, `@@sql_auto_is_null` and `@@sql_safe_updates` answer a `LONGLONG` of length 1 carrying the binary and numeric flags; and `@@max_allowed_packet` and
 `@@wait_timeout` answer a `LONGLONG` of length 21 carrying those and the unsigned flag. The
 two counters answer this server's own values rather than MySQL's defaults, which is what makes
 them honest.

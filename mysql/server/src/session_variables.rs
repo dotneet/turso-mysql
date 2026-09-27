@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use turso_mysql_parser::{
-    parse_optional_select_database, parse_optional_session_setting,
+    parse_optional_select_database, parse_optional_session_settings,
     parse_optional_session_sql_notes, parse_optional_show_variables,
     parse_optional_system_variable_query, parse_optional_user_variable_assignment,
     parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
@@ -73,6 +73,34 @@ pub(crate) struct MySqlSessionVariables {
     transaction_isolation: MySqlIsolationLevel,
     /// A level the client set for the next transaction alone.
     next_transaction_isolation: Option<MySqlIsolationLevel>,
+    /// The modes this session named beyond the ones the server always runs.
+    sql_mode_choices: SqlModeChoices,
+    /// The idle time the session asked for in place of the server's own.
+    wait_timeout: Option<Duration>,
+}
+
+/// The `sql_mode` flags a session may turn on or off.
+///
+/// The rest of the modes a session names describe what this server does
+/// anyway, and are checked against that rather than kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SqlModeChoices {
+    /// Also refuse bad values on a table without transactions, which every
+    /// table here already has, so it changes nothing but what is read back.
+    strict_all_tables: bool,
+    /// Store a written 0 in a counted column rather than taking the next
+    /// number.
+    no_auto_value_on_zero: bool,
+}
+
+impl SqlModeChoices {
+    fn named_in(modes: &[String]) -> Self {
+        let named = |wanted: &str| modes.iter().any(|mode| mode.eq_ignore_ascii_case(wanted));
+        Self {
+            strict_all_tables: named("STRICT_ALL_TABLES"),
+            no_auto_value_on_zero: named("NO_AUTO_VALUE_ON_ZERO"),
+        }
+    }
 }
 
 impl Default for MySqlSessionVariables {
@@ -88,6 +116,8 @@ impl Default for MySqlSessionVariables {
             time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
             transaction_isolation: MySqlIsolationLevel::default(),
             next_transaction_isolation: None,
+            sql_mode_choices: SqlModeChoices::default(),
+            wait_timeout: None,
         }
     }
 }
@@ -146,52 +176,28 @@ impl MySqlSessionVariables {
         session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
-        if let Some(setting) = parse_optional_session_setting(sql, session_sql_mode)
-            .map_err(|_| FrontendErrorKind::Syntax)?
-        {
-            let setting = self.resolve_dump_session_setting(setting)?;
-            accept_session_setting(&setting, session_sql_mode)?;
-            match setting {
-                MySqlSessionSetting::LockWaitTimeout(seconds) => {
-                    self.lock_wait_timeout = Some(Duration::from_secs(seconds));
-                }
-                MySqlSessionSetting::ForeignKeyChecks(enabled) => {
-                    self.foreign_key_checks = enabled;
-                    self.pending_foreign_key_checks = Some(enabled);
-                }
-                MySqlSessionSetting::CharacterSetResultsNull => {
-                    self.raw_character_set_results = true;
-                    self.binary_character_set_results = false;
-                }
-                MySqlSessionSetting::CharacterSetResults(value) => {
-                    self.raw_character_set_results = false;
-                    self.binary_character_set_results = value.eq_ignore_ascii_case("binary");
-                }
-                MySqlSessionSetting::Names { .. } => {
-                    self.raw_character_set_results = false;
-                    self.binary_character_set_results = false;
-                }
-                MySqlSessionSetting::TimeZone(zone) => {
-                    self.time_zone = the_zone_read_back(&zone);
-                }
-                MySqlSessionSetting::TransactionIsolationLevel {
-                    level,
-                    next_transaction_only,
-                } => {
-                    let level = MySqlIsolationLevel::from_name(&level)
-                        .expect("an accepted isolation level has a name this server keeps");
-                    if !next_transaction_only {
-                        self.transaction_isolation = level;
-                    } else if status_flags & SERVER_STATUS_IN_TRANS != 0 {
-                        // Measured on MySQL 8.4.11: 1568 for the next-transaction
-                        // form inside a transaction, while the SESSION form is
-                        // taken there and holds from the next transaction on.
-                        return Err(FrontendErrorKind::TransactionCharacteristicsInProgress);
-                    } else {
-                        self.next_transaction_isolation = Some(level);
-                    }
-                }
-                _ => {}
+        let parsed = match parse_optional_session_settings(sql, session_sql_mode) {
+            Ok(parsed) => parsed,
+            Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            Err(_) => return Err(FrontendErrorKind::Syntax),
+        };
+        if let Some(assignments) = parsed {
+            // Measured on MySQL 8.4.11: when one assignment of a `SET` fails,
+            // none of them takes effect, so every one is checked before any is
+            // applied.
+            let assignments = assignments
+                .into_iter()
+                .map(|setting| {
+                    let setting = self.resolve_dump_session_setting(setting)?;
+                    let setting = self.resolve_sql_mode_expression(setting, session_sql_mode);
+                    accept_session_setting(&setting, session_sql_mode, status_flags)?;
+                    Ok(setting)
+                })
+                .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
+            for setting in assignments {
+                self.apply_session_setting(setting);
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags,
@@ -289,6 +295,92 @@ impl MySqlSessionVariables {
             status_flags,
             ..CommandOkResult::default()
         })))
+    }
+
+    /// Applies one assignment that [`accept_session_setting`] has taken.
+    fn apply_session_setting(&mut self, setting: MySqlSessionSetting) {
+        match setting {
+            MySqlSessionSetting::SqlMode(named) => {
+                self.sql_mode_choices = SqlModeChoices::named_in(&named);
+            }
+            MySqlSessionSetting::LockWaitTimeout(seconds) => {
+                self.lock_wait_timeout = Some(Duration::from_secs(seconds));
+            }
+            MySqlSessionSetting::WaitTimeout(seconds) => {
+                self.wait_timeout = seconds.map(Duration::from_secs);
+            }
+            MySqlSessionSetting::ForeignKeyChecks(enabled) => {
+                self.foreign_key_checks = enabled;
+                self.pending_foreign_key_checks = Some(enabled);
+            }
+            MySqlSessionSetting::CharacterSetResultsNull => {
+                self.raw_character_set_results = true;
+                self.binary_character_set_results = false;
+            }
+            MySqlSessionSetting::CharacterSetResults(value) => {
+                self.raw_character_set_results = false;
+                self.binary_character_set_results = value.eq_ignore_ascii_case("binary");
+            }
+            MySqlSessionSetting::Names { .. } => {
+                self.raw_character_set_results = false;
+                self.binary_character_set_results = false;
+            }
+            MySqlSessionSetting::TimeZone(zone) => {
+                self.time_zone = the_zone_read_back(&zone);
+            }
+            MySqlSessionSetting::TransactionIsolationLevel {
+                level,
+                next_transaction_only,
+            } => {
+                let level = MySqlIsolationLevel::from_name(&level)
+                    .expect("an accepted isolation level has a name this server keeps");
+                if next_transaction_only {
+                    self.next_transaction_isolation = Some(level);
+                } else {
+                    self.transaction_isolation = level;
+                }
+            }
+            MySqlSessionSetting::SqlModeFromUserVariable(_)
+            | MySqlSessionSetting::SqlModeExpression(_) => {
+                unreachable!("a sql_mode is worked out before it is applied")
+            }
+            MySqlSessionSetting::InformationSchemaStatsExpiry(_)
+            | MySqlSessionSetting::SqlAutoIsNull(_)
+            | MySqlSessionSetting::SqlSafeUpdates(_)
+            | MySqlSessionSetting::CharacterSetClient(_)
+            | MySqlSessionSetting::CollationConnection(_)
+            | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
+        }
+    }
+
+    /// Works out a `sql_mode` written as an expression over the one in force.
+    fn resolve_sql_mode_expression(
+        &self,
+        setting: MySqlSessionSetting,
+        session_sql_mode: SessionSqlMode,
+    ) -> MySqlSessionSetting {
+        let MySqlSessionSetting::SqlModeExpression(value) = setting else {
+            return setting;
+        };
+        MySqlSessionSetting::SqlMode(value.named_modes(
+            &self.reported_sql_mode(session_sql_mode),
+            &reported_sql_mode(SessionSqlMode::default()),
+        ))
+    }
+
+    /// The `sql_mode` this session reads back.
+    pub(crate) fn reported_sql_mode(&self, session_sql_mode: SessionSqlMode) -> String {
+        reported_sql_mode_with(session_sql_mode, self.sql_mode_choices)
+    }
+
+    /// Whether a written 0 is stored as 0 rather than asking the counter.
+    pub(crate) const fn no_auto_value_on_zero(&self) -> bool {
+        self.sql_mode_choices.no_auto_value_on_zero
+    }
+
+    /// The idle time this session asked for, if it asked for one.
+    pub(crate) const fn wait_timeout(&self) -> Option<Duration> {
+        self.wait_timeout
     }
 
     fn resolve_dump_session_setting(
@@ -484,7 +576,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 28] = [
+const SHOWN_VARIABLES: [&str; 31] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -496,6 +588,7 @@ const SHOWN_VARIABLES: [&str; 28] = [
     "collation_connection",
     "collation_database",
     "collation_server",
+    "default_storage_engine",
     "foreign_key_checks",
     "init_connect",
     "interactive_timeout",
@@ -504,8 +597,10 @@ const SHOWN_VARIABLES: [&str; 28] = [
     "max_allowed_packet",
     "net_write_timeout",
     "performance_schema",
+    "sql_auto_is_null",
     "sql_mode",
     "sql_notes",
+    "sql_safe_updates",
     "system_time_zone",
     "time_zone",
     "transaction_isolation",
@@ -547,6 +642,7 @@ fn shown_variable_value(
 fn accept_session_setting(
     setting: &MySqlSessionSetting,
     session_sql_mode: SessionSqlMode,
+    status_flags: u16,
 ) -> Result<(), FrontendErrorKind> {
     match setting {
         MySqlSessionSetting::SqlMode(named) => {
@@ -557,7 +653,37 @@ fn accept_session_setting(
             }
             Ok(())
         }
-        MySqlSessionSetting::SqlModeFromUserVariable(_) => Err(FrontendErrorKind::Unsupported),
+        MySqlSessionSetting::SqlModeFromUserVariable(_)
+        | MySqlSessionSetting::SqlModeExpression(_) => Err(FrontendErrorKind::Unsupported),
+        // Measured on MySQL 8.4.11: from one second to a year. The idle time
+        // is the caller's to keep, and a value past either end is refused
+        // rather than clamped with MySQL's warning.
+        MySqlSessionSetting::WaitTimeout(None) => Ok(()),
+        MySqlSessionSetting::WaitTimeout(Some(seconds)) => {
+            if (1..=31_536_000).contains(seconds) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        // A comparison with NULL never finds the row just inserted here, which
+        // is what 0 says; 1 asks for a rule this server does not have.
+        MySqlSessionSetting::SqlAutoIsNull(enabled) => {
+            if *enabled {
+                Err(FrontendErrorKind::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
+        // An UPDATE or DELETE with no key in its WHERE runs here, which is what
+        // 0 says; 1 asks for a refusal this server does not make.
+        MySqlSessionSetting::SqlSafeUpdates(enabled) => {
+            if *enabled {
+                Err(FrontendErrorKind::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
         MySqlSessionSetting::TimeZone(zone) => {
             if parse_time_zone_offset(zone).is_some() {
                 Ok(())
@@ -625,12 +751,20 @@ fn accept_session_setting(
         // server keeps. The other two are refused rather than accepted and
         // ignored, because a client that asked for `SERIALIZABLE` and was told
         // yes would be reasoning about a guarantee it does not have.
-        MySqlSessionSetting::TransactionIsolationLevel { level, .. } => {
-            if MySqlIsolationLevel::from_name(level).is_some() {
-                Ok(())
-            } else {
-                Err(FrontendErrorKind::Unsupported)
+        MySqlSessionSetting::TransactionIsolationLevel {
+            level,
+            next_transaction_only,
+        } => {
+            if MySqlIsolationLevel::from_name(level).is_none() {
+                return Err(FrontendErrorKind::Unsupported);
             }
+            // Measured on MySQL 8.4.11: 1568 for the next-transaction form
+            // inside a transaction, while the SESSION form is taken there and
+            // holds from the next transaction on.
+            if *next_transaction_only && status_flags & SERVER_STATUS_IN_TRANS != 0 {
+                return Err(FrontendErrorKind::TransactionCharacteristicsInProgress);
+            }
+            Ok(())
         }
     }
 }
@@ -662,6 +796,7 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
     ]
     .iter()
     .any(|known| mode.eq_ignore_ascii_case(known))
+        || mode.eq_ignore_ascii_case("NO_AUTO_VALUE_ON_ZERO")
 }
 
 /// Answers `SELECT @@name` and `SELECT VERSION()` from what this server is.
@@ -813,7 +948,16 @@ fn counted_system_variable(
         return Some((settings.net_write_timeout_seconds().to_string(), 21, true));
     }
     if name.eq_ignore_ascii_case("wait_timeout") {
-        return Some((settings.wait_timeout_seconds().to_string(), 21, true));
+        let seconds = session_variables
+            .wait_timeout
+            .map_or(settings.wait_timeout_seconds(), |wait| wait.as_secs());
+        return Some((seconds.to_string(), 21, true));
+    }
+    // Neither rule is one this server has, and a session is refused both.
+    if name.eq_ignore_ascii_case("sql_auto_is_null")
+        || name.eq_ignore_ascii_case("sql_safe_updates")
+    {
+        return Some(("0".to_owned(), 1, false));
     }
     // MySQL keeps an idle connection a client called interactive for
     // `interactive_timeout` instead. This server keeps every connection for the
@@ -858,7 +1002,11 @@ fn worded_system_variable(
         return Some(SERVER_VERSION_COMMENT.to_owned());
     }
     if name.eq_ignore_ascii_case("sql_mode") {
-        return Some(reported_sql_mode(session_sql_mode));
+        return Some(session_variables.reported_sql_mode(session_sql_mode));
+    }
+    // InnoDB is the engine `SHOW CREATE TABLE` and `SHOW ENGINES` name.
+    if name.eq_ignore_ascii_case("default_storage_engine") {
+        return Some("InnoDB".to_owned());
     }
     // A client that asks for any other character set is refused, so every one
     // of these is utf8mb4 and stays that way.
@@ -984,16 +1132,30 @@ fn parse_time_zone_offset(zone: &str) -> Option<i32> {
 /// `ANSI_QUOTES,ONLY_FULL_GROUP_BY,NO_BACKSLASH_ESCAPES,STRICT_TRANS_TABLES,...`
 /// — so they are written in that order here.
 pub(crate) fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
-    let mut modes = Vec::with_capacity(8);
+    reported_sql_mode_with(session_sql_mode, SqlModeChoices::default())
+}
+
+/// The `sql_mode` a session reads back, with the flags it turned on.
+///
+/// Measured on MySQL 8.4.11: `NO_AUTO_VALUE_ON_ZERO` reads back after
+/// `ONLY_FULL_GROUP_BY` and `STRICT_ALL_TABLES` after `STRICT_TRANS_TABLES`.
+fn reported_sql_mode_with(session_sql_mode: SessionSqlMode, choices: SqlModeChoices) -> String {
+    let mut modes = Vec::with_capacity(10);
     if session_sql_mode.ansi_quotes {
         modes.push("ANSI_QUOTES");
     }
     modes.push("ONLY_FULL_GROUP_BY");
+    if choices.no_auto_value_on_zero {
+        modes.push("NO_AUTO_VALUE_ON_ZERO");
+    }
     if session_sql_mode.no_backslash_escapes {
         modes.push("NO_BACKSLASH_ESCAPES");
     }
+    modes.push("STRICT_TRANS_TABLES");
+    if choices.strict_all_tables {
+        modes.push("STRICT_ALL_TABLES");
+    }
     modes.extend([
-        "STRICT_TRANS_TABLES",
         "NO_ZERO_IN_DATE",
         "NO_ZERO_DATE",
         "ERROR_FOR_DIVISION_BY_ZERO",
@@ -1181,6 +1343,104 @@ mod tests {
         };
         assert_eq!(result.rows, vec![vec![None]]);
         assert_eq!(result.columns[0].column_type, MYSQL_TYPE_VAR_STRING);
+    }
+
+    /// Rails opens every connection with this one statement. Measured on
+    /// MySQL 8.4.11: it is taken, and the three settings read back as below.
+    #[test]
+    fn takes_the_statement_rails_opens_with() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                SERVER_STATUS_AUTOCOMMIT,
+            )
+        };
+        let read = |run: &mut dyn FnMut(&str) -> _, sql: &str| -> Vec<Option<String>> {
+            let Ok(Some(CommandExecutionResult::ResultSet(result))) = run(sql) else {
+                panic!("{sql} must return a result set");
+            };
+            result.rows[0]
+                .iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(|value| String::from_utf8(value.clone()).unwrap())
+                })
+                .collect()
+        };
+        assert!(matches!(
+            run("SET NAMES utf8mb4,  @@SESSION.sql_mode = CONCAT(CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), ',NO_AUTO_VALUE_ON_ZERO'),  @@SESSION.wait_timeout = 2147483"),
+            Ok(Some(CommandExecutionResult::Ok(_)))
+        ));
+        assert_eq!(
+            read(
+                &mut run,
+                "SELECT @@sql_mode, @@wait_timeout, @@GLOBAL.wait_timeout, @@sql_auto_is_null, @@sql_safe_updates, @@default_storage_engine"
+            ),
+            [
+                Some(
+                    "ONLY_FULL_GROUP_BY,NO_AUTO_VALUE_ON_ZERO,STRICT_TRANS_TABLES,STRICT_ALL_TABLES,\
+                     NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+                        .to_owned()
+                ),
+                Some("2147483".to_owned()),
+                Some(MySqlBootstrapSettings::default().wait_timeout_seconds().to_string()),
+                Some("0".to_owned()),
+                Some("0".to_owned()),
+                Some("InnoDB".to_owned()),
+            ]
+        );
+        assert!(session.no_auto_value_on_zero());
+        assert_eq!(session.wait_timeout(), Some(Duration::from_secs(2_147_483)));
+
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                SERVER_STATUS_AUTOCOMMIT,
+            )
+        };
+        // Measured on MySQL 8.4.11: DEFAULT goes back to what a new session
+        // starts with.
+        assert!(matches!(
+            run("SET sql_mode = DEFAULT, wait_timeout = DEFAULT"),
+            Ok(Some(CommandExecutionResult::Ok(_)))
+        ));
+        assert!(!session.no_auto_value_on_zero());
+        assert_eq!(session.wait_timeout(), None);
+    }
+
+    /// Measured on MySQL 8.4.11: when one assignment of a `SET` fails, none of
+    /// them takes effect.
+    #[test]
+    fn a_set_with_one_refused_assignment_changes_nothing() {
+        let mut session = MySqlSessionVariables::default();
+        let mut run = |sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                SERVER_STATUS_AUTOCOMMIT,
+            )
+        };
+        for sql in [
+            "SET foreign_key_checks = 0, wait_timeout = 0",
+            "SET @@SESSION.sql_mode = CONCAT(@@sql_mode, ',NO_AUTO_VALUE_ON_ZERO'), sql_auto_is_null = 1",
+            "SET wait_timeout = 100, sql_safe_updates = 1",
+            "SET SESSION wait_timeout = 100, GLOBAL foreign_key_checks = 0",
+        ] {
+            assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");
+        }
+        assert!(session.foreign_key_checks);
+        assert!(!session.no_auto_value_on_zero());
+        assert_eq!(session.wait_timeout(), None);
     }
 
     /// The two levels this server keeps are taken, and each reads back as the
@@ -2048,6 +2308,7 @@ mod tests {
                 ("collation_connection", "utf8mb4_general_ci"),
                 ("collation_database", "utf8mb4_0900_ai_ci"),
                 ("collation_server", "utf8mb4_0900_ai_ci"),
+                ("default_storage_engine", "InnoDB"),
                 ("foreign_key_checks", "ON"),
                 ("init_connect", ""),
                 ("interactive_timeout", "28800"),
@@ -2056,12 +2317,14 @@ mod tests {
                 ("max_allowed_packet", "67108864"),
                 ("net_write_timeout", "60"),
                 ("performance_schema", "OFF"),
+                ("sql_auto_is_null", "OFF"),
                 (
                     "sql_mode",
                     "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,\
                      NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
                 ),
                 ("sql_notes", "ON"),
+                ("sql_safe_updates", "OFF"),
                 ("system_time_zone", "UTC"),
                 ("time_zone", "SYSTEM"),
                 ("transaction_isolation", "REPEATABLE-READ"),

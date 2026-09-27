@@ -296,7 +296,10 @@ speaks; anything measured here from now on has to pass that flag.
 | `@@version`, `@@version_comment`, `VERSION()` | works |
 | `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
 | The variables a driver reads before it sends any work — the `@@character_set_*` and `@@collation_*` names, `@@time_zone`, `@@system_time_zone`, `@@transaction_isolation`, `@@auto_increment_increment`, `@@auto_increment_offset`, `@@interactive_timeout`, `@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license` | works; each answers what this server decides for itself, and three read differently from MySQL's own — see COMPAT.md |
-| `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in |
+| `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in; `sql_mode` may be an expression over `@@sql_mode`, and `NO_AUTO_VALUE_ON_ZERO` is kept |
+| `SET wait_timeout`, `SET sql_auto_is_null = 0`, `SET sql_safe_updates = 0`, several assignments in one `SET` | works |
+| A `SET` of a `GLOBAL` variable, `sql_auto_is_null = 1` or `sql_safe_updates = 1` | refused; nothing here can change another session, and neither rule is one this server has |
+| `SET wait_timeout` outside one second through a year | refused, where MySQL clamps it with a warning |
 | `SET time_zone` | accepts `UTC`, `SYSTEM` and fixed offsets from `-13:59` through `+14:00`; see the TIMESTAMP boundaries below |
 | Any other `@@name` | refused as 1193 rather than answered with a value the server does not have |
 | A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |

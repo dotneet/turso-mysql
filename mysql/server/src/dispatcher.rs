@@ -225,6 +225,12 @@ pub trait CommandExecutor {
         false
     }
 
+    /// Returns the idle time this session asked for with `SET wait_timeout`,
+    /// which the connection keeps in place of the runtime's own.
+    fn session_wait_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
         &mut self,

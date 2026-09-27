@@ -81,13 +81,17 @@ pub struct MySqlTransactionOutcome {
 impl MySqlConnection {
     /// Readies the session for one statement from the client.
     ///
-    /// `next` is the level a transaction the statement begins will run at.
-    /// Inside a `READ COMMITTED` transaction the snapshot the last statement
-    /// read from is let go, so this one reads what is committed now.
+    /// `next` is the level a transaction the statement begins will run at,
+    /// and `written_zero` what a 0 written into a counted column means under
+    /// the session's `sql_mode`. Inside a `READ COMMITTED` transaction the
+    /// snapshot the last statement read from is let go, so this one reads what
+    /// is committed now.
     pub fn prepare_for_client_statement(
         &self,
         next: MySqlIsolationLevel,
+        written_zero: WrittenZero,
     ) -> std::result::Result<(), MySqlQueryError> {
+        *self.written_zero.lock().unwrap() = written_zero;
         let current = {
             let mut isolation = self.transaction_isolation.lock().unwrap();
             isolation.next = next;

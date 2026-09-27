@@ -531,7 +531,11 @@ impl RuntimeTcpConnection {
                         self.complete_admission()?;
                         admission_complete = true;
                     }
-                    read_deadline = Instant::now() + self.timeouts.idle();
+                    read_deadline = Instant::now()
+                        + self
+                            .orchestrator
+                            .session_wait_timeout()
+                            .unwrap_or_else(|| self.timeouts.idle());
                 }
                 OrchestratorEvent::AwaitingClientFrame => {}
                 OrchestratorEvent::Closing | OrchestratorEvent::Closed => return Ok(()),
