@@ -6589,7 +6589,7 @@ fn rejects_unsafe_create_view_forms() {
         "CREATE SQL SECURITY INVOKER VIEW users_view AS SELECT name FROM users",
         "CREATE VIEW users_view (display_name) AS SELECT name FROM users",
         "CREATE VIEW users_view AS SELECT name FROM users WHERE name LIKE 'A%'",
-        "CREATE VIEW users_view AS SELECT name, COUNT(*) AS c FROM users GROUP BY name",
+        "CREATE VIEW users_view AS SELECT name FROM users GROUP BY name HAVING COUNT(*) > 1",
         "CREATE VIEW users_view AS SELECT name FROM users WITH CASCADED CHECK OPTION",
     ] {
         assert!(

@@ -4371,7 +4371,7 @@ fn view_projection_rejects_non_column_shapes() {
         };
         assert!(
             matches!(
-                MySqlConnection::view_projection(&select),
+                MySqlConnection::view_projection(&select, false),
                 Err(MySqlColumnMetadataError::UnsupportedDefinition)
             ),
             "expected unsupported view projection for {sql:?}"

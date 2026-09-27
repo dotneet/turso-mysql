@@ -193,16 +193,17 @@ impl MySqlConnection {
         };
         let statement = parse_schema_ddl_ast(decoded.normalized_ddl, mode)
             .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-        let create_statement = if turso_mysql_parser::translated_view_has_a_condition(&statement) {
-            turso_mysql_parser::render_show_create_written_view_mysql(
-                decoded.normalized_ddl,
-                mode,
-                &creator.username,
-            )
-        } else {
-            turso_mysql_parser::render_show_create_view_mysql(&statement, &creator.username)
-        }
-        .map_err(|error| LimboError::Corrupt(error.to_string()))?;
+        let create_statement =
+            if turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement) {
+                turso_mysql_parser::render_show_create_written_view_mysql(
+                    decoded.normalized_ddl,
+                    mode,
+                    &creator.username,
+                )
+            } else {
+                turso_mysql_parser::render_show_create_view_mysql(&statement, &creator.username)
+            }
+            .map_err(|error| LimboError::Corrupt(error.to_string()))?;
         Ok(Some(MySqlViewMetadata {
             name: view.name.clone(),
             create_statement,
@@ -850,6 +851,78 @@ impl MySqlConnection {
         self.read_view_columns(view.as_str(), view.as_str(), &stored_sql)
     }
 
+    /// Reads what each column of a view grouping its rows reads, with the
+    /// columns of the one table it reads, or nothing for any other view.
+    ///
+    /// Only the aggregates whose answer MySQL reports in a shape measured
+    /// here are taken: a count of anything, and the least or greatest of a
+    /// whole-number or `VARCHAR` column.
+    pub fn grouped_view_readings(
+        &self,
+        view: &MySqlTableName,
+    ) -> std::result::Result<
+        Option<(
+            turso_mysql_parser::MySqlWrittenView,
+            Vec<MySqlColumnMetadata>,
+        )>,
+        MySqlColumnMetadataError,
+    > {
+        let schema = self.inner.current_schema();
+        let Some(stored) = schema.get_view(view.as_str()) else {
+            return Err(MySqlColumnMetadataError::TableNotFound);
+        };
+        let decoded = decode_schema_sql(SchemaSqlKind::View, &stored.sql)
+            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
+            .ok_or(MySqlColumnMetadataError::UnsupportedDefinition)?;
+        let mode = SessionSqlMode {
+            ansi_quotes: decoded.context.sql_mode.ansi_quotes,
+            no_backslash_escapes: decoded.context.sql_mode.no_backslash_escapes,
+        };
+        let statement = parse_create_view_ast(decoded.normalized_ddl, mode)
+            .map_err(mysql_metadata_parse_error)?;
+        if !turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement) {
+            return Ok(None);
+        }
+        let written = turso_mysql_parser::written_view_columns(decoded.normalized_ddl, mode)
+            .map_err(mysql_metadata_parse_error)?;
+        if !written.grouped() {
+            return Ok(None);
+        }
+        let columns = self.list_columns(written.table())?;
+        Self::refuse_readings_not_measured(&written, &columns)?;
+        Ok(Some((written, columns)))
+    }
+
+    pub(super) fn refuse_readings_not_measured(
+        written: &turso_mysql_parser::MySqlWrittenView,
+        columns: &[MySqlColumnMetadata],
+    ) -> std::result::Result<(), MySqlColumnMetadataError> {
+        use turso_mysql_parser::MySqlViewColumnReading;
+
+        for (_, reading) in written.columns() {
+            let read = match reading {
+                MySqlViewColumnReading::Count => continue,
+                MySqlViewColumnReading::Column(column) => (column, false),
+                MySqlViewColumnReading::Least(column)
+                | MySqlViewColumnReading::Greatest(column) => (column, true),
+                MySqlViewColumnReading::Sum(_) | MySqlViewColumnReading::Average(_) => {
+                    return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+                }
+            };
+            let (name, bounded) = read;
+            let column = columns
+                .iter()
+                .find(|column| column.name().eq_ignore_ascii_case(name))
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            if bounded
+                && !(super::is_integer_type(column.type_name()) || column.type_name() == "VARCHAR")
+            {
+                return Err(MySqlColumnMetadataError::UnsupportedDefinition);
+            }
+        }
+        Ok(())
+    }
+
     fn read_view_columns(
         &self,
         requested_name: &str,
@@ -871,18 +944,19 @@ impl MySqlConnection {
         // A view with a condition is kept in the text MySQL prints, which
         // reads back as itself; any other in the text the engine's statement
         // renders.
-        let canonical = if turso_mysql_parser::translated_view_has_a_condition(&statement) {
-            turso_mysql_parser::view_written_as_mysql_prints_it(
-                decoded.normalized_ddl,
-                mode,
-                &|table| self.declared_column_names(table),
-            )
-            .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?
-            .ok_or(MySqlColumnMetadataError::CorruptDefinition)?
-        } else {
-            render_create_view_mysql_with_mode(&statement, mode)
+        let canonical =
+            if turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement) {
+                turso_mysql_parser::view_written_as_mysql_prints_it(
+                    decoded.normalized_ddl,
+                    mode,
+                    &|table| self.declared_column_names(table),
+                )
                 .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?
-        };
+                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?
+            } else {
+                render_create_view_mysql_with_mode(&statement, mode)
+                    .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?
+            };
         if canonical != decoded.normalized_ddl {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
@@ -905,7 +979,10 @@ impl MySqlConnection {
         {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
-        let (source_table, projected_columns) = Self::view_projection(select)?;
+        let (source_table, projected_columns) = Self::view_projection(
+            select,
+            turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&statement),
+        )?;
         if turso_core::schema::is_system_table(source_table.as_str()) {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
@@ -980,6 +1057,7 @@ impl MySqlConnection {
     /// name it answers under and the table column it reads.
     pub(super) fn view_projection(
         select: &turso_parser::ast::Select,
+        kept_as_mysql_prints_it: bool,
     ) -> std::result::Result<(MySqlTableName, Vec<(String, String)>), MySqlColumnMetadataError>
     {
         if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
@@ -1032,10 +1110,8 @@ impl MySqlConnection {
                     (name.as_str().to_owned(), name.as_str().to_owned())
                 }
                 // A view kept in the text MySQL prints names every column
-                // `table`.`column` AS `name`.
-                (Expr::Qualified(table, name), Some(alias))
-                    if table.as_str().eq_ignore_ascii_case(source_table.as_str()) =>
-                {
+                // `column` AS `name`.
+                (Expr::Name(name) | Expr::Id(name), Some(alias)) if kept_as_mysql_prints_it => {
                     (alias.name().as_str().to_owned(), name.as_str().to_owned())
                 }
                 _ => return Err(MySqlColumnMetadataError::UnsupportedDefinition),

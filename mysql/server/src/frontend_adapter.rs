@@ -4601,6 +4601,10 @@ struct SourceTableColumns {
     /// MySQL reports for them rather than shapes read out of stored DDL. A
     /// table has these or the ones above, never both.
     catalog_columns: Vec<ColumnDefinitionConfig>,
+    /// The columns of a view grouping its rows, whose shapes MySQL reads out
+    /// of the table it gathers the groups into rather than out of the table
+    /// the view reads. A source has these, the catalog's or the table's.
+    view_columns: Vec<ColumnDefinitionConfig>,
     /// The columns a `WITH` name projects, in order, when this reference is a
     /// CTE rather than the table itself. A result column's ordinal counts
     /// through these, not through the table's own columns.
@@ -4630,9 +4634,10 @@ impl SourceTableColumns {
         if self.projected_columns.is_empty() {
             return Ok(ordinal);
         }
-        if !self.catalog_columns.is_empty() {
-            // A CTE over an `information_schema` table would have to count
-            // through what the CTE projected, which is not read here.
+        if !self.catalog_columns.is_empty() || !self.view_columns.is_empty() {
+            // A CTE over an `information_schema` table or a grouping view
+            // would have to count through what the CTE projected, which is
+            // not read here.
             return Err(FrontendErrorKind::Unsupported);
         }
         let name = self
@@ -5033,6 +5038,16 @@ impl TableResultMetadata {
                 .ok_or(FrontendErrorKind::Unsupported)?
                 .clone();
             definition.name = name;
+            return Ok(definition);
+        }
+        if !table.view_columns.is_empty() {
+            let mut definition = table
+                .view_columns
+                .get(ordinal)
+                .ok_or(FrontendErrorKind::Internal)?
+                .clone();
+            definition.name = name;
+            definition.table = table_reference;
             return Ok(definition);
         }
         let source = table
@@ -8059,6 +8074,7 @@ fn table_result_metadata_for_references(
                 subquery: source.subquery(),
                 columns: Vec::new(),
                 catalog_columns: catalog_table_columns(catalog),
+                view_columns: Vec::new(),
                 outer: source.outer(),
                 projected_columns: source.projected_columns().to_vec(),
             });
@@ -8069,10 +8085,16 @@ fn table_result_metadata_for_references(
             .find(|table| table.name().eq_ignore_ascii_case(source.table().as_str()))
             .map(|table| table.kind())
             .ok_or(FrontendErrorKind::MissingObject)?;
+        let mut view_columns = Vec::new();
         let columns = if table_kind == MySqlTableKind::BaseTable {
             connection
                 .list_columns(source.table())
                 .map_err(column_metadata_error_kind)?
+        } else if let Some(grouped) =
+            grouped_view_columns(connection, selected_database, source.table())?
+        {
+            view_columns = grouped;
+            Vec::new()
         } else {
             // A view projecting one table's columns reports each the way the
             // table does, under the view's own name. Any other view stays on
@@ -8089,6 +8111,7 @@ fn table_result_metadata_for_references(
             subquery: source.subquery(),
             columns,
             catalog_columns: Vec::new(),
+            view_columns,
             outer: source.outer(),
             projected_columns: source.projected_columns().to_vec(),
         });
@@ -8105,6 +8128,94 @@ fn table_result_metadata_for_references(
         table.column_ordinal(*ordinal)?;
     }
     Ok(Some(metadata))
+}
+
+/// Works out the columns of a view grouping its rows, or nothing for any
+/// other view.
+///
+/// Measured on MySQL 8.4.11, such a view is read out of a table MySQL gathers
+/// the groups into, and each column reports that table's shape: a grouped
+/// column keeps its table as its original table and its type, length and
+/// nullability, and loses its key flags — a primary-key `id` reports
+/// `NOT_NULL UNSIGNED` — and an aggregate names the view as its original
+/// table. A count is a NOT NULL `LONGLONG` of 21 without the binary flag a
+/// `COUNT` read from a table carries, and the least or greatest of a column is
+/// that column's shape, nullable and without its keys.
+#[cfg(unix)]
+fn grouped_view_columns(
+    connection: &MySqlConnection,
+    database: &str,
+    view: &MySqlTableName,
+) -> Result<Option<Vec<ColumnDefinitionConfig>>, FrontendErrorKind> {
+    use turso_mysql_parser::MySqlViewColumnReading;
+
+    let Some((written, columns)) = connection
+        .grouped_view_readings(view)
+        .map_err(column_metadata_error_kind)?
+    else {
+        return Ok(None);
+    };
+    let base = written.table().as_str().to_owned();
+    let base_metadata = TableResultMetadata {
+        database: database.to_owned(),
+        tables: vec![SourceTableColumns {
+            source_table: base.clone(),
+            table_reference: base,
+            branch: 0,
+            subquery: false,
+            columns,
+            catalog_columns: Vec::new(),
+            view_columns: Vec::new(),
+            projected_columns: Vec::new(),
+            outer: false,
+        }],
+        union: false,
+    };
+    let key_flags = MYSQL_PRI_KEY_FLAG
+        | MYSQL_UNIQUE_KEY_FLAG
+        | MYSQL_PART_KEY_FLAG
+        | MYSQL_AUTO_INCREMENT_FLAG;
+    let base_column = |name: &str, column: &str| {
+        let (table, ordinal) = base_metadata.column_named(column)?;
+        base_metadata.column_definition_for_reference(
+            Some((table.table_reference.clone(), ordinal)),
+            name.to_owned(),
+            None,
+        )
+    };
+    written
+        .columns()
+        .iter()
+        .map(|(name, reading)| {
+            let mut definition = match reading {
+                MySqlViewColumnReading::Column(column) => {
+                    let mut definition = base_column(name, column)?;
+                    definition.flags &= !key_flags;
+                    return Ok(definition);
+                }
+                MySqlViewColumnReading::Count => {
+                    let mut definition = column_definition(name.clone(), MYSQL_TYPE_LONGLONG);
+                    definition.column_length = 21;
+                    set_column_flags(&mut definition, MYSQL_NOT_NULL_FLAG);
+                    definition
+                }
+                MySqlViewColumnReading::Least(column)
+                | MySqlViewColumnReading::Greatest(column) => {
+                    let mut definition = base_column(name, column)?;
+                    definition.flags &= !(key_flags | MYSQL_NOT_NULL_FLAG);
+                    definition
+                }
+                MySqlViewColumnReading::Sum(_) | MySqlViewColumnReading::Average(_) => {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+            };
+            database.clone_into(&mut definition.schema);
+            view.as_str().clone_into(&mut definition.original_table);
+            definition.original_name.clone_from(name);
+            Ok(definition)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 #[cfg(unix)]

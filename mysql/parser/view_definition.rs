@@ -3,8 +3,9 @@
 //! MySQL keeps a view as the text it prints in `SHOW CREATE VIEW`: every
 //! column qualified by its table and named with an `AS`, keywords in lower
 //! case, and each comparison and each run of `AND` or `OR` in parentheses of
-//! its own. A view whose `SELECT` carries a condition is kept here in that
-//! same text, so what `SHOW CREATE VIEW` prints is what was stored.
+//! its own. A view whose `SELECT` carries a condition, groups its rows or
+//! aggregates them is kept here in that same text, so what `SHOW CREATE VIEW`
+//! prints is what was stored.
 
 use super::*;
 use sqlparser::ast::Query;
@@ -12,8 +13,8 @@ use sqlparser::ast::Query;
 /// Names the columns a base table declares, or nothing for any other name.
 pub type DeclaredColumns<'a> = dyn Fn(&MySqlTableName) -> Option<Vec<String>> + 'a;
 
-/// Writes a `CREATE VIEW` whose `SELECT` carries a `WHERE` the way MySQL
-/// prints it back, or answers nothing for any other `CREATE VIEW`.
+/// Writes a `CREATE VIEW` kept in the text MySQL prints the way MySQL prints
+/// it back, or answers nothing for any other `CREATE VIEW`.
 ///
 /// `declared_columns` names the columns a table declares, which is how MySQL
 /// writes a column however the statement spelled it: measured on 8.4.11,
@@ -28,7 +29,7 @@ pub fn view_written_as_mysql_prints_it(
     let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
         return Ok(None);
     };
-    if !has_a_condition(&view.query) {
+    if !kept_as_mysql_prints_it(&view.query) {
         return Ok(None);
     }
     refuse_view_options(&view)?;
@@ -37,40 +38,45 @@ pub fn view_written_as_mysql_prints_it(
     };
     let name = MySqlTableName::parse(&name.value)?;
     Ok(Some(format!(
-        "CREATE VIEW `{}` AS {}",
-        name.as_str().replace('`', "``"),
-        view_body(&view.query, mode, Some(declared_columns))?
+        "CREATE VIEW {} AS {}",
+        quoted_name(name.as_str()),
+        view_body(
+            &view.query,
+            mode,
+            Some(declared_columns),
+            Written::AsMySqlPrintsIt
+        )?
     )))
 }
 
 /// The MySQL DDL a view is kept under.
 ///
-/// A view with a condition is kept in the text MySQL prints, which the engine
-/// statement cannot be rendered back into — a `LIKE` or a `<=>` has become
-/// something else by then — so the text it was made from is kept, once it is
-/// proved to translate to that same statement. Any other view is rendered
-/// from its statement.
+/// A view kept in the text MySQL prints cannot be rendered back into it from
+/// the engine's statement — a `count(0)` or a `<=>` has become something else
+/// by then — so the text it was made from is kept, once it is proved to
+/// translate to that same statement. Any other view is rendered from its
+/// statement.
 pub fn mysql_create_view_ddl(
     statement: &Stmt,
     written: &str,
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
-    if !translated_view_has_a_condition(statement) {
+    if !translated_view_is_kept_as_mysql_prints_it(statement) {
         return render_create_view_mysql_with_mode(statement, mode);
     }
     if parse_create_view_ast(written, mode)? != *statement {
-        return unsupported("a view with a condition written other than as it was made");
+        return unsupported("a view kept as MySQL prints it written other than as it was made");
     }
     Ok(written.to_owned())
 }
 
-/// Reads the `SELECT` of a `CREATE VIEW` written the way MySQL prints it, as
-/// that same text.
-pub fn written_view_select(sql: &str, mode: SessionSqlMode) -> Result<String, ParseError> {
+/// Reads the `SELECT` of a view kept in the text MySQL prints, written the
+/// way the `SELECT` translator reads it, which is what the view runs.
+pub fn translated_view_select(sql: &str, mode: SessionSqlMode) -> Result<String, ParseError> {
     let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
         return Err(ParseError::ExpectedCreateView);
     };
-    view_body(&view.query, mode, None)
+    view_body(&view.query, mode, None, Written::ForTheTranslator)
 }
 
 /// Prints `SHOW CREATE VIEW` for a view kept in the text MySQL prints.
@@ -89,36 +95,230 @@ pub fn render_show_create_written_view_mysql(
         "CREATE ALGORITHM=UNDEFINED DEFINER=`{}`@`%` SQL SECURITY DEFINER VIEW {} AS {}",
         username.replace('`', "``"),
         quoted_name(&name.value),
-        view_body(&view.query, mode, None)?
+        view_body(&view.query, mode, None, Written::AsMySqlPrintsIt)?
     ))
 }
 
-/// Reports whether a view's `SELECT` carries a `WHERE`, which is the shape
-/// kept in the text MySQL prints.
-pub(crate) fn has_a_condition(query: &Query) -> bool {
-    matches!(query.body.as_ref(), SetExpr::Select(select) if select.selection.is_some())
+/// What each column of a view kept in the text MySQL prints reads, and
+/// whether the view groups its rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlWrittenView {
+    table: MySqlTableName,
+    grouped: bool,
+    columns: Vec<(String, MySqlViewColumnReading)>,
 }
 
-/// Reports whether a translated view's `SELECT` carries a `WHERE`.
-pub fn translated_view_has_a_condition(statement: &Stmt) -> bool {
-    matches!(
-        statement,
-        Stmt::CreateView { select, .. }
-            if matches!(&select.body.select, OneSelect::Select { where_clause: Some(_), .. })
-    )
+impl MySqlWrittenView {
+    /// Returns the one table the view reads.
+    pub fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Reports whether the view groups its rows, by a `GROUP BY` or by an
+    /// aggregate over them all. MySQL reads such a view out of a table of its
+    /// own, which is what changes the shape it reports for each column.
+    pub const fn grouped(&self) -> bool {
+        self.grouped
+    }
+
+    /// Returns each column's name and what it reads, in order.
+    pub fn columns(&self) -> &[(String, MySqlViewColumnReading)] {
+        &self.columns
+    }
 }
 
-/// Writes a view's `SELECT` the way MySQL prints it, refusing every shape
-/// whose printing has not been measured.
+/// What one column of a view reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlViewColumnReading {
+    /// A column of the table, named as the table declares it.
+    Column(String),
+    /// `COUNT(*)`, `COUNT(col)` or `COUNT(DISTINCT col)`.
+    Count,
+    Sum(String),
+    Average(String),
+    Least(String),
+    Greatest(String),
+}
+
+/// Reads what each column of a view kept in the text MySQL prints reads.
+pub fn written_view_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlWrittenView, ParseError> {
+    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+        return Err(ParseError::ExpectedCreateView);
+    };
+    let (select, table) = one_table_select(&view.query)?;
+    let body = ViewBody {
+        table: &table,
+        declared: None,
+        mode,
+        written: Written::AsMySqlPrintsIt,
+    };
+    let mut grouped = !group_by_columns(select)?.is_empty();
+    let mut columns = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (expr, alias) = projected(item)?;
+        let reading = match body.written_column(expr) {
+            Some(column) => MySqlViewColumnReading::Column(column.value.clone()),
+            None => {
+                grouped = true;
+                let (function, argument) = aggregate(expr)?;
+                let argument = match argument {
+                    Some(argument) => Some(
+                        body.written_column(argument)
+                            .ok_or(ParseError::Unsupported {
+                                feature: "CREATE VIEW aggregate over something other than a column",
+                            })?
+                            .value
+                            .clone(),
+                    ),
+                    None => None,
+                };
+                match (function, argument) {
+                    (Aggregate::Count { .. }, _) => MySqlViewColumnReading::Count,
+                    (Aggregate::Sum, Some(column)) => MySqlViewColumnReading::Sum(column),
+                    (Aggregate::Average, Some(column)) => MySqlViewColumnReading::Average(column),
+                    (Aggregate::Least, Some(column)) => MySqlViewColumnReading::Least(column),
+                    (Aggregate::Greatest, Some(column)) => MySqlViewColumnReading::Greatest(column),
+                    _ => return unsupported("CREATE VIEW aggregate"),
+                }
+            }
+        };
+        let name = match (alias, &reading) {
+            (Some(alias), _) => alias.value.clone(),
+            (None, MySqlViewColumnReading::Column(column)) => column.clone(),
+            (None, _) => return unsupported("CREATE VIEW aggregate without a name"),
+        };
+        columns.push((name, reading));
+    }
+    Ok(MySqlWrittenView {
+        table,
+        grouped,
+        columns,
+    })
+}
+
+/// Reports whether a view is kept in the text MySQL prints: one whose
+/// `SELECT` carries a condition, groups its rows or aggregates them.
+pub(crate) fn kept_as_mysql_prints_it(query: &Query) -> bool {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.selection.is_some()
+        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
+        || select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::UnnamedExpr(Expr::Function(_))
+                    | SelectItem::ExprWithAlias {
+                        expr: Expr::Function(_),
+                        ..
+                    }
+            )
+        })
+}
+
+/// Reports whether a translated view is kept in the text MySQL prints.
+pub fn translated_view_is_kept_as_mysql_prints_it(statement: &Stmt) -> bool {
+    let Stmt::CreateView { select, .. } = statement else {
+        return false;
+    };
+    let OneSelect::Select {
+        columns,
+        where_clause,
+        group_by,
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    where_clause.is_some()
+        || group_by.is_some()
+        || columns.iter().any(|column| {
+            matches!(
+                column,
+                ResultColumn::Expr(expr, _)
+                    if matches!(
+                        expr.as_ref(),
+                        TursoExpr::FunctionCall { .. } | TursoExpr::FunctionCallStar { .. }
+                    )
+            )
+        })
+}
+
+/// Which of the two texts a view's `SELECT` is written into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Written {
+    /// As MySQL prints it back: `` `t`.`c` ``, `count(0)`, `group by`.
+    AsMySqlPrintsIt,
+    /// As the `SELECT` translator reads it: each column bare, `COUNT(*)`.
+    ForTheTranslator,
+}
+
+/// Writes a view's `SELECT`, refusing every shape whose printing has not been
+/// measured.
 ///
 /// Without `declared_columns` each column keeps the spelling it was written
-/// with, which is what the translation of text already written this way
-/// reads.
+/// with, which is what reading text already written this way needs.
 pub(crate) fn view_body(
     query: &Query,
     mode: SessionSqlMode,
     declared_columns: Option<&DeclaredColumns<'_>>,
+    written: Written,
 ) -> Result<String, ParseError> {
+    let (select, table) = one_table_select(query)?;
+    let declared = match declared_columns {
+        Some(declared_columns) => {
+            Some(declared_columns(&table).ok_or(ParseError::Unsupported {
+                feature: "CREATE VIEW over something other than a base table",
+            })?)
+        }
+        None => None,
+    };
+    let body = ViewBody {
+        table: &table,
+        declared: declared.as_deref(),
+        mode,
+        written,
+    };
+    let columns = select
+        .projection
+        .iter()
+        .map(|item| body.projected_column(item))
+        .collect::<Result<Vec<_>, _>>()?;
+    if columns.is_empty() {
+        return unsupported("CREATE VIEW without projections");
+    }
+    let mut text = format!(
+        "select {} from {}",
+        columns.join(","),
+        quoted_name(table.as_str())
+    );
+    if let Some(condition) = &select.selection {
+        text.push_str(" where ");
+        text.push_str(&body.condition(condition)?);
+    }
+    let grouping = group_by_columns(select)?;
+    if !grouping.is_empty() {
+        let grouping = grouping
+            .iter()
+            .map(|expr| match body.written_column(expr) {
+                Some(column) => body.column(column),
+                None => unsupported("CREATE VIEW grouping by something other than a column"),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        text.push_str(" group by ");
+        text.push_str(&grouping.join(","));
+    }
+    Ok(text)
+}
+
+/// Reads a view's `SELECT` over one table, refusing every clause whose
+/// printing has not been measured.
+fn one_table_select(
+    query: &Query,
+) -> Result<(&sqlparser::ast::Select, MySqlTableName), ParseError> {
     if query.with.is_some()
         || query.order_by.is_some()
         || query.limit_clause.is_some()
@@ -145,7 +345,6 @@ pub(crate) fn view_body(
         || !select.lateral_views.is_empty()
         || select.prewhere.is_some()
         || !select.connect_by.is_empty()
-        || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if exprs.is_empty())
         || !select.cluster_by.is_empty()
         || !select.distribute_by.is_empty()
         || !select.sort_by.is_empty()
@@ -184,38 +383,102 @@ pub(crate) fn view_body(
     let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
         return unsupported("CREATE VIEW over a qualified table");
     };
-    let table = MySqlTableName::parse(&table.value)?;
-    let declared = match declared_columns {
-        Some(declared_columns) => {
-            Some(declared_columns(&table).ok_or(ParseError::Unsupported {
-                feature: "CREATE VIEW over something other than a base table",
-            })?)
+    Ok((select, MySqlTableName::parse(&table.value)?))
+}
+
+fn group_by_columns(select: &sqlparser::ast::Select) -> Result<&[Expr], ParseError> {
+    match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) if modifiers.is_empty() => {
+            Ok(exprs)
         }
-        None => None,
-    };
-    let body = ViewBody {
-        table: &table,
-        declared: declared.as_deref(),
-        mode,
-    };
-    let columns = select
-        .projection
-        .iter()
-        .map(|item| body.projected_column(item))
-        .collect::<Result<Vec<_>, _>>()?;
-    if columns.is_empty() {
-        return unsupported("CREATE VIEW without projections");
+        _ => unsupported("CREATE VIEW GROUP BY form"),
     }
-    let mut written = format!(
-        "select {} from {}",
-        columns.join(","),
-        quoted_name(table.as_str())
-    );
-    if let Some(condition) = &select.selection {
-        written.push_str(" where ");
-        written.push_str(&body.condition(condition)?);
+}
+
+fn projected(item: &SelectItem) -> Result<(&Expr, Option<&Ident>), ParseError> {
+    match item {
+        SelectItem::UnnamedExpr(expr) => Ok((expr, None)),
+        SelectItem::ExprWithAlias { expr, alias } => Ok((expr, Some(alias))),
+        _ => unsupported("CREATE VIEW projection"),
     }
-    Ok(written)
+}
+
+/// The aggregates a view takes, each measured on MySQL 8.4.11 for how it is
+/// printed back and for the column it reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Aggregate {
+    Count { distinct: bool },
+    Sum,
+    Average,
+    Least,
+    Greatest,
+}
+
+/// Reads one aggregate and the column it reads, which a `COUNT(*)` has none
+/// of.
+fn aggregate(expr: &Expr) -> Result<(Aggregate, Option<&Expr>), ParseError> {
+    let Expr::Function(function) = expr else {
+        return unsupported("CREATE VIEW projection");
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return unsupported("CREATE VIEW call");
+    };
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return unsupported("CREATE VIEW call");
+    };
+    if name.quote_style.is_some()
+        || function.over.is_some()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+        || !arguments.clauses.is_empty()
+    {
+        return unsupported("CREATE VIEW call");
+    }
+    let distinct = match arguments.duplicate_treatment {
+        None => false,
+        Some(sqlparser::ast::DuplicateTreatment::Distinct) => true,
+        Some(sqlparser::ast::DuplicateTreatment::All) => {
+            return unsupported("CREATE VIEW aggregate over ALL")
+        }
+    };
+    let named = |candidate: &str| name.value.eq_ignore_ascii_case(candidate);
+    let function = if named("COUNT") {
+        Aggregate::Count { distinct }
+    } else if distinct {
+        return unsupported("CREATE VIEW aggregate over DISTINCT");
+    } else if named("SUM") {
+        Aggregate::Sum
+    } else if named("AVG") {
+        Aggregate::Average
+    } else if named("MIN") {
+        Aggregate::Least
+    } else if named("MAX") {
+        Aggregate::Greatest
+    } else {
+        return unsupported("CREATE VIEW call");
+    };
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)]
+            if function == (Aggregate::Count { distinct: false }) =>
+        {
+            Ok((function, None))
+        }
+        // `count(0)` is how MySQL prints `COUNT(*)` back, and counts every row
+        // as it does.
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(value),
+        ))] if function == (Aggregate::Count { distinct: false })
+            && matches!(&value.value, Value::Number(number, false) if number == "0") =>
+        {
+            Ok((function, None))
+        }
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(argument))] => {
+            Ok((function, Some(argument)))
+        }
+        _ => unsupported("CREATE VIEW aggregate argument"),
+    }
 }
 
 /// What writing one view's `SELECT` needs to know.
@@ -223,26 +486,74 @@ struct ViewBody<'a> {
     table: &'a MySqlTableName,
     declared: Option<&'a [String]>,
     mode: SessionSqlMode,
+    written: Written,
 }
 
 impl ViewBody<'_> {
     /// Writes one result column, `` `t`.`c` AS `name` ``, named after its
-    /// alias or, without one, after the column as it was written.
+    /// alias or, without one, after the column as it was written. An
+    /// aggregate has to be named: MySQL names one after the text it was
+    /// written as, spacing and all.
     fn projected_column(&self, item: &SelectItem) -> Result<String, ParseError> {
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(expr) => (expr, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => return unsupported("CREATE VIEW projection"),
+        let (expr, alias) = projected(item)?;
+        if let Some(column) = self.written_column(expr) {
+            let name = alias.unwrap_or(column);
+            return Ok(format!(
+                "{} AS {}",
+                self.column(column)?,
+                quoted_name(&name.value)
+            ));
+        }
+        let Some(alias) = alias else {
+            return unsupported("CREATE VIEW aggregate without a name");
         };
-        let Some(column) = self.written_column(expr) else {
-            return unsupported("CREATE VIEW projection");
-        };
-        let name = alias.unwrap_or(column);
         Ok(format!(
             "{} AS {}",
-            self.column(column)?,
-            quoted_name(&name.value)
+            self.aggregate(expr)?,
+            quoted_name(&alias.value)
         ))
+    }
+
+    /// Writes an aggregate: measured on MySQL 8.4.11, `COUNT(*)` is printed
+    /// `count(0)` and the rest by their names in lower case over their
+    /// qualified column, `count(distinct ...)` among them.
+    fn aggregate(&self, expr: &Expr) -> Result<String, ParseError> {
+        let (function, argument) = aggregate(expr)?;
+        let argument = match argument {
+            Some(argument) => match self.written_column(argument) {
+                Some(column) => Some(self.column(column)?),
+                None => {
+                    return unsupported("CREATE VIEW aggregate over something other than a column")
+                }
+            },
+            None => None,
+        };
+        let prints = self.written == Written::AsMySqlPrintsIt;
+        Ok(match (function, argument) {
+            (Aggregate::Count { .. }, None) if prints => "count(0)".to_owned(),
+            (Aggregate::Count { .. }, None) => "COUNT(*)".to_owned(),
+            (Aggregate::Count { distinct: true }, Some(column)) if prints => {
+                format!("count(distinct {column})")
+            }
+            (Aggregate::Count { distinct: true }, Some(column)) => {
+                format!("COUNT(DISTINCT {column})")
+            }
+            (function, Some(column)) => {
+                let name = match function {
+                    Aggregate::Count { .. } => "count",
+                    Aggregate::Sum => "sum",
+                    Aggregate::Average => "avg",
+                    Aggregate::Least => "min",
+                    Aggregate::Greatest => "max",
+                };
+                if prints {
+                    format!("{name}({column})")
+                } else {
+                    format!("{}({column})", name.to_ascii_uppercase())
+                }
+            }
+            (_, None) => unreachable!("only a count reads no column"),
+        })
     }
 
     /// Reads the column an expression names, refusing a qualifier naming any
@@ -262,6 +573,8 @@ impl ViewBody<'_> {
         }
     }
 
+    /// Writes a column: qualified by its table, as MySQL prints it, or bare,
+    /// as the translator reads the one table a view reads.
     fn column(&self, column: &Ident) -> Result<String, ParseError> {
         let declared = match self.declared {
             Some(declared) => declared
@@ -273,11 +586,14 @@ impl ViewBody<'_> {
                 .as_str(),
             None => column.value.as_str(),
         };
-        Ok(format!(
-            "{}.{}",
-            quoted_name(self.table.as_str()),
-            quoted_name(declared)
-        ))
+        Ok(match self.written {
+            Written::AsMySqlPrintsIt => format!(
+                "{}.{}",
+                quoted_name(self.table.as_str()),
+                quoted_name(declared)
+            ),
+            Written::ForTheTranslator => quoted_name(declared),
+        })
     }
 
     /// Writes a condition: measured on MySQL 8.4.11, each comparison stands
@@ -407,8 +723,87 @@ mod tests {
     use super::*;
 
     fn declared(table: &MySqlTableName) -> Option<Vec<String>> {
-        (table.as_str() == "posts")
-            .then(|| ["id", "user_id", "n", "title"].map(str::to_owned).to_vec())
+        match table.as_str() {
+            "posts" => Some(["id", "user_id", "n", "title"].map(str::to_owned).to_vec()),
+            "keyed" => Some(["id", "code", "grp", "amount"].map(str::to_owned).to_vec()),
+            _ => None,
+        }
+    }
+
+    /// Each expectation is what MySQL 8.4.11 printed for the same statement.
+    #[test]
+    fn a_view_grouping_its_rows_is_written_the_way_mysql_prints_it() {
+        for (sql, expected, translated) in [
+            (
+                "CREATE VIEW v2 AS SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id",
+                "CREATE VIEW `v2` AS select `posts`.`user_id` AS `user_id`,count(0) AS `c` from `posts` group by `posts`.`user_id`",
+                "select `user_id` AS `user_id`,COUNT(*) AS `c` from `posts` group by `user_id`",
+            ),
+            (
+                "CREATE VIEW g1 AS SELECT id, code, grp, COUNT(*) AS c FROM keyed GROUP BY id, code, grp",
+                "CREATE VIEW `g1` AS select `keyed`.`id` AS `id`,`keyed`.`code` AS `code`,`keyed`.`grp` AS `grp`,count(0) AS `c` from `keyed` group by `keyed`.`id`,`keyed`.`code`,`keyed`.`grp`",
+                "select `id` AS `id`,`code` AS `code`,`grp` AS `grp`,COUNT(*) AS `c` from `keyed` group by `id`,`code`,`grp`",
+            ),
+            (
+                "CREATE VIEW g2 AS SELECT grp, SUM(amount) AS s, AVG(amount) AS a, MIN(code) AS lo, MAX(id) AS hi, COUNT(amount) AS n FROM keyed WHERE grp > 0 GROUP BY grp",
+                "CREATE VIEW `g2` AS select `keyed`.`grp` AS `grp`,sum(`keyed`.`amount`) AS `s`,avg(`keyed`.`amount`) AS `a`,min(`keyed`.`code`) AS `lo`,max(`keyed`.`id`) AS `hi`,count(`keyed`.`amount`) AS `n` from `keyed` where (`keyed`.`grp` > 0) group by `keyed`.`grp`",
+                "select `grp` AS `grp`,SUM(`amount`) AS `s`,AVG(`amount`) AS `a`,MIN(`code`) AS `lo`,MAX(`id`) AS `hi`,COUNT(`amount`) AS `n` from `keyed` where (`grp` > 0) group by `grp`",
+            ),
+            (
+                "CREATE VIEW g3 AS SELECT COUNT(*) AS c, MAX(amount) AS m FROM keyed",
+                "CREATE VIEW `g3` AS select count(0) AS `c`,max(`keyed`.`amount`) AS `m` from `keyed`",
+                "select COUNT(*) AS `c`,MAX(`amount`) AS `m` from `keyed`",
+            ),
+            (
+                "CREATE VIEW w2 AS SELECT user_id, COUNT(DISTINCT n) AS cd FROM posts GROUP BY user_id",
+                "CREATE VIEW `w2` AS select `posts`.`user_id` AS `user_id`,count(distinct `posts`.`n`) AS `cd` from `posts` group by `posts`.`user_id`",
+                "select `user_id` AS `user_id`,COUNT(DISTINCT `n`) AS `cd` from `posts` group by `user_id`",
+            ),
+        ] {
+            let written = written(sql).unwrap_or_else(|| panic!("{sql}"));
+            assert_eq!(written, expected, "{sql}");
+            assert_eq!(self::written(&written).as_deref(), Some(expected));
+            assert_eq!(
+                translated_view_select(&written, SessionSqlMode::default()).unwrap(),
+                translated
+            );
+        }
+        let columns = written_view_columns(
+            "CREATE VIEW `g2` AS select `keyed`.`grp` AS `grp`,sum(`keyed`.`amount`) AS `s`,count(0) AS `c` from `keyed` group by `keyed`.`grp`",
+            SessionSqlMode::default(),
+        )
+        .unwrap();
+        assert!(columns.grouped());
+        assert_eq!(columns.table().as_str(), "keyed");
+        assert_eq!(
+            columns.columns(),
+            [
+                (
+                    "grp".to_owned(),
+                    MySqlViewColumnReading::Column("grp".to_owned())
+                ),
+                (
+                    "s".to_owned(),
+                    MySqlViewColumnReading::Sum("amount".to_owned())
+                ),
+                ("c".to_owned(), MySqlViewColumnReading::Count),
+            ]
+        );
+        for sql in [
+            // MySQL names an unnamed aggregate after the text it was written
+            // as, spacing and all.
+            "CREATE VIEW v AS SELECT user_id, COUNT(*) FROM posts GROUP BY user_id",
+            "CREATE VIEW v AS SELECT user_id, SUM(DISTINCT n) AS s FROM posts GROUP BY user_id",
+            "CREATE VIEW v AS SELECT user_id, SUM(n + 1) AS s FROM posts GROUP BY user_id",
+            "CREATE VIEW v AS SELECT user_id, GROUP_CONCAT(n) AS s FROM posts GROUP BY user_id",
+            "CREATE VIEW v AS SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*) > 1",
+            "CREATE VIEW v AS SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id WITH ROLLUP",
+        ] {
+            assert!(
+                view_written_as_mysql_prints_it(sql, SessionSqlMode::default(), &declared).is_err(),
+                "{sql}"
+            );
+        }
     }
 
     fn written(sql: &str) -> Option<String> {

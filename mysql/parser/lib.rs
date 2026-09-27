@@ -176,8 +176,10 @@ pub use temporal_value::{
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use view_definition::{
-    mysql_create_view_ddl, render_show_create_written_view_mysql, translated_view_has_a_condition,
-    view_written_as_mysql_prints_it, written_view_select,
+    mysql_create_view_ddl, render_show_create_written_view_mysql,
+    translated_view_is_kept_as_mysql_prints_it, translated_view_select,
+    view_written_as_mysql_prints_it, written_view_columns, MySqlViewColumnReading,
+    MySqlWrittenView,
 };
 pub use written_number::{read_written_number, WrittenNumber};
 pub use written_bytes::{
@@ -5883,8 +5885,13 @@ fn translate_create_view(view: &CreateView, mode: SessionSqlMode) -> Result<Stri
     // A `SELECT` with a condition is translated the way a `SELECT` written on
     // its own is, which is what holds each comparison to MySQL's rules; the
     // frontend holds its values to the columns' types before the view is made.
-    let query = if view_definition::has_a_condition(&view.query) {
-        let body = view_definition::view_body(&view.query, mode, None)?;
+    let query = if view_definition::kept_as_mysql_prints_it(&view.query) {
+        let body = view_definition::view_body(
+            &view.query,
+            mode,
+            None,
+            view_definition::Written::ForTheTranslator,
+        )?;
         parse_select(&body, mode)?.as_sql().to_owned()
     } else {
         render_simple_view_query(&view.query)?

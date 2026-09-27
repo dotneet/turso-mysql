@@ -347,3 +347,188 @@ fn a_view_with_a_condition_is_kept_the_way_mysql_prints_it() {
     );
     assert_eq!(rows(&mut adapter, "SELECT T FROM y1"), ["a"]);
 }
+
+/// MySQL reads a view grouping its rows out of a table it gathers the groups
+/// into, and reports each column in that table's shape: a grouped column
+/// keeps its own table as its original table and loses its key flags, and an
+/// aggregate names the view.
+#[test]
+fn a_view_grouping_its_rows_reports_the_columns_mysql_reports() {
+    let (directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE keyed (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, code VARCHAR(10) NOT NULL UNIQUE, grp INT NOT NULL, amount INT DEFAULT 3)",
+        "INSERT INTO keyed (code, grp, amount) VALUES ('a', 1, 10), ('b', 1, 20), ('c', 2, NULL)",
+        "CREATE VIEW v2 AS SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id",
+        "CREATE VIEW g1 AS SELECT id, code, grp, COUNT(*) AS c FROM keyed GROUP BY id, code, grp",
+        "CREATE VIEW g2 AS SELECT grp, MIN(code) AS lo, MAX(id) AS hi, COUNT(amount) AS n FROM keyed WHERE grp > 0 GROUP BY grp",
+        "CREATE VIEW g3 AS SELECT COUNT(*) AS c, MAX(amount) AS m FROM keyed",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let shown = |adapter: &mut Adapter, view: &str| {
+        rows(adapter, &format!("SHOW CREATE VIEW {view}"))[0]
+            .split('|')
+            .nth(1)
+            .unwrap()
+            .to_owned()
+    };
+    for (view, select) in [
+        (
+            "v2",
+            "select `posts`.`user_id` AS `user_id`,count(0) AS `c` from `posts` group by `posts`.`user_id`",
+        ),
+        (
+            "g1",
+            "select `keyed`.`id` AS `id`,`keyed`.`code` AS `code`,`keyed`.`grp` AS `grp`,count(0) AS `c` from `keyed` group by `keyed`.`id`,`keyed`.`code`,`keyed`.`grp`",
+        ),
+        (
+            "g2",
+            "select `keyed`.`grp` AS `grp`,min(`keyed`.`code`) AS `lo`,max(`keyed`.`id`) AS `hi`,count(`keyed`.`amount`) AS `n` from `keyed` where (`keyed`.`grp` > 0) group by `keyed`.`grp`",
+        ),
+        (
+            "g3",
+            "select count(0) AS `c`,max(`keyed`.`amount`) AS `m` from `keyed`",
+        ),
+    ] {
+        assert_eq!(
+            shown(&mut adapter, view),
+            format!("CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`%` SQL SECURITY DEFINER VIEW `{view}` AS {select}")
+        );
+    }
+    for (sql, expected) in [
+        ("SELECT * FROM v2 ORDER BY 1", &["1|2", "2|1"][..]),
+        (
+            "SELECT * FROM g1 ORDER BY 1",
+            &["1|a|1|1", "2|b|1|1", "3|c|2|1"],
+        ),
+        ("SELECT * FROM g2 ORDER BY 1", &["1|a|2|2", "2|c|3|0"]),
+        ("SELECT * FROM g3", &["3|20"]),
+    ] {
+        assert_eq!(rows(&mut adapter, sql), expected, "{sql}");
+    }
+
+    let shape = |column: &ColumnDefinitionConfig| {
+        (
+            column.name.clone(),
+            column.table.clone(),
+            column.original_table.clone(),
+            column.column_type,
+            column.column_length,
+            column.flags & !MYSQL_NUM_FLAG,
+            column.decimals,
+        )
+    };
+    let not_null = MYSQL_NOT_NULL_FLAG;
+    let no_default = MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let unsigned = MYSQL_UNSIGNED_FLAG;
+    for (sql, expected) in [
+        (
+            "SELECT * FROM v2",
+            vec![
+                ("user_id", "v2", "posts", MYSQL_TYPE_LONG, 11, 0),
+                ("c", "v2", "v2", MYSQL_TYPE_LONGLONG, 21, not_null),
+            ],
+        ),
+        (
+            "SELECT * FROM g1",
+            vec![
+                (
+                    "id",
+                    "g1",
+                    "keyed",
+                    MYSQL_TYPE_LONGLONG,
+                    20,
+                    not_null | unsigned,
+                ),
+                (
+                    "code",
+                    "g1",
+                    "keyed",
+                    MYSQL_TYPE_VAR_STRING,
+                    40,
+                    not_null | no_default,
+                ),
+                (
+                    "grp",
+                    "g1",
+                    "keyed",
+                    MYSQL_TYPE_LONG,
+                    11,
+                    not_null | no_default,
+                ),
+                ("c", "g1", "g1", MYSQL_TYPE_LONGLONG, 21, not_null),
+            ],
+        ),
+        (
+            "SELECT * FROM g2",
+            vec![
+                (
+                    "grp",
+                    "g2",
+                    "keyed",
+                    MYSQL_TYPE_LONG,
+                    11,
+                    not_null | no_default,
+                ),
+                ("lo", "g2", "g2", MYSQL_TYPE_VAR_STRING, 40, no_default),
+                ("hi", "g2", "g2", MYSQL_TYPE_LONGLONG, 20, unsigned),
+                ("n", "g2", "g2", MYSQL_TYPE_LONGLONG, 21, not_null),
+            ],
+        ),
+        (
+            "SELECT * FROM g3",
+            vec![
+                ("c", "g3", "g3", MYSQL_TYPE_LONGLONG, 21, not_null),
+                ("m", "g3", "g3", MYSQL_TYPE_LONG, 11, 0),
+            ],
+        ),
+        (
+            "SELECT c FROM g1 x",
+            vec![("c", "x", "g1", MYSQL_TYPE_LONGLONG, 21, not_null)],
+        ),
+    ] {
+        let expected = expected
+            .into_iter()
+            .map(|(name, table, original, kind, length, flags)| {
+                (
+                    name.to_owned(),
+                    table.to_owned(),
+                    original.to_owned(),
+                    kind,
+                    length,
+                    flags,
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns(&mut adapter, sql)
+                .iter()
+                .map(shape)
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+    }
+
+    // Measured, `SUM` of an `INT` is a `NEWDECIMAL` of 33 and `AVG` one of 16
+    // with 4 decimals; a view reads neither here, and nothing unnamed.
+    for sql in [
+        "CREATE VIEW bad AS SELECT grp, SUM(amount) AS s FROM keyed GROUP BY grp",
+        "CREATE VIEW bad AS SELECT grp, AVG(amount) AS a FROM keyed GROUP BY grp",
+        "CREATE VIEW bad AS SELECT grp, COUNT(*) FROM keyed GROUP BY grp",
+        "CREATE VIEW bad AS SELECT grp FROM keyed GROUP BY grp HAVING COUNT(*) > 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(
+        rows(&mut adapter, "SELECT * FROM v2 ORDER BY 1"),
+        ["1|2", "2|1"]
+    );
+    assert_eq!(
+        columns(&mut adapter, "SELECT c FROM v2")[0].column_length,
+        21
+    );
+}

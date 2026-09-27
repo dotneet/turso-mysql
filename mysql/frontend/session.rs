@@ -3365,7 +3365,7 @@ impl MySqlConnection {
             Stmt::CreateIndex { .. } => render_create_index_mysql_with_mode(&stmt, mode)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?,
             Stmt::CreateView { .. }
-                if turso_mysql_parser::translated_view_has_a_condition(&stmt) =>
+                if turso_mysql_parser::translated_view_is_kept_as_mysql_prints_it(&stmt) =>
             {
                 sql.to_string()
             }
@@ -3402,8 +3402,21 @@ impl MySqlConnection {
     /// they are known — a written day against a moment, a word against a
     /// `JSON` column — is refused rather than kept in its untyped form.
     fn check_view_select(&self, written: &str) -> Result<()> {
-        let select = turso_mysql_parser::written_view_select(written, self.parser_mode())
+        let select = turso_mysql_parser::translated_view_select(written, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let readings = turso_mysql_parser::written_view_columns(written, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        if readings.grouped() {
+            let columns = self.list_columns(readings.table()).map_err(|error| {
+                LimboError::ParseError(format!("CREATE VIEW source columns: {error:?}"))
+            })?;
+            Self::refuse_readings_not_measured(&readings, &columns).map_err(|_| {
+                LimboError::ParseError(
+                    "a view grouping its rows reads only COUNT, and MIN or MAX of a whole number or a VARCHAR"
+                        .to_string(),
+                )
+            })?;
+        }
         let (translated, rendered_differently) = self.parse_select_knowing_column_types(&select)?;
         if rendered_differently {
             return Err(LimboError::ParseError(
