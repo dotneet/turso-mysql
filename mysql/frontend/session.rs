@@ -71,9 +71,74 @@ pub struct MySqlConnection {
     written_zero: Arc<Mutex<WrittenZero>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
+    schema_readings: Arc<Mutex<SchemaReadings>>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
+}
+
+/// What [`MySqlConnection::list_tables`] and [`MySqlConnection::list_columns`]
+/// read, for the one schema it was read from.
+///
+/// A schema is never changed in place while this holds it, so any change
+/// makes a new one and what is kept here stops being found.
+#[derive(Default)]
+struct SchemaReadings {
+    schema: Option<Arc<turso_core::schema::Schema>>,
+    tables: Option<Vec<MySqlTable>>,
+    columns: HashMap<String, Vec<MySqlColumnMetadata>>,
+    /// How many times a table's columns were read rather than found here.
+    #[cfg(test)]
+    column_reads: usize,
+}
+
+impl SchemaReadings {
+    fn tables(&self, schema: &Arc<turso_core::schema::Schema>) -> Option<Vec<MySqlTable>> {
+        self.reads(schema).and_then(|kept| kept.tables.clone())
+    }
+
+    fn columns(
+        &self,
+        schema: &Arc<turso_core::schema::Schema>,
+        table: &str,
+    ) -> Option<Vec<MySqlColumnMetadata>> {
+        self.reads(schema)
+            .and_then(|kept| kept.columns.get(table).cloned())
+    }
+
+    fn keep_tables(&mut self, schema: Arc<turso_core::schema::Schema>, tables: &[MySqlTable]) {
+        self.for_schema(schema).tables = Some(tables.to_vec());
+    }
+
+    fn keep_columns(
+        &mut self,
+        schema: Arc<turso_core::schema::Schema>,
+        table: &str,
+        columns: &[MySqlColumnMetadata],
+    ) {
+        let kept = self.for_schema(schema);
+        kept.columns.insert(table.to_owned(), columns.to_vec());
+        #[cfg(test)]
+        {
+            kept.column_reads += 1;
+        }
+    }
+
+    fn reads(&self, schema: &Arc<turso_core::schema::Schema>) -> Option<&Self> {
+        self.schema
+            .as_ref()
+            .is_some_and(|kept| Arc::ptr_eq(kept, schema))
+            .then_some(self)
+    }
+
+    fn for_schema(&mut self, schema: Arc<turso_core::schema::Schema>) -> &mut Self {
+        if self.reads(&schema).is_none() {
+            self.tables = None;
+            self.columns.clear();
+            self.schema = Some(schema);
+        }
+        self
+    }
 }
 
 /// Closes an engine connection when dropped.
@@ -1186,6 +1251,7 @@ impl MySqlConnection {
             written_zero: Arc::new(Mutex::new(WrittenZero::AsksForTheNextNumber)),
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
+            schema_readings: Arc::default(),
         })
     }
 

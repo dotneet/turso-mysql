@@ -14,7 +14,30 @@ impl MySqlConnection {
     ///
     /// This reads the persisted schema directly through the trusted Core
     /// connection. SQLite and Turso internal tables are deliberately omitted.
+    /// A `SELECT` lists them to describe its result, so the list is kept for as
+    /// long as the schema it was read from is the one in force.
     pub fn list_tables(&self) -> Result<Vec<MySqlTable>> {
+        self.inner.maybe_update_schema();
+        let schema = self.inner.current_schema();
+        if let Some(tables) = self
+            .schema_readings
+            .lock()
+            .expect("MySQL schema readings mutex poisoned")
+            .tables(&schema)
+        {
+            return Ok(tables);
+        }
+        let tables = self.read_tables()?;
+        if Arc::ptr_eq(&schema, &self.inner.current_schema()) {
+            self.schema_readings
+                .lock()
+                .expect("MySQL schema readings mutex poisoned")
+                .keep_tables(schema, &tables);
+        }
+        Ok(tables)
+    }
+
+    fn read_tables(&self) -> Result<Vec<MySqlTable>> {
         let sql = format!(
             "SELECT name, type, sql FROM sqlite_schema \
              WHERE type IN ('table', 'view') \
@@ -395,7 +418,39 @@ impl MySqlConnection {
     /// The normalized MySQL DDL is the source for MySQL-only fields. Core is
     /// used only to verify that the marked catalog row still describes the
     /// loaded table and its columns in the same order.
+    ///
+    /// One statement reads a table's columns several times over, and each read
+    /// parses the stored DDL again, so the answer is kept for as long as the
+    /// schema it was read from is the one in force.
     pub fn list_columns(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        // A schema another session committed is taken up here the way the
+        // engine takes it up before it compiles a statement.
+        self.inner.maybe_update_schema();
+        let schema = self.inner.current_schema();
+        if let Some(columns) = self
+            .schema_readings
+            .lock()
+            .expect("MySQL schema readings mutex poisoned")
+            .columns(&schema, table.as_str())
+        {
+            return Ok(columns);
+        }
+        let columns = self.read_columns(table)?;
+        // Reading may have taken up a newer schema; what it read then belongs
+        // to that one, not to the one looked up above.
+        if Arc::ptr_eq(&schema, &self.inner.current_schema()) {
+            self.schema_readings
+                .lock()
+                .expect("MySQL schema readings mutex poisoned")
+                .keep_columns(schema, table.as_str(), &columns);
+        }
+        Ok(columns)
+    }
+
+    fn read_columns(
         &self,
         table: &MySqlTableName,
     ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {

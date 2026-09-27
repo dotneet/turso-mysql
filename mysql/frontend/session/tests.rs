@@ -3988,6 +3988,36 @@ fn dropping_and_recreating_auto_increment_table_gets_new_identity_and_starts_at_
     Ok(())
 }
 
+/// A table's columns are read once for each schema and kept until the schema
+/// changes.
+#[test]
+fn a_tables_columns_are_read_once_for_each_schema() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-column-cache.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT, label VARCHAR(10))")?;
+    let table = MySqlTableName::parse("records").unwrap();
+    let reads = || connection.schema_readings.lock().unwrap().column_reads;
+
+    let first = connection.list_columns(&table).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(connection.list_columns(&table).unwrap(), first);
+    assert_eq!(reads(), 1);
+
+    connection.execute("ALTER TABLE records ADD COLUMN n INT")?;
+    let altered = connection.list_columns(&table).unwrap();
+    assert_eq!(
+        altered
+            .iter()
+            .map(|column| column.name())
+            .collect::<Vec<_>>(),
+        ["id", "label", "n"]
+    );
+    assert_eq!(reads(), 2);
+    connection.close()?;
+    Ok(())
+}
+
 /// A write can leave the WAL holding far more than the engine's own
 /// checkpoint empties, so past a bound it is truncated, but never inside a
 /// transaction.
