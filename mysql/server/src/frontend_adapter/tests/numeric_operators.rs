@@ -365,9 +365,8 @@ fn numeric_operators_refuse_what_mysql_answers_by_another_rule() {
         "SELECT -r FROM nm",
         "SELECT d DIV 2 FROM nm",
         "SELECT -d FROM nm",
-        // A DECIMAL rounded left of the point, or to a whole number down or up.
+        // A DECIMAL rounded left of the point.
         "SELECT ROUND(d, -1) FROM nm",
-        "SELECT FLOOR(d) FROM nm",
         // Places read from the row.
         "SELECT ROUND(r, i) FROM nm",
     ] {

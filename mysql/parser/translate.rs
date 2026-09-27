@@ -4871,15 +4871,16 @@ fn render_select_expr(
         Expr::Floor { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
         {
-            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
-                return unsupported("SELECT FLOOR over DECIMAL requires exact numeric handling");
-            }
             let sqlparser::ast::CeilFloorKind::DateTimeField(
                 sqlparser::ast::DateTimeField::NoDateTime,
             ) = field
             else {
                 return unsupported("FLOOR option");
             };
+            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
+                let inner = render_select_expr(inner, render_context)?;
+                return Ok(render_decimal_to_whole(&inner, false));
+            }
             // The engine's `floor` keeps a whole number whole and a real number
             // real, which is the kind MySQL answers for each.
             let inner = render_select_expr(inner, render_context)?;
@@ -4888,15 +4889,16 @@ fn render_select_expr(
         Expr::Ceil { expr: inner, field }
             if static_select_metadata::classify_static_select_expr(expr).is_some() =>
         {
-            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
-                return unsupported("SELECT CEIL over DECIMAL requires exact numeric handling");
-            }
             let sqlparser::ast::CeilFloorKind::DateTimeField(
                 sqlparser::ast::DateTimeField::NoDateTime,
             ) = field
             else {
                 return unsupported("CEIL option");
             };
+            if decimal_operand_scale(inner, render_context.decimal_columns).is_some() {
+                let inner = render_select_expr(inner, render_context)?;
+                return Ok(render_decimal_to_whole(&inner, true));
+            }
             let inner = render_select_expr(inner, render_context)?;
             Ok(format!("ceil({inner})"))
         }
@@ -5161,6 +5163,22 @@ fn render_select_expr(
         }
         _ => unsupported("SELECT expression"),
     }
+}
+
+/// Writes `FLOOR` or `CEIL` of a `DECIMAL` as the whole number it lands on.
+///
+/// The engine's own `floor` reads a `DECIMAL` as a double and would lose its
+/// digits, so the fraction is cut off exactly and the whole number moved one
+/// down, or one up, where a fraction was cut. The frontend holds the column to
+/// the widths MySQL answers a whole number for.
+fn render_decimal_to_whole(decimal: &str, up: bool) -> String {
+    let whole = format!("mysql_decimal_truncate({decimal}, 0)");
+    let (past, step) = if up {
+        (format!("numeric_lt({whole}, {decimal})"), "numeric_add")
+    } else {
+        (format!("numeric_lt({decimal}, {whole})"), "numeric_sub")
+    };
+    format!("CAST(CASE WHEN {past} THEN {step}({whole}, '1') ELSE {whole} END AS INTEGER)")
 }
 
 /// Writes `IS TRUE`, `IS FALSE`, `IS NOT TRUE` or `IS NOT FALSE` over what
@@ -5568,6 +5586,7 @@ fn render_scalar_call(
             "TRUNCATE",
             "ROUND",
             "FORMAT",
+            "CEILING",
             "JSON_ARRAY",
             "JSON_OBJECT",
             "JSON_SET",
@@ -5873,6 +5892,12 @@ fn render_scalar_call(
     } else if let Some(engine) = engine_math_reading(&name.value) {
         engine
     } else if name.value.eq_ignore_ascii_case("CEILING") {
+        if has_decimal_argument {
+            return Ok(render_decimal_to_whole(
+                &single_column_argument(function),
+                true,
+            ));
+        }
         return Ok(format!("ceil({})", single_column_argument(function)));
     } else if name.value.eq_ignore_ascii_case("ROUND") {
         let Some(StaticSelectMetadata::ScalarCall {

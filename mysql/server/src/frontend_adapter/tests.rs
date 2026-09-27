@@ -30669,3 +30669,6 @@ mod network_addresses;
 
 #[cfg(unix)]
 mod time_seconds;
+
+#[cfg(unix)]
+mod decimal_to_whole;

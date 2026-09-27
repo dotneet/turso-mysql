@@ -3362,7 +3362,14 @@ Measured on 8.4.11, what it answers is the kind of number its column holds:
 
 `FLOOR`, `CEIL` and `CEILING` answer a `LONGLONG` of 21 over a whole number and
 a `DOUBLE` of 23 over a `DOUBLE` — they used to answer a whole number for both.
-Over a `DECIMAL` they stay refused.
+Over a `DECIMAL` they answer a `LONGLONG` of 21 too while its whole digits, and
+one more where it has a fraction, number no more than eighteen — measured on
+8.4.11, `DECIMAL(18,0)` and `DECIMAL(10,2)` do and `DECIMAL(19,1)` does not —
+NOT NULL over a NOT NULL column and signed over an unsigned one. The fraction
+is cut off exactly and the whole number moved one down or up where one was
+cut, since the engine's own `floor` would read the `DECIMAL` as a double: over
+a `DECIMAL(10,2)` holding -1.50, `FLOOR` is -2 and `CEIL` -1. A wider `DECIMAL`
+answers a `NEWDECIMAL` and is refused.
 
 A `DOUBLE` rounded to a negative zero is written `-0`, as MySQL writes it —
 measured, `ROUND(-0.4e0)` and `CEIL(-0.5e0)` are both `-0`, and so is a `-0e0`

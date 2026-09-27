@@ -7432,8 +7432,8 @@ fn scalar_call_column_definition(
 /// place is cut away for the carry — `DECIMAL(10,3)` rounded to 1 reports 11
 /// with a scale of 1, to none 9, and to 5 the column's own 12 and 3. A `BIGINT`
 /// rounded left of the point, which MySQL answers 1690 for past the largest
-/// one, a DECIMAL rounded left of the point, `FLOOR` and `CEIL` over a DECIMAL,
-/// and every other type are refused.
+/// one, a DECIMAL rounded left of the point, `FLOOR` and `CEIL` over a DECIMAL
+/// too wide for a LONGLONG, and every other type are refused.
 #[cfg(unix)]
 fn rounded_definition(
     name: String,
@@ -7452,6 +7452,21 @@ fn rounded_definition(
         let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
         definition.column_length = 23;
         definition.decimals = NOT_FIXED_DECIMALS;
+        return Ok(definition);
+    }
+    // Measured on MySQL 8.4.11: `FLOOR` and `CEIL` over a DECIMAL answer a
+    // LONGLONG of 21 while its whole digits, and one more where it has a
+    // fraction, number no more than eighteen — `DECIMAL(18,0)` and
+    // `DECIMAL(10,2)` do, `DECIMAL(19,1)` does not — and a NEWDECIMAL past
+    // that, which is not taken. An unsigned one answers a signed LONGLONG.
+    if let (None, "DECIMAL" | "DECIMAL UNSIGNED", Some((precision, scale))) =
+        (places, source.type_name(), source.decimal_size())
+    {
+        if precision - scale + u32::from(scale > 0) > 18 {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+        definition.column_length = 21;
         return Ok(definition);
     }
     let (Some(places), "DECIMAL", Some((precision, scale))) =
