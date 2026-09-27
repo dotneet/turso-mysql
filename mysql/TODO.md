@@ -195,6 +195,11 @@ boolean literal.
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |
 | A `CHARSET` or `COLLATE` naming anything but `utf8mb4` and `utf8mb4_0900_ai_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back, and this prints one trailer whatever a table holds |
+| `CREATE DATABASE` naming a character set, collation or encryption but `utf8mb4`, `utf8mb4_0900_ai_ci` and `'N'` — Prisma's and Laravel's `utf8mb4_unicode_ci` among them | refused; MySQL gives every table made in such a database that collation, and a database here keeps none of its own to give |
+| `ALTER TABLE v DISABLE KEYS` / `ENABLE KEYS` over a view | refused, where MySQL answers 1347 |
+| A view over more than one table, or with a `WHERE` — what a dump of a view over a join writes | refused; a view here reads one table's columns as they stand |
+| A trigger whose values are anything but a `NEW` column or a literal — `CONCAT('post ', NEW.title)` | refused |
+| A view or trigger in a dump naming a `DEFINER` other than the account restoring it — `root`@`localhost` | refused, as MySQL refuses it to an account without `SET_ANY_DEFINER`; accounts here are all `'name'@'%'` |
 | `ROW_FORMAT` and every other table option but the engine, character set, collation, `AUTO_INCREMENT` and `COMMENT` | refused; measured, MySQL prints `ROW_FORMAT` back, and none of the rest has been measured |
 | A table `COMMENT` longer than 2048 characters, or written in double quotes | refused; MySQL answers 1628 for the first and takes the second |
 | `AUTO_INCREMENT=<n>` naming a start past what the column holds | refused; measured, MySQL creates the table and answers 1467 for the first row, so this refuses the statement instead of storing a mark no row could take |
@@ -259,8 +264,8 @@ boolean literal.
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
 | `UPDATE` / `DELETE` over more than one table | refused |
 | `LIMIT` with no `ORDER BY`, or an `ORDER BY` over a column that is not an integer, on an `UPDATE` / `DELETE` | refused |
+| An `INSERT` into a counted table carrying a trigger, or into a table whose trigger writes into a counted table | refused; a restored dump's counted table with a trigger takes no new row. The rows the dump wrote before making its trigger are taken |
 | `TRUNCATE TABLE` on a counted table carrying a trigger | refused; that table is written again to restart its counter and a trigger is not the table's own row, where MySQL leaves one where it stood. A table with no counter is emptied in place and keeps its triggers |
-| `SET unique_checks = 0` | refused; MySQL lets duplicate rows into a unique index while it is off, which there is no honest way to say here |
 | `SET foreign_key_checks` to a value that is neither 0, 1, `OFF` nor `ON` | refused as a syntax error where MySQL answers 1231 |
 
 ---
@@ -347,6 +352,10 @@ speaks; anything measured here from now on has to pass that flag.
 | A `SET` of a `GLOBAL` variable, `sql_auto_is_null = 1` or `sql_safe_updates = 1` | refused; nothing here can change another session, and neither rule is one this server has |
 | `SET wait_timeout` outside one second through a year | refused, where MySQL clamps it with a warning |
 | `SET time_zone` | accepts `UTC`, `SYSTEM` and fixed offsets from `-13:59` through `+14:00`; see the TIMESTAMP boundaries below |
+| `SET unique_checks` | works; with it off, a duplicate key is refused as MySQL 8.4 refuses one under its default `innodb_change_buffering=none` |
+| `SET character_set_client`, `character_set_results` or `collation_connection` to latin1 | taken for what a dump sets around a view: a statement outside ASCII, a result set, and a prepared statement are refused while it is named, and a view made then records utf8mb4 rather than latin1 |
+| Any character set or collation but utf8mb4's three and latin1 | refused |
+| `SHOW WARNINGS` with no database selected | refused as 1046, where MySQL answers it |
 | Any other `@@name` | refused as 1193 rather than answered with a value the server does not have |
 | A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |
 | A user variable beside anything else in a projection — `SELECT @x, id FROM t` | refused; the reader answers a projection of variables and nothing else |
@@ -472,7 +481,10 @@ also checked against a pinned MySQL 8.4.11 oracle and its own tests.
 
 - PHP `mysqli`, Python `PyMySQL` / `mysqlclient`
 - ORM versions and settings beyond the pinned GORM and Hibernate fixtures
-- `mysqldump` and restore, end to end
+- `mysqldump` and restore through a real `mysql` client. A standard
+  `mysqldump --single-transaction --databases` of a small schema, replayed the
+  way the client splits it, restores whole and reads back as dumped; the
+  client itself has not been run against this server
 
 The pinned MySQL 8.0.46 command-line client passed the privileged Linux
 cross-UID TLS/TCP E2E locally on 2026-09-26. It covers schema creation and

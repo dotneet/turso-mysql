@@ -76,6 +76,9 @@ impl Error for MySqlDatabaseError {}
 pub enum MySqlAdminCommandResult {
     /// A logical database was created and published.
     Created { database: String },
+    /// `CREATE DATABASE IF NOT EXISTS` found the database already there and
+    /// left it as it stands.
+    AlreadyExists { database: String },
     /// A logical database was dropped.
     Dropped { database: String },
     /// A session now selects the named logical database.
@@ -312,10 +315,16 @@ impl MySqlDatabaseSession {
         command: MySqlAdminCommand,
     ) -> Result<MySqlAdminCommandResult, MySqlDatabaseError> {
         match command {
-            MySqlAdminCommand::CreateDatabase { name } => {
-                let database = self.catalog.create(name.as_str())?;
-                Ok(MySqlAdminCommandResult::Created { database })
-            }
+            MySqlAdminCommand::CreateDatabase {
+                name,
+                only_if_missing,
+            } => match self.catalog.create(name.as_str()) {
+                Ok(database) => Ok(MySqlAdminCommandResult::Created { database }),
+                Err(MySqlDatabaseError::DatabaseAlreadyExists(database)) if only_if_missing => {
+                    Ok(MySqlAdminCommandResult::AlreadyExists { database })
+                }
+                Err(error) => Err(error),
+            },
             MySqlAdminCommand::DropDatabase { name } => {
                 let database = name.into_string();
                 if self.selected_database() == Some(database.as_str()) {
@@ -1401,6 +1410,18 @@ mod tests {
         session
             .execute_admin_command("CREATE DATABASE archive")
             .unwrap();
+        assert_eq!(
+            session.execute_admin_command("CREATE DATABASE IF NOT EXISTS Archive"),
+            Ok(MySqlAdminCommandResult::AlreadyExists {
+                database: "archive".to_owned(),
+            })
+        );
+        assert_eq!(
+            session.execute_admin_command("CREATE DATABASE archive"),
+            Err(MySqlAdminCommandError::Database(
+                MySqlDatabaseError::DatabaseAlreadyExists("archive".to_owned())
+            ))
+        );
         session.execute_admin_command("USE reports").unwrap();
 
         let list = session
@@ -1428,7 +1449,7 @@ mod tests {
         for sql in [
             "CREATE DATABASE one; DROP DATABASE two",
             "CREATE DATABASE one -- comment",
-            "CREATE DATABASE IF NOT EXISTS one",
+            "CREATE DATABASE one CHARACTER SET latin1",
             "DROP DATABASE IF EXISTS one",
             "USE one /* comment */",
         ] {

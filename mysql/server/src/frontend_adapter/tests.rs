@@ -30631,3 +30631,6 @@ mod migration_ddl;
 
 #[cfg(unix)]
 mod counted_inserts;
+
+#[cfg(unix)]
+mod mysqldump_restore;

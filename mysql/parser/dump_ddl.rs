@@ -1,3 +1,7 @@
+use super::admin_command::{
+    admin_command_ends, consume_admin_table_name, consume_admin_word,
+    tokenize_versioned_admin_command, AdminToken,
+};
 use super::{parse_optional_drop_view, unsupported, MySqlTableName, ParseError, SessionSqlMode};
 
 /// A schema statement that the MySQL CLI sends after reading a mysqldump file.
@@ -72,6 +76,38 @@ pub fn parse_optional_mysqldump_drop_view(
     };
     parse_optional_drop_view(&format!("DROP VIEW {name}"), mode)?
         .map_or_else(|| unsupported("mysqldump DROP VIEW"), |name| Ok(Some(name)))
+}
+
+/// Reads `ALTER TABLE t DISABLE KEYS` or `ENABLE KEYS`, which `mysqldump`
+/// writes around every table's rows inside `/*!40000 ... */`, and answers the
+/// table it names.
+///
+/// Any other `ALTER TABLE` is left to its own reader.
+pub fn parse_optional_alter_table_keys(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlTableName>, ParseError> {
+    let tokens = tokenize_versioned_admin_command(sql, mode)?;
+    let mut cursor = 0;
+    if !consume_admin_word(&tokens, &mut cursor, "ALTER")
+        || !consume_admin_word(&tokens, &mut cursor, "TABLE")
+    {
+        return Ok(None);
+    }
+    let Ok(table) = consume_admin_table_name(&tokens, &mut cursor) else {
+        return Ok(None);
+    };
+    if !(consume_admin_word(&tokens, &mut cursor, "DISABLE")
+        || consume_admin_word(&tokens, &mut cursor, "ENABLE"))
+        || !consume_admin_word(&tokens, &mut cursor, "KEYS")
+        || matches!(tokens.get(cursor), Some(AdminToken::Dot))
+    {
+        return Ok(None);
+    }
+    if !admin_command_ends(&tokens, cursor) {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(table))
 }
 
 fn expand_create_comments(mut sql: &str) -> Result<String, ParseError> {
@@ -204,6 +240,41 @@ mod tests {
             parse_optional_mysqldump_drop_view("DROP VIEW names", crate::SessionSqlMode::default())
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn reads_the_key_switches_a_dump_writes_around_each_table() {
+        let mode = crate::SessionSqlMode::default();
+        for sql in [
+            "/*!40000 ALTER TABLE `posts` DISABLE KEYS */",
+            "/*!40000 ALTER TABLE `posts` ENABLE KEYS */;",
+            "ALTER TABLE posts enable keys",
+        ] {
+            assert_eq!(
+                parse_optional_alter_table_keys(sql, mode)
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+                "posts",
+                "{sql}"
+            );
+        }
+        for sql in [
+            "ALTER TABLE posts ADD COLUMN c INT",
+            "ALTER TABLE probe.posts DISABLE KEYS",
+            "ALTER TABLE posts DISABLE",
+            "SELECT 1",
+        ] {
+            assert_eq!(
+                parse_optional_alter_table_keys(sql, mode),
+                Ok(None),
+                "{sql}"
+            );
+        }
+        assert!(
+            parse_optional_alter_table_keys("ALTER TABLE posts DISABLE KEYS, ADD c INT", mode)
+                .is_err()
         );
     }
 

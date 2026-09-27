@@ -23,7 +23,6 @@ mod number_format;
 mod select_projection_origins;
 mod session_queries;
 mod session_settings;
-mod session_variables;
 mod shift_moment;
 mod show_engines;
 mod show_full_tables;
@@ -94,7 +93,8 @@ pub use date_format::{format_moment, format_width, week_number};
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::parse_optional_drop_view;
 pub use dump_ddl::{
-    parse_optional_mysqldump_ddl, parse_optional_mysqldump_drop_view, MySqlDumpDdl,
+    parse_optional_alter_table_keys, parse_optional_mysqldump_ddl,
+    parse_optional_mysqldump_drop_view, MySqlDumpDdl,
 };
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
@@ -133,10 +133,9 @@ pub use session_queries::{
     MySqlUserVariableRead,
 };
 pub use session_settings::{
-    parse_optional_session_settings, parse_optional_user_variable_assignment, MySqlSessionSetting,
-    MySqlUserVariableAssignment, MySqlUserVariableValue, SqlModeValue,
+    parse_optional_session_settings, MySqlSessionSetting, MySqlUserVariableAssignment,
+    MySqlUserVariableValue, SqlModeValue,
 };
-pub use session_variables::parse_optional_session_sql_notes;
 pub use shift_moment::shifted_moment;
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{
@@ -1811,8 +1810,12 @@ impl AsRef<str> for MySqlTableName {
 /// connection is selected or changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlAdminCommand {
-    /// Create one logical database.
-    CreateDatabase { name: MySqlDatabaseName },
+    /// Create one logical database, or with `IF NOT EXISTS` leave one that is
+    /// already there as it stands.
+    CreateDatabase {
+        name: MySqlDatabaseName,
+        only_if_missing: bool,
+    },
     /// Drop one logical database.
     DropDatabase { name: MySqlDatabaseName },
     /// Select one logical database for the current session.
@@ -1825,9 +1828,9 @@ impl MySqlAdminCommand {
     /// Returns the command's logical database name, when it has one.
     pub fn name(&self) -> Option<&MySqlDatabaseName> {
         match self {
-            Self::CreateDatabase { name } | Self::DropDatabase { name } | Self::Use { name } => {
-                Some(name)
-            }
+            Self::CreateDatabase { name, .. }
+            | Self::DropDatabase { name }
+            | Self::Use { name } => Some(name),
             Self::ListDatabases => None,
         }
     }

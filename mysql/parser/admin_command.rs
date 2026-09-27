@@ -208,11 +208,14 @@ fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
 
 /// Parses one strict MySQL database-management command.
 ///
-/// The accepted grammar is exactly one of `CREATE DATABASE name`, `DROP
-/// DATABASE name`, `USE name`, or `SHOW DATABASES`, followed by an optional
-/// semicolon. Database options, `IF EXISTS` clauses, comments, qualified
-/// names, and all trailing tokens are rejected. Names are checked and returned
-/// in canonical ASCII-lowercase form.
+/// The accepted grammar is exactly one of `CREATE DATABASE [IF NOT EXISTS]
+/// name [options]`, `DROP DATABASE name`, `USE name`, or `SHOW DATABASES`,
+/// followed by an optional semicolon. A versioned comment MySQL runs is read
+/// as the text it holds, which is how `mysqldump` writes its `CREATE
+/// DATABASE`. Database options naming anything but what every database here
+/// already is, `IF EXISTS` clauses, other comments, qualified names, and all
+/// trailing tokens are rejected. Names are checked and returned in canonical
+/// ASCII-lowercase form.
 pub fn parse_admin_command(
     sql: &str,
     mode: SessionSqlMode,
@@ -231,7 +234,7 @@ pub fn parse_optional_admin_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAdminCommand>, ParseError> {
-    let tokens = tokenize_admin_command(sql, mode)?;
+    let tokens = tokenize_versioned_admin_command(sql, mode)?;
     let mut cursor = skip_admin_comments(&tokens, 0);
     let had_leading_comment = cursor != 0;
     let Some(kind) = admin_statement_kind(&tokens, &mut cursor)? else {
@@ -243,9 +246,21 @@ pub fn parse_optional_admin_command(
         });
     }
     let command = match kind {
-        AdminStatementKind::CreateDatabase => MySqlAdminCommand::CreateDatabase {
-            name: consume_admin_database_name(&tokens, &mut cursor)?,
-        },
+        AdminStatementKind::CreateDatabase => {
+            let only_if_missing = consume_admin_word(&tokens, &mut cursor, "IF");
+            if only_if_missing
+                && !(consume_admin_word(&tokens, &mut cursor, "NOT")
+                    && consume_admin_word(&tokens, &mut cursor, "EXISTS"))
+            {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            let name = consume_admin_database_name(&tokens, &mut cursor)?;
+            consume_database_options(&tokens, &mut cursor)?;
+            MySqlAdminCommand::CreateDatabase {
+                name,
+                only_if_missing,
+            }
+        }
         AdminStatementKind::DropDatabase => MySqlAdminCommand::DropDatabase {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
         },
@@ -264,6 +279,56 @@ pub fn parse_optional_admin_command(
     Ok(Some(command))
 }
 
+/// Reads the options of a `CREATE DATABASE`, taking only the ones that name
+/// what every database here already is.
+///
+/// Measured on MySQL 8.4.11: each may start with `DEFAULT`, take an `=`, be
+/// written in any order and more than once, and a name may be bare, quoted
+/// with backticks or a string; `SHOW CREATE DATABASE` then prints `DEFAULT
+/// CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci` and `DEFAULT
+/// ENCRYPTION='N'`. A database here keeps no character set, collation or
+/// encryption of its own: a table made in it without a collation of its own
+/// is `utf8mb4_0900_ai_ci`, as a table made in such a MySQL database is, so
+/// that is the one database collation that can be kept. Prisma and Laravel
+/// create theirs under `utf8mb4_unicode_ci`, and MySQL then gives every
+/// table made there that collation, which this refuses rather than breaks.
+fn consume_database_options(tokens: &[AdminToken], cursor: &mut usize) -> Result<(), ParseError> {
+    loop {
+        let _ = consume_admin_word(tokens, cursor, "DEFAULT");
+        let named = if consume_admin_word(tokens, cursor, "CHARACTER") {
+            if !consume_admin_word(tokens, cursor, "SET") {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            "utf8mb4"
+        } else if consume_admin_word(tokens, cursor, "CHARSET") {
+            "utf8mb4"
+        } else if consume_admin_word(tokens, cursor, "COLLATE") {
+            "utf8mb4_0900_ai_ci"
+        } else if consume_admin_word(tokens, cursor, "ENCRYPTION") {
+            "N"
+        } else {
+            return Ok(());
+        };
+        if matches!(tokens.get(*cursor), Some(AdminToken::Equals)) {
+            *cursor += 1;
+        }
+        let value = match tokens.get(*cursor) {
+            Some(
+                AdminToken::Word(value)
+                | AdminToken::QuotedIdentifier(value)
+                | AdminToken::StringLiteral(value),
+            ) => value,
+            _ => return Err(ParseError::ExpectedAdminCommand),
+        };
+        if !value.eq_ignore_ascii_case(named) {
+            return Err(ParseError::Unsupported {
+                feature: "database character set, collation or encryption this server cannot keep",
+            });
+        }
+        *cursor += 1;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AdminToken {
     Word(String),
@@ -279,6 +344,7 @@ pub(crate) enum AdminToken {
     RightParen,
     Star,
     At,
+    Equals,
     Comment,
     Other,
 }
@@ -295,28 +361,61 @@ pub(crate) fn tokenize_admin_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<AdminToken>, ParseError> {
-    tokenize_admin_command_with_local_comment(sql, mode, false)
+    tokenize_admin_text(sql, mode, VersionedComments::Kept)
+}
+
+/// Tokenizes a statement reading every versioned comment MySQL would run as
+/// the text it holds.
+pub(crate) fn tokenize_versioned_admin_command(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<AdminToken>, ParseError> {
+    tokenize_admin_text(sql, mode, VersionedComments::Expanded)
 }
 
 pub(crate) fn tokenize_lock_tables_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<AdminToken>, ParseError> {
-    tokenize_admin_command_with_local_comment(sql, mode, true)
+    tokenize_admin_text(sql, mode, VersionedComments::MysqldumpLocal)
 }
 
-fn tokenize_admin_command_with_local_comment(
+/// What the tokenizer makes of a `/*!NNNNN ... */` comment, which MySQL runs
+/// on any server at or past the version it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionedComments {
+    /// Every comment is one [`AdminToken::Comment`].
+    Kept,
+    /// `/*!32311 LOCAL */`, which `mysqldump` writes into `LOCK TABLES`, is
+    /// the word it holds; every other comment is kept.
+    MysqldumpLocal,
+    /// Every versioned comment this server's version runs is read as the text
+    /// it holds.
+    Expanded,
+}
+
+/// The version `/*!NNNNN ... */` is compared with: MySQL 8.4.11, the one this
+/// server answers as.
+const MYSQL_VERSION_ID: u32 = 80_411;
+
+fn tokenize_admin_text(
     sql: &str,
     mode: SessionSqlMode,
-    expand_mysqldump_local: bool,
+    versioned_comments: VersionedComments,
 ) -> Result<Vec<AdminToken>, ParseError> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut cursor = 0;
+    let mut inside_versioned_comment = false;
     while cursor < bytes.len() {
         let byte = bytes[cursor];
         if byte.is_ascii_whitespace() {
             cursor += 1;
+            continue;
+        }
+        if inside_versioned_comment && sql[cursor..].starts_with("*/") {
+            inside_versioned_comment = false;
+            cursor += 2;
             continue;
         }
         if byte == b'#'
@@ -324,10 +423,19 @@ fn tokenize_admin_command_with_local_comment(
             || (byte == b'/' && bytes.get(cursor + 1) == Some(&b'*'))
         {
             const MYSQLDUMP_LOCAL: &str = "/*!32311 LOCAL */";
-            if expand_mysqldump_local && sql[cursor..].starts_with(MYSQLDUMP_LOCAL) {
+            if versioned_comments == VersionedComments::MysqldumpLocal
+                && sql[cursor..].starts_with(MYSQLDUMP_LOCAL)
+            {
                 tokens.push(AdminToken::Word("LOCAL".to_owned()));
                 cursor += MYSQLDUMP_LOCAL.len();
                 continue;
+            }
+            if versioned_comments == VersionedComments::Expanded && !inside_versioned_comment {
+                if let Some(body) = versioned_comment_body(sql, cursor) {
+                    inside_versioned_comment = true;
+                    cursor = body;
+                    continue;
+                }
             }
             tokens.push(AdminToken::Comment);
             cursor = consume_admin_comment(bytes, cursor);
@@ -395,11 +503,40 @@ fn tokenize_admin_command_with_local_comment(
             b')' => AdminToken::RightParen,
             b'*' => AdminToken::Star,
             b'@' => AdminToken::At,
+            b'=' => AdminToken::Equals,
             _ => AdminToken::Other,
         });
         cursor += 1;
     }
+    if inside_versioned_comment {
+        return Err(ParseError::Sqlparser(
+            "unterminated versioned comment".to_string(),
+        ));
+    }
     Ok(tokens)
+}
+
+/// Returns where the text of a versioned comment starting at `cursor` begins,
+/// when it is one this server's version runs.
+///
+/// MySQL writes the version as five digits, or none for a comment every
+/// version runs.
+fn versioned_comment_body(sql: &str, cursor: usize) -> Option<usize> {
+    let after_mark = cursor + sql[cursor..].strip_prefix("/*!").map(|_| 3)?;
+    let digits = sql[after_mark..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    match digits {
+        0 => Some(after_mark),
+        5 => {
+            let version: u32 = sql[after_mark..after_mark + 5]
+                .parse()
+                .expect("five ASCII digits are a number");
+            (version <= MYSQL_VERSION_ID).then_some(after_mark + 5)
+        }
+        _ => None,
+    }
 }
 
 /// Reads one MySQL string literal and returns its value and the byte after it.

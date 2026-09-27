@@ -2146,7 +2146,22 @@ connection with `SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'`. The
 connection keeps `utf8mb4_general_ci`, the collation the handshake sends,
 until the session names another, and a `SET NAMES` without a collation goes
 back to it, where MySQL 8.4 would go to `utf8mb4_0900_ai_ci`. Any other
-character set or collation is refused.
+character set or collation is refused, but for latin1 below.
+
+`SET character_set_client`, `character_set_results` and `collation_connection`
+also take `latin1` and `latin1_swedish_ci`, which is what a dump sets around
+every view whose creator's client was left at its default — measured, the
+`mysql` client in the 8.4.11 image is. latin1's first 128 characters are
+ASCII's, as utf8mb4's are, so while the session names latin1 for what it sends
+or for its connection a statement written in ASCII is taken and one with any
+other byte is refused, since latin1 reads that byte as another character; the
+view text a dump writes is ASCII. While it names latin1 for its results, a
+statement answering rows is refused rather than sent in utf8mb4, and a prepared
+statement is refused while any of the three names latin1. Each reads back as
+named, and `SET NAMES utf8mb4` or the dump's own restoring `SET` ends it. A
+view made in that window is kept with no record of the latin1: MySQL's
+`information_schema.VIEWS` reports `latin1` and `latin1_swedish_ci` for it,
+and this server's reports utf8mb4.
 
 Measured on MySQL 8.4.11: the connection's collation is what every text column
 of a result reports — 224 under `utf8mb4_unicode_ci`, 255 under
@@ -2181,7 +2196,15 @@ there leaves the value alone and the empty entries it leaves are dropped.
 One `SET` may make several assignments separated by commas — Rails sends
 `SET NAMES utf8mb4, @@SESSION.sql_mode = ..., @@SESSION.wait_timeout = ...` —
 and, measured on 8.4.11, when one of them fails none takes effect, which is
-what happens here. A scope word holds for the assignments after it until
+what happens here. A user variable may be set beside the settings, which is how
+a standard `mysqldump` saves each one it changes —
+`SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0` — and every value is
+read before any is assigned: measured, `SET @a = '+01:00', time_zone = @a`
+finds the `@a` in force before the statement. `time_zone`,
+`foreign_key_checks`, `unique_checks`, `sql_notes`, `sql_mode` and the three
+character-set names each take a user variable's value, which is how the dump
+puts them back; a switch takes a variable holding 0 or 1 and a zone one holding
+a word, and anything else is refused where MySQL answers 1231. A scope word holds for the assignments after it until
 another is written, so `SET GLOBAL a = 0, b = 0` sets both globally there;
 nothing here can change another session, so a global assignment, written as a
 word or as `@@GLOBAL.`, is refused.
@@ -2821,6 +2844,37 @@ transaction. A DDL statement is not held to it, because it commits what came
 before and so leaves the read-only transaction before it runs; measured,
 `START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken there too.
 `READ WRITE` is the default spelled out and changes nothing.
+
+A standard `mysqldump --databases` restores through the `mysql` client
+statement by statement, and every statement MySQL 8.4.11's writes for a schema
+of counted tables, a foreign key, `JSON`, `DECIMAL` defaults, `utf8mb4_unicode_ci`
+and `utf8mb4_0900_ai_ci` tables, a trigger and a view is taken; the rows read
+back as they were dumped. Besides the settings above, that takes three forms.
+
+`CREATE DATABASE` takes `IF NOT EXISTS`, which over a database already there
+answers OK with note 1007, and the database options, each of which may start
+with `DEFAULT`, take an `=`, come in any order and name its value bare, in
+backticks or as a string, all measured. A database here keeps no character
+set, collation or encryption of its own, and a table made in it without a
+collation is `utf8mb4_0900_ai_ci`, as one made in a MySQL database of that
+collation is; so `CHARACTER SET utf8mb4`, `COLLATE utf8mb4_0900_ai_ci` and
+`ENCRYPTION 'N'` are taken, and any other value is refused. That refuses the
+`utf8mb4_unicode_ci` Prisma and Laravel create theirs with: MySQL gives every
+table made there that collation. A versioned comment is read as the text it
+holds, the way `mysqldump` writes the statement:
+``CREATE DATABASE /*!32312 IF NOT EXISTS*/ `probe` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */``.
+
+`ALTER TABLE t DISABLE KEYS` and `ENABLE KEYS`, which a dump writes around
+every table's rows, answer OK with note 1031, `Table storage engine for 't'
+doesn't have this option`, as InnoDB's do, measured; a name that is not there
+answers 1146, and a view, which MySQL answers 1347, is refused.
+
+The placeholder view a dump writes first — `SELECT 1 AS name, ...` — is
+replaced by the real one at the end, and the real one arrives as three
+versioned comments across three lines, which is read as one `CREATE VIEW`
+naming its `DEFINER`. A view or trigger whose `DEFINER` is another account than
+the one restoring is refused, as MySQL refuses it to an account without
+`SET_ANY_DEFINER`.
 
 `START TRANSACTION WITH CONSISTENT SNAPSHOT` is taken, which is what
 `mysqldump --single-transaction` opens with — inside the versioned comment
@@ -3558,7 +3612,7 @@ previous statement without clearing them.
 `SELECT @@name` answers the variables this server has an honest answer for and refuses the
 rest, which is the same rule `SHOW VARIABLES` follows. Every client opens by reading a handful
 of them, so refusing them all ends a connection before any work starts. Taken: `@@version` and
-`@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@foreign_key_checks`,
+`@@version_comment`, `@@sql_mode`, `@@autocommit`, `@@sql_notes`, `@@foreign_key_checks`, `@@unique_checks`,
 `@@max_allowed_packet` and `@@wait_timeout`, the five `@@character_set_*` names, the three
 `@@collation_*` names, `@@system_time_zone` and `@@time_zone`, `@@transaction_isolation`,
 `@@auto_increment_increment` and `@@auto_increment_offset`, `@@interactive_timeout`,
@@ -3637,7 +3691,7 @@ and `@@default_storage_engine` reads `InnoDB`.
 
 Their shapes are measured on 8.4.11: a word answers the same `VAR_STRING` of length 87380 with
 31 decimals and no flags that `@@version` does; `@@autocommit`, `@@sql_notes` and
-`@@foreign_key_checks`, `@@sql_auto_is_null` and `@@sql_safe_updates` answer a `LONGLONG` of length 1 carrying the binary and numeric flags; and `@@max_allowed_packet` and
+`@@foreign_key_checks`, `@@unique_checks`, `@@sql_auto_is_null` and `@@sql_safe_updates` answer a `LONGLONG` of length 1 carrying the binary and numeric flags; and `@@max_allowed_packet` and
 `@@wait_timeout` answer a `LONGLONG` of length 21 carrying those and the unsigned flag. The
 two counters answer this server's own values rather than MySQL's defaults, which is what makes
 them honest.
@@ -3647,15 +3701,26 @@ parent that is there. It is the first thing a fixture loader says and the first
 thing a dumped schema says, both of them writing rows in an order no foreign key
 would allow, so refusing it stopped the load at its first statement. Unlike the
 other settings this takes, it is not a restatement of what the server already
-does: the engine has the same switch, and it is turned.
+does: the engine has the same switch, and it is turned. A standard dump turns
+it off before its `CREATE DATABASE` and `USE`, so a connection `USE` or
+`COM_INIT_DB` opens is given the switch, the lock wait and the zone the session
+set before it had one; without that, a dump's rows for a child table, written
+before its parent in name order, were refused.
 
 Measured on 8.4.11 and matched: the switch reads 1 to begin with, a child row
 pointing nowhere is refused while it is on, turning it off lets that row in,
 turning it back on leaves the row where it is rather than looking at it again,
 and the next row pointing nowhere is refused again. `OFF` and `ON` say what 0
 and 1 say and read back as them. A value that is neither is refused, where MySQL
-answers 1231. `unique_checks` is refused: MySQL lets duplicate rows into a
-unique index while it is off, and there is no honest way to say that here.
+answers 1231.
+
+`SET unique_checks` takes 0, 1, `OFF` and `ON`, and `@@unique_checks` reads it
+back. It changes nothing here, which is what it changes in MySQL 8.4 as
+configured by default: InnoDB skips a uniqueness check only for a row it
+buffers in the change buffer, and `innodb_change_buffering` is `none` from 8.4
+on. Measured on 8.4.11: with it off, a second row with a key already there is
+refused with 1062, into a unique secondary index and into the primary key
+alike.
 
 `CREATE TABLE IF NOT EXISTS` is what an idempotent setup script writes, and it
 was refused outright. MySQL leaves a table that is already there exactly as it
@@ -4419,7 +4484,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | Unsigned integers and `DECIMAL` | partial | partial | partial | partial | partial | [D004 plan](../docs/mysql-compatibility-plan.md), [`DECIMAL` parser](parser/lib.rs), [`exact numeric core`](../core/numeric/decimal.rs) | Fresh `DECIMAL(p,s)` and unsigned columns use exact blobs with declared scale, half-away-from-zero assignment rounding, precision errors, indexed comparisons and ordering, exact `SUM`/`AVG`, and text/prepared output. Projection arithmetic takes a known decimal column or aggregate with a numeric literal through `+`, `-`, `*` or `/`, and known integer columns or aggregates through `+`, `-` or `*`. DECIMAL with a FLOAT/DOUBLE column is refused until mixed precision is implemented. `UPDATE` and `ON DUPLICATE KEY UPDATE` arithmetic with a DECIMAL target keep written and bound decimal operands exact; division by a written nonzero integer is exact. Zero and reversed division and nested or untyped SELECT decimal forms fail closed. Old binary64 decimal tables cannot recover their digits and must be re-imported. Full-range `BIGINT UNSIGNED` storage, indexed comparisons, prepared values, and binary results are covered; mixed signed comparisons and some expression forms remain refused. |
 | `utf8mb4_0900_ai_ci` comparisons | partial | partial | partial | partial | partial | [frozen UCA9 weights](../core/translate/mysql_uca9.rs), [data generator](../core/translate/generate_mysql_uca9.py), [license](../licenses/core/unicode-data-license.md), [collation oracle case](conformance/cases/p0/collation-utf8mb4-0900-ai-ci.json) | New v3 text tables use frozen Unicode 9 primary weights for comparison, sort keys, equality hashes, indexes, uniqueness, and `LIKE`. Explicit `utf8mb4_bin` comparisons use byte order with PAD SPACE. The UCA weight data and schema version are fixed so reopening a new table preserves its ordering. Existing v1/v2 text tables need a rebuild and fail closed; unsupported collation forms also fail closed. |
 | `utf8mb4_unicode_ci` comparisons | partial | partial | partial | partial | partial | [frozen UCA 4.0.0 weights](../core/translate/mysql_uca400.rs), [data generator](../core/translate/generate_mysql_uca400.py), [license](../licenses/core/unicode-data-license.md), [Laravel and Prisma tables](server/src/frontend_adapter/tests/unicode_collation.rs) | A column or table declared `utf8mb4_unicode_ci` compares, sorts, hashes, indexes, keeps keys unique and matches `LIKE` under Unicode 4.0.0 primary weights with PAD SPACE, checked against MySQL's `WEIGHT_STRING()` for every BMP character. `FIELD`, `GREATEST`, `LEAST`, `NULLIF`, and ordering by or comparing a text-answering call over one, are refused. |
-| `SET foreign_key_checks` | yes | yes | n/a | n/a | yes | [`setting reader`](parser/session_settings.rs), [`session variables`](server/src/session_variables.rs), [oracle case](conformance/cases/p0/session-foreign-key-checks.json), [P0 manifest](conformance/Makefile) | The switch is really turned: the engine has the same one, so a row written while it is off may name a parent that is not there. `0`, `1`, `OFF` and `ON` are all taken, under the bare and `SESSION` spellings, and `SELECT @@foreign_key_checks` reads it back. Turning it back on leaves a row written while it was off where it is, which is what MySQL does. A value that is neither is refused where MySQL answers 1231, and `unique_checks` is refused outright. |
+| `SET foreign_key_checks` | yes | yes | n/a | n/a | yes | [`setting reader`](parser/session_settings.rs), [`session variables`](server/src/session_variables.rs), [oracle case](conformance/cases/p0/session-foreign-key-checks.json), [P0 manifest](conformance/Makefile) | The switch is really turned: the engine has the same one, so a row written while it is off may name a parent that is not there. `0`, `1`, `OFF` and `ON` are all taken, under the bare and `SESSION` spellings, and `SELECT @@foreign_key_checks` reads it back. Turning it back on leaves a row written while it was off where it is, which is what MySQL does. A value that is neither is refused where MySQL answers 1231. A connection `USE` opens afterwards is given the switch. |
 | `AUTO_INCREMENT` / `LAST_INSERT_ID()` | partial | partial | partial | partial | experimental | [`checked parser`](parser/lib.rs), [`schema envelope`](frontend/schema_sql.rs), [`durable range primitive`](../core/storage/auto_increment.rs), [sequential](conformance/cases/p0/auto-increment.json), [parallel](conformance/cases/p0/auto-increment-parallel.json), [restart](conformance/cases/p0/auto-increment-restart.json), [key clause](conformance/cases/p0/create-counted-key-clause.json), [foreign key](conformance/cases/p0/create-counted-foreign-key.json), [bigint](conformance/cases/p0/create-bigint-counter.json) oracle cases | The checked v3 form accepts exactly one `INT`/`INTEGER`/`BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY`, with `INT UNSIGNED` and `BIGINT UNSIGNED` spellings. The key may be written on the column or as a `PRIMARY KEY (col)` clause of its own, the spelling a dumped schema carries, and the column's attributes may come in any order — Django writes `bigint AUTO_INCREMENT NOT NULL PRIMARY KEY` — as MySQL takes them, measured on 8.4.11. Signed and `INT UNSIGNED` keys use a non-`sqlite_sequence` rowid alias; `BIGINT UNSIGNED` uses a separate `mysql_uint64` primary key, and is creatable, reopenable, and replayable through the identity-backed embedded frontend. Registry-selected embedded sessions reserve one durable contiguous range at execute time for unqualified INSERTs with an explicit non-ID column list and VALUES rows of direct literals and the clock readings an ordinary INSERT takes, and for `INSERT ... SELECT` copies, which reserve the batches of numbers MySQL spends on them. Prepared execution additionally accepts bare `?` values in that same omitted-ID `VALUES` shape: preparation does not reserve, and execution rechecks identity and triggers before reserving, injecting, repreparing, binding, and writing. Rollback and failed execution do not reclaim a durable range; the first generated ID is recorded only after a successful write and remains connection-local across failure and rollback, including across `USE` database switches. The checked `SELECT LAST_INSERT_ID()` path reads that live state through embedded and current protocol SELECT paths. Narrow text and prepared protocol INSERT paths return affected rows and the first generated ID in their OK packets. A marked table takes an `ALTER TABLE` that leaves its counted column alone, and the column keeps the type it was declared with across one: measured on 8.4.11, a `bigint` key is still a `bigint` after a column is added, placed, restated, renamed or dropped, and an `int unsigned` one still `int unsigned`. Named or numbered markers, expressions, explicit allocator columns, qualified names, `TEMPORARY`, wider INSERT forms, explicit exhaustion handling, and direct connections without an allocator capability remain gated. |
 | Checked one-table `UPDATE` | partial | partial | experimental | partial | experimental | [`checked parser`](parser/lib.rs), [`frontend affected rows`](frontend/session.rs), [`core changed-row counter`](../core/connection.rs), [`frontend adapter`](server/src/frontend_adapter.rs) | One unqualified table with no alias, joins, `FROM`, optimizer hints, `RETURNING`, or conflict clause. `ORDER BY` and `LIMIT` are supported via a rowid subquery over integer columns; bare `LIMIT` without `ORDER BY` and non-integer ordering are rejected. Assignment values and predicates use the existing conservative DML forms. Text and prepared protocol execution return bounded OK results. The default affected-row count is rows whose stored key or record changed. `CLIENT_FOUND_ROWS` reports predicate-matched rows instead. Core updates this separate success-only counter for both WAL and MVCC execution, without changing SQLite `changes()`. Multi-table and wider expression forms remain rejected. |
 | Classic packet framing and handshake | n/a | n/a | experimental | experimental | partial | [`mysql/server`](server/src/lib.rs), [`connection state`](server/src/connection_state.rs), [`complete-frame owner`](server/src/orchestrator.rs), [`Unix protocol owner`](server/src/runtime_unix_connection.rs), [`TCP connection foundation`](server/src/runtime_tcp_connection.rs), [`TCP server`](server/src/runtime_tcp_server.rs), [`Unix server`](server/src/runtime_unix_server.rs) | Bounded codecs, stream boundaries, atomic response batches, and a transport-neutral complete-frame owner exist. Result sets reject a column count above the protocol limit before text or binary encoding. The packet writer bounds batch staging by queued frame and byte limits and leaves the queue unchanged when a batch is rejected. The same-UID Unix boundary drives it as an already-secure transport without advertising `CLIENT_SSL`; the supervised TCP server owns the bounded accept/reaper lifecycle and the crate-private TCP owner performs the mandatory TLS transition before authentication. The standalone runtime exposes a TCP CLI whose `--listen IP:PORT` mode requires both `--tls-cert PATH` and `--tls-key PATH` and conflicts with Unix socket flags; the checked-in privileged `mysql_async` TCP E2E is wired into CI, and the final recorded privileged Linux gate passed it. Global connection authorization and optional authorized initial-database selection must succeed before fast/full authentication emits its final OK; failure emits a fixed 1045 ERR and closes. Payloads are capped at 4,096 bytes, decoder feeds emit at most 16 packets at a time without rejecting a larger valid coalesced read, and accepted response-packet limits are at least 4,096 bytes. |

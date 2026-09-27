@@ -6609,6 +6609,7 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
         parse_admin_command("CREATE DATABASE Reports;", SessionSqlMode::default()).unwrap(),
         MySqlAdminCommand::CreateDatabase {
             name: MySqlDatabaseName::parse("reports").unwrap(),
+            only_if_missing: false,
         }
     );
     assert_eq!(
@@ -7608,9 +7609,9 @@ fn rejects_comments_options_qualified_names_and_trailing_junk() {
         "CREATE DATABASE reports -- hidden",
         "CREATE DATABASE reports # hidden",
         "CREATE DATABASE reports /* hidden */",
-        "CREATE DATABASE reports CHARACTER SET utf8mb4",
+        "CREATE DATABASE reports CHARACTER SET utf8mb4 /* hidden */",
         "DROP DATABASE IF EXISTS reports",
-        "CREATE DATABASE IF NOT EXISTS reports",
+        "CREATE DATABASE IF EXISTS reports",
         "USE tenant.reports",
         "CREATE DATABASE reports; DROP DATABASE other",
         "USE reports garbage",
@@ -7625,6 +7626,71 @@ fn rejects_comments_options_qualified_names_and_trailing_junk() {
         parse_admin_command("USE reports garbage", SessionSqlMode::default()),
         Err(ParseError::TrailingAdminCommandTokens)
     );
+}
+
+/// `mysqldump` writes its `CREATE DATABASE` inside versioned comments, and
+/// Prisma and Laravel name a character set and collation. Measured on MySQL
+/// 8.4.11: each option may start with `DEFAULT`, take an `=`, come in any
+/// order, and name its value bare, in backticks or as a string.
+#[test]
+fn reads_create_database_with_the_options_every_database_here_has() {
+    let mode = SessionSqlMode::default();
+    for (sql, name, only_if_missing) in [
+        (
+            "CREATE DATABASE /*!32312 IF NOT EXISTS*/ `probe` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='N' */",
+            "probe",
+            true,
+        ),
+        ("CREATE DATABASE IF NOT EXISTS other", "other", true),
+        (
+            "create database `laravel` default character set `utf8mb4` default collate `utf8mb4_0900_ai_ci`",
+            "laravel",
+            false,
+        ),
+        (
+            "CREATE DATABASE o3 CHARSET = 'utf8mb4' COLLATE = 'utf8mb4_0900_ai_ci' ENCRYPTION 'N';",
+            "o3",
+            false,
+        ),
+        (
+            "/*!40000 CREATE DATABASE o4 COLLATE utf8mb4_0900_ai_ci CHARACTER SET utf8mb4 */",
+            "o4",
+            false,
+        ),
+    ] {
+        assert_eq!(
+            parse_admin_command(sql, mode),
+            Ok(MySqlAdminCommand::CreateDatabase {
+                name: MySqlDatabaseName::parse(name).unwrap(),
+                only_if_missing,
+            }),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE DATABASE prisma CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        "create database `l` default character set `utf8mb4` default collate `utf8mb4_unicode_ci`",
+        "CREATE DATABASE l1 CHARACTER SET latin1",
+        "CREATE DATABASE l2 CHARSET utf8",
+        "CREATE DATABASE e1 ENCRYPTION 'Y'",
+    ] {
+        assert!(
+            matches!(
+                parse_admin_command(sql, mode),
+                Err(ParseError::Unsupported { .. })
+            ),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE DATABASE /*!99999 IF NOT EXISTS*/ future",
+        "CREATE DATABASE /*!32312 IF NOT EXISTS future",
+        "CREATE DATABASE c CHARACTER utf8mb4",
+        "CREATE DATABASE c CHARACTER SET + utf8mb4",
+        "CREATE DATABASE IF EXISTS c",
+    ] {
+        assert!(parse_admin_command(sql, mode).is_err(), "{sql}");
+    }
 }
 
 #[test]
@@ -7659,6 +7725,7 @@ fn optionally_parses_only_the_network_admin_surface() {
         parse_optional_admin_command("CREATE DATABASE reports", mode),
         Ok(Some(MySqlAdminCommand::CreateDatabase {
             name: MySqlDatabaseName::parse("reports").unwrap(),
+            only_if_missing: false,
         }))
     );
     assert_eq!(

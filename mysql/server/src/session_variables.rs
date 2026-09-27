@@ -2,11 +2,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use turso_mysql_parser::{
-    parse_optional_select_database, parse_optional_session_settings,
-    parse_optional_session_sql_notes, parse_optional_show_variables,
-    parse_optional_system_variable_query, parse_optional_user_variable_assignment,
-    parse_optional_user_variable_query, MySqlSelectDatabaseQuery, MySqlSessionSetting,
-    MySqlShowVariablesCommand, MySqlSystemVariableQuery, MySqlSystemVariableRead,
+    parse_optional_select_database, parse_optional_session_settings, parse_optional_show_variables,
+    parse_optional_system_variable_query, parse_optional_user_variable_query,
+    MySqlSelectDatabaseQuery, MySqlSessionSetting, MySqlShowVariablesCommand,
+    MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableAssignment,
     MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
 };
 
@@ -29,6 +28,17 @@ use crate::{
 
 /// The character set this server speaks, and the only one it takes.
 const SERVER_CHARACTER_SET: &str = "utf8mb4";
+
+/// The one other character set a session may name for what it sends, what it
+/// is sent and its connection, which is what a view carries in a dump.
+///
+/// Its first 128 characters are ASCII's, as utf8mb4's are, so a statement in
+/// ASCII reads the same under either and is the only kind taken while it is
+/// named; a result is refused rather than sent in it.
+const LATIN1_CHARACTER_SET: &str = "latin1";
+
+/// latin1's default collation, which `mysqldump` names beside it.
+const LATIN1_COLLATION: &str = "latin1_swedish_ci";
 
 /// The collations a session may run its connection on.
 ///
@@ -87,11 +97,31 @@ const SERVER_TIME_ZONE_AT_THE_START: &str = "SYSTEM";
 /// The licence this repository carries. MySQL's own answer is `GPL`.
 const SERVER_LICENSE: &str = "MIT";
 
+/// One assignment of a `SET`, read and checked but not applied yet.
+enum CheckedAssignment {
+    Setting(MySqlSessionSetting),
+    UserVariable {
+        name: String,
+        value: MySqlUserVariableValue,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
     /// Whether a row this session writes has to name a parent that is there.
     foreign_key_checks: bool,
+    /// What `@@unique_checks` reads back. Measured on MySQL 8.4.11 with its
+    /// default `innodb_change_buffering=none`: a duplicate key is refused with
+    /// 1062 while it is off as while it is on, which is what this server does
+    /// whatever it says.
+    unique_checks: bool,
+    /// Whether the session named latin1 for the statements it sends.
+    latin1_client: bool,
+    /// Whether the session named latin1 for the results it is sent.
+    latin1_results: bool,
+    /// Whether the session named latin1 for its connection.
+    latin1_connection: bool,
     raw_character_set_results: bool,
     binary_character_set_results: bool,
     /// A foreign-key switch this session asked for and the caller has not
@@ -105,6 +135,9 @@ pub(crate) struct MySqlSessionVariables {
     user_variables: HashMap<String, MySqlUserVariableValue>,
     /// A lock wait this session asked for and the caller has not applied yet.
     lock_wait_timeout: Option<Duration>,
+    /// The lock wait this session last asked for, which every connection it
+    /// opens afterwards is given.
+    lock_wait: Option<Duration>,
     /// The zone the client last named, as MySQL reads it back.
     ///
     /// Fixed offsets affect TIMESTAMP values in the current session.
@@ -150,11 +183,16 @@ impl Default for MySqlSessionVariables {
         Self {
             sql_notes: true,
             foreign_key_checks: true,
+            unique_checks: true,
+            latin1_client: false,
+            latin1_results: false,
+            latin1_connection: false,
             raw_character_set_results: false,
             binary_character_set_results: false,
             pending_foreign_key_checks: None,
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
+            lock_wait: None,
             time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
             transaction_isolation: MySqlIsolationLevel::default(),
             next_transaction_isolation: None,
@@ -207,6 +245,31 @@ impl MySqlSessionVariables {
         self.lock_wait_timeout.take()
     }
 
+    /// Whether a row this session writes has to name a parent that is there,
+    /// which a connection the session opens later is given too.
+    pub(crate) const fn foreign_key_checks(&self) -> bool {
+        self.foreign_key_checks
+    }
+
+    /// The lock wait this session asked for, which a connection the session
+    /// opens later is given too.
+    pub(crate) const fn lock_wait(&self) -> Option<Duration> {
+        self.lock_wait
+    }
+
+    /// Whether a statement has to be ASCII to be read as the session meant it:
+    /// under latin1 a byte past 127 is a different character from the one
+    /// utf8mb4 reads there, and a character latin1 lacks turns into `?`.
+    pub(crate) const fn reads_statements_as_latin1(&self) -> bool {
+        self.latin1_client || self.latin1_connection
+    }
+
+    /// Whether the session asked for its results in latin1, which this server
+    /// does not convert them to.
+    pub(crate) const fn wants_latin1_results(&self) -> bool {
+        self.latin1_results
+    }
+
     /// Takes the foreign-key switch this session last asked for, if it asked
     /// since this was last read.
     ///
@@ -232,64 +295,23 @@ impl MySqlSessionVariables {
             Err(_) => return Err(FrontendErrorKind::Syntax),
         };
         if let Some(assignments) = parsed {
-            // Measured on MySQL 8.4.11: when one assignment of a `SET` fails,
-            // none of them takes effect, so every one is checked before any is
-            // applied.
+            // Measured on MySQL 8.4.11: every value a `SET` names is read
+            // before any is assigned — `SET @a = '+01:00', time_zone = @a`
+            // finds @a as it stood before the statement — and when one
+            // assignment fails, none of them takes effect.
             let assignments = assignments
                 .into_iter()
                 .map(|setting| {
-                    let setting = self.resolve_dump_session_setting(setting)?;
-                    let setting = self.resolve_sql_mode_expression(setting, session_sql_mode);
-                    accept_session_setting(&setting, session_sql_mode, status_flags)?;
-                    Ok(setting)
+                    self.checked_assignment(setting, settings, session_sql_mode, status_flags)
                 })
                 .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
-            for setting in assignments {
-                self.apply_session_setting(setting);
-            }
-            return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
-                status_flags,
-                ..CommandOkResult::default()
-            })));
-        }
-        if let Some(assignments) = parse_optional_user_variable_assignment(sql, session_sql_mode)
-            .map_err(|_| FrontendErrorKind::Syntax)?
-        {
             for assignment in assignments {
-                let value = if let Some(name) = assignment.system_variable() {
-                    if ![
-                        "character_set_client",
-                        "character_set_results",
-                        "collation_connection",
-                        "sql_mode",
-                    ]
-                    .contains(&name)
-                    {
-                        return Err(FrontendErrorKind::UnknownSystemVariable);
+                match assignment {
+                    CheckedAssignment::Setting(setting) => self.apply_session_setting(setting),
+                    CheckedAssignment::UserVariable { name, value } => {
+                        self.user_variables.insert(name, value);
                     }
-                    if name == "character_set_results" && self.raw_character_set_results {
-                        MySqlUserVariableValue::Null
-                    } else if name == "character_set_results" && self.binary_character_set_results {
-                        MySqlUserVariableValue::Text("binary".to_owned())
-                    } else {
-                        MySqlUserVariableValue::Text(
-                            worded_system_variable(name, session_sql_mode, self)
-                                .ok_or(FrontendErrorKind::UnknownSystemVariable)?,
-                        )
-                    }
-                } else if let Some(name) = assignment.user_variable() {
-                    self.user_variables
-                        .get(name)
-                        .cloned()
-                        .unwrap_or(MySqlUserVariableValue::Null)
-                } else {
-                    assignment
-                        .literal_value()
-                        .expect("assignment source is one of literal, system or user variable")
-                        .clone()
-                };
-                self.user_variables
-                    .insert(assignment.name().to_owned(), value);
+                }
             }
             return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
                 status_flags,
@@ -331,18 +353,76 @@ impl MySqlSessionVariables {
                 status_flags,
             )));
         }
-        let enabled = match parse_optional_session_sql_notes(sql, SessionSqlMode::default()) {
-            Ok(Some(enabled)) => enabled,
-            Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
-                return Err(FrontendErrorKind::Unsupported);
+        Ok(None)
+    }
+
+    /// Reads what one assignment of a `SET` names and checks the server can
+    /// keep it, without changing anything yet.
+    fn checked_assignment(
+        &self,
+        setting: MySqlSessionSetting,
+        settings: MySqlBootstrapSettings,
+        session_sql_mode: SessionSqlMode,
+        status_flags: u16,
+    ) -> Result<CheckedAssignment, FrontendErrorKind> {
+        if let MySqlSessionSetting::UserVariable(assignment) = setting {
+            return Ok(CheckedAssignment::UserVariable {
+                name: assignment.name().to_owned(),
+                value: self.assigned_value(
+                    &assignment,
+                    settings,
+                    session_sql_mode,
+                    status_flags,
+                )?,
+            });
+        }
+        let setting = self.resolve_dump_session_setting(setting)?;
+        let setting = self.resolve_sql_mode_expression(setting, session_sql_mode);
+        accept_session_setting(&setting, session_sql_mode, status_flags)?;
+        Ok(CheckedAssignment::Setting(setting))
+    }
+
+    /// The value `SET @name = ...` gives a user variable.
+    ///
+    /// Measured on MySQL 8.4.11: a switch read from `@@name` is held as an
+    /// integer, and a word such as `@@time_zone` as a string.
+    fn assigned_value(
+        &self,
+        assignment: &MySqlUserVariableAssignment,
+        settings: MySqlBootstrapSettings,
+        session_sql_mode: SessionSqlMode,
+        status_flags: u16,
+    ) -> Result<MySqlUserVariableValue, FrontendErrorKind> {
+        if let Some(name) = assignment.system_variable() {
+            if name == "character_set_results" && self.raw_character_set_results {
+                return Ok(MySqlUserVariableValue::Null);
             }
-            Ok(None) | Err(_) => return Ok(None),
-        };
-        self.sql_notes = enabled;
-        Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
-            status_flags,
-            ..CommandOkResult::default()
-        })))
+            if name == "character_set_results" && self.binary_character_set_results {
+                return Ok(MySqlUserVariableValue::Text("binary".to_owned()));
+            }
+            if let Some((value, _, _)) = counted_system_variable(name, settings, status_flags, self)
+            {
+                return Ok(MySqlUserVariableValue::Integer(
+                    value
+                        .parse()
+                        .expect("a system variable answered with a number fits an i64"),
+                ));
+            }
+            return worded_system_variable(name, session_sql_mode, self)
+                .map(MySqlUserVariableValue::Text)
+                .ok_or(FrontendErrorKind::UnknownSystemVariable);
+        }
+        if let Some(name) = assignment.user_variable() {
+            return Ok(self
+                .user_variables
+                .get(name)
+                .cloned()
+                .unwrap_or(MySqlUserVariableValue::Null));
+        }
+        Ok(assignment
+            .literal_value()
+            .expect("assignment source is one of literal, system or user variable")
+            .clone())
     }
 
     /// Applies one assignment that [`accept_session_setting`] has taken.
@@ -353,6 +433,7 @@ impl MySqlSessionVariables {
             }
             MySqlSessionSetting::LockWaitTimeout(seconds) => {
                 self.lock_wait_timeout = Some(Duration::from_secs(seconds));
+                self.lock_wait = Some(Duration::from_secs(seconds));
             }
             MySqlSessionSetting::WaitTimeout(seconds) => {
                 self.wait_timeout = seconds.map(Duration::from_secs);
@@ -361,28 +442,48 @@ impl MySqlSessionVariables {
                 self.foreign_key_checks = enabled;
                 self.pending_foreign_key_checks = Some(enabled);
             }
+            MySqlSessionSetting::UniqueChecks(enabled) => {
+                self.unique_checks = enabled;
+            }
+            MySqlSessionSetting::SqlNotes(enabled) => {
+                self.sql_notes = enabled;
+            }
             MySqlSessionSetting::CharacterSetResultsNull => {
                 self.raw_character_set_results = true;
                 self.binary_character_set_results = false;
+                self.latin1_results = false;
             }
             MySqlSessionSetting::CharacterSetResults(value) => {
                 self.raw_character_set_results = false;
                 self.binary_character_set_results = value.eq_ignore_ascii_case("binary");
+                self.latin1_results = value.eq_ignore_ascii_case(LATIN1_CHARACTER_SET);
+            }
+            MySqlSessionSetting::CharacterSetClient(value) => {
+                self.latin1_client = value.eq_ignore_ascii_case(LATIN1_CHARACTER_SET);
             }
             // Without a collation, the connection keeps the one the handshake
             // named, as it always has here.
             MySqlSessionSetting::Names { collation, .. } => {
                 self.raw_character_set_results = false;
                 self.binary_character_set_results = false;
+                self.latin1_client = false;
+                self.latin1_results = false;
+                self.latin1_connection = false;
                 self.connection_collation = match collation.as_deref() {
                     None => ConnectionCollation::default(),
                     Some(name) => ConnectionCollation::from_name(name)
                         .expect("an accepted collation is one the connection runs on"),
                 };
             }
+            // A latin1 connection leaves the utf8mb4 collation a result's
+            // columns report where it was: measured on MySQL 8.4.11, they
+            // report the one they did before.
             MySqlSessionSetting::CollationConnection(name) => {
-                self.connection_collation = ConnectionCollation::from_name(&name)
-                    .expect("an accepted collation is one the connection runs on");
+                self.latin1_connection = name.eq_ignore_ascii_case(LATIN1_COLLATION);
+                if !self.latin1_connection {
+                    self.connection_collation = ConnectionCollation::from_name(&name)
+                        .expect("an accepted collation is one the connection runs on");
+                }
             }
             MySqlSessionSetting::TimeZone(zone) => {
                 self.time_zone = the_zone_read_back(&zone);
@@ -400,13 +501,14 @@ impl MySqlSessionVariables {
                 }
             }
             MySqlSessionSetting::SqlModeFromUserVariable(_)
-            | MySqlSessionSetting::SqlModeExpression(_) => {
-                unreachable!("a sql_mode is worked out before it is applied")
+            | MySqlSessionSetting::SqlModeExpression(_)
+            | MySqlSessionSetting::FromUserVariable { .. }
+            | MySqlSessionSetting::UserVariable(_) => {
+                unreachable!("a setting read from a variable is worked out before it is applied")
             }
             MySqlSessionSetting::InformationSchemaStatsExpiry(_)
             | MySqlSessionSetting::SqlAutoIsNull(_)
             | MySqlSessionSetting::SqlSafeUpdates(_)
-            | MySqlSessionSetting::CharacterSetClient(_)
             | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
         }
     }
@@ -469,6 +571,27 @@ impl MySqlSessionVariables {
             MySqlSessionSetting::CollationConnection(value) => Ok(
                 MySqlSessionSetting::CollationConnection(self.resolve_dump_word(value)?),
             ),
+            MySqlSessionSetting::FromUserVariable {
+                variable,
+                user_variable,
+            } => {
+                let held = self.user_variables.get(&user_variable);
+                match (variable.as_str(), held) {
+                    ("time_zone", Some(MySqlUserVariableValue::Text(zone))) => {
+                        Ok(MySqlSessionSetting::TimeZone(zone.clone()))
+                    }
+                    (switch, Some(MySqlUserVariableValue::Integer(value @ (0 | 1)))) => {
+                        let enabled = *value == 1;
+                        Ok(match switch {
+                            "foreign_key_checks" => MySqlSessionSetting::ForeignKeyChecks(enabled),
+                            "unique_checks" => MySqlSessionSetting::UniqueChecks(enabled),
+                            "sql_notes" => MySqlSessionSetting::SqlNotes(enabled),
+                            _ => return Err(FrontendErrorKind::Unsupported),
+                        })
+                    }
+                    _ => Err(FrontendErrorKind::Unsupported),
+                }
+            }
             other => Ok(other),
         }
     }
@@ -634,7 +757,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 31] = [
+const SHOWN_VARIABLES: [&str; 32] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -663,6 +786,7 @@ const SHOWN_VARIABLES: [&str; 31] = [
     "time_zone",
     "transaction_isolation",
     "transaction_read_only",
+    "unique_checks",
     "version",
     "version_comment",
     "wait_timeout",
@@ -756,9 +880,15 @@ fn accept_session_setting(
         // apply, and the engine's own switch says exactly what MySQL's does,
         // so both values are taken.
         MySqlSessionSetting::ForeignKeyChecks(_) => Ok(()),
+        MySqlSessionSetting::UniqueChecks(_) | MySqlSessionSetting::SqlNotes(_) => Ok(()),
+        MySqlSessionSetting::UserVariable(_) | MySqlSessionSetting::FromUserVariable { .. } => {
+            unreachable!("a setting read from a variable is worked out before it is checked")
+        }
         MySqlSessionSetting::CharacterSetResultsNull => Ok(()),
         MySqlSessionSetting::CharacterSetClient(value) => {
-            if value.eq_ignore_ascii_case(SERVER_CHARACTER_SET) {
+            if value.eq_ignore_ascii_case(SERVER_CHARACTER_SET)
+                || value.eq_ignore_ascii_case(LATIN1_CHARACTER_SET)
+            {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -767,6 +897,7 @@ fn accept_session_setting(
         MySqlSessionSetting::CharacterSetResults(value) => {
             if value.eq_ignore_ascii_case(SERVER_CHARACTER_SET)
                 || value.eq_ignore_ascii_case("binary")
+                || value.eq_ignore_ascii_case(LATIN1_CHARACTER_SET)
             {
                 Ok(())
             } else {
@@ -776,7 +907,9 @@ fn accept_session_setting(
         MySqlSessionSetting::SqlQuoteShowCreate(true) => Ok(()),
         MySqlSessionSetting::SqlQuoteShowCreate(false) => Err(FrontendErrorKind::Unsupported),
         MySqlSessionSetting::CollationConnection(value) => {
-            if ConnectionCollation::from_name(value).is_some() {
+            if ConnectionCollation::from_name(value).is_some()
+                || value.eq_ignore_ascii_case(LATIN1_COLLATION)
+            {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -1015,6 +1148,13 @@ fn counted_system_variable(
     if name.eq_ignore_ascii_case("sql_notes") {
         return Some((u8::from(session_variables.sql_notes).to_string(), 1, false));
     }
+    if name.eq_ignore_ascii_case("unique_checks") {
+        return Some((
+            u8::from(session_variables.unique_checks).to_string(),
+            1,
+            false,
+        ));
+    }
     // A READ ONLY transaction leaves MySQL's session default unchanged. This
     // server does not accept a change to that default, so it remains off.
     if name.eq_ignore_ascii_case("transaction_read_only") {
@@ -1092,8 +1232,20 @@ fn worded_system_variable(
     if name.eq_ignore_ascii_case("default_storage_engine") {
         return Some("InnoDB".to_owned());
     }
+    // latin1 is the one other character set a session may name, and only for
+    // what it sends, what it is sent and its connection.
+    if (name.eq_ignore_ascii_case("character_set_client") && session_variables.latin1_client)
+        || (name.eq_ignore_ascii_case("character_set_results") && session_variables.latin1_results)
+        || (name.eq_ignore_ascii_case("character_set_connection")
+            && session_variables.latin1_connection)
+    {
+        return Some(LATIN1_CHARACTER_SET.to_owned());
+    }
+    if name.eq_ignore_ascii_case("collation_connection") && session_variables.latin1_connection {
+        return Some(LATIN1_COLLATION.to_owned());
+    }
     // A client that asks for any other character set is refused, so every one
-    // of these is utf8mb4 and stays that way.
+    // of these is utf8mb4 otherwise.
     if [
         "character_set_client",
         "character_set_connection",
@@ -2161,9 +2313,9 @@ mod tests {
             );
         }
         for sql in [
-            "SET character_set_client = latin1",
-            "SET character_set_results = latin1",
-            "SET collation_connection = latin1_swedish_ci",
+            "SET character_set_client = cp1251",
+            "SET character_set_results = latin2",
+            "SET collation_connection = latin1_bin",
             "SET collation_connection = utf8mb4_unicode_520_ci",
             "SET character_set_client = @missing",
             "SET sql_mode = @missing",
@@ -2173,6 +2325,235 @@ mod tests {
         assert_eq!(
             run("SET @saved_cs_client = @@unknown_dump_variable"),
             Err(FrontendErrorKind::UnknownSystemVariable)
+        );
+    }
+
+    fn read_row(session: &mut MySqlSessionVariables, sql: &str) -> Vec<Option<String>> {
+        let Ok(Some(CommandExecutionResult::ResultSet(result))) = session.execute_query(
+            sql,
+            MySqlBootstrapSettings::default(),
+            None,
+            SessionSqlMode::default(),
+            2,
+        ) else {
+            panic!("{sql} must return a result set");
+        };
+        result.rows[0]
+            .iter()
+            .map(|value| value.clone().map(|value| String::from_utf8(value).unwrap()))
+            .collect()
+    }
+
+    /// A standard `mysqldump` saves each setting it changes in a user variable,
+    /// in the same `SET` that changes it, and puts every one back at the end.
+    /// Measured on MySQL 8.4.11: each saved value is read before the setting
+    /// beside it changes, and every one reads back as it was once restored.
+    #[test]
+    fn a_standard_mysqldump_saves_each_setting_and_puts_it_back() {
+        let mut session = MySqlSessionVariables::default();
+        let run = |session: &mut MySqlSessionVariables, sql: &str| {
+            assert!(
+                matches!(
+                    session.execute_query(
+                        sql,
+                        MySqlBootstrapSettings::default(),
+                        None,
+                        SessionSqlMode::default(),
+                        2,
+                    ),
+                    Ok(Some(CommandExecutionResult::Ok(_)))
+                ),
+                "{sql}"
+            );
+        };
+        let settings =
+            "SELECT @@foreign_key_checks, @@unique_checks, @@sql_notes, @@time_zone, @@sql_mode";
+        let before = read_row(&mut session, settings);
+        for sql in [
+            "/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */",
+            "/*!40103 SET TIME_ZONE='+00:00' */",
+            "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */",
+            "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */",
+            "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */",
+            "/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */",
+        ] {
+            run(&mut session, sql);
+        }
+        assert_eq!(
+            read_row(&mut session, settings)[..4],
+            [
+                Some("0".to_owned()),
+                Some("0".to_owned()),
+                Some("0".to_owned()),
+                Some("+00:00".to_owned()),
+            ]
+        );
+        assert!(session.no_auto_value_on_zero());
+        assert_eq!(
+            read_row(
+                &mut session,
+                "SELECT @OLD_UNIQUE_CHECKS, @OLD_FOREIGN_KEY_CHECKS, @OLD_SQL_NOTES, @OLD_TIME_ZONE"
+            ),
+            [
+                Some("1".to_owned()),
+                Some("1".to_owned()),
+                Some("1".to_owned()),
+                Some("SYSTEM".to_owned()),
+            ]
+        );
+        for sql in [
+            "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */",
+            "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */",
+            "/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */",
+            "/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */",
+            "/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */",
+        ] {
+            run(&mut session, sql);
+        }
+        assert_eq!(read_row(&mut session, settings), before);
+        assert!(!session.no_auto_value_on_zero());
+
+        // A switch read from a variable that holds anything but 0 or 1 is
+        // refused, and so is a zone read from one that holds no word.
+        run(&mut session, "SET @two = 2, @none = NULL");
+        for sql in [
+            "SET foreign_key_checks = @two",
+            "SET unique_checks = @none",
+            "SET time_zone = @two",
+            "SET sql_notes = @missing",
+        ] {
+            assert_eq!(
+                session.execute_query(
+                    sql,
+                    MySqlBootstrapSettings::default(),
+                    None,
+                    SessionSqlMode::default(),
+                    2,
+                ),
+                Err(FrontendErrorKind::Unsupported),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Measured on MySQL 8.4.11: every value a `SET` names is read before any
+    /// is assigned, so `SET @a = '+01:00', time_zone = @a` reads the @a in
+    /// force before it — there, none, which it answers with 1231 — and a
+    /// failing assignment leaves the ones beside it undone.
+    #[test]
+    fn one_set_reads_every_value_before_it_assigns_any() {
+        let mut session = MySqlSessionVariables::default();
+        let run = |session: &mut MySqlSessionVariables, sql: &str| {
+            session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                None,
+                SessionSqlMode::default(),
+                2,
+            )
+        };
+        assert_eq!(
+            run(&mut session, "SET @a = '+01:00', time_zone = @a"),
+            Err(FrontendErrorKind::Unsupported)
+        );
+        assert_eq!(read_row(&mut session, "SELECT @a"), [None]);
+        assert!(run(&mut session, "SET @a = '+01:00'").is_ok());
+        assert!(run(&mut session, "SET @a = '+02:00', time_zone = @a").is_ok());
+        assert_eq!(
+            read_row(&mut session, "SELECT @a"),
+            [Some("+02:00".to_owned())]
+        );
+        assert_eq!(
+            read_row(&mut session, "SELECT @@time_zone"),
+            [Some("+01:00".to_owned())]
+        );
+    }
+
+    /// latin1 is what a view created by a client left at its default carries
+    /// in a dump. Its first 128 characters are ASCII's, as utf8mb4's are.
+    #[test]
+    fn latin1_is_taken_and_read_back_while_it_is_named() {
+        let mut session = MySqlSessionVariables::default();
+        let run = |session: &mut MySqlSessionVariables, sql: &str| {
+            assert!(
+                matches!(
+                    session.execute_query(
+                        sql,
+                        MySqlBootstrapSettings::default(),
+                        None,
+                        SessionSqlMode::default(),
+                        2,
+                    ),
+                    Ok(Some(CommandExecutionResult::Ok(_)))
+                ),
+                "{sql}"
+            );
+        };
+        let names = "SELECT @@character_set_client, @@character_set_results, \
+                     @@character_set_connection, @@collation_connection";
+        run(
+            &mut session,
+            "/*!50001 SET @saved_cs_client = @@character_set_client */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET @saved_cs_results = @@character_set_results */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET @saved_col_connection = @@collation_connection */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET character_set_client = latin1 */",
+        );
+        assert!(session.reads_statements_as_latin1());
+        assert!(!session.wants_latin1_results());
+        run(
+            &mut session,
+            "/*!50001 SET character_set_results = latin1 */",
+        );
+        assert!(session.wants_latin1_results());
+        run(
+            &mut session,
+            "/*!50001 SET collation_connection = latin1_swedish_ci */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET character_set_results = utf8mb4 */",
+        );
+        assert_eq!(
+            read_row(&mut session, names),
+            [
+                Some("latin1".to_owned()),
+                Some("utf8mb4".to_owned()),
+                Some("latin1".to_owned()),
+                Some("latin1_swedish_ci".to_owned()),
+            ]
+        );
+        assert_eq!(session.connection_collation_id(), 45);
+        run(
+            &mut session,
+            "/*!50001 SET character_set_client = @saved_cs_client */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET character_set_results = @saved_cs_results */",
+        );
+        run(
+            &mut session,
+            "/*!50001 SET collation_connection = @saved_col_connection */",
+        );
+        assert!(!session.reads_statements_as_latin1());
+        assert!(!session.wants_latin1_results());
+        assert_eq!(
+            read_row(&mut session, names),
+            [
+                Some("utf8mb4".to_owned()),
+                Some("utf8mb4".to_owned()),
+                Some("utf8mb4".to_owned()),
+                Some("utf8mb4_general_ci".to_owned()),
+            ]
         );
     }
 
@@ -2516,6 +2897,7 @@ mod tests {
                 ("time_zone", "SYSTEM"),
                 ("transaction_isolation", "REPEATABLE-READ"),
                 ("transaction_read_only", "OFF"),
+                ("unique_checks", "ON"),
                 ("version", SERVER_VERSION),
                 ("version_comment", SERVER_VERSION_COMMENT),
                 ("wait_timeout", "28800"),
@@ -2595,16 +2977,16 @@ mod tests {
                 3
             )
             .is_err());
-        assert!(first
-            .execute_query(
+        assert_eq!(
+            first.execute_query(
                 "SET sql_notes=1; SELECT 1",
                 MySqlBootstrapSettings::default(),
                 None,
                 SessionSqlMode::default(),
                 3
-            )
-            .unwrap()
-            .is_none());
+            ),
+            Err(FrontendErrorKind::Syntax)
+        );
         assert_eq!(notes(&mut first), b"0");
         first
             .execute_query(

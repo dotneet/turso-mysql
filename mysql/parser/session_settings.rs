@@ -28,6 +28,22 @@ pub enum MySqlSessionSetting {
     /// and a dumped schema each say, both of them writing rows in an order no
     /// foreign key would allow.
     ForeignKeyChecks(bool),
+    /// `SET unique_checks = 0` or `= 1`.
+    UniqueChecks(bool),
+    /// `SET sql_notes = 0` or `= 1`.
+    SqlNotes(bool),
+    /// `SET @name = value`, written beside the system variables of one `SET`.
+    /// `mysqldump` saves every setting it changes that way:
+    /// `SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0`.
+    UserVariable(MySqlUserVariableAssignment),
+    /// `SET <variable> = @name`, which is how a dump puts back what it saved
+    /// — `SET TIME_ZONE=@OLD_TIME_ZONE`. `variable` is `time_zone`,
+    /// `foreign_key_checks`, `unique_checks` or `sql_notes`. What it becomes
+    /// depends on what the user variable holds, which is the server's to read.
+    FromUserVariable {
+        variable: String,
+        user_variable: String,
+    },
     /// `SET character_set_results = NULL` disables result conversion.
     CharacterSetResultsNull,
     CharacterSetClient(String),
@@ -65,6 +81,16 @@ pub enum MySqlSessionSetting {
         next_transaction_only: bool,
     },
 }
+
+/// The settings a `SET` may give the value of a user variable, beside
+/// `sql_mode` and the three character-set names, which have readers of their
+/// own.
+const SETTINGS_READ_FROM_A_USER_VARIABLE: [&str; 4] = [
+    "time_zone",
+    "foreign_key_checks",
+    "unique_checks",
+    "sql_notes",
+];
 
 /// Parses one supported `SET` of session variables.
 ///
@@ -214,6 +240,20 @@ fn take_one_session_setting(
             collation,
         }));
     }
+    if let Some(name) = scanner.take_user_variable_reference() {
+        // MySQL takes both spellings here; `:=` is the only one that also works
+        // inside an expression.
+        let _ = scanner.take_byte(b':');
+        if !scanner.take_byte(b'=') {
+            return Ok(None);
+        }
+        let Some(source) = scanner.take_user_variable_assignment_source(mode) else {
+            return unsupported("SET of a user variable to an unsupported expression");
+        };
+        return Ok(Some(MySqlSessionSetting::UserVariable(
+            MySqlUserVariableAssignment { name, source },
+        )));
+    }
     let Some(WrittenVariable {
         name,
         scope: written_scope,
@@ -239,6 +279,17 @@ fn take_one_session_setting(
     let _ = scanner.take_byte(b':');
     if !scanner.take_byte(b'=') {
         return Ok(None);
+    }
+    if let Some(variable) = SETTINGS_READ_FROM_A_USER_VARIABLE
+        .iter()
+        .find(|variable| name.eq_ignore_ascii_case(variable))
+    {
+        if let Some(user_variable) = scanner.take_user_variable_reference() {
+            return Ok(Some(MySqlSessionSetting::FromUserVariable {
+                variable: (*variable).to_owned(),
+                user_variable,
+            }));
+        }
     }
     let setting = if name.eq_ignore_ascii_case("transaction_isolation") {
         let Some(level) = scanner.take_string(mode) else {
@@ -295,18 +346,20 @@ fn take_one_session_setting(
         };
         MySqlSessionSetting::LockWaitTimeout(value)
     } else if name.eq_ignore_ascii_case("foreign_key_checks") {
-        // Measured on MySQL 8.4.11: the switch is written `0`/`1` and `OFF`/`ON`
-        // alike, both reading back as `0` and `1`, and any other number
-        // answers 1231.
-        let value = match scanner.take_unsigned() {
-            Some(0) => false,
-            Some(1) => true,
-            Some(_) => return unsupported("foreign_key_checks value; expected 0, 1, ON or OFF"),
-            None if scanner.take_keyword("ON") => true,
-            None if scanner.take_keyword("OFF") => false,
-            None => return Ok(None),
+        let Some(value) = take_checked_switch(scanner)? else {
+            return Ok(None);
         };
         MySqlSessionSetting::ForeignKeyChecks(value)
+    } else if name.eq_ignore_ascii_case("unique_checks") {
+        let Some(value) = take_checked_switch(scanner)? else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::UniqueChecks(value)
+    } else if name.eq_ignore_ascii_case("sql_notes") {
+        let Some(value) = take_checked_switch(scanner)? else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::SqlNotes(value)
     } else if name.eq_ignore_ascii_case("character_set_results") {
         if scanner.take_keyword("NULL") {
             MySqlSessionSetting::CharacterSetResultsNull
@@ -338,6 +391,21 @@ fn take_one_session_setting(
         return Ok(None);
     };
     Ok(Some(setting))
+}
+
+/// Reads a switch whose other numbers MySQL refuses.
+///
+/// Measured on MySQL 8.4.11: the switch is written `0`/`1` and `OFF`/`ON`
+/// alike, both reading back as `0` and `1`, and any other number answers 1231.
+fn take_checked_switch(scanner: &mut Scanner<'_>) -> Result<Option<bool>, ParseError> {
+    match scanner.take_unsigned() {
+        Some(0) => Ok(Some(false)),
+        Some(1) => Ok(Some(true)),
+        Some(_) => unsupported("switch value; expected 0, 1, ON or OFF"),
+        None if scanner.take_keyword("ON") => Ok(Some(true)),
+        None if scanner.take_keyword("OFF") => Ok(Some(false)),
+        None => Ok(None),
+    }
 }
 
 /// One `SET @name = value`.
@@ -395,58 +463,6 @@ pub enum MySqlUserVariableValue {
     /// A decimal literal, kept as it was written.
     Decimal(String),
     Text(String),
-}
-
-/// Parses `SET @name = value[, @name = value...]`.
-///
-/// Returns `None` for anything that is not one, so the other `SET` readers keep
-/// their own statements. A literal or one direct variable read is taken; an
-/// expression such as `SET @y := @x + 1` is refused rather than half-answered.
-pub fn parse_optional_user_variable_assignment(
-    sql: &str,
-    mode: SessionSqlMode,
-) -> Result<Option<Vec<MySqlUserVariableAssignment>>, ParseError> {
-    let Some(body) = statement_body(sql) else {
-        return Ok(None);
-    };
-    let mut scanner = Scanner::new(body);
-    if !scanner.take_keyword("SET") {
-        return Ok(None);
-    }
-    let mut assignments = Vec::new();
-    loop {
-        scanner.skip_spaces();
-        if !scanner.take_byte(b'@') || scanner.at_byte(b'@') {
-            return Ok(None);
-        }
-        let Some(name) = scanner.take_user_variable_name() else {
-            return Ok(None);
-        };
-        // MySQL takes both spellings here; `:=` is the only one that also works
-        // inside an expression.
-        scanner.skip_spaces();
-        let _ = scanner.take_byte(b':');
-        if !scanner.take_byte(b'=') {
-            return Ok(None);
-        }
-        let Some(source) = scanner.take_user_variable_assignment_source(mode) else {
-            return Err(ParseError::Unsupported {
-                feature: "SET of a user variable to an unsupported expression",
-            });
-        };
-        assignments.push(MySqlUserVariableAssignment {
-            name: name.to_ascii_lowercase(),
-            source,
-        });
-        scanner.skip_spaces();
-        if !scanner.take_byte(b',') {
-            break;
-        }
-    }
-    if !scanner.at_end() {
-        return Err(ParseError::TrailingAdminCommandTokens);
-    }
-    Ok(Some(assignments))
 }
 
 /// Splits a `sql_mode` value into the modes it names.
@@ -655,10 +671,6 @@ impl<'a> Scanner<'a> {
         }
         self.cursor += 1;
         true
-    }
-
-    fn at_byte(&self, expected: u8) -> bool {
-        self.bytes.get(self.cursor) == Some(&expected)
     }
 
     /// Reads the name after a `@`, which takes the same characters a table
@@ -1083,7 +1095,6 @@ mod tests {
         for sql in [
             "SELECT 1",
             "SET autocommit = 0",
-            "SET sql_notes = 1",
             "SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400",
             "SET sql_mode",
             "",
@@ -1098,11 +1109,13 @@ mod tests {
     #[test]
     fn reads_a_user_variable_assignment() {
         let read = |sql: &str| {
-            parse_optional_user_variable_assignment(sql, SessionSqlMode::default())
-                .unwrap()
+            parse_all(sql)
                 .unwrap()
                 .into_iter()
-                .map(|assignment| {
+                .map(|setting| {
+                    let MySqlSessionSetting::UserVariable(assignment) = setting else {
+                        panic!("{sql}: {setting:?}");
+                    };
                     (
                         assignment.name().to_owned(),
                         assignment.literal_value().cloned().unwrap(),
@@ -1140,14 +1153,7 @@ mod tests {
             ]
         );
 
-        // The system-variable settings keep their own reader.
-        for sql in ["SET @@sql_mode = ''", "SET sql_mode = ''", "SELECT @x"] {
-            assert_eq!(
-                parse_optional_user_variable_assignment(sql, SessionSqlMode::default()),
-                Ok(None),
-                "{sql}"
-            );
-        }
+        assert_eq!(parse("SELECT @x"), None);
 
         // An expression is refused rather than half-answered.
         for sql in [
@@ -1156,31 +1162,105 @@ mod tests {
             "SET @x = 1 extra",
         ] {
             assert!(
-                parse_optional_user_variable_assignment(sql, SessionSqlMode::default()).is_err(),
+                parse_optional_session_settings(sql, SessionSqlMode::default()).is_err(),
                 "{sql}"
             );
         }
     }
 
+    fn saved(setting: &MySqlSessionSetting) -> &MySqlUserVariableAssignment {
+        let MySqlSessionSetting::UserVariable(assignment) = setting else {
+            panic!("{setting:?} saves no user variable");
+        };
+        assignment
+    }
+
     #[test]
     fn reads_the_saved_variables_in_a_compact_mysqldump() {
-        let sql = "/*!50003 SET @saved_cs_client = @@character_set_client */";
-        let assignments = parse_optional_user_variable_assignment(sql, SessionSqlMode::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(assignments[0].name(), "saved_cs_client");
+        let setting = parse("/*!50003 SET @saved_cs_client = @@character_set_client */").unwrap();
+        assert_eq!(saved(&setting).name(), "saved_cs_client");
         assert_eq!(
-            assignments[0].system_variable(),
+            saved(&setting).system_variable(),
             Some("character_set_client")
         );
 
-        let assignments = parse_optional_user_variable_assignment(
-            "SET @next = @saved_cs_client",
-            SessionSqlMode::default(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(assignments[0].user_variable(), Some("saved_cs_client"));
+        let setting = parse("SET @next = @saved_cs_client").unwrap();
+        assert_eq!(saved(&setting).user_variable(), Some("saved_cs_client"));
+    }
+
+    /// The settings a standard `mysqldump` opens with each save the value in
+    /// force before changing it, in one `SET`, and it puts every one back at
+    /// the end.
+    #[test]
+    fn reads_the_settings_a_standard_mysqldump_saves_and_puts_back() {
+        let settings =
+            parse_all("/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */")
+                .unwrap();
+        assert_eq!(saved(&settings[0]).name(), "old_unique_checks");
+        assert_eq!(saved(&settings[0]).system_variable(), Some("unique_checks"));
+        assert_eq!(settings[1], MySqlSessionSetting::UniqueChecks(false));
+
+        let settings =
+            parse_all("/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */")
+                .unwrap();
+        assert_eq!(saved(&settings[0]).system_variable(), Some("sql_mode"));
+        assert_eq!(
+            settings[1],
+            MySqlSessionSetting::SqlMode(vec!["NO_AUTO_VALUE_ON_ZERO".to_owned()])
+        );
+        assert_eq!(
+            parse_all("/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */").unwrap()[1],
+            MySqlSessionSetting::SqlNotes(false)
+        );
+        assert_eq!(
+            saved(&parse("/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */").unwrap()).system_variable(),
+            Some("time_zone")
+        );
+
+        for (sql, variable, user_variable) in [
+            (
+                "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */",
+                "time_zone",
+                "old_time_zone",
+            ),
+            (
+                "/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */",
+                "foreign_key_checks",
+                "old_foreign_key_checks",
+            ),
+            (
+                "/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */",
+                "unique_checks",
+                "old_unique_checks",
+            ),
+            (
+                "/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */",
+                "sql_notes",
+                "old_sql_notes",
+            ),
+        ] {
+            assert_eq!(
+                parse(sql),
+                Some(MySqlSessionSetting::FromUserVariable {
+                    variable: variable.to_owned(),
+                    user_variable: user_variable.to_owned(),
+                }),
+                "{sql}"
+            );
+        }
+        for sql in ["SET unique_checks = 2", "SET sql_notes = 2"] {
+            assert!(
+                matches!(
+                    parse_optional_session_settings(sql, SessionSqlMode::default()),
+                    Err(ParseError::Unsupported { .. })
+                ),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse("SET SESSION sql_notes = ON"),
+            Some(MySqlSessionSetting::SqlNotes(true))
+        );
     }
 
     #[test]

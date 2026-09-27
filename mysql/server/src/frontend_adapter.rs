@@ -286,10 +286,12 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = self.execute_query_statement(sql);
-        finish_client_statement(&connection, &mut self.session_variables, result)
+        let result = finish_client_statement(&connection, &mut self.session_variables, result);
+        refuse_a_result_in_latin1(&self.session_variables, result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -313,6 +315,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
+        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let mut result = prepare_checked_statement(&self.connection, sql)?;
         if let Err(error) = apply_raw_column_collations(
             &self.connection,
@@ -360,6 +363,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
@@ -658,10 +662,19 @@ where
         self.session
             .select_database(&canonical_name)
             .map_err(database_error_kind)?;
-        self.session
-            .connection()
-            .map_err(database_error_kind)?
-            .set_time_zone_offset_seconds(self.session_variables.time_zone_offset_seconds());
+        self.carry_the_session_onto_its_connection()
+    }
+
+    /// Gives a connection the session has just opened what the session asked
+    /// for before it had one: a dump turns foreign-key checks off before its
+    /// `CREATE DATABASE` and `USE`, and its rows rely on that.
+    fn carry_the_session_onto_its_connection(&self) -> Result<(), FrontendErrorKind> {
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        connection.set_time_zone_offset_seconds(self.session_variables.time_zone_offset_seconds());
+        connection.set_foreign_key_checks(self.session_variables.foreign_key_checks());
+        if let Some(wait) = self.session_variables.lock_wait() {
+            connection.set_lock_wait(wait);
+        }
         Ok(())
     }
 
@@ -936,12 +949,13 @@ where
         command: MySqlAdminCommand,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
         match &command {
-            MySqlAdminCommand::CreateDatabase { name } => {
+            MySqlAdminCommand::CreateDatabase { name, .. } => {
                 let canonical_name =
                     canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
                 self.authorize(DatabaseAction::Create {
                     database: &canonical_name,
                 })?;
+                self.raised_warnings.clear();
             }
             MySqlAdminCommand::DropDatabase { name } => {
                 let canonical_name =
@@ -980,6 +994,22 @@ where
             .session
             .execute_parsed_admin_command(command)
             .map_err(database_error_kind)?;
+        if matches!(result, MySqlAdminCommandResult::Selected { .. }) {
+            self.carry_the_session_onto_its_connection()?;
+        }
+        // Measured on MySQL 8.4.11: `CREATE DATABASE IF NOT EXISTS` over a
+        // database that is there answers OK with note 1007.
+        if let MySqlAdminCommandResult::AlreadyExists { database } = &result {
+            let noted = self.session_variables.sql_notes();
+            if noted {
+                self.raised_warnings
+                    .push(MySqlWarning::database_exists(database));
+            }
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                warnings: u16::from(noted),
+                ..CommandOkResult::default()
+            }));
+        }
         admin_result_to_execution_result(result)
     }
     fn prepare_gorm_catalog_query(
@@ -1715,17 +1745,19 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         let connection = self.session.connection().ok().cloned();
         if let Some(connection) = &connection {
             prepare_for_client_statement(connection, &self.session_variables)?;
         }
         let result = self.execute_query_statement(sql);
-        match &connection {
+        let result = match &connection {
             Some(connection) => {
                 finish_client_statement(connection, &mut self.session_variables, result)
             }
             None => result,
-        }
+        };
+        refuse_a_result_in_latin1(&self.session_variables, result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -1751,6 +1783,7 @@ where
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
             sql,
             self.session.session_sql_mode(),
@@ -1827,6 +1860,7 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self
             .prepared_statements
             .statements
@@ -2854,6 +2888,32 @@ fn execute_checked_query(
         // 0, whatever the table held.
         return Ok(CommandExecutionResult::Ok(CommandOkResult {
             status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
+    }
+    if let Some(table) =
+        turso_mysql_parser::parse_optional_alter_table_keys(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+    {
+        // Measured on MySQL 8.4.11: InnoDB keeps no switch for its keys, so
+        // both answer OK with note 1031 over a table, 1146 over a name that is
+        // not there, and 1347 over a view, which is refused here.
+        let listed = connection
+            .list_tables()
+            .map_err(frontend_error_kind)?
+            .into_iter()
+            .find(|listed| listed.name().eq_ignore_ascii_case(table.as_str()));
+        match listed.map(|listed| listed.kind()) {
+            None => return Err(FrontendErrorKind::MissingObject),
+            Some(MySqlTableKind::View) => return Err(FrontendErrorKind::Unsupported),
+            Some(MySqlTableKind::BaseTable) => {}
+        }
+        if sql_notes {
+            raised.push(MySqlWarning::keys_have_no_switch(table.as_str()));
+        }
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            warnings: u16::from(sql_notes),
             ..CommandOkResult::default()
         }));
     }
@@ -3941,6 +4001,44 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
     }
+}
+
+/// Refuses a statement that a session naming latin1 wrote outside ASCII, the
+/// one range where latin1 and utf8mb4 read the same bytes alike.
+fn refuse_what_latin1_reads_differently(
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+    sql: &str,
+) -> Result<(), FrontendErrorKind> {
+    if session_variables.reads_statements_as_latin1() && !sql.is_ascii() {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    Ok(())
+}
+
+/// Refuses a result the session asked for in latin1, which this server does
+/// not convert its utf8mb4 text to.
+fn refuse_a_result_in_latin1(
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+    result: Result<CommandExecutionResult, FrontendErrorKind>,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if session_variables.wants_latin1_results()
+        && matches!(result, Ok(CommandExecutionResult::ResultSet(_)))
+    {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    result
+}
+
+/// Refuses a prepared statement while the session names latin1 for anything:
+/// its bound strings arrive in the client's character set and its rows go out
+/// in the results', and neither is converted here.
+fn refuse_a_prepared_statement_under_latin1(
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+) -> Result<(), FrontendErrorKind> {
+    if session_variables.reads_statements_as_latin1() || session_variables.wants_latin1_results() {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    Ok(())
 }
 
 /// Readies a connection for one statement from the client.
@@ -7790,6 +7888,30 @@ impl MySqlWarning {
             level: "Warning",
             code: 138,
             message: "InnoDB: WITH CONSISTENT SNAPSHOT was ignored because this phrase can only be used with REPEATABLE READ isolation level.".to_owned(),
+        }
+    }
+
+    /// The note MySQL raises for `ALTER TABLE t DISABLE KEYS` and `ENABLE
+    /// KEYS` over an InnoDB table.
+    ///
+    /// Measured on MySQL 8.4.11: `Note`, code 1031, and this message.
+    fn keys_have_no_switch(table: &str) -> Self {
+        Self {
+            level: "Note",
+            code: 1031,
+            message: format!("Table storage engine for '{table}' doesn't have this option"),
+        }
+    }
+
+    /// The note MySQL raises for `CREATE DATABASE IF NOT EXISTS` naming a
+    /// database that is already there.
+    ///
+    /// Measured on MySQL 8.4.11: `Note`, code 1007, and this message.
+    fn database_exists(database: &str) -> Self {
+        Self {
+            level: "Note",
+            code: 1007,
+            message: format!("Can't create database '{database}'; database exists"),
         }
     }
 

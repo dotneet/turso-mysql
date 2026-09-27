@@ -12,6 +12,7 @@ pub(super) fn admin_result_to_execution_result(
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     match result {
         MySqlAdminCommandResult::Created { .. }
+        | MySqlAdminCommandResult::AlreadyExists { .. }
         | MySqlAdminCommandResult::Dropped { .. }
         | MySqlAdminCommandResult::Selected { .. } => {
             Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
