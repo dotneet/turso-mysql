@@ -16,6 +16,7 @@ use turso_mysql_parser::{parse_optional_admin_command, MySqlAdminCommand, Sessio
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
 use crate::schema_sql::SchemaSqlSessionContext;
+use crate::wal_keeper::WalKeeper;
 use crate::{MySqlConnection, MySqlPreparedStatementAuthority, MySqlQueryError};
 
 type OsDatabaseRegistry = DatabaseRegistry<OsDataRoot>;
@@ -172,6 +173,9 @@ pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlD
 /// callers can create, list, select, and drop names without receiving paths,
 /// registry entries, or database descriptors.
 pub struct MySqlDatabaseCatalog {
+    /// Declared first so that its thread is stopped before the databases it
+    /// empties the WALs of are closed.
+    wal_keeper: WalKeeper,
     inner: Mutex<DatabaseCatalog>,
     /// The named locks every session of this server shares.
     named_locks: Arc<MySqlNamedLocks>,
@@ -182,6 +186,7 @@ impl MySqlDatabaseCatalog {
     pub fn open(root_path: impl AsRef<Path>) -> Result<Arc<Self>, MySqlDatabaseError> {
         let catalog = DatabaseCatalog::open(root_path).map_err(MySqlDatabaseError::from)?;
         Ok(Arc::new(Self {
+            wal_keeper: WalKeeper::start(),
             inner: Mutex::new(catalog),
             named_locks: Arc::default(),
         }))
@@ -350,7 +355,8 @@ impl MySqlDatabaseSession {
                     io,
                     self.prepared_statement_authority.clone(),
                 )
-                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+                .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?
+                .with_wal_keeper(self.catalog.wal_keeper.handle(), Arc::downgrade(&database));
             connection.set_last_insert_id(self.last_insert_id);
             SelectedDatabase {
                 name: canonical_name,
@@ -762,6 +768,56 @@ mod tests {
         assert_eq!(tables(&reader), ["records"]);
         connection(&writer).execute("CREATE TABLE notes (id INT)")?;
         assert_eq!(tables(&reader), ["notes", "records"]);
+        Ok(())
+    }
+
+    /// A session of a catalog leaves emptying a WAL past its bound to the
+    /// catalog's keeper, which empties it on a thread of its own while the
+    /// session stays open and goes on writing.
+    #[test]
+    fn the_catalogs_keeper_empties_a_wal_while_the_session_stays_open() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("kept")
+            .map_err(|_| turso_core::LimboError::InternalError("select".into()))?;
+        let connection = session.connection().unwrap().clone();
+        connection.execute("CREATE TABLE records (id INT, label TEXT)")?;
+        let label = "x".repeat(1000);
+        for id in 0..50 {
+            connection.execute(&format!(
+                "INSERT INTO records (id, label) VALUES ({id}, '{label}')"
+            ))?;
+        }
+        let wal_length = || {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.file_name().to_string_lossy().ends_with("-wal"))
+                .map(|entry| entry.metadata().unwrap().len())
+                .unwrap()
+        };
+        assert!(wal_length() > 0);
+
+        connection.truncate_the_wal_past(0)?;
+        let keeper = catalog.wal_keeper.handle();
+        keeper.wait_for_the_requests_before();
+        assert_eq!(
+            keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(wal_length(), 0);
+
+        connection.execute("INSERT INTO records (id, label) VALUES (50, 'after')")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT COUNT(*) FROM records")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(51)]]
+        );
         Ok(())
     }
 

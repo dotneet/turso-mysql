@@ -18,6 +18,7 @@ mod session;
 pub mod show_create_table;
 mod temporal_zone;
 mod truncate_table;
+mod wal_keeper;
 
 pub use alter_table_indexes::MySqlAlterTableIndexError;
 pub use create_table_as_select::MySqlCreateTableAsSelectError;

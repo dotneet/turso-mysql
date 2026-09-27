@@ -47,6 +47,7 @@ use crate::schema_sql::{
     SchemaSqlCreator, SchemaSqlSessionContext, SchemaSqlV2Metadata,
 };
 use crate::truncate_table::MySqlTruncateTableError;
+use crate::wal_keeper::WalKeeperHandle;
 use transaction_isolation::TransactionIsolation;
 pub use transaction_isolation::{MySqlIsolationLevel, MySqlTransactionOutcome};
 
@@ -72,6 +73,9 @@ pub struct MySqlConnection {
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     schema_readings: Arc<Mutex<SchemaReadings>>,
+    /// The catalog's WAL keeper and this connection's database, when the
+    /// connection belongs to a catalog.
+    wal_keeper: Option<(WalKeeperHandle, std::sync::Weak<turso_core::Database>)>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -1252,6 +1256,7 @@ impl MySqlConnection {
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
             schema_readings: Arc::default(),
+            wal_keeper: None,
         })
     }
 
@@ -1299,15 +1304,17 @@ impl MySqlConnection {
         result
     }
 
-    /// Empties the WAL once it holds more than
+    /// Has the WAL emptied once it holds more than
     /// [`Self::WAL_FRAMES_BEFORE_TRUNCATING`] frames, between transactions.
     ///
     /// The engine's own checkpoint copies the WAL into the database after a
     /// write but leaves the file at its size, and a pooled connection may stay
     /// open for as long as the server runs. So a large write would otherwise
     /// keep its whole size on disk, and a start after a crash would read all
-    /// of it again. Another session reading at the same moment keeps the WAL
-    /// busy; the attempt is left to the next statement then.
+    /// of it again. A session of a catalog asks the catalog's WAL keeper,
+    /// which empties it on a thread of its own; one opened on its own empties
+    /// it here. Another session reading at the same moment keeps the WAL busy;
+    /// the attempt is left to a later statement then.
     pub fn keep_the_wal_small(&self) -> Result<()> {
         self.truncate_the_wal_past(Self::WAL_FRAMES_BEFORE_TRUNCATING)
     }
@@ -1315,9 +1322,22 @@ impl MySqlConnection {
     /// 64 MiB of 4 KiB pages.
     const WAL_FRAMES_BEFORE_TRUNCATING: u64 = 16_384;
 
-    fn truncate_the_wal_past(&self, frames: u64) -> Result<()> {
+    /// Hands emptying this connection's WAL to a catalog's keeper.
+    pub(crate) fn with_wal_keeper(
+        mut self,
+        keeper: WalKeeperHandle,
+        database: std::sync::Weak<turso_core::Database>,
+    ) -> Self {
+        self.wal_keeper = Some((keeper, database));
+        self
+    }
+
+    pub(crate) fn truncate_the_wal_past(&self, frames: u64) -> Result<()> {
         if !self.inner.get_auto_commit() || self.inner.wal_state()?.max_frame <= frames {
             return Ok(());
+        }
+        if let Some((keeper, database)) = &self.wal_keeper {
+            return keeper.ask_to_truncate(database);
         }
         match self.inner.checkpoint(turso_core::CheckpointMode::Truncate {
             upper_bound_inclusive: None,
