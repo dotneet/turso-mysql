@@ -4294,6 +4294,7 @@ fn parse_select_inner(
         integer_columns,
         real_columns,
         json_columns,
+        false,
     )?;
     Ok(TranslatedSelect {
         collation_sensitive_call_columns,

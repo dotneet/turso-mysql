@@ -18,6 +18,7 @@ use turso_mysql_parser::{
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
+use crate::group_concat;
 use crate::schema_sql::{
     decode_persisted_schema_sql, decode_schema_sql_any, reencode_schema_sql,
     validate_schema_sql_catalog, DecodedSchemaSql, SchemaSqlCatalogEntry, SchemaSqlId,
@@ -552,6 +553,12 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
+        if arg_count == 4
+            && (name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT)
+                || name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT_COUNT))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -574,6 +581,11 @@ impl Dialect for MySqlDialect {
                 Ok(signed) => Value::from_i64(signed),
                 Err(_) => Value::from_text(id.to_string()),
             });
+        }
+        if name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT)
+            || name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT_COUNT)
+        {
+            return group_concat::call(connection, name, args);
         }
         if name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT) {
             let [value] = args else {

@@ -576,6 +576,15 @@ pub struct Connection {
     /// runs. Nothing in the engine reads it.
     pub(super) mysql_catalog_rows: parking_lot::RwLock<HashMap<String, Arc<Vec<Vec<Value>>>>>,
     pub(super) trigger_rowid_supplier: parking_lot::RwLock<Option<Arc<dyn TriggerRowidSupplier>>>,
+    /// What a MySQL session's own functions keep between the rows of the
+    /// statement running.
+    ///
+    /// MySQL numbers the row a `GROUP_CONCAT` was cut at by counting what
+    /// the call has joined across every group of the statement, and a
+    /// function called once per group can only count that by leaving the
+    /// count somewhere the next call finds it. The session puts it here and
+    /// reads it back. Nothing in the engine reads it.
+    pub(super) mysql_function_state: parking_lot::Mutex<Option<Box<dyn std::any::Any + Send>>>,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2951,6 +2960,14 @@ impl Connection {
 
     pub(crate) fn trigger_rowid_supplier(&self) -> Option<Arc<dyn TriggerRowidSupplier>> {
         self.trigger_rowid_supplier.read().clone()
+    }
+
+    /// What a MySQL session's own functions keep between the rows of the
+    /// statement running, or `None` when the session has left nothing.
+    pub fn mysql_function_state(
+        &self,
+    ) -> parking_lot::MutexGuard<'_, Option<Box<dyn std::any::Any + Send>>> {
+        self.mysql_function_state.lock()
     }
 
     pub fn mysql_changed_rows(&self) -> i64 {

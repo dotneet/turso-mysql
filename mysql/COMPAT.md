@@ -1377,9 +1377,10 @@ unsigned flag — `MAX(id)` over a `BIGINT UNSIGNED` a `LONGLONG` of 20, unsigne
 what a client decoding the binary protocol reads the value by — and `SUM` and `AVG` count
 its digits the way they count a signed one's, 3 for a `TINYINT UNSIGNED`, 10 for an `INT
 UNSIGNED` and 20 for a `BIGINT UNSIGNED`, so `SUM` over the last answers 43, and answer a
-signed decimal. `GROUP_CONCAT`
-answers `MYSQL_TYPE_BLOB` (252) of length 65536 and 31 decimals, flags 0,
-skipping NULL values and defaulting to comma `,` separator.
+signed decimal. `GROUP_CONCAT` skips NULL values, joins the rest with a comma
+unless a `SEPARATOR` says otherwise, and answers a column sized by the
+session's `group_concat_max_len`, flags 0 and 31 decimals: under the default
+1024 a `LONG_BLOB` of 65536 (see "`GROUP_CONCAT` and `group_concat_max_len`").
 
 Three things hold for all four. The result is nullable whatever the column is,
 because an empty table gives NULL. It belongs to no table, so the schema, table
@@ -2335,7 +2336,8 @@ not describe.
 
 A window, a filter, more than one argument and an
 expression argument stay refused; DISTINCT on aggregates other than COUNT remains refused;
-`GROUP_CONCAT` with `SEPARATOR`, `ORDER BY`, or `DISTINCT` stays refused.
+`GROUP_CONCAT` with `ORDER BY` or `DISTINCT` stays refused; a `SEPARATOR` is
+taken.
 
 `REPLACE INTO` is taken, over the same `VALUES` shape an ordinary `INSERT`
 takes. MySQL's `REPLACE` deletes the rows a unique key collides with and
@@ -2802,11 +2804,9 @@ refused.
 `SHOW PROCESSLIST` and `SHOW STATUS` stay refused. Measured on 8.4.11, a
 session without the `PROCESS` privilege sees every connection of its own
 account, a pool's other connections among them, and a session here knows only
-itself; and the 330 status counters describe the whole server. `SET
-group_concat_max_len` is refused: MySQL cuts a `GROUP_CONCAT` at that many
-bytes with warning 1260 and sizes the result column by it, and this server
-cuts nothing — which also means that under MySQL's default of 1024 a longer
-`GROUP_CONCAT` is answered whole here where MySQL cuts it.
+itself; and the 330 status counters describe the whole server.
+`group_concat_max_len` is a session setting here as it is in MySQL; see
+"`GROUP_CONCAT` and `group_concat_max_len`".
 
 A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
 spells out on every text column, so refusing them stopped a `mysqldump` from
@@ -4298,18 +4298,66 @@ TABLE` prints no constraint at all, whatever `ON DELETE` or `ON UPDATE` was
 written beside it. The table-level `FOREIGN KEY (a) REFERENCES p(id)` is a
 different statement, which MySQL does enforce, and it stays refused.
 
-`GROUP_CONCAT` takes a `SEPARATOR` and a `DISTINCT`, one at a time. MySQL
-writes the separator as a clause after the column and the engine as a second
-argument, and the default is a comma in both, so the two agree over the same
-rows: measured on 8.4.11, `GROUP_CONCAT(name SEPARATOR '-')` answers `x-y-z`
-and `GROUP_CONCAT(DISTINCT team)` answers `a,b` where the plain call answers
-`a,a,b,a`. The two together are refused, the engine taking `DISTINCT` only
-over a single argument and the separator being that second one, and so is an
-`ORDER BY` inside the call: MySQL orders the parts it joins, and the engine's
-planner refuses an `ORDER BY` inside any aggregate. Joining the rows of an
-ordered subquery would not do instead, since nothing holds the engine to
-reading them in that order. A prepared `GROUP_CONCAT` answers its
-`LONG_BLOB` as length-encoded bytes, as MySQL does; it used to fail.
+### `GROUP_CONCAT` and `group_concat_max_len`
+
+`GROUP_CONCAT(col [SEPARATOR s])` joins a group's values the way MySQL does
+and cuts the result where MySQL cuts it. Measured on 8.4.11:
+`GROUP_CONCAT(name SEPARATOR '-')` answers `x-y-z`, NULLs are skipped, and a
+group of nothing but NULLs, or no rows at all, answers NULL.
+
+The cut is at the session's `group_concat_max_len` bytes, 1024 until the
+session sets it. `SET [SESSION | LOCAL] group_concat_max_len = n`, the
+`@@` spellings and `DEFAULT` are taken for any `n` from 4 up to the largest
+unsigned 64-bit number, and `SELECT @@group_concat_max_len` and `SHOW
+VARIABLES` read it back, an unsigned `LONGLONG` of 21 as in MySQL. What
+MySQL does, and this server with it: the result is cut in bytes, a separator
+counting like a value, and never inside a character — at 4, `aéé` becomes
+`aé`, and `aé,bb` becomes `aé,`. A result exactly as long as the limit is not
+cut. Each cut raises warning 1260, `Row N was cut by GROUP_CONCAT()`, where `N`
+counts what that one call has joined across the statement's groups up to and
+including the value the cut fell in, leaving out NULLs and the values after
+a cut: over groups `x,x,x` / NULLs / `zz,zz` at 4, one call warns `Row 3` and
+`Row 5`. The warnings come in the order MySQL reads the rows, two calls cut on
+one row in the order they are written. A group a `HAVING` drops is still
+counted and warned about, a call named again in an `ORDER BY` is not warned
+about twice, and a scalar subquery counts for itself. The warnings reach the result's warning count and `SHOW WARNINGS`.
+An `INSERT ... SELECT` writing a cut value fails with 1260 instead and writes
+nothing, as MySQL does under the strict mode this server runs; MySQL's message
+names the row, where this one's stays fixed.
+
+The engine's `group_concat` gathers each group's rows, every one written with
+its length in bytes so no value can be mistaken for a separator, and
+`mysql_group_concat` joins them and cuts. Numbering a cut needs what the call
+joined in earlier groups, which the function leaves on the engine connection
+between groups; the adapter resets it before each statement and reads the
+cuts back after.
+
+The limit also sizes the column, measured in both protocols: up to 512 a
+`VAR_STRING` of four bytes to each — 16 at 4, 2048 at 512 — and past that a
+`LONG_BLOB` of 64 bytes to each — 32832 at 513, 65536 at 1024, 64000000 at
+1000000 — up to 4294967295. A scalar subquery answering one takes the same
+shape, and `IFNULL(GROUP_CONCAT(col), 0)` the same shape, never null. A
+prepared statement keeps the largest limit it was prepared or executed under,
+for the cut and its column alike, which is what MySQL does over
+`COM_STMT_PREPARE`: prepared at 5 and executed after the session moves to
+1024 and back to 8, it answers whole and reports a `LONG_BLOB` of 65536.
+
+Refused, each measured to differ: `DISTINCT`, which MySQL applies under the
+column's collation and joins in that collation's order — over `b`, `B`, `é`,
+`e`, `A` it answers `A,b,é`, where the engine keeps identical values apart
+from the others and joins them in the order it read them; an `ORDER BY`
+inside the call, which the engine's planner refuses inside any aggregate; a
+`DOUBLE` or `FLOAT` column, which MySQL writes the shortest way (`1e20`,
+`0.1`) and the engine does not (`1.0e+20`, `0.100000001490116`); a `BLOB`, a
+binary string and a `JSON` column, each answering a binary result of a width
+of its own; a `GROUP_CONCAT` in a `UNION` branch, whose column MySQL reports
+by a rule of its own; a `GROUP_CONCAT` in an `ORDER BY` that the projection
+does not name, which MySQL cuts and warns about all the same; and a limit
+below 4, which MySQL takes as 4 with warning
+1292.
+MySQL answers 1232 for a limit written as a word, a number with a point,
+`NULL` or `ON`, and those are refused. A prepared `GROUP_CONCAT` answers its
+bytes length-encoded, as MySQL does.
 
 `JSON_ARRAYAGG(col)` collects a column of words or of whole numbers into a
 JSON array, in the order the rows are read, the way `GROUP_CONCAT` joins them.

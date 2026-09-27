@@ -1221,11 +1221,10 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
     };
     assert_eq!(result.rows[0][0], None);
 
-    // A separator and a DISTINCT are each taken, and both answer what MySQL
-    // 8.4.11 answers over the same rows.
+    // A separator is taken, and answers what MySQL 8.4.11 answers over the
+    // same rows.
     for (sql, expected) in [
         ("SELECT GROUP_CONCAT(name SEPARATOR '-') FROM t", "x-y-z"),
-        ("SELECT GROUP_CONCAT(DISTINCT team) FROM t", "a,b"),
         ("SELECT GROUP_CONCAT(team) FROM t", "a,a,b,a"),
     ] {
         let CommandExecutionResult::ResultSet(joined) = adapter
@@ -1242,10 +1241,12 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
     }
 
     // Refused: an ORDER BY, which MySQL applies to the parts it joins and
-    // the engine has no way to say; DISTINCT beside a separator, the engine
-    // taking DISTINCT only over one argument; and several columns.
+    // the engine has no way to say; a DISTINCT, which MySQL applies under
+    // the column's collation and joins in that collation's order; and
+    // several columns.
     for sql in [
         "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM t",
+        "SELECT GROUP_CONCAT(DISTINCT team) FROM t",
         "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM t",
         "SELECT GROUP_CONCAT(team, name) FROM t",
     ] {
@@ -30746,3 +30747,6 @@ mod check_constraints;
 
 #[cfg(unix)]
 mod database_collation;
+
+#[cfg(unix)]
+mod cut_group_concat;

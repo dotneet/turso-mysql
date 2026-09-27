@@ -153,6 +153,8 @@ pub(crate) struct MySqlSessionVariables {
     /// How long, in milliseconds, a `SELECT` may run before it is stopped;
     /// zero for no limit.
     max_execution_time: u64,
+    /// How many bytes a `GROUP_CONCAT` answers before it is cut.
+    group_concat_max_len: u64,
     /// The collation the session runs its connection on.
     connection_collation: ConnectionCollation,
     /// The collation of the selected database as it was when the session
@@ -214,6 +216,7 @@ impl Default for MySqlSessionVariables {
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
             max_execution_time: 0,
+            group_concat_max_len: turso_mysql::DEFAULT_GROUP_CONCAT_MAX_LEN,
             connection_collation: ConnectionCollation::default(),
             database_collation: None,
         }
@@ -260,6 +263,12 @@ impl MySqlSessionVariables {
     /// if the session set a limit.
     pub(crate) fn select_time_limit(&self) -> Option<Duration> {
         (self.max_execution_time > 0).then(|| Duration::from_millis(self.max_execution_time))
+    }
+
+    /// How many bytes a `GROUP_CONCAT` this session runs answers before it is
+    /// cut.
+    pub(crate) const fn group_concat_max_len(&self) -> u64 {
+        self.group_concat_max_len
     }
 
     pub(crate) fn time_zone_offset_seconds(&self) -> i32 {
@@ -432,11 +441,12 @@ impl MySqlSessionVariables {
             }
             if let Some((value, _, _)) = counted_system_variable(name, settings, status_flags, self)
             {
-                return Ok(MySqlUserVariableValue::Integer(
-                    value
-                        .parse()
-                        .expect("a system variable answered with a number fits an i64"),
-                ));
+                // Only `group_concat_max_len` can hold more than an `i64`
+                // does, and a user variable here holds no unsigned number.
+                return value
+                    .parse()
+                    .map(MySqlUserVariableValue::Integer)
+                    .map_err(|_| FrontendErrorKind::Unsupported);
             }
             return worded_system_variable(name, session_sql_mode, self)
                 .map(MySqlUserVariableValue::Text)
@@ -470,6 +480,10 @@ impl MySqlSessionVariables {
             }
             MySqlSessionSetting::MaxExecutionTime(milliseconds) => {
                 self.max_execution_time = milliseconds.unwrap_or(0);
+            }
+            MySqlSessionSetting::GroupConcatMaxLen(bytes) => {
+                self.group_concat_max_len =
+                    bytes.unwrap_or(turso_mysql::DEFAULT_GROUP_CONCAT_MAX_LEN);
             }
             MySqlSessionSetting::ForeignKeyChecks(enabled) => {
                 self.foreign_key_checks = enabled;
@@ -790,7 +804,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 33] = [
+const SHOWN_VARIABLES: [&str; 34] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -804,6 +818,7 @@ const SHOWN_VARIABLES: [&str; 33] = [
     "collation_server",
     "default_storage_engine",
     "foreign_key_checks",
+    "group_concat_max_len",
     "init_connect",
     "interactive_timeout",
     "license",
@@ -880,6 +895,12 @@ fn accept_session_setting(
         // running longer is stopped with 3024 while an `UPDATE` runs on. The
         // caller stops a `SELECT` that way.
         MySqlSessionSetting::MaxExecutionTime(_) => Ok(()),
+        // Measured on MySQL 8.4.11: anything below 4 is taken as 4 with
+        // warning 1292, which this refuses rather than raising.
+        MySqlSessionSetting::GroupConcatMaxLen(Some(bytes)) if *bytes < 4 => {
+            Err(FrontendErrorKind::Unsupported)
+        }
+        MySqlSessionSetting::GroupConcatMaxLen(_) => Ok(()),
         MySqlSessionSetting::WaitTimeout(Some(seconds)) => {
             if (1..=31_536_000).contains(seconds) {
                 Ok(())
@@ -1222,6 +1243,11 @@ fn counted_system_variable(
     // LONGLONG of 21.
     if name.eq_ignore_ascii_case("max_execution_time") {
         return Some((session_variables.max_execution_time.to_string(), 21, true));
+    }
+    // Measured on MySQL 8.4.11: 1024 until a session sets it, and an unsigned
+    // LONGLONG of 21.
+    if name.eq_ignore_ascii_case("group_concat_max_len") {
+        return Some((session_variables.group_concat_max_len.to_string(), 21, true));
     }
     // Neither rule is one this server has, and a session is refused both.
     if name.eq_ignore_ascii_case("sql_auto_is_null")
@@ -2935,6 +2961,7 @@ mod tests {
                 ("collation_server", "utf8mb4_0900_ai_ci"),
                 ("default_storage_engine", "InnoDB"),
                 ("foreign_key_checks", "ON"),
+                ("group_concat_max_len", "1024"),
                 ("init_connect", ""),
                 ("interactive_timeout", "28800"),
                 ("license", "MIT"),

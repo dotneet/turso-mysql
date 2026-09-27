@@ -3237,6 +3237,29 @@ impl MySqlConnection {
         *self.session_time_zone_offset.lock().unwrap()
     }
 
+    /// Sets how many bytes a `GROUP_CONCAT` answers before it is cut, which is
+    /// what the session's `group_concat_max_len` says.
+    pub fn set_group_concat_max_len(&self, max_len: u64) {
+        crate::group_concat::set_max_len(&self.inner, max_len);
+    }
+
+    pub fn group_concat_max_len(&self) -> u64 {
+        crate::group_concat::max_len(&self.inner)
+    }
+
+    /// Forgets what the last statement's `GROUP_CONCAT` calls joined, before
+    /// the next one runs. MySQL counts the row a cut names within one
+    /// statement.
+    pub fn forget_group_concat_cuts(&self) {
+        crate::group_concat::forget_progress(&self.inner);
+    }
+
+    /// The rows the statement that ran cut a `GROUP_CONCAT` at, in the order
+    /// MySQL warns about them, each the row its warning 1260 names.
+    pub fn take_group_concat_cuts(&self) -> Vec<u64> {
+        crate::group_concat::take_cut_rows(&self.inner)
+    }
+
     /// Takes the lock `LOCK TABLES` asks for and holds it.
     ///
     /// MySQL locks each table the statement names and holds the lock across

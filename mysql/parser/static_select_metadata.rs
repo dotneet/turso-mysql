@@ -3542,12 +3542,14 @@ pub(super) fn column_aggregate_argument(
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
-    // `GROUP_CONCAT` is the one aggregate here that carries either of these:
-    // a `DISTINCT` before its column or a `SEPARATOR` after it. The engine
-    // spells the separator as a second argument, and it takes `DISTINCT`
-    // only over a single argument, so the two together are refused.
+    // `GROUP_CONCAT` is the one aggregate here that carries a `SEPARATOR`
+    // after its column.
     if kind == ColumnAggregateKind::Concatenated {
-        if arguments.duplicate_treatment.is_some() && !arguments.clauses.is_empty() {
+        // Measured on MySQL 8.4.11: `DISTINCT` drops values equal under the
+        // column's collation and joins the rest in that collation's order —
+        // `b,B,é,e,A` answers `A,b,é` — where the engine drops only
+        // identical values and keeps them in the order it read them.
+        if arguments.duplicate_treatment.is_some() {
             return None;
         }
         if !checked_group_concat_clauses(&arguments.clauses) {

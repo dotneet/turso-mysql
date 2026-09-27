@@ -82,7 +82,8 @@ numbers and over columns of one kind, and `COUNT`, `SUM`, `AVG`, `MIN` and
 | A text call over a `MEDIUMTEXT` or a `LONGTEXT` | refused; measured, MySQL answers a `LONG_BLOB` — `LOWER(mt)` reports 268435440 and `CONCAT(mt, 'a')` 67108864, `max_allowed_packet` — by a rule not worked out |
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
-| `GROUP_CONCAT` with an `ORDER BY`, or with `DISTINCT` beside a `SEPARATOR` | refused; MySQL orders the parts it joins and the engine's planner refuses an `ORDER BY` inside an aggregate (`core/translate/planner.rs`), and the engine takes `DISTINCT` only over a single argument, which the separator occupies |
+| `GROUP_CONCAT` with an `ORDER BY` or a `DISTINCT` | refused; MySQL orders the parts it joins and the engine's planner refuses an `ORDER BY` inside an aggregate (`core/translate/planner.rs`). Measured: `DISTINCT` drops values equal under the column's collation, keeping the first read, and joins the rest in that collation's order — `b,B,é,e,A` answers `A,b,é`, and over whole numbers `-1,2,9,10,100` — where the engine's drops only identical values and keeps the order it read them. A cut `DISTINCT` names the row by its place in that order, counted across groups |
+| `GROUP_CONCAT` over a `DOUBLE`, a `FLOAT`, a `BLOB`, a binary string or a `JSON` column | refused; measured, MySQL writes `1e20` and `0.1` where the engine writes `1.0e+20` and `0.100000001490116`, and a binary argument answers a binary result — up to 512 a `VAR_STRING` one byte to each with the binary collation and flag, past it a `LONG_BLOB` as wide as the limit — and a `JSON` one the text shape with the binary flag |
 | `JSON_ARRAYAGG` over a `DOUBLE`, a `DECIMAL`, a moment or a JSON column, or with `DISTINCT` | refused; MySQL writes each of those into the array by a rule of its own |
 | `JSON_OBJECTAGG` | refused; measured, MySQL answers 3158 for a NULL key, and the engine's `json_group_object` has not been held to that or to anything else about keys |
 | `BIT_OR`, `BIT_AND`, `BIT_XOR` | refused; the engine has no bit aggregate. Measured: each answers an unsigned `LONGLONG` of 21, NOT NULL, reading a negative as its sixty-four bits — `BIT_OR` over 3 and -4 is 18446744073709551615 — and over no rows `BIT_AND` answers 18446744073709551615 and the others 0 |
@@ -370,8 +371,10 @@ speaks; anything measured here from now on has to pass that flag.
 | `SHOW [FULL] PROCESSLIST` | refused; measured, a session without the `PROCESS` privilege sees every connection of its own account — a pool's other connections among them — and this session knows only itself |
 | `SHOW [GLOBAL] STATUS` | refused; MySQL answers 330 counters about the whole server, `Threads_connected` and `Uptime` among them, which a session here has no reading of |
 | `SHOW COLLATION` / `SHOW CHARACTER SET` with a `WHERE` other than `=` and `LIKE` tests joined by `AND` | refused; the listing is filtered here rather than by a query engine |
-| `SET group_concat_max_len` | refused; MySQL cuts a `GROUP_CONCAT` at that many bytes with warning 1260 and reports a result column sized by it — measured, up to 512 a `VAR_STRING` of four bytes a character, past it a `LONG_BLOB` of 64 times the value — and this server cuts nothing |
-| A `GROUP_CONCAT` longer than 1024 bytes | answered whole, where MySQL, under its default `group_concat_max_len`, cuts it to 1024 bytes and warns with 1260 |
+| `SET group_concat_max_len` below 4, or read from a user variable | refused; measured, MySQL takes anything below 4 as 4 with warning 1292 (`Truncated incorrect group_concat_max_len value: '0'`) |
+| `SET @x = @@group_concat_max_len` past the largest `BIGINT` | refused; a user variable here holds no unsigned number |
+| A `GROUP_CONCAT` column of a statement sorting its groups by anything but the grouped columns, or of `SELECT DISTINCT` over groups | reports the shape it has unsorted; measured, MySQL reads it out of a table it sorts through — a `VAR_STRING` with 0 decimals up to 512, past it a `BLOB` of 16 bytes to each (16384 at 1024) with the blob flag — and every other aggregate column of the statement loses its binary flag there too |
+| A `GROUP_CONCAT` in a `UNION`, `EXCEPT` or `INTERSECT` branch | refused; it used to be answered with a column of type NULL, and measured, MySQL reports a `VAR_STRING` with 0 decimals up to 512 and a `BLOB` of 65536 with the blob flag at 1024. Each branch counts its cuts for itself: `UNION ALL` of two cut calls warns `Row 3` twice |
 | `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
@@ -541,6 +544,8 @@ Behaviour that works but does not match MySQL lives in
 - complex window projections still have conservative source-column metadata
 - `SHOW FULL COLUMNS` derives `Privileges` from database or table grants;
   column-specific grants are not supported
+- an `INSERT ... SELECT` failing on a cut `GROUP_CONCAT` answers 1260 with a
+  fixed message, where MySQL's names the row
 
 ---
 

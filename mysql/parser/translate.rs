@@ -410,6 +410,7 @@ pub(crate) fn translate_select_query(
     integer_columns: &[String],
     real_columns: &[String],
     json_columns: &[String],
+    writes_its_rows: bool,
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -434,6 +435,7 @@ pub(crate) fn translate_select_query(
     render_context.integer_columns = integer_columns;
     render_context.real_columns = real_columns;
     render_context.json_columns = json_columns;
+    render_context.writes_its_rows = writes_its_rows;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     let mut sequence = None;
     if let Some(with) = &query.with {
@@ -511,6 +513,13 @@ pub(crate) fn translate_select_query(
                 );
                 let (left, mut sources) = render_select_body(left, &mut render_context)?;
                 let (right, right_sources) = render_select_body(right, &mut render_context)?;
+                // Measured on MySQL 8.4.11: the column a branch's
+                // `GROUP_CONCAT` lands in is a `VAR_STRING` or a `BLOB` of a
+                // width of its own, which the shape a `UNION` reports here
+                // does not follow.
+                if render_context.group_concat_calls > 0 {
+                    return unsupported("GROUP_CONCAT in a set operation branch");
+                }
                 sources.extend(right_sources.into_iter().map(|mut source| {
                     source.branch = 1;
                     source
@@ -592,6 +601,11 @@ pub(crate) fn translate_select_query(
             &mut render_context,
             &mut row_count_parameters,
         )?);
+    }
+    // Measured on MySQL 8.4.11: `ORDER BY GROUP_CONCAT(a)` with no such call
+    // projected still cuts it and warns.
+    if render_context.names_an_unprojected_group_concat {
+        return unsupported("GROUP_CONCAT outside the projection");
     }
     Ok(RenderedSelect {
         sqlite_sql: normalized,
@@ -814,19 +828,31 @@ fn render_select_body(
     // else — a subquery, a branch of a `UNION` — the engine would read the
     // text it is worked out to.
     let outer_projection = std::mem::take(&mut render_context.renders_the_outer_projection);
+    render_context.renders_a_projection_item = false;
+    let outer_counts_in_having = std::mem::replace(
+        &mut render_context.counts_group_concat_in_having,
+        select.having.is_some(),
+    );
+    let outer_group_concat_counts = std::mem::take(&mut render_context.group_concat_counts);
+    let outer_projected_group_concats = std::mem::take(&mut render_context.projected_group_concats);
     let projection = select
         .projection
         .iter()
-        .map(|item| match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
-                if outer_projection =>
-            {
-                match crate::written_value::read_written_value(expr) {
-                    Some((_, rendered)) => render_written_value(item, rendered, render_context),
-                    None => render_select_item(item, render_context),
+        .map(|item| {
+            render_context.renders_a_projection_item = true;
+            let rendered = match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
+                    if outer_projection =>
+                {
+                    match crate::written_value::read_written_value(expr) {
+                        Some((_, rendered)) => render_written_value(item, rendered, render_context),
+                        None => render_select_item(item, render_context),
+                    }
                 }
-            }
-            _ => render_select_item(item, render_context),
+                _ => render_select_item(item, render_context),
+            };
+            render_context.renders_a_projection_item = false;
+            rendered
         })
         .collect::<Result<Vec<_>, _>>()?;
     if projection.is_empty() {
@@ -887,6 +913,9 @@ fn render_select_body(
         predicates.push(render_select_predicate(selection, render_context)?);
     }
     if row_filter {
+        if !render_context.group_concat_counts.is_empty() {
+            return unsupported("GROUP_CONCAT beside a HAVING that filters rows");
+        }
         let having = having.as_ref().expect("the HAVING was read above");
         predicates.push(render_select_predicate(having, render_context)?);
     }
@@ -924,8 +953,20 @@ fn render_select_body(
             }
         }
         normalized.push_str(" HAVING ");
-        normalized.push_str(&render_having_predicate(having, render_context)?);
+        let rendered = render_having_predicate(having, render_context)?;
+        let counts = std::mem::take(&mut render_context.group_concat_counts);
+        if counts.is_empty() {
+            normalized.push_str(&rendered);
+        } else {
+            normalized.push_str(&format!("{} AND ({rendered})", counts.join(" AND ")));
+        }
     }
+    render_context.counts_group_concat_in_having = outer_counts_in_having;
+    render_context.group_concat_counts = outer_group_concat_counts;
+    render_context.last_projected_group_concats = std::mem::replace(
+        &mut render_context.projected_group_concats,
+        outer_projected_group_concats,
+    );
     Ok((normalized, source_tables))
 }
 
@@ -2464,6 +2505,7 @@ pub(crate) fn translate_insert(
                     &[],
                     &[],
                     &[],
+                    true,
                 )?;
                 // A SELECT that needs a second rendering pass to learn its
                 // column types is rendered by the frontend, which knows them,
@@ -4406,6 +4448,35 @@ pub(crate) struct SelectRenderContext<'a> {
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
     parameter_count: usize,
+    /// How many `GROUP_CONCAT` calls the statement has rendered, which tells
+    /// each one's count of joined values apart from the others'.
+    group_concat_calls: i64,
+    /// Whether a projection item is being rendered, the one place a
+    /// `GROUP_CONCAT` warns about a cut: a `HAVING` or an `ORDER BY` naming
+    /// the same call is the same value in MySQL, not a second one to warn
+    /// about.
+    renders_a_projection_item: bool,
+    /// Whether the statement writes the rows it reads — `INSERT ... SELECT`
+    /// — where a cut `GROUP_CONCAT` fails the statement rather than warning.
+    writes_its_rows: bool,
+    /// Whether the body being rendered has a `HAVING`, which the engine
+    /// tests before it works out the projection. MySQL counts and warns
+    /// about a group the `HAVING` then drops, so the `HAVING` is where each
+    /// `GROUP_CONCAT` of the projection is counted.
+    counts_group_concat_in_having: bool,
+    /// The calls counting each projected `GROUP_CONCAT` that the body's
+    /// `HAVING` is to test first.
+    group_concat_counts: Vec<String>,
+    /// Each `GROUP_CONCAT` the body being rendered projects, as it gathers
+    /// its rows and names its separator.
+    projected_group_concats: Vec<String>,
+    /// The same for the last body rendered, which the statement's own
+    /// `ORDER BY` reads once the body is done.
+    last_projected_group_concats: Vec<String>,
+    /// Whether a `GROUP_CONCAT` stands outside the projection with no
+    /// projected one of its own. MySQL counts and warns about that one too,
+    /// which nothing here does, so the statement is refused.
+    names_an_unprojected_group_concat: bool,
 }
 
 impl<'a> SelectRenderContext<'a> {
@@ -4452,6 +4523,14 @@ impl<'a> SelectRenderContext<'a> {
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
             parameter_count: 0,
+            group_concat_calls: 0,
+            renders_a_projection_item: false,
+            writes_its_rows: false,
+            counts_group_concat_in_having: false,
+            group_concat_counts: Vec::new(),
+            projected_group_concats: Vec::new(),
+            last_projected_group_concats: Vec::new(),
+            names_an_unprojected_group_concat: false,
         }
     }
 
@@ -4705,6 +4784,12 @@ fn render_aggregate_call(
             render_aggregate_argument(function, render_context)
         );
     }
+    if matches!(
+        static_select_metadata::column_aggregate_argument(function),
+        Some((static_select_metadata::ColumnAggregateKind::Concatenated, _))
+    ) {
+        return render_group_concat(function, render_context);
+    }
     // The engine calls the sample standard deviation `stddev`, where MySQL
     // keeps that name for the population one. Every other aggregate here is
     // spelled the same in both.
@@ -4736,18 +4821,66 @@ fn render_aggregate_call(
     } else {
         function.name.to_string()
     };
-    // MySQL writes the separator as a clause after the column and the engine
-    // as a second argument. The default is a comma in both, so a call without
-    // one needs nothing said about it.
-    let separator = match static_select_metadata::group_concat_separator(function) {
-        Some(separator) => format!(", '{}'", separator.replace('\'', "''")),
-        None => String::new(),
-    };
     format!(
-        "{name}({}{separator})",
+        "{name}({})",
         render_aggregate_argument(function, render_context)
     )
 }
+
+/// Renders `GROUP_CONCAT(col [SEPARATOR s])`.
+///
+/// MySQL cuts the result at the session's `group_concat_max_len` and warns
+/// with the number of the value the cut fell in, which needs each group's
+/// rows one by one. The engine's `group_concat` gathers them, each written
+/// with its length so nothing a value holds reads as a separator, and
+/// `mysql_group_concat` joins them the way MySQL does. A separator is a
+/// comma unless one is written.
+fn render_group_concat(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> String {
+    let column = render_aggregate_argument(function, render_context);
+    let separator = static_select_metadata::group_concat_separator(function)
+        .unwrap_or(",")
+        .replace('\'', "''");
+    render_context.group_concat_calls += 1;
+    let call = render_context.group_concat_calls;
+    let gathered = format!(
+        "group_concat(CASE WHEN {column} IS NULL THEN 'N' \
+         ELSE 'V' || length(CAST(({column} || '') AS BLOB)) || ':' || {column} END, '')"
+    );
+    let on_cut = if render_context.writes_its_rows {
+        GROUP_CONCAT_CUT_FAILS
+    } else {
+        GROUP_CONCAT_CUT_WARNS
+    };
+    let named = format!("{gathered}, '{separator}'");
+    if !render_context.renders_a_projection_item {
+        if !render_context.projected_group_concats.contains(&named)
+            && !render_context.last_projected_group_concats.contains(&named)
+        {
+            render_context.names_an_unprojected_group_concat = true;
+        }
+        return format!("mysql_group_concat({named}, {call}, {GROUP_CONCAT_NAMED_AGAIN})");
+    }
+    render_context.projected_group_concats.push(named);
+    if render_context.counts_group_concat_in_having {
+        render_context.group_concat_counts.push(format!(
+            "mysql_group_concat_count({gathered}, '{separator}', {call}, {on_cut})"
+        ));
+        return format!(
+            "mysql_group_concat({gathered}, '{separator}', {call}, {GROUP_CONCAT_NAMED_AGAIN})"
+        );
+    }
+    format!("mysql_group_concat({gathered}, '{separator}', {call}, {on_cut})")
+}
+
+/// What `mysql_group_concat` does about a cut: nothing more for a call named
+/// again in a `HAVING` or an `ORDER BY`, which MySQL does not count or warn
+/// about twice; warn; or fail a statement that writes the result.
+const GROUP_CONCAT_NAMED_AGAIN: u8 = 0;
+const GROUP_CONCAT_CUT_WARNS: u8 = 1;
+const GROUP_CONCAT_CUT_FAILS: u8 = 2;
 
 fn aggregate_argument_name(function: &sqlparser::ast::Function) -> String {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {

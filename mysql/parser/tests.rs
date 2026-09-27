@@ -5636,8 +5636,9 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         // MySQL orders the parts it joins and the engine's group_concat has no
         // way to say in what order, so the ORDER BY form stays refused.
         "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM users",
-        // The engine takes DISTINCT only over a single argument, and the
-        // separator is that second argument, so the two together are refused.
+        // MySQL drops values equal under the column's collation and joins
+        // the rest in its order, which the engine's DISTINCT does not.
+        "SELECT GROUP_CONCAT(DISTINCT name) FROM users",
         "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM users",
         "SELECT GROUP_CONCAT(id, name) FROM users",
         // A number written with a fraction is read, but a HAVING is counted
@@ -5660,7 +5661,9 @@ fn select_group_concat_translates_plain_call() {
     let translated = parse_select("SELECT GROUP_CONCAT(name) FROM users", mode).unwrap();
     assert_eq!(
         translated.as_sql(),
-        "SELECT GROUP_CONCAT(\"name\") AS \"GROUP_CONCAT(name)\" FROM \"users\""
+        "SELECT mysql_group_concat(group_concat(CASE WHEN \"name\" IS NULL THEN 'N' \
+         ELSE 'V' || length(CAST((\"name\" || '') AS BLOB)) || ':' || \"name\" END, ''), \
+         ',', 1, 1) AS \"GROUP_CONCAT(name)\" FROM \"users\""
     );
     assert_eq!(
         translated.static_result_metadata(),

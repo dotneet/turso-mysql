@@ -345,6 +345,9 @@ pub enum FrontendErrorKind {
     IncorrectValue,
     /// An integer result left `BIGINT`'s range.
     NumericOverflow,
+    /// A `GROUP_CONCAT` a statement writes was longer than the session's
+    /// `group_concat_max_len`.
+    GroupConcatCut,
     /// A value did not fit the range its column's type accepts.
     OutOfRange,
     /// A value did not name a moment its column's type can hold.
@@ -519,6 +522,12 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         }
         FrontendErrorKind::NumericOverflow => {
             (1690, *b"22003", b"BIGINT value is out of range".as_slice())
+        }
+        // Measured on MySQL 8.4.11: the warning a `SELECT` raises becomes this
+        // error under strict mode when the value is written, and MySQL's
+        // message names the row, where the message here stays fixed.
+        FrontendErrorKind::GroupConcatCut => {
+            (1260, *b"HY000", b"a row was cut by GROUP_CONCAT()".as_slice())
         }
         // Measured on MySQL 8.4.11: what a value outside its column's range
         // answers, whether it is past the top of an unsigned integer or a
@@ -2560,6 +2569,7 @@ mod tests {
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
             (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),
+            (FrontendErrorKind::GroupConcatCut, 1260, *b"HY000"),
             (FrontendErrorKind::IncorrectValue, 1366, *b"HY000"),
             (FrontendErrorKind::IncorrectTemporalValue, 1292, *b"22007"),
             (FrontendErrorKind::UnknownTable, 1051, *b"42S02"),

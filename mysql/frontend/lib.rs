@@ -12,6 +12,7 @@ mod database_open;
 mod database_registry;
 mod dialect;
 mod drop_table;
+mod group_concat;
 pub mod named_locks;
 pub mod schema_sql;
 mod session;
@@ -29,6 +30,7 @@ pub use database_catalog::{
 };
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
+pub use group_concat::{DEFAULT_GROUP_CONCAT_MAX_LEN, GROUP_CONCAT_CUT_ERROR};
 pub use session::{
     MySqlAffectedRowsMode, MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata,
     MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlIndexEntry,

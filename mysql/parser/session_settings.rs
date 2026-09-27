@@ -74,6 +74,12 @@ pub enum MySqlSessionSetting {
     /// This one changes how the server behaves: a `SELECT` running longer
     /// than it is stopped.
     MaxExecutionTime(Option<u64>),
+    /// `SET group_concat_max_len = <n>`, in bytes, or `DEFAULT` for MySQL's
+    /// 1024.
+    ///
+    /// This one changes how the server behaves too: a `GROUP_CONCAT` longer
+    /// than it is cut there.
+    GroupConcatMaxLen(Option<u64>),
     /// `SET sql_auto_is_null = 0` or `= 1`.
     SqlAutoIsNull(bool),
     /// `SET sql_safe_updates = 0` or `= 1`.
@@ -331,6 +337,14 @@ fn take_one_session_setting(
             MySqlSessionSetting::MaxExecutionTime(None)
         } else if let Some(value) = scanner.take_unsigned() {
             MySqlSessionSetting::MaxExecutionTime(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("group_concat_max_len") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::GroupConcatMaxLen(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::GroupConcatMaxLen(Some(value))
         } else {
             return Ok(None);
         }
@@ -1360,6 +1374,42 @@ mod tests {
         );
         // Measured on MySQL 8.4.11: a word is 1232, which is not a setting.
         assert_eq!(parse("SET max_execution_time = '10'"), None);
+    }
+
+    /// ORMs and reporting tools raise the limit right after connecting.
+    /// Measured on MySQL 8.4.11: any whole number up to the largest unsigned
+    /// 64-bit one is taken, and a word, a number with a point, a negative
+    /// number, `NULL` and `ON` are not.
+    #[test]
+    fn reads_the_group_concat_limit() {
+        assert_eq!(
+            parse("SET SESSION group_concat_max_len = 1000000"),
+            Some(MySqlSessionSetting::GroupConcatMaxLen(Some(1_000_000)))
+        );
+        assert_eq!(
+            parse("SET @@session.group_concat_max_len = 18446744073709551615"),
+            Some(MySqlSessionSetting::GroupConcatMaxLen(Some(u64::MAX)))
+        );
+        assert_eq!(
+            parse("SET group_concat_max_len = DEFAULT"),
+            Some(MySqlSessionSetting::GroupConcatMaxLen(None))
+        );
+        for refused in [
+            "SET group_concat_max_len = '100'",
+            "SET group_concat_max_len = 1.5",
+            "SET group_concat_max_len = -1",
+            "SET group_concat_max_len = NULL",
+            "SET group_concat_max_len = ON",
+            "SET group_concat_max_len = 18446744073709551616",
+        ] {
+            assert!(
+                !matches!(
+                    parse_optional_session_settings(refused, SessionSqlMode::default()),
+                    Ok(Some(_))
+                ),
+                "{refused}"
+            );
+        }
     }
 
     /// Rails without strict mode takes the strict modes out with `REPLACE`.

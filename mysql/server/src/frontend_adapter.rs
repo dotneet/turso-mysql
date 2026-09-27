@@ -184,6 +184,9 @@ pub struct MySqlCommandAdapter {
     /// What the last statement warned about, which `SHOW WARNINGS` reports.
     raised_warnings: Vec<MySqlWarning>,
     prepared_types: HashMap<u32, Vec<StatementParameterType>>,
+    /// The largest `group_concat_max_len` each prepared statement was prepared
+    /// or executed under, which is the limit MySQL keeps cutting it at.
+    prepared_group_concat_max_lens: HashMap<u32, u64>,
     pending_long_data: PendingLongData,
     /// The named locks this session holds. A directly supplied connection has
     /// no server around it, so it has a lock table of its own.
@@ -226,6 +229,11 @@ struct DatabasePreparedStatement {
     /// The checked statement's own text, which a window or a `UNION` reads its
     /// result columns' origins from each time it is executed.
     sql: Option<String>,
+    /// The limit a `GROUP_CONCAT` in it is cut at. Measured on MySQL 8.4.11:
+    /// a prepared statement keeps the largest `group_concat_max_len` it was
+    /// prepared or executed under, for both the cut and its column, so a
+    /// session lowering the limit afterwards leaves the statement uncut.
+    group_concat_max_len: u64,
 }
 
 #[cfg(unix)]
@@ -253,6 +261,7 @@ impl MySqlCommandAdapter {
             session_variables: crate::session_variables::MySqlSessionVariables::default(),
             raised_warnings: Vec::new(),
             prepared_types: HashMap::new(),
+            prepared_group_concat_max_lens: HashMap::new(),
             pending_long_data: PendingLongData::default(),
             named_locks: Arc::new(MySqlNamedLocks::default()).session(),
         }
@@ -308,6 +317,7 @@ impl CommandExecutor for MySqlCommandAdapter {
             .reset_connection()
             .map_err(frontend_query_error)?;
         self.prepared_types.clear();
+        self.prepared_group_concat_max_lens.clear();
         // MySQL's reset lets go of every named lock the session holds.
         self.named_locks.release_all();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
@@ -325,6 +335,9 @@ impl CommandExecutor for MySqlCommandAdapter {
             return Err(FrontendErrorKind::Unsupported);
         }
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        let group_concat_max_len = self.session_variables.group_concat_max_len();
+        self.connection
+            .set_group_concat_max_len(group_concat_max_len);
         let mut result = prepare_checked_statement(&self.connection, sql)?;
         if let Err(error) = apply_raw_column_collations(
             &self.connection,
@@ -335,12 +348,15 @@ impl CommandExecutor for MySqlCommandAdapter {
                 .remove_prepared_statement(result.statement_id);
             return Err(error);
         }
+        self.prepared_group_concat_max_lens
+            .insert(result.statement_id, group_concat_max_len);
         Ok(result)
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
         self.connection.remove_prepared_statement(statement_id);
         self.prepared_types.remove(&statement_id);
+        self.prepared_group_concat_max_lens.remove(&statement_id);
         self.pending_long_data.clear_statement(statement_id);
     }
 
@@ -463,6 +479,7 @@ impl MySqlCommandAdapter {
                 select_time_limit: self.session_variables.select_time_limit(),
                 affected_rows_mode: MySqlAffectedRowsMode::Changed,
                 sql_notes: self.session_variables.sql_notes(),
+                group_concat_max_len: self.session_variables.group_concat_max_len(),
                 raised: &mut self.raised_warnings,
             },
         )?;
@@ -483,6 +500,16 @@ impl MySqlCommandAdapter {
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         let long_data = self.pending_long_data.take_statement(statement_id);
+        let group_concat_max_len = self
+            .prepared_group_concat_max_lens
+            .entry(statement_id)
+            .or_default();
+        *group_concat_max_len =
+            (*group_concat_max_len).max(self.session_variables.group_concat_max_len());
+        self.connection
+            .set_group_concat_max_len(*group_concat_max_len);
+        self.connection.forget_group_concat_cuts();
+        self.raised_warnings.clear();
         let mut result = execute_prepared_statement(
             &self.connection,
             &mut self.prepared_types,
@@ -492,12 +519,19 @@ impl MySqlCommandAdapter {
             None,
             MySqlAffectedRowsMode::Changed,
         )?;
+        self.raised_warnings.extend(
+            self.connection
+                .take_group_concat_cuts()
+                .into_iter()
+                .map(MySqlWarning::cut_by_group_concat),
+        );
         if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
             apply_raw_column_collations(
                 &self.connection,
                 &mut rows.columns,
                 self.session_variables.raw_character_set_results(),
             )?;
+            rows.warnings = u16::try_from(self.raised_warnings.len()).unwrap_or(u16::MAX);
         }
         Ok(result)
     }
@@ -1271,6 +1305,7 @@ where
                 catalog_query: Some(query),
                 runs_as_text: None,
                 sql: None,
+                group_concat_max_len: self.session_variables.group_concat_max_len(),
             },
         );
         Ok(PreparedStatementResult {
@@ -2821,6 +2856,7 @@ where
                 select_time_limit: self.session_variables.select_time_limit(),
                 affected_rows_mode,
                 sql_notes: self.session_variables.sql_notes(),
+                group_concat_max_len: self.session_variables.group_concat_max_len(),
                 raised: &mut self.raised_warnings,
             },
         )?;
@@ -2858,6 +2894,7 @@ where
             .connection()
             .map_err(database_error_kind)?
             .clone();
+        connection.set_group_concat_max_len(self.session_variables.group_concat_max_len());
         let metadata = connection
             .prepare_checked_statement(sql)
             .map_err(prepared_statement_error)?;
@@ -2910,6 +2947,7 @@ where
                 catalog_query: None,
                 runs_as_text: None,
                 sql: Some(sql.to_owned()),
+                group_concat_max_len: self.session_variables.group_concat_max_len(),
             },
         );
         result
@@ -2956,6 +2994,7 @@ where
                 catalog_query: None,
                 runs_as_text: Some(sql.to_owned()),
                 sql: None,
+                group_concat_max_len: self.session_variables.group_concat_max_len(),
             },
         );
         Ok(PreparedStatementResult {
@@ -3045,6 +3084,14 @@ where
         } else {
             self.query_timeout
         };
+        statement.group_concat_max_len = statement
+            .group_concat_max_len
+            .max(self.session_variables.group_concat_max_len());
+        statement
+            .connection
+            .set_group_concat_max_len(statement.group_concat_max_len);
+        statement.connection.forget_group_concat_cuts();
+        self.raised_warnings.clear();
         let mut result = execute_database_prepared_statement(
             statement,
             parameter_payload,
@@ -3052,12 +3099,20 @@ where
             timeout,
             affected_rows_mode,
         )?;
+        self.raised_warnings.extend(
+            statement
+                .connection
+                .take_group_concat_cuts()
+                .into_iter()
+                .map(MySqlWarning::cut_by_group_concat),
+        );
         if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
             apply_raw_column_collations(
                 &statement.connection,
                 &mut rows.columns,
                 self.session_variables.raw_character_set_results(),
             )?;
+            rows.warnings = u16::try_from(self.raised_warnings.len()).unwrap_or(u16::MAX);
         }
         Ok(result)
     }
@@ -3155,6 +3210,9 @@ struct CheckedQueryOptions<'a> {
     select_time_limit: Option<Duration>,
     affected_rows_mode: MySqlAffectedRowsMode,
     sql_notes: bool,
+    /// How many bytes a `GROUP_CONCAT` answers before it is cut, which the
+    /// session sets with `group_concat_max_len`.
+    group_concat_max_len: u64,
     /// Every warning the statement raises, so a later `SHOW WARNINGS` can
     /// report it.
     raised: &'a mut Vec<MySqlWarning>,
@@ -3172,9 +3230,12 @@ fn execute_checked_query(
         select_time_limit,
         affected_rows_mode,
         sql_notes,
+        group_concat_max_len,
         raised,
     } = options;
     let sql = strip_leading_sql_comments(sql);
+    connection.set_group_concat_max_len(group_concat_max_len);
+    connection.forget_group_concat_cuts();
     if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Syntax)?
     {
@@ -3422,6 +3483,7 @@ fn execute_checked_query(
                 select_time_limit,
                 affected_rows_mode,
                 sql_notes,
+                group_concat_max_len,
                 raised,
             },
         );
@@ -3441,6 +3503,7 @@ fn execute_checked_query(
                     select_time_limit,
                     affected_rows_mode,
                     sql_notes,
+                    group_concat_max_len,
                     raised,
                 },
             );
@@ -3565,6 +3628,13 @@ fn execute_checked_query(
             the_shorter_limit(query_timeout, select_time_limit),
         )?;
         result.status_flags = connection_status_flags(connection);
+        raised.extend(
+            connection
+                .take_group_concat_cuts()
+                .into_iter()
+                .map(MySqlWarning::cut_by_group_concat),
+        );
+        result.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
         return Ok(CommandExecutionResult::ResultSet(result));
     }
     if !is_checked_write_statement(sql) {
@@ -5050,6 +5120,8 @@ struct TableResultMetadata {
     /// A `UNION` reads more than one branch, and its result columns belong to
     /// none of the tables any single branch names.
     union: bool,
+    /// The limit a `GROUP_CONCAT` is cut at, which sizes its column.
+    group_concat_max_len: u64,
 }
 
 #[cfg(unix)]
@@ -5823,8 +5895,22 @@ impl TableResultMetadata {
             set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
             return Ok(definition);
         } else if kind == ColumnAggregateKind::Concatenated {
-            definition.column_type = MYSQL_TYPE_LONG_BLOB;
-            definition.column_length = 65536;
+            if !joins_as_the_engine_writes_it(source) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            // Measured on MySQL 8.4.11, in both protocols: up to 512 bytes a
+            // `VAR_STRING` four bytes to each, past that a `LONG_BLOB` 64
+            // bytes to each, up to the widest a column can say it is.
+            let max_len = self.group_concat_max_len;
+            if max_len <= 512 {
+                definition.column_type = MYSQL_TYPE_VAR_STRING;
+                definition.column_length =
+                    u32::try_from(max_len * 4).expect("512 bytes, four to each, fit a u32");
+            } else {
+                definition.column_type = MYSQL_TYPE_LONG_BLOB;
+                definition.column_length =
+                    u32::try_from(max_len.saturating_mul(64)).unwrap_or(u32::MAX);
+            }
             definition.decimals = 31;
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
         } else if kind != ColumnAggregateKind::MinMax {
@@ -8424,6 +8510,24 @@ fn writes_into_a_document_the_way_mysql_does(source: &MySqlColumnMetadata) -> bo
         || source.decimal_size().is_some_and(|(_, scale)| scale == 0)
 }
 
+/// Reports whether MySQL writes a column's values into a `GROUP_CONCAT` the
+/// way the engine does.
+///
+/// Measured on MySQL 8.4.11: a `DOUBLE` or a `FLOAT` is written the shortest
+/// way — `1e20`, `0.1` — where the engine writes `1.0e+20` and
+/// `0.100000001490116`, and a `BLOB`, a binary string or a `JSON` column
+/// answers a binary result of a width of its own.
+#[cfg(unix)]
+fn joins_as_the_engine_writes_it(column: &MySqlColumnMetadata) -> bool {
+    is_text_column(column)
+        || is_whole_number_column(column.type_name())
+        || column.decimal_size().is_some()
+        || matches!(
+            column.type_name(),
+            "DATE" | "DATETIME" | "TIMESTAMP" | "TIME" | "YEAR" | "ENUM"
+        )
+}
+
 #[cfg(unix)]
 fn is_text_column(column: &MySqlColumnMetadata) -> bool {
     matches!(
@@ -8987,6 +9091,7 @@ fn table_result_metadata_for_references(
         database: selected_database.to_owned(),
         tables,
         union: source_tables.iter().any(|source| source.branch() > 0),
+        group_concat_max_len: connection.group_concat_max_len(),
     };
     for (reference, ordinal) in source_references {
         let Some(table) = metadata.table_for(reference) else {
@@ -9040,6 +9145,7 @@ fn grouped_view_columns(
             derived: None,
         }],
         union: false,
+        group_concat_max_len: connection.group_concat_max_len(),
     };
     let key_flags = MYSQL_PRI_KEY_FLAG
         | MYSQL_UNIQUE_KEY_FLAG
@@ -9658,6 +9764,18 @@ impl MySqlWarning {
             level: "Note",
             code: 1050,
             message: format!("Table '{table}' already exists"),
+        }
+    }
+
+    /// The warning MySQL raises for a `GROUP_CONCAT` longer than the
+    /// session's `group_concat_max_len`, naming the row the cut fell at.
+    ///
+    /// Measured on MySQL 8.4.11: `Warning`, code 1260, and this message.
+    fn cut_by_group_concat(row: u64) -> Self {
+        Self {
+            level: "Warning",
+            code: 1260,
+            message: format!("Row {row} was cut by GROUP_CONCAT()"),
         }
     }
 
@@ -10427,6 +10545,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::BusySnapshot => FrontendErrorKind::SerializationFailure,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
+        LimboError::InvalidArgument(message)
+            if message.starts_with(turso_mysql::GROUP_CONCAT_CUT_ERROR) =>
+        {
+            FrontendErrorKind::GroupConcatCut
+        }
         // Measured on MySQL 8.4.11: a row breaking a `CHECK` is 3819, where one
         // breaking a key is 1062.
         LimboError::Constraint(message) if message.starts_with("CHECK constraint failed") => {
