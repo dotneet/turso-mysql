@@ -549,6 +549,15 @@ pub struct Connection {
     /// session leaves what it may see here for them to read. Nothing in the
     /// engine reads it.
     pub(super) mysql_visible_tables: parking_lot::RwLock<Option<Vec<String>>>,
+    /// The rows a MySQL session worked out for its catalog tables, by the
+    /// name the engine knows each table by.
+    ///
+    /// Some of those tables answer what only the session can work out — the
+    /// databases it may see, or each column's type as MySQL prints it, which
+    /// is read out of stored DDL by statements a table scan cannot run — so
+    /// the session leaves the rows here before a statement that scans one
+    /// runs. Nothing in the engine reads it.
+    pub(super) mysql_catalog_rows: parking_lot::RwLock<HashMap<String, Arc<Vec<Vec<Value>>>>>,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
@@ -2902,6 +2911,19 @@ impl Connection {
     /// Records the tables a MySQL session may see, or `None` for all of them.
     pub fn set_mysql_visible_tables(&self, visible: Option<Vec<String>>) {
         *self.mysql_visible_tables.write() = visible;
+    }
+
+    /// The rows a MySQL session left for one of its catalog tables, or `None`
+    /// when it has left none.
+    pub fn mysql_catalog_rows(&self, table: &str) -> Option<Arc<Vec<Vec<Value>>>> {
+        self.mysql_catalog_rows.read().get(table).cloned()
+    }
+
+    /// Leaves the rows one of a MySQL session's catalog tables answers.
+    pub fn set_mysql_catalog_rows(&self, table: &str, rows: Vec<Vec<Value>>) {
+        self.mysql_catalog_rows
+            .write()
+            .insert(table.to_owned(), Arc::new(rows));
     }
 
     pub fn mysql_changed_rows(&self) -> i64 {

@@ -48,9 +48,24 @@ pub enum MySqlCatalogTable {
     KeyColumnUsage,
     TableConstraints,
     ReferentialConstraints,
+    Routines,
+    Columns,
+    Schemata,
 }
 
 impl MySqlCatalogTable {
+    const ALL: [Self; 9] = [
+        Self::Tables,
+        Self::Views,
+        Self::Statistics,
+        Self::KeyColumnUsage,
+        Self::TableConstraints,
+        Self::ReferentialConstraints,
+        Self::Routines,
+        Self::Columns,
+        Self::Schemata,
+    ];
+
     /// The name the engine knows this table by, which has no qualifier.
     pub const fn engine_name(self) -> &'static str {
         match self {
@@ -60,7 +75,28 @@ impl MySqlCatalogTable {
             Self::KeyColumnUsage => "mysql_information_schema_key_column_usage",
             Self::TableConstraints => "mysql_information_schema_table_constraints",
             Self::ReferentialConstraints => "mysql_information_schema_referential_constraints",
+            Self::Routines => "mysql_information_schema_routines",
+            Self::Columns => "mysql_information_schema_columns",
+            Self::Schemata => "mysql_information_schema_schemata",
         }
+    }
+
+    /// Answers whether the session works out this table's rows before a
+    /// statement that scans it runs, rather than the table reading them out
+    /// of the schema itself.
+    pub const fn rows_come_from_the_session(self) -> bool {
+        matches!(self, Self::Columns | Self::Schemata)
+    }
+
+    /// Answers whether this table holds every column MySQL gives it, which is
+    /// what a wildcard over it asks for.
+    ///
+    /// `TABLES` and `VIEWS` leave out columns this server has nothing true to
+    /// answer with — storage statistics, times, and a view's definition as
+    /// MySQL rewrites it — so a wildcard over either would answer a row
+    /// narrower than MySQL's.
+    pub const fn answers_every_column(self) -> bool {
+        !matches!(self, Self::Tables | Self::Views)
     }
 
     /// The columns this table answers, in the order MySQL declares them, each
@@ -96,6 +132,7 @@ impl MySqlCatalogTable {
                 ("SEQ_IN_INDEX", "INT"),
                 ("COLUMN_NAME", "TEXT"),
                 ("COLLATION", "TEXT"),
+                ("CARDINALITY", "BIGINT"),
                 ("SUB_PART", "BIGINT"),
                 ("PACKED", "TEXT"),
                 ("NULLABLE", "TEXT"),
@@ -141,21 +178,79 @@ impl MySqlCatalogTable {
                 ("TABLE_NAME", "TEXT"),
                 ("REFERENCED_TABLE_NAME", "TEXT"),
             ],
+            Self::Routines => &[
+                ("SPECIFIC_NAME", "TEXT"),
+                ("ROUTINE_CATALOG", "TEXT"),
+                ("ROUTINE_SCHEMA", "TEXT"),
+                ("ROUTINE_NAME", "TEXT"),
+                ("ROUTINE_TYPE", "TEXT"),
+                ("DATA_TYPE", "TEXT"),
+                ("CHARACTER_MAXIMUM_LENGTH", "BIGINT"),
+                ("CHARACTER_OCTET_LENGTH", "BIGINT"),
+                ("NUMERIC_PRECISION", "INT UNSIGNED"),
+                ("NUMERIC_SCALE", "INT UNSIGNED"),
+                ("DATETIME_PRECISION", "INT UNSIGNED"),
+                ("CHARACTER_SET_NAME", "TEXT"),
+                ("COLLATION_NAME", "TEXT"),
+                ("DTD_IDENTIFIER", "TEXT"),
+                ("ROUTINE_BODY", "TEXT"),
+                ("ROUTINE_DEFINITION", "TEXT"),
+                ("EXTERNAL_NAME", "TEXT"),
+                ("EXTERNAL_LANGUAGE", "TEXT"),
+                ("PARAMETER_STYLE", "TEXT"),
+                ("IS_DETERMINISTIC", "TEXT"),
+                ("SQL_DATA_ACCESS", "TEXT"),
+                ("SQL_PATH", "TEXT"),
+                ("SECURITY_TYPE", "TEXT"),
+                ("CREATED", "DATETIME"),
+                ("LAST_ALTERED", "DATETIME"),
+                ("SQL_MODE", "TEXT"),
+                ("ROUTINE_COMMENT", "TEXT"),
+                ("DEFINER", "TEXT"),
+                ("CHARACTER_SET_CLIENT", "TEXT"),
+                ("COLLATION_CONNECTION", "TEXT"),
+                ("DATABASE_COLLATION", "TEXT"),
+            ],
+            Self::Columns => &[
+                ("TABLE_CATALOG", "TEXT"),
+                ("TABLE_SCHEMA", "TEXT"),
+                ("TABLE_NAME", "TEXT"),
+                ("COLUMN_NAME", "TEXT"),
+                ("ORDINAL_POSITION", "INT UNSIGNED"),
+                ("COLUMN_DEFAULT", "TEXT"),
+                ("IS_NULLABLE", "TEXT"),
+                ("DATA_TYPE", "TEXT"),
+                ("CHARACTER_MAXIMUM_LENGTH", "BIGINT"),
+                ("CHARACTER_OCTET_LENGTH", "BIGINT"),
+                ("NUMERIC_PRECISION", "BIGINT UNSIGNED"),
+                ("NUMERIC_SCALE", "BIGINT UNSIGNED"),
+                ("DATETIME_PRECISION", "INT UNSIGNED"),
+                ("CHARACTER_SET_NAME", "TEXT"),
+                ("COLLATION_NAME", "TEXT"),
+                ("COLUMN_TYPE", "TEXT"),
+                ("COLUMN_KEY", "TEXT"),
+                ("EXTRA", "TEXT"),
+                ("PRIVILEGES", "TEXT"),
+                ("COLUMN_COMMENT", "TEXT"),
+                ("GENERATION_EXPRESSION", "TEXT"),
+                ("SRS_ID", "INT UNSIGNED"),
+            ],
+            Self::Schemata => &[
+                ("CATALOG_NAME", "TEXT"),
+                ("SCHEMA_NAME", "TEXT"),
+                ("DEFAULT_CHARACTER_SET_NAME", "TEXT"),
+                ("DEFAULT_COLLATION_NAME", "TEXT"),
+                ("SQL_PATH", "TEXT"),
+                ("DEFAULT_ENCRYPTION", "TEXT"),
+            ],
         }
     }
 
     /// Reads a table back from the name the engine knows it by.
     pub fn from_engine_name(name: &str) -> Option<Self> {
-        [
-            Self::Tables,
-            Self::Views,
-            Self::Statistics,
-            Self::KeyColumnUsage,
-            Self::TableConstraints,
-            Self::ReferentialConstraints,
-        ]
-        .into_iter()
-        .find(|table| table.engine_name().eq_ignore_ascii_case(name))
+        Self::ALL
+            .into_iter()
+            .find(|table| table.engine_name().eq_ignore_ascii_case(name))
     }
 
     /// Returns the type a value compared against one of these columns has to
@@ -172,16 +267,9 @@ impl MySqlCatalogTable {
         if !database.eq_ignore_ascii_case("information_schema") {
             return None;
         }
-        [
-            Self::Tables,
-            Self::Views,
-            Self::Statistics,
-            Self::KeyColumnUsage,
-            Self::TableConstraints,
-            Self::ReferentialConstraints,
-        ]
-        .into_iter()
-        .find(|catalog| table.eq_ignore_ascii_case(catalog.mysql_name()))
+        Self::ALL
+            .into_iter()
+            .find(|catalog| table.eq_ignore_ascii_case(catalog.mysql_name()))
     }
 
     /// The name MySQL knows this table by, without its `information_schema`
@@ -194,6 +282,9 @@ impl MySqlCatalogTable {
             Self::KeyColumnUsage => "KEY_COLUMN_USAGE",
             Self::TableConstraints => "TABLE_CONSTRAINTS",
             Self::ReferentialConstraints => "REFERENTIAL_CONSTRAINTS",
+            Self::Routines => "ROUTINES",
+            Self::Columns => "COLUMNS",
+            Self::Schemata => "SCHEMATA",
         }
     }
 }
@@ -636,19 +727,19 @@ fn render_select_body(
     }
 
     let (from, source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
-    // An `information_schema` table answers a few of the columns MySQL gives
-    // it, so a wildcard — which asks for all of them — would answer a row of a
-    // different width than MySQL answers.
-    if source_tables
-        .iter()
-        .any(|source| source.catalog().is_some())
-        && select.projection.iter().any(|item| {
-            matches!(
-                item,
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
-            )
-        })
-    {
+    // Some `information_schema` tables answer only a few of the columns MySQL
+    // gives them, and a wildcard over one of those — which asks for all of
+    // them — would answer a row of a different width than MySQL answers.
+    if source_tables.iter().any(|source| {
+        source
+            .catalog()
+            .is_some_and(|catalog| !catalog.answers_every_column())
+    }) && select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+        )
+    }) {
         return unsupported("information_schema wildcard projection");
     }
 

@@ -1358,6 +1358,19 @@ impl MySqlConnection {
         self.inner.set_mysql_visible_tables(visible);
     }
 
+    /// Leaves the rows one `information_schema` table answers, for a table
+    /// whose rows only the session can work out.
+    ///
+    /// A row may stop short of the table's width, holding only the columns
+    /// that could be worked out; a statement reading one past them fails.
+    pub fn set_catalog_rows(
+        &self,
+        table: turso_mysql_parser::MySqlCatalogTable,
+        rows: Vec<Vec<Value>>,
+    ) {
+        self.inner.set_mysql_catalog_rows(table.engine_name(), rows);
+    }
+
     /// Close the underlying database connection.
     ///
     /// Prepared statements are cleared only after the underlying close

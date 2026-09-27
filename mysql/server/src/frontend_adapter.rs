@@ -793,6 +793,118 @@ where
         Ok(())
     }
 
+    /// Works out the rows of an `information_schema` table that only this
+    /// session can answer, and leaves them where the table reads them.
+    ///
+    /// They are worked out again for every statement that scans the table, so
+    /// a statement never reads rows a schema change has made stale.
+    #[cfg(unix)]
+    fn publish_catalog_rows(
+        &mut self,
+        selected_database: &str,
+        visibility: CatalogVisibility,
+        catalog: MySqlCatalogTable,
+    ) -> Result<(), FrontendErrorKind> {
+        let rows = match catalog {
+            MySqlCatalogTable::Columns => {
+                self.information_schema_columns_rows(selected_database, visibility)?
+            }
+            MySqlCatalogTable::Schemata => {
+                self.information_schema_schemata_rows(selected_database)?
+            }
+            _ => unreachable!("only COLUMNS and SCHEMATA take their rows from the session"),
+        };
+        self.session
+            .connection()
+            .map_err(database_error_kind)?
+            .set_catalog_rows(catalog, rows);
+        Ok(())
+    }
+
+    /// The rows of `information_schema.COLUMNS`: every column of every table
+    /// and view the session may see.
+    ///
+    /// A table whose columns this cannot read answers its name and nothing
+    /// else, so a query about some other table is not refused for it, while
+    /// one that reads its columns is.
+    #[cfg(unix)]
+    fn information_schema_columns_rows(
+        &self,
+        selected_database: &str,
+        visibility: CatalogVisibility,
+    ) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        let tables = connection
+            .list_tables()
+            .map_err(|_| FrontendErrorKind::Internal)?;
+        let tables = self.filter_catalog_tables(selected_database, visibility, tables)?;
+        // A column lists the privileges the session holds on it, the same
+        // answer `SHOW FULL COLUMNS` gives here.
+        let privileges = match visibility {
+            CatalogVisibility::All => "select,insert,update,references",
+            CatalogVisibility::GrantedTables => "select",
+        };
+        let mut rows = Vec::new();
+        for table in tables {
+            let name =
+                MySqlTableName::parse(table.name()).map_err(|_| FrontendErrorKind::Internal)?;
+            match connection.list_columns(&name) {
+                Ok(columns) => rows.extend(catalog_results::information_schema_columns_rows(
+                    selected_database,
+                    table.name(),
+                    columns,
+                    privileges,
+                )?),
+                Err(MySqlColumnMetadataError::TableNotFound) => {}
+                Err(MySqlColumnMetadataError::Engine(_)) => {
+                    return Err(FrontendErrorKind::Internal)
+                }
+                Err(
+                    MySqlColumnMetadataError::CorruptDefinition
+                    | MySqlColumnMetadataError::UnsupportedDefinition,
+                ) => rows.push(vec![
+                    Value::build_text("def"),
+                    Value::build_text(selected_database.to_owned()),
+                    Value::build_text(table.name().to_owned()),
+                ]),
+            }
+            if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+                return Err(FrontendErrorKind::Internal);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The rows of `information_schema.SCHEMATA`: every database the session
+    /// may list, or the one it is in when it may list none.
+    ///
+    /// MySQL shows a session the databases it holds any privilege on, and a
+    /// session is in one it may reach.
+    #[cfg(unix)]
+    fn information_schema_schemata_rows(
+        &mut self,
+        selected_database: &str,
+    ) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
+        let databases = match self
+            .authorizer
+            .authorize(&self.principal, DatabaseAction::List)
+        {
+            Ok(()) => {
+                let result = self
+                    .session
+                    .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
+                    .map_err(database_error_kind)?;
+                let MySqlAdminCommandResult::Listed { databases } = result else {
+                    unreachable!("listing the databases answers a list");
+                };
+                databases
+            }
+            Err(AuthorizationError::Denied) => vec![selected_database.to_owned()],
+            Err(error) => return Err(authorization_frontend_error(error)),
+        };
+        Ok(catalog_results::information_schema_schemata_rows(databases))
+    }
+
     fn authorize_catalog_visibility(
         &self,
         database: &str,
@@ -2023,9 +2135,11 @@ where
                 self.status_flags(),
             );
         }
-        if parse_optional_information_schema_schemata(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-            .is_some()
+        // The two written shapes the catalogue reader took before the engine
+        // could scan these tables still answer them, and anything else falls
+        // through to the tables the engine scans.
+        if let Ok(Some(_)) =
+            parse_optional_information_schema_schemata(sql, SessionSqlMode::default())
         {
             self.authorize(DatabaseAction::List)?;
             let result = self
@@ -2037,9 +2151,8 @@ where
             };
             return information_schema_schemata_result_to_execution_result(databases);
         }
-        if let Some(query) =
+        if let Ok(Some(query)) =
             parse_optional_information_schema_columns(sql, SessionSqlMode::default())
-                .map_err(|_| FrontendErrorKind::Syntax)?
         {
             let selected_database = self
                 .session
@@ -2528,6 +2641,13 @@ where
         {
             self.publish_catalog_visibility(&selected_database, visibility)?;
         }
+        for catalog in source_tables
+            .iter()
+            .filter_map(MySqlSelectSource::catalog)
+            .filter(|catalog| catalog.rows_come_from_the_session())
+        {
+            self.publish_catalog_rows(&selected_database, visibility, catalog)?;
+        }
         self.raised_warnings.clear();
         let connection = self.session.connection().map_err(database_error_kind)?;
         let replacement = if may_create_a_view_or_trigger(sql) {
@@ -2801,6 +2921,24 @@ where
             })
             .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
         self.authorize_prepared_query(&database, &source_tables, read_only_select)?;
+        let session_catalogs = source_tables
+            .iter()
+            .filter_map(MySqlSelectSource::catalog)
+            .filter(|catalog| catalog.rows_come_from_the_session())
+            .collect::<Vec<_>>();
+        if !session_catalogs.is_empty() {
+            // The rows are worked out over the database the session is in,
+            // which a statement prepared in another one does not read.
+            if self.session.selected_database() != Some(database.as_str()) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            // A statement reading an `information_schema` table was
+            // authorized under the database-wide grant, which sees every
+            // table.
+            for catalog in session_catalogs {
+                self.publish_catalog_rows(&database, CatalogVisibility::All, catalog)?;
+            }
+        }
         let long_data = self.pending_long_data.take_statement(statement_id);
         let statement = self
             .prepared_statements
@@ -8518,6 +8656,9 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
         MySqlCatalogTable::ReferentialConstraints => {
             catalog_results::information_schema_referential_constraints_columns()
         }
+        MySqlCatalogTable::Routines => catalog_results::information_schema_routines_columns(),
+        MySqlCatalogTable::Columns => catalog_results::information_schema_columns_every_column(),
+        MySqlCatalogTable::Schemata => catalog_results::information_schema_schemata_columns(),
     }
 }
 

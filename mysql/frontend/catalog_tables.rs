@@ -44,6 +44,15 @@ pub(crate) const INFORMATION_SCHEMA_TABLE_CONSTRAINTS: &str =
 pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
     "mysql_information_schema_referential_constraints";
 
+/// The name the engine knows `information_schema.ROUTINES` by.
+pub(crate) const INFORMATION_SCHEMA_ROUTINES: &str = "mysql_information_schema_routines";
+
+/// The name the engine knows `information_schema.COLUMNS` by.
+pub(crate) const INFORMATION_SCHEMA_COLUMNS: &str = "mysql_information_schema_columns";
+
+/// The name the engine knows `information_schema.SCHEMATA` by.
+pub(crate) const INFORMATION_SCHEMA_SCHEMATA: &str = "mysql_information_schema_schemata";
+
 /// Registers every `information_schema` table on one logical database.
 ///
 /// A database is opened once and acquired many times, and registering mutates
@@ -80,6 +89,59 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
     if !database.has_table(INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS) {
         database.register_internal_vtab(InformationSchemaReferentialConstraints {
             database: name.to_owned(),
+        })?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_ROUTINES) {
+        database.register_internal_vtab(InformationSchemaRoutines)?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_COLUMNS) {
+        database.register_internal_vtab(SessionCatalogTable {
+            name: INFORMATION_SCHEMA_COLUMNS,
+            mysql_name: "COLUMNS",
+            // The database name is compared as it was written, the way MySQL
+            // compares it: measured on MySQL 8.4.11, `TABLE_SCHEMA =
+            // 'TURSO_ORACLE'` answers nothing where `'turso_oracle'` answers
+            // the columns. A table or column name is not, this frontend
+            // folding the case of every table name it is given.
+            columns: &[
+                "TABLE_CATALOG TEXT",
+                "TABLE_SCHEMA TEXT",
+                "TABLE_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "COLUMN_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "ORDINAL_POSITION INTEGER",
+                "COLUMN_DEFAULT TEXT",
+                "IS_NULLABLE TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "DATA_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "CHARACTER_MAXIMUM_LENGTH INTEGER",
+                "CHARACTER_OCTET_LENGTH INTEGER",
+                "NUMERIC_PRECISION INTEGER",
+                "NUMERIC_SCALE INTEGER",
+                "DATETIME_PRECISION INTEGER",
+                "CHARACTER_SET_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "COLLATION_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "COLUMN_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "COLUMN_KEY TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "EXTRA TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "PRIVILEGES TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "COLUMN_COMMENT TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "GENERATION_EXPRESSION TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "SRS_ID INTEGER",
+            ],
+        })?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_SCHEMATA) {
+        database.register_internal_vtab(SessionCatalogTable {
+            name: INFORMATION_SCHEMA_SCHEMATA,
+            mysql_name: "SCHEMATA",
+            // A database name is compared as it was written, as for COLUMNS.
+            columns: &[
+                "CATALOG_NAME TEXT",
+                "SCHEMA_NAME TEXT",
+                "DEFAULT_CHARACTER_SET_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "DEFAULT_COLLATION_NAME TEXT COLLATE MYSQL_UCA9_AI_CI",
+                "SQL_PATH TEXT",
+                "DEFAULT_ENCRYPTION TEXT COLLATE MYSQL_UCA9_AI_CI",
+            ],
         })?;
     }
     Ok(())
@@ -427,7 +489,8 @@ impl InternalVirtualTable for InformationSchemaStatistics {
              INDEX_SCHEMA TEXT COLLATE MYSQL_UCA9_AI_CI, \
              INDEX_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, SEQ_IN_INDEX INTEGER, \
              COLUMN_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
-             COLLATION TEXT COLLATE MYSQL_UCA9_AI_CI, SUB_PART INTEGER, \
+             COLLATION TEXT COLLATE MYSQL_UCA9_AI_CI, CARDINALITY INTEGER, \
+             SUB_PART INTEGER, \
              PACKED TEXT COLLATE MYSQL_UCA9_AI_CI, \
              NULLABLE TEXT COLLATE MYSQL_UCA9_AI_CI, \
              INDEX_TYPE TEXT COLLATE MYSQL_UCA9_AI_CI, \
@@ -473,7 +536,11 @@ impl InternalVirtualTable for InformationSchemaStatistics {
                     index_name: "PRIMARY".to_owned(),
                     sequence: position as i64 + 1,
                     column_name: column_name.clone(),
-                    nullable: nullable(column_name),
+                    // MySQL holds every key column NOT NULL. The engine does
+                    // not mark the column its rowid stands for, which is the
+                    // counted key of an `AUTO_INCREMENT` table, so it is not
+                    // asked.
+                    nullable: "",
                 });
             }
             for index in indexes_beside_the_primary_key(&schema, name, &btree) {
@@ -558,14 +625,20 @@ impl InternalVirtualTableCursor for InformationSchemaStatisticsCursor {
             6 => Value::from_i64(row.sequence),
             7 => Value::build_text(row.column_name.clone()),
             8 => Value::build_text("A"),
+            // MySQL answers InnoDB's estimate of how many distinct values the
+            // index holds, cached for a day by default, so what it answers
+            // after a write depends on when it last looked. The engine keeps
+            // no estimate, and NULL is what MySQL answers for an index it has
+            // none for, which is what `SHOW INDEX` here answers too.
             9 => Value::Null,
             10 => Value::Null,
-            11 => Value::build_text(row.nullable),
-            12 => Value::build_text("BTREE"),
-            13 => Value::build_text(""),
+            11 => Value::Null,
+            12 => Value::build_text(row.nullable),
+            13 => Value::build_text("BTREE"),
             14 => Value::build_text(""),
-            15 => Value::build_text("YES"),
-            16 => Value::Null,
+            15 => Value::build_text(""),
+            16 => Value::build_text("YES"),
+            17 => Value::Null,
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.STATISTICS has no column {column}"
@@ -1129,6 +1202,201 @@ impl InternalVirtualTableCursor for InformationSchemaReferentialConstraintsCurso
     }
 }
 
+/// `information_schema.ROUTINES`, which is always empty.
+///
+/// Stored procedures and functions are refused here, so no database holds
+/// one, and no rows is the true answer to a client asking which there are.
+/// The columns are MySQL's own, so a wildcard answers the width MySQL does.
+#[derive(Debug)]
+struct InformationSchemaRoutines;
+
+impl InternalVirtualTable for InformationSchemaRoutines {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_ROUTINES.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        let columns = [
+            "SPECIFIC_NAME TEXT",
+            "ROUTINE_CATALOG TEXT",
+            "ROUTINE_SCHEMA TEXT",
+            "ROUTINE_NAME TEXT",
+            "ROUTINE_TYPE TEXT",
+            "DATA_TYPE TEXT",
+            "CHARACTER_MAXIMUM_LENGTH INTEGER",
+            "CHARACTER_OCTET_LENGTH INTEGER",
+            "NUMERIC_PRECISION INTEGER",
+            "NUMERIC_SCALE INTEGER",
+            "DATETIME_PRECISION INTEGER",
+            "CHARACTER_SET_NAME TEXT",
+            "COLLATION_NAME TEXT",
+            "DTD_IDENTIFIER TEXT",
+            "ROUTINE_BODY TEXT",
+            "ROUTINE_DEFINITION TEXT",
+            "EXTERNAL_NAME TEXT",
+            "EXTERNAL_LANGUAGE TEXT",
+            "PARAMETER_STYLE TEXT",
+            "IS_DETERMINISTIC TEXT",
+            "SQL_DATA_ACCESS TEXT",
+            "SQL_PATH TEXT",
+            "SECURITY_TYPE TEXT",
+            "CREATED TEXT",
+            "LAST_ALTERED TEXT",
+            "SQL_MODE TEXT",
+            "ROUTINE_COMMENT TEXT",
+            "DEFINER TEXT",
+            "CHARACTER_SET_CLIENT TEXT",
+            "COLLATION_CONNECTION TEXT",
+            "DATABASE_COLLATION TEXT",
+        ];
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_ROUTINES} ({})",
+            columns.join(", ")
+        )
+    }
+
+    fn open(
+        &self,
+        _connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(NoRoutinesCursor)))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+struct NoRoutinesCursor;
+
+impl InternalVirtualTableCursor for NoRoutinesCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        Ok(false)
+    }
+
+    fn rowid(&self) -> i64 {
+        unreachable!("information_schema.ROUTINES has no row to stand on")
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        Err(LimboError::InternalError(format!(
+            "information_schema.ROUTINES has no row to read column {column} from"
+        )))
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        Ok(false)
+    }
+}
+
+/// An `information_schema` table whose rows the session works out and leaves
+/// on the connection before a statement that scans it runs.
+///
+/// `SCHEMATA` answers the databases the session may see, which live in the
+/// server's catalog rather than in this database, and `COLUMNS` answers each
+/// column the way MySQL prints it, which is read out of the stored DDL by
+/// statements a scan in the middle of a statement cannot run.
+///
+/// A row shorter than the table holds only the columns the session could work
+/// out, and reading one past them fails: a table whose columns cannot be read
+/// still answers its name, so a query about another table is not refused for
+/// it.
+#[derive(Debug)]
+struct SessionCatalogTable {
+    name: &'static str,
+    mysql_name: &'static str,
+    columns: &'static [&'static str],
+}
+
+impl InternalVirtualTable for SessionCatalogTable {
+    fn name(&self) -> String {
+        self.name.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!("CREATE TABLE {} ({})", self.name, self.columns.join(", "))
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let rows = connection.mysql_catalog_rows(self.name).ok_or_else(|| {
+            LimboError::InternalError(format!(
+                "information_schema.{} was scanned before its rows were worked out",
+                self.mysql_name
+            ))
+        })?;
+        Ok(Arc::new(RwLock::new(SessionCatalogCursor {
+            mysql_name: self.mysql_name,
+            width: self.columns.len(),
+            rows,
+            position: -1,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+struct SessionCatalogCursor {
+    mysql_name: &'static str,
+    width: usize,
+    rows: Arc<Vec<Vec<Value>>>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for SessionCatalogCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        if column >= self.width {
+            return Err(LimboError::InternalError(format!(
+                "information_schema.{} has no column {column}",
+                self.mysql_name
+            )));
+        }
+        let row = &self.rows[self.position as usize];
+        row.get(column).cloned().ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "information_schema.{} cannot answer column {column} of this row",
+                self.mysql_name
+            ))
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,6 +1813,89 @@ mod tests {
             )),
             vec![row(&["parent", "PRIMARY"]), row(&["parent", "uk_code"])]
         );
+    }
+
+    /// `COLUMNS` answers the rows the session left for it, and a table whose
+    /// columns the session could not read answers its name and no more: a
+    /// query about another table is answered, and one reading that table's
+    /// columns is refused rather than answered with made-up ones.
+    #[test]
+    fn a_table_the_session_could_not_read_answers_its_name_and_nothing_else() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(MemoryIO::new());
+        let database = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        )
+        .unwrap();
+        register_catalog_tables(&database, "reports").unwrap();
+        let connection = database.connect().unwrap();
+        let scan = |sql: &str| {
+            connection
+                .prepare(sql)
+                .and_then(|mut statement| statement.run_collect_rows())
+        };
+
+        // Nothing has been left yet, and a scan says so rather than
+        // answering no columns at all.
+        assert!(scan(&format!(
+            "SELECT COLUMN_NAME FROM {INFORMATION_SCHEMA_COLUMNS}"
+        ))
+        .is_err());
+
+        let mut readable = vec![
+            Value::build_text("def"),
+            Value::build_text("reports"),
+            Value::build_text("alpha"),
+            Value::build_text("id"),
+            Value::from_i64(1),
+        ];
+        readable.resize(22, Value::Null);
+        connection.set_mysql_catalog_rows(
+            INFORMATION_SCHEMA_COLUMNS,
+            vec![
+                readable,
+                vec![
+                    Value::build_text("def"),
+                    Value::build_text("reports"),
+                    Value::build_text("broken"),
+                ],
+            ],
+        );
+        let texts = |rows: Vec<Vec<Value>>| -> Vec<String> {
+            rows.into_iter()
+                .map(|row| match &row[0] {
+                    Value::Text(text) => text.as_str().to_owned(),
+                    other => panic!("{other:?} is not text"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            texts(
+                scan(&format!(
+                    "SELECT TABLE_NAME FROM {INFORMATION_SCHEMA_COLUMNS}"
+                ))
+                .unwrap()
+            ),
+            ["alpha", "broken"]
+        );
+        assert_eq!(
+            texts(
+                scan(&format!(
+                    "SELECT COLUMN_NAME FROM {INFORMATION_SCHEMA_COLUMNS} \
+                     WHERE TABLE_NAME = 'alpha'"
+                ))
+                .unwrap()
+            ),
+            ["id"]
+        );
+        assert!(scan(&format!(
+            "SELECT COLUMN_NAME FROM {INFORMATION_SCHEMA_COLUMNS}"
+        ))
+        .is_err());
     }
 
     fn row(values: &[&str]) -> Vec<String> {

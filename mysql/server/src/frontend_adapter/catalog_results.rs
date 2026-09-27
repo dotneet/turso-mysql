@@ -473,9 +473,7 @@ fn information_schema_tables_ordinal(column: MySqlInformationSchemaTablesColumn)
 /// this answers, in the order MySQL declares them.
 ///
 /// Every value comes from the pinned MySQL 8.4.11 golden
-/// `information-schema-statistics.json`. `CARDINALITY` is the one column MySQL
-/// has that is missing here: it is an estimate the engine keeps no equivalent
-/// of, and answering a made-up one is worse than answering none.
+/// `information-schema-statistics.json`.
 pub(super) fn information_schema_statistics_columns() -> Vec<ColumnDefinitionConfig> {
     [
         (
@@ -517,6 +515,7 @@ pub(super) fn information_schema_statistics_columns() -> Vec<ColumnDefinitionCon
         ),
         ("COLUMN_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
         ("COLLATION", "", MYSQL_TYPE_VAR_STRING, 4, 0),
+        ("CARDINALITY", "", MYSQL_TYPE_LONGLONG, 21, 0),
         ("SUB_PART", "", MYSQL_TYPE_LONGLONG, 21, 0),
         // Measured: MySQL reports the column it never fills as the null type.
         ("PACKED", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
@@ -783,6 +782,178 @@ pub(super) fn information_schema_referential_constraints_columns() -> Vec<Column
             ),
         ],
     )
+}
+
+/// The shapes MySQL reports for the `information_schema.ROUTINES` columns, in
+/// the order MySQL declares them.
+///
+/// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
+/// every other table here is pinned to. Three columns are constants in MySQL's
+/// own definition of the table, and those name no table at all.
+pub(super) fn information_schema_routines_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let listed = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let chosen =
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let blob = MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
+    [
+        (
+            "SPECIFIC_NAME",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            256u32,
+            listed,
+        ),
+        (
+            "ROUTINE_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "ROUTINE_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "ROUTINE_NAME",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        ("ROUTINE_TYPE", "routines", MYSQL_TYPE_STRING, 36, chosen),
+        ("DATA_TYPE", "", MYSQL_TYPE_BLOB, 201_326_580, blob),
+        ("CHARACTER_MAXIMUM_LENGTH", "", MYSQL_TYPE_LONGLONG, 21, 0),
+        ("CHARACTER_OCTET_LENGTH", "", MYSQL_TYPE_LONGLONG, 21, 0),
+        (
+            "NUMERIC_PRECISION",
+            "routines",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_UNSIGNED_FLAG,
+        ),
+        (
+            "NUMERIC_SCALE",
+            "routines",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_UNSIGNED_FLAG,
+        ),
+        (
+            "DATETIME_PRECISION",
+            "routines",
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_UNSIGNED_FLAG,
+        ),
+        ("CHARACTER_SET_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        ("COLLATION_NAME", "", MYSQL_TYPE_VAR_STRING, 256, 0),
+        ("DTD_IDENTIFIER", "", MYSQL_TYPE_BLOB, 201_326_580, blob),
+        (
+            "ROUTINE_BODY",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            32,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        ("ROUTINE_DEFINITION", "", MYSQL_TYPE_BLOB, u32::MAX, blob),
+        ("EXTERNAL_NAME", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
+        (
+            "EXTERNAL_LANGUAGE",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "PARAMETER_STYLE",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "IS_DETERMINISTIC",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        ("SQL_DATA_ACCESS", "routines", MYSQL_TYPE_STRING, 68, chosen),
+        ("SQL_PATH", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
+        ("SECURITY_TYPE", "routines", MYSQL_TYPE_STRING, 28, chosen),
+        ("CREATED", "routines", MYSQL_TYPE_TIMESTAMP, 19, named),
+        ("LAST_ALTERED", "routines", MYSQL_TYPE_TIMESTAMP, 19, named),
+        (
+            "SQL_MODE",
+            "routines",
+            MYSQL_TYPE_STRING,
+            2080,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_SET_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "ROUTINE_COMMENT",
+            "routines",
+            MYSQL_TYPE_BLOB,
+            262_140,
+            named | MYSQL_BLOB_FLAG,
+        ),
+        ("DEFINER", "routines", MYSQL_TYPE_VAR_STRING, 1152, named),
+        (
+            "CHARACTER_SET_CLIENT",
+            "character_sets",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        (
+            "COLLATION_CONNECTION",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        (
+            "DATABASE_COLLATION",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(name, original_table, column_type, column_length, flags)| {
+            let mut column = ColumnDefinitionConfig::new(name, column_type);
+            // MySQL defines these three as constants, which belong to no
+            // table.
+            if !matches!(name, "EXTERNAL_NAME" | "SQL_PATH" | "PARAMETER_STYLE") {
+                "information_schema".clone_into(&mut column.schema);
+                "ROUTINES".clone_into(&mut column.table);
+            }
+            original_table.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+            column.character_set = if matches!(
+                column_type,
+                MYSQL_TYPE_LONG | MYSQL_TYPE_LONGLONG | MYSQL_TYPE_NULL | MYSQL_TYPE_TIMESTAMP
+            ) {
+                MYSQL_BINARY_COLLATION
+            } else {
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            };
+            column.column_length = column_length;
+            column.flags = flags;
+            if name == "PARAMETER_STYLE" {
+                column.decimals = 31;
+            }
+            column
+        },
+    )
+    .collect()
 }
 
 /// The five dump-facing VIEWS attributes plus the two columns used to find a row.
@@ -1266,6 +1437,303 @@ pub(super) fn information_schema_columns_columns(
     projected
         .iter()
         .map(|column| whole[information_schema_columns_position(*column)].clone())
+        .collect()
+}
+
+/// Every column of `information_schema.COLUMNS`, in the order MySQL declares
+/// them, which is what a wildcard over the table answers.
+///
+/// The thirteen the catalogue reader answers keep the shapes pinned there. The
+/// other nine were measured on MySQL 8.4.11 through `SELECT *` with an `ORDER
+/// BY`, the reading every other table here is pinned to.
+pub(super) fn information_schema_columns_every_column() -> Vec<ColumnDefinitionConfig> {
+    let answered = information_schema_columns_columns(&[
+        MySqlInformationSchemaColumnsColumn::ColumnName,
+        MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+        MySqlInformationSchemaColumnsColumn::ColumnDefault,
+        MySqlInformationSchemaColumnsColumn::IsNullable,
+        MySqlInformationSchemaColumnsColumn::DataType,
+        MySqlInformationSchemaColumnsColumn::CharacterMaximumLength,
+        MySqlInformationSchemaColumnsColumn::NumericPrecision,
+        MySqlInformationSchemaColumnsColumn::NumericScale,
+        MySqlInformationSchemaColumnsColumn::CollationName,
+        MySqlInformationSchemaColumnsColumn::ColumnType,
+        MySqlInformationSchemaColumnsColumn::ColumnKey,
+        MySqlInformationSchemaColumnsColumn::Extra,
+        MySqlInformationSchemaColumnsColumn::ColumnComment,
+    ]);
+    let mut answered = answered.into_iter();
+    let mut next_answered = || {
+        answered
+            .next()
+            .expect("the catalogue reader answers thirteen columns")
+    };
+    let named = |name: &str, original_table: &str| {
+        let mut column = information_schema_column_definition(
+            name,
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            DEFAULT_UTF8MB4_COLLATION.into(),
+            false,
+        );
+        original_table.clone_into(&mut column.original_table);
+        column.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+        column
+    };
+    let mut character_octet_length = information_schema_column_definition(
+        "CHARACTER_OCTET_LENGTH",
+        MYSQL_TYPE_LONGLONG,
+        21,
+        MYSQL_BINARY_COLLATION,
+        false,
+    );
+    character_octet_length.flags = MYSQL_NUM_FLAG;
+    let mut datetime_precision = information_schema_column_definition(
+        "DATETIME_PRECISION",
+        MYSQL_TYPE_LONG,
+        10,
+        MYSQL_BINARY_COLLATION,
+        true,
+    );
+    datetime_precision.flags = MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG;
+    let character_set_name = information_schema_column_definition(
+        "CHARACTER_SET_NAME",
+        MYSQL_TYPE_VAR_STRING,
+        256,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+    let privileges = information_schema_column_definition(
+        "PRIVILEGES",
+        MYSQL_TYPE_VAR_STRING,
+        616,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+    let mut generation_expression = information_schema_column_definition(
+        "GENERATION_EXPRESSION",
+        MYSQL_TYPE_BLOB,
+        u32::MAX,
+        DEFAULT_UTF8MB4_COLLATION.into(),
+        false,
+    );
+    generation_expression.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
+    let mut srs_id = information_schema_column_definition(
+        "SRS_ID",
+        MYSQL_TYPE_LONG,
+        10,
+        MYSQL_BINARY_COLLATION,
+        true,
+    );
+    srs_id.flags = MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG;
+
+    let column_name = next_answered();
+    let ordinal_position = next_answered();
+    let column_default = next_answered();
+    let is_nullable = next_answered();
+    let data_type = next_answered();
+    let character_maximum_length = next_answered();
+    let numeric_precision = next_answered();
+    let numeric_scale = next_answered();
+    let collation_name = next_answered();
+    let column_type = next_answered();
+    let column_key = next_answered();
+    let extra = next_answered();
+    let column_comment = next_answered();
+    vec![
+        named("TABLE_CATALOG", "catalogs"),
+        named("TABLE_SCHEMA", "schemata"),
+        named("TABLE_NAME", "tables"),
+        column_name,
+        ordinal_position,
+        column_default,
+        is_nullable,
+        data_type,
+        character_maximum_length,
+        character_octet_length,
+        numeric_precision,
+        numeric_scale,
+        datetime_precision,
+        character_set_name,
+        collation_name,
+        column_type,
+        column_key,
+        extra,
+        privileges,
+        column_comment,
+        generation_expression,
+        srs_id,
+    ]
+}
+
+/// The rows `information_schema.COLUMNS` answers for one table, every column
+/// of each, in the order MySQL declares them.
+///
+/// Measured on MySQL 8.4.11 over one of every type: a `CHAR`, `VARCHAR`,
+/// `ENUM` or `SET` holds four bytes a character, a `TEXT` or a binary type is
+/// measured in bytes already, so its two lengths are the same number, and only
+/// a `TIME`, `DATETIME` or `TIMESTAMP` has a `DATETIME_PRECISION` — a `DATE`
+/// has none. No column here is generated or spatial, so every
+/// `GENERATION_EXPRESSION` is empty and every `SRS_ID` is NULL.
+pub(super) fn information_schema_columns_rows(
+    database: &str,
+    table: &str,
+    columns: Vec<MySqlColumnMetadata>,
+    privileges: &str,
+) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
+    let text = |bytes: Vec<u8>| {
+        String::from_utf8(bytes)
+            .map(Value::build_text)
+            .map_err(|_| FrontendErrorKind::Internal)
+    };
+    let number = |bytes: Option<Vec<u8>>| -> Result<Value, FrontendErrorKind> {
+        match bytes {
+            None => Ok(Value::Null),
+            Some(bytes) => std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|digits| digits.parse::<i64>().ok())
+                .map(Value::from_i64)
+                .ok_or(FrontendErrorKind::Internal),
+        }
+    };
+    let mut rows = Vec::with_capacity(columns.len());
+    for (ordinal, column) in columns.into_iter().enumerate() {
+        let column_type = show_column_type_name(&column)?;
+        let data_type = the_type_without_its_own_words(&column_type).to_vec();
+        let (character_maximum_length, numeric_precision, numeric_scale, collation_name) =
+            information_schema_column_sizes(&column, &column_type);
+        let character_octet_length = match data_type.as_slice() {
+            b"char" | b"varchar" | b"enum" | b"set" => character_maximum_length
+                .as_ref()
+                .map(|characters| {
+                    let characters = std::str::from_utf8(characters)
+                        .ok()
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or(FrontendErrorKind::Internal)?;
+                    Ok((characters * 4).to_string().into_bytes())
+                })
+                .transpose()?,
+            _ => character_maximum_length.clone(),
+        };
+        let datetime_precision = match data_type.as_slice() {
+            b"time" | b"datetime" | b"timestamp" => {
+                Value::from_i64(i64::from(column.temporal_precision().unwrap_or(0)))
+            }
+            _ => Value::Null,
+        };
+        let character_set_name = match &collation_name {
+            Some(_) => Value::build_text("utf8mb4"),
+            None => Value::Null,
+        };
+        let key = match column.key() {
+            MySqlColumnKey::None => "",
+            MySqlColumnKey::Multiple => "MUL",
+            MySqlColumnKey::Unique => "UNI",
+            MySqlColumnKey::Primary => "PRI",
+        };
+        rows.push(vec![
+            Value::build_text("def"),
+            Value::build_text(database.to_owned()),
+            Value::build_text(table.to_owned()),
+            Value::build_text(column.name().to_owned()),
+            Value::from_i64(ordinal as i64 + 1),
+            match show_column_default_value(&column)? {
+                Some(default) => text(default)?,
+                None => Value::Null,
+            },
+            Value::build_text(if column.nullable() { "YES" } else { "NO" }),
+            text(data_type)?,
+            number(character_maximum_length)?,
+            number(character_octet_length)?,
+            number(numeric_precision)?,
+            number(numeric_scale)?,
+            datetime_precision,
+            character_set_name,
+            match collation_name {
+                Some(collation) => text(collation)?,
+                None => Value::Null,
+            },
+            text(column_type)?,
+            Value::build_text(key),
+            text(show_column_extra(column.extra())?)?,
+            Value::build_text(privileges.to_owned()),
+            Value::build_text(column.comment().to_owned()),
+            Value::build_text(""),
+            Value::Null,
+        ]);
+    }
+    Ok(rows)
+}
+
+/// Every column of `information_schema.SCHEMATA`, in the order MySQL declares
+/// them.
+///
+/// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
+/// every other table here is pinned to. `SQL_PATH` is a constant in MySQL's
+/// own definition of the table, and names no table at all.
+pub(super) fn information_schema_schemata_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let listed = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let mut columns = catalog_text_columns(
+        "SCHEMATA",
+        &[
+            (
+                "CATALOG_NAME",
+                "catalogs",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                named,
+            ),
+            ("SCHEMA_NAME", "schemata", MYSQL_TYPE_VAR_STRING, 256, named),
+            (
+                "DEFAULT_CHARACTER_SET_NAME",
+                "character_sets",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                listed,
+            ),
+            (
+                "DEFAULT_COLLATION_NAME",
+                "collations",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                listed,
+            ),
+            ("SQL_PATH", "", MYSQL_TYPE_NULL, 0, MYSQL_BINARY_FLAG),
+            (
+                "DEFAULT_ENCRYPTION",
+                "schemata",
+                MYSQL_TYPE_STRING,
+                12,
+                named | MYSQL_ENUM_FLAG,
+            ),
+        ],
+    );
+    let sql_path = &mut columns[4];
+    sql_path.schema.clear();
+    sql_path.table.clear();
+    sql_path.character_set = MYSQL_BINARY_COLLATION;
+    columns
+}
+
+/// The rows `information_schema.SCHEMATA` answers, one for each database the
+/// session may list.
+///
+/// Every database here is made with MySQL's default character set and
+/// collation, and none is encrypted.
+pub(super) fn information_schema_schemata_rows(databases: Vec<String>) -> Vec<Vec<Value>> {
+    databases
+        .into_iter()
+        .map(|database| {
+            vec![
+                Value::build_text("def"),
+                Value::build_text(database),
+                Value::build_text("utf8mb4"),
+                Value::build_text("utf8mb4_0900_ai_ci"),
+                Value::Null,
+                Value::build_text("NO"),
+            ]
+        })
         .collect()
 }
 

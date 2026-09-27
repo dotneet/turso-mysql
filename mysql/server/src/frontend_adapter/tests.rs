@@ -9869,7 +9869,6 @@ fn an_information_schema_query_is_answered_in_the_order_it_asked() {
     for sql in [
         "SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
         "SELECT * FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
-        "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't'",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -9962,7 +9961,7 @@ fn an_information_schema_table_is_read_through_the_select_path() {
     // and any other schema's table.
     for sql in [
         "SELECT UPPER(TABLE_NAME) FROM information_schema.TABLES",
-        "SELECT ROUTINE_NAME FROM information_schema.ROUTINES",
+        "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS",
         "SELECT id FROM other.alpha",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
@@ -19385,20 +19384,23 @@ fn information_schema_statistics_reports_every_index_column_with_measured_shapes
         ]
     );
 
-    for query in [
-        // A wildcard asks for MySQL's eighteen columns and this answers
-        // seventeen of them.
-        "SELECT * FROM information_schema.STATISTICS",
-        // The one column MySQL has that this does not answer.
-        "SELECT CARDINALITY FROM information_schema.STATISTICS",
-        // A numeric column takes no text.
-        "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE NON_UNIQUE = 'no'",
-    ] {
-        assert!(
-            adapter.execute_query(query).is_err(),
-            "information_schema.STATISTICS query this cannot answer must be refused: {query}"
-        );
-    }
+    // A numeric column takes no text.
+    assert!(adapter
+        .execute_query(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS WHERE NON_UNIQUE = 'no'"
+        )
+        .is_err());
+
+    // All eighteen of MySQL's columns are answered, so a wildcard is.
+    let CommandExecutionResult::ResultSet(everything) = adapter
+        .execute_query("SELECT * FROM information_schema.STATISTICS")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(everything.columns.len(), 18);
+    assert_eq!(everything.columns[9].name, "CARDINALITY");
+    assert!(everything.rows.iter().all(|row| row[9].is_none()));
 }
 
 #[cfg(unix)]
@@ -19597,13 +19599,16 @@ fn information_schema_key_column_usage_reports_the_keys_a_migration_tool_reads()
         ]]
     );
 
-    // A wildcard is refused over every one of these tables. This is the only
-    // one that answers all of MySQL's columns, so the row would be the right
-    // width — but a query that names its columns is answered either way, and
-    // one rule for all of them is worth more than that.
-    assert!(adapter
+    // It answers all twelve of MySQL's columns, so a wildcard is answered
+    // with a row of the width MySQL answers.
+    let CommandExecutionResult::ResultSet(everything) = adapter
         .execute_query("SELECT * FROM information_schema.KEY_COLUMN_USAGE")
-        .is_err());
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(everything.columns.len(), 12);
+    assert!(everything.rows.iter().all(|row| row.len() == 12));
 }
 
 #[cfg(unix)]
@@ -21380,22 +21385,15 @@ fn information_schema_columns_rejects_malformed_queries_without_fallthrough() {
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("reports").unwrap();
 
-    for query in [
-        "SELECT * FROM information_schema.COLUMNS",
-        // A column MySQL has and this does not answer.
-        "SELECT CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records'",
-        "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY COLUMN_NAME",
-        "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION DESC",
-        "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION; SELECT 1",
-    ] {
-        assert_eq!(
-            adapter.execute_query(query),
-            Err(FrontendErrorKind::Syntax),
-            "malformed information_schema.COLUMNS query must fail closed: {query}"
-        );
-    }
+    // Two statements in one are not the one shape the catalogue reader
+    // takes, and the ordinary `SELECT` path runs one statement at a time.
+    let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION; SELECT 1";
+    assert!(
+        adapter.execute_query(query).is_err(),
+        "two statements in one must fail closed: {query}"
+    );
     assert_eq!(
-        authorizer.actions(),
+        authorizer.actions()[..2],
         vec![
             RecordedDatabaseAction::Connect(None),
             RecordedDatabaseAction::Connect(Some("reports".to_owned())),
@@ -21405,7 +21403,7 @@ fn information_schema_columns_rejects_malformed_queries_without_fallthrough() {
 
 #[cfg(unix)]
 #[test]
-fn information_schema_columns_keeps_prepare_fail_closed() {
+fn information_schema_columns_is_answered_when_prepared() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer.clone());
     let mut adapter = factory
@@ -21415,14 +21413,29 @@ fn information_schema_columns_keeps_prepare_fail_closed() {
         .unwrap();
     adapter.authorize_connection().unwrap();
     adapter.execute_init_db("reports").unwrap();
+    adapter
+        .execute_query("CREATE TABLE grown (id INT NOT NULL PRIMARY KEY, note INT)")
+        .unwrap();
 
-    let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'records' ORDER BY ORDINAL_POSITION";
-    assert!(matches!(
-        adapter.execute_stmt_prepare(query),
-        Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
-    ));
+    let query = "SELECT COLUMN_NAME, ORDINAL_POSITION, COLUMN_DEFAULT, IS_NULLABLE, COLUMN_TYPE, COLUMN_KEY, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'grown' ORDER BY ORDINAL_POSITION";
+    let statement = adapter.execute_stmt_prepare(query).unwrap();
+    let PreparedStatementExecutionResult::ResultSet(read) = adapter
+        .execute_stmt_execute(statement.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("a prepared COLUMNS query answers rows");
+    };
+    let names = read
+        .rows
+        .iter()
+        .map(|row| match &row[0] {
+            BinaryResultValue::Text(name) => name.clone(),
+            other => panic!("COLUMN_NAME is text, not {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["id", "note"]);
     assert_eq!(
-        authorizer.actions(),
+        authorizer.actions()[..3],
         vec![
             RecordedDatabaseAction::Connect(None),
             RecordedDatabaseAction::Connect(Some("reports".to_owned())),
@@ -21880,6 +21893,9 @@ fn information_schema_schemata_rejects_malformed_queries_without_fallthrough() {
         .unwrap();
     adapter.authorize_connection().unwrap();
 
+    // With no database selected, only the one shape the catalogue reader
+    // takes is answered: every other one is read by a table the selected
+    // database's connection scans, and there is none.
     for query in [
         "SELECT * FROM information_schema.SCHEMATA",
         "SELECT SCHEMA_NAME, DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA",
@@ -21887,10 +21903,9 @@ fn information_schema_schemata_rejects_malformed_queries_without_fallthrough() {
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA LIMIT 1",
         "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA; SELECT 1",
     ] {
-        assert_eq!(
-            adapter.execute_query(query),
-            Err(FrontendErrorKind::Syntax),
-            "malformed information_schema.SCHEMATA query must fail closed: {query}"
+        assert!(
+            adapter.execute_query(query).is_err(),
+            "information_schema.SCHEMATA query with no database selected must fail closed: {query}"
         );
     }
     assert_eq!(
@@ -25283,15 +25298,20 @@ fn the_columns_table_answers_a_type_without_its_size_or_sign() {
     assert_eq!(spoken.rows.len(), 6);
     assert_eq!(spoken.rows[0], vec![Some(b"id".to_vec())]);
 
-    // The other way round is not the order they come back in, so it stays
-    // refused rather than answered in the order it did not ask for.
-    assert!(adapter
+    // The other way round is answered the other way round, by the engine
+    // scanning the table rather than by the order its rows are worked out in.
+    let CommandExecutionResult::ResultSet(reversed) = adapter
         .execute_query(
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kinds' \
              ORDER BY ORDINAL_POSITION DESC",
         )
-        .is_err());
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(reversed.rows.len(), 6);
+    assert_eq!(reversed.rows[5], vec![Some(b"id".to_vec())]);
 }
 
 /// A key over words has to match them the way every other reading of a word
@@ -30710,3 +30730,6 @@ mod grouped_reports;
 
 #[cfg(unix)]
 mod derived_tables;
+
+#[cfg(unix)]
+mod information_schema_wildcards;
