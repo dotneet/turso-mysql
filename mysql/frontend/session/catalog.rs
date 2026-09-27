@@ -308,10 +308,17 @@ impl MySqlConnection {
         }
 
         // MySQL lists the unique indexes before the non-unique ones and keeps
-        // each group in creation order, which is the order the engine allocated
-        // their root pages in.
+        // each group in creation order, which is the order their rows stand in
+        // the schema: an index written again goes last there, as a dropped and
+        // added one does in MySQL, where the page it lands on may be one an
+        // older index let go of.
+        let created = self.index_creation_order(table.as_str())?;
         let mut indexes = schema.get_indices(table.as_str()).collect::<Vec<_>>();
-        indexes.sort_by_key(|index| index.root_page);
+        indexes.sort_by_key(|index| {
+            created
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&index.name))
+        });
 
         let mut unique = Vec::new();
         let mut secondary = Vec::new();
@@ -347,6 +354,32 @@ impl MySqlConnection {
         primary.extend(unique);
         primary.extend(secondary);
         Ok(primary)
+    }
+
+    /// The stored names of one table's indexes, in the order their schema rows
+    /// were written.
+    fn index_creation_order(
+        &self,
+        table: &str,
+    ) -> std::result::Result<Vec<String>, MySqlShowCreateTableError> {
+        let sql = format!(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND lower(tbl_name) = '{}'",
+            table.to_lowercase().replace('\'', "''")
+        );
+        let rows = self
+            .inner
+            .prepare_internal(&sql)
+            .map_err(MySqlShowCreateTableError::Engine)?
+            .run_collect_rows()
+            .map_err(MySqlShowCreateTableError::Engine)?;
+        rows.iter()
+            .map(|row| match row.as_slice() {
+                [Value::Text(name)] => Ok(name.as_str().to_owned()),
+                _ => Err(MySqlShowCreateTableError::Engine(LimboError::Corrupt(
+                    "sqlite_schema index row has an invalid shape".to_string(),
+                ))),
+            })
+            .collect()
     }
 
     /// Counts the named rows in `information_schema.TABLE_CONSTRAINTS` for one table.

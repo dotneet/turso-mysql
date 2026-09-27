@@ -164,6 +164,8 @@ impl Drop for CloseOnLastDrop {
 
 struct StoredIndexStatement {
     sql: String,
+    /// The name the engine holds the index under.
+    stored_name: String,
     implicit: bool,
 }
 
@@ -4148,6 +4150,22 @@ impl MySqlConnection {
             .map(|index| index.key_name().to_owned())
             .collect::<Vec<_>>();
         names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let renames = checked
+            .operations()
+            .iter()
+            .filter_map(|operation| match operation {
+                MySqlAlterTableIndexOperation::Rename { from, to } => Some((from, to)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !renames.is_empty() {
+            assert_eq!(
+                renames.len(),
+                checked.operations().len(),
+                "the parser reads a RENAME INDEX only in a statement of renames alone"
+            );
+            return self.rename_indexes(checked.table(), &renames, names);
+        }
         for operation in checked.operations() {
             let (sql, stored_drop_name) = match operation {
                 MySqlAlterTableIndexOperation::Add {
@@ -4207,8 +4225,110 @@ impl MySqlConnection {
                         Some(stored_name),
                     )
                 }
+                MySqlAlterTableIndexOperation::Rename { .. } => {
+                    unreachable!("renames are applied together above")
+                }
             };
             self.prepare_alter_table_index_statement(&sql, operation, stored_drop_name.as_deref())?;
+        }
+        Ok(())
+    }
+
+    /// Gives indexes new names, each written again under its new one.
+    ///
+    /// Every rename is read against the names the table carried before the
+    /// statement, so all the old indexes are dropped before any new one is
+    /// made, which is what lets two indexes swap names. An index the engine
+    /// made for a foreign key comes back as an ordinary one: measured on MySQL
+    /// 8.4.11, a renamed one is kept when a later index covers the same
+    /// columns, where one never renamed is dropped.
+    fn rename_indexes(
+        &self,
+        table: &MySqlTableName,
+        renames: &[(&String, &String)],
+        names: Vec<String>,
+    ) -> std::result::Result<(), MySqlAlterTableIndexError> {
+        let mut kept = names;
+        for (from, _) in renames {
+            let Some(position) = kept.iter().position(|held| held.eq_ignore_ascii_case(from))
+            else {
+                return Err(MySqlAlterTableIndexError::MissingIndexToRename);
+            };
+            kept.remove(position);
+        }
+        for (_, to) in renames {
+            if kept.iter().any(|held| held.eq_ignore_ascii_case(to)) {
+                return Err(MySqlAlterTableIndexError::DuplicateIndex);
+            }
+            kept.push((*to).clone());
+        }
+        let stored = self
+            .stored_index_statements(table.as_str())
+            .map_err(MySqlAlterTableIndexError::Engine)?;
+        let mut new_names = Vec::with_capacity(renames.len());
+        for (from, to) in renames {
+            let stored_name = self
+                .inner
+                .current_schema()
+                .get_indices(table.as_str())
+                .find(|index| mysql_index_name(index).eq_ignore_ascii_case(from))
+                .map(|index| index.name.clone())
+                .ok_or(MySqlAlterTableIndexError::MissingIndexToRename)?;
+            if !stored
+                .iter()
+                .any(|statement| statement.stored_name == stored_name)
+            {
+                return Err(MySqlAlterTableIndexError::RenamingAColumnsOwnKey);
+            }
+            new_names.push((stored_name, *to));
+        }
+        // Measured on MySQL 8.4.11: a renamed index keeps its place among the
+        // table's keys, where one written again goes last. So every index from
+        // the first renamed one on is written again, in the order they stood.
+        let first = stored
+            .iter()
+            .position(|statement| {
+                new_names
+                    .iter()
+                    .any(|(stored_name, _)| *stored_name == statement.stored_name)
+            })
+            .expect("every renamed index was found among the stored ones");
+        let mut written_again = Vec::with_capacity(stored.len() - first);
+        for statement in &stored[first..] {
+            let renamed_to = new_names
+                .iter()
+                .find(|(stored_name, _)| *stored_name == statement.stored_name)
+                .map(|(_, to)| *to);
+            written_again.push(match renamed_to {
+                Some(to) => (
+                    statement.stored_name.clone(),
+                    create_index_under_another_name(&statement.sql, to, self.parser_mode())
+                        .map_err(MySqlAlterTableIndexError::Engine)?,
+                    false,
+                ),
+                None => (
+                    statement.stored_name.clone(),
+                    statement.sql.clone(),
+                    statement.implicit,
+                ),
+            });
+        }
+        for (stored_name, _, _) in &written_again {
+            let stmt = Stmt::DropIndex {
+                if_exists: false,
+                idx_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    stored_name.clone(),
+                )),
+            };
+            self.inner
+                .prepare_translated_stmt(stmt, &format!("DROP INDEX \"{stored_name}\""))
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlAlterTableIndexError::Engine)?;
+        }
+        for (_, sql, implicit) in &written_again {
+            self.prepare_with_index_origin(sql, *implicit)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlAlterTableIndexError::Engine)?;
         }
         Ok(())
     }
@@ -4269,6 +4389,9 @@ impl MySqlConnection {
                     .and_then(|mut statement| statement.run_ignore_rows())
                     .map(|_| ())
                     .map_err(MySqlAlterTableIndexError::Engine)
+            }
+            MySqlAlterTableIndexOperation::Rename { .. } => {
+                unreachable!("renames are applied by rename_indexes")
             }
         }
     }
@@ -4860,16 +4983,15 @@ impl MySqlConnection {
                     "marked index SQL did not describe an index".to_string(),
                 ));
             };
-            let implicit = idx_name
-                .name
-                .as_str()
-                .starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX);
-            if let Some(logical_name) = logical_mysql_index_name(idx_name.name.as_str()) {
+            let stored_name = idx_name.name.as_str().to_owned();
+            let implicit = stored_name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX);
+            if let Some(logical_name) = logical_mysql_index_name(&stored_name) {
                 idx_name.name = turso_parser::ast::Name::exact(logical_name);
             }
             statements.push(StoredIndexStatement {
                 sql: render_create_index_mysql_with_mode(&statement, self.parser_mode())
                     .map_err(|error| LimboError::Corrupt(error.to_string()))?,
+                stored_name,
                 implicit,
             });
         }
@@ -9204,6 +9326,21 @@ pub(crate) fn mysql_index_name(index: &turso_core::schema::Index) -> String {
     index.name.clone()
 }
 
+/// One stored `CREATE INDEX`, as the MySQL statement that makes the same index
+/// under the name `to`.
+fn create_index_under_another_name(sql: &str, to: &str, mode: SessionSqlMode) -> Result<String> {
+    let mut statement =
+        parse_schema_ddl_ast(sql, mode).map_err(|error| LimboError::Corrupt(error.to_string()))?;
+    let Stmt::CreateIndex { idx_name, .. } = &mut statement else {
+        return Err(LimboError::Corrupt(
+            "stored index SQL did not describe an index".to_string(),
+        ));
+    };
+    idx_name.name = turso_parser::ast::Name::exact(to.to_owned());
+    render_create_index_mysql_with_mode(&statement, mode)
+        .map_err(|error| LimboError::Corrupt(error.to_string()))
+}
+
 fn primary_key_covers_columns(
     primary: &[(String, turso_parser::ast::SortOrder)],
     columns: &[String],
@@ -9496,8 +9633,12 @@ fn mysql_query_parse_error(error: MySqlParseError) -> MySqlQueryError {
 fn mysql_query_index_error(error: MySqlAlterTableIndexError) -> MySqlQueryError {
     match error {
         MySqlAlterTableIndexError::MissingTable => MySqlQueryError::MissingTable,
-        MySqlAlterTableIndexError::MissingIndex => MySqlQueryError::MissingIndex,
+        MySqlAlterTableIndexError::MissingIndex
+        | MySqlAlterTableIndexError::MissingIndexToRename => MySqlQueryError::MissingIndex,
         MySqlAlterTableIndexError::DuplicateIndex => MySqlQueryError::DuplicateIndex,
+        error @ MySqlAlterTableIndexError::RenamingAColumnsOwnKey => {
+            MySqlQueryError::Unsupported(error.to_string())
+        }
         MySqlAlterTableIndexError::JsonIndex => MySqlQueryError::JsonIndex,
         MySqlAlterTableIndexError::RequiredByForeignKey => MySqlQueryError::RequiredByForeignKey,
         MySqlAlterTableIndexError::Engine(error) => MySqlQueryError::Engine(error),

@@ -278,3 +278,70 @@ fn rename_table_renames_every_pair_in_order_or_none_of_them() {
         vec![some(&["4"])]
     );
 }
+
+/// Laravel's `renameIndex` and Rails' `rename_index` write `ALTER TABLE t
+/// RENAME INDEX a TO b`.
+#[test]
+fn rename_index_keeps_the_index_and_its_place() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE i5 (a INT, b INT, c INT, n INT, KEY ka (a), KEY kb (b), KEY kc (c), UNIQUE KEY un (n))",
+    );
+    run(&mut adapter, "ALTER TABLE i5 RENAME INDEX ka TO kz");
+    run(&mut adapter, "alter table `i5` rename key `un` to `ux`");
+    let expected = concat!(
+        "CREATE TABLE `i5` (\n",
+        "  `a` int DEFAULT NULL,\n",
+        "  `b` int DEFAULT NULL,\n",
+        "  `c` int DEFAULT NULL,\n",
+        "  `n` int DEFAULT NULL,\n",
+        "  UNIQUE KEY `ux` (`n`),\n",
+        "  KEY `kz` (`a`),\n",
+        "  KEY `kb` (`b`),\n",
+        "  KEY `kc` (`c`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(printed_table(&mut adapter, "i5"), expected);
+    // A renamed unique index still refuses a second row with the same value.
+    run(&mut adapter, "INSERT INTO i5 (n) VALUES (1)");
+    assert!(adapter
+        .execute_query("INSERT INTO i5 (n) VALUES (1)")
+        .is_err());
+
+    // Two names swapped in one statement, each read against the names the
+    // table had before it.
+    run(
+        &mut adapter,
+        "ALTER TABLE i5 RENAME INDEX kb TO kc, RENAME INDEX kc TO kb",
+    );
+    let keys = rows(&mut adapter, "SHOW INDEX FROM i5")
+        .iter()
+        .map(|row| (row[2].clone().unwrap(), row[4].clone().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [("ux", "n"), ("kz", "a"), ("kc", "b"), ("kb", "c")]
+            .map(|(key, column)| (key.to_owned(), column.to_owned()))
+    );
+
+    assert_eq!(
+        refused_with(&mut adapter, "ALTER TABLE i5 RENAME INDEX nope TO k3"),
+        FrontendErrorKind::KeyDoesNotExist
+    );
+    assert_eq!(
+        refused_with(&mut adapter, "ALTER TABLE i5 RENAME INDEX kz TO ux"),
+        FrontendErrorKind::DuplicateKeyName
+    );
+    assert_eq!(
+        refused_with(
+            &mut adapter,
+            "ALTER TABLE i5 RENAME INDEX kz TO x, RENAME INDEX kz TO y"
+        ),
+        FrontendErrorKind::KeyDoesNotExist
+    );
+
+    let mut adapter = reopened(&directory, adapter);
+    let shown = rows(&mut adapter, "SHOW INDEX FROM i5");
+    assert_eq!(shown[1][2].as_deref(), Some("kz"));
+}

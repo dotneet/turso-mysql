@@ -3012,8 +3012,17 @@ fn execute_checked_query(
                     // an index that is not there, 1061 for an `ADD INDEX`
                     // naming one that is.
                     MySqlAlterTableIndexError::MissingIndex => FrontendErrorKind::CantDropKey,
+                    // Measured on MySQL 8.4.11: 1176 for a `RENAME INDEX`
+                    // naming an index that is not there, and 1061 for one
+                    // naming a new name that is.
+                    MySqlAlterTableIndexError::MissingIndexToRename => {
+                        FrontendErrorKind::KeyDoesNotExist
+                    }
                     MySqlAlterTableIndexError::DuplicateIndex => {
                         FrontendErrorKind::DuplicateKeyName
+                    }
+                    MySqlAlterTableIndexError::RenamingAColumnsOwnKey => {
+                        FrontendErrorKind::Unsupported
                     }
                     MySqlAlterTableIndexError::JsonIndex => FrontendErrorKind::JsonIndex,
                     MySqlAlterTableIndexError::RequiredByForeignKey => {

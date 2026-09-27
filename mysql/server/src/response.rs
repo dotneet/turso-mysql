@@ -362,6 +362,8 @@ pub enum FrontendErrorKind {
     UnknownSystemVariable,
     /// A `DROP INDEX` named an index the table does not carry.
     CantDropKey,
+    /// A `RENAME INDEX` named an index the table does not carry.
+    KeyDoesNotExist,
     /// A unique, or other constraint rejected the operation.
     ConstraintViolation,
     /// A foreign key rejected the row.
@@ -522,6 +524,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1091,
             *b"42000",
             b"Can't DROP; check that column/key exists".as_slice(),
+        ),
+        FrontendErrorKind::KeyDoesNotExist => (
+            1176,
+            *b"42000",
+            b"Key doesn't exist in table".as_slice(),
         ),
         FrontendErrorKind::MissingRequiredDefault => (
             1364,

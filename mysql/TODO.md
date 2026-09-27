@@ -182,7 +182,9 @@ boolean literal.
 
 | Form | State |
 |---|---|
-| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / the index operations | refused |
+| `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / the index operations, `RENAME INDEX` among them | refused |
+| `RENAME INDEX` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` does not read it, so it is read by its own words and only on its own. Measured, MySQL takes it beside anything else |
+| `RENAME INDEX` of the key a column declares for itself — `email VARCHAR(255) UNIQUE` | refused; the engine keeps that one with no statement of its own to write again under the new name |
 | Moving the column a table counts on, or the one its key is over | refused; the counted column stands for the engine's rowid and the key is what the rows are found by, and neither survives being written somewhere else |
 | `ALTER TABLE ... ADD COLUMN ... FIRST`/`AFTER` on a table carrying a trigger | refused; the table is written again and a trigger is not the table's own row, where MySQL leaves one where it stood |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |

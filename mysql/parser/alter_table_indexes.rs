@@ -22,6 +22,16 @@ pub enum MySqlAlterTableIndexOperation {
     Drop {
         name: String,
     },
+    /// `RENAME INDEX from TO to`, or its `RENAME KEY` spelling.
+    ///
+    /// Measured on MySQL 8.4.11: the renames of one statement are all read
+    /// against the indexes the table carried before it, so `RENAME INDEX a TO
+    /// b, RENAME INDEX b TO a` swaps two names, and a statement renaming one
+    /// index twice answers 1176 for the second.
+    Rename {
+        from: String,
+        to: String,
+    },
 }
 
 /// One `ALTER TABLE` that only adds or drops indexes.
@@ -59,6 +69,9 @@ pub fn parse_optional_alter_table_indexes(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAlterTableIndexes>, ParseError> {
+    if let Some(renamed) = renamed_indexes(sql)? {
+        return Ok(Some(renamed));
+    }
     let spelled_as_alter = drop_index_spelled_as_alter_table(sql);
     let sql = spelled_as_alter.as_deref().unwrap_or(sql);
     let spelled_as_index = drop_key_spelled_as_drop_index(sql);
@@ -92,6 +105,69 @@ pub fn parse_optional_alter_table_indexes(
         .iter()
         .map(checked_index_operation)
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(MySqlAlterTableIndexes { table, operations }))
+}
+
+/// Reads an `ALTER TABLE` that renames indexes and does nothing else —
+/// `ALTER TABLE t RENAME INDEX a TO b`, which is what Laravel's `renameIndex`
+/// and Rails' `rename_index` write.
+///
+/// `sqlparser` reads `RENAME INDEX` as the start of a column rename and fails,
+/// so the words are read here instead. Answers `None` for any other statement,
+/// a rename beside some other operation among them, which is left to fail
+/// where it is read.
+fn renamed_indexes(sql: &str) -> Result<Option<MySqlAlterTableIndexes>, ParseError> {
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return Ok(None);
+    };
+    let mut words = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .peekable();
+    let named = |token: Option<&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next(), "ALTER") || !named(words.next(), "TABLE") {
+        return Ok(None);
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return Ok(None);
+    };
+    let mut operations = Vec::new();
+    loop {
+        if !named(words.next(), "RENAME") {
+            return Ok(None);
+        }
+        if !matches!(words.next(), Some(Token::Word(word))
+            if word.quote_style.is_none()
+                && (word.value.eq_ignore_ascii_case("INDEX") || word.value.eq_ignore_ascii_case("KEY")))
+        {
+            return Ok(None);
+        }
+        let Some(Token::Word(from)) = words.next() else {
+            return Ok(None);
+        };
+        if !named(words.next(), "TO") {
+            return Ok(None);
+        }
+        let Some(Token::Word(to)) = words.next() else {
+            return Ok(None);
+        };
+        operations.push(MySqlAlterTableIndexOperation::Rename {
+            from: checked_index_name(&from.value)?,
+            to: checked_index_name(&to.value)?,
+        });
+        match words.next() {
+            Some(Token::Comma) => continue,
+            None | Some(Token::EOF) => break,
+            Some(Token::SemiColon) if words.all(|token| matches!(token, Token::EOF)) => break,
+            Some(_) => return Ok(None),
+        }
+    }
+    let table = MySqlTableName::parse(&table.value).map_err(|_| ParseError::Unsupported {
+        feature: "ALTER TABLE name",
+    })?;
     Ok(Some(MySqlAlterTableIndexes { table, operations }))
 }
 
@@ -415,6 +491,39 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn alter_table_reads_the_indexes_it_renames() {
+        let rename = |from: &str, to: &str| MySqlAlterTableIndexOperation::Rename {
+            from: from.to_owned(),
+            to: to.to_owned(),
+        };
+        assert_eq!(
+            parsed("ALTER TABLE records RENAME INDEX ka TO kz").operations(),
+            [rename("ka", "kz")]
+        );
+        let renamed = parsed("alter table `Records` rename key `a_b` to `c`, RENAME INDEX x TO y;");
+        assert_eq!(renamed.table().as_str(), "records");
+        assert_eq!(renamed.operations(), [rename("a_b", "c"), rename("x", "y")]);
+        for sql in [
+            "ALTER TABLE records RENAME INDEX a TO b, ADD COLUMN c INT",
+            "ALTER TABLE records RENAME INDEX a",
+            "ALTER TABLE records RENAME COLUMN a TO b",
+        ] {
+            assert!(
+                renamed_indexes(sql).unwrap().is_none(),
+                "{sql} must be left to the ordinary path"
+            );
+        }
+        // MySQL calls the primary key's index `PRIMARY`: measured, renaming it
+        // is 1176 and renaming onto it is 1280.
+        for sql in [
+            "ALTER TABLE records RENAME INDEX `PRIMARY` TO k",
+            "ALTER TABLE records RENAME INDEX k TO `PRIMARY`",
+        ] {
+            assert!(renamed_indexes(sql).is_err(), "{sql}");
+        }
     }
 
     #[test]
