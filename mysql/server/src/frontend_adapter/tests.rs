@@ -26971,8 +26971,7 @@ fn an_index_is_dropped_by_a_statement_of_its_own() {
 ///
 /// Measured on MySQL 8.4.11: the rename lands, the names may be quoted, a name
 /// already taken is 1050 and a table that is not there is 1146. Renaming
-/// several tables at once is refused — MySQL renames them together, and
-/// several `ALTER TABLE`s would not.
+/// several tables at once is covered in `tests/migration_ddl.rs`.
 #[cfg(unix)]
 #[test]
 fn a_table_is_renamed_by_a_statement_of_its_own() {
@@ -27014,9 +27013,6 @@ fn a_table_is_renamed_by_a_statement_of_its_own() {
     assert!(tables(&mut adapter).contains(&"one".to_owned()));
 
     for sql in [
-        // MySQL renames several tables together, which several ALTER TABLEs
-        // would not.
-        "RENAME TABLE one TO two, taken TO three",
         // 1050 in MySQL: the name is already taken.
         "RENAME TABLE one TO taken",
         // 1146 in MySQL: the table is not there.

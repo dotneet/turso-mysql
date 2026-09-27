@@ -309,6 +309,17 @@ pub enum MySqlDropViewError {
     Engine(LimboError),
 }
 
+/// Failure while renaming tables with one `RENAME TABLE`.
+#[derive(Debug)]
+pub enum MySqlRenameTableError {
+    /// A pair names a table that is not there when its turn comes.
+    MissingTable,
+    /// A pair names a new name a table or view already has when its turn
+    /// comes.
+    NameTaken,
+    Query(MySqlQueryError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MySqlWriteResult {
     /// Rows selected by this successful statement's affected-row mode.
@@ -3792,6 +3803,54 @@ impl MySqlConnection {
         let mut query = capability.allocator.peek_high_water(table.key)?;
         let high_water = capability.io.block(|| query.step())?;
         Ok((high_water > 0).then_some(high_water))
+    }
+
+    /// Runs one `RENAME TABLE`, renaming every pair it names or none of them.
+    ///
+    /// Measured on MySQL 8.4.11: the pairs are taken in the order written, each
+    /// against the names the ones before it left, so `RENAME TABLE a TO t, b TO
+    /// a, t TO b` swaps two tables. A pair naming a table that is not there by
+    /// then is 1146 and one naming a new name that is taken is 1050, a table
+    /// renamed onto its own name among them, and either leaves every table
+    /// under the name it had.
+    pub fn execute_rename_tables(
+        &self,
+        pairs: &[(MySqlTableName, MySqlTableName)],
+    ) -> std::result::Result<(), MySqlRenameTableError> {
+        let mut renamed: Vec<(&MySqlTableName, bool)> = Vec::new();
+        let names_a_table_by_then =
+            |renamed: &[(&MySqlTableName, bool)], table: &MySqlTableName| match renamed
+                .iter()
+                .rev()
+                .find(|(name, _)| name.as_str().eq_ignore_ascii_case(table.as_str()))
+            {
+                Some((_, there)) => Ok(*there),
+                None => self
+                    .names_a_table(table)
+                    .map_err(|error| MySqlRenameTableError::Query(MySqlQueryError::Engine(error))),
+            };
+        for (from, to) in pairs {
+            if !names_a_table_by_then(&renamed, from)? {
+                return Err(MySqlRenameTableError::MissingTable);
+            }
+            if names_a_table_by_then(&renamed, to)? {
+                return Err(MySqlRenameTableError::NameTaken);
+            }
+            renamed.push((from, false));
+            renamed.push((to, true));
+        }
+        let statements = pairs
+            .iter()
+            .map(|(from, to)| {
+                format!(
+                    "ALTER TABLE {} RENAME TO {}",
+                    mysql_quoted(from.as_str()),
+                    mysql_quoted(to.as_str())
+                )
+            })
+            .collect::<Vec<_>>();
+        self.execute_expanded_alter_table(&statements)
+            .map_err(MySqlRenameTableError::Query)
     }
 
     fn execute_expanded_alter_table(

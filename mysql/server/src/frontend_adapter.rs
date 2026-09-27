@@ -53,7 +53,7 @@ use turso_mysql::{
     MySqlAffectedRowsMode, MySqlAlterTableIndexError, MySqlConnection,
     MySqlCreateTableAsSelectError, MySqlDropTableError, MySqlMarkerType,
     MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
-    MySqlQueryError, MySqlTruncateTableError,
+    MySqlQueryError, MySqlRenameTableError, MySqlTruncateTableError,
 };
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
@@ -72,8 +72,8 @@ use turso_mysql_parser::{
     parse_optional_show_columns, parse_optional_show_create_table,
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
-    rename_table_spelled_as_alter_table, select_projection_origins, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
+    renamed_tables, select_projection_origins, ArithmeticOperand, ArithmeticOperator,
+    ArithmeticShape, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
     ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
     MySqlCatalogTable, MySqlDatabaseName, MySqlInformationSchemaColumnsColumn,
     MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
@@ -2917,11 +2917,22 @@ fn execute_checked_query(
         Ok(false) => {}
         Err(_) => return Err(FrontendErrorKind::Unsupported),
     }
-    // MySQL renames a table with a statement of its own as well as with an
-    // `ALTER TABLE`, and the second is what this reads, so the words are moved
-    // into that shape before anything else looks at them.
-    let renamed = rename_table_spelled_as_alter_table(sql);
-    let sql = renamed.as_deref().unwrap_or(sql);
+    if let Some(pairs) = renamed_tables(sql) {
+        connection
+            .execute_rename_tables(&pairs)
+            .map_err(|error| match error {
+                // Measured on MySQL 8.4.11: 1146 for a table that is not
+                // there and 1050 for a new name that is taken, a view's
+                // among them.
+                MySqlRenameTableError::MissingTable => FrontendErrorKind::MissingObject,
+                MySqlRenameTableError::NameTaken => FrontendErrorKind::DuplicateObject,
+                MySqlRenameTableError::Query(error) => frontend_query_error(error),
+            })?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
+    }
     if is_schema_statement(sql) {
         // MySQL answers a name that is already there before it looks at
         // anything else, so the name is looked up before anything runs:

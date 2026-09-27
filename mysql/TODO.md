@@ -203,8 +203,8 @@ boolean literal.
 | `ALTER TABLE` mixing supported index and column operations | accepted as one transaction; a later failure rolls back every earlier operation, and foreign-key child-index coverage is checked after the full statement so an index can be replaced atomically |
 | `ALTER TABLE ... ADD/DROP INDEX \`PRIMARY\`` | refused; adding or dropping a primary key is a different operation |
 | `DROP INDEX name` with no table after it | refused; MySQL requires the table, and the engine's own spelling names none |
-| `RENAME TABLE` renaming several tables at once | refused; MySQL renames them together and several `ALTER TABLE`s would not |
-| A rename onto a name already taken, or of a table that is not there | refused, where MySQL answers 1050 and 1146; the `ALTER TABLE` spelling has always answered the same way |
+| `RENAME TABLE` naming a database — `RENAME TABLE db.a TO db.b` — or a view, or any `RENAME TABLE` while the database holds a view | refused; MySQL takes all three. The last is the rule every `ALTER TABLE ... RENAME TO` already keeps |
+| `ALTER TABLE a RENAME TO b` onto a name already taken, or of a table that is not there | refused, where MySQL answers 1050 and 1146; the `RENAME TABLE` spelling answers both |
 | `CREATE TABLE ... AS SELECT` over a division, an aggregate, or an unaliased expression | refused; integer `+`, `-` and `*` work. A division makes a `decimal(14,4)` on a rule of its own, and an unaliased expression column takes its name from the expression's own text — measured, `SELECT a + 1` makes a column called `a + 1` |
 | `CREATE TABLE ... AS SELECT` over a column with a string `DEFAULT` | refused; the escaping is undecided, the same reason `SHOW CREATE TABLE` refuses to print one |
 | `CREATE TABLE ... (columns) AS SELECT`, and `IF NOT EXISTS` or `TEMPORARY` beside an `AS SELECT` | refused |

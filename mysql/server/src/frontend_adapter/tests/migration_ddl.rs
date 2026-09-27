@@ -186,3 +186,95 @@ fn a_whole_number_default_mysql_refuses_is_refused() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+fn refused_with(adapter: &mut Adapter, sql: &str) -> FrontendErrorKind {
+    match adapter.execute_query(sql) {
+        Err(error) => error,
+        Ok(result) => panic!("{sql} must fail, answered {result:?}"),
+    }
+}
+
+fn table_names(adapter: &mut Adapter) -> Vec<String> {
+    rows(adapter, "SHOW TABLES")
+        .into_iter()
+        .map(|row| row[0].clone().unwrap())
+        .collect()
+}
+
+/// Laravel's `Schema::rename` and Rails' `rename_table` write `RENAME TABLE`.
+#[test]
+fn rename_table_renames_every_pair_in_order_or_none_of_them() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20) NOT NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO posts (title) VALUES ('a'), ('b')",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE notes (id INT NOT NULL PRIMARY KEY, body TEXT)",
+    );
+    run(&mut adapter, "INSERT INTO notes VALUES (1, 'n')");
+
+    run(&mut adapter, "RENAME TABLE `posts` TO `articles`");
+    run(&mut adapter, "INSERT INTO articles (title) VALUES ('c')");
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, title FROM articles ORDER BY id"),
+        vec![some(&["1", "a"]), some(&["2", "b"]), some(&["3", "c"])]
+    );
+
+    // A swap through a third name, which only works pair by pair.
+    run(
+        &mut adapter,
+        "RENAME TABLE articles TO spare, notes TO articles, spare TO notes;",
+    );
+    let expected_articles = concat!(
+        "CREATE TABLE `articles` (\n",
+        "  `id` int NOT NULL,\n",
+        "  `body` text,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    let expected_notes = concat!(
+        "CREATE TABLE `notes` (\n",
+        "  `id` int NOT NULL AUTO_INCREMENT,\n",
+        "  `title` varchar(20) NOT NULL,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(printed_table(&mut adapter, "articles"), expected_articles);
+    assert_eq!(printed_table(&mut adapter, "notes"), expected_notes);
+
+    assert_eq!(
+        refused_with(&mut adapter, "RENAME TABLE nope TO z"),
+        FrontendErrorKind::MissingObject
+    );
+    assert_eq!(
+        refused_with(&mut adapter, "RENAME TABLE articles TO notes"),
+        FrontendErrorKind::DuplicateObject
+    );
+    assert_eq!(
+        refused_with(&mut adapter, "RENAME TABLE articles TO articles"),
+        FrontendErrorKind::DuplicateObject
+    );
+    // The second pair fails, and the first is not left renamed.
+    assert_eq!(
+        refused_with(&mut adapter, "RENAME TABLE articles TO q, nope TO r"),
+        FrontendErrorKind::MissingObject
+    );
+    let names = table_names(&mut adapter);
+    assert!(names.contains(&"articles".to_owned()), "{names:?}");
+    assert!(!names.contains(&"q".to_owned()), "{names:?}");
+
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(printed_table(&mut adapter, "articles"), expected_articles);
+    assert_eq!(printed_table(&mut adapter, "notes"), expected_notes);
+    run(&mut adapter, "INSERT INTO notes (title) VALUES ('d')");
+    assert_eq!(
+        rows(&mut adapter, "SELECT MAX(id) FROM notes"),
+        vec![some(&["4"])]
+    );
+}
