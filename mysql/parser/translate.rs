@@ -5523,15 +5523,29 @@ fn render_scalar_call(
     {
         return render_branches_call(name, function, &branches, render_context);
     }
-    let has_decimal_argument = match &function.args {
-        FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
-            matches!(argument,
-                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr))
-                    if decimal_operand_scale(expr, render_context.decimal_columns).is_some())
-        }),
-        _ => false,
+    let decimal_argument_scales = match &function.args {
+        FunctionArguments::List(arguments) => arguments
+            .args
+            .iter()
+            .filter_map(|argument| match argument {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expr,
+                )) => decimal_operand_scale(expr, render_context.decimal_columns),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
     };
+    let has_decimal_argument = !decimal_argument_scales.is_empty();
+    // The engine reads a `BIGINT UNSIGNED` and a `DECIMAL` with no places out
+    // as the digits MySQL writes it with, so a call writing its argument out
+    // as text answers what MySQL answers over one.
+    let writes_whole_decimals_out = decimal_argument_scales.iter().all(|scale| *scale == 0)
+        && ["CONCAT", "CONCAT_WS", "LPAD", "RPAD", "LEFT", "RIGHT"]
+            .iter()
+            .any(|call| name.value.eq_ignore_ascii_case(call));
     if has_decimal_argument
+        && !writes_whole_decimals_out
         && ![
             "ABS",
             "TRUNCATE",
@@ -5548,7 +5562,9 @@ fn render_scalar_call(
     {
         return unsupported("SELECT function over DECIMAL requires exact numeric handling");
     }
-    let engine = if name.value.eq_ignore_ascii_case("LENGTH") {
+    let engine = if name.value.eq_ignore_ascii_case("LENGTH")
+        || name.value.eq_ignore_ascii_case("OCTET_LENGTH")
+    {
         "octet_length"
     } else if name.value.eq_ignore_ascii_case("CHAR_LENGTH")
         || name.value.eq_ignore_ascii_case("CHARACTER_LENGTH")

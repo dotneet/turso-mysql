@@ -1871,9 +1871,12 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         let Expr::Value(pad_val) = pad else {
             return None;
         };
+        // Measured on MySQL 8.4.11: nothing to pad with answers an empty word
+        // where padding is needed, `LPAD('hi', 5, '')` being `''`, and the
+        // engine answers the value unpadded.
         if !matches!(
             &pad_val.value,
-            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
+            Value::SingleQuotedString(pad) | Value::DoubleQuotedString(pad) if !pad.is_empty()
         ) {
             return None;
         }
@@ -2760,7 +2763,7 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
         ScalarFunction::ChecksJson
     } else if named(&["JSON_QUOTE"]) {
         ScalarFunction::QuotesAsJson
-    } else if named(&["LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
+    } else if named(&["LENGTH", "OCTET_LENGTH", "CHAR_LENGTH", "CHARACTER_LENGTH"]) {
         ScalarFunction::CountsText
     } else if named(&["ABS"]) {
         ScalarFunction::KeepsNumericShape

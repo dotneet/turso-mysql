@@ -345,7 +345,6 @@ fn string_calls_refuse_what_mysql_answers_by_another_rule() {
     for sql in [
         // A TEXT answers a MEDIUM_BLOB of 1048560, a shape of its own.
         "SELECT SUBSTRING_INDEX(t, '.', 1) FROM s",
-        "SELECT CONCAT_WS('-', t) FROM s",
         "SELECT SUBSTR(t, 2) FROM s",
         // A number is written out before it is cut or digested.
         "SELECT SUBSTRING_INDEX(n, '1', 1) FROM s",

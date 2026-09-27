@@ -71,7 +71,8 @@ numbers and over columns of one kind, and `COUNT`, `SUM`, `AVG`, `MIN` and
 | `NULLIF` over two columns of words, or a number against a word | refused; MySQL reads a word as a number and compares two words without regard to case, where the engine compares them by their kinds |
 | `GREATEST`, `LEAST`, `NULLIF` and `MD5` over written values alone, naming no column | refused; each answers a shape read off the column it names, and there is none |
 | `CAST(col AS CHAR)` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; conversion through the engine's generic text cast has not been verified against MySQL's numeric formatting |
-| `CAST(col AS CHAR)` over a `TEXT` | refused; MySQL answers a `MEDIUM_BLOB` of 1048560 for one, a shape this does not write |
+| `CAST(col AS CHAR)`, `SUBSTRING`, `SUBSTRING_INDEX`, `REPEAT` and `HEX` over a `TEXT` | refused; MySQL answers a `MEDIUM_BLOB` for each, and only `CONCAT`, `CONCAT_WS`, `LOWER`, `UPPER`, `REVERSE`, `REPLACE` and `TRIM` have had its width measured |
+| A text call over a `MEDIUMTEXT` or a `LONGTEXT` | refused; measured, MySQL answers a `LONG_BLOB` — `LOWER(mt)` reports 268435440 and `CONCAT(mt, 'a')` 67108864, `max_allowed_packet` — by a rule not worked out |
 | `HOUR()` / `MINUTE()` / `SECOND()` over a `TIME` | refused; a `TIME` holds a span running to 838 hours, which MySQL reads out whole and the engine has no reader for |
 | `YEAR()` / `MONTH()` / `DAY()` over anything but a plain date column | refused; measured, `YEAR` over a `TIME` answers the current year, which is a coercion rather than a reading |
 | `GROUP_CONCAT` with an `ORDER BY`, or with `DISTINCT` beside a `SEPARATOR` | refused; MySQL orders the parts it joins and the engine's planner refuses an `ORDER BY` inside an aggregate (`core/translate/planner.rs`), and the engine takes `DISTINCT` only over a single argument, which the separator occupies |

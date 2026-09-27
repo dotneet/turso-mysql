@@ -982,7 +982,8 @@ also refused when its source column collation cannot be checked.
 
 The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
 `REPLACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE` (2 arguments), `HEX` (text columns),
-`LENGTH`, `CHAR_LENGTH` (and its `CHARACTER_LENGTH` spelling), `NOW()` with
+`LENGTH` (and its `OCTET_LENGTH` spelling), `CHAR_LENGTH` (and its
+`CHARACTER_LENGTH` spelling), `NOW()` with
 `CURRENT_TIMESTAMP`, `ABS`, `SIGN`, `SQRT`, `POW` (with `POWER`), `MOD`, `ROUND`,
 `GREATEST`, `LEAST`, `NULLIF`,
 `IFNULL` with `COALESCE`, `CONCAT`, `CONCAT_WS`, `SUBSTRING` (with `SUBSTR`),
@@ -1011,7 +1012,33 @@ and `IFNULL` keeps the width.
 laid end to end, a string literal counting the characters it spells, so
 `CONCAT(v, 'z')` over that `VARCHAR(8)` reports 36 and `CONCAT(v, v)` 64; `LEFT`
 and `RIGHT` are as wide as the count they were asked for, so `LEFT(v, 2)`
-reports 8. A `CASE` is as wide as its widest branch:
+reports 8. `LENGTH`, `CHAR_LENGTH`, `INSTR`, `LOCATE` and `TRUNCATE` carry
+`NOT NULL` over a NOT NULL column, measured on 8.4.11 (they used to leave it
+off), and nothing a call answers over a column read through the outer side of
+a join does.
+
+Over a `TEXT` the answer outgrows a `VAR_STRING`. Measured on 8.4.11: `LOWER`,
+`UPPER`, `REVERSE`, `REPLACE` and `TRIM` over one answer a `MEDIUM_BLOB` of
+1048560 with no flags — they used to report the `TEXT`'s own `VAR_STRING` of
+262140 — and a `CONCAT` or `CONCAT_WS` naming one answers a `MEDIUM_BLOB` in
+which every part counts four times over: the `TEXT`'s 262140 bytes, and each
+word and column beside it, so `CONCAT(t)` reports 1048560, `CONCAT('x', t)`
+1048576 and `CONCAT(title, ': ', body)` over a `VARCHAR(200)` 1051792. `LEFT`
+over a `TEXT` stays as wide as its count. Over a `MEDIUMTEXT` or a `LONGTEXT`
+the answer is a `LONG_BLOB`, which is refused. The binary protocol sends a
+`MEDIUM_BLOB` as length-encoded bytes.
+
+`LPAD`, `RPAD`, `LEFT`, `RIGHT` and `CONCAT` write a number or a moment out
+before they pad, cut or join it, as MySQL does — `LPAD(id, 5, '0')` over a
+`BIGINT UNSIGNED` is `00001` and `LPAD(n, 4, '0')` over -5 is `00-5` — for
+every kind whose spelling the engine shares: whole numbers, `BIGINT UNSIGNED`,
+a `DECIMAL` with no places, and the moments. A `DOUBLE` and a `DECIMAL` with
+places are refused, spelled by rules of their own. `LPAD` and `RPAD` with
+nothing to pad with are refused: measured, MySQL answers an empty word where
+padding is needed, `LPAD('hi', 5, '')` being `''`, and the engine answers the
+value unpadded.
+
+A `CASE` is as wide as its widest branch:
 `CASE WHEN n > 1 THEN 'y' ELSE 'n' END` reports 4 and is NOT NULL, and
 `IF(n > 1, 'y', 'n')` reports the same, measured identically.
 

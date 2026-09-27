@@ -3669,7 +3669,7 @@ fn binary_result_value(
         MySqlPreparedValue::Text(value)
             if matches!(
                 column_type,
-                MYSQL_TYPE_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_JSON
+                MYSQL_TYPE_BLOB | MYSQL_TYPE_MEDIUM_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_JSON
             ) =>
         {
             Ok(BinaryResultValue::Blob(value.into_bytes()))
@@ -6276,8 +6276,13 @@ fn scalar_call_column_definition(
     let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
     // Measured: the answer is as wide as its arguments laid end to end, a
     // string literal counting the characters it spells.
+    // Measured on MySQL 8.4.11: beside a `TEXT` the answer is a MEDIUM_BLOB
+    // four times as wide again — every part, the `TEXT`'s own 262140 bytes and
+    // each word and column beside it, counts four times over, so `CONCAT(t)`
+    // reports 1048560 and `CONCAT(t, 'x')` 1048576.
     if function == ScalarFunction::Concatenates {
         let mut width = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+        let mut beside_a_text = false;
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
             let source = table
@@ -6286,8 +6291,19 @@ fn scalar_call_column_definition(
                 // An `information_schema` table names its columns itself, and an
                 // aggregate or a call over one of them has not been measured.
                 .ok_or(FrontendErrorKind::Unsupported)?;
-            let length = spelled_characters(source).ok_or(FrontendErrorKind::Unsupported)?;
+            let length = if source.type_name() == "TEXT" {
+                beside_a_text = true;
+                MYSQL_TEXT_CHARACTERS
+            } else {
+                spelled_characters(source).ok_or(FrontendErrorKind::Unsupported)?
+            };
             width = width.saturating_add(length.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER));
+        }
+        if beside_a_text {
+            return medium_blob_text_definition(
+                name,
+                width.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            );
         }
         return Ok(text_call_definition(name, width, not_null));
     }
@@ -6518,6 +6534,12 @@ fn scalar_call_column_definition(
     // of 2, the precision losing the digit the scale lost. Only the last needs
     // the count, so a DECIMAL is refused until the count can be read here.
     if function == ScalarFunction::CutsDigits {
+        // Measured: a NOT NULL column cut short cannot be null either.
+        let not_null_flag = if !source.nullable() && !table.outer {
+            MYSQL_NOT_NULL_FLAG
+        } else {
+            0
+        };
         // Measured: over a DECIMAL the answer is a DECIMAL of its own — the
         // scale is the count it was asked for held to the column's, and the
         // width is the column's whole digits plus a sign, plus the fraction
@@ -6530,7 +6552,10 @@ fn scalar_call_column_definition(
             definition.column_length = precision.saturating_sub(scale).saturating_add(1)
                 + if cut > 0 { cut + 1 } else { 0 };
             definition.decimals = cut as u8;
-            set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+            set_column_flags(
+                &mut definition,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | not_null_flag,
+            );
             return Ok(definition);
         }
         let mut definition = match source.type_name() {
@@ -6550,7 +6575,10 @@ fn scalar_call_column_definition(
             }
             _ => return Err(FrontendErrorKind::Unsupported),
         };
-        set_column_flags(&mut definition, MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG);
+        set_column_flags(
+            &mut definition,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG | not_null_flag,
+        );
         return Ok(definition);
     }
     if function == ScalarFunction::GroupsDigits {
@@ -6662,7 +6690,16 @@ fn scalar_call_column_definition(
         };
         return Ok(text_call_definition(name, width, not_null));
     }
-    if wants_text != is_text_column(source) && function != ScalarFunction::NullsOnMatch {
+    // Measured on MySQL 8.4.11: `LPAD(id, 5, '0')` writes the number out and
+    // pads it, `00001`, and `LEFT` cuts it the same way, which the engine
+    // does for every kind it spells the way MySQL does. A `DOUBLE` or a
+    // `DECIMAL` with places is spelled by a rule of its own.
+    let cuts_or_pads_a_spelled_value =
+        function == ScalarFunction::TakesCharacters && spelled_characters(source).is_some();
+    if wants_text != is_text_column(source)
+        && function != ScalarFunction::NullsOnMatch
+        && !cuts_or_pads_a_spelled_value
+    {
         return Err(FrontendErrorKind::Unsupported);
     }
     // Measured on MySQL 8.4.11: `MD5`, `SHA1` and `SHA2` each answer a
@@ -6900,10 +6937,26 @@ fn scalar_call_column_definition(
         | ScalarFunction::WritesAnEpochMoment => {
             unreachable!("a JSON, moment or plain reading answered above")
         }
+        // Measured on MySQL 8.4.11: over a `TEXT` the answer is a MEDIUM_BLOB
+        // of 1048560, the `TEXT`'s 262140 bytes counted four times over, and
+        // over a `MEDIUMTEXT` a LONG_BLOB, which is not taken.
+        ScalarFunction::KeepsTextShape if source.type_name() == "TEXT" => {
+            medium_blob_text_definition(
+                name,
+                MYSQL_TEXT_CHARACTERS
+                    .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER)
+                    .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            )?
+        }
+        ScalarFunction::KeepsTextShape
+            if matches!(source.type_name(), "MEDIUMTEXT" | "LONGTEXT") =>
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         ScalarFunction::KeepsTextShape => {
             let mut definition = own_shape(name)?;
             // Measured: the answer is a VAR_STRING whatever the argument was,
-            // so a CHAR argument widens and a TEXT one narrows to it.
+            // so a CHAR argument widens to it.
             definition.column_type = MYSQL_TYPE_VAR_STRING;
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
             definition.decimals = NOT_FIXED_DECIMALS;
@@ -7143,8 +7196,13 @@ fn scalar_call_column_definition(
     } else {
         MYSQL_BINARY_FLAG
     };
+    // Measured on MySQL 8.4.11: a count or a place read out of a NOT NULL
+    // column cannot be null either, and neither can a sign or a rounding —
+    // unless the column is on the outer side of a join, which can answer a
+    // row without it.
     let not_null = not_null
         || (!source.nullable()
+            && !table.outer
             && matches!(
                 function,
                 ScalarFunction::KeepsNumericShape
@@ -7152,6 +7210,8 @@ fn scalar_call_column_definition(
                     | ScalarFunction::RoundsToPlaces { .. }
                     | ScalarFunction::RoundsToWhole
                     | ScalarFunction::Negates
+                    | ScalarFunction::CountsText
+                    | ScalarFunction::Locates
             ));
     set_column_flags(
         &mut definition,
@@ -7287,6 +7347,35 @@ fn counted_between_definition(name: String, function: ScalarFunction) -> ColumnD
     set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
     definition
 }
+
+/// The characters a `TEXT` holds at most, which MySQL counts a `TEXT` in when
+/// a call works out how wide its answer can be.
+#[cfg(unix)]
+const MYSQL_TEXT_CHARACTERS: u32 = 65535;
+
+/// The column a text call reports when its answer outgrows a VAR_STRING:
+/// measured on MySQL 8.4.11, a MEDIUM_BLOB with the text collation and no
+/// flags, even over a NOT NULL column. Wider than a MEDIUM_BLOB holds is a
+/// LONG_BLOB, which has not been measured.
+#[cfg(unix)]
+fn medium_blob_text_definition(
+    name: String,
+    width: u32,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    if width > MYSQL_MEDIUM_BLOB_LENGTH {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let mut definition = column_definition(name, MYSQL_TYPE_MEDIUM_BLOB);
+    definition.column_length = width;
+    definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    definition.decimals = NOT_FIXED_DECIMALS;
+    set_column_flags(&mut definition, 0);
+    Ok(definition)
+}
+
+/// The most bytes a MEDIUM_BLOB holds.
+#[cfg(unix)]
+const MYSQL_MEDIUM_BLOB_LENGTH: u32 = 16_777_215;
 
 /// Builds the `VAR_STRING` a call that answers text of a known width reports.
 #[cfg(unix)]

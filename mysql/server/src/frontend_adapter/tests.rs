@@ -30649,3 +30649,6 @@ mod clock_readings;
 
 #[cfg(unix)]
 mod built_documents;
+
+#[cfg(unix)]
+mod text_widths;
