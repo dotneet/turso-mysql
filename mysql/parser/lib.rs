@@ -37,8 +37,8 @@ mod temporal_value;
 mod translate;
 mod truncate_table;
 mod view_definition;
-mod written_number;
 mod written_bytes;
+mod written_number;
 mod written_value;
 
 use admin_command::{
@@ -181,10 +181,10 @@ pub use view_definition::{
     view_written_as_mysql_prints_it, written_view_columns, MySqlViewColumnReading,
     MySqlWrittenView,
 };
-pub use written_number::{read_written_number, WrittenNumber};
 pub use written_bytes::{
     base64_length, crc32, first_byte, first_character_code, quoted_for_sql, to_base64,
 };
+pub use written_number::{read_written_number, WrittenNumber};
 pub use written_value::WrittenValue;
 
 /// Longest `VARCHAR` this server takes, in characters.
