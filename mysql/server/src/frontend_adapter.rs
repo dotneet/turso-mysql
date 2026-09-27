@@ -73,9 +73,10 @@ use turso_mysql_parser::{
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     renamed_tables, select_projection_origins, table_comment_change, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
-    ConnectorJSchemataListingQuery, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
-    MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
+    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
+    GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
+    MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
     MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
     MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
 };
