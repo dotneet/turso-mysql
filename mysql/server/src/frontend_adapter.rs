@@ -3656,6 +3656,14 @@ fn binary_result_value(
         {
             Ok(BinaryResultValue::Blob(value))
         }
+        // A binary string written out — `0x41`, `b'101'` — crosses as its
+        // bytes, length-encoded, the way a VARCHAR's text does.
+        MySqlPreparedValue::Blob(value)
+            if column_type == MYSQL_TYPE_VAR_STRING
+                && column.character_set == MYSQL_BINARY_COLLATION =>
+        {
+            Ok(BinaryResultValue::Blob(value))
+        }
         // A TEXT column reports BLOB, and a GROUP_CONCAT a LONG_BLOB, so each
         // value crosses as the same length-encoded bytes.
         MySqlPreparedValue::Text(value)

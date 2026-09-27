@@ -97,6 +97,9 @@ pub enum StaticSelectMetadata {
         kind: ColumnAggregateKind,
         branches: Box<StaticSelectMetadata>,
     },
+    /// A value written out in full, whose shape is fixed by how it is
+    /// written.
+    WrittenValue(crate::WrittenValue),
 }
 
 /// One thing a `CASE`, `IF`, `IFNULL` or `COALESCE` can answer.
@@ -3140,12 +3143,12 @@ fn classify_cast(
 }
 
 /// Classifies `CONVERT(col, <type>)`, which means what `CAST(col AS <type>)`
-/// means.
+/// means, and `CONVERT(col USING utf8mb4)`, which means `CAST(col AS CHAR)`.
 ///
-/// The other spellings are refused. `CONVERT(col USING <charset>)` names a
-/// character set rather than a type, and this server speaks one; the T-SQL
-/// `CONVERT(<type>, col)` and `TRY_CONVERT` write the two the other way round
-/// and answer NULL where MySQL raises, neither of which is MySQL.
+/// The other spellings are refused. Another character set than utf8mb4 would
+/// change the collation the answer carries; the T-SQL `CONVERT(<type>, col)`
+/// and `TRY_CONVERT` write the two the other way round and answer NULL where
+/// MySQL raises, neither of which is MySQL.
 fn classify_convert(expr: &Expr) -> Option<StaticSelectMetadata> {
     let Expr::Convert {
         is_try,
@@ -3158,8 +3161,29 @@ fn classify_convert(expr: &Expr) -> Option<StaticSelectMetadata> {
     else {
         return None;
     };
-    if *is_try || *target_before_value || charset.is_some() || !styles.is_empty() {
+    if *is_try || *target_before_value || !styles.is_empty() {
         return None;
+    }
+    // Measured on MySQL 8.4.11: `CONVERT(col USING utf8mb4)` answers what
+    // `CAST(col AS CHAR)` answers, the column written out in the character set
+    // this server speaks — a VARCHAR(200) reports 800, an INT 44.
+    if let Some(charset) = charset {
+        let [sqlparser::ast::ObjectNamePart::Identifier(name)] = charset.0.as_slice() else {
+            return None;
+        };
+        if data_type.is_some()
+            || name.quote_style.is_some()
+            || !name.value.eq_ignore_ascii_case("utf8mb4")
+        {
+            return None;
+        }
+        return classify_cast(
+            &sqlparser::ast::CastKind::Cast,
+            expr,
+            &sqlparser::ast::DataType::Char(None),
+            None,
+            false,
+        );
     }
     classify_cast(
         &sqlparser::ast::CastKind::Cast,

@@ -830,9 +830,45 @@ and so does reading a number or a day out of a word — `CAST('  7 apples' AS SI
 there with a warning this does not raise.
 
 `CONVERT(col, <type>)` means what `CAST(col AS <type>)` means and is written out the same
-way. The other spellings are refused: `CONVERT(col USING <charset>)` names a character set
-rather than a type and this server speaks one, and the T-SQL `CONVERT(<type>, col)` and
-`TRY_CONVERT` write the two the other way round and answer NULL where MySQL raises.
+way, and `CONVERT(col USING utf8mb4)` means `CAST(col AS CHAR)`: measured on 8.4.11, both
+write the column out in the one character set this server speaks, a `VARCHAR(200)`
+reporting 800 and an `INT` 44. The other spellings are refused: another character set would
+change the collation the answer carries, and the T-SQL `CONVERT(<type>, col)` and
+`TRY_CONVERT` write the two the other way round and answer NULL where MySQL raises. An
+unaliased cast or `CONVERT` is named after the text it was written as, as MySQL names it.
+
+A value written out in full in the statement's own result is worked out before the
+statement runs, into the text MySQL answers and the column MySQL reports, because the engine
+answers a different one. Measured on 8.4.11:
+
+- A number written with a point is a `NEWDECIMAL` that reports its digits, a point and a
+  sign — `1.5` reports 4 with one decimal, `.5` 3, `0.10` 5 with two, and `100.` 4 with
+  none — and it answers the digits it was written with, `0.10` rather than the engine's
+  `0.1`. A number with redundant leading zeroes, `007.5`, is refused: MySQL counts their
+  width by a rule of its own, `007.5` three digits and `000.5` two.
+- A number written with an exponent is a `DOUBLE` as wide as it was written — `1e3`
+  reports 3 and `1.5e-3` 6 — and 23 when negative.
+- `0x41`, `X'41'` and `b'101'` are binary strings of their bytes, a `VAR_STRING` in the
+  binary character set as long as the bytes; the two hexadecimal spellings carry the
+  unsigned flag and the bit spelling does not. An odd count of hexadecimal digits is
+  refused, because sqlparser gives `X'4'`, a syntax error in MySQL, and `0x4`, one byte,
+  the same shape.
+- `CAST(<number> AS DECIMAL(p,s))` rounds half away from zero to `s` places and reports
+  `p` digits, a sign and a point — `DECIMAL(10,2)` reports 12 — with `DECIMAL` alone meaning
+  `DECIMAL(10,0)`. A number too wide for the type is refused: MySQL holds it to the widest
+  one the type takes and warns. A word and a `DOUBLE` read into a `DECIMAL` are refused.
+- `CAST('<day>' AS DATE)` and `CAST('<moment>' AS DATETIME)` answer the day or moment a
+  column of that type would store, a `DATE` of 10 or a `DATETIME` of 19, nullable. A word
+  naming no day is refused: MySQL answers NULL with warning 1292.
+- `CAST('<document>' AS JSON)` answers the document the way MySQL stores one — keys sorted,
+  the last of a repeated key kept — as a `JSON` column. A word that is no document is
+  refused, which MySQL answers 3141 for.
+- `CAST('<word>' AS CHAR)` and `CONVERT('<word>' USING utf8mb4)` answer the word as a
+  `VAR_STRING` four bytes to each character, nullable.
+
+Each of these, and each cast of `NULL` to the same types, is taken only where it stands in
+the statement's own result. In a subquery, a derived table or a branch of a `UNION` it is
+refused, because nothing there reports the shape it was worked out to.
 
 A call stands where a column stands on the left of a comparison:
 `WHERE LOWER(email) = 'a@x'`, `WHERE CHAR_LENGTH(name) > 3`, `WHERE YEAR(d) = 2024`,

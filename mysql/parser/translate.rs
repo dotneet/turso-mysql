@@ -336,7 +336,10 @@ pub(crate) fn translate_select_query(
         _ => &[],
     };
     let (mut normalized, mut source_tables) = match query.body.as_ref() {
-        SetExpr::Select(select) => render_select_body(select, &mut render_context)?,
+        SetExpr::Select(select) => {
+            render_context.renders_the_outer_projection = true;
+            render_select_body(select, &mut render_context)?
+        }
         SetExpr::SetOperation {
             left,
             op,
@@ -567,10 +570,25 @@ fn render_select_body(
         return unsupported("SELECT feature");
     }
 
+    // A value written out in full is worked out here only where it stands in
+    // the statement's own result, whose shape is reported for it. Anywhere
+    // else — a subquery, a branch of a `UNION` — the engine would read the
+    // text it is worked out to.
+    let outer_projection = std::mem::take(&mut render_context.renders_the_outer_projection);
     let projection = select
         .projection
         .iter()
-        .map(|item| render_select_item(item, render_context))
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
+                if outer_projection =>
+            {
+                match crate::written_value::read_written_value(expr) {
+                    Some((_, rendered)) => render_written_value(item, rendered, render_context),
+                    None => render_select_item(item, render_context),
+                }
+            }
+            _ => render_select_item(item, render_context),
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if projection.is_empty() {
         return unsupported("SELECT without projections");
@@ -663,6 +681,38 @@ fn render_select_body(
         normalized.push_str(&render_having_predicate(having, render_context)?);
     }
     Ok((normalized, source_tables))
+}
+
+/// Writes a value worked out in full under the name MySQL gives it: its
+/// alias, or the text it was written as.
+fn render_written_value(
+    item: &SelectItem,
+    rendered: String,
+    render_context: &SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => {
+            Ok(format!("{rendered} AS {}", render_ident(alias)))
+        }
+        SelectItem::UnnamedExpr(expr) => {
+            // Measured: MySQL leaves a written plus sign out of the name,
+            // `+1.5` being named `1.5`, and keeps a minus sign in it.
+            let named = match expr {
+                Expr::UnaryOp {
+                    op: UnaryOperator::Plus,
+                    expr: inner,
+                } => inner.as_ref(),
+                _ => expr,
+            };
+            let name = source_text(render_context.source, named)
+                .ok_or(ParseError::Unsupported {
+                    feature: "SELECT written value whose source text cannot be recovered",
+                })?
+                .replace('"', "\"\"");
+            Ok(format!("{rendered} AS \"{name}\""))
+        }
+        _ => unreachable!("only an expression item carries a written value"),
+    }
 }
 
 /// Reports whether a `HAVING` filters rows rather than groups.
@@ -1532,6 +1582,11 @@ pub(crate) fn select_static_result_metadata(
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                if let Some((shape, _)) = crate::written_value::read_written_value(expr) {
+                    return StaticSelectProjectionMetadata::Literal(
+                        StaticSelectMetadata::WrittenValue(shape),
+                    );
+                }
                 classify_static_select_expr(expr).map_or(
                     StaticSelectProjectionMetadata::Other,
                     StaticSelectProjectionMetadata::Literal,
@@ -3987,6 +4042,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// these as that day's midnight, which changes what the comparison
     /// renders as; `compares_a_written_day` says when it matters.
     moment_columns: &'a [String],
+    /// Whether the next projection rendered is the statement's own result
+    /// rather than a subquery's or a `UNION` branch's.
+    renders_the_outer_projection: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
     /// Whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column was
@@ -4041,6 +4099,7 @@ impl<'a> SelectRenderContext<'a> {
             moment_columns,
             rewritten_on_update,
             subquery_tables: Vec::new(),
+            renders_the_outer_projection: false,
             orders_a_bare_column: false,
             checks_type_sensitive_expression: false,
             renders_a_condition_without_column_types: false,
@@ -4170,6 +4229,8 @@ fn render_select_item(
             | Expr::Floor { .. }
             | Expr::Ceil { .. }
             | Expr::Extract { .. }
+            | Expr::Cast { .. }
+            | Expr::Convert { .. }
             | Expr::Subquery(_)),
         ) if static_select_metadata::classify_static_select_expr(expr).is_some() => {
             let name = source_text(render_context.source, expr)
@@ -6695,6 +6756,8 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
             | Expr::Floor { .. }
             | Expr::Ceil { .. }
             | Expr::Extract { .. }
+            | Expr::Cast { .. }
+            | Expr::Convert { .. }
     ) {
         let open_paren = bytes[..start].iter().rposition(|byte| *byte == b'(')?;
         let name_end = bytes[..open_paren]
@@ -6741,7 +6804,9 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         | Expr::Trim { .. }
         | Expr::Floor { .. }
         | Expr::Ceil { .. }
-        | Expr::Extract { .. } => true,
+        | Expr::Extract { .. }
+        | Expr::Cast { .. }
+        | Expr::Convert { .. } => true,
         _ => false,
     };
     if closes_with_a_paren {

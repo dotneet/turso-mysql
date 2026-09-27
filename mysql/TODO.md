@@ -95,6 +95,11 @@ name or built on one, a windowed aggregate over anything but one plain column,
 and a `LAG` or `LEAD` carrying an offset or a default.
 Numbers: a seeded `RAND(n)` is refused: the engine has no seeded random, so
 answering one would answer a different sequence.
+Written values: a number with a point or an exponent, a hexadecimal or bit
+literal, and a cast of a written value are taken only in the statement's own
+result, not in a subquery, a derived table or a `UNION` branch. A number with
+redundant leading zeroes (`007.5`), a word or a `DOUBLE` cast to `DECIMAL`, and
+a cast a warning comes with are refused.
 Temporal: `FROM_UNIXTIME` over a fraction or a word, which MySQL carries into
 the moment or reads as the number it begins with.
 JSON: `JSON_SEARCH` with a path to search inside. `JSON_SET`,

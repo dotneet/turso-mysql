@@ -1,11 +1,23 @@
-use turso_mysql_parser::StaticSelectMetadata;
+use turso_mysql_parser::{StaticSelectMetadata, WrittenValue};
 
-use crate::ColumnDefinitionConfig;
+use crate::{ColumnDefinitionConfig, DEFAULT_UTF8MB4_COLLATION};
 
+const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 const MYSQL_TYPE_NULL: u8 = 0x06;
 const MYSQL_TYPE_LONGLONG: u8 = 0x08;
+const MYSQL_TYPE_DATE: u8 = 0x0a;
+const MYSQL_TYPE_DATETIME: u8 = 0x0c;
+const MYSQL_TYPE_JSON: u8 = 0xf5;
+const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
+const MYSQL_TYPE_VAR_STRING: u8 = 0xfd;
 const MYSQL_NOT_NULL_FLAG: u16 = 1;
+const MYSQL_UNSIGNED_FLAG: u16 = 32;
 const MYSQL_BINARY_FLAG: u16 = 128;
+/// The decimals a column reports when its answer has no fixed count of them.
+const NOT_FIXED_DECIMALS: u8 = 31;
+/// The widest a JSON document can be, which every JSON answer reports.
+const MYSQL_JSON_LENGTH: u32 = u32::MAX - 3;
+const UTF8MB4_MAX_BYTES_PER_CHARACTER: u32 = 4;
 /// Some numeric expressions carry this flag; a plain integer literal does not.
 const MYSQL_NUM_FLAG: u16 = 32_768;
 const MYSQL_BINARY_COLLATION: u16 = 63;
@@ -62,6 +74,7 @@ pub(crate) fn static_result_column_metadata(
             flags: MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
             decimals: 0,
         },
+        StaticSelectMetadata::WrittenValue(written) => written_value_metadata(*written),
         StaticSelectMetadata::ColumnAggregate { .. }
         | StaticSelectMetadata::WindowAggregate { .. }
         | StaticSelectMetadata::WindowCount
@@ -72,6 +85,74 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::AggregateOverBranches { .. }
         | StaticSelectMetadata::ScalarCall { .. } => return None,
     })
+}
+
+/// Measured on MySQL 8.4.11, what a value written out in full reports.
+fn written_value_metadata(written: WrittenValue) -> StaticResultColumnMetadata {
+    let text_collation = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    match written {
+        // A sign and a point beside the digits: `1.50` reports 5 and
+        // `CAST(1 AS DECIMAL(10,2))` 12, and a whole number no point.
+        WrittenValue::Decimal {
+            precision,
+            scale,
+            not_null,
+        } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_NEWDECIMAL,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: precision + u32::from(scale > 0) + 1,
+            flags: MYSQL_BINARY_FLAG
+                | MYSQL_NUM_FLAG
+                | if not_null { MYSQL_NOT_NULL_FLAG } else { 0 },
+            decimals: u8::try_from(scale).expect("a DECIMAL holds at most 30 places"),
+        },
+        WrittenValue::Double { length } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_DOUBLE,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: length,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            decimals: NOT_FIXED_DECIMALS,
+        },
+        WrittenValue::Bytes { length, unsigned } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_VAR_STRING,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: length,
+            flags: MYSQL_NOT_NULL_FLAG
+                | MYSQL_BINARY_FLAG
+                | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 },
+            decimals: 0,
+        },
+        // A cast to a day, a moment or a document is nullable whatever it
+        // was given, a word naming none answering NULL.
+        WrittenValue::Day => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_DATE,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: 10,
+            flags: MYSQL_BINARY_FLAG,
+            decimals: 0,
+        },
+        WrittenValue::Moment => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_DATETIME,
+            character_set: MYSQL_BINARY_COLLATION,
+            column_length: 19,
+            flags: MYSQL_BINARY_FLAG,
+            decimals: 0,
+        },
+        WrittenValue::Json => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_JSON,
+            character_set: text_collation,
+            column_length: MYSQL_JSON_LENGTH,
+            flags: MYSQL_BINARY_FLAG,
+            decimals: NOT_FIXED_DECIMALS,
+        },
+        WrittenValue::Text { characters } => StaticResultColumnMetadata {
+            column_type: MYSQL_TYPE_VAR_STRING,
+            character_set: text_collation,
+            column_length: characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
+            flags: 0,
+            decimals: NOT_FIXED_DECIMALS,
+        },
+    }
 }
 
 pub(crate) fn static_column_definition(

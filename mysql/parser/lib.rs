@@ -35,6 +35,7 @@ mod temporal_value;
 mod translate;
 mod truncate_table;
 mod written_number;
+mod written_value;
 
 use admin_command::{
     admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
@@ -166,6 +167,7 @@ pub use temporal_value::{
 pub use translate::{MySqlCatalogTable, MySqlSelectSource};
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use written_number::{read_written_number, WrittenNumber};
+pub use written_value::WrittenValue;
 
 /// Longest `VARCHAR` this server takes, in characters.
 ///

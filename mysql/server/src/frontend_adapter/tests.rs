@@ -23873,9 +23873,9 @@ fn a_cast_answers_what_mysql_answers_for_the_targets_it_takes() {
     );
 
     for sql in [
-        // `CONVERT(col USING <charset>)` names a character set rather than a
-        // type, and this server speaks one.
-        "SELECT CONVERT(label USING utf8mb4) FROM readings",
+        // Another character set than utf8mb4 would change the collation the
+        // answer carries.
+        "SELECT CONVERT(label USING latin1) FROM readings",
         "SELECT CONVERT(n, UNSIGNED) FROM readings",
         // Measured: MySQL wraps a negative into an unsigned 64-bit number —
         // `CAST(-3 AS UNSIGNED)` answers 18446744073709551613 — and the engine
@@ -30640,3 +30640,6 @@ mod conditional_expressions;
 
 #[cfg(unix)]
 mod written_numbers;
+
+#[cfg(unix)]
+mod written_values;
