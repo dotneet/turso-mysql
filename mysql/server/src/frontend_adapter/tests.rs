@@ -30611,6 +30611,8 @@ mod fractional_moments;
 mod rails_statements;
 
 #[cfg(unix)]
+mod collecting_aggregates;
+#[cfg(unix)]
 mod numeric_operators;
 #[cfg(unix)]
 mod string_functions;

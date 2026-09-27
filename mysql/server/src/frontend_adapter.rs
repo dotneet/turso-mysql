@@ -3546,14 +3546,20 @@ fn binary_result_value(
         // 8.4.11, the document's own bytes, length-encoded, and the same over
         // both protocols.
         MySqlPreparedValue::Blob(value)
-            if matches!(column_type, MYSQL_TYPE_BLOB | MYSQL_TYPE_JSON) =>
+            if matches!(
+                column_type,
+                MYSQL_TYPE_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_JSON
+            ) =>
         {
             Ok(BinaryResultValue::Blob(value))
         }
-        // A TEXT column reports BLOB, so its value crosses as the same
-        // length-encoded bytes.
+        // A TEXT column reports BLOB, and a GROUP_CONCAT a LONG_BLOB, so each
+        // value crosses as the same length-encoded bytes.
         MySqlPreparedValue::Text(value)
-            if matches!(column_type, MYSQL_TYPE_BLOB | MYSQL_TYPE_JSON) =>
+            if matches!(
+                column_type,
+                MYSQL_TYPE_BLOB | MYSQL_TYPE_LONG_BLOB | MYSQL_TYPE_JSON
+            ) =>
         {
             Ok(BinaryResultValue::Blob(value.into_bytes()))
         }
@@ -4969,6 +4975,21 @@ impl TableResultMetadata {
             definition.column_type = MYSQL_TYPE_DOUBLE;
             definition.column_length = 23;
             definition.decimals = NOT_FIXED_DECIMALS;
+        } else if kind == ColumnAggregateKind::CollectsIntoJson {
+            // Measured on MySQL 8.4.11: the JSON type at the widest a document
+            // can be, with the text collation and the binary flag, as
+            // `JSON_ARRAY` answers. Only words and whole numbers are taken: a
+            // DOUBLE, a DECIMAL, a moment or a JSON document is written into
+            // the array by a rule of its own.
+            if !(is_text_column(source) || is_signed_whole_number_column(source.type_name())) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let mut definition = column_definition(definition.name, MYSQL_TYPE_JSON);
+            definition.column_length = u32::MAX - 3;
+            definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+            definition.decimals = NOT_FIXED_DECIMALS;
+            set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+            return Ok(definition);
         } else if kind == ColumnAggregateKind::Concatenated {
             definition.column_type = MYSQL_TYPE_LONG_BLOB;
             definition.column_length = 65536;
@@ -5250,7 +5271,9 @@ impl TableResultMetadata {
                     ColumnAggregateKind::MinMax => {
                         (precision, scale, source.decimal_size().is_some())
                     }
-                    ColumnAggregateKind::Concatenated | ColumnAggregateKind::DeviatesBySample => {
+                    ColumnAggregateKind::Concatenated
+                    | ColumnAggregateKind::DeviatesBySample
+                    | ColumnAggregateKind::CollectsIntoJson => {
                         return Err(FrontendErrorKind::Unsupported)
                     }
                 };
@@ -5396,7 +5419,8 @@ fn apply_summing_aggregate_metadata(
         ColumnAggregateKind::Avg => (precision + 4, (scale + 4).min(MYSQL_MAX_DECIMAL_SCALE)),
         ColumnAggregateKind::MinMax
         | ColumnAggregateKind::Concatenated
-        | ColumnAggregateKind::DeviatesBySample => {
+        | ColumnAggregateKind::DeviatesBySample
+        | ColumnAggregateKind::CollectsIntoJson => {
             unreachable!("only SUM and AVG use summing metadata")
         }
     };

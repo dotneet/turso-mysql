@@ -3404,8 +3404,24 @@ rows: measured on 8.4.11, `GROUP_CONCAT(name SEPARATOR '-')` answers `x-y-z`
 and `GROUP_CONCAT(DISTINCT team)` answers `a,b` where the plain call answers
 `a,a,b,a`. The two together are refused, the engine taking `DISTINCT` only
 over a single argument and the separator being that second one, and so is an
-`ORDER BY` inside the call: MySQL orders the parts it joins and the engine's
-`group_concat` has no way to say in what order it joins them.
+`ORDER BY` inside the call: MySQL orders the parts it joins, and the engine's
+planner refuses an `ORDER BY` inside any aggregate. Joining the rows of an
+ordered subquery would not do instead, since nothing holds the engine to
+reading them in that order. A prepared `GROUP_CONCAT` answers its
+`LONG_BLOB` as length-encoded bytes, as MySQL does; it used to fail.
+
+`JSON_ARRAYAGG(col)` collects a column of words or of whole numbers into a
+JSON array, in the order the rows are read, the way `GROUP_CONCAT` joins them.
+Measured on 8.4.11: a word becomes a JSON string escaped the way MySQL escapes
+one (`["a\"b", "c\\d", "e\nf\tg"]`), a `CHAR` without its trailing spaces, a
+whole number a JSON number up to the largest `BIGINT`, a NULL the JSON null,
+and no rows at all answer NULL rather than an empty array. It reports the JSON
+type at the widest a document can be, with the text collation and the binary
+flag, as `JSON_ARRAY` does. The engine's `json_group_array` builds the array,
+the document is written again the way MySQL writes one, and an empty group is
+answered NULL. Refused: a `DOUBLE`, a `DECIMAL`, a moment or a JSON column,
+each of which MySQL writes into the array by a rule of its own, a `DISTINCT`,
+and `JSON_OBJECTAGG`, which MySQL answers 3158 for a NULL key.
 
 `STDDEV_SAMP` is taken, and it is the only standard deviation that is.
 Measured on 8.4.11 over 2, 4, 4, 4, 5, 5, 7, 9: the sample form answers

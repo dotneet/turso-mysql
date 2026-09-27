@@ -351,6 +351,9 @@ pub enum ColumnAggregateKind {
     Concatenated,
     /// `STDDEV_SAMP`, which answers a DOUBLE whatever the column is.
     DeviatesBySample,
+    /// `JSON_ARRAYAGG`, which answers a JSON array of every value, and NULL
+    /// over no rows at all.
+    CollectsIntoJson,
 }
 
 /// Source-level kind of one checked `SELECT` projection item.
@@ -2885,6 +2888,8 @@ pub(super) fn column_aggregate_argument(
     // it, so answering one of those would mean answering a different number.
     } else if name.value.eq_ignore_ascii_case("STDDEV_SAMP") {
         ColumnAggregateKind::DeviatesBySample
+    } else if name.value.eq_ignore_ascii_case("JSON_ARRAYAGG") {
+        ColumnAggregateKind::CollectsIntoJson
     } else {
         return None;
     };

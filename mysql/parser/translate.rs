@@ -4213,6 +4213,21 @@ fn render_aggregate_call(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
 ) -> String {
+    // The engine's `json_group_array` builds the same array and answers an
+    // empty one over no rows, where MySQL answers NULL; its document is
+    // written again the way MySQL writes one.
+    if matches!(
+        static_select_metadata::column_aggregate_argument(function),
+        Some((
+            static_select_metadata::ColumnAggregateKind::CollectsIntoJson,
+            _
+        ))
+    ) {
+        return format!(
+            "CASE WHEN count(*) = 0 THEN NULL ELSE mysql_json_document(json_group_array({})) END",
+            render_aggregate_argument(function, render_context)
+        );
+    }
     // The engine calls the sample standard deviation `stddev`, where MySQL
     // keeps that name for the population one. Every other aggregate here is
     // spelled the same in both.
