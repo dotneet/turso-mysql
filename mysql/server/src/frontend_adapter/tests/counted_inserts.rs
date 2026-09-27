@@ -164,6 +164,21 @@ fn a_counted_row_takes_the_clock_as_a_value() {
         ),
         (1, 2)
     );
+    // And with no column list, where every column of the table is meant.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO users VALUES (NULL, 'Ed', 'ed@x.com', NOW(), NOW())"
+        ),
+        (1, 3)
+    );
+    assert_eq!(
+        one(
+            &mut adapter,
+            "SELECT COUNT(*) FROM users WHERE id = 3 AND updated_at IS NOT NULL"
+        ),
+        "1"
+    );
 }
 
 /// Each row of these is written by a statement of its own, where MySQL reads
