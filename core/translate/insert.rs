@@ -2813,10 +2813,10 @@ fn translate_column(
             dest_end: None,
         });
     } else if let Some(default_expr) = column.default.as_ref() {
-        translate_expr(program, None, default_expr, column_register, resolver)?;
+        translate_default(program, column, default_expr, column_register, resolver)?;
     } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
         if let Some(default_expr) = resolved.default_expr() {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
+            translate_default(program, column, default_expr, column_register, resolver)?;
         } else {
             program.emit_insn(Insn::Null {
                 dest: column_register,
@@ -2828,6 +2828,40 @@ fn translate_column(
             dest: column_register,
             dest_end: None,
         });
+    }
+    Ok(())
+}
+
+/// Writes a column's default into its register. A column whose value is
+/// encoded in place before it is stored must have its default written again
+/// for every row: hoisted out of the row loop, the second row would encode the
+/// first row's already encoded value a second time. See
+/// [NoConstantOptReason::CustomTypeEncode].
+fn translate_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    default_expr: &ast::Expr,
+    column_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let encoded_in_place = column.is_array()
+        || resolver
+            .schema()
+            .resolve_type_unchecked(&column.ty_str)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.encode().is_some()));
+    if encoded_in_place {
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            default_expr,
+            column_register,
+            resolver,
+            NoConstantOptReason::CustomTypeEncode,
+        )?;
+    } else {
+        translate_expr(program, None, default_expr, column_register, resolver)?;
     }
     Ok(())
 }

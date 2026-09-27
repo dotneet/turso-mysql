@@ -20772,6 +20772,58 @@ mod tests {
             .unwrap();
     }
 
+    /// A default is written into the column's register and then encoded in
+    /// place, so it has to be written again for every row: once it was
+    /// evaluated only before the first row, and the second row encoded the
+    /// first row's already encoded value a second time and failed.
+    #[test]
+    fn mysql_numeric_defaults_fill_every_row_an_insert_writes() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            "mysql-numeric-defaults-every-row.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(MysqlDecimalTestDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER, balance mysql_decimal(10,2) NOT NULL DEFAULT '0.00', \
+             spare mysql_decimal(10,2) DEFAULT '1.50', big mysql_uint64 DEFAULT '18446744073709551615')",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t(id) VALUES (1), (2), (3)")
+            .unwrap();
+        conn.execute("INSERT INTO t(id) SELECT id + 3 FROM t")
+            .unwrap();
+        let mut rows = Vec::new();
+        conn.prepare("SELECT id, balance, spare, big FROM t ORDER BY id")
+            .unwrap()
+            .run_with_row_callback(|row| {
+                rows.push((
+                    row.get::<i64>(0)?,
+                    row.get::<String>(1)?,
+                    row.get::<String>(2)?,
+                    row.get::<String>(3)?,
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let expected: Vec<_> = (1..=6)
+            .map(|id| {
+                (
+                    id,
+                    "0.00".to_string(),
+                    "1.50".to_string(),
+                    "18446744073709551615".to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(rows, expected);
+    }
+
     struct MysqlDecimalTestDialect;
 
     impl Dialect for MysqlDecimalTestDialect {

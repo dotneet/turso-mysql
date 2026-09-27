@@ -463,6 +463,42 @@ fn a_decimal_column_restated_by_modify_is_read_by_the_session_that_changed_it() 
     );
 }
 
+/// A `DECIMAL` and a `BIGINT UNSIGNED` are kept in an encoded form, and a
+/// default is encoded once for every row that takes it: an insert of several
+/// rows used to encode the first row's default again for the second and fail.
+/// Measured on MySQL 8.4.11 with the same statements.
+#[test]
+fn every_row_of_an_insert_takes_the_encoded_defaults() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE v4 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, \
+         balance DECIMAL(10,2) NOT NULL DEFAULT '0.00', spare DECIMAL(10,2) DEFAULT '1.50', \
+         big BIGINT UNSIGNED DEFAULT 18446744073709551615)",
+    );
+    run(&mut adapter, "INSERT INTO v4 (name) VALUES ('a'), ('b')");
+    run(
+        &mut adapter,
+        "CREATE TABLE v5 (id INT NOT NULL PRIMARY KEY, name VARCHAR(100) NOT NULL, \
+         balance DECIMAL(10,2) NOT NULL DEFAULT '0.00')",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO v5 (id, name) VALUES (1, 'a'), (2, 'b')",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT * FROM v4 ORDER BY id"),
+        vec![
+            some(&["1", "a", "0.00", "1.50", "18446744073709551615"]),
+            some(&["2", "b", "0.00", "1.50", "18446744073709551615"]),
+        ]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, balance FROM v5 ORDER BY id"),
+        vec![some(&["1", "0.00"]), some(&["2", "0.00"])]
+    );
+}
+
 /// Laravel's `comment()` on a table writes `alter table t comment = 'x'` and
 /// Rails writes `ALTER TABLE t COMMENT 'x'`.
 #[test]
