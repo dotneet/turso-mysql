@@ -352,6 +352,164 @@ fn a_select_reading_the_counted_table_it_writes_copies_what_stood() {
     assert_eq!(counter(&mut adapter, "a1").as_deref(), Some("27"));
 }
 
+/// Laravel's `insertUsing` as it arrives, prepared with its bindings in the
+/// `SELECT`'s `WHERE`, into a counted table and into one counting nothing.
+///
+/// Measured on MySQL 8.4.11: the `SELECT` finds the rows a bare `SELECT`
+/// binding the same values finds — a word matching without regard to case, a
+/// bound day meeting a `TIMESTAMP` — and copies them in the order its
+/// `ORDER BY` names, a text column ordered without regard to case.
+#[test]
+fn laravels_prepared_insert_using_copies_the_rows_its_bindings_choose() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, LARAVEL_USERS);
+    run(
+        &mut adapter,
+        "create table `archive` (`name` varchar(255) not null, `email` varchar(255) null)",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO users (name, email, created_at) VALUES ('Fi', 'fi@x.com', '2024-01-02 03:04:05'), ('bo', 'bo@x.com', '2023-06-01 00:00:00'), ('Al', NULL, NULL)"
+        ),
+        (3, 1)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `users` (`name`, `email`) select `name`, `email` from `users` where `id` = ?",
+            &words(&["1"]),
+        ),
+        (1, 4)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "4");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `users` (`name`, `email`) select `name`, `email` from `users` where `name` = ?",
+            &words(&["FI"]),
+        ),
+        (2, 5)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `archive` (`name`, `email`) select `name`, `email` from `users` where `created_at` > ?",
+            &words(&["2024-01-01"]),
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `archive` (`name`, `email`) select `name`, `email` from `users` where `name` = ?",
+            &words(&["AL"]),
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `users` (`name`) select `name` from `archive` order by `name`"
+        ),
+        (2, 8)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "insert into `users` (`name`) select `name` from `users` where `id` > ? order by `name` desc",
+            &words(&["6"]),
+        ),
+        (2, 11)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `archive` (`name`) select `name` from `users` order by `name` limit 2"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, name, email FROM users ORDER BY id"
+        ),
+        vec![
+            some(&["1", "Fi", "fi@x.com"]),
+            some(&["2", "bo", "bo@x.com"]),
+            vec![Some("3".to_owned()), Some("Al".to_owned()), None],
+            some(&["4", "Fi", "fi@x.com"]),
+            some(&["5", "Fi", "fi@x.com"]),
+            some(&["6", "Fi", "fi@x.com"]),
+            vec![Some("8".to_owned()), Some("Al".to_owned()), None],
+            vec![Some("9".to_owned()), Some("Fi".to_owned()), None],
+            vec![Some("11".to_owned()), Some("Fi".to_owned()), None],
+            vec![Some("12".to_owned()), Some("Al".to_owned()), None],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT name, email FROM archive ORDER BY name"
+        ),
+        vec![
+            vec![Some("Al".to_owned()), None],
+            vec![Some("Al".to_owned()), None],
+            vec![Some("Al".to_owned()), None],
+            some(&["Fi", "fi@x.com"]),
+        ]
+    );
+    assert_eq!(counter(&mut adapter, "users").as_deref(), Some("14"));
+}
+
+/// A prepared copy whose `SELECT` was read knowing its columns' types runs
+/// again after another table is made, and is refused once a table it reads
+/// changes, where it would have to be read again.
+#[test]
+fn a_prepared_copy_keeps_its_reading_of_the_tables_it_names() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE src (name VARCHAR(20) NOT NULL, score INT NOT NULL)",
+    );
+    run(&mut adapter, "CREATE TABLE dst (name VARCHAR(20) NOT NULL)");
+    run(
+        &mut adapter,
+        "INSERT INTO src (name, score) VALUES ('b', 1), ('A', 2), ('c', 3)",
+    );
+    let statement = adapter
+        .execute_stmt_prepare(
+            "INSERT INTO dst (name) SELECT name FROM src WHERE score < ? ORDER BY name LIMIT ?",
+        )
+        .unwrap();
+    // A word for the score, and a whole number for the row count, which is
+    // all a `LIMIT ?` takes.
+    let execute = |adapter: &mut Adapter, below: &str, limit: i64| {
+        let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0, MYSQL_TYPE_LONGLONG, 0];
+        payload.push(u8::try_from(below.len()).unwrap());
+        payload.extend_from_slice(below.as_bytes());
+        payload.extend_from_slice(&limit.to_le_bytes());
+        match adapter.execute_stmt_execute(statement.statement_id, &payload) {
+            Ok(PreparedStatementExecutionResult::Ok(result)) => Ok(result.affected_rows),
+            Ok(_) => panic!("a copy answers OK"),
+            Err(error) => Err(error),
+        }
+    };
+    assert_eq!(execute(&mut adapter, "3", 1), Ok(1));
+    run(&mut adapter, "CREATE TABLE other (x INT)");
+    assert_eq!(execute(&mut adapter, "9", 2), Ok(2));
+    assert_eq!(
+        rows(&mut adapter, "SELECT name FROM dst"),
+        vec![some(&["A"]), some(&["A"]), some(&["b"])]
+    );
+    run(&mut adapter, "ALTER TABLE src ADD COLUMN note TEXT");
+    assert!(execute(&mut adapter, "9", 2).is_err());
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM dst"),
+        vec![some(&["3"])]
+    );
+}
+
 /// Laravel's `insertUsing`, copying a row into a table Laravel counts.
 #[test]
 fn laravels_insert_using_copies_into_a_counted_table() {
@@ -951,7 +1109,7 @@ fn a_trigger_writes_into_a_counted_table_with_that_tables_next_numbers() {
     assert_eq!(
         written(
             &mut adapter,
-            "INSERT INTO posts (title) SELECT title FROM drafts"
+            "INSERT INTO posts (title) SELECT title FROM drafts ORDER BY k"
         ),
         (2, 51)
     );

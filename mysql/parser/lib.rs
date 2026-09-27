@@ -115,7 +115,7 @@ pub use dump_ddl::{
 };
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
 pub use insert_select::{
-    direct_insert_select_projection, filtered_insert_select_projection,
+    direct_insert_select_projection, filtered_insert_select_projection, insert_select_source_sql,
     parse_optional_insert_select, parse_optional_insert_select_without_columns,
     parse_optional_insert_set_as_values, parse_optional_insert_values_without_columns,
     MySqlDirectInsertSelectProjection, MySqlInsertSelect, MySqlInsertSelectWithoutColumns,
@@ -1289,9 +1289,27 @@ pub struct TranslatedDml {
     /// which is read as that number only once the column is known to hold
     /// numbers.
     compares_a_written_number: bool,
+    /// Which parameters stand where an `INSERT ... SELECT`'s `SELECT` writes a
+    /// row count.
+    row_count_parameters: Vec<usize>,
+    /// Whether the `SELECT` an `INSERT ... SELECT` copies from was rendered
+    /// by the frontend knowing its columns' types, which a statement read
+    /// again without a connection cannot do.
+    copies_a_select_rendered_knowing_its_types: bool,
 }
 
 impl TranslatedDml {
+    /// Reports whether the `SELECT` this `INSERT ... SELECT` copies from was
+    /// rendered knowing its columns' types.
+    pub fn copies_a_select_rendered_knowing_its_types(&self) -> bool {
+        self.copies_a_select_rendered_knowing_its_types
+    }
+
+    /// Returns which parameters stand where the statement writes a row count.
+    pub fn row_count_parameters(&self) -> &[usize] {
+        &self.row_count_parameters
+    }
+
     /// Reports whether a comparison names a column against a word naming a
     /// number, which a second reading knowing the columns' types renders.
     pub fn compares_a_written_number(&self) -> bool {
@@ -4350,11 +4368,13 @@ pub fn parse_dml_knowing_numeric_columns(
             .knowing_integer_columns(integer_columns);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
+    let mut row_count_parameters = Vec::new();
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
-            let rendered = translate_insert(&insert, sql, mode, decimal_columns)?;
+            let rendered = translate_insert(&insert, sql, mode, decimal_columns, None)?;
             read_tables = rendered.read_tables;
             inherited_comparisons = rendered.checked_comparisons;
+            row_count_parameters = rendered.row_count_parameters;
             // An INSERT ... SELECT compares against the table the SELECT reads,
             // not the one it writes, so that is the table the comparisons are
             // checked against.
@@ -4413,6 +4433,49 @@ pub fn parse_dml_knowing_numeric_columns(
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
         json_reading_columns: render_context.json_reading_columns,
         compares_a_written_number: render_context.compares_a_written_number,
+        row_count_parameters,
+        copies_a_select_rendered_knowing_its_types: false,
+    })
+}
+
+/// Why an `INSERT ... SELECT` is refused when its `SELECT` has to know its
+/// columns' types to be rendered — an `ORDER BY` over a bare column, or a
+/// comparison against a `?`. The frontend renders such a `SELECT` itself and
+/// hands it to [`parse_insert_select_knowing_its_select`].
+pub const INSERT_SELECT_NEEDING_COLUMN_TYPES: &str = "INSERT SELECT needing column types";
+
+/// Parses an `INSERT INTO t (a, b) <SELECT>` whose `SELECT` the frontend has
+/// rendered knowing its columns' types, from the text
+/// [`insert_select_source_sql`] answered for the same statement.
+pub fn parse_insert_select_knowing_its_select(
+    sql: &str,
+    mode: SessionSqlMode,
+    select: &TranslatedSelect,
+) -> Result<TranslatedDml, ParseError> {
+    let Statement::Insert(insert) = parse_one_statement(sql, mode)? else {
+        return Err(ParseError::ExpectedDml);
+    };
+    if insert
+        .source
+        .as_deref()
+        .is_none_or(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
+    {
+        return unsupported("INSERT without a SELECT");
+    }
+    let rendered = translate_insert(&insert, sql, mode, &[], Some(select))?;
+    Ok(TranslatedDml {
+        sqlite_sql: rendered.sqlite_sql,
+        checked_update: None,
+        checked_comparisons: rendered.checked_comparisons,
+        source_table: rendered.compared_table,
+        read_tables: rendered.read_tables,
+        checked_subquery_comparisons: Vec::new(),
+        ordered_columns: Vec::new(),
+        collation_sensitive_call_columns: select.collation_sensitive_call_columns.clone(),
+        json_reading_columns: select.json_reading_columns.clone(),
+        compares_a_written_number: false,
+        row_count_parameters: rendered.row_count_parameters,
+        copies_a_select_rendered_knowing_its_types: true,
     })
 }
 
@@ -4616,7 +4679,7 @@ fn parse_checked_auto_increment_insert(
 
     // Reuse the existing checked SQL normalizer only after the stricter shape
     // checks above. The executable path exposes the typed AST, not this SQL.
-    let normalized = translate_insert(&normalized_insert, sql, mode, &[])?;
+    let normalized = translate_insert(&normalized_insert, sql, mode, &[], None)?;
     let sqlite_statement = parse_normalized_dml(&normalized.sqlite_sql)?;
     let row_count = NonZeroUsize::new(values.rows.len()).ok_or(ParseError::Unsupported {
         feature: "INSERT without VALUES rows",

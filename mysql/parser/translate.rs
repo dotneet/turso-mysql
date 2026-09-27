@@ -2347,13 +2347,19 @@ pub(crate) struct RenderedInsert {
     /// The comparisons that `WHERE` recorded, to be held to the column's type
     /// exactly as a `SELECT`'s are.
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
+    /// Which parameters stand where the `SELECT` writes a row count.
+    pub(crate) row_count_parameters: Vec<usize>,
 }
 
+/// Renders one checked `INSERT`. An `INSERT ... SELECT` whose `SELECT` has to
+/// know its columns' types to be rendered takes it from `typed_select`, the
+/// same `SELECT` rendered by the frontend knowing them.
 pub(crate) fn translate_insert(
     insert: &Insert,
     sql: &str,
     mode: SessionSqlMode,
     decimal_columns: &[(String, u32)],
+    typed_select: Option<&crate::TranslatedSelect>,
 ) -> Result<RenderedInsert, ParseError> {
     if !insert.optimizer_hints.is_empty()
         || insert.or.is_some()
@@ -2435,27 +2441,47 @@ pub(crate) fn translate_insert(
         if insert.on.is_some() {
             return unsupported("INSERT SELECT with ON DUPLICATE KEY UPDATE");
         }
-        let rendered = translate_select_query(
-            source,
-            sql,
-            mode,
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-        )?;
-        // A SELECT that needs a second rendering pass to learn its column types
-        // has no way to ask for one from here, so it is refused rather than
-        // rendered from the first pass alone.
-        if rendered.orders_a_bare_column || rendered.compares_a_placeholder {
-            return unsupported("INSERT SELECT needing column types");
-        }
-        if !rendered.checked_subquery_comparisons.is_empty() {
+        let rendered = match typed_select {
+            Some(select) => RenderedCopy {
+                sqlite_sql: select.sqlite_sql.clone(),
+                source_tables: select.source_tables.clone(),
+                source_table: select.source_table.clone(),
+                checked_comparisons: select.checked_comparisons.clone(),
+                compares_through_a_subquery: !select.checked_subquery_comparisons.is_empty(),
+                row_count_parameters: select.row_count_parameters.clone(),
+            },
+            None => {
+                let rendered = translate_select_query(
+                    source,
+                    sql,
+                    mode,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )?;
+                // A SELECT that needs a second rendering pass to learn its
+                // column types is rendered by the frontend, which knows them,
+                // and handed back here.
+                if rendered.orders_a_bare_column || rendered.compares_a_placeholder {
+                    return unsupported(crate::INSERT_SELECT_NEEDING_COLUMN_TYPES);
+                }
+                RenderedCopy {
+                    sqlite_sql: rendered.sqlite_sql,
+                    source_tables: rendered.source_tables,
+                    source_table: rendered.source_table,
+                    checked_comparisons: rendered.checked_comparisons,
+                    compares_through_a_subquery: !rendered.checked_subquery_comparisons.is_empty(),
+                    row_count_parameters: rendered.row_count_parameters,
+                }
+            }
+        };
+        if rendered.compares_through_a_subquery {
             return unsupported("INSERT SELECT with a subquery comparison");
         }
         return Ok(RenderedInsert {
@@ -2467,6 +2493,7 @@ pub(crate) fn translate_insert(
             read_tables: rendered.source_tables,
             compared_table: rendered.source_table.map(|table| table.as_str().to_owned()),
             checked_comparisons: rendered.checked_comparisons,
+            row_count_parameters: rendered.row_count_parameters,
         });
     }
     if source.with.is_some()
@@ -2500,6 +2527,7 @@ pub(crate) fn translate_insert(
                 read_tables: Vec::new(),
                 compared_table: None,
                 checked_comparisons: Vec::new(),
+                row_count_parameters: Vec::new(),
             });
         }
         return unsupported("INSERT without an explicit column list");
@@ -2550,6 +2578,7 @@ pub(crate) fn translate_insert(
             read_tables: Vec::new(),
             compared_table: None,
             checked_comparisons: Vec::new(),
+            row_count_parameters: Vec::new(),
         });
     }
     Ok(RenderedInsert {
@@ -2562,7 +2591,18 @@ pub(crate) fn translate_insert(
         read_tables: Vec::new(),
         compared_table: None,
         checked_comparisons: Vec::new(),
+        row_count_parameters: Vec::new(),
     })
+}
+
+/// What the `SELECT` of an `INSERT ... SELECT` renders to.
+struct RenderedCopy {
+    sqlite_sql: String,
+    source_tables: Vec<MySqlSelectSource>,
+    source_table: Option<MySqlTableName>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
+    compares_through_a_subquery: bool,
+    row_count_parameters: Vec<usize>,
 }
 
 /// Which columns are given `DEFAULT` in every row of an `INSERT`.
@@ -2983,6 +3023,7 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedIns
         read_tables: Vec::new(),
         compared_table: None,
         checked_comparisons: Vec::new(),
+        row_count_parameters: Vec::new(),
     })
 }
 

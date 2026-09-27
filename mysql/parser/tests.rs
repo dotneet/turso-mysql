@@ -6360,6 +6360,59 @@ fn translates_insert_select_and_names_what_it_reads() {
 }
 
 #[test]
+fn an_insert_select_takes_the_select_the_frontend_rendered_knowing_its_types() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO dst (n, m) SELECT n, m FROM src WHERE name = ? ORDER BY n LIMIT ?";
+    assert!(matches!(
+        parse_dml(sql, mode),
+        Err(ParseError::Unsupported { feature }) if feature == INSERT_SELECT_NEEDING_COLUMN_TYPES
+    ));
+    let select_sql = insert_select_source_sql(sql, mode).unwrap().unwrap();
+    assert_eq!(
+        select_sql,
+        "SELECT n, m FROM src WHERE name = ? ORDER BY n LIMIT ?"
+    );
+    let select = parse_select_with_column_types(
+        &select_sql,
+        mode,
+        &["name".to_owned()],
+        &["n".to_owned(), "m".to_owned(), "name".to_owned()],
+        &[],
+    )
+    .unwrap();
+    let translated = parse_insert_select_knowing_its_select(sql, mode, &select).unwrap();
+    assert!(translated.copies_a_select_rendered_knowing_its_types());
+    assert_eq!(
+        translated.as_sql(),
+        format!("INSERT INTO \"dst\" (\"n\", \"m\") {}", select.as_sql())
+    );
+    assert_eq!(translated.row_count_parameters(), [1]);
+    assert_eq!(translated.source_table(), Some("src"));
+    assert_eq!(
+        translated.checked_comparisons(),
+        select.checked_comparisons()
+    );
+    assert!(translated.parse_ast().is_ok());
+
+    // The column list is the first parenthesis the statement opens, and the
+    // SELECT is everything after it, parentheses and all.
+    assert_eq!(
+        insert_select_source_sql("INSERT INTO dst (n) (SELECT n FROM src)", mode)
+            .unwrap()
+            .as_deref(),
+        Some("(SELECT n FROM src)")
+    );
+    assert_eq!(
+        insert_select_source_sql("INSERT INTO dst (n) VALUES (1)", mode).unwrap(),
+        None
+    );
+    assert_eq!(
+        insert_select_source_sql("INSERT INTO dst SELECT n FROM src", mode).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn translates_insert_ignore_as_the_engines_or_ignore() {
     for (sql, normalized) in [
         (

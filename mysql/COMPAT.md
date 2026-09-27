@@ -2389,9 +2389,17 @@ MySQL answers 1136 there. `IGNORE` and an upsert clause are refused with the
 form, as they are wherever they are written.
 
 The `WHERE` inside is checked against the table the SELECT reads rather than the
-one the INSERT writes, which is the table it actually compares against. A SELECT that would need a second rendering pass to learn its
-column types — one ordering a bare column, or comparing a `?` — is refused,
-because there is no way to ask for that pass from a DML statement.
+one the INSERT writes, which is the table it actually compares against. A SELECT that has to
+know its columns' types to be rendered — one ordering a bare column, or comparing a `?` — is
+rendered the way a bare `SELECT` is, read a second time knowing them, and the copy takes what
+that reading renders. Measured on 8.4.11, Laravel's `insertUsing` arrives prepared as
+`insert into t (a, b) select a, b from u where c = ?`, and its `SELECT` finds the rows a bare
+`SELECT` binding the same value finds: a word matching without regard to case, a bound day
+meeting a `TIMESTAMP`. A bound value there is held to the column it meets as a bare prepared
+`SELECT` holds it, a `LIMIT ?` included, which takes a whole number only. One ordering a text
+column copies the rows in the order MySQL answers them, without regard to case. A prepared
+statement read that way is read again only while the tables it names stand as they did; once
+one changes it answers an error and is prepared again.
 
 `INSERT IGNORE` is taken, over both forms, and skips a row whose key collides
 instead of failing the statement — the engine's own `OR IGNORE`. Measured on
@@ -2535,8 +2543,11 @@ holds, so the counter's landing place depends on the rows in an order this does 
 required column the copy leaves out answers 1364 once there is a row to write, and before a
 number is spent; with no row, measured, there is no complaint. `IGNORE`, `REPLACE` and
 `ON DUPLICATE KEY UPDATE` beside a `SELECT` are refused on such a table, as is a copy in a
-session whose time zone is not UTC, a prepared one, and one whose batch of numbers would pass
-the column's highest — MySQL cuts that batch short and writes the rows that fit.
+session whose time zone is not UTC and one whose batch of numbers would pass the column's
+highest — MySQL cuts that batch short and writes the rows that fit. A prepared copy — how
+Laravel's `insertUsing` arrives, its bindings in the `SELECT`'s `WHERE` — is taken: nothing is
+reserved when it is prepared, and when it runs its `SELECT` binds the values it was given and
+is read before a number is taken, exactly as the text statement is.
 
 A table that counts its own ids may carry a trigger, and a trigger may write into one — a
 restored `mysqldump` of a blog carries exactly that, each new post writing a row into an audit

@@ -309,6 +309,63 @@ pub fn parse_optional_insert_select(
     Ok(Some(MySqlInsertSelect { table, columns }))
 }
 
+/// Answers the `SELECT` of an `INSERT INTO t (a, b) <SELECT>` as it was
+/// written, for the frontend to render knowing its columns' types.
+///
+/// The `SELECT` is the rest of the statement after the parenthesis closing the
+/// column list, which is the first one the statement opens. Every `?` of the
+/// statement stands in it, the column list holding none, so each keeps its
+/// number. Answers `None` for any other statement.
+pub fn insert_select_source_sql(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<String>, ParseError> {
+    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+        return Ok(None);
+    };
+    if insert.columns.is_empty() || !insert.assignments.is_empty() {
+        return Ok(None);
+    }
+    if insert
+        .source
+        .as_deref()
+        .is_none_or(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
+    {
+        return Ok(None);
+    }
+    if insert.partitioned.is_some() || insert.on.is_some() {
+        return unsupported("INSERT SELECT option");
+    }
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let mut depth = 0_usize;
+    let mut column_list_closed = false;
+    for token in &tokens {
+        if column_list_closed {
+            if matches!(token.token, Token::Whitespace(_)) {
+                continue;
+            }
+            let start = byte_offset_of(sql, token.span.start).ok_or(ParseError::Unsupported {
+                feature: "INSERT SELECT source position",
+            })?;
+            return Ok(Some(sql[start..].to_owned()));
+        }
+        match token.token {
+            Token::LParen => depth += 1,
+            Token::RParen => {
+                depth = depth.checked_sub(1).ok_or(ParseError::Unsupported {
+                    feature: "INSERT SELECT column list",
+                })?;
+                column_list_closed = depth == 0;
+            }
+            _ => {}
+        }
+    }
+    unsupported("INSERT SELECT source position")
+}
+
 /// One `INSERT INTO t VALUES (...)` written with no column list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlInsertValuesWithoutColumns {

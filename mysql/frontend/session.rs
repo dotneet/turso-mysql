@@ -1013,8 +1013,68 @@ enum PreparedExecutionPlan {
         /// The tables the statement reads, which a trigger it sets off may
         /// not write.
         read_tables: Vec<String>,
+        /// What an `INSERT`'s `SELECT` compares its bound values with.
+        copied_select: Option<CopiedSelect>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
+    CountedInsertSelect(Box<PreparedCountedInsertSelect>),
+}
+
+impl PreparedExecutionPlan {
+    /// The tables, comparisons and row counts a `SELECT` holds its bound
+    /// values to — a bare one, or the one an `INSERT ... SELECT` copies from.
+    fn select_comparisons(&self) -> Option<SelectComparisons<'_>> {
+        match self {
+            Self::Select {
+                source_tables,
+                checked_comparisons,
+                row_count_parameters,
+                ..
+            } => Some(SelectComparisons {
+                source_tables,
+                checked_comparisons,
+                row_count_parameters,
+            }),
+            Self::OrdinaryWrite {
+                copied_select: Some(copied),
+                ..
+            } => Some(copied.comparisons()),
+            Self::CountedInsertSelect(copy) => Some(copy.copied_select.comparisons()),
+            Self::OrdinaryWrite { .. } | Self::AutoIncrementInsert(_) => None,
+        }
+    }
+}
+
+struct SelectComparisons<'a> {
+    source_tables: &'a [MySqlSelectSource],
+    checked_comparisons: &'a [CheckedSelectComparison],
+    row_count_parameters: &'a [usize],
+}
+
+/// What the `SELECT` of a prepared `INSERT ... SELECT` holds its bound values
+/// to, which is what a bare prepared `SELECT` holds them to.
+struct CopiedSelect {
+    source_tables: Vec<MySqlSelectSource>,
+    checked_comparisons: Vec<CheckedSelectComparison>,
+    row_count_parameters: Vec<usize>,
+}
+
+impl CopiedSelect {
+    fn of(translated: &TranslatedDml) -> Self {
+        Self {
+            source_tables: translated.read_tables().to_vec(),
+            checked_comparisons: translated.checked_comparisons().to_vec(),
+            row_count_parameters: translated.row_count_parameters().to_vec(),
+        }
+    }
+
+    fn comparisons(&self) -> SelectComparisons<'_> {
+        SelectComparisons {
+            source_tables: &self.source_tables,
+            checked_comparisons: &self.checked_comparisons,
+            row_count_parameters: &self.row_count_parameters,
+        }
+    }
 }
 
 /// Returns the tables a comparison's column may belong to, nearest first.
@@ -1168,6 +1228,16 @@ struct PreparedAutoIncrementInsert {
     sql: String,
     insert: CheckedAutoIncrementInsert,
     table: AutoIncrementTable,
+    parameter_count: usize,
+}
+
+/// A prepared `INSERT ... SELECT` into a table that counts its own ids,
+/// Laravel's `insertUsing` with its bindings.
+struct PreparedCountedInsertSelect {
+    sql: String,
+    copy: turso_mysql_parser::MySqlInsertSelect,
+    table: AutoIncrementTable,
+    copied_select: CopiedSelect,
     parameter_count: usize,
 }
 
@@ -1708,7 +1778,14 @@ impl MySqlConnection {
                 feature: "session-local clock functions in a non-UTC time zone",
             });
         }
-        let translated = parse_dml(sql, mode)?;
+        let translated = match parse_dml(sql, mode) {
+            Err(MySqlParseError::Unsupported { feature })
+                if feature == turso_mysql_parser::INSERT_SELECT_NEEDING_COLUMN_TYPES =>
+            {
+                self.parse_insert_select_knowing_its_select(sql, mode)?
+            }
+            translated => translated?,
+        };
         let insert_target = translated
             .parse_ast()
             .ok()
@@ -1796,9 +1873,12 @@ impl MySqlConnection {
             .filter(|column| is_integer_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        if rewritten.is_empty()
-            && decimal_columns.is_empty()
-            && !translated.compares_a_written_number()
+        // The `SELECT` a copy reads was rendered knowing its own columns'
+        // types; the table it writes changes nothing in how it renders.
+        if translated.copies_a_select_rendered_knowing_its_types()
+            || (rewritten.is_empty()
+                && decimal_columns.is_empty()
+                && !translated.compares_a_written_number())
         {
             return Ok((
                 translated,
@@ -1822,6 +1902,38 @@ impl MySqlConnection {
             integer_columns,
             table_definition,
         ))
+    }
+
+    /// Renders an `INSERT ... SELECT` whose `SELECT` has to know its columns'
+    /// types, the way a bare `SELECT` is rendered: read once, and again
+    /// knowing the types of the columns it orders by and compares with a `?`.
+    ///
+    /// Measured on MySQL 8.4.11, the `SELECT` of `INSERT INTO t (a) SELECT a
+    /// FROM u WHERE name = ?` finds the rows a bare `SELECT` binding the same
+    /// value finds, a word matching without regard to case, and one ordering
+    /// by a text column copies the rows in the order the bare one answers.
+    fn parse_insert_select_knowing_its_select(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+    ) -> std::result::Result<TranslatedDml, MySqlParseError> {
+        const REFUSED: MySqlParseError = MySqlParseError::Unsupported {
+            feature: "INSERT SELECT whose SELECT is refused on its own",
+        };
+        let select_sql = turso_mysql_parser::insert_select_source_sql(sql, mode)?.ok_or(
+            MySqlParseError::Unsupported {
+                feature: turso_mysql_parser::INSERT_SELECT_NEEDING_COLUMN_TYPES,
+            },
+        )?;
+        let (select, _) = self
+            .parse_select_knowing_column_types(&select_sql)
+            .map_err(|_| REFUSED)?;
+        Self::reject_internal_catalog_select(&select).map_err(|_| REFUSED)?;
+        self.reject_binary_scalar_collation(&select)
+            .map_err(|_| REFUSED)?;
+        self.refuse_select_json_readings_of_other_columns(&select)
+            .map_err(|_| REFUSED)?;
+        turso_mysql_parser::parse_insert_select_knowing_its_select(sql, mode, &select)
     }
 
     fn insert_select_copies_decimal_columns(
@@ -2007,6 +2119,7 @@ impl MySqlConnection {
             read_table_definitions,
             untracked_read_source,
             shifted_timestamp_insert: None,
+            typed_copy: None,
         }
     }
 
@@ -2058,6 +2171,13 @@ impl MySqlConnection {
             checked_insert_target(&statement).map_err(MySqlPreparedStatementError::Engine)?;
         if matches!(statement, Stmt::Insert { .. }) {
             if let Some(table) = self.prepared_auto_increment_insert_table(sql, mode)? {
+                if let Some(copy) = turso_mysql_parser::parse_optional_insert_select(sql, mode)
+                    .map_err(|error| {
+                        MySqlPreparedStatementError::Prepare(mysql_query_parse_error(error))
+                    })?
+                {
+                    return self.prepare_counted_insert_select(sql, copy, table, &translated);
+                }
                 let target = insert_target
                     .as_ref()
                     .expect("a checked INSERT has a target");
@@ -2099,6 +2219,9 @@ impl MySqlConnection {
         if shifted_timestamp_insert {
             frozen.shifted_timestamp_insert = Some(statement.clone());
         }
+        if translated.copies_a_select_rendered_knowing_its_types() {
+            frozen.typed_copy = Some(statement.clone());
+        }
         let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         let statement = self
             .inner
@@ -2114,10 +2237,62 @@ impl MySqlConnection {
             Some(statement),
             PreparedExecutionPlan::OrdinaryWrite {
                 is_update,
+                copied_select: (insert_target.is_some() && !translated.read_tables().is_empty())
+                    .then(|| CopiedSelect::of(&translated)),
                 insert_target,
                 written_table,
                 read_tables: read_table_names(&translated),
             },
+        ))
+    }
+
+    /// Prepares an `INSERT ... SELECT` into a table that counts its own ids.
+    ///
+    /// Nothing is reserved here: the rows are read and numbered when it runs,
+    /// the `SELECT` binding the values the statement is run with, exactly as
+    /// the text statement copies them.
+    fn prepare_counted_insert_select(
+        &self,
+        sql: &str,
+        copy: turso_mysql_parser::MySqlInsertSelect,
+        table: AutoIncrementTable,
+        translated: &TranslatedDml,
+    ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
+    {
+        let Stmt::Insert {
+            body: InsertBody::Select(source, None),
+            ..
+        } = translated.parse_ast().map_err(|error| {
+            MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
+        })?
+        else {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Unsupported(
+                    "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
+                ),
+            ));
+        };
+        let reading = Stmt::Select(source);
+        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(
+            FrozenInjectedAutoIncrementInsertParser {
+                statement: reading.clone(),
+            },
+        ));
+        let reading = self
+            .inner
+            .prepare_translated_stmt_with_options(reading, sql, &options)
+            .map_err(|error| {
+                MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(error))
+            })?;
+        Ok((
+            None,
+            PreparedExecutionPlan::CountedInsertSelect(Box::new(PreparedCountedInsertSelect {
+                sql: sql.to_owned(),
+                copy,
+                table,
+                copied_select: CopiedSelect::of(translated),
+                parameter_count: reading.parameters_count(),
+            })),
         ))
     }
 
@@ -2545,6 +2720,20 @@ impl MySqlConnection {
                 .reset()
                 .map_err(MySqlPreparedStatementError::Engine)?;
         }
+        if let PreparedExecutionPlan::CountedInsertSelect(copy) = &prepared.execution_plan {
+            let values = self
+                .core_values_for(&prepared.execution_plan, values)
+                .map_err(MySqlPreparedStatementError::Engine)?;
+            return self
+                .execute_prepared_counted_insert_select(copy, &values, timeout, affected_rows_mode)
+                .map(MySqlPreparedExecutionResult::Write)
+                .map_err(|error| match error {
+                    MySqlQueryError::MissingRequiredDefault(column) => {
+                        MySqlPreparedStatementError::MissingRequiredDefault(column)
+                    }
+                    error => MySqlPreparedStatementError::Prepare(error),
+                });
+        }
         let timeout = if let PreparedExecutionPlan::OrdinaryWrite {
             insert_target: Some(target),
             ..
@@ -2601,8 +2790,6 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
         callback: &mut impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> Result<MySqlPreparedExecutionResult> {
-        let mut bound_temporal = Vec::new();
-        let mut whole_number_parameters = Vec::new();
         if let PreparedExecutionPlan::Select {
             checked_comparisons,
             ..
@@ -2617,12 +2804,123 @@ impl MySqlConnection {
             prepared.bound_a_number_to_a_json_reading |= binds_a_number;
             held?;
         }
-        if let PreparedExecutionPlan::Select {
+        let values = self.core_values_for(&prepared.execution_plan, values)?;
+
+        match &prepared.execution_plan {
+            PreparedExecutionPlan::Select { reads_table, .. } => {
+                if *reads_table {
+                    self.begin_implicit_transaction_for_table_read()?;
+                }
+                let statement = prepared.statement.as_mut().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "prepared SELECT has no reusable core statement".to_string(),
+                    )
+                })?;
+                bind_prepared_values(statement, &values)?;
+                if let Some(timeout) = timeout {
+                    statement.set_query_timeout_override(Some(Some(timeout)));
+                }
+                let mut rows = Vec::new();
+                statement.run_with_row_callback(|row| {
+                    let row = row
+                        .get_values()
+                        .map(|value| mysql_prepared_value_from_core(value.clone()))
+                        .collect::<Vec<_>>();
+                    callback(&row)?;
+                    rows.push(row);
+                    Ok(())
+                })?;
+                Ok(MySqlPreparedExecutionResult::Rows(rows))
+            }
+            PreparedExecutionPlan::OrdinaryWrite {
+                is_update,
+                written_table,
+                insert_target,
+                read_tables,
+                ..
+            } => {
+                if let Some(target) = insert_target {
+                    self.check_the_triggers_an_insert_sets_off(
+                        target.table().as_str(),
+                        read_tables,
+                    )?;
+                }
+                let deadline = self.write_deadline(timeout);
+                self.check_write_deadline(deadline)?;
+                self.begin_implicit_transaction_for_write()?;
+                let statement = prepared.statement.as_mut().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "prepared write has no reusable core statement".to_string(),
+                    )
+                })?;
+                bind_prepared_values(statement, &values)?;
+                let timeout = self.remaining_write_timeout(deadline)?;
+                run_checked_write_statement(statement, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, written_table.as_deref())
+                })?;
+                Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
+                    affected_rows: self.affected_rows(*is_update, affected_rows_mode)?,
+                    last_insert_id: 0,
+                }))
+            }
+            PreparedExecutionPlan::AutoIncrementInsert(insert) => self
+                .execute_prepared_auto_increment_insert(
+                    insert,
+                    &values,
+                    timeout,
+                    affected_rows_mode,
+                ),
+            PreparedExecutionPlan::CountedInsertSelect(_) => Err(LimboError::InternalError(
+                "a prepared counted copy runs before the statement is bound".to_string(),
+            )),
+        }
+    }
+
+    fn execute_prepared_counted_insert_select(
+        &self,
+        copy: &PreparedCountedInsertSelect,
+        values: &[Value],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        let deadline = self.write_deadline(timeout);
+        self.check_write_deadline(deadline)?;
+        self.begin_implicit_transaction_for_write()?;
+        let table = self
+            .load_auto_increment_table(copy.table.name.as_str())
+            .map_err(MySqlQueryError::Engine)?
+            .ok_or(MySqlQueryError::Engine(LimboError::SchemaUpdated))?;
+        if table.key != copy.table.key || table.stored_sql != copy.table.stored_sql {
+            return Err(MySqlQueryError::Engine(LimboError::SchemaUpdated));
+        }
+        self.execute_counted_insert_select(
+            &copy.sql,
+            &copy.copy,
+            table,
+            values,
+            deadline,
+            affected_rows_mode,
+        )
+    }
+
+    /// Checks the values a prepared statement is run with and puts each into
+    /// the form the engine binds.
+    ///
+    /// A value a `SELECT` compares with a column is held to that column as a
+    /// bare prepared `SELECT` holds it, the `SELECT` of an `INSERT ... SELECT`
+    /// included.
+    fn core_values_for(
+        &self,
+        plan: &PreparedExecutionPlan,
+        values: &[MySqlPreparedValue],
+    ) -> Result<Vec<Value>> {
+        let mut bound_temporal = Vec::new();
+        let mut whole_number_parameters = Vec::new();
+        if let Some(SelectComparisons {
             source_tables,
             checked_comparisons,
             row_count_parameters,
-            ..
-        } = &prepared.execution_plan
+        }) = plan.select_comparisons()
         {
             bound_temporal =
                 self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
@@ -2640,11 +2938,10 @@ impl MySqlConnection {
             Self::validate_row_count_values(row_count_parameters, values)?;
             Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
         }
-        if let PreparedExecutionPlan::OrdinaryWrite { insert_target, .. } = &prepared.execution_plan
-        {
+        if let PreparedExecutionPlan::OrdinaryWrite { insert_target, .. } = plan {
             self.refuse_untyped_wide_integer_write_parameters(insert_target.as_ref(), values)?;
         }
-        let timestamp_parameters = match &prepared.execution_plan {
+        let timestamp_parameters = match plan {
             PreparedExecutionPlan::OrdinaryWrite {
                 insert_target: Some(target),
                 ..
@@ -2653,7 +2950,7 @@ impl MySqlConnection {
         };
         // A value meeting a column that holds a day or a moment is put into
         // that column's own form first, which is what MySQL reads it as.
-        let values = values
+        values
             .iter()
             .enumerate()
             .map(|(ordinal, value)| {
@@ -2705,72 +3002,7 @@ impl MySqlConnection {
                     None => mysql_prepared_value_to_core(value),
                 }
             })
-            .collect::<Result<Vec<_>>>()?;
-
-        match &prepared.execution_plan {
-            PreparedExecutionPlan::Select { reads_table, .. } => {
-                if *reads_table {
-                    self.begin_implicit_transaction_for_table_read()?;
-                }
-                let statement = prepared.statement.as_mut().ok_or_else(|| {
-                    LimboError::InternalError(
-                        "prepared SELECT has no reusable core statement".to_string(),
-                    )
-                })?;
-                bind_prepared_values(statement, &values)?;
-                if let Some(timeout) = timeout {
-                    statement.set_query_timeout_override(Some(Some(timeout)));
-                }
-                let mut rows = Vec::new();
-                statement.run_with_row_callback(|row| {
-                    let row = row
-                        .get_values()
-                        .map(|value| mysql_prepared_value_from_core(value.clone()))
-                        .collect::<Vec<_>>();
-                    callback(&row)?;
-                    rows.push(row);
-                    Ok(())
-                })?;
-                Ok(MySqlPreparedExecutionResult::Rows(rows))
-            }
-            PreparedExecutionPlan::OrdinaryWrite {
-                is_update,
-                written_table,
-                insert_target,
-                read_tables,
-            } => {
-                if let Some(target) = insert_target {
-                    self.check_the_triggers_an_insert_sets_off(
-                        target.table().as_str(),
-                        read_tables,
-                    )?;
-                }
-                let deadline = self.write_deadline(timeout);
-                self.check_write_deadline(deadline)?;
-                self.begin_implicit_transaction_for_write()?;
-                let statement = prepared.statement.as_mut().ok_or_else(|| {
-                    LimboError::InternalError(
-                        "prepared write has no reusable core statement".to_string(),
-                    )
-                })?;
-                bind_prepared_values(statement, &values)?;
-                let timeout = self.remaining_write_timeout(deadline)?;
-                run_checked_write_statement(statement, timeout).map_err(|error| {
-                    self.map_unsigned_decimal_write_error(error, written_table.as_deref())
-                })?;
-                Ok(MySqlPreparedExecutionResult::Write(MySqlWriteResult {
-                    affected_rows: self.affected_rows(*is_update, affected_rows_mode)?,
-                    last_insert_id: 0,
-                }))
-            }
-            PreparedExecutionPlan::AutoIncrementInsert(insert) => self
-                .execute_prepared_auto_increment_insert(
-                    insert,
-                    &values,
-                    timeout,
-                    affected_rows_mode,
-                ),
-        }
+            .collect::<Result<Vec<_>>>()
     }
 
     fn execute_prepared_auto_increment_insert(
@@ -2894,13 +3126,11 @@ impl MySqlConnection {
             .statements
             .get_mut(&statement_id)
             .ok_or(MySqlPreparedStatementError::UnknownStatement { statement_id })?;
-        if matches!(
-            &prepared.execution_plan,
-            PreparedExecutionPlan::Select {
-                checked_comparisons,
-                ..
-            } if !checked_comparisons.is_empty()
-        ) {
+        if prepared
+            .execution_plan
+            .select_comparisons()
+            .is_some_and(|comparisons| !comparisons.checked_comparisons.is_empty())
+        {
             return Err(MySqlPreparedStatementError::Prepare(
                 MySqlQueryError::Unsupported(
                     "SELECT comparison statements require the checked prepared-statement API"
@@ -7362,6 +7592,7 @@ impl MySqlConnection {
                                 sql,
                                 &copy,
                                 table,
+                                &[],
                                 deadline,
                                 affected_rows_mode,
                             );
@@ -7459,6 +7690,9 @@ impl MySqlConnection {
         if shifted_timestamp_insert {
             frozen.shifted_timestamp_insert = Some(statement.clone());
         }
+        if translated.copies_a_select_rendered_knowing_its_types() {
+            frozen.typed_copy = Some(statement.clone());
+        }
         let mut options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
         if let Some(table) = counted {
             options =
@@ -7519,6 +7753,7 @@ impl MySqlConnection {
         sql: &str,
         copy: &turso_mysql_parser::MySqlInsertSelect,
         table: AutoIncrementTable,
+        values: &[Value],
         deadline: Option<turso_core::MonotonicInstant>,
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
@@ -7556,7 +7791,7 @@ impl MySqlConnection {
                 "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
             ));
         }
-        let rows = self.read_rows_to_copy(sql, source, copy.columns().len(), deadline)?;
+        let rows = self.read_rows_to_copy(sql, source, copy.columns().len(), values, deadline)?;
         if rows.is_empty() {
             return Ok(MySqlWriteResult {
                 affected_rows: 0,
@@ -7691,6 +7926,7 @@ impl MySqlConnection {
         sql: &str,
         source: turso_parser::ast::Select,
         width: usize,
+        values: &[Value],
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<Vec<Vec<Value>>, MySqlQueryError> {
         let statement = Stmt::Select(source);
@@ -7708,6 +7944,12 @@ impl MySqlConnection {
                 "INSERT SELECT answering a different number of columns than it names".to_string(),
             ));
         }
+        if reading.parameters_count() != values.len() {
+            return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                "a counted copy's SELECT binds a different number of values".to_string(),
+            )));
+        }
+        bind_prepared_values(&mut reading, values).map_err(MySqlQueryError::Engine)?;
         if let Some(timeout) = self.remaining_write_timeout(deadline)? {
             reading.set_query_timeout_override(Some(Some(timeout)));
         }
@@ -9380,14 +9622,18 @@ fn prepared_auto_increment_statement_metadata(
     statement_id: u32,
     execution_plan: &PreparedExecutionPlan,
 ) -> std::result::Result<MySqlPreparedStatementMetadata, MySqlPreparedStatementError> {
-    let PreparedExecutionPlan::AutoIncrementInsert(insert) = execution_plan else {
-        return Err(MySqlPreparedStatementError::Prepare(
-            MySqlQueryError::Engine(LimboError::InternalError(
-                "prepared statement metadata source is missing a core statement".to_string(),
-            )),
-        ));
+    let parameter_count = match execution_plan {
+        PreparedExecutionPlan::AutoIncrementInsert(insert) => insert.parameter_count,
+        PreparedExecutionPlan::CountedInsertSelect(copy) => copy.parameter_count,
+        _ => {
+            return Err(MySqlPreparedStatementError::Prepare(
+                MySqlQueryError::Engine(LimboError::InternalError(
+                    "prepared statement metadata source is missing a core statement".to_string(),
+                )),
+            ));
+        }
     };
-    let parameter_count = u16::try_from(insert.parameter_count).map_err(|_| {
+    let parameter_count = u16::try_from(parameter_count).map_err(|_| {
         MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
             "prepared statement has more parameters than MySQL can represent".to_string(),
         ))
@@ -10779,6 +11025,10 @@ struct FrozenDmlParser {
     read_table_definitions: Vec<(String, String)>,
     untracked_read_source: bool,
     shifted_timestamp_insert: Option<Stmt>,
+    /// An `INSERT ... SELECT` whose `SELECT` was rendered knowing its
+    /// columns' types, which only a connection can read. It stands for as
+    /// long as the tables it names are the tables it was rendered from.
+    typed_copy: Option<Stmt>,
 }
 
 /// Holds an `UPDATE` or `DELETE` `WHERE` to the same rule a `SELECT` `WHERE`
@@ -11527,6 +11777,9 @@ impl ReprepareParser for FrozenDmlParser {
                         .to_string(),
                 ));
             }
+        }
+        if let Some(statement) = &self.typed_copy {
+            return Ok((Some(Cmd::Stmt(statement.clone())), sql.len()));
         }
         let translated = turso_mysql_parser::parse_dml_knowing_numeric_columns(
             sql,
