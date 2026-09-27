@@ -8231,3 +8231,44 @@ fn the_last_select_read_is_answered_without_reading_it_again() {
     assert!(parse_select("SELECT id FROM the_last_select_read WHERE", ansi).is_err());
     assert_eq!(reads(), before + 3);
 }
+
+/// `LOCK IN SHARE MODE` is read as `FOR SHARE`, the lock Laravel's
+/// `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` ask for. Measured on
+/// MySQL 8.4.11: it follows `LIMIT`, may be written in any case and with a
+/// comment between its words, and takes none of `NOWAIT`, `SKIP LOCKED` or
+/// `OF`, each of which is 1064 there.
+#[test]
+fn lock_in_share_mode_is_read_as_for_share() {
+    let mode = SessionSqlMode::default();
+    let for_share = parse_select("SELECT v FROM a WHERE id = 1 FOR SHARE", mode).unwrap();
+    for sql in [
+        "SELECT v FROM a WHERE id = 1 LOCK IN SHARE MODE",
+        "SELECT v FROM a WHERE id = 1 lock  in share\nmode",
+        "SELECT v FROM a WHERE id = 1 LOCK /* x */ IN SHARE MODE",
+    ] {
+        let read = parse_select(sql, mode).unwrap();
+        assert!(read.locks_rows(), "{sql}");
+        assert_eq!(read.as_sql(), for_share.as_sql(), "{sql}");
+    }
+    assert!(parse_select(
+        "SELECT v FROM a ORDER BY id LIMIT 1 LOCK IN SHARE MODE",
+        mode
+    )
+    .unwrap()
+    .locks_rows());
+    for sql in [
+        "SELECT v FROM a LOCK IN SHARE MODE NOWAIT",
+        "SELECT v FROM a LOCK IN SHARE MODE SKIP LOCKED",
+        "SELECT v FROM a LOCK IN SHARE MODE OF a",
+        "SELECT v FROM a LOCK IN SHARE MODE LIMIT 1",
+        "SELECT v FROM a LOCK IN SHARE",
+    ] {
+        assert!(
+            matches!(parse_select(sql, mode), Err(ParseError::Sqlparser(_))),
+            "{sql}: {:?}",
+            parse_select(sql, mode)
+        );
+    }
+    let quoted = parse_select("SELECT 'LOCK IN SHARE MODE' FROM a", mode).unwrap();
+    assert!(!quoted.locks_rows());
+}

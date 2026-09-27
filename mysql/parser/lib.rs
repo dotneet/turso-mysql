@@ -186,7 +186,7 @@ use sqlparser::{
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
     parser::{Parser, ParserError},
-    tokenizer::{Token, Tokenizer, Whitespace},
+    tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace},
 };
 use turso_parser::{
     ast::{
@@ -4793,7 +4793,12 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
 
 fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let statements = Parser::parse_sql(&dialect, sql)
+    let tokens = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
+    let statements = Parser::new(&dialect)
+        .with_tokens_with_locations(spell_lock_in_share_mode_as_for_share(tokens))
+        .parse_statements()
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let [statement] = statements.as_slice() else {
         return Err(ParseError::ExpectedOneStatement {
@@ -4801,6 +4806,46 @@ fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, Par
         });
     };
     Ok(statement.clone())
+}
+
+/// `LOCK IN SHARE MODE` is MySQL's older spelling of `FOR SHARE`, and
+/// sqlparser reads only the newer one.
+///
+/// Measured on MySQL 8.4.11, the two are read alike wherever a locking clause
+/// may stand — after `LIMIT`, in a subquery, after a `UNION` — except that the
+/// older spelling takes none of `NOWAIT`, `SKIP LOCKED` or `OF`. Those are
+/// left spelled as written, so they stay the syntax error MySQL answers. Each
+/// replacement keeps the place it was written at, so what is read out of the
+/// statement's text by place still reads the same text.
+fn spell_lock_in_share_mode_as_for_share(mut tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let words = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !matches!(token.token, Token::Whitespace(_)))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    let mut older_spellings = Vec::new();
+    for (position, window) in words.windows(4).enumerate() {
+        let [lock, in_, share, mode] = [window[0], window[1], window[2], window[3]];
+        let spelled_the_older_way = is_unquoted_word(&tokens[lock].token, "LOCK")
+            && is_unquoted_word(&tokens[in_].token, "IN")
+            && is_unquoted_word(&tokens[share].token, "SHARE")
+            && is_unquoted_word(&tokens[mode].token, "MODE");
+        let followed_by_an_option = words.get(position + 4).is_some_and(|&next| {
+            ["NOWAIT", "SKIP", "OF"]
+                .iter()
+                .any(|option| is_unquoted_word(&tokens[next].token, option))
+        });
+        if spelled_the_older_way && !followed_by_an_option {
+            older_spellings.push((lock, in_, mode));
+        }
+    }
+    for (lock, in_, mode) in older_spellings {
+        tokens[lock].token = Token::make_keyword("FOR");
+        tokens[in_].token = Token::Whitespace(Whitespace::Space);
+        tokens[mode].token = Token::Whitespace(Whitespace::Space);
+    }
+    tokens
 }
 
 fn parse_normalized_create_table(sql: &str) -> Result<Stmt, ParseError> {

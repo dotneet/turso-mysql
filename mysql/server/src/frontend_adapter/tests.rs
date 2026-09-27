@@ -23465,10 +23465,27 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
     );
     one.execute_query("ROLLBACK").unwrap();
 
+    // `LOCK IN SHARE MODE` is MySQL's older spelling of `FOR SHARE`, which
+    // Laravel's `sharedLock()` writes, and it takes the same lock.
+    one.execute_query("START TRANSACTION").unwrap();
+    let CommandExecutionResult::ResultSet(shared) = one
+        .execute_query("SELECT balance FROM accounts WHERE id = 1 LOCK IN SHARE MODE")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(shared.rows, vec![vec![Some(b"150".to_vec())]]);
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 997 WHERE id = 2"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    one.execute_query("ROLLBACK").unwrap();
+
     // The options that say what to do when the lock is already held ask for
     // something one lock cannot answer, and so does naming which tables to
-    // lock.
+    // lock. The older spelling takes none of them at all: MySQL answers 1064.
     for sql in [
+        "SELECT balance FROM accounts LOCK IN SHARE MODE NOWAIT",
         "SELECT balance FROM accounts FOR UPDATE NOWAIT",
         "SELECT balance FROM accounts FOR UPDATE SKIP LOCKED",
         "SELECT balance FROM accounts FOR UPDATE OF accounts",

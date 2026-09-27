@@ -455,13 +455,11 @@ pub(crate) fn translate_select_query(
     })
 }
 
-/// Unwraps parenthesised query wrappers around a compound branch, refusing any
-/// branch that carries options like `ORDER BY` or `LIMIT` that cannot be
-/// flattened into the set operation.
 /// Reports whether a statement asked to read the rows it is about to change.
 ///
-/// `FOR UPDATE` and `LOCK IN SHARE MODE` are the two spellings MySQL has, and
-/// both are read the same way here: the engine holds one write lock over the
+/// `FOR UPDATE` and `FOR SHARE` are the two locks MySQL has — `LOCK IN SHARE
+/// MODE` reaches here spelled as `FOR SHARE` — and both are read the same way
+/// here: the engine holds one write lock over the
 /// whole database rather than a lock for each row, so there is no weaker lock
 /// to take for the sharing one. The options that change what happens when the
 /// lock is already held — `NOWAIT`, `SKIP LOCKED` — and the one that names
@@ -483,6 +481,9 @@ fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseErr
     ))
 }
 
+/// Unwraps parenthesised query wrappers around a compound branch, refusing any
+/// branch that carries options like `ORDER BY` or `LIMIT` that cannot be
+/// flattened into the set operation.
 fn unwrap_select_body(expr: &SetExpr) -> Result<&sqlparser::ast::Select, ParseError> {
     match expr {
         SetExpr::Select(select) => Ok(select),
