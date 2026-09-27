@@ -3908,11 +3908,17 @@ fn prepare_for_client_statement(
 /// A level set for the next transaction alone is used up once one begins, and
 /// a transaction that could not finish is rolled back the way MySQL rolls one
 /// back before answering 1213.
+/// A statement that finished with the WAL grown past its bound empties it.
 fn finish_client_statement<T>(
     connection: &MySqlConnection,
     session_variables: &mut crate::session_variables::MySqlSessionVariables,
     result: Result<T, FrontendErrorKind>,
 ) -> Result<T, FrontendErrorKind> {
+    if result.is_ok() {
+        connection
+            .keep_the_wal_small()
+            .map_err(frontend_error_kind)?;
+    }
     match &result {
         Ok(_) if connection.began_transaction() => {
             session_variables.use_up_next_transaction_isolation();

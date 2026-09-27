@@ -71,6 +71,26 @@ pub struct MySqlConnection {
     written_zero: Arc<Mutex<WrittenZero>>,
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
+    /// Closes the engine connection once the last clone lets go. Declared
+    /// last so that everything else a clone shares is gone first.
+    _closes_on_last_drop: Arc<CloseOnLastDrop>,
+}
+
+/// Closes an engine connection when dropped.
+///
+/// Only a closed connection runs the engine's closing checkpoint, which
+/// empties the WAL. A connection that is merely dropped leaves the WAL as it
+/// was, however large a write made it, and the next open reads every frame of
+/// it again: measured, 6.7 GB after one UPDATE of a million rows, and over a
+/// second added to the next start.
+struct CloseOnLastDrop(Arc<Connection>);
+
+impl Drop for CloseOnLastDrop {
+    fn drop(&mut self) {
+        // A drop has nowhere to report a failure to. A closing checkpoint that
+        // fails leaves the WAL for the next open, which recovers it.
+        let _ = self.0.close();
+    }
 }
 
 struct StoredIndexStatement {
@@ -1154,6 +1174,7 @@ impl MySqlConnection {
         // durable MySQL table carries one.
         inner.set_foreign_keys_enabled(true);
         Ok(Self {
+            _closes_on_last_drop: Arc::new(CloseOnLastDrop(Arc::clone(&inner))),
             inner,
             schema_context,
             auto_increment: None,
@@ -1210,6 +1231,37 @@ impl MySqlConnection {
             self.clear_prepared_statements();
         }
         result
+    }
+
+    /// Empties the WAL once it holds more than
+    /// [`Self::WAL_FRAMES_BEFORE_TRUNCATING`] frames, between transactions.
+    ///
+    /// The engine's own checkpoint copies the WAL into the database after a
+    /// write but leaves the file at its size, and a pooled connection may stay
+    /// open for as long as the server runs. So a large write would otherwise
+    /// keep its whole size on disk, and a start after a crash would read all
+    /// of it again. Another session reading at the same moment keeps the WAL
+    /// busy; the attempt is left to the next statement then.
+    pub fn keep_the_wal_small(&self) -> Result<()> {
+        self.truncate_the_wal_past(Self::WAL_FRAMES_BEFORE_TRUNCATING)
+    }
+
+    /// 64 MiB of 4 KiB pages.
+    const WAL_FRAMES_BEFORE_TRUNCATING: u64 = 16_384;
+
+    fn truncate_the_wal_past(&self, frames: u64) -> Result<()> {
+        if !self.inner.get_auto_commit() || self.inner.wal_state()?.max_frame <= frames {
+            return Ok(());
+        }
+        match self.inner.checkpoint(turso_core::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        }) {
+            Ok(_)
+            | Err(LimboError::Busy)
+            | Err(LimboError::BusySnapshot)
+            | Err(LimboError::StatementsInProgress(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn last_insert_id(&self) -> u64 {

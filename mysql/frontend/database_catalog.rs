@@ -721,6 +721,43 @@ mod tests {
         Ok(())
     }
 
+    /// Only a closed engine connection runs the closing checkpoint, so a
+    /// session that ends has to close its connection, or the WAL stays as
+    /// large as the last write made it and the next open reads all of it.
+    #[test]
+    fn a_session_that_ends_leaves_an_empty_wal() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("written").unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session
+            .select_database("written")
+            .map_err(|_| turso_core::LimboError::InternalError("select".into()))?;
+        let connection = session
+            .connection()
+            .map_err(|_| turso_core::LimboError::InternalError("connection".into()))?;
+        connection.execute("CREATE TABLE records (id INT, label TEXT)")?;
+        let label = "x".repeat(1000);
+        for id in 0..50 {
+            connection.execute(&format!(
+                "INSERT INTO records (id, label) VALUES ({id}, '{label}')"
+            ))?;
+        }
+        let wal_length = || {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.file_name().to_string_lossy().ends_with("-wal"))
+                .map(|entry| entry.metadata().unwrap().len())
+                .unwrap()
+        };
+        assert!(wal_length() > 0);
+        drop(session);
+        assert_eq!(wal_length(), 0);
+        Ok(())
+    }
+
     #[test]
     fn public_sessions_share_one_catalog_and_see_each_others_rows() -> CoreResult<()> {
         let directory = private_tempdir();

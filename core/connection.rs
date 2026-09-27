@@ -2645,7 +2645,9 @@ impl Connection {
         self.index_methods_on_transaction_rolled_back();
         self.clear_mvcc_log_meta();
 
-        let is_memory_db = is_memory_like(&self.db.path);
+        // A database opened from files handed over already open has no path,
+        // which would read as an in-memory one and skip the closing checkpoint.
+        let is_memory_db = self.db.is_in_memory_db();
         let should_checkpoint_on_close = pager
             .wal
             .as_ref()

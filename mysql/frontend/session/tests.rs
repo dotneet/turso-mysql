@@ -3988,6 +3988,40 @@ fn dropping_and_recreating_auto_increment_table_gets_new_identity_and_starts_at_
     Ok(())
 }
 
+/// A write can leave the WAL holding far more than the engine's own
+/// checkpoint empties, so past a bound it is truncated, but never inside a
+/// transaction.
+#[test]
+fn a_wal_past_its_bound_is_truncated_between_transactions() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-wal-bound.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT, label TEXT)")?;
+    connection.execute("INSERT INTO records (id, label) VALUES (1, 'kept')")?;
+    let frames = || connection.inner().wal_state().unwrap().max_frame;
+    let written = frames();
+    assert!(written > 0);
+
+    connection.truncate_the_wal_past(written)?;
+    assert_eq!(frames(), written);
+
+    connection.inner().execute("BEGIN")?;
+    connection.truncate_the_wal_past(0)?;
+    assert_eq!(frames(), written);
+    connection.inner().execute("COMMIT")?;
+
+    connection.truncate_the_wal_past(0)?;
+    assert_eq!(frames(), 0);
+    assert_eq!(
+        connection
+            .prepare_select("SELECT label FROM records")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_text("kept")]]
+    );
+    connection.close()?;
+    Ok(())
+}
+
 #[test]
 fn lists_user_tables_and_views_in_name_order() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
