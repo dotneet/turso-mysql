@@ -58,6 +58,14 @@ pub enum StaticSelectMetadata {
         column_name: String,
         kind: ColumnAggregateKind,
     },
+    /// A `MIN`, `MAX` or `SUM` over a column named with its table in a
+    /// statement reading several tables — `SUM(posts.views)` over a join —
+    /// which the server finishes from that table's column.
+    QualifiedAggregate {
+        table: String,
+        column_name: String,
+        kind: ColumnAggregateKind,
+    },
     /// The same aggregate over a window, which answers almost the same shape.
     WindowAggregate {
         column_name: String,
@@ -642,6 +650,15 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             .map(|(kind, column)| StaticSelectMetadata::ColumnAggregate {
                 column_name: column.value.clone(),
                 kind,
+            })
+            .or_else(|| {
+                qualified_aggregate_argument(function).map(|(kind, table, column)| {
+                    StaticSelectMetadata::QualifiedAggregate {
+                        table: table.value.clone(),
+                        column_name: column.value.clone(),
+                        kind,
+                    }
+                })
             })
             .or_else(|| aggregate_over_branches(function))
             .or_else(|| scalar_call(function)),
@@ -3751,6 +3768,50 @@ pub(super) fn column_aggregate_argument(
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => Some((kind, column)),
+        _ => None,
+    }
+}
+
+/// Returns the kind, the table and the column of a `MIN`, `MAX` or `SUM` over
+/// a column named with its table — `SUM(posts.views)`.
+///
+/// A statement reading one table has that table's name left out before it is
+/// read, so this is how a join writes one, the name saying which table's
+/// column the answer's shape comes from. Measured on MySQL 8.4.11, each
+/// answers the shape it answers over that table alone.
+pub(crate) fn qualified_aggregate_argument(
+    function: &sqlparser::ast::Function,
+) -> Option<(
+    ColumnAggregateKind,
+    &sqlparser::ast::Ident,
+    &sqlparser::ast::Ident,
+)> {
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some() {
+        return None;
+    }
+    let kind = if name.value.eq_ignore_ascii_case("MIN") || name.value.eq_ignore_ascii_case("MAX") {
+        ColumnAggregateKind::MinMax
+    } else if name.value.eq_ignore_ascii_case("SUM") {
+        ColumnAggregateKind::Sum
+    } else {
+        return None;
+    };
+    if has_aggregate_modifiers(function) {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::CompoundIdentifier(parts),
+        ))] if parts.len() == 2 => Some((kind, &parts[0], &parts[1])),
         _ => None,
     }
 }

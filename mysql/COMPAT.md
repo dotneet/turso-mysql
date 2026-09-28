@@ -901,10 +901,17 @@ A count takes a qualified column, which is what a join has to write. `COUNT(b.id
 `LEFT JOIN` is how a query asks how many rows each row on the other side has, and a join
 cannot leave the qualifier off. A count is the one aggregate this can take qualified, because
 it is the one whose result does not depend on what the column holds — measured on 8.4.11, a
-count is a non-null `LONGLONG` of length 21 whatever it counts. `MIN`, `MAX`, `SUM`, `AVG`
-and the rest answer their argument's own type, so over a join each still takes a bare column:
-reading the table a qualifier names is work the result metadata has not been taught. A
-statement reading one table is the exception, which is how TypeORM's query builder
+count is a non-null `LONGLONG` of length 21 whatever it counts. `MIN`, `MAX` and `SUM` answer
+their argument's own type, and over a join the qualifier says which table's column that is:
+SQLAlchemy's `sum(posts.views)` beside `users.name`, Laravel's `sum(posts.views)` grouped by
+`users.email` and TypeORM's `MAX(Post.views)` over a `LEFT JOIN` are each answered in the shape
+the call answers over that table alone — measured on 8.4.11, a total over an `INT` a
+`NEWDECIMAL` of 33, over a `BIGINT` one of 42, a largest the column's own type, each nullable
+with the binary flag, and NULL for a group the `LEFT JOIN` found nothing for. Only a signed
+whole number is taken there: the engine keeps a `DECIMAL` and a `BIGINT UNSIGNED` in stored
+forms of their own and compares words by their bytes, so a joined `SUM(u.balance)`,
+`MAX(p.user_id)` over an unsigned id or `MAX(u.name)` is refused. `AVG` and the rest still take
+a bare column over a join. A statement reading one table is the exception, which is how TypeORM's query builder
 (`SUM(user.balance)` over `FROM users user`) and Django (`SUM(users.balance)`) write every
 aggregate: outside a subquery the qualifier can only name that table, so the argument is read
 as the bare column, and measured on 8.4.11 the answer and its shape are the bare column's, the
@@ -1820,7 +1827,11 @@ column no index covers, and reports the same shapes there; this keeps the
 shapes MySQL reports when an index answers the grouping instead — measured,
 `SELECT user_id, COUNT(*) ... GROUP BY user_id` reports the count's binary flag
 over an indexed `user_id` and not over an unindexed one — because which one
-MySQL takes is its planner's choice.
+MySQL takes is its planner's choice. A join grouped by whole columns is the
+same: measured, Django's `GROUP BY users.id` over `users LEFT OUTER JOIN posts`
+keeps the binary flag on its count and total, and SQLAlchemy's `GROUP BY
+users.id, users.name`, whose key no index holds, loses it, a `MAX` there
+carrying `NO_DEFAULT_VALUE` instead; this reports the first.
 
 Rows come back in the order the engine groups them, sorted by key, where MySQL
 answers a statement grouping in a temporary table in the order it met each

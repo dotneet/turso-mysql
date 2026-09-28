@@ -6807,6 +6807,60 @@ impl TableResultMetadata {
         kind: ColumnAggregateKind,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         let (table, ordinal) = self.column_named(column_name)?;
+        self.aggregate_definition_over(table, ordinal, name, kind)
+    }
+
+    /// Builds the result column a `MIN`, `MAX` or `SUM` over a column named
+    /// with its table reports, in a statement reading several tables.
+    ///
+    /// Measured on MySQL 8.4.11: each answers the shape it answers over that
+    /// table alone — `SUM(posts.views)` over an `INT` a `NEWDECIMAL` of 33,
+    /// `MAX(Post.views)` a `LONG` of 11 — nullable, with the binary flag,
+    /// whether the table is on the outer side of a `LEFT JOIN` or not. Only a
+    /// signed whole number is answered: the engine keeps a `DECIMAL` and a
+    /// `BIGINT UNSIGNED` in stored forms of their own, which it would sum or
+    /// compare as it stores them, and compares words by their bytes where
+    /// MySQL compares them under a collation.
+    fn qualified_aggregate_column_definition(
+        &self,
+        name: String,
+        table_reference: &str,
+        column_name: &str,
+        kind: ColumnAggregateKind,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        let mut named = self.tables.iter().filter(|table| {
+            table.branch == 0
+                && !table.subquery
+                && table.table_reference.eq_ignore_ascii_case(table_reference)
+        });
+        let (Some(table), None) = (named.next(), named.next()) else {
+            return Err(FrontendErrorKind::Unsupported);
+        };
+        if table.derived.is_some()
+            || !table.projected_columns.is_empty()
+            || !table.catalog_columns.is_empty()
+            || !table.view_columns.is_empty()
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let ordinal = table
+            .columns
+            .iter()
+            .position(|column| column.name().eq_ignore_ascii_case(column_name))
+            .ok_or(FrontendErrorKind::UnknownColumn)?;
+        if !is_signed_whole_number_column(table.columns[ordinal].type_name()) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        self.aggregate_definition_over(table, ordinal, name, kind)
+    }
+
+    fn aggregate_definition_over(
+        &self,
+        table: &SourceTableColumns,
+        ordinal: usize,
+        name: String,
+        kind: ColumnAggregateKind,
+    ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
         let source = table
             .columns
             .get(ordinal)
@@ -9609,6 +9663,7 @@ fn is_window_call(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
 fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> bool {
     match metadata {
         turso_mysql_parser::StaticSelectMetadata::ColumnAggregate { .. }
+        | turso_mysql_parser::StaticSelectMetadata::QualifiedAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::RoundedAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::RolledUpKey { .. }
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
@@ -9645,6 +9700,13 @@ fn aggregate_column_definition(
                 .ok_or(FrontendErrorKind::Unsupported)?
                 .aggregate_column_definition(name, column_name, *kind)
         }
+        turso_mysql_parser::StaticSelectMetadata::QualifiedAggregate {
+            table,
+            column_name,
+            kind,
+        } => source_metadata
+            .ok_or(FrontendErrorKind::Unsupported)?
+            .qualified_aggregate_column_definition(name, table, column_name, *kind),
         // Measured on MySQL 8.4.11: a windowed aggregate answers the shape its
         // plain form does, apart from the binary flag, which it does not
         // carry, and MIN and MAX, which widen an INT to LONGLONG where the

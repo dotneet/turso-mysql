@@ -891,6 +891,8 @@ fn render_select_body(
         .iter()
         .map(|item| {
             render_context.renders_a_projection_item = true;
+            render_context.takes_a_joined_aggregate =
+                outer_projection && is_an_aggregate_over_a_joined_column(item);
             let rendered = match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
                     if outer_projection =>
@@ -903,6 +905,7 @@ fn render_select_body(
                 _ => render_select_item(item, render_context),
             };
             render_context.renders_a_projection_item = false;
+            render_context.takes_a_joined_aggregate = false;
             rendered
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1022,6 +1025,15 @@ fn render_select_body(
         outer_projected_group_concats,
     );
     Ok((normalized, source_tables))
+}
+
+/// Reports whether a projection item is a `MIN`, `MAX` or `SUM` over a
+/// column named with its table, standing on its own.
+fn is_an_aggregate_over_a_joined_column(item: &SelectItem) -> bool {
+    matches!(item,
+        SelectItem::UnnamedExpr(Expr::Function(function))
+        | SelectItem::ExprWithAlias { expr: Expr::Function(function), .. }
+            if static_select_metadata::qualified_aggregate_argument(function).is_some())
 }
 
 /// Reports whether a statement answers the count of its one derived table's
@@ -1980,6 +1992,7 @@ fn names_an_aggregate(expr: &Expr) -> bool {
 fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
     static_select_metadata::is_count_call(function)
         || static_select_metadata::column_aggregate_argument(function).is_some()
+        || static_select_metadata::qualified_aggregate_argument(function).is_some()
         || static_select_metadata::aggregate_over_branches(function).is_some()
         || matches!(
             static_select_metadata::scalar_call(function),
@@ -5537,6 +5550,11 @@ pub(crate) struct SelectRenderContext<'a> {
     /// the same call is the same value in MySQL, not a second one to warn
     /// about.
     renders_a_projection_item: bool,
+    /// Whether that item is one of the statement's own result columns and is
+    /// itself an aggregate over a joined column, the one place one is taken:
+    /// its shape is reported there, where the server checks the column's
+    /// kind.
+    takes_a_joined_aggregate: bool,
     /// Whether the statement writes the rows it reads — `INSERT ... SELECT`
     /// — where a cut `GROUP_CONCAT` fails the statement rather than warning.
     writes_its_rows: bool,
@@ -5613,6 +5631,7 @@ impl<'a> SelectRenderContext<'a> {
             parameter_count: 0,
             group_concat_calls: 0,
             renders_a_projection_item: false,
+            takes_a_joined_aggregate: false,
             writes_its_rows: false,
             counts_group_concat_in_having: false,
             group_concat_counts: Vec::new(),
@@ -5689,7 +5708,8 @@ fn render_select_item(
         // unnamed count carries that name as an alias.
         SelectItem::UnnamedExpr(expr @ Expr::Function(function))
             if static_select_metadata::is_count_call(function)
-                || static_select_metadata::column_aggregate_argument(function).is_some() =>
+                || static_select_metadata::column_aggregate_argument(function).is_some()
+                || static_select_metadata::qualified_aggregate_argument(function).is_some() =>
         {
             let name = source_text(render_context.source, expr)
                 .unwrap_or_else(|| mysql_aggregate_column_name(function))
@@ -5945,6 +5965,28 @@ fn render_aggregate_call(
     format!(
         "{name}({})",
         render_aggregate_argument(function, render_context)
+    )
+}
+
+/// Renders a `MIN`, `MAX` or `SUM` over a column named with its table.
+///
+/// Which kind of column it reads is the server's to check once it knows the
+/// table, and only a signed whole number is answered: the engine sums and
+/// compares those as MySQL does, where a `DECIMAL` or a `BIGINT UNSIGNED` is
+/// kept in a stored form of its own and words are compared under a collation.
+/// Until then the statement is marked as one whose types matter.
+fn render_qualified_aggregate(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> String {
+    let (_, table, column) = static_select_metadata::qualified_aggregate_argument(function)
+        .expect("a qualified aggregate was checked to name a table's column");
+    render_context.checks_type_sensitive_expression = true;
+    format!(
+        "{}({}.{})",
+        function.name,
+        render_ident(table),
+        render_ident(column)
     )
 }
 
@@ -6310,6 +6352,12 @@ fn render_select_expr(
                 || static_select_metadata::column_aggregate_argument(function).is_some() =>
         {
             Ok(render_aggregate_call(function, render_context))
+        }
+        Expr::Function(function)
+            if render_context.takes_a_joined_aggregate
+                && static_select_metadata::qualified_aggregate_argument(function).is_some() =>
+        {
+            Ok(render_qualified_aggregate(function, render_context))
         }
         Expr::Function(function)
             if static_select_metadata::aggregate_over_branches(function).is_some() =>

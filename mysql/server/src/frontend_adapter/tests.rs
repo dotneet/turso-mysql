@@ -23423,16 +23423,13 @@ fn a_count_takes_the_qualified_column_a_join_has_to_write() {
     };
     assert_eq!(distinct.rows, vec![vec![Some(b"2".to_vec())]]);
 
-    // Over a join the other aggregates still take a bare column: each answers
-    // its argument's own type, which means reading the column the qualifier
-    // names out of the table it belongs to. Over one table the qualifier can
-    // only name that table, which orm_select_shapes covers.
-    for sql in [
-        "SELECT MIN(b.id) FROM authors a JOIN books b ON b.author_id = a.id",
-        "SELECT a.id, AVG(b.id) FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.id",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
+    // Over a join an average still takes a bare column. `MIN`, `MAX` and
+    // `SUM` over a joined column are covered by joined_reports; over one
+    // table the qualifier can only name that table, which orm_select_shapes
+    // covers.
+    let sql =
+        "SELECT a.id, AVG(b.id) FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.id";
+    assert!(adapter.execute_query(sql).is_err(), "{sql}");
 }
 
 /// `SELECT ... FOR UPDATE` reads rows this session is about to change, and
@@ -30847,3 +30844,6 @@ mod prisma_statements;
 
 #[cfg(unix)]
 mod gorm_and_typeorm;
+
+#[cfg(unix)]
+mod joined_reports;

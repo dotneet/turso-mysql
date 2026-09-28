@@ -77,6 +77,7 @@ pub(crate) fn static_result_column_metadata(
         },
         StaticSelectMetadata::WrittenValue(written) => written_value_metadata(*written),
         StaticSelectMetadata::ColumnAggregate { .. }
+        | StaticSelectMetadata::QualifiedAggregate { .. }
         | StaticSelectMetadata::WindowAggregate { .. }
         | StaticSelectMetadata::WindowCount
         | StaticSelectMetadata::ScalarSubquery(_)
