@@ -244,6 +244,23 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | A derived table in an `UPDATE` or a `DELETE` | refused; each reads its own table |
 | `DISTINCT ON` | refused, and no part of MySQL |
 
+### What Gitea's integration suite still meets
+
+Gitea v1.27.3's own suite (`run.sh gitea`, xorm over go-sql-driver) passes 348
+of the 395 tests MySQL 8.4.11 passes in the harness. What stands in the way of
+the rest, by the tests it ends:
+
+| Statement | State |
+|---|---|
+| Packages: `package_version.id IN (SELECT MAX(package_version.id) FROM package_version INNER JOIN package ON ... GROUP BY package_version.package_id)`, `package.id IN (SELECT id FROM (SELECT package.id FROM package LEFT JOIN package_version ON ...) temp)`, `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package`, and `package_version LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` | refused: an aggregate over a column named through a joined table, a derived table joining tables inside a membership test or joined beside another, and an `ON` that is not an equality. Most `TestPackage*` tests |
+| `DELETE FROM action_runner WHERE id IN (SELECT action_runner.id FROM (SELECT * FROM action_runner) action_runner INNER JOIN action_task ON ...)` | refused, a derived table inside a statement that writes. Every repository and user deletion runs it first (`TestAPIOrg`, `TestAdminDeleteUser`, `TestEphemeralActionsRunnerDeletion`) |
+| `SELECT owner_id AS org_id, COUNT(DISTINCT(repository.id)) AS repo_count FROM repository INNER JOIN org_user ON ... GROUP BY owner_id` | refused, a distinct count of a column named through a joined table. The dashboard's organisation list (`TestLinks`) |
+| `SELECT COALESCE(sum(tracked_time.time), 0) FROM tracked_time INNER JOIN issue ON ...` | refused, an aggregate over a joined table's column inside a call. Every issue list page (`TestViewIssues*`, `TestNoLoginViewIssues`) |
+| `SELECT created_unix DIV 900 * 900 AS timestamp, count(user_id) AS contributions ... GROUP BY timestamp ORDER BY timestamp` | refused: arithmetic over a column with two operators, and grouping by the alias of an expression. The activity heatmap (`TestUserHeatmap`, `TestHeatmapEndpoints`, `TestPrivateActivity*`) |
+| `UPDATE milestone SET completeness = (CASE WHEN ... THEN 100 ELSE 100*num_closed_issues/(CASE WHEN num_issues > 0 THEN num_issues ELSE 1 END) END)` | refused, a `CASE` holding arithmetic and a division written into a column (`TestAPIIssuesMilestone`) |
+| `SELECT id FROM milestone WHERE LOWER(name) IN (?, ...)` | refused, a membership test over a call rather than a column |
+| `ALTER DATABASE ... COLLATE utf8mb4_bin`, `utf8mb4_0900_as_cs` | refused, a database collation other than `utf8mb4_0900_ai_ci` and `utf8mb4_unicode_ci`; Gitea logs it and runs on a case-insensitive database, and `TestDatabaseCollation` fails |
+
 ### DDL
 
 | Form | State |
@@ -406,6 +423,8 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `IS_USED_LOCK` | refused; it answers the holder's connection ID, which this server does not hand out |
 | A named-lock call beside anything else, with a bound name, or with a fractional or quoted timeout | refused; MySQL reads a fraction as whole seconds by a rule of its own |
 | `XA` transactions | refused, and out of scope — see what this frontend is for |
+| An `INSERT` into a table that counts its ids, waiting behind another session's write transaction | takes its id before it waits, so an id the other transaction writes explicitly meanwhile collides and the insert answers 1062. MySQL's insert does not wait for that transaction, and Gitea's background notice insert beside its fixture loading succeeds there |
+| Two write transactions whose snapshots overlap | the later one is given up with 1213 when it writes, where MySQL locks rows and lets both commit; Gitea retries none of its transactions, so a background job writing beside a request fails now and then (`DELETE FROM repository`, `INSERT INTO package_blob` in the suite) |
 
 ---
 
