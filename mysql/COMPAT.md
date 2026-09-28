@@ -1900,7 +1900,17 @@ types against, so the aggregate's own argument column is recorded instead —
 would, which is what makes the integer literal safe. `COUNT` records nothing,
 because it answers an integer whatever it counts. `AND`, `OR`, `NOT` and
 parentheses cross; the right side has to be an exact signed integer, or — against
-a `COUNT` — a `?`, which GORM's `Having("COUNT(*) > ?", 1)` sends. Measured on
+a `COUNT`, a `SUM`, a `MIN` or a `MAX` — a `?`, which GORM's `Having("COUNT(*) >
+?", 1)` and Prisma's `groupBy` with `having: { views: { _sum: { gt: 5 } } }`
+send. The aggregated column may be named with its table or the query's alias —
+TypeORM writes `HAVING SUM(post.views) > 5`, Prisma `HAVING
+SUM(prisma.posts.views) > ?` — and the name keeps its table, so a projection
+alias of the same name does not stand in for it. A value bound against a sum,
+a least or a greatest is held to what may be bound against its column: a whole
+number, a word naming one, or NULL, each compared as MySQL compares it with the
+total. Measured on 8.4.11, a `DOUBLE` 2.9 and the word `'2.9'` compare there as
+2.9, which the engine would too, but a fraction against a whole-number column
+is refused here as it is in a `WHERE`. Measured on
 8.4.11, MySQL reads a value bound there as a whole number: a bound `LONGLONG`
 and a word naming a whole number compare as that number, a `DOUBLE` as a number
 (`COUNT(*) > 1.5` finds the groups of two, `> 0.5` every group), and NULL finds

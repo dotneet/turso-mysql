@@ -268,6 +268,54 @@ fn typeorms_relation_loading_compares_a_joined_id_with_a_word() {
     );
 }
 
+/// TypeORM's `.having('SUM(post.views) > 5')` names the aggregated column by
+/// the query's alias, and a join names it by its table's. Measured on MySQL
+/// 8.4.11, each keeps the groups whose total passes.
+#[test]
+fn typeorms_having_compares_a_total_named_by_its_alias() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, TYPEORM_POSTS);
+    run(
+        &mut adapter,
+        "INSERT INTO posts (user_id, title, views) VALUES (1, 'a', 10), (1, 'b', 0), (2, 'c', 3)",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `post`.`user_id` AS `userId`, SUM(`post`.`views`) AS `views` FROM `posts` `post` GROUP BY `post`.`user_id` HAVING SUM(`post`.`views`) > 5"
+        ),
+        vec![vec![Some("1".to_owned()), Some("10".to_owned())]]
+    );
+    // The qualified column is the table's, not the projection's alias of the
+    // same name.
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT p.user_id AS views, SUM(p.views) AS total FROM posts p GROUP BY p.user_id HAVING SUM(p.views) > 5"
+        ),
+        vec![vec![Some("1".to_owned()), Some("10".to_owned())]]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `p`.`user_id`, MAX(`p`.`views`) FROM `posts` `p` JOIN `posts` `q` ON `q`.`id` = `p`.`id` GROUP BY `p`.`user_id` HAVING MAX(`p`.`views`) >= 3 ORDER BY `p`.`user_id`"
+        ),
+        vec![
+            vec![Some("1".to_owned()), Some("10".to_owned())],
+            vec![Some("2".to_owned()), Some("3".to_owned())],
+        ]
+    );
+    // A joined list of the values is a word, which MySQL reads as a number
+    // here and the engine would order after every number.
+    let joined =
+        "SELECT p.user_id FROM posts p GROUP BY p.user_id HAVING GROUP_CONCAT(p.views) > 5";
+    assert!(adapter.execute_query(joined).is_err(), "{joined}");
+    assert_eq!(
+        adapter.execute_stmt_prepare(joined).map(|_| ()),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
 /// GORM's association reads join on a `BIGINT UNSIGNED` id, which a word
 /// naming the id finds too.
 #[test]

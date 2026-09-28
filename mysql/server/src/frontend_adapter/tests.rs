@@ -30850,3 +30850,6 @@ mod joined_reports;
 
 #[cfg(unix)]
 mod concurrent_transactions;
+
+#[cfg(unix)]
+mod prisma_client_reads;

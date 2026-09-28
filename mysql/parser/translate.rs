@@ -2177,7 +2177,7 @@ fn render_having_predicate(
             if is_checked_select_comparison_operator(op)
                 && matches!(left.as_ref(), Expr::Function(function)
                     if static_select_metadata::is_count_call(function)
-                        || static_select_metadata::column_aggregate_argument(function).is_some()) =>
+                        || aggregated_column(function).is_some()) =>
         {
             let Expr::Function(function) = left.as_ref() else {
                 unreachable!("the guard requires a checked aggregate");
@@ -2217,10 +2217,25 @@ fn render_having_predicate(
             } else {
                 (rendered_right, rhs)
             };
-            if !matches!(rhs, CheckedSelectComparisonRhs::SignedInteger(_)) {
+            let aggregated = aggregated_column(function);
+            // A bound value meets a sum, a least or a greatest the way it
+            // meets the column itself, which is how the frontend holds what
+            // binds there: over a whole-number column MySQL's sum is an exact
+            // number, and each compares with the value as a number.
+            let bound_value_taken = matches!(rhs, CheckedSelectComparisonRhs::Placeholder { .. })
+                && matches!(
+                    aggregated,
+                    Some((
+                        static_select_metadata::ColumnAggregateKind::Sum
+                            | static_select_metadata::ColumnAggregateKind::MinMax,
+                        _,
+                        _
+                    ))
+                );
+            if !matches!(rhs, CheckedSelectComparisonRhs::SignedInteger(_)) && !bound_value_taken {
                 return unsupported("HAVING comparison requires an exact signed integer");
             }
-            if let Some((_, column)) = static_select_metadata::column_aggregate_argument(function) {
+            if let Some((_, qualifier, column)) = aggregated {
                 render_context.checks_type_sensitive_expression = true;
                 if render_context
                     .decimal_columns
@@ -2234,7 +2249,7 @@ fn render_having_predicate(
                 render_context
                     .checked_comparisons
                     .push(CheckedSelectComparison {
-                        qualifier: None,
+                        qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
                         inner_sources: Vec::new(),
                         column_name: column.value.clone(),
                         operator,
@@ -2260,6 +2275,34 @@ fn render_having_predicate(
         } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("HAVING predicate"),
     }
+}
+
+/// The kind, the table if one is named, and the column of an aggregate over
+/// one column — `SUM(views)` or `SUM(post.views)`.
+///
+/// A column named with its table is taken under a sum, a least or a greatest,
+/// which answer a number over a whole-number column. A `GROUP_CONCAT` answers
+/// a word, which MySQL compares with a number as a double and the engine
+/// orders after every number.
+fn aggregated_column(
+    function: &sqlparser::ast::Function,
+) -> Option<(
+    static_select_metadata::ColumnAggregateKind,
+    Option<&sqlparser::ast::Ident>,
+    &sqlparser::ast::Ident,
+)> {
+    if let Some((kind, column)) = static_select_metadata::column_aggregate_argument(function) {
+        return Some((kind, None, column));
+    }
+    static_select_metadata::qualified_aggregate_argument(function)
+        .filter(|(kind, _, _)| {
+            matches!(
+                kind,
+                static_select_metadata::ColumnAggregateKind::Sum
+                    | static_select_metadata::ColumnAggregateKind::MinMax
+            )
+        })
+        .map(|(kind, table, column)| (kind, Some(table), column))
 }
 
 pub(crate) fn select_static_result_metadata(
