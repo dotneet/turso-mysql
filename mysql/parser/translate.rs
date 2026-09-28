@@ -3332,6 +3332,61 @@ fn names_the_offered_row(function: &sqlparser::ast::Function) -> bool {
     )
 }
 
+/// Counts the `VALUES(col)` calls an `INSERT`'s `ON DUPLICATE KEY UPDATE`
+/// writes.
+pub(crate) fn offered_row_calls(insert: &Insert) -> usize {
+    let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
+        return 0;
+    };
+    assignments
+        .iter()
+        .map(|assignment| offered_row_calls_in(&assignment.value))
+        .sum()
+}
+
+fn offered_row_calls_in(expr: &Expr) -> usize {
+    match expr {
+        Expr::Function(function) if names_the_offered_row(function) => 1,
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(arguments) => arguments
+                .args
+                .iter()
+                .map(|argument| match argument {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(inner),
+                    ) => offered_row_calls_in(inner),
+                    _ => 0,
+                })
+                .sum(),
+            _ => 0,
+        },
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => offered_row_calls_in(inner),
+        Expr::BinaryOp { left, right, .. } => {
+            offered_row_calls_in(left) + offered_row_calls_in(right)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().map_or(0, offered_row_calls_in)
+                + conditions
+                    .iter()
+                    .map(|arm| {
+                        offered_row_calls_in(&arm.condition) + offered_row_calls_in(&arm.result)
+                    })
+                    .sum::<usize>()
+                + else_result.as_deref().map_or(0, offered_row_calls_in)
+        }
+        _ => 0,
+    }
+}
+
 /// Renders `INSERT ... SET a = 1, b = 2` as the column-list form it means.
 ///
 /// The SET form carries the column list and the values interleaved, so it has

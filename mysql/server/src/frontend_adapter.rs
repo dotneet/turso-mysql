@@ -390,6 +390,13 @@ impl CommandExecutor for MySqlCommandAdapter {
         }
         self.prepared_group_concat_max_lens
             .insert(result.statement_id, group_concat_max_len);
+        self.raised_warnings.clear();
+        warn_about_offered_row_calls(
+            &mut self.raised_warnings,
+            sql,
+            self.connection.parser_mode(),
+        );
+        result.warnings = u16::try_from(self.raised_warnings.len()).unwrap_or(u16::MAX);
         Ok(result)
     }
 
@@ -3544,7 +3551,14 @@ where
                 text: sql.to_owned(),
             },
         );
-        result
+        self.raised_warnings.clear();
+        warn_about_offered_row_calls(
+            &mut self.raised_warnings,
+            sql,
+            self.session.session_sql_mode(),
+        );
+        let warnings = u16::try_from(self.raised_warnings.len()).unwrap_or(u16::MAX);
+        result.map(|result| PreparedStatementResult { warnings, ..result })
     }
 
     /// Retains a statement the checked prepared path does not take — Laravel
@@ -4289,12 +4303,23 @@ fn execute_checked_query(
             }
             error => frontend_query_error(error),
         })?;
+    warn_about_offered_row_calls(raised, sql, connection.parser_mode());
     Ok(CommandExecutionResult::Ok(CommandOkResult {
         affected_rows: result.affected_rows,
         last_insert_id: result.last_insert_id,
         status_flags: connection_status_flags(connection),
+        warnings: u16::try_from(raised.len()).unwrap_or(u16::MAX),
         ..CommandOkResult::default()
     }))
+}
+
+/// Raises MySQL's warning 1287 once for each `VALUES(col)` the statement's
+/// upsert calls.
+fn warn_about_offered_row_calls(raised: &mut Vec<MySqlWarning>, sql: &str, mode: SessionSqlMode) {
+    raised.extend(
+        std::iter::repeat_with(MySqlWarning::offered_row_call_deprecated)
+            .take(turso_mysql_parser::count_offered_row_calls(sql, mode)),
+    );
 }
 
 fn prepare_checked_statement(
@@ -10692,6 +10717,18 @@ impl MySqlWarning {
             level: "Warning",
             code: 1287,
             message: "SQL_CALC_FOUND_ROWS is deprecated and will be removed in a future release. Consider using two separate queries instead.".to_owned(),
+        }
+    }
+
+    /// The warning MySQL raises for each `VALUES(col)` an `ON DUPLICATE KEY
+    /// UPDATE` calls, a spelling 8.0.20 deprecated.
+    ///
+    /// Measured on MySQL 8.4.11: `Warning`, code 1287, and this message.
+    fn offered_row_call_deprecated() -> Self {
+        Self {
+            level: "Warning",
+            code: 1287,
+            message: "'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead".to_owned(),
         }
     }
 

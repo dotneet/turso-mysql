@@ -4945,6 +4945,20 @@ pub fn parse_auto_increment_insert_target(
     Ok(Some(insert_name(&table)?.as_str().to_owned()))
 }
 
+/// How many times one statement calls `VALUES(col)` in an `ON DUPLICATE KEY
+/// UPDATE`, or 0 for a statement that is no such `INSERT`.
+///
+/// MySQL 8.0.20 deprecated the call in favour of a name on the offered row,
+/// and measured on 8.4.11 it raises warning 1287 once for each call written,
+/// however many rows the statement offers — when the statement is prepared,
+/// and not again when it is executed.
+pub fn count_offered_row_calls(sql: &str, mode: SessionSqlMode) -> usize {
+    match parse_one_statement(sql, mode) {
+        Ok(Statement::Insert(insert)) => translate::offered_row_calls(&insert),
+        _ => 0,
+    }
+}
+
 fn validate_auto_increment_insert_token_shape(
     sql: &str,
     mode: SessionSqlMode,

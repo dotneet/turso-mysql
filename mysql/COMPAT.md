@@ -2255,6 +2255,12 @@ offered, which is how a counter is stepped: `hits = hits + 1`, or
 the row already there in both MySQL and the engine, and `VALUES(col)` is the
 offered one, which the engine calls `excluded.col`.
 
+MySQL 8.0.20 deprecated `VALUES(col)`, and TypeORM and GORM still write it.
+Measured on 8.4.11, each call written raises warning 1287 once, however many
+rows the statement offers, and a prepared statement raises it when it is
+prepared rather than each time it is executed. This raises the same warnings,
+at the same points, and `SHOW WARNINGS` lists them.
+
 Since MySQL 8.0.19 the offered row may carry a name instead — `VALUES (...) AS
 offered ... hits = t.hits + offered.hits` — which is the spelling that replaces
 `VALUES()`. Measured on 8.4.11 over (1, 10, 'a') and (2, 20, 'b'), running the

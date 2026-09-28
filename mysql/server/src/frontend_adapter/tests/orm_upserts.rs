@@ -58,6 +58,52 @@ fn some(values: &[&str]) -> Vec<Option<String>> {
         .collect()
 }
 
+/// The affected rows, the id and the count of warnings one write reports.
+fn written_with_warnings(adapter: &mut Adapter, sql: &str) -> (u64, u64, u16) {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => {
+            (result.affected_rows, result.last_insert_id, result.warnings)
+        }
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+/// The codes `SHOW WARNINGS` lists for the last statement.
+fn warning_codes(adapter: &mut Adapter) -> Vec<String> {
+    rows(adapter, "SHOW WARNINGS")
+        .into_iter()
+        .map(|row| row[1].clone().unwrap())
+        .collect()
+}
+
+const VALUES_DEPRECATED: &str = "'VALUES function' is deprecated and will be removed in a future release. Please use an alias (INSERT INTO ... VALUES (...) AS alias) and replace VALUES(col) in the ON DUPLICATE KEY UPDATE clause with alias.col instead";
+
+/// The null bitmap, the new-parameters flag and one VAR_STRING parameter for
+/// each word.
+fn words(values: &[&str]) -> Vec<u8> {
+    let mut payload = vec![0; values.len().div_ceil(8)];
+    payload.push(1);
+    for _ in values {
+        payload.extend_from_slice(&[MYSQL_TYPE_VAR_STRING, 0]);
+    }
+    for value in values {
+        payload.push(u8::try_from(value.len()).unwrap());
+        payload.extend_from_slice(value.as_bytes());
+    }
+    payload
+}
+
+/// The affected rows and the id one execution of a prepared write reports,
+/// with the count of warnings it raised.
+fn executed(adapter: &mut Adapter, statement_id: u32, payload: &[u8]) -> (u64, u64, u16) {
+    match adapter.execute_stmt_execute(statement_id, payload) {
+        Ok(PreparedStatementExecutionResult::Ok(result)) => {
+            (result.affected_rows, result.last_insert_id, result.warnings)
+        }
+        other => panic!("statement {statement_id} must answer OK, answered {other:?}"),
+    }
+}
+
 const RAILS_TAGS: &str = "CREATE TABLE `tags` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, `name` varchar(64) NOT NULL, UNIQUE INDEX `index_tags_on_name` (`name`)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
 
 /// Rails 8's `insert_all!` names the offered row, as every insert it builds
@@ -165,5 +211,83 @@ fn an_upsert_reading_a_column_it_already_wrote_is_refused() {
     assert_eq!(
         rows(&mut adapter, "SELECT code, a, b FROM pairs"),
         vec![some(&["x", "5", "12"])]
+    );
+}
+
+/// `VALUES(col)` in an upsert, which TypeORM and GORM still write, raises
+/// MySQL's deprecation warning 1287 once for each call written — over one row
+/// or several — and a prepared statement raises it when it is prepared, not
+/// when it is executed.
+#[test]
+fn values_in_an_upsert_warns_once_for_each_call() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE codes (code varchar(10) PRIMARY KEY, name varchar(20) NOT NULL, hits int NOT NULL DEFAULT 7)",
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('a', 'A', 1) ON DUPLICATE KEY UPDATE hits = VALUES(hits) + VALUES(hits)"
+        ),
+        (1, 0, 2)
+    );
+    assert_eq!(warning_codes(&mut adapter), ["1287", "1287"]);
+    assert_eq!(
+        rows(&mut adapter, "SHOW WARNINGS")[0],
+        some(&["Warning", "1287", VALUES_DEPRECATED])
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('a', 'A', 1), ('b', 'B', 2) ON DUPLICATE KEY UPDATE hits = VALUES(hits) + VALUES(hits)"
+        ),
+        (3, 0, 2)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, hits FROM codes ORDER BY code"),
+        vec![some(&["a", "2"]), some(&["b", "2"])]
+    );
+    // A name on the offered row is the spelling that replaces it, and warns
+    // about nothing.
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('a', 'A', 1) AS o ON DUPLICATE KEY UPDATE hits = o.hits"
+        ),
+        (2, 0, 0)
+    );
+    assert!(warning_codes(&mut adapter).is_empty());
+
+    // GORM's `clause.OnConflict{UpdateAll: true}` on a table counting its own
+    // ids, prepared.
+    run(
+        &mut adapter,
+        "CREATE TABLE `gt` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    let statement = adapter
+        .execute_stmt_prepare(
+            "INSERT INTO `gt` (`name`) VALUES (?) ON DUPLICATE KEY UPDATE `name`=VALUES(`name`)",
+        )
+        .unwrap();
+    assert_eq!(statement.warnings, 1);
+    assert_eq!(warning_codes(&mut adapter), ["1287"]);
+    assert_eq!(
+        executed(&mut adapter, statement.statement_id, &words(&["sql"])),
+        (1, 1, 0)
+    );
+    assert!(warning_codes(&mut adapter).is_empty());
+    assert_eq!(
+        executed(&mut adapter, statement.statement_id, &words(&["sql"])),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        executed(&mut adapter, statement.statement_id, &words(&["SQL"])),
+        (2, 1, 0)
+    );
+    adapter.execute_stmt_close(statement.statement_id);
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name FROM gt"),
+        vec![some(&["1", "SQL"])]
     );
 }
