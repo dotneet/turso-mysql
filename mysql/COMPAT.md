@@ -5489,6 +5489,12 @@ same rows:
   `'T\_kyo'` does not, and a missing member or a NULL column matches neither
   way. The pattern is written or bound as a word; MySQL reads a bound number
   as its digits, which is refused here.
+- `LIKE` and `NOT LIKE` over a whole `JSON` column — Entity Framework Core's
+  `EF.Functions.Like(u.Profile, "%\"a\"%")` — match the text MySQL prints for
+  the document, which the column holds, under `utf8mb4_bin`. Measured on
+  8.4.11: `'%TOKYO%'` finds no `"Tokyo"`, `'{"city": "Tokyo"%'` needs the
+  space MySQL prints after the colon, keys read in MySQL's own order, and a
+  NULL document matches neither way.
 - `JSON_LENGTH(col[, 'path'])` is compared with a number. A written word is
   refused: MySQL reads `json_length(doc) = '6'` as a number.
 

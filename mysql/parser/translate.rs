@@ -11991,6 +11991,32 @@ fn render_checked_like(
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
     };
+    // A `JSON` column is matched as the text MySQL prints it as, which
+    // carries `utf8mb4_bin` and so tells case apart: measured on 8.4.11,
+    // Entity Framework Core's `EF.Functions.Like(u.Profile, "%\"a\"%")` finds
+    // the document holding `"a"`, `'%TOKYO%'` finds no `"Tokyo"`, and
+    // `'{"city": "Tokyo"%'` needs the space MySQL prints after the colon. The
+    // column holds the document in that same text.
+    if render_context.is_json_column(&column.value) {
+        let operator = if negated {
+            CheckedSelectComparisonOperator::NotLike
+        } else {
+            CheckedSelectComparisonOperator::Like
+        };
+        json_condition::record_json_comparison(
+            render_context,
+            operator,
+            rhs,
+            crate::CheckedComparisonAnswer::JsonPattern,
+        );
+        let matched =
+            format!("mysql_binary_like({rendered_column}, {rendered_pattern}, {escape_argument})");
+        return Ok(if negated {
+            format!("(NOT {matched})")
+        } else {
+            format!("({matched})")
+        });
+    }
     let matched =
         format!("mysql_uca9_like({rendered_column}, {rendered_pattern}, {escape_argument})");
     let rendered = if negated {

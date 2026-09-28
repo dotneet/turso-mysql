@@ -382,6 +382,49 @@ fn a_total_falls_back_on_a_zero_written_with_places() {
     }
 }
 
+/// `EF.Functions.Like` over a `JSON` column matches the document as text. It
+/// was refused, the matched column not being one of words.
+///
+/// Measured on MySQL 8.4.11: the document is matched as the text MySQL
+/// prints for it, under `utf8mb4_bin` — case told apart, a space after each
+/// colon and comma, keys in MySQL's own order — and a NULL document matches
+/// neither `LIKE` nor `NOT LIKE`.
+#[test]
+fn like_matches_a_json_document_as_the_text_mysql_prints() {
+    let (_directory, mut adapter) = adapter();
+    changed(
+        &mut adapter,
+        "INSERT INTO `Users` (`Balance`, `Email`, `Name`, `Profile`) VALUES (1, 'zed@example.com', 'Zed', '{\"tags\":[\"z\"],\"city\":\"Oslo\",\"a\":1.50}')",
+    );
+    for (pattern, count) in [
+        ("'%\"a\"%'", "2"),
+        ("'%TOKYO%'", "0"),
+        ("'%Tokyo%'", "1"),
+        ("'{\"city\": \"Tokyo\"%'", "1"),
+        ("'{\"city\":\"Tokyo\"%'", "0"),
+        ("'{\"a\": 1.5, \"city\": \"Oslo\"%'", "1"),
+        ("'%_a_%'", "3"),
+    ] {
+        assert_eq!(
+            rows(
+                &mut adapter,
+                &format!(
+                    "SELECT COUNT(*)\nFROM `Users` AS `u`\nWHERE `u`.`Profile` LIKE {pattern}"
+                )
+            ),
+            [row(&[count])],
+            "{pattern}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COUNT(*) FROM `Users` AS `u` WHERE `u`.`Profile` NOT LIKE '%\"a\"%'"
+        ),
+        [row(&["1"])]
+    );
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

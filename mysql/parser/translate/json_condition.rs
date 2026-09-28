@@ -890,7 +890,7 @@ fn render_against_null(
 
 /// Records what a JSON reading was compared with, so the frontend holds a
 /// bound value to the kinds the comparison was rendered for.
-fn record_json_comparison(
+pub(super) fn record_json_comparison(
     render_context: &mut SelectRenderContext<'_>,
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
