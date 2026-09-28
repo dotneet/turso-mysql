@@ -2269,6 +2269,9 @@ impl MySqlConnection {
             .as_ref()
             .map(|target| target.table().as_str().to_owned())
             .or_else(|| translated.source_table().map(str::to_owned));
+        let word_parameters = self
+            .dml_word_parameters(&translated)
+            .map_err(MySqlPreparedStatementError::Engine)?;
         Ok((
             Some(statement),
             PreparedExecutionPlan::OrdinaryWrite {
@@ -2278,7 +2281,7 @@ impl MySqlConnection {
                 insert_target,
                 written_table,
                 read_tables: read_table_names(&translated),
-                word_parameters: word_parameters(translated.checked_comparisons()),
+                word_parameters,
             },
         ))
     }
@@ -2965,12 +2968,15 @@ impl MySqlConnection {
                 self.decimal_comparison_parameters(source_tables, checked_comparisons)?;
             whole_number_parameters =
                 self.whole_number_comparison_parameters(source_tables, checked_comparisons)?;
+            let word_parameters =
+                self.word_comparison_parameters(source_tables, checked_comparisons)?;
             Self::validate_select_comparison_values(
                 checked_comparisons,
                 values,
                 &bound_temporal,
                 &bound_decimal,
                 &whole_number_parameters,
+                &word_parameters,
             )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
             Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
@@ -7155,6 +7161,95 @@ impl MySqlConnection {
         Ok(bound)
     }
 
+    /// Finds the parameters that meet a column holding words, which bind a
+    /// word compared under the column's collation.
+    ///
+    /// The parser marks such a comparison collated only where it was told the
+    /// statement's one table's columns; one inside a subquery — Laravel's
+    /// `select exists(select * from posts where title = ?)` — is found here by
+    /// the column's own type.
+    fn word_comparison_parameters(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<Vec<usize>> {
+        let mut words = Vec::new();
+        for comparison in comparisons {
+            let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
+                continue;
+            };
+            if comparison.answers().is_some() {
+                continue;
+            }
+            if let Some(type_name) = source_tables.iter().find_map(|source| {
+                source
+                    .catalog()
+                    .and_then(|catalog| catalog.column_type(comparison.column_name()))
+            }) {
+                if is_text_type(type_name) {
+                    words.push(*ordinal);
+                }
+                continue;
+            }
+            for table in comparison_tables(source_tables, comparison)? {
+                if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
+                    if is_text_type(&type_name) {
+                        words.push(*ordinal);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(words)
+    }
+
+    /// Finds the parameters a DML statement compares with a column of words,
+    /// each by the type of the column it meets: one of a table the statement
+    /// reads, or else one of the table it writes.
+    fn dml_word_parameters(&self, translated: &TranslatedDml) -> Result<Vec<usize>> {
+        let read = translated.read_tables();
+        let joins = read.iter().any(|source| !source.subquery());
+        let (inner, written): (Vec<_>, Vec<_>) = translated
+            .checked_comparisons()
+            .iter()
+            .cloned()
+            .partition(|comparison| {
+                joins
+                    || comparison
+                        .qualifier()
+                        .or_else(|| comparison.inner_source())
+                        .is_some_and(|name| {
+                            read.iter()
+                                .any(|source| source.reference().eq_ignore_ascii_case(name))
+                        })
+            });
+        let mut words = self.word_comparison_parameters(read, &inner)?;
+        if written.is_empty() {
+            return Ok(words);
+        }
+        let table = translated
+            .source_table()
+            .ok_or(LimboError::SchemaUpdated)
+            .and_then(|table| {
+                MySqlTableName::parse(table)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))
+            })?;
+        for comparison in &written {
+            let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
+                continue;
+            };
+            if comparison.answers().is_some() {
+                continue;
+            }
+            if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
+                if is_text_type(&type_name) {
+                    words.push(*ordinal);
+                }
+            }
+        }
+        Ok(words)
+    }
+
     /// Holds a DML statement's comparisons to the columns they name.
     ///
     /// A statement that reads no table beyond the one it writes says that
@@ -7319,12 +7414,8 @@ impl MySqlConnection {
                     continue;
                 }
             }
-            if !checked_comparison_fits_column(
-                comparison.rhs(),
-                &type_name,
-                comparison.collated(),
-                comparison.operator(),
-            ) {
+            if !checked_comparison_fits_column(comparison.rhs(), &type_name, comparison.operator())
+            {
                 return Err(checked_comparison_column_refusal(
                     comparison.rhs(),
                     comparison.column_name(),
@@ -7489,6 +7580,7 @@ impl MySqlConnection {
         bound_temporal: &[BoundTemporalParameter],
         bound_decimal: &[usize],
         whole_number_parameters: &[usize],
+        word_parameters: &[usize],
     ) -> Result<()> {
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -7517,14 +7609,13 @@ impl MySqlConnection {
             let stored_as_a_moment = bound_temporal
                 .iter()
                 .any(|parameter| parameter.ordinal == *ordinal);
+            let meets_words = comparison.collated() || word_parameters.contains(ordinal);
             // A number meeting a column of words is refused for the reason a
             // DML statement refuses one; see
             // `refuse_a_word_parameter_bound_otherwise`.
             let fits = match value {
                 MySqlPreparedValue::Null => true,
-                MySqlPreparedValue::Integer(_) => {
-                    !patterns && !stored_as_a_moment && !comparison.collated()
-                }
+                MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment && !meets_words,
                 MySqlPreparedValue::UnsignedInteger(_) => {
                     !patterns && !stored_as_a_moment && bound_decimal.contains(ordinal)
                 }
@@ -7532,7 +7623,7 @@ impl MySqlConnection {
                     if patterns {
                         true
                     } else {
-                        comparison.collated()
+                        meets_words
                             || stored_as_a_moment
                             || bound_decimal.contains(ordinal)
                             || (whole_number_parameters.contains(ordinal)
@@ -10650,7 +10741,6 @@ fn compared_kind(column: &ComparedColumn) -> Option<ComparedKind> {
 fn checked_comparison_fits_column(
     rhs: &CheckedSelectComparisonRhs,
     type_name: &str,
-    collated: bool,
     operator: CheckedSelectComparisonOperator,
 ) -> bool {
     match rhs {
@@ -10683,15 +10773,14 @@ fn checked_comparison_fits_column(
                 || is_text_type(type_name)
                 || stores_a_canonical_form(type_name)
         }
-        // A parameter carries no type until it is bound, so a text column is
-        // only safe when the rendered SQL already asked for the collation, and
-        // a column stored in a canonical form is never safe: the bound value
-        // is not put into that form.
+        // A parameter carries no type until it is bound. A column of words
+        // compares a bound word under the collation it was declared with, and
+        // what binds there is held to a word when the statement runs; a column
+        // stored in a canonical form is never safe: the bound value is not put
+        // into that form.
         //
-        // A `LIKE` is the exception. It asks for no collation, because the
-        // engine already matches a pattern without regard to ASCII case the
-        // way MySQL's does, and what it binds is a pattern rather than a value
-        // — so it meets the text column it names.
+        // A `LIKE` binds a pattern rather than a value, which meets the text
+        // column it names alone.
         CheckedSelectComparisonRhs::Placeholder { .. } => {
             if matches!(
                 operator,
@@ -10699,9 +10788,7 @@ fn checked_comparison_fits_column(
             ) {
                 return is_text_type(type_name);
             }
-            is_integer_type(type_name)
-                || is_decimal_type(type_name)
-                || (collated && is_text_type(type_name))
+            is_integer_type(type_name) || is_decimal_type(type_name) || is_text_type(type_name)
         }
         // Two columns are held to each other by `column_pair_refusal`, which
         // needs both of them.
@@ -11002,12 +11089,7 @@ fn select_comparison_fits_column(
         _ => None,
     };
     if bound.is_none()
-        && !checked_comparison_fits_column(
-            comparison.rhs(),
-            type_name,
-            comparison.collated(),
-            comparison.operator(),
-        )
+        && !checked_comparison_fits_column(comparison.rhs(), type_name, comparison.operator())
     {
         return Err(checked_comparison_column_refusal(
             comparison.rhs(),
@@ -11251,7 +11333,6 @@ fn validate_frozen_select_comparison_columns(
             if !checked_comparison_fits_column(
                 comparison.rhs(),
                 &column.ty_str,
-                comparison.collated(),
                 comparison.operator(),
             ) {
                 return Err(checked_comparison_column_refusal(
@@ -11287,12 +11368,8 @@ fn validate_frozen_select_comparison_columns(
         }) else {
             return Err(LimboError::SchemaUpdated);
         };
-        if !checked_comparison_fits_column(
-            comparison.rhs(),
-            &column.ty_str,
-            comparison.collated(),
-            comparison.operator(),
-        ) {
+        if !checked_comparison_fits_column(comparison.rhs(), &column.ty_str, comparison.operator())
+        {
             return Err(checked_comparison_column_refusal(
                 comparison.rhs(),
                 comparison.column_name(),
@@ -11615,19 +11692,6 @@ fn read_table_names(translated: &TranslatedDml) -> Vec<String> {
         .read_tables()
         .iter()
         .map(|source| source.table().as_str().to_owned())
-        .collect()
-}
-
-/// The parameters a DML statement compares with a column of words — a
-/// comparison the parser collated because it was told the column holds them.
-fn word_parameters(comparisons: &[CheckedSelectComparison]) -> Vec<usize> {
-    comparisons
-        .iter()
-        .filter(|comparison| comparison.collated())
-        .filter_map(|comparison| match comparison.rhs() {
-            CheckedSelectComparisonRhs::Placeholder { ordinal } => Some(*ordinal),
-            _ => None,
-        })
         .collect()
 }
 

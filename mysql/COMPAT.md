@@ -2220,7 +2220,11 @@ column's collation, as a prepared `SELECT`'s does: the statement is read a
 second time knowing which of its table's columns hold words. Measured on 8.4.11
 over `utf8mb4_unicode_ci`: `key = ?` bound `'LARAVEL-CACHE-COUNTER  '` finds
 `laravel-cache-counter`, `key IN (?, ?)` matches the same way, and a `?` in the
-`SET` is counted before those of the `WHERE`. A number bound there is refused,
+`SET` is counted before those of the `WHERE`. A `?` inside a subquery is held
+the same way, by the type of the column it meets — Laravel's `->exists()`,
+`firstOrCreate` and `unique` rule send `select exists(select * from posts where
+title = ?) as exists`, which MySQL answers as a NOT NULL binary `LONGLONG` of 1
+— where it used to be refused for want of that column's type. A number bound there is refused,
 in a prepared `SELECT` too, where it used to be compared as the word it spells:
 MySQL compares a column of words with a number as the number each word begins
 with — `name = 0` finds `'abc'` and `name = 5` finds `'5x'`.

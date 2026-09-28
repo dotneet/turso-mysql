@@ -482,7 +482,7 @@ fn laravel_writes_where_a_column_of_words_matches_a_bound_word() {
 }
 
 /// A number bound against a column of words is refused, prepared, in a
-/// `SELECT` as in a write. Measured on MySQL 8.4.11: MySQL compares it with the
+/// `SELECT` as in a write, and inside a subquery of either. Measured on MySQL 8.4.11: MySQL compares it with the
 /// number each word begins with — `name = 0` finds `'abc'` and `name = 5`
 /// finds `'5x'` — where the engine would compare it as the word it spells and
 /// find neither.
@@ -491,12 +491,15 @@ fn a_number_bound_against_a_column_of_words_is_refused() {
     let (_directory, mut adapter) = adapter();
     for sql in [
         "create table `w` (`id` int primary key, `name` varchar(20))",
+        "create table `v` (`id` int primary key, `name` varchar(20))",
         "insert into `w` values (1, 'abc'), (2, '5x')",
     ] {
         adapter.execute_query(sql).unwrap();
     }
     for sql in [
         "select `id` from `w` where `name` = ?",
+        "select exists(select * from `w` where `name` = ?) as `exists`",
+        "update `v` set `id` = `id` where exists (select 1 from `w` where `w`.`name` = ?)",
         "update `w` set `id` = `id` where `name` = ?",
         "delete from `w` where `name` = ?",
     ] {
@@ -546,5 +549,59 @@ fn every_bound_value_of_a_set_is_compared_with_its_own_column() {
             "select `a`, `b`, `updated_at` > '2000-01-01 00:00:00' from `t`"
         ),
         [[word("1"), word("5"), word("1")]]
+    );
+}
+
+/// Laravel's `->exists()`, `firstOrCreate`, `updateOrCreate` and the `unique`
+/// validation rule ask whether a row is there with a subquery comparing a
+/// column of words with a bound word. Measured on MySQL 8.4.11 over
+/// `utf8mb4_unicode_ci`: the answer is a NOT NULL `LONGLONG` of 1, binary,
+/// and `'third '` finds `Third`.
+#[test]
+fn laravel_asks_whether_a_row_exists_by_a_bound_word() {
+    let (_directory, mut adapter) = adapter();
+    adapter.execute_query(LARAVEL_OPENS_WITH).unwrap();
+    for sql in [
+        "create table `posts` (`id` bigint unsigned not null auto_increment primary key, `title` varchar(255) not null, `views` int not null default '0') default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "insert into `posts` (`title`) values ('Hello'), ('Third')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let exists = "select exists(select * from `posts` where `title` = ?) as `exists`";
+    for (title, found) in [("third ", 1), ("nope", 0)] {
+        let PreparedStatementExecutionResult::ResultSet(result) =
+            prepared(&mut adapter, exists, &bound(&[Bound::Word(title)]))
+        else {
+            panic!("{exists} must answer a row");
+        };
+        let [column] = result.columns.as_slice() else {
+            panic!("{exists} must answer one column");
+        };
+        assert_eq!(
+            (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.flags
+            ),
+            (
+                "exists",
+                MYSQL_TYPE_LONGLONG,
+                1,
+                63,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            )
+        );
+        assert_eq!(
+            result.rows,
+            [[BinaryResultValue::Integer(found)]],
+            "{title}"
+        );
+    }
+    let statement = adapter.execute_stmt_prepare(exists).unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(statement.statement_id, &bound(&[Bound::Number(0)])),
+        Err(FrontendErrorKind::Unsupported)
     );
 }

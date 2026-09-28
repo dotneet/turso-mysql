@@ -5617,6 +5617,8 @@ fn prepared_integer_comparisons_recheck_schema_and_type_after_reprepare() -> Res
         .drop_table(&command)
         .map_err(|error| LimboError::InternalError(error.to_string()))?;
     connection.execute("CREATE TABLE records (id TEXT)")?;
+    // The column holds words now, which MySQL compares with a number as the
+    // number each begins with.
     assert!(matches!(
         connection.execute_prepared_select(
             metadata.statement_id,
@@ -5624,7 +5626,7 @@ fn prepared_integer_comparisons_recheck_schema_and_type_after_reprepare() -> Res
             None,
         ),
         Err(MySqlPreparedStatementError::Engine(LimboError::InvalidArgument(message)))
-            if message.contains("signed integer")
+            if message.contains("does not fit the column's type")
     ));
 
     connection.close()?;
