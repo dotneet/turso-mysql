@@ -196,16 +196,84 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
 }
 
 fn set_to_current(p: &mut DateTime) {
-    let now = std::time::SystemTime::now();
-    let duration = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
     const UNIX_EPOCH_IJD: i64 = 210866760000000;
-    p.i_jd = UNIX_EPOCH_IJD + duration.as_millis() as i64;
+    p.i_jd = UNIX_EPOCH_IJD + the_statements_clock_reading();
     p.valid_jd = true;
     p.is_utc = true;
     p.is_local = false;
     p.clear_ymd_hms_tz();
+}
+
+/// Milliseconds since the Unix epoch that `'now'` names.
+///
+/// SQLite reads the clock once for each `sqlite3_step()`, so every `'now'` a
+/// statement reads while it steps names the same moment: two columns one
+/// INSERT stamps agree, and so do the rows of one INSERT ... SELECT. Outside a
+/// step the clock is read each time.
+fn the_statements_clock_reading() -> i64 {
+    STEP_CLOCK.with(|clock| match clock.get() {
+        StepClock::Read(reading) => reading,
+        StepClock::Unread => {
+            let reading = read_the_clock();
+            clock.set(StepClock::Read(reading));
+            reading
+        }
+        StepClock::OutsideAStep => read_the_clock(),
+    })
+}
+
+fn read_the_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepClock {
+    OutsideAStep,
+    /// Inside a step that has not read the clock yet.
+    Unread,
+    Read(i64),
+}
+
+std::thread_local! {
+    static STEP_CLOCK: std::cell::Cell<StepClock> =
+        const { std::cell::Cell::new(StepClock::OutsideAStep) };
+}
+
+/// Runs one step of a statement with every `'now'` read inside it naming one
+/// moment, and keeps that moment in `held` so a step resumed after I/O reads
+/// it again.
+///
+/// A step run inside another — a trigger's statement, or any statement run
+/// inside [`read_the_clock_once`] — reads the moment of the one around it.
+pub fn step_reading_the_clock_once<T>(held: &mut Option<i64>, step: impl FnOnce() -> T) -> T {
+    if STEP_CLOCK.with(|clock| clock.get()) != StepClock::OutsideAStep {
+        return step();
+    }
+    let _outside_after = LeaveTheStep;
+    STEP_CLOCK.with(|clock| clock.set(held.map_or(StepClock::Unread, StepClock::Read)));
+    let result = step();
+    if let StepClock::Read(reading) = STEP_CLOCK.with(|clock| clock.get()) {
+        *held = Some(reading);
+    }
+    result
+}
+
+/// Runs `run` with every statement it steps reading the clock once between
+/// them, as if they were one statement.
+pub fn read_the_clock_once<T>(run: impl FnOnce() -> T) -> T {
+    step_reading_the_clock_once(&mut None, run)
+}
+
+/// Leaves the step when dropped, a panic included.
+struct LeaveTheStep;
+
+impl Drop for LeaveTheStep {
+    fn drop(&mut self) {
+        STEP_CLOCK.with(|clock| clock.set(StepClock::OutsideAStep));
+    }
 }
 
 fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {

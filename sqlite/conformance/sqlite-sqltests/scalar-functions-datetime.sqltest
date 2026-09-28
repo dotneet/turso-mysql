@@ -2558,3 +2558,15 @@ test unixepoch-just-past-lower-boundary {
 }
 expect {
 }
+
+# SQLite reads the clock once for each sqlite3_step(), so every 'now' one step
+# reads names the same moment, however long the step runs.
+test now-names-one-moment-for-the-whole-step {
+    SELECT count(DISTINCT moment), count(*) FROM (
+        WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 20000)
+        SELECT strftime('%Y-%m-%d %H:%M:%f', 'now') || julianday('now') AS moment FROM c
+    );
+}
+expect {
+    1|20000
+}

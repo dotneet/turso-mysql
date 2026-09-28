@@ -934,6 +934,9 @@ pub struct ProgramState {
     /// the statement wrote over no row, no table's rowid being zero.
     pub mysql_upserted_rowid: AtomicI64,
     pub pending_mysql_update_old_record: Option<(Option<i64>, ImmutableRecord)>,
+    /// The moment `'now'` names for the step under way, kept while the step
+    /// waits on I/O so that it reads the same moment when it resumes.
+    clock_reading: Option<i64>,
 }
 
 impl std::fmt::Debug for Program {
@@ -1011,6 +1014,7 @@ impl ProgramState {
             n_mysql_updated_rows: AtomicI64::new(0),
             mysql_upserted_rowid: AtomicI64::new(0),
             pending_mysql_update_old_record: None,
+            clock_reading: None,
             explain_state: RwLock::new(ExplainState::default()),
             pending_fail_error: None,
             pending_fail_prepare_error: None,
@@ -1169,6 +1173,7 @@ impl ProgramState {
         self.n_mysql_updated_rows.store(0, Ordering::SeqCst);
         self.mysql_upserted_rowid.store(0, Ordering::SeqCst);
         self.pending_mysql_update_old_record = None;
+        self.clock_reading = None;
         *self.explain_state.write() = ExplainState::default();
         self.pending_fail_error = None;
         self.pending_fail_prepare_error = None;
@@ -1819,16 +1824,29 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         state.execution_state = ProgramExecutionState::Running;
-        let result = match query_mode {
-            QueryMode::Normal => self.normal_step(state, pager, waker),
-            QueryMode::Explain => self.explain_step(state, pager),
-            QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Text,
-            } => self.explain_query_plan_step(state, pager),
-            QueryMode::ExplainQueryPlan {
-                format: EqpFormat::Json,
-            } => self.explain_query_plan_json_step(state, pager),
-        };
+        let mut clock_reading = state.clock_reading.take();
+        let result =
+            crate::functions::datetime::step_reading_the_clock_once(&mut clock_reading, || {
+                match query_mode {
+                    QueryMode::Normal => self.normal_step(state, pager, waker),
+                    QueryMode::Explain => self.explain_step(state, pager),
+                    QueryMode::ExplainQueryPlan {
+                        format: EqpFormat::Text,
+                    } => self.explain_query_plan_step(state, pager),
+                    QueryMode::ExplainQueryPlan {
+                        format: EqpFormat::Json,
+                    } => self.explain_query_plan_json_step(state, pager),
+                }
+            });
+        // SQLite reads the clock afresh for each `sqlite3_step()`, which ends
+        // with a row, the end of the statement or an error; a step waiting on
+        // I/O or yielding has not ended yet.
+        if matches!(
+            result,
+            Ok(StepResult::IO | StepResult::Yield | StepResult::Sleep { .. })
+        ) {
+            state.clock_reading = clock_reading;
+        }
         match &result {
             Ok(StepResult::Done) => {
                 state.execution_state = ProgramExecutionState::Done;
