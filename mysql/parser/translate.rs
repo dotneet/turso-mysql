@@ -5747,10 +5747,12 @@ fn render_update_assignment_value(
             let SetExpr::Select(select) = query.body.as_ref() else {
                 return unsupported("UPDATE assignment subquery body");
             };
-            let Some(ScalarSubqueryAnswer::TheColumnsOwnKind(read)) =
-                subquery_answering_one_value(select)
-            else {
-                return unsupported("UPDATE assignment subquery");
+            let read = match subquery_answering_one_value(select) {
+                Some(ScalarSubqueryAnswer::TheColumnsOwnKind(read)) => read,
+                Some(ScalarSubqueryAnswer::AWholeNumber) => {
+                    return render_set_count(query, written, render_context);
+                }
+                _ => return unsupported("UPDATE assignment subquery"),
             };
             let Some(source) = subquery_source_table(select) else {
                 return unsupported("UPDATE assignment subquery table");
@@ -5788,6 +5790,39 @@ fn render_update_assignment_value(
             Ok(rendered)
         }
     }
+}
+
+/// Renders `SET n = (SELECT COUNT(*) FROM ...)`, which is how Gitea keeps its
+/// counts — `UPDATE repository SET num_watches = (SELECT COUNT(*) FROM watch
+/// WHERE repo_id = ? AND mode <> 2) WHERE id = ?`.
+///
+/// A count over one implicit group answers exactly one whole number, so the
+/// column written is held to whole numbers once the frontend has said which
+/// those are; the engine refuses a count too large for it, as MySQL answers
+/// 1264. Nothing the subquery reads is a column of the answer, so it may join
+/// tables the way an `EXISTS` may.
+fn render_set_count(
+    query: &sqlparser::ast::Query,
+    written: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    render_context.falls_back_in_a_set = true;
+    if render_context.knows_the_integer_columns {
+        let holds_whole_numbers = render_context
+            .integer_columns
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(written))
+            && !render_context
+                .decimal_columns
+                .iter()
+                .any(|(known, _)| known.eq_ignore_ascii_case(written));
+        if !holds_whole_numbers {
+            return unsupported("UPDATE writing a count into a column that holds no whole number");
+        }
+    }
+    render_context.an_exists_may_join = true;
+    let (rendered, _) = render_subquery(query, render_context)?;
+    Ok(format!("({rendered})"))
 }
 
 /// Whether a `SET` value is a call writing whole numbers out as words into a
@@ -6568,8 +6603,9 @@ pub(crate) struct SelectRenderContext<'a> {
     pub(crate) bound_arithmetic_operands: Vec<crate::BoundArithmeticOperand>,
     /// The columns an `UPDATE` writes a `CAST(... AS JSON)` into.
     pub(crate) json_cast_columns: Vec<String>,
-    /// Whether an `UPDATE` reads a column through `COALESCE(col, n)`, which is
-    /// only taken once the kinds of the table's columns are known.
+    /// Whether an `UPDATE` reads a column through `COALESCE(col, n)` or writes
+    /// a `COUNT` into one, which is only taken once the kinds of the table's
+    /// columns are known.
     pub(crate) falls_back_in_a_set: bool,
     /// Whether the caller said which of the table's columns hold whole
     /// numbers, which a second reading of a DML statement does.

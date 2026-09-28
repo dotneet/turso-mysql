@@ -9107,11 +9107,18 @@ fn an_update_takes_one_value_out_of_another_table() {
         "UPDATE users SET score = (SELECT points FROM teams) WHERE id = 1",
         // A grouped subquery answers a row per group.
         "UPDATE users SET score = (SELECT MAX(points) FROM teams GROUP BY id) WHERE id = 1",
-        // A count says nothing about the kind of the column written.
-        "UPDATE users SET score = (SELECT COUNT(*) FROM teams) WHERE id = 1",
     ] {
         assert!(parse_dml(sql, mode).is_err(), "{sql}");
     }
+
+    // A count is written only once the column is known to hold whole numbers,
+    // which a first reading does not know.
+    let counted = parse_dml(
+        "UPDATE users SET score = (SELECT COUNT(*) FROM teams) WHERE id = 1",
+        mode,
+    )
+    .unwrap();
+    assert!(counted.falls_back_in_a_set());
 }
 
 /// `DEFAULT` written where a value goes asks for the column's own default.

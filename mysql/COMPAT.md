@@ -993,8 +993,11 @@ exactly one row, which an aggregate over one implicit group does — the same re
 comparison against a subquery is held to. A plain column does not, and MySQL answers 1242
 there, so that is refused. A subquery reading the table being changed is refused too, which is
 MySQL's 1093. The column written and the column read are held to the same kind, so a word into
-a column of numbers is turned away rather than coerced, and a `COUNT(*)` is refused because a
-count says nothing about the kind of the column it would be written into.
+a column of numbers is turned away rather than coerced. A `COUNT` answers one whole number, so
+it is written into a column holding whole numbers — Gitea keeps its counts with `UPDATE
+repository SET num_watches = (SELECT COUNT(*) FROM watch WHERE repo_id = ? AND mode <> 2)`, and
+a label's closed issues with a count over a join — and a count too large for the column is 1264
+as in MySQL; into a column of words, which MySQL writes the digits into, it is refused.
 
 `LIMIT 18446744073709551615 OFFSET n` is how MySQL is asked for every row after an offset, and
 its row counts run to a whole unsigned 64-bit number where the engine's run to a signed one.

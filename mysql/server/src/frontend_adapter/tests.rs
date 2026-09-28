@@ -24519,8 +24519,9 @@ fn an_update_takes_one_value_out_of_another_table() {
         "UPDATE t SET n = (SELECT MAX(word) FROM src) WHERE id = 1",
         // The source has no such column, so this reads the row being changed.
         "UPDATE t SET n = (SELECT MAX(n) FROM src) WHERE id = 1",
-        // A count says nothing about the kind of the column written.
-        "UPDATE t SET n = (SELECT COUNT(*) FROM src) WHERE id = 1",
+        // A count into a column of words is written as its digits by MySQL,
+        // a conversion not worked out here.
+        "UPDATE t SET name = (SELECT COUNT(*) FROM src) WHERE id = 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }

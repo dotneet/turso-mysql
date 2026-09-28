@@ -760,3 +760,82 @@ fn a_membership_test_reads_a_column_of_a_joined_statement() {
         Err(FrontendErrorKind::Unsupported)
     ));
 }
+
+/// Gitea keeps its counts with `UPDATE ... SET num_x = (SELECT COUNT(*) ...)`,
+/// joining tables inside for a label's closed issues. A count answers one
+/// whole number, so it is written into a column holding whole numbers; every
+/// row here is the one MySQL 8.4.11 left, and a count too large for the
+/// column is refused as MySQL refuses it.
+#[test]
+fn giteas_count_updates_write_a_count_into_a_whole_number_column() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `num_watches` INT NULL, `lower_name` VARCHAR(255) NULL, `tiny` TINYINT NULL)",
+        "CREATE TABLE `watch` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `mode` SMALLINT DEFAULT 1 NOT NULL)",
+        "CREATE TABLE `label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `num_issues` INT NULL, `num_closed_issues` INT NULL, `updated_unix` BIGINT(20) NULL)",
+        "CREATE TABLE `issue_label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `issue_id` BIGINT(20) NULL, `label_id` BIGINT(20) NULL)",
+        "CREATE TABLE `issue` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `is_closed` TINYINT(1) NULL)",
+        "INSERT INTO `repository` (`num_watches`) VALUES (0), (0)",
+        "INSERT INTO `watch` (`repo_id`, `mode`) VALUES (1, 1), (1, 2), (1, 1), (2, 3)",
+        "INSERT INTO `label` (`num_issues`) VALUES (0), (0)",
+        "INSERT INTO `issue` (`is_closed`) VALUES (0), (1), (1)",
+        "INSERT INTO `issue_label` (`issue_id`, `label_id`) VALUES (1, 1), (2, 1), (3, 1), (2, 2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let changed = prepared(
+        &mut adapter,
+        "UPDATE `repository` SET num_watches=(SELECT COUNT(*) FROM `watch` WHERE repo_id=? AND mode<>2) WHERE id=?",
+        &[Bound::Whole(1), Bound::Whole(1)],
+    );
+    assert!(matches!(
+        changed,
+        Ok(PreparedStatementExecutionResult::Ok(CommandOkResult {
+            affected_rows: 1,
+            ..
+        }))
+    ));
+    run(
+        &mut adapter,
+        "UPDATE `label` SET `updated_unix` = 5, `num_issues` = (SELECT count(*) FROM issue_label WHERE label_id=1), `num_closed_issues` = (SELECT count(*) FROM issue_label INNER JOIN issue ON issue_label.issue_id = issue.id WHERE issue.is_closed=1 AND issue_label.label_id=1) WHERE `id`=1",
+    );
+    let text = |value: &str| Some(value.to_owned());
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, num_watches FROM repository ORDER BY id"
+        ),
+        [[text("1"), text("2")], [text("2"), text("0")]]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, num_issues, num_closed_issues, updated_unix FROM label ORDER BY id"
+        ),
+        [
+            [text("1"), text("3"), text("2"), text("5")],
+            [text("2"), text("0"), None, None],
+        ]
+    );
+    // MySQL writes a count into a column of words as its digits, which is a
+    // conversion not worked out here.
+    assert!(matches!(
+        adapter.execute_query(
+            "UPDATE `repository` SET lower_name=(SELECT COUNT(*) FROM `watch` WHERE repo_id=1) WHERE id=2"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+    run(
+        &mut adapter,
+        &format!(
+            "INSERT INTO `watch` (`repo_id`) VALUES {}",
+            vec!["(9)"; 130].join(", ")
+        ),
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "UPDATE `repository` SET tiny=(SELECT COUNT(*) FROM `watch` WHERE repo_id=9) WHERE id=1"
+        ),
+        Err(FrontendErrorKind::OutOfRange)
+    ));
+}

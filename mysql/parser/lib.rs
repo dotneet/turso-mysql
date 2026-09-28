@@ -1598,9 +1598,9 @@ impl TranslatedDml {
         &self.bound_arithmetic_operands
     }
 
-    /// Reports whether an `UPDATE` reads a column through `COALESCE(col, n)`,
-    /// which a reading of the statement has to know the table's column kinds
-    /// to take.
+    /// Reports whether an `UPDATE` reads a column through `COALESCE(col, n)`
+    /// or writes a `COUNT` into one, which a reading of the statement has to
+    /// know the table's column kinds to take.
     pub fn falls_back_in_a_set(&self) -> bool {
         self.falls_back_in_a_set
     }
