@@ -767,6 +767,66 @@ fn include_reads_relations_through_derived_tables_sorted_across_them() {
     }
 }
 
+/// The app checks its connection with `SqlQuery<string>($"SELECT
+/// CONCAT(VERSION(), ' ', DATABASE()) AS Value").Single()`, which EF wraps in
+/// a derived table. It answered 1064.
+///
+/// Measured on MySQL 8.4.11: the `CONCAT` is a nullable `VAR_STRING` as long
+/// as its parts together, 24 + 4 + 256 = 284, with 31 decimals, which it
+/// loses through the derived table, naming it.
+#[test]
+fn the_connection_check_reads_the_version_and_database_through_a_derived_table() {
+    let (_directory, mut adapter) = adapter();
+    let checked = result_set(
+        &mut adapter,
+        "SELECT `s`.`Value`\nFROM (\n    SELECT CONCAT(VERSION(), ' ', DATABASE()) AS Value\n) AS `s`\nLIMIT 2",
+    );
+    let column = &checked.columns[0];
+    assert_eq!(
+        (
+            column.name.as_str(),
+            column.table.as_str(),
+            column.column_type,
+            column.column_length,
+            column.decimals,
+            column.flags
+        ),
+        ("Value", "s", MYSQL_TYPE_VAR_STRING, 284, 0, 0)
+    );
+    let [row] = checked.rows.as_slice() else {
+        panic!("one row, answered {:?}", checked.rows);
+    };
+    let [Some(value)] = row.as_slice() else {
+        panic!("one value, answered {row:?}");
+    };
+    assert!(value.ends_with(b" reports"), "{value:?}");
+
+    let plain = result_set(
+        &mut adapter,
+        "SELECT CONCAT(VERSION(), ' ', DATABASE()) AS Value",
+    );
+    assert_eq!(
+        (
+            plain.columns[0].table.as_str(),
+            plain.columns[0].column_length,
+            plain.columns[0].decimals
+        ),
+        ("", 284, 31)
+    );
+    let version = result_set(
+        &mut adapter,
+        "SELECT `s`.`Value` FROM (SELECT VERSION() AS Value) AS `s` LIMIT 2",
+    );
+    assert_eq!(
+        (
+            version.columns[0].column_length,
+            version.columns[0].decimals,
+            version.columns[0].flags
+        ),
+        (24, 0, MYSQL_NOT_NULL_FLAG)
+    );
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

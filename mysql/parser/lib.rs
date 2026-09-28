@@ -188,10 +188,10 @@ pub use select_projection_origins::{
 pub use serial_type::write_serial_out;
 pub use session_queries::{
     parse_optional_named_lock_query, parse_optional_select_database,
-    parse_optional_system_variable_query, parse_optional_user_variable_query, MySqlNamedLockCall,
-    MySqlNamedLockFunction, MySqlNamedLockQuery, MySqlSelectDatabaseQuery, MySqlSessionCall,
-    MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableQuery,
-    MySqlUserVariableRead,
+    parse_optional_system_variable_query, parse_optional_user_variable_query,
+    MySqlConcatenatedPart, MySqlNamedLockCall, MySqlNamedLockFunction, MySqlNamedLockQuery,
+    MySqlSelectDatabaseQuery, MySqlSessionCall, MySqlSystemVariableQuery, MySqlSystemVariableRead,
+    MySqlUserVariableQuery, MySqlUserVariableRead,
 };
 pub use session_settings::{
     parse_optional_session_settings, parse_optional_session_settings_with_parameters,

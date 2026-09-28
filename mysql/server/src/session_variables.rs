@@ -4,9 +4,10 @@ use std::time::Duration;
 use turso_mysql_parser::{
     parse_optional_select_database, parse_optional_session_settings, parse_optional_show_variables,
     parse_optional_system_variable_query, parse_optional_user_variable_query,
-    MySqlSelectDatabaseQuery, MySqlSessionCall, MySqlSessionSetting, MySqlShowVariablesCommand,
-    MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableAssignment,
-    MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
+    MySqlConcatenatedPart, MySqlSelectDatabaseQuery, MySqlSessionCall, MySqlSessionSetting,
+    MySqlShowVariablesCommand, MySqlSystemVariableQuery, MySqlSystemVariableRead,
+    MySqlUserVariableAssignment, MySqlUserVariableQuery, MySqlUserVariableValue,
+    MySqlVariableScope, SessionSqlMode,
 };
 
 use turso_mysql::MySqlIsolationLevel;
@@ -1555,6 +1556,12 @@ fn system_variable_result(
     let mut columns = Vec::with_capacity(query.reads().len());
     let mut row = Vec::with_capacity(query.reads().len());
     for read in query.reads() {
+        if !read.concatenated().is_empty() {
+            let (column, value) = concatenated_column(read, selected_database);
+            columns.push(column);
+            row.push(value);
+            continue;
+        }
         if let Some(call) = read.session_call() {
             let (column, value) = session_call_column(
                 read,
@@ -1610,12 +1617,55 @@ fn system_variable_result(
             row.push(Some(value.into_bytes()));
         }
     }
+    // Measured on MySQL 8.4.11: read through a derived table, the words keep
+    // their type, length and NOT NULL, name the derived table, and lose the
+    // 31 decimals a call's words carry.
+    if let Some(derived) = query.through_a_derived_table() {
+        for column in &mut columns {
+            derived.clone_into(&mut column.table);
+            column.decimals = 0;
+        }
+    }
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
         columns,
         rows: vec![row],
         warnings: 0,
         status_flags,
     }))
+}
+
+/// Answers `CONCAT(VERSION(), ' ', DATABASE())`, with the column MySQL reports
+/// it in.
+///
+/// Measured on MySQL 8.4.11: a `VAR_STRING` as long as its parts together —
+/// `VERSION()` 24, `DATABASE()` 256 and a word four bytes to each character
+/// it spells, so this one is 284 — with 31 decimals, and nullable whatever
+/// its parts are. It is NULL where `DATABASE()` is.
+fn concatenated_column(
+    read: &MySqlSystemVariableRead,
+    selected_database: Option<&str>,
+) -> (ColumnDefinitionConfig, Option<Vec<u8>>) {
+    let mut length = 0u32;
+    let mut value = Some(String::new());
+    for part in read.concatenated() {
+        let (width, spelled) = match part {
+            MySqlConcatenatedPart::Version => (24, Some(SERVER_VERSION)),
+            MySqlConcatenatedPart::Database => (256, selected_database),
+            MySqlConcatenatedPart::Word(word) => (
+                (word.chars().count() as u32).saturating_mul(4),
+                Some(word.as_str()),
+            ),
+        };
+        length = length.saturating_add(width);
+        value = value.zip(spelled).map(|(value, spelled)| value + spelled);
+    }
+    let mut column =
+        ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
+    column.catalog = "def".into();
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = length;
+    column.decimals = NOT_FIXED_DECIMALS;
+    (column, value.map(String::into_bytes))
 }
 
 /// What a `SELECT` of variables and session calls is answered from, beside

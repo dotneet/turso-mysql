@@ -3242,6 +3242,17 @@ that alone, measured. One reader answers every variable this server has an
 answer for, a row of them at a time, and a name it does not know is refused
 rather than answered with a value this server does not have.
 
+`CONCAT` over `VERSION()`, `DATABASE()` and words in quotes is answered the same
+way — an Entity Framework Core app checks its connection with
+`SqlQuery<string>($"SELECT CONCAT(VERSION(), ' ', DATABASE()) AS Value")`.
+Measured on 8.4.11, it is a `VAR_STRING` as long as its parts together
+(`VERSION()` 24, `DATABASE()` 256, a word four bytes to a character), with 31
+decimals, nullable whatever its parts are, and NULL with no database selected.
+EF reads a single value through a derived table, `SELECT s.Value FROM (SELECT
+... AS Value) AS s LIMIT 2`; `VERSION()`, `DATABASE()` and such a `CONCAT` are
+answered there too, measured to keep their type, length and NOT NULL, name the
+derived table and lose the 31 decimals.
+
 A client's opening `SET` statements are taken when the server is already in the
 state they ask for, and refused when they would change it. Every real client
 sends a handful of these before any work starts, so refusing them all ends the

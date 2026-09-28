@@ -78,6 +78,7 @@ pub fn parse_optional_select_database(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlSystemVariableQuery {
     reads: Vec<MySqlSystemVariableRead>,
+    through_a_derived_table: Option<String>,
 }
 
 impl MySqlSystemVariableQuery {
@@ -85,6 +86,26 @@ impl MySqlSystemVariableQuery {
     pub fn reads(&self) -> &[MySqlSystemVariableRead] {
         &self.reads
     }
+
+    /// Returns the name of the derived table the statement reads its one
+    /// value through, when it reads one: Entity Framework Core's `SqlQuery`
+    /// wraps the app's statement as `SELECT s.Value FROM (SELECT ... AS Value)
+    /// AS s LIMIT 2`.
+    pub fn through_a_derived_table(&self) -> Option<&str> {
+        self.through_a_derived_table.as_deref()
+    }
+}
+
+/// One part of a `CONCAT` a session answers on its own —
+/// `CONCAT(VERSION(), ' ', DATABASE())`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlConcatenatedPart {
+    /// `VERSION()`.
+    Version,
+    /// `DATABASE()` or `SCHEMA()`.
+    Database,
+    /// A word written in quotes.
+    Word(String),
 }
 
 /// A call answering what the session knows about itself rather than a
@@ -119,10 +140,16 @@ pub struct MySqlSystemVariableRead {
     session_named: bool,
     called: bool,
     zone_conversion: Option<(String, String)>,
+    concatenated: Vec<MySqlConcatenatedPart>,
     column_name: String,
 }
 
 impl MySqlSystemVariableRead {
+    /// Returns what a `CONCAT` joins, or nothing when this reads no `CONCAT`.
+    pub fn concatenated(&self) -> &[MySqlConcatenatedPart] {
+        &self.concatenated
+    }
+
     /// Returns the variable named, without the `@@` or a scope prefix.
     pub fn name(&self) -> &str {
         &self.name
@@ -195,6 +222,9 @@ pub fn parse_optional_system_variable_query(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlSystemVariableQuery>, ParseError> {
+    if let Some(query) = read_through_a_derived_table(sql, mode)? {
+        return Ok(Some(query));
+    }
     let mut scanner = Scanner::new(sql, mode);
     scanner.skip_gaps();
     if !scanner.take_keyword("SELECT") {
@@ -226,7 +256,116 @@ pub fn parse_optional_system_variable_query(
     if !scanner.at_end() {
         return Ok(None);
     }
-    Ok(Some(MySqlSystemVariableQuery { reads }))
+    Ok(Some(MySqlSystemVariableQuery {
+        reads,
+        through_a_derived_table: None,
+    }))
+}
+
+/// Reads `SELECT s.Value FROM (SELECT <one word the session knows> AS Value)
+/// AS s [LIMIT n]`, which is how Entity Framework Core's
+/// `Database.SqlQuery<string>(...).Single()` asks for `VERSION()`,
+/// `DATABASE()` or a `CONCAT` of them.
+///
+/// Only those words are read through a derived table; measured on MySQL
+/// 8.4.11, each keeps its type, length and NOT NULL there and loses the 31
+/// decimals a call's words carry.
+fn read_through_a_derived_table(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlSystemVariableQuery>, ParseError> {
+    let mut scanner = Scanner::new(sql, mode);
+    scanner.skip_gaps();
+    if !scanner.take_keyword("SELECT") {
+        return Ok(None);
+    }
+    scanner.skip_gaps();
+    let Some(qualifier) = scanner.take_alias_name() else {
+        return Ok(None);
+    };
+    if !scanner.take_byte(b'.') {
+        return Ok(None);
+    }
+    let Some(column) = scanner.take_alias_name() else {
+        return Ok(None);
+    };
+    scanner.skip_gaps();
+    if !scanner.take_keyword("FROM") {
+        return Ok(None);
+    }
+    scanner.skip_gaps();
+    if !scanner.at_byte(b'(') {
+        return Ok(None);
+    }
+    let Some(closing) = closing_parenthesis(sql, scanner.cursor) else {
+        return Ok(None);
+    };
+    let inner = &sql[scanner.cursor + 1..closing];
+    scanner.cursor = closing + 1;
+    scanner.skip_gaps();
+    let Some(alias) = scanner.take_alias()? else {
+        return Ok(None);
+    };
+    if !alias.eq_ignore_ascii_case(&qualifier) {
+        return Ok(None);
+    }
+    scanner.skip_gaps();
+    if scanner.take_keyword("LIMIT") {
+        scanner.skip_gaps();
+        if !matches!(scanner.take_whole_number(), Some(limit) if limit > 0) {
+            return Ok(None);
+        }
+    }
+    if !scanner.at_end() {
+        return Ok(None);
+    }
+    let Some(mut query) = parse_optional_system_variable_query(inner, mode)? else {
+        return Ok(None);
+    };
+    let [read] = query.reads.as_mut_slice() else {
+        return Ok(None);
+    };
+    let reads_words = read.called
+        || !read.concatenated.is_empty()
+        || read.session_call == Some(MySqlSessionCall::Database);
+    if query.through_a_derived_table.is_some()
+        || !reads_words
+        || !read.column_name.eq_ignore_ascii_case(&column)
+    {
+        return Ok(None);
+    }
+    read.column_name = column;
+    query.through_a_derived_table = Some(alias);
+    Ok(Some(query))
+}
+
+/// The place of the parenthesis closing the one opened at `open`, past
+/// anything quoted in between.
+fn closing_parenthesis(sql: &str, open: usize) -> Option<usize> {
+    let bytes = sql.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut at = open;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        match quote {
+            Some(closing) if byte == closing => quote = None,
+            Some(_) => {}
+            None => match byte {
+                b'\'' | b'"' | b'`' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            },
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Reads one `@@name` or `VERSION()`, with the alias that may follow it.
@@ -240,7 +379,14 @@ fn take_system_variable_read(
     let mut called = false;
     let mut zone_conversion = None;
     let mut session_call = None;
-    let name = if scanner.take_keyword("CONVERT_TZ") {
+    let mut concatenated = Vec::new();
+    let name = if scanner.take_keyword("CONCAT") {
+        let Some(parts) = take_concatenated_parts(scanner) else {
+            return Ok(None);
+        };
+        concatenated = parts;
+        String::new()
+    } else if scanner.take_keyword("CONVERT_TZ") {
         let Some(zones) = take_zone_conversion_probe(scanner) else {
             return Ok(None);
         };
@@ -300,8 +446,52 @@ fn take_system_variable_read(
         session_named,
         called,
         zone_conversion,
+        concatenated,
         column_name: alias.unwrap_or(expression),
     }))
+}
+
+/// Reads the parts of `CONCAT(...)` after its name: `VERSION()`,
+/// `DATABASE()`, `SCHEMA()` and words in quotes, or nothing for anything
+/// else.
+fn take_concatenated_parts(scanner: &mut Scanner) -> Option<Vec<MySqlConcatenatedPart>> {
+    scanner.skip_gaps();
+    if !scanner.take_byte(b'(') {
+        return None;
+    }
+    let mut parts = Vec::new();
+    loop {
+        scanner.skip_gaps();
+        let part = if scanner.take_keyword("VERSION") {
+            MySqlConcatenatedPart::Version
+        } else if scanner.take_keyword("DATABASE") || scanner.take_keyword("SCHEMA") {
+            MySqlConcatenatedPart::Database
+        } else {
+            let Some(Some(word)) = scanner.take_nullable_string() else {
+                return None;
+            };
+            parts.push(MySqlConcatenatedPart::Word(word));
+            scanner.skip_gaps();
+            if scanner.take_byte(b',') {
+                continue;
+            }
+            return scanner.take_byte(b')').then_some(parts);
+        };
+        scanner.skip_gaps();
+        if !scanner.take_byte(b'(') {
+            return None;
+        }
+        scanner.skip_gaps();
+        if !scanner.take_byte(b')') {
+            return None;
+        }
+        parts.push(part);
+        scanner.skip_gaps();
+        if scanner.take_byte(b',') {
+            continue;
+        }
+        return scanner.take_byte(b')').then_some(parts);
+    }
 }
 
 /// Reads one call answering what the session knows about itself.
@@ -1194,6 +1384,39 @@ mod tests {
             column_name("SELECT DATABASE() -- x").as_deref(),
             Some("DATABASE()")
         );
+    }
+
+    #[test]
+    fn reads_a_concatenation_of_session_words_through_a_derived_table() {
+        let read = |sql| parse_optional_system_variable_query(sql, SessionSqlMode::default());
+        let query = read(
+            "SELECT `s`.`Value`\nFROM (\n    SELECT CONCAT(VERSION(), ' ', DATABASE()) AS Value\n) AS `s`\nLIMIT 2",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(query.through_a_derived_table(), Some("s"));
+        let [concatenated] = query.reads() else {
+            panic!("one read, answered {query:?}");
+        };
+        assert_eq!(concatenated.column_name(), "Value");
+        assert_eq!(
+            concatenated.concatenated(),
+            [
+                MySqlConcatenatedPart::Version,
+                MySqlConcatenatedPart::Word(" ".to_owned()),
+                MySqlConcatenatedPart::Database
+            ]
+        );
+        for other in [
+            "SELECT s.Value FROM (SELECT CONCAT(VERSION(), name) AS Value) AS s",
+            "SELECT s.Value FROM (SELECT @@wait_timeout AS Value) AS s",
+            "SELECT s.Value FROM (SELECT VERSION() AS Value) AS t",
+            "SELECT s.Other FROM (SELECT VERSION() AS Value) AS s",
+            "SELECT s.Value FROM (SELECT VERSION() AS Value, DATABASE()) AS s",
+            "SELECT s.Value FROM (SELECT VERSION() AS Value) AS s LIMIT 0",
+        ] {
+            assert_eq!(read(other).unwrap(), None, "{other}");
+        }
     }
 
     #[test]
