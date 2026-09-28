@@ -15,11 +15,116 @@
 //!   one inside a key, `HAVING DATE(created_at) > ...` under `GROUP BY
 //!   DATE(created_at)`. It may name the projection's aliases.
 //!
-//! MySQL also lets a column through when the key it depends on is a primary
-//! key — `SELECT id, name ... GROUP BY id` — which is not worked out here, so
-//! that form stays refused.
+//! MySQL also lets a column through when the keys decide it: they hold a
+//! table's primary key, or a unique key whose columns are all `NOT NULL`, and
+//! so decide the whole row — `SELECT name ... GROUP BY id` — also across a
+//! join that matches one table's column to another's. Which keys a table has
+//! is the frontend's to know, so such a column is recorded here with what the
+//! statement's joins say, in a [`MySqlColumnsTheKeysDecide`], and checked
+//! there.
 
 use super::*;
+
+/// A column a grouped statement names, with the table name or the alias it
+/// was written with, when it was written with one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlNamedColumn {
+    table: Option<String>,
+    column: String,
+}
+
+impl MySqlNamedColumn {
+    /// Returns the table name or alias the column was written with.
+    pub fn table(&self) -> Option<&str> {
+        self.table.as_deref()
+    }
+
+    /// Returns the column's name.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    fn written(column: GroupedColumn<'_>) -> Self {
+        Self {
+            table: column.0.map(|table| table.value.clone()),
+            column: column.1.value.clone(),
+        }
+    }
+}
+
+/// The columns a grouped statement projects beside its keys, which MySQL
+/// takes only when the keys decide them.
+///
+/// Measured on MySQL 8.4.11 under `ONLY_FULL_GROUP_BY`: keys holding a
+/// table's primary key, or a unique key whose columns are all `NOT NULL`,
+/// decide every column of that table — `SELECT name ... GROUP BY id` and
+/// `GROUP BY email` pass, a unique key over a nullable column does not, and
+/// neither does `GROUP BY id + 0`. A join's `ON` carries a decided column to
+/// the column it is matched with: `users u JOIN posts p ON u.id = p.user_id
+/// GROUP BY p.id` decides `u.name`. A `LEFT JOIN` carries one only from the
+/// tables before it to the table it adds, and only when every column of those
+/// tables its `ON` names is decided: `posts p LEFT JOIN users u ON u.id =
+/// p.user_id GROUP BY p.id` decides `u.name`, `users u LEFT JOIN posts p ...
+/// GROUP BY p.id` does not decide `u.name`, and neither does an `ON` joined by
+/// `OR` or one also naming a column the keys do not decide. A table's keys
+/// decide its own columns on either side of a `LEFT JOIN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlColumnsTheKeysDecide {
+    keys: Vec<MySqlNamedColumn>,
+    columns: Vec<MySqlNamedColumn>,
+    joins: Vec<MySqlJoinedTable>,
+}
+
+impl MySqlColumnsTheKeysDecide {
+    /// Returns the grouping keys that are whole columns.
+    pub fn keys(&self) -> &[MySqlNamedColumn] {
+        &self.keys
+    }
+
+    /// Returns the projected columns the keys have to decide.
+    pub fn columns(&self) -> &[MySqlNamedColumn] {
+        &self.columns
+    }
+
+    /// Returns each table the statement joins to its first, in order.
+    pub fn joins(&self) -> &[MySqlJoinedTable] {
+        &self.joins
+    }
+}
+
+/// One table a statement joins, and what its `ON` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlJoinedTable {
+    reference: String,
+    left_join: bool,
+    matched_columns: Vec<(MySqlNamedColumn, MySqlNamedColumn)>,
+    other_columns: Option<Vec<MySqlNamedColumn>>,
+}
+
+impl MySqlJoinedTable {
+    /// Returns the name the joined table goes by: its alias, or its own name.
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// Reports whether this is a `LEFT JOIN`, which keeps a row of the tables
+    /// before it that it finds no match for.
+    pub fn left_join(&self) -> bool {
+        self.left_join
+    }
+
+    /// Returns each pair of columns the `ON` matches with `=`, standing on its
+    /// own or among others joined by `AND`.
+    pub fn matched_columns(&self) -> &[(MySqlNamedColumn, MySqlNamedColumn)] {
+        &self.matched_columns
+    }
+
+    /// Returns every column the rest of the `ON` names, or nothing when the
+    /// rest is written in a form not read here.
+    pub fn other_columns(&self) -> Option<&[MySqlNamedColumn]> {
+        self.other_columns.as_deref()
+    }
+}
 
 /// Renders a `GROUP BY` and holds the projection to `ONLY_FULL_GROUP_BY`.
 ///
@@ -28,9 +133,11 @@ use super::*;
 /// so the engine groups on the value the client reads back.
 pub(super) fn render_select_group_by(
     group_by: &[Expr],
-    projection: &[SelectItem],
+    select: &sqlparser::ast::Select,
+    outer_statement: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    let projection = select.projection.as_slice();
     let mut rendered = Vec::with_capacity(group_by.len());
     for key in group_by {
         // A key naming the projection's alias for an expression groups by
@@ -52,6 +159,7 @@ pub(super) fn render_select_group_by(
         }
         rendered.push(render_select_expr(key, render_context)?);
     }
+    let mut decided = Vec::new();
     for item in projection {
         let expr = match item {
             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -59,11 +167,198 @@ pub(super) fn render_select_group_by(
             // the rule and is refused rather than let through.
             _ => return unsupported("GROUP BY with a wildcard projection"),
         };
-        if !answers_one_value_per_group(expr, group_by) && !is_named_by_a_key(item, group_by) {
-            return unsupported("GROUP BY leaves a projected column out of the grouping");
+        if answers_one_value_per_group(expr, group_by) || is_named_by_a_key(item, group_by) {
+            continue;
+        }
+        match columns_beside_the_keys(expr, group_by) {
+            Some(columns) if outer_statement => decided.extend(columns),
+            _ => return unsupported("GROUP BY leaves a projected column out of the grouping"),
         }
     }
+    if !decided.is_empty() {
+        let Some(joins) = joined_tables(&select.from) else {
+            return unsupported("GROUP BY keys deciding a column over this FROM");
+        };
+        render_context.columns_the_keys_decide = Some(MySqlColumnsTheKeysDecide {
+            keys: group_by
+                .iter()
+                .filter_map(grouped_column)
+                .map(MySqlNamedColumn::written)
+                .collect(),
+            columns: decided,
+            joins,
+        });
+    }
     Ok(rendered.join(", "))
+}
+
+/// Returns the columns an expression names outside its aggregates that are
+/// not grouping keys, when it names nothing else a group has more than one
+/// of.
+fn columns_beside_the_keys(expr: &Expr, group_by: &[Expr]) -> Option<Vec<MySqlNamedColumn>> {
+    let whole_column_keys = group_by
+        .iter()
+        .filter(|key| grouped_column(key).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut columns = Vec::new();
+    reads_only(expr, &mut |read| {
+        if group_by
+            .iter()
+            .any(|key| names_the_same_expression(key, read))
+            || names_a_whole_column_key(read, &whole_column_keys)
+        {
+            return true;
+        }
+        match grouped_column(read) {
+            Some(column) => {
+                columns.push(MySqlNamedColumn::written(column));
+                true
+            }
+            None => false,
+        }
+    })
+    .then_some(columns)
+}
+
+/// Reads what each join of a `FROM` says, for a `FROM` of one table and the
+/// tables joined to it by `JOIN` or `LEFT JOIN` with an `ON`, each a table
+/// under its own name or an alias.
+///
+/// Anything else — a comma, `USING`, a `RIGHT JOIN`, a derived table — has
+/// not been measured and answers nothing, which refuses the column.
+fn joined_tables(from: &[sqlparser::ast::TableWithJoins]) -> Option<Vec<MySqlJoinedTable>> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let [sqlparser::ast::TableWithJoins { relation, joins }] = from else {
+        return None;
+    };
+    table_reference(relation)?;
+    joins
+        .iter()
+        .map(|join| {
+            let (left_join, on) = match &join.join_operator {
+                JoinOperator::Join(JoinConstraint::On(on))
+                | JoinOperator::Inner(JoinConstraint::On(on)) => (false, on),
+                JoinOperator::Left(JoinConstraint::On(on))
+                | JoinOperator::LeftOuter(JoinConstraint::On(on)) => (true, on),
+                _ => return None,
+            };
+            let mut matched_columns = Vec::new();
+            let mut other_columns = Some(Vec::new());
+            for condition in conditions_joined_by_and(on) {
+                if let Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Eq,
+                    right,
+                } = condition
+                {
+                    if let (Some(left), Some(right)) = (
+                        grouped_column(without_parentheses(left)),
+                        grouped_column(without_parentheses(right)),
+                    ) {
+                        matched_columns.push((
+                            MySqlNamedColumn::written(left),
+                            MySqlNamedColumn::written(right),
+                        ));
+                        continue;
+                    }
+                }
+                if let Some(columns) = other_columns.as_mut() {
+                    if !columns_named_in(condition, columns) {
+                        other_columns = None;
+                    }
+                }
+            }
+            Some(MySqlJoinedTable {
+                reference: table_reference(&join.relation)?,
+                left_join,
+                matched_columns,
+                other_columns,
+            })
+        })
+        .collect()
+}
+
+/// Returns the name a table in a `FROM` goes by, when it is a plain table.
+fn table_reference(relation: &TableFactor) -> Option<String> {
+    let TableFactor::Table {
+        name,
+        alias,
+        args: None,
+        with_hints,
+        version: None,
+        partitions,
+        ..
+    } = relation
+    else {
+        return None;
+    };
+    if !with_hints.is_empty() || !partitions.is_empty() {
+        return None;
+    }
+    if let Some(alias) = alias {
+        return alias.columns.is_empty().then(|| alias.name.value.clone());
+    }
+    match name.0.last()? {
+        ObjectNamePart::Identifier(table) => Some(table.value.clone()),
+        _ => None,
+    }
+}
+
+/// Splits a condition into the parts `AND` joins, through parentheses.
+fn conditions_joined_by_and(condition: &Expr) -> Vec<&Expr> {
+    match without_parentheses(condition) {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut conditions = conditions_joined_by_and(left);
+            conditions.extend(conditions_joined_by_and(right));
+            conditions
+        }
+        condition => vec![condition],
+    }
+}
+
+fn without_parentheses(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Nested(inner) => without_parentheses(inner),
+        expr => expr,
+    }
+}
+
+/// Adds every column an expression names to `columns`, and reports whether
+/// it is written in a form this reads through.
+fn columns_named_in(expr: &Expr, columns: &mut Vec<MySqlNamedColumn>) -> bool {
+    if let Some(column) = grouped_column(expr) {
+        columns.push(MySqlNamedColumn::written(column));
+        return true;
+    }
+    match expr {
+        Expr::Value(_) => true,
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner) => columns_named_in(inner, columns),
+        Expr::BinaryOp { left, right, .. } => {
+            columns_named_in(left, columns) && columns_named_in(right, columns)
+        }
+        Expr::InList { expr, list, .. } => {
+            columns_named_in(expr, columns)
+                && list.iter().all(|member| columns_named_in(member, columns))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            columns_named_in(expr, columns)
+                && columns_named_in(low, columns)
+                && columns_named_in(high, columns)
+        }
+        _ => false,
+    }
 }
 
 /// Reports whether a grouping key is a call the engine groups the way MySQL
@@ -120,7 +415,7 @@ pub(super) fn hold_the_grouped_having(
         .filter(|key| grouped_column(key).is_some())
         .cloned()
         .collect::<Vec<_>>();
-    if !reads_only(having, &|expr| match expr {
+    if !reads_only(having, &mut |expr| match expr {
         Expr::Identifier(name) if names_an_alias(name) => true,
         _ => names_a_whole_column_key(expr, &whole_column_keys),
     }) {
@@ -222,7 +517,7 @@ fn answers_one_value_per_group(expr: &Expr, group_by: &[Expr]) -> bool {
         .filter(|key| grouped_column(key).is_some())
         .cloned()
         .collect::<Vec<_>>();
-    reads_only(expr, &|read| {
+    reads_only(expr, &mut |read| {
         group_by
             .iter()
             .any(|key| names_the_same_expression(key, read))
@@ -246,7 +541,7 @@ fn names_a_whole_column_key(expr: &Expr, whole_column_keys: &[Expr]) -> bool {
 /// whole grouping key is taken as one. A column it does not take, and
 /// anything this does not know how to walk — a subquery, a window — answers
 /// false, which refuses the statement rather than guessing.
-fn reads_only(expr: &Expr, allowed: &dyn Fn(&Expr) -> bool) -> bool {
+fn reads_only(expr: &Expr, allowed: &mut dyn FnMut(&Expr) -> bool) -> bool {
     if allowed(expr) {
         return true;
     }

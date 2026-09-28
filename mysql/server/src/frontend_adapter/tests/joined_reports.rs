@@ -322,3 +322,188 @@ fn laravel_groups_a_join_by_a_unique_column_and_filters_by_an_alias() {
     );
     assert_eq!(answered, expected);
 }
+
+/// Django's `User.objects.annotate(post_count=Count("posts"),
+/// views=Sum("posts__views")).filter(post_count__gte=2)` groups by the
+/// primary key alone and projects the name beside it, which MySQL's
+/// `ONLY_FULL_GROUP_BY` takes because the key decides the row. Its tag
+/// counts group a `LEFT OUTER JOIN` by the tag's key the same way.
+///
+/// Measured, MySQL keeps the binary flag on the first statement's count and
+/// total. It sorts the second through a temporary table for its `ORDER BY 2
+/// DESC`, where the count loses the binary flag and the name its unique-key
+/// flags; this reports the shapes a statement read without one answers.
+#[test]
+fn django_projects_a_column_the_primary_key_it_groups_by_decides() {
+    let (_directory, mut adapter) = adapter_over(SIGNED_IDS);
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT `users`.`name` AS `name`, COUNT(`posts`.`id`) AS `post_count`, SUM(`posts`.`views`) AS `views` FROM `users` LEFT OUTER JOIN `posts` ON (`users`.`id` = `posts`.`user_id`) GROUP BY `users`.`id` HAVING COUNT(`posts`.`id`) >= 2 ORDER BY `users`.`id` ASC",
+    );
+    assert_eq!(
+        shapes,
+        [
+            shape("name", MYSQL_TYPE_VAR_STRING, 400, 0, WORDS),
+            shape("post_count", MYSQL_TYPE_LONGLONG, 21, 0, COUNTED),
+            shape("views", MYSQL_TYPE_NEWDECIMAL, 33, 0, AGGREGATED),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("Alice"), Some("2"), Some("15")],
+            &[Some("Bob"), Some("2"), Some("1")],
+        ])
+    );
+
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT `tags`.`name` AS `name`, COUNT(`post_tag`.`post_id`) AS `n` FROM `tags` LEFT OUTER JOIN `post_tag` ON (`tags`.`id` = `post_tag`.`tag_id`) GROUP BY `tags`.`id` HAVING COUNT(`post_tag`.`post_id`) > 0 ORDER BY 2 DESC, 1 ASC",
+    );
+    assert_eq!(
+        shapes,
+        [
+            shape(
+                "name",
+                MYSQL_TYPE_VAR_STRING,
+                200,
+                0,
+                WORDS | MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG
+            ),
+            shape("n", MYSQL_TYPE_LONGLONG, 21, 0, COUNTED),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("news"), Some("2")],
+            &[Some("python"), Some("2")],
+            &[Some("sql"), Some("1")],
+        ])
+    );
+}
+
+/// Which columns a grouping's keys decide, measured on MySQL 8.4.11 over the
+/// same tables: a primary key and a unique key over `NOT NULL` columns decide
+/// their table's row, a join's `ON` carries a decided column to the column it
+/// matches, and a `LEFT JOIN` carries one only to the table it adds, when
+/// every column of the tables before it that its `ON` names is decided. Each
+/// refused statement is one MySQL answers 1055 for.
+#[test]
+fn a_column_stands_beside_the_keys_only_when_they_decide_it() {
+    let (_directory, mut adapter) = adapter_over(UNSIGNED_IDS);
+    for sql in [
+        "CREATE TABLE loose (a INT, b INT UNIQUE, c INT)",
+        "INSERT INTO loose VALUES (1, 1, 1), (1, 2, 2)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let mut sorted = |sql: &str| {
+        let (_, mut answered) = report(&mut adapter, sql);
+        answered.sort();
+        answered
+    };
+    assert_eq!(
+        sorted("SELECT id, name FROM users GROUP BY id"),
+        rows(&[
+            &[Some("1"), Some("Alice")],
+            &[Some("2"), Some("Bob")],
+            &[Some("3"), Some("Carol")],
+        ])
+    );
+    assert_eq!(
+        sorted("SELECT email, name FROM users GROUP BY email"),
+        rows(&[
+            &[Some("alice@example.com"), Some("Alice")],
+            &[Some("bob@example.com"), Some("Bob")],
+            &[Some("carol@example.com"), Some("Carol")],
+        ])
+    );
+    let every_post = rows(&[
+        &[Some("Bob post"), Some("Bob")],
+        &[Some("Draft"), Some("Bob")],
+        &[Some("Hello"), Some("Alice")],
+        &[Some("Second"), Some("Alice")],
+    ]);
+    assert_eq!(
+        sorted(
+            "SELECT p.title, u.name FROM users u JOIN posts p ON u.id = p.user_id GROUP BY p.id"
+        ),
+        every_post
+    );
+    assert_eq!(
+        sorted(
+            "SELECT p.title, u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id GROUP BY p.id"
+        ),
+        every_post
+    );
+    assert_eq!(
+        sorted("SELECT p.title FROM users u LEFT JOIN posts p ON u.id = p.user_id GROUP BY p.id"),
+        rows(&[
+            &[None],
+            &[Some("Bob post")],
+            &[Some("Draft")],
+            &[Some("Hello")],
+            &[Some("Second")],
+        ])
+    );
+    assert_eq!(
+        sorted(
+            "SELECT u.name FROM posts p LEFT JOIN users u ON p.user_id = u.id AND u.is_active = 1 GROUP BY p.user_id"
+        ),
+        rows(&[&[Some("Alice")], &[Some("Bob")]])
+    );
+    assert_eq!(
+        sorted(
+            "SELECT pt.tag_id, p.title FROM post_tag pt JOIN posts p ON p.id = pt.post_id GROUP BY pt.post_id, pt.tag_id"
+        ),
+        rows(&[
+            &[Some("1"), Some("Hello")],
+            &[Some("1"), Some("Second")],
+            &[Some("2"), Some("Second")],
+            &[Some("3"), Some("Bob post")],
+            &[Some("3"), Some("Hello")],
+        ])
+    );
+    assert_eq!(
+        sorted("SELECT UPPER(name) FROM users GROUP BY id"),
+        rows(&[&[Some("ALICE")], &[Some("BOB")], &[Some("CAROL")]])
+    );
+    assert_eq!(
+        sorted(
+            "SELECT u.name, t.name FROM users u JOIN posts p ON p.user_id = u.id JOIN post_tag pt ON pt.post_id = p.id JOIN tags t ON t.id = pt.tag_id GROUP BY p.id, t.id"
+        ),
+        rows(&[
+            &[Some("Alice"), Some("news")],
+            &[Some("Alice"), Some("python")],
+            &[Some("Alice"), Some("python")],
+            &[Some("Alice"), Some("sql")],
+            &[Some("Bob"), Some("news")],
+        ])
+    );
+
+    for sql in [
+        // A unique key over a column that may be NULL decides nothing.
+        "SELECT b, c FROM loose GROUP BY b",
+        "SELECT a, c FROM loose GROUP BY a",
+        // The table a `LEFT JOIN` adds decides nothing before it.
+        "SELECT p.title, u.name FROM users u LEFT JOIN posts p ON u.id = p.user_id GROUP BY p.id",
+        "SELECT u.name FROM users u LEFT JOIN posts p ON u.id = p.user_id GROUP BY p.user_id",
+        "SELECT p.title FROM posts p LEFT JOIN users u ON u.id = p.user_id GROUP BY u.id",
+        // The `ON` names `p.id`, which the key does not decide.
+        "SELECT u.name FROM posts p LEFT JOIN users u ON p.user_id = p.id AND u.id = p.user_id GROUP BY p.user_id",
+        // Part of a primary key decides nothing, and a key inside an
+        // expression is no key.
+        "SELECT pt.tag_id FROM post_tag pt GROUP BY pt.post_id",
+        "SELECT name FROM users GROUP BY id + 0",
+    ] {
+        assert!(is_refused(&mut adapter, sql), "{sql}");
+    }
+    // How MySQL writes such a view out and reads it back has not been
+    // measured.
+    assert!(adapter
+        .execute_query("CREATE VIEW named_by_id AS SELECT id, name FROM users GROUP BY id")
+        .is_err());
+}

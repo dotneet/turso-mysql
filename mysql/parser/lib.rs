@@ -210,7 +210,10 @@ pub use temporal_value::{
     normalize_time_with_precision, normalize_year, seconds_in_the_time, time_of_seconds,
     year_from_number,
 };
-pub use translate::{MySqlCatalogTable, MySqlDerivedColumns, MySqlSelectSource};
+pub use translate::{
+    MySqlCatalogTable, MySqlColumnsTheKeysDecide, MySqlDerivedColumns, MySqlJoinedTable,
+    MySqlNamedColumn, MySqlSelectSource,
+};
 pub use trigger_definition::{
     mysql_create_trigger_ddl, trigger_body_readings, trigger_written_as_mysql_keeps_it,
     written_trigger, MySqlTriggerBody, MySqlTriggerEvent, MySqlTriggerTiming, MySqlTriggerValue,
@@ -1012,6 +1015,7 @@ pub struct TranslatedSelect {
     /// Whether `SQL_CALC_FOUND_ROWS` asked for the rows the statement answers
     /// without its `LIMIT`.
     calculates_found_rows: bool,
+    columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
     collation_sensitive_call_columns: Vec<String>,
     json_reading_columns: Vec<String>,
     reads_table: bool,
@@ -1857,6 +1861,12 @@ impl TranslatedSelect {
     /// answers without its `LIMIT`, which running it notes on the connection.
     pub const fn calculates_found_rows(&self) -> bool {
         self.calculates_found_rows
+    }
+
+    /// Returns the columns a grouped statement projects beside its keys,
+    /// which it may name only when the keys decide them.
+    pub const fn columns_the_keys_decide(&self) -> Option<&MySqlColumnsTheKeysDecide> {
+        self.columns_the_keys_decide.as_ref()
     }
 
     /// Returns which parameters stand where a row count is written.
@@ -4531,6 +4541,7 @@ fn parse_select_inner(
         checked_subquery_comparisons,
         concatenates_groups,
         calculates_found_rows,
+        columns_the_keys_decide,
     } = translate_select_query(
         &query,
         sql,
@@ -4571,6 +4582,7 @@ fn parse_select_inner(
         parameter_count,
         concatenates_groups,
         calculates_found_rows,
+        columns_the_keys_decide,
     })
 }
 

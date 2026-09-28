@@ -3301,11 +3301,66 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         "SELECT date(\"joined\") AS \"d\", COUNT(*) AS \"COUNT(*)\" FROM \"users\" GROUP BY date(\"joined\") HAVING (date(\"joined\") > '2026-01-01') ORDER BY \"d\" ASC"
     );
 
+    // A column beside the keys is left to the frontend, which knows whether
+    // the keys hold a key of its table and so decide it.
+    let translated = parse_select(
+        "SELECT team, score FROM users GROUP BY team",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let decided = translated
+        .columns_the_keys_decide()
+        .expect("score is not a key");
+    assert_eq!(
+        decided
+            .columns()
+            .iter()
+            .map(|column| (column.table(), column.column()))
+            .collect::<Vec<_>>(),
+        [(None, "score")]
+    );
+    assert_eq!(
+        decided
+            .keys()
+            .iter()
+            .map(|column| (column.table(), column.column()))
+            .collect::<Vec<_>>(),
+        [(None, "team")]
+    );
+    let translated = parse_select(
+        "SELECT u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id AND u.active = 1 GROUP BY p.id",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let [join] = translated.columns_the_keys_decide().unwrap().joins() else {
+        panic!("one join");
+    };
+    assert_eq!(join.reference(), "u");
+    assert!(join.left_join());
+    assert_eq!(join.matched_columns().len(), 1);
+    assert_eq!(
+        join.other_columns()
+            .unwrap()
+            .iter()
+            .map(|column| (column.table(), column.column()))
+            .collect::<Vec<_>>(),
+        [(Some("u"), "active")]
+    );
+
     for sql in [
         // Each projection here lands in one row of several, which MySQL
         // answers 1055 for under its own default sql_mode.
-        "SELECT team, score FROM users GROUP BY team",
         "SELECT * FROM users GROUP BY team",
+        // A subquery, a derived table and a branch of a `UNION` do not have
+        // the columns their keys decide worked out.
+        "SELECT (SELECT name FROM users GROUP BY id) FROM teams",
+        "SELECT t.name FROM (SELECT name FROM users GROUP BY id) t",
+        "SELECT name FROM users GROUP BY id UNION SELECT name FROM teams",
+        // A comma, `USING` and a `RIGHT JOIN` are not read for what they
+        // match.
+        "SELECT u.name FROM users u, posts p GROUP BY u.id",
+        "SELECT u.name FROM users u JOIN posts p USING (id) GROUP BY u.id",
+        "SELECT u.name FROM users u RIGHT JOIN posts p ON p.user_id = u.id GROUP BY u.id",
         // A key that is an expression has to be one the engine groups the
         // way MySQL does.
         "SELECT team FROM users GROUP BY team + 1",
@@ -6431,9 +6486,17 @@ fn translates_insert_select_and_names_what_it_reads() {
         // The copy is written with no upsert clause, so one is refused rather
         // than dropped.
         "INSERT INTO dst (id, n) SELECT id, n FROM src ON DUPLICATE KEY UPDATE n = n + 1",
+        // Whether the keys decide a column beside them is checked only for a
+        // statement answering rows.
+        "INSERT INTO dst (id, n) SELECT id, n FROM src GROUP BY id",
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
     }
+    assert!(parse_optional_create_table_as_select(
+        "CREATE TABLE dst AS SELECT id, n FROM src GROUP BY id",
+        SessionSqlMode::default()
+    )
+    .is_err());
 }
 
 #[test]

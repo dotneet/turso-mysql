@@ -1718,6 +1718,8 @@ impl MySqlConnection {
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.refuse_select_json_readings_of_other_columns(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
+                self.hold_the_projection_to_what_the_keys_decide(&translated)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.validate_select_comparison_columns(
                     translated.source_tables(),
                     translated.checked_comparisons(),
@@ -4167,6 +4169,13 @@ impl MySqlConnection {
         Self::reject_internal_catalog_select(&translated)?;
         self.reject_binary_scalar_collation(&translated)?;
         self.refuse_select_json_readings_of_other_columns(&translated)?;
+        // How MySQL writes a view out and reads its columns back when its keys
+        // decide a column beside them has not been measured.
+        if translated.columns_the_keys_decide().is_some() {
+            return Err(LimboError::ParseError(
+                "a view projecting a column its grouping keys decide".to_string(),
+            ));
+        }
         Self::reject_raw_select_comparisons(&translated)?;
         self.validate_select_comparison_columns(
             translated.source_tables(),
@@ -6522,6 +6531,7 @@ impl MySqlConnection {
         Self::reject_internal_catalog_select(&translated)?;
         self.reject_binary_scalar_collation(&translated)?;
         self.refuse_select_json_readings_of_other_columns(&translated)?;
+        self.hold_the_projection_to_what_the_keys_decide(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.reject_index_hints_naming_no_key(&translated)?;
         self.validate_select_comparison_columns(
@@ -7426,6 +7436,119 @@ impl MySqlConnection {
             translated.json_reading_columns(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
+    }
+
+    /// Holds a grouped statement's projection to the columns its keys decide,
+    /// which is what MySQL's `ONLY_FULL_GROUP_BY` lets stand beside them — see
+    /// [`turso_mysql_parser::MySqlColumnsTheKeysDecide`] for what was measured.
+    ///
+    /// The keys decide a table's row once they hold its primary key or a
+    /// unique key whose columns are all `NOT NULL`, and a join's `ON` carries a
+    /// decided column to the column it matches. Only whole-number columns are
+    /// carried across a match, which is what every measured join matched on.
+    fn hold_the_projection_to_what_the_keys_decide(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let Some(claim) = translated.columns_the_keys_decide() else {
+            return Ok(());
+        };
+        let refused = || {
+            MySqlQueryError::Unsupported(
+                "GROUP BY leaves a projected column out of the grouping".to_string(),
+            )
+        };
+        let schema = self.inner.current_schema();
+        let mut tables = Vec::new();
+        for source in translated.source_tables() {
+            if source.subquery() {
+                continue;
+            }
+            if source.branch() != 0
+                || source.catalog().is_some()
+                || source.derived().is_some()
+                || !source.projected_columns().is_empty()
+            {
+                return Err(refused());
+            }
+            let Some(btree) = schema.get_btree_table(source.table().as_str()) else {
+                return Err(refused());
+            };
+            let columns = self.list_columns(source.table()).map_err(|_| refused())?;
+            let not_null = |name: &str| {
+                columns
+                    .iter()
+                    .any(|column| column.name().eq_ignore_ascii_case(name) && !column.nullable())
+            };
+            let mut keys = Vec::new();
+            if !btree.primary_key_columns.is_empty() {
+                keys.push(
+                    btree
+                        .primary_key_columns
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+            for index in schema.get_indices(source.table().as_str()) {
+                if index.unique
+                    && index.where_clause.is_none()
+                    && index.columns.iter().all(|column| not_null(&column.name))
+                {
+                    keys.push(
+                        index
+                            .columns
+                            .iter()
+                            .map(|column| column.name.clone())
+                            .collect(),
+                    );
+                }
+            }
+            tables.push(TableTheKeysMayDecide {
+                reference: source.reference(),
+                columns,
+                keys,
+            });
+        }
+        if tables.len() != claim.joins().len() + 1
+            || claim
+                .joins()
+                .iter()
+                .zip(&tables[1..])
+                .any(|(join, table)| !join.reference().eq_ignore_ascii_case(table.reference))
+        {
+            return Err(refused());
+        }
+        let mut decided = std::collections::HashSet::new();
+        for key in claim.keys() {
+            decided.insert(resolve_named_column(&tables, key).ok_or_else(refused)?);
+        }
+        loop {
+            let before = decided.len();
+            for (position, table) in tables.iter().enumerate() {
+                if table.keys.iter().any(|key| {
+                    key.iter()
+                        .all(|column| decided.contains(&(position, column.to_ascii_lowercase())))
+                }) {
+                    for column in &table.columns {
+                        decided.insert((position, column.name().to_ascii_lowercase()));
+                    }
+                }
+            }
+            for (position, join) in claim.joins().iter().enumerate() {
+                carry_across_the_join(&tables, position + 1, join, &mut decided);
+            }
+            if decided.len() == before {
+                break;
+            }
+        }
+        for column in claim.columns() {
+            let resolved = resolve_named_column(&tables, column).ok_or_else(refused)?;
+            if !decided.contains(&resolved) {
+                return Err(refused());
+            }
+        }
+        Ok(())
     }
 
     fn reject_binary_scalar_collation(
@@ -11211,6 +11334,115 @@ fn columns_under_derived_names(
         }
     }
     Ok(named)
+}
+
+/// One table a grouped statement reads, with the keys that decide its row.
+struct TableTheKeysMayDecide<'a> {
+    reference: &'a str,
+    columns: Vec<MySqlColumnMetadata>,
+    /// The primary key's columns and each `NOT NULL` unique key's.
+    keys: Vec<Vec<String>>,
+}
+
+/// Finds the table a named column belongs to, by the name or alias it was
+/// written with, or by its being the one table holding a column of that name.
+fn resolve_named_column(
+    tables: &[TableTheKeysMayDecide<'_>],
+    named: &turso_mysql_parser::MySqlNamedColumn,
+) -> Option<(usize, String)> {
+    let holds = |table: &TableTheKeysMayDecide<'_>| {
+        table
+            .columns
+            .iter()
+            .any(|column| column.name().eq_ignore_ascii_case(named.column()))
+    };
+    let position = match named.table() {
+        Some(written) => {
+            let position = tables
+                .iter()
+                .position(|table| written.eq_ignore_ascii_case(table.reference))?;
+            holds(&tables[position]).then_some(position)?
+        }
+        None => {
+            let mut holding = tables.iter().enumerate().filter(|(_, table)| holds(table));
+            let (position, _) = holding.next()?;
+            holding.next().is_none().then_some(position)?
+        }
+    };
+    Some((position, named.column().to_ascii_lowercase()))
+}
+
+/// Carries decided columns across one join's `ON`.
+///
+/// An inner join's match holds on every row it answers, so either side
+/// decides the other. A `LEFT JOIN` also answers a row of the tables before
+/// it with nothing matched, so it carries a column only from them to the
+/// table it adds, and only once every column of theirs its `ON` names is
+/// decided.
+fn carry_across_the_join(
+    tables: &[TableTheKeysMayDecide<'_>],
+    joined: usize,
+    join: &turso_mysql_parser::MySqlJoinedTable,
+    decided: &mut std::collections::HashSet<(usize, String)>,
+) {
+    let resolve = |named| resolve_named_column(tables, named);
+    let Some(matched) = join
+        .matched_columns()
+        .iter()
+        .map(|(left, right)| Some((resolve(left)?, resolve(right)?)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    let whole_numbers = |(table, column): &(usize, String)| {
+        tables[*table].columns.iter().any(|declared| {
+            declared.name().eq_ignore_ascii_case(column) && is_integer_type(declared.type_name())
+        })
+    };
+    if !join.left_join() {
+        for (left, right) in matched {
+            if !whole_numbers(&left) || !whole_numbers(&right) {
+                continue;
+            }
+            if decided.contains(&left) {
+                decided.insert(right);
+            } else if decided.contains(&right) {
+                decided.insert(left);
+            }
+        }
+        return;
+    }
+    let Some(others) = join
+        .other_columns()
+        .map(|others| others.iter().map(resolve).collect::<Option<Vec<_>>>())
+    else {
+        return;
+    };
+    let Some(others) = others else {
+        return;
+    };
+    let named_before = matched
+        .iter()
+        .flat_map(|(left, right)| [left, right])
+        .chain(&others)
+        .filter(|(table, _)| *table != joined)
+        .collect::<Vec<_>>();
+    if named_before
+        .iter()
+        .any(|named| named.0 > joined || !decided.contains(*named))
+    {
+        return;
+    }
+    for (left, right) in matched {
+        let (before, added) = match (left.0 == joined, right.0 == joined) {
+            (false, true) => (left, right),
+            (true, false) => (right, left),
+            _ => continue,
+        };
+        if whole_numbers(&before) && whole_numbers(&added) && decided.contains(&before) {
+            decided.insert(added);
+        }
+    }
 }
 
 fn is_integer_type(type_name: &str) -> bool {

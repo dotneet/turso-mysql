@@ -106,6 +106,9 @@ pub fn parse_optional_create_table_as_select(
     // refuses are refused here too and the same text fills the table.
     let select_sql = query.to_string();
     let translated = parse_select(&select_sql, mode)?;
+    if translated.columns_the_keys_decide().is_some() {
+        return unsupported("CREATE TABLE AS SELECT projecting a column its grouping keys decide");
+    }
     let Some(source_table) = translated.source_table() else {
         return unsupported("CREATE TABLE AS SELECT over more than one table");
     };

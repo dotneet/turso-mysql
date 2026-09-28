@@ -22,6 +22,7 @@ mod recursive;
 mod rollup;
 
 pub use derived::MySqlDerivedColumns;
+pub use grouping::{MySqlColumnsTheKeysDecide, MySqlJoinedTable, MySqlNamedColumn};
 
 /// One table a `SELECT` reads, with the name the engine reports for it.
 ///
@@ -402,6 +403,9 @@ pub(crate) struct RenderedSelect {
     pub(crate) concatenates_groups: bool,
     /// Whether the statement notes the rows it answers without its `LIMIT`.
     pub(crate) calculates_found_rows: bool,
+    /// The columns a grouped statement projects beside its keys, which the
+    /// frontend holds to what the keys decide.
+    pub(crate) columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -669,6 +673,7 @@ pub(crate) fn translate_select_query(
         parameter_count: render_context.parameter_count,
         concatenates_groups: render_context.group_concat_calls > 0,
         calculates_found_rows: render_context.calculates_found_rows,
+        columns_the_keys_decide: render_context.columns_the_keys_decide,
     })
 }
 
@@ -984,7 +989,8 @@ fn render_select_body(
         normalized.push_str(" GROUP BY ");
         normalized.push_str(&grouping::render_select_group_by(
             group_by,
-            &select.projection,
+            select,
+            outer_projection,
             render_context,
         )?);
     }
@@ -2788,6 +2794,11 @@ pub(crate) fn translate_insert(
             Some(select) if select.concatenates_groups => {
                 return unsupported("INSERT SELECT with a GROUP_CONCAT needing column types");
             }
+            // Which columns a grouping's keys decide is the frontend's to
+            // check, which it does for a statement it answers rows for.
+            Some(select) if select.columns_the_keys_decide.is_some() => {
+                return unsupported("INSERT SELECT projecting a column its grouping keys decide");
+            }
             Some(select) => RenderedCopy {
                 sqlite_sql: select.sqlite_sql.clone(),
                 source_tables: select.source_tables.clone(),
@@ -2817,6 +2828,11 @@ pub(crate) fn translate_insert(
                 // and handed back here.
                 if rendered.orders_a_bare_column || rendered.compares_a_placeholder {
                     return unsupported(crate::INSERT_SELECT_NEEDING_COLUMN_TYPES);
+                }
+                if rendered.columns_the_keys_decide.is_some() {
+                    return unsupported(
+                        "INSERT SELECT projecting a column its grouping keys decide",
+                    );
                 }
                 RenderedCopy {
                     sqlite_sql: rendered.sqlite_sql,
@@ -5576,6 +5592,8 @@ pub(crate) struct SelectRenderContext<'a> {
     /// projected one of its own. MySQL counts and warns about that one too,
     /// which nothing here does, so the statement is refused.
     names_an_unprojected_group_concat: bool,
+    /// The columns the statement's own `GROUP BY` has to decide.
+    columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
 }
 
 impl<'a> SelectRenderContext<'a> {
@@ -5638,6 +5656,7 @@ impl<'a> SelectRenderContext<'a> {
             projected_group_concats: Vec::new(),
             last_projected_group_concats: Vec::new(),
             names_an_unprojected_group_concat: false,
+            columns_the_keys_decide: None,
         }
     }
 

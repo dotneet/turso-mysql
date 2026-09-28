@@ -1795,11 +1795,33 @@ than assumed. Measured on MySQL 8.4.11:
   projection's aliases, `HAVING d > ...` included.
 
 Each of those is refused here where MySQL answers its error. So are a wildcard
-projection, whose columns cannot be checked against the grouping, a scalar
+projection, whose columns cannot be checked against the grouping, and a scalar
 subquery in a grouped projection naming any column — whose outer columns are not
-worked out; `(SELECT COUNT(*) FROM users)` names none and is taken — and
-the column MySQL lets through because the key it depends on is a primary key —
-`SELECT id, name ... GROUP BY id` — which is not worked out either. A call over
+worked out; `(SELECT COUNT(*) FROM users)` names none and is taken.
+
+A projected column the keys decide is taken beside them, which is how Django
+groups a report — `SELECT users.name, COUNT(posts.id) ... FROM users LEFT OUTER
+JOIN posts ON (users.id = posts.user_id) GROUP BY users.id` — and how the mysql
+client's script groups posts with their tags, `GROUP BY u.id, p.id`. Measured on
+MySQL 8.4.11: keys holding a table's primary key, or a unique key whose columns
+are all `NOT NULL`, decide every column of that table — `GROUP BY id` and `GROUP
+BY email` pass, a unique key over a nullable column and part of a composite
+primary key do not, and neither does `GROUP BY id + 0`. A join's `ON` carries a
+decided column to the column it matches, alone or among others joined by `AND`:
+`users u JOIN posts p ON u.id = p.user_id GROUP BY p.id` decides `u.name`. A
+`LEFT JOIN` carries one only from the tables before it to the table it adds, and
+only when every column of those tables its `ON` names is decided — `posts p LEFT
+JOIN users u ON u.id = p.user_id GROUP BY p.id` decides `u.name`, `users u LEFT
+JOIN posts p ... GROUP BY p.id` does not decide `u.name`, and `ON p.user_id =
+p.id AND u.id = p.user_id` decides nothing under `GROUP BY p.user_id`, the rows
+it leaves unmatched differing within a group. A table's keys decide its own
+columns on either side, a `LEFT JOIN`'s missing row answering NULL for all of
+them. Everything else MySQL answers 1055 for is refused here. Some forms MySQL
+takes are refused too, not having been worked out: a match in the `WHERE`, a
+comma join, `USING`, a `RIGHT JOIN`, a match between columns that are not both
+whole numbers, a derived table or a view among the tables, a decided column in
+the `ORDER BY` or the `HAVING`, and the same grouping in a subquery, a `UNION`,
+a view, `INSERT ... SELECT` or `CREATE TABLE ... AS SELECT`. A call over
 words the client wrote itself is not taken as a key — `GROUP BY UPPER(title)` —
 because MySQL groups words under the column's collation, where `a` and `A` are
 one group, and the engine groups the call's answer by its bytes; `DATE_FORMAT`
@@ -1831,7 +1853,9 @@ MySQL takes is its planner's choice. A join grouped by whole columns is the
 same: measured, Django's `GROUP BY users.id` over `users LEFT OUTER JOIN posts`
 keeps the binary flag on its count and total, and SQLAlchemy's `GROUP BY
 users.id, users.name`, whose key no index holds, loses it, a `MAX` there
-carrying `NO_DEFAULT_VALUE` instead; this reports the first.
+carrying `NO_DEFAULT_VALUE` instead; this reports the first. Django's tag
+counts, `GROUP BY tags.id ... ORDER BY 2 DESC`, are sorted through such a table
+too, where the count loses the flag and `tags.name` its unique-key flags.
 
 Rows come back in the order the engine groups them, sorted by key, where MySQL
 answers a statement grouping in a temporary table in the order it met each
