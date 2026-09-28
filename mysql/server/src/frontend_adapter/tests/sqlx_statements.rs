@@ -441,3 +441,51 @@ fn sqlx_places_a_column_beside_a_rename_and_a_restatement() {
         ]
     );
 }
+
+/// sqlx's `raw_sql` sends `UPDATE posts SET body = CONCAT(COALESCE(body,
+/// ''), '!') WHERE title = 'Hello'` beside two reads in one text query,
+/// appending to a column that may hold nothing. Measured on MySQL 8.4.11:
+/// `First post` becomes `First post!` and a NULL becomes `!`, and an `IFNULL`
+/// beside a column and a written `', '` joins all three.
+#[test]
+fn sqlx_appends_to_a_column_that_may_hold_nothing() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE posts (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(200) NOT NULL, body TEXT NULL, views INT NOT NULL DEFAULT 0)",
+        "INSERT INTO posts (title, body) VALUES ('Hello', 'First post'), ('Hello', NULL), ('Other', 'x')",
+        "UPDATE posts SET body = CONCAT(COALESCE(body, ''), '!') WHERE title = 'Hello'",
+        "UPDATE posts SET body = CONCAT(IFNULL(body, 'none'), ', ', title) WHERE id = 3",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT body FROM posts ORDER BY id"),
+        [
+            [Some("First post!".to_owned())],
+            [Some("!".to_owned())],
+            [Some("x, Other".to_owned())],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            " SELECT COUNT(*) AS n FROM posts WHERE body LIKE '%!'"
+        ),
+        [[Some("2".to_owned())]]
+    );
+
+    // A number written out as a word, a word written into a number and a
+    // column the same `SET` has already written each follow rules of their
+    // own, which this does not repeat.
+    for sql in [
+        "UPDATE posts SET body = CONCAT(COALESCE(views, ''), '!')",
+        "UPDATE posts SET views = CONCAT(COALESCE(body, ''), '!')",
+        "UPDATE posts SET title = 'a', body = CONCAT(COALESCE(title, ''), '!')",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}

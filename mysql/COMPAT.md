@@ -425,6 +425,15 @@ statement the frontend asks for. Measured on 8.4.11: a NULL counts up to 1 and
 way `n + 1` is. Such a fallback over any other kind of column, or onto anything
 but a written whole number, is refused.
 
+sqlx's raw statement appends to a column that may hold nothing with `SET body
+= CONCAT(COALESCE(body, ''), '!')`. A `CONCAT` over columns of words, written
+words, and `COALESCE` or `IFNULL` falling a column of words back on a written
+word is taken written into a column of words, the kinds read on the second
+reading. Measured on 8.4.11: `First post` becomes `First post!`, a NULL
+becomes `!`, and a NULL part outside a fallback still makes the whole answer
+NULL. Over a column of numbers, written into one, or reading a column the same
+`SET` has already written, it is refused.
+
 A `?` in that arithmetic is how GORM writes `gorm.Expr("balance - ?", 10)`, and MySQL reads
 what binds there by the column the answer is written into. Measured on 8.4.11 with the binary
 types go-sql-driver sends: into a `DECIMAL(10,2)`, a bound whole number and a bound word

@@ -5236,6 +5236,9 @@ fn render_update_assignment_value(
             }
             render_select_expr(value, render_context)
         }
+        Expr::Function(function) if words_joined_with_fallbacks(function).is_some() => {
+            render_set_words_joined_with_fallbacks(function, written, assigned, render_context)
+        }
         // A fallback the arm above cannot read the shape of on its own — one
         // naming its column through its table, the way Rails does — is held
         // to the column's kind once the frontend has said what it is.
@@ -5382,6 +5385,122 @@ fn render_set_fallback(
         None => render_ident(name),
     };
     Ok(format!("coalesce({rendered_column}, {fallback})"))
+}
+
+/// One argument of a `CONCAT` an `UPDATE` writes into a column of words.
+enum JoinedPart<'a> {
+    Column(&'a Ident),
+    Word(&'a Expr),
+    /// `COALESCE(col, 'word')` or `IFNULL(col, 'word')`.
+    ColumnOrWord(&'a Ident, &'a Expr),
+}
+
+/// Reads `CONCAT` over columns, written words and a column falling back on a
+/// written word — sqlx's raw statement appends to a column that may hold
+/// nothing with `SET body = CONCAT(COALESCE(body, ''), '!')`. Answers `None`
+/// for anything else, and for a `CONCAT` with no fallback, which the
+/// projection's own reading takes.
+fn words_joined_with_fallbacks(function: &sqlparser::ast::Function) -> Option<Vec<JoinedPart<'_>>> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || !name.value.eq_ignore_ascii_case("CONCAT")
+        || function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let is_a_word = |expr: &Expr| {
+        matches!(expr, Expr::Value(value)
+            if matches!(value.value, Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)))
+    };
+    let parts = arguments
+        .args
+        .iter()
+        .map(|argument| {
+            let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) =
+                argument
+            else {
+                return None;
+            };
+            match expr {
+                Expr::Identifier(column) => Some(JoinedPart::Column(column)),
+                _ if is_a_word(expr) => Some(JoinedPart::Word(expr)),
+                _ => {
+                    let (Expr::Identifier(column), fallback) = fallback_over_a_column(expr)? else {
+                        return None;
+                    };
+                    is_a_word(fallback).then_some(JoinedPart::ColumnOrWord(column, fallback))
+                }
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    parts
+        .iter()
+        .any(|part| matches!(part, JoinedPart::ColumnOrWord(..)))
+        .then_some(parts)
+}
+
+/// Renders a `CONCAT` [`words_joined_with_fallbacks`] reads, into a column of
+/// words and over columns of words only, which the frontend says on the
+/// second reading it asks for.
+///
+/// Measured on MySQL 8.4.11: a NULL part makes the whole answer NULL, and a
+/// fallback stands for its column's NULL, so `CONCAT(COALESCE(body, ''),
+/// '!')` writes `!` over a NULL and `First post!` over `First post`. The
+/// engine's `||` answers NULL for a NULL part too; its own `concat` would
+/// skip it.
+fn render_set_words_joined_with_fallbacks(
+    function: &sqlparser::ast::Function,
+    written: &str,
+    assigned: &[String],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let parts = words_joined_with_fallbacks(function).expect("the caller read the parts");
+    let named = |part: &JoinedPart<'_>| match part {
+        JoinedPart::Column(column) | JoinedPart::ColumnOrWord(column, _) => {
+            Some(column.value.clone())
+        }
+        JoinedPart::Word(_) => None,
+    };
+    let columns = parts.iter().filter_map(named).collect::<Vec<_>>();
+    if columns.iter().any(|column| {
+        assigned
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(column))
+    }) {
+        return unsupported("UPDATE assignment reading a column it has already assigned");
+    }
+    render_context.falls_back_in_a_set = true;
+    if render_context.knows_the_integer_columns
+        && (!render_context.is_text_column(written)
+            || !columns
+                .iter()
+                .all(|column| render_context.is_text_column(column)))
+    {
+        return unsupported("CONCAT with a fallback in a SET over anything but columns of words");
+    }
+    let rendered = parts
+        .iter()
+        .map(|part| match part {
+            JoinedPart::Column(column) => Ok(render_ident(column)),
+            JoinedPart::Word(word) => render_dml_expr(word),
+            JoinedPart::ColumnOrWord(column, word) => Ok(format!(
+                "coalesce({}, {})",
+                render_ident(column),
+                render_dml_expr(word)?
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("({})", rendered.join(" || ")))
 }
 
 /// Renders one side of `+`, `-` or `*` in an `UPDATE`'s value, noting a `?`
