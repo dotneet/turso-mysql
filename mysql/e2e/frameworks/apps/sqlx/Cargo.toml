@@ -1,0 +1,16 @@
+[package]
+name = "sqlx-e2e"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Not part of the repository's workspace. Cargo.lock pins every crate.
+[workspace]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+futures-util = { version = "0.3", default-features = false }
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
+serde_json = "1"
+sqlx = { version = "=0.8.6", default-features = false, features = ["mysql", "runtime-tokio", "tls-rustls-ring-webpki", "migrate", "derive", "json", "chrono", "rust_decimal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }

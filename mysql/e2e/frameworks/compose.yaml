@@ -224,3 +224,10 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-efcore:local
     working_dir: /app
     command: ["./run.sh"]
+
+  sqlx:
+    <<: *app
+    build: ./apps/sqlx
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-sqlx:local
+    working_dir: /app
+    command: ["./run.sh"]
