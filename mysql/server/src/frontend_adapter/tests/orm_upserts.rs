@@ -808,5 +808,140 @@ fn an_upsert_leaving_an_on_update_column_to_mysql_is_refused() {
         ),
         Err(FrontendErrorKind::Unsupported)
     );
-    assert_eq!(rows(&mut adapter, "SELECT COUNT(*) FROM users"), vec![some(&["0"])]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM users"),
+        vec![some(&["0"])]
+    );
+}
+
+/// One value bound to a prepared statement.
+enum Bound<'a> {
+    Id(i64),
+    Word(&'a str),
+}
+
+/// The null bitmap, the new-parameters flag, and each value as a LONGLONG or
+/// a VAR_STRING.
+fn bound(values: &[Bound<'_>]) -> Vec<u8> {
+    let mut payload = vec![0; values.len().div_ceil(8)];
+    payload.push(1);
+    for value in values {
+        payload.extend_from_slice(&[
+            match value {
+                Bound::Id(_) => MYSQL_TYPE_LONGLONG,
+                Bound::Word(_) => MYSQL_TYPE_VAR_STRING,
+            },
+            0,
+        ]);
+    }
+    for value in values {
+        match value {
+            Bound::Id(id) => payload.extend_from_slice(&id.to_le_bytes()),
+            Bound::Word(word) => {
+                payload.push(u8::try_from(word.len()).unwrap());
+                payload.extend_from_slice(word.as_bytes());
+            }
+        }
+    }
+    payload
+}
+
+fn prepared_write(adapter: &mut Adapter, sql: &str, payload: &[u8]) -> (u64, u64) {
+    let statement = adapter
+        .execute_stmt_prepare(sql)
+        .unwrap_or_else(|error| panic!("prepare {sql}: {error:?}"));
+    let result = adapter.execute_stmt_execute(statement.statement_id, payload);
+    adapter.execute_stmt_close(statement.statement_id);
+    match result {
+        Ok(PreparedStatementExecutionResult::Ok(result)) => {
+            (result.affected_rows, result.last_insert_id)
+        }
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+/// Prisma prepares every insert with the id among its columns and binds the
+/// id it writes. Measured on MySQL 8.4.11 with go-sql-driver, one statement
+/// after the other: a row naming its own id reports it and leaves
+/// `LAST_INSERT_ID()` alone, the counter moves past it once it is written,
+/// and a row refused as a duplicate of another key moves it nowhere.
+#[test]
+fn a_prepared_row_naming_its_own_id_moves_the_counter_past_it() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` BIGINT NOT NULL AUTO_INCREMENT, `name` VARCHAR(100) NOT NULL, UNIQUE INDEX `tags_name_key`(`name`), PRIMARY KEY (`id`)) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+    );
+    let with_id = "INSERT INTO `tags` (`id`,`name`) VALUES (?,?)";
+    let without_id = "INSERT INTO `tags` (`name`) VALUES (?)";
+    let last_insert_id = |adapter: &mut Adapter| rows(adapter, "SELECT LAST_INSERT_ID()");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            with_id,
+            &bound(&[Bound::Id(5), Bound::Word("a")])
+        ),
+        (1, 5)
+    );
+    assert_eq!(last_insert_id(&mut adapter), vec![some(&["0"])]);
+    assert_eq!(
+        prepared_write(&mut adapter, without_id, &bound(&[Bound::Word("b")])),
+        (1, 6)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            with_id,
+            &bound(&[Bound::Id(3), Bound::Word("c")])
+        ),
+        (1, 3)
+    );
+    assert_eq!(last_insert_id(&mut adapter), vec![some(&["6"])]);
+    assert_eq!(
+        prepared_write(&mut adapter, without_id, &bound(&[Bound::Word("d")])),
+        (1, 7)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO `tags` (`id`,`name`) VALUES (?,?),(?,?)",
+            &bound(&[
+                Bound::Id(10),
+                Bound::Word("e"),
+                Bound::Id(9),
+                Bound::Word("f")
+            ])
+        ),
+        (2, 9)
+    );
+    assert_eq!(last_insert_id(&mut adapter), vec![some(&["7"])]);
+    let statement = adapter.execute_stmt_prepare(with_id).unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(
+            statement.statement_id,
+            &bound(&[Bound::Id(20), Bound::Word("a")])
+        ),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    adapter.execute_stmt_close(statement.statement_id);
+    assert_eq!(
+        prepared_write(&mut adapter, without_id, &bound(&[Bound::Word("g")])),
+        (1, 11)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name FROM tags ORDER BY id"),
+        vec![
+            some(&["3", "c"]),
+            some(&["5", "a"]),
+            some(&["6", "b"]),
+            some(&["7", "d"]),
+            some(&["9", "f"]),
+            some(&["10", "e"]),
+            some(&["11", "g"]),
+        ]
+    );
+    let printed = rows(&mut adapter, "SHOW CREATE TABLE `tags`")[0][1]
+        .clone()
+        .unwrap();
+    assert!(printed.contains("AUTO_INCREMENT=12"), "{printed}");
 }

@@ -1430,3 +1430,93 @@ fn a_row_that_fails_before_it_is_written_spends_no_number() {
         vec![some(&["14", "16"]), some(&["17", "20"])]
     );
 }
+
+/// A row refused as a duplicate of another key spends the number it asked for,
+/// one row or several, in a transaction or out of one, where a row naming its
+/// own id and refused moves the counter nowhere. Measured on MySQL 8.4.11 one
+/// statement after the other.
+#[test]
+fn a_row_refused_as_a_duplicate_spends_its_number_and_a_written_id_does_not() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `ttags` (`id` BIGINT NOT NULL AUTO_INCREMENT, `name` VARCHAR(100) NOT NULL, UNIQUE INDEX `tags_name_key`(`name`), PRIMARY KEY (`id`))",
+    );
+    let refused = |adapter: &mut Adapter, sql: &str| {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::ConstraintViolation),
+            "{sql}"
+        );
+    };
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (id, name) VALUES (5, 'a')"),
+        (1, 5)
+    );
+    refused(
+        &mut adapter,
+        "INSERT INTO ttags (id, name) VALUES (20, 'a')",
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (name) VALUES ('g')"),
+        (1, 6)
+    );
+    refused(&mut adapter, "INSERT INTO ttags (name) VALUES ('g')");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (name) VALUES ('h')"),
+        (1, 8)
+    );
+    run(&mut adapter, "BEGIN");
+    refused(&mut adapter, "INSERT INTO ttags (name) VALUES ('h')");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (name) VALUES ('i')"),
+        (1, 10)
+    );
+    run(&mut adapter, "COMMIT");
+    refused(&mut adapter, "INSERT INTO ttags (name) VALUES ('j'), ('a')");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (name) VALUES ('k')"),
+        (1, 13)
+    );
+    refused(&mut adapter, "INSERT INTO ttags (name) VALUES ('a'), ('l')");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ttags (name) VALUES ('m')"),
+        (1, 16)
+    );
+    // Laravel's `User::create` of a duplicate email, prepared, over the
+    // `bigint unsigned` key it counts with: the next user takes 5.
+    run(&mut adapter, LARAVEL_USERS);
+    run(
+        &mut adapter,
+        "alter table `users` add unique `users_email_unique`(`email`)",
+    );
+    let insert =
+        "insert into `users` (`name`, `email`, `updated_at`, `created_at`) values (?, ?, ?, ?)";
+    for (name, email, expected) in [
+        ("Alice", "alice@example.com", Some((1, 1))),
+        ("Bob", "bob@example.com", Some((1, 2))),
+        ("Carol", "carol@example.com", Some((1, 3))),
+        ("Alice again", "alice@example.com", None),
+        ("Dave", "dave@example.com", Some((1, 5))),
+    ] {
+        let statement = adapter.execute_stmt_prepare(insert).unwrap();
+        let result = adapter.execute_stmt_execute(
+            statement.statement_id,
+            &words(&[name, email, "2026-09-28 01:00:00", "2026-09-28 01:00:00"]),
+        );
+        adapter.execute_stmt_close(statement.statement_id);
+        match expected {
+            Some(expected) => {
+                let Ok(PreparedStatementExecutionResult::Ok(result)) = result else {
+                    panic!("{name}: {result:?}");
+                };
+                assert_eq!((result.affected_rows, result.last_insert_id), expected);
+            }
+            None => assert_eq!(
+                result,
+                Err(FrontendErrorKind::ConstraintViolation),
+                "{name}"
+            ),
+        }
+    }
+}

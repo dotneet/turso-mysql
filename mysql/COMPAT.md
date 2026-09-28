@@ -693,8 +693,15 @@ MySQL prints for it. One difference: MySQL raises warning 1681 for each width it
 this raises none, so a client counting warnings after a `CREATE TABLE` sees zero here.
 
 A fixture writes its own ids — `INSERT INTO t (id, name) VALUES (1, 'a')` — and a counted
-table takes them. The counter is raised past the highest id the statement wrote before the row
-is written, so it never hands the same number out again. Measured on 8.4.11 and matched: rows
+table takes them, and so does a prepared statement binding them, which is how Prisma writes
+every row. The counter never hands the same number out again: where a `VALUES` row names an id
+past it, the rows are written under the counter's lease and it moves past each row's number
+once that row is written. Measured on 8.4.11 and matched: an id of 20 refused as a duplicate of
+another key leaves the next number where it was, while a row asking for the next number and
+refused as a duplicate spends it, one row or several, in a transaction or out of one — so a
+row that fails as Laravel's `User::create` of a taken email does leaves the next user one
+number on. The other forms, `INSERT ... SET id = 1` and rows a trigger numbering a counted table
+of its own sets off, raise the counter before the row is written. Measured on 8.4.11 and matched: rows
 written out of order still leave the counter one past the highest of them, a written id below
 the counter leaves it where it stands, and a negative id is stored as written and moves
 nothing. `LAST_INSERT_ID()` is left as it stood, which is what MySQL does — but the id the

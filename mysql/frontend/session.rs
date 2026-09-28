@@ -7883,6 +7883,11 @@ impl MySqlConnection {
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;
+        if let Some(result) =
+            self.write_rows_naming_ids_past_the_counter(sql, deadline, affected_rows_mode)?
+        {
+            return Ok(result);
+        }
         // A statement that writes the counted column its own numbers — which is
         // what a fixture does when it wants known ids — runs as an ordinary
         // INSERT, with the counter raised past the highest number it wrote.
@@ -8587,6 +8592,47 @@ impl MySqlConnection {
     /// that mixes the two is refused: measured, `VALUES (NULL, 6), (50, 7),
     /// (NULL, 8)` writes 6, 50 and 51, the counter moving past each written
     /// number as the rows go by, which one range reserved up front cannot do.
+    /// Writes a `VALUES` insert whose every row names its own positive id, one
+    /// of them past the counter, under the counter's lease, moving it past
+    /// each row's number once that row is written — as the prepared form is.
+    /// Measured on MySQL 8.4.11: an id of 20 refused as a duplicate of another
+    /// key leaves the next number where it was. Answers `None` for any other
+    /// statement, and for rows a trigger numbering a counted table of its own
+    /// sets off, which keep the older path raising the counter first.
+    fn write_rows_naming_ids_past_the_counter(
+        &self,
+        sql: &str,
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<Option<MySqlWriteResult>, MySqlQueryError> {
+        let Ok(insert) = parse_auto_increment_insert(sql, self.parser_mode()) else {
+            return Ok(None);
+        };
+        let Some(table) = self
+            .load_auto_increment_table(insert.table_name().as_str())
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(None);
+        };
+        let Ok(bound) = insert.bind_allocator_table_with(&table.definition, self.written_zero())
+        else {
+            return Ok(None);
+        };
+        if bound.rowwise_conflicts()
+            || !bound
+                .row_values()
+                .iter()
+                .all(|value| matches!(value, AutoIncrementRowValue::Explicit(id) if *id > 0))
+            || self
+                .check_the_triggers_an_insert_sets_off(&table.name, &[])
+                .map_err(MySqlQueryError::Engine)?
+        {
+            return Ok(None);
+        }
+        self.execute_high_water_mixed_insert(sql, &bound, &table, &[], deadline, affected_rows_mode)
+            .map_err(MySqlQueryError::Engine)
+    }
+
     fn raise_the_counter_past_written_ids(
         &self,
         sql: &str,
@@ -8989,7 +9035,12 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> Result<Option<MySqlWriteResult>> {
         let row_values = self.auto_increment_row_values(bound, table, values)?;
-        if bound.rowwise_conflicts() || !row_values.contains(&InsertAutoIncrementValue::Generated) {
+        // Rows that all name their own ids come here too when one of them is
+        // past the counter — Prisma binds each id it writes — since the counter
+        // has to move past a row's number only once the row is written:
+        // measured on 8.4.11, an id of 20 refused as a duplicate of another
+        // key leaves the next number where it was.
+        if bound.rowwise_conflicts() {
             return Ok(None);
         }
         let highest_explicit = row_values
@@ -9065,94 +9116,103 @@ impl MySqlConnection {
         // MySQL reads the clock once for the whole statement, and each row
         // below is written by a statement of its own, so they read one moment
         // between them.
-        let result = turso_core::read_the_clock_once(|| -> Result<MySqlWriteResult> {
-            let mut affected_rows = 0_u64;
-            let mut first_generated = None;
-            let mut last_explicit = None;
-            for (row_number, row_value) in row_values.iter().enumerate() {
-                self.check_write_deadline(deadline)
-                    .map_err(Into::<LimboError>::into)?;
-                let id = match row_value {
-                    InsertAutoIncrementValue::Generated => {
-                        if !preallocated {
-                            reserved_end = current
-                                .checked_add(row_values.len() as u64)
-                                .ok_or(LimboError::IntegerOverflow)?;
-                            if reserved_end > generated_ceiling {
+        let result =
+            turso_core::read_the_clock_once(|| -> Result<(MySqlWriteResult, Option<u64>)> {
+                let mut affected_rows = 0_u64;
+                let mut first_generated = None;
+                let mut last_explicit = None;
+                for (row_number, row_value) in row_values.iter().enumerate() {
+                    self.check_write_deadline(deadline)
+                        .map_err(Into::<LimboError>::into)?;
+                    let id = match row_value {
+                        InsertAutoIncrementValue::Generated => {
+                            if !preallocated {
+                                reserved_end = current
+                                    .checked_add(row_values.len() as u64)
+                                    .ok_or(LimboError::IntegerOverflow)?;
+                                if reserved_end > generated_ceiling {
+                                    return Err(LimboError::Constraint(
+                                        "AUTO_INCREMENT value is outside the column's type"
+                                            .to_string(),
+                                    ));
+                                }
+                                capability.io.block(|| lease.advance_past(reserved_end))?;
+                                preallocated = true;
+                            }
+                            current = current.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+                            if current > generated_ceiling {
                                 return Err(LimboError::Constraint(
                                     "AUTO_INCREMENT value is outside the column's type".to_string(),
                                 ));
                             }
-                            capability.io.block(|| lease.advance_past(reserved_end))?;
-                            preallocated = true;
-                        }
-                        current = current.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-                        if current > generated_ceiling {
-                            return Err(LimboError::Constraint(
-                                "AUTO_INCREMENT value is outside the column's type".to_string(),
-                            ));
-                        }
-                        if current > reserved_end {
-                            capability.io.block(|| lease.advance_past(current))?;
-                            reserved_end = current;
-                        }
-                        current
-                    }
-                    InsertAutoIncrementValue::Explicit(id) => *id,
-                };
-                let statement = bound
-                    .inject_one_row(row_number, id)
-                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let options = injected_auto_increment_prepare_options(table, statement.clone());
-                let mut statement = self
-                    .inner
-                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
-                let parameter_count = statement.parameters_count();
-                let bound_values = values.get(..parameter_count).ok_or_else(|| {
-                    LimboError::InternalError(
-                        "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
-                    )
-                })?;
-                bind_prepared_values(&mut statement, bound_values)?;
-                let timeout = self
-                    .remaining_write_timeout(deadline)
-                    .map_err(Into::<LimboError>::into)?;
-                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
-                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
-                })?;
-                affected_rows = affected_rows
-                    .checked_add(
-                        self.affected_rows(false, affected_rows_mode)
-                            .map_err(Into::<LimboError>::into)?,
-                    )
-                    .ok_or(LimboError::IntegerOverflow)?;
-                match row_value {
-                    InsertAutoIncrementValue::Generated => {
-                        first_generated.get_or_insert(id);
-                    }
-                    InsertAutoIncrementValue::Explicit(_) => {
-                        if id > current {
-                            current = id;
-                            if id > reserved_end {
-                                capability.io.block(|| lease.advance_past(id))?;
-                                reserved_end = id;
+                            if current > reserved_end {
+                                capability.io.block(|| lease.advance_past(current))?;
+                                reserved_end = current;
                             }
+                            current
                         }
-                        last_explicit = Some(id);
+                        InsertAutoIncrementValue::Explicit(id) => *id,
+                    };
+                    let statement = bound
+                        .inject_one_row(row_number, id)
+                        .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                    let options = injected_auto_increment_prepare_options(table, statement.clone());
+                    let mut statement = self
+                        .inner
+                        .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                    let parameter_count = statement.parameters_count();
+                    let bound_values = values.get(..parameter_count).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+                        )
+                    })?;
+                    bind_prepared_values(&mut statement, bound_values)?;
+                    let timeout = self
+                        .remaining_write_timeout(deadline)
+                        .map_err(Into::<LimboError>::into)?;
+                    run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                        self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                    })?;
+                    affected_rows = affected_rows
+                        .checked_add(
+                            self.affected_rows(false, affected_rows_mode)
+                                .map_err(Into::<LimboError>::into)?,
+                        )
+                        .ok_or(LimboError::IntegerOverflow)?;
+                    match row_value {
+                        InsertAutoIncrementValue::Generated => {
+                            first_generated.get_or_insert(id);
+                        }
+                        InsertAutoIncrementValue::Explicit(_) => {
+                            if id > current {
+                                current = id;
+                                if id > reserved_end {
+                                    capability.io.block(|| lease.advance_past(id))?;
+                                    reserved_end = id;
+                                }
+                            }
+                            last_explicit = Some(id);
+                        }
                     }
                 }
-            }
-            Ok(MySqlWriteResult {
-                affected_rows,
-                last_insert_id: first_generated.or(last_explicit).unwrap_or(0),
-            })
-        });
-        let result = result.and_then(|result| {
+                Ok((
+                    MySqlWriteResult {
+                        affected_rows,
+                        last_insert_id: first_generated.or(last_explicit).unwrap_or(0),
+                    },
+                    first_generated,
+                ))
+            });
+        let result = result.and_then(|(result, first_generated)| {
             lease.release()?;
             self.inner
                 .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
                 .run_ignore_rows()?;
-            self.inner.set_mysql_last_insert_id(result.last_insert_id);
+            // Measured: a row naming its own id is reported by that id and
+            // leaves `LAST_INSERT_ID()` where it stood.
+            if let Some(id) = first_generated {
+                self.inner.set_mysql_last_insert_id(id);
+            }
             Ok(result)
         });
         if result.is_err() {
