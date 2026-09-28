@@ -466,3 +466,226 @@ fn django_reads_the_tables_and_a_tables_collation() {
         [[text("utf8mb4_0900_ai_ci")]]
     );
 }
+
+/// Django's `get_table_description`, which `inspectdb` and every migration
+/// that alters a column run, as Django 5.2 writes it with the table's own
+/// collation bound in.
+const DJANGO_COLUMNS: &str = "\n            SELECT\n                column_name, data_type, character_maximum_length,\n                numeric_precision, numeric_scale, extra, column_default,\n                CASE\n                    WHEN collation_name = 'utf8mb4_0900_ai_ci' THEN NULL\n                    ELSE collation_name\n                END AS collation_name,\n                CASE\n                    WHEN column_type LIKE '% unsigned' THEN 1\n                    ELSE 0\n                END AS is_unsigned,\n                column_comment\n            FROM information_schema.columns\n            WHERE table_name = 'TABLE' AND table_schema = DATABASE()\n            ";
+
+/// Measured on MySQL 8.4.11 over the tables Django's migration writes, and
+/// one with an unsigned column, a column of another collation and a comment:
+/// the rows below, in an order MySQL does not promise. The `CASE` over
+/// `collation_name` reports the shape the column reports on its own, naming
+/// no table.
+#[test]
+fn django_describes_a_tables_columns() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `django_users` (`id` bigint AUTO_INCREMENT NOT NULL PRIMARY KEY, `email` varchar(191) NOT NULL UNIQUE, `name` varchar(100) NOT NULL, `balance` numeric(10, 2) NOT NULL, `is_active` bool NOT NULL, `profile` json NULL, `created_at` datetime(6) NOT NULL, `updated_at` datetime(6) NOT NULL)",
+        "CREATE TABLE `extras` (`id` int NOT NULL PRIMARY KEY, `u` int unsigned NULL, `code` varchar(10) COLLATE utf8mb4_bin NULL COMMENT 'the code', `n` smallint DEFAULT 7)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let described = |adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+                     table: &str| {
+        let (columns, mut read) = rows(adapter, &DJANGO_COLUMNS.replace("TABLE", table));
+        read.sort();
+        (columns, read)
+    };
+    let row = |values: [Option<&str>; 10]| values.map(|value| value.map(str::to_owned)).to_vec();
+    let (columns, read) = described(&mut adapter, "django_users");
+    assert_eq!(
+        read,
+        [
+            row([
+                Some("balance"),
+                Some("decimal"),
+                None,
+                Some("10"),
+                Some("2"),
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("created_at"),
+                Some("datetime"),
+                None,
+                None,
+                None,
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("email"),
+                Some("varchar"),
+                Some("191"),
+                None,
+                None,
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("id"),
+                Some("bigint"),
+                None,
+                Some("19"),
+                Some("0"),
+                Some("auto_increment"),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("is_active"),
+                Some("tinyint"),
+                None,
+                Some("3"),
+                Some("0"),
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("name"),
+                Some("varchar"),
+                Some("100"),
+                None,
+                None,
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("profile"),
+                Some("json"),
+                None,
+                None,
+                None,
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("updated_at"),
+                Some("datetime"),
+                None,
+                None,
+                None,
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+        ]
+    );
+    assert_eq!(
+        described(&mut adapter, "extras").1,
+        [
+            row([
+                Some("code"),
+                Some("varchar"),
+                Some("10"),
+                None,
+                None,
+                Some(""),
+                None,
+                Some("utf8mb4_bin"),
+                Some("0"),
+                Some("the code")
+            ]),
+            row([
+                Some("id"),
+                Some("int"),
+                None,
+                Some("10"),
+                Some("0"),
+                Some(""),
+                None,
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("n"),
+                Some("smallint"),
+                None,
+                Some("5"),
+                Some("0"),
+                Some(""),
+                Some("7"),
+                None,
+                Some("0"),
+                Some("")
+            ]),
+            row([
+                Some("u"),
+                Some("int"),
+                None,
+                Some("10"),
+                Some("0"),
+                Some(""),
+                None,
+                None,
+                Some("1"),
+                Some("")
+            ]),
+        ]
+    );
+    let (plain, _) = rows(
+        &mut adapter,
+        "SELECT collation_name, numeric_precision, column_comment FROM information_schema.columns WHERE table_name = 'extras'",
+    );
+    let (cased, _) = rows(
+        &mut adapter,
+        "SELECT CASE WHEN column_name = 'id' THEN NULL ELSE collation_name END AS a, CASE WHEN column_name = 'id' THEN NULL ELSE numeric_precision END AS b, CASE WHEN column_name = 'x' THEN NULL ELSE column_comment END AS c FROM information_schema.columns WHERE table_name = 'extras'",
+    );
+    for ((plain, cased), name) in plain.iter().zip(&cased).zip(["a", "b", "c"]) {
+        assert_eq!(cased.name, name);
+        assert!(cased.table.is_empty() && cased.original_table.is_empty());
+        assert_eq!(
+            (
+                cased.column_type,
+                cased.column_length,
+                cased.character_set,
+                cased.decimals
+            ),
+            (
+                plain.column_type,
+                plain.column_length,
+                plain.character_set,
+                plain.decimals
+            ),
+            "{name}"
+        );
+        assert_eq!(cased.flags, plain.flags & !MYSQL_NOT_NULL_FLAG, "{name}");
+    }
+    assert_eq!(columns[7].name, "collation_name");
+    // A catalog column beside a written word or another catalog column has
+    // not been measured.
+    for sql in [
+        "SELECT CASE WHEN column_name = 'id' THEN 'x' ELSE column_name END AS c FROM information_schema.columns",
+        "SELECT CASE WHEN column_name = 'id' THEN data_type ELSE column_name END AS c FROM information_schema.columns",
+        "SELECT COALESCE(collation_name, column_name) AS c FROM information_schema.columns",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

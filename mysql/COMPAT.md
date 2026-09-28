@@ -3369,6 +3369,16 @@ counters — Laravel lists tables with `(data_length + index_length) as size` �
 answered with the shape measured on 8.4.11, an unsigned `LONGLONG` of length 22
 without the binary flag; every other arithmetic over these columns is refused.
 
+A `CASE` whose branches are one `information_schema` column or NULL is taken
+too. Django's `get_table_description`, which `inspectdb` and every migration
+altering a column run, reads `CASE WHEN collation_name = 'utf8mb4_0900_ai_ci'
+THEN NULL ELSE collation_name END` out of `COLUMNS`. Measured on 8.4.11 over
+`COLLATION_NAME`, `DATA_TYPE`, `COLUMN_COMMENT` and `NUMERIC_PRECISION`: the
+answer reports the column's own shape — its type, length, collation and flags
+— naming no table, and a NULL branch or a missing `ELSE` takes the `NOT_NULL`
+flag off it. A catalog column beside a written value or another column, or
+under `IFNULL` or `COALESCE`, stays refused.
+
 `DATABASE()` and `SCHEMA()` after the `FROM` of a query reading
 `information_schema` are the selected database's name, or NULL when none is
 selected, which is what they answer; this is how Rails, Django and Laravel

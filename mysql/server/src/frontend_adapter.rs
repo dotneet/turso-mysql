@@ -6918,6 +6918,15 @@ impl TableResultMetadata {
         may_be_null: bool,
         falls_back: bool,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+        if let Some(definition) = Self::catalog_column_branches(
+            source_metadata,
+            &name,
+            branches,
+            may_be_null,
+            falls_back,
+        )? {
+            return Ok(definition);
+        }
         let answer = Self::branches_answer(source_metadata, branches)?;
         let not_null = if falls_back {
             answer.any_not_null
@@ -6925,6 +6934,60 @@ impl TableResultMetadata {
             !may_be_null && answer.all_not_null
         };
         Ok(answer.kind.column_definition(name, not_null))
+    }
+
+    /// Finishes a `CASE` whose branches are one `information_schema` column
+    /// or NULL — Django's `CASE WHEN collation_name = 'utf8mb4_0900_ai_ci'
+    /// THEN NULL ELSE collation_name END` — or answers `None` when no branch
+    /// names such a column.
+    ///
+    /// Measured on MySQL 8.4.11 over `information_schema.COLUMNS`: the answer
+    /// is the column's own shape — a word column's type, length and
+    /// collation, a number column's type and flags — naming no table, and a
+    /// NULL branch takes the `NOT_NULL` flag off it. A catalog column beside
+    /// a written value or another column has not been measured and is
+    /// refused.
+    fn catalog_column_branches(
+        source_metadata: Option<&Self>,
+        name: &str,
+        branches: &[Branch],
+        may_be_null: bool,
+        falls_back: bool,
+    ) -> Result<Option<ColumnDefinitionConfig>, FrontendErrorKind> {
+        let Some(source_metadata) = source_metadata else {
+            return Ok(None);
+        };
+        let mut catalog_columns = Vec::new();
+        for branch in branches {
+            let Branch::Column { column_name } = branch else {
+                continue;
+            };
+            let (table, ordinal) = source_metadata.column_named(column_name)?;
+            if let Some(column) = table.catalog_columns.get(ordinal) {
+                catalog_columns.push(column);
+            }
+        }
+        let Some(first) = catalog_columns.first() else {
+            return Ok(None);
+        };
+        if falls_back
+            || catalog_columns.len() != branches.len()
+            || catalog_columns
+                .iter()
+                .any(|column| !column.name.eq_ignore_ascii_case(&first.name))
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let mut definition = ColumnDefinitionConfig::new(name, first.column_type);
+        definition.character_set = first.character_set;
+        definition.column_length = first.column_length;
+        definition.decimals = first.decimals;
+        definition.flags = if may_be_null {
+            first.flags & !MYSQL_NOT_NULL_FLAG
+        } else {
+            first.flags
+        };
+        Ok(Some(definition))
     }
 
     /// Finishes `SUM`, `AVG`, `MIN` or `MAX` over a `CASE` or `IF`.
