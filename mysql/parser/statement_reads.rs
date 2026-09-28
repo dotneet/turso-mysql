@@ -14,6 +14,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
@@ -165,9 +166,10 @@ enum TokenDialect {
     PlainMySql,
 }
 
-/// A tokenizer's failure, kept in parts because sqlparser's error cannot be
+/// A tokenizer's answer, shared by the dialect settings that read a text the
+/// same way. A failure is kept in parts because sqlparser's error cannot be
 /// copied.
-type KeptTokens = Result<Vec<TokenWithSpan>, (String, Location)>;
+type KeptTokens = Rc<Result<Vec<TokenWithSpan>, (String, Location)>>;
 
 fn with_tokens<T>(
     dialect: TokenDialect,
@@ -182,10 +184,10 @@ fn with_tokens<T>(
                 Tokenizer::new(&MySqlDialect {}, sql).tokenize_with_location()
             }
         };
-        tokens.map_err(|error| (error.message, error.location))
+        Rc::new(tokens.map_err(|error| (error.message, error.location)))
     };
     let lend = |tokens: &KeptTokens| {
-        use_tokens(match tokens {
+        use_tokens(match tokens.as_ref() {
             Ok(tokens) => Ok(tokens.as_slice()),
             Err((message, location)) => Err(TokenizerError {
                 message: message.clone(),
@@ -196,20 +198,42 @@ fn with_tokens<T>(
     if !keeping() {
         return lend(&read());
     }
-    let is_this_text =
-        |(key, text, _): &&(TokenDialect, String, KeptTokens)| *key == dialect && text == sql;
-    if !TOKENS.with(|kept| kept.borrow().iter().any(|entry| is_this_text(&entry))) {
-        let tokens = read();
-        TOKENS.with(|kept| remember(&mut kept.borrow_mut(), dialect, sql, tokens));
+    let kept_for = |dialect: TokenDialect| {
+        TOKENS.with(|kept| {
+            kept.borrow()
+                .iter()
+                .find(|(key, text, _)| *key == dialect && text == sql)
+                .map(|(_, _, tokens)| Rc::clone(tokens))
+        })
+    };
+    let tokens = match kept_for(dialect) {
+        Some(tokens) => tokens,
+        None => {
+            let tokens = the_other_setting(dialect)
+                .filter(|_| !crate::mentions_ignoring_case(sql, "/*!"))
+                .and_then(kept_for)
+                .unwrap_or_else(read);
+            TOKENS.with(|kept| remember(&mut kept.borrow_mut(), dialect, sql, Rc::clone(&tokens)));
+            tokens
+        }
+    };
+    lend(&tokens)
+}
+
+/// The session's other setting for `/*!NNNNN ... */` comments.
+///
+/// The two differ only in whether such a comment is read as the text it
+/// holds, and sqlparser consults the setting nowhere but at a comment opening
+/// `/*!`, so a text with no `/*!` in it reads as the same tokens, a failure
+/// included, under both.
+fn the_other_setting(dialect: TokenDialect) -> Option<TokenDialect> {
+    match dialect {
+        TokenDialect::Session(session) => Some(TokenDialect::Session(SessionMySqlDialect {
+            expand_executable_comments: !session.expand_executable_comments,
+            ..session
+        })),
+        TokenDialect::PlainMySql => None,
     }
-    TOKENS.with(|kept| {
-        let kept = kept.borrow();
-        let (_, _, tokens) = kept
-            .iter()
-            .find(is_this_text)
-            .expect("the tokens of this text were just kept");
-        lend(tokens)
-    })
 }
 
 /// How many texts of each kind of reading are kept. A statement is read

@@ -432,11 +432,12 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
 
 /// A dump's extended `INSERT` runs to a MiB, and every reading of a statement
 /// costs time in proportion to its length, so the long statement is read
-/// whole only a few times on its way to running: once by each of the three
-/// ways the recognizers tokenize it, once into a syntax tree, once by the
-/// engine and once by each of the three ways the command tokenizer reads it —
-/// and, since it names no columns, twice more tokenized and once more parsed
-/// with its column list written out. Before the readings were kept while a
+/// whole only a few times on its way to running: tokenized once for the
+/// session's dialect and once for sqlparser's own, parsed once into a syntax
+/// tree, read once by the engine and once by each of the three ways the
+/// command tokenizer reads it — and, since it names no columns, tokenized and
+/// parsed once more with its column list written out. Before the readings were
+/// kept while a
 /// statement is answered, it was tokenized 26 times, parsed 8 times and read
 /// by the command tokenizer 23 times.
 #[test]
@@ -463,7 +464,7 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
     assert_eq!(
         whole_readings(before, turso_mysql_parser::bytes_read(), sql.len()),
         turso_mysql_parser::BytesRead {
-            tokenized: 5,
+            tokenized: 3,
             parsed: 2,
             parsed_by_the_engine: 1,
             tokenized_as_a_command: 3,

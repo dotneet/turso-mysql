@@ -9420,6 +9420,41 @@ fn a_kept_reading_answers_what_reading_afresh_would() {
     assert!(bytes_read().parsed_by_the_engine > first_reading.parsed_by_the_engine);
 }
 
+/// The session's two settings for `/*!NNNNN ... */` comments read a text with
+/// none in it as the same tokens, so it is tokenized once for both; a text
+/// holding one is tokenized under each, and each reads it as it would afresh.
+#[test]
+fn a_text_without_executable_comments_is_tokenized_once_for_both_settings() {
+    let mode = SessionSqlMode::default();
+    let expanding = SessionMySqlDialect::new(mode);
+    let keeping_comments = SessionMySqlDialect::without_executable_comments(mode);
+    let read_afresh = |sql: &str| {
+        (
+            statement_reads::tokens(&expanding, sql),
+            statement_reads::tokens(&keeping_comments, sql),
+        )
+    };
+    for (sql, readings) in [
+        ("INSERT INTO t VALUES (1, '/* a */ /*! b */')", 2),
+        ("INSERT INTO t VALUES (1) /*!80000 , (2) */", 2),
+        ("INSERT INTO t VALUES (1, 'x') /* plain */", 1),
+        ("INSERT INTO t VALUES ('never closed", 1),
+    ] {
+        let afresh = read_afresh(sql);
+        let _kept = keep_reads();
+        let before = bytes_read().tokenized;
+        assert_eq!(read_afresh(sql), afresh, "{sql}");
+        assert_eq!(read_afresh(sql), afresh, "{sql}");
+        assert_eq!(
+            bytes_read().tokenized - before,
+            readings * sql.len(),
+            "{sql}"
+        );
+    }
+    let (expanded, kept) = read_afresh("SELECT 1 /*!80000 , 2 */");
+    assert_ne!(expanded.unwrap(), kept.unwrap());
+}
+
 /// A word is found in any letter case at any place, the first and the last
 /// included, and a text shorter than the word never holds it; what it finds
 /// is what comparing every window of the text found.

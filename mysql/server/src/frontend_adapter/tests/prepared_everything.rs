@@ -122,8 +122,8 @@ fn only_a_statement_without_parameters_or_rows_is_run_as_text() {
 
 /// An ORM's batch insert is one long statement with a `?` for each value, and
 /// every reading of a statement costs time in proportion to its length. When
-/// it is prepared it is tokenized once by each of the two ways the recognizers
-/// read it there, parsed once and read by the engine once; when it is executed
+/// it is prepared it is tokenized once, parsed once and read by the engine
+/// once; when it is executed
 /// it is read once more, to number its rows. Before the readings were kept
 /// while a statement is answered, preparing it tokenized it 13 times, parsed
 /// it 9 times and had the engine read it 4.
@@ -157,7 +157,7 @@ fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed()
     assert_eq!(
         whole_readings(before, prepared_at, sql.len()),
         turso_mysql_parser::BytesRead {
-            tokenized: 2,
+            tokenized: 1,
             parsed: 1,
             parsed_by_the_engine: 1,
             tokenized_as_a_command: 0,
