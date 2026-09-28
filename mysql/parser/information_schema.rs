@@ -680,6 +680,91 @@ pub fn parse_optional_flyway_schema_emptiness_query(
     Ok(Some(FlywaySchemaEmptinessQuery { schemas }))
 }
 
+/// The question `sqlx database create`, `drop` and `reset` ask before they
+/// act, often before any database is selected: whether a database of the
+/// name bound is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlxDatabaseExistsQuery {
+    name: Option<String>,
+    column: String,
+}
+
+impl SqlxDatabaseExistsQuery {
+    /// The database asked about, `None` for one a `?` binds.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// What MySQL names the answer: the call as the statement wrote it.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+}
+
+/// Recognizes `select exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE
+/// SCHEMA_NAME = ?)`, as sqlx 0.8 writes it, with the name bound or written.
+pub fn parse_optional_sqlx_database_exists_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<SqlxDatabaseExistsQuery>, ParseError> {
+    const QUERY: &str =
+        "select exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '__S__')";
+    if !names_information_schema(sql) {
+        return Ok(None);
+    }
+    let actual = tokenize_information_schema_query(sql, mode)?;
+    if actual.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return Ok(None);
+    }
+    let expected = tokenize_information_schema_query(QUERY, mode)?;
+    let actual = actual
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if actual.len() != expected.len() {
+        return Ok(None);
+    }
+    let mut name = None;
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        match (expected, actual) {
+            (Token::SingleQuotedString(placeholder), Token::SingleQuotedString(written))
+                if placeholder == "__S__" =>
+            {
+                name = Some(written.clone());
+            }
+            (Token::SingleQuotedString(placeholder), Token::Placeholder(marker))
+                if placeholder == "__S__" && marker == "?" => {}
+            (expected, actual) if same_catalog_token(actual, expected) => {}
+            _ => return Ok(None),
+        }
+    }
+    // The statement is `select` and the call, so the call is what is left
+    // once the first word and a closing `;` are taken off.
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let Some(column) = trimmed
+        .get("select".len()..)
+        .map(str::trim_start)
+        .filter(|_| trimmed[.."select".len()].eq_ignore_ascii_case("select"))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(SqlxDatabaseExistsQuery {
+        name,
+        column: column.to_owned(),
+    }))
+}
+
 /// Whether a statement names `INFORMATION_SCHEMA` anywhere, which every
 /// Connector/J catalog query does.
 fn names_information_schema(sql: &str) -> bool {

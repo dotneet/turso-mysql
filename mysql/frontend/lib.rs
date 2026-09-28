@@ -45,11 +45,11 @@ pub use session::{
     MySqlIsolationLevel, MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
     MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
-    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
-    MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError, MySqlShowCreateTableError,
-    MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable, MySqlTableKind,
-    MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata, MySqlWriteResult,
-    ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
+    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedStatementPlace,
+    MySqlPreparedValue, MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError,
+    MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable,
+    MySqlTableKind, MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata,
+    MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
 pub use temporal_zone::shift_timestamp;
 pub use truncate_table::MySqlTruncateTableError;

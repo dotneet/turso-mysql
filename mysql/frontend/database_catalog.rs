@@ -636,6 +636,11 @@ impl MySqlDatabaseSession {
             .map(|selected| selected.name.as_str())
     }
 
+    /// The quota every prepared statement of the server holds a place in.
+    pub fn prepared_statement_authority(&self) -> &MySqlPreparedStatementAuthority {
+        &self.prepared_statement_authority
+    }
+
     /// The collation `@@collation_database` reads: the selected database's as
     /// it was when it was selected, or `None` with no database selected.
     pub fn selected_database_collation(&self) -> Option<MySqlTableCollation> {

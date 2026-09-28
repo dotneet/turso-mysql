@@ -88,9 +88,10 @@ pub use information_schema::{
     parse_optional_flyway_schema_emptiness_query,
     parse_optional_gorm_information_schema_prepared_query,
     parse_optional_laravel_information_schema_query, parse_optional_performance_schema_read,
-    ConnectorJForeignKey, ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
-    ConnectorJTables, FlywaySchemaEmptinessQuery, GormInformationSchemaPreparedQuery,
-    LaravelInformationSchemaQuery, LaravelSchema, PerformanceSchemaRead,
+    parse_optional_sqlx_database_exists_query, ConnectorJForeignKey,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery, ConnectorJTables,
+    FlywaySchemaEmptinessQuery, GormInformationSchemaPreparedQuery, LaravelInformationSchemaQuery,
+    LaravelSchema, PerformanceSchemaRead, SqlxDatabaseExistsQuery,
 };
 use mysql_ddl::render_mysql_column;
 pub use prisma_catalog::{

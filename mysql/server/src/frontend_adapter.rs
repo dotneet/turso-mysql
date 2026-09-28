@@ -282,6 +282,9 @@ enum RunAsText {
 struct DatabasePreparedStatementRegistry {
     next_statement_id: Option<u32>,
     statements: HashMap<u32, DatabasePreparedStatement>,
+    /// Statements the server answers itself, which need no database's
+    /// connection and so can be prepared before one is selected.
+    sessionless: HashMap<u32, SessionlessPreparedStatement>,
 }
 
 #[cfg(unix)]
@@ -290,8 +293,18 @@ impl Default for DatabasePreparedStatementRegistry {
         Self {
             next_statement_id: Some(1),
             statements: HashMap::new(),
+            sessionless: HashMap::new(),
         }
     }
+}
+
+/// sqlx's question whether a database is there, which `sqlx database
+/// create`, `drop` and `reset` ask on a connection that selects none.
+#[cfg(unix)]
+struct SessionlessPreparedStatement {
+    query: turso_mysql_parser::SqlxDatabaseExistsQuery,
+    parameter_types: Option<Vec<StatementParameterType>>,
+    _place: turso_mysql::MySqlPreparedStatementPlace,
 }
 
 impl MySqlCommandAdapter {
@@ -2665,6 +2678,7 @@ where
             statement.connection.clear_prepared_statements();
         }
         self.prepared_statements.statements.clear();
+        self.prepared_statements.sessionless.clear();
         // MySQL's reset lets go of every named lock the session holds.
         self.named_locks.release_all();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
@@ -2696,10 +2710,19 @@ where
                 .connection
                 .remove_prepared_statement(statement.connection_statement_id);
         }
+        self.prepared_statements.sessionless.remove(&statement_id);
         self.pending_long_data.clear_statement(statement_id);
     }
 
     fn execute_stmt_reset(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        if self
+            .prepared_statements
+            .sessionless
+            .contains_key(&statement_id)
+        {
+            self.pending_long_data.clear_statement(statement_id);
+            return Ok(());
+        }
         let statement = self
             .prepared_statements
             .statements
@@ -2716,17 +2739,22 @@ where
     }
 
     fn execute_stmt_send_long_data(&mut self, statement_id: u32, parameter_id: u16, data: &[u8]) {
-        let Some(parameter_count) = self
+        let sessionless = self
             .prepared_statements
-            .statements
+            .sessionless
             .get(&statement_id)
-            .and_then(|statement| {
-                statement
-                    .connection
-                    .prepared_statement_metadata(statement.connection_statement_id)
-            })
-            .map(|metadata| metadata.parameter_count)
-        else {
+            .map(|statement| u16::from(statement.query.name().is_none()));
+        let Some(parameter_count) = sessionless.or_else(|| {
+            self.prepared_statements
+                .statements
+                .get(&statement_id)
+                .and_then(|statement| {
+                    statement
+                        .connection
+                        .prepared_statement_metadata(statement.connection_statement_id)
+                })
+                .map(|metadata| metadata.parameter_count)
+        }) else {
             return;
         };
         self.pending_long_data
@@ -2740,6 +2768,13 @@ where
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         let _kept_reads = turso_mysql_parser::keep_reads();
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        if self
+            .prepared_statements
+            .sessionless
+            .contains_key(&statement_id)
+        {
+            return self.execute_sessionless_statement(statement_id, parameter_payload);
+        }
         self.follow_a_dropped_database()?;
         self.prepare_again_when_its_database_went(statement_id)?;
         self.session_variables
@@ -3110,6 +3145,14 @@ where
                 .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
                 .collect();
             return Ok(prepared);
+        }
+        if let Some(query) = turso_mysql_parser::parse_optional_sqlx_database_exists_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self.prepare_sessionless_statement(query);
         }
         if let Some(query) = turso_mysql_parser::parse_optional_prisma_information_schema_query(
             sql,
@@ -3629,6 +3672,23 @@ where
             return self
                 .flyway_schema_emptiness_result(&schemas)
                 .map(CommandExecutionResult::ResultSet);
+        }
+        if let Some(query) = turso_mysql_parser::parse_optional_sqlx_database_exists_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            // A `?` is 1064 in a statement sent as text.
+            let name = query.name().ok_or(FrontendErrorKind::Syntax)?;
+            let found = self.database_is_there(name)?;
+            return Ok(CommandExecutionResult::ResultSet(
+                catalog_results::database_exists_text_result(
+                    query.column(),
+                    found,
+                    self.status_flags(),
+                ),
+            ));
         }
         // The one written shape this recognized before the engine could scan
         // the table still answers it, because it takes a `WHERE TABLE_SCHEMA =
@@ -4509,6 +4569,116 @@ where
             warnings: 0,
             status_flags: self.status_flags(),
         })
+    }
+
+    /// Prepares sqlx's question whether a database is there on no database's
+    /// connection: `sqlx database reset` asks it before it has selected one.
+    /// The statement still takes a place in the server's quota.
+    fn prepare_sessionless_statement(
+        &mut self,
+        query: turso_mysql_parser::SqlxDatabaseExistsQuery,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let place = self
+            .session
+            .prepared_statement_authority()
+            .take_a_place()
+            .map_err(prepared_statement_error)?;
+        let Some(statement_id) = self.prepared_statements.next_statement_id else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        self.prepared_statements.next_statement_id = statement_id.checked_add(1);
+        let parameters = usize::from(query.name().is_none());
+        let columns = vec![catalog_results::database_exists_column(query.column())];
+        self.prepared_statements.sessionless.insert(
+            statement_id,
+            SessionlessPreparedStatement {
+                query,
+                parameter_types: None,
+                _place: place,
+            },
+        );
+        Ok(PreparedStatementResult {
+            statement_id,
+            parameters: (1..=parameters)
+                .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
+                .collect(),
+            columns,
+            warnings: 0,
+            status_flags: self.status_flags(),
+        })
+    }
+
+    fn execute_sessionless_statement(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let long_data = self.pending_long_data.take_statement(statement_id);
+        if let Some(error) = long_data.error {
+            return Err(pending_long_data_error(error));
+        }
+        let long_data = long_data
+            .values
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>();
+        let statement = self
+            .prepared_statements
+            .sessionless
+            .get_mut(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        let name = match statement.query.name() {
+            Some(name) => name.to_owned(),
+            None => {
+                let decoded = decode_statement_execute_parameters_with_long_data(
+                    parameter_payload,
+                    1,
+                    statement.parameter_types.as_deref(),
+                    &long_data,
+                )
+                .map_err(statement_execute_decode_error)?;
+                statement.parameter_types = Some(decoded.types);
+                // A bound number is compared with the names by a rule of its
+                // own, which has not been measured.
+                match <[StatementParameterValue; 1]>::try_from(decoded.values) {
+                    Ok([StatementParameterValue::String(name)]) => name,
+                    _ => return Err(FrontendErrorKind::Unsupported),
+                }
+            }
+        };
+        let column = statement.query.column().to_owned();
+        let found = self.database_is_there(&name)?;
+        let read =
+            catalog_results::database_exists_text_result(&column, found, self.status_flags());
+        binary_session_read(read).map(PreparedStatementExecutionResult::ResultSet)
+    }
+
+    /// Whether a database of this name is there, for a session that may list
+    /// the databases, as the listing of `information_schema.SCHEMATA` with no
+    /// database selected asks.
+    ///
+    /// A name differing from one only in case is refused: this server reports
+    /// `lower_case_table_names = 1`, under which MySQL's answer depends on how
+    /// it compares the catalog's names, and that has not been measured.
+    fn database_is_there(&mut self, name: &str) -> Result<bool, FrontendErrorKind> {
+        self.authorize(DatabaseAction::List)?;
+        let result = self
+            .session
+            .execute_parsed_admin_command(MySqlAdminCommand::ListDatabases)
+            .map_err(database_error_kind)?;
+        let MySqlAdminCommandResult::Listed { databases } = result else {
+            unreachable!("listing the databases answers a list");
+        };
+        if databases.iter().any(|database| database == name) {
+            return Ok(true);
+        }
+        if databases
+            .iter()
+            .any(|database| database.eq_ignore_ascii_case(name))
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        Ok(false)
     }
 
     fn execute_prepared_statement_command(

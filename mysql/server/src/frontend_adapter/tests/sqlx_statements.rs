@@ -544,3 +544,99 @@ fn sqlx_copies_an_id_beside_a_bound_title_out_of_a_table_holding_a_decimal() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// `sqlx database reset` connects with no database selected, asks whether
+/// its database is there with a prepared `select exists(...)`, drops it,
+/// asks again on a new connection and creates it. Measured on MySQL 8.4.11
+/// through sqlx 0.8.6: a NOT NULL `LONGLONG` of 1 with the binary flag, named
+/// after the call as written, 1 while the database is there and 0 once it is
+/// gone.
+#[test]
+fn sqlx_asks_whether_its_database_is_there_before_selecting_one() {
+    const EXISTS: &str =
+        "select exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?)";
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes(ACCOUNT),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    run(&mut adapter, SESSION);
+
+    let is_there = |adapter: &mut Adapter| {
+        let result = prepared_rows(adapter, EXISTS, &[Bound::Word("reports")]);
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_type,
+                    column.flags,
+                    column.column_length
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                "exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?)",
+                MYSQL_TYPE_LONGLONG,
+                0x81,
+                1
+            )]
+        );
+        result.rows
+    };
+    assert_eq!(is_there(&mut adapter), [[BinaryResultValue::Integer(1)]]);
+    run(&mut adapter, "DROP DATABASE IF EXISTS `reports`");
+    assert_eq!(is_there(&mut adapter), [[BinaryResultValue::Integer(0)]]);
+    run(&mut adapter, "CREATE DATABASE `reports`");
+    assert_eq!(is_there(&mut adapter), [[BinaryResultValue::Integer(1)]]);
+
+    let written = result_columns_and_rows(
+        &mut adapter,
+        "select exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'nope');",
+    );
+    assert_eq!(
+        written,
+        (
+            vec![
+                "exists(SELECT 1 from INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'nope')"
+                    .to_owned()
+            ],
+            vec![vec![Some("0".to_owned())]]
+        )
+    );
+
+    // Whether a name differing only in case names the database turns on how
+    // MySQL compares the catalog's names, which has not been measured.
+    assert_eq!(
+        prepared(&mut adapter, EXISTS, &[Bound::Word("REPORTS")]),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+fn result_columns_and_rows(
+    adapter: &mut Adapter,
+    sql: &str,
+) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must answer rows");
+    };
+    (
+        result
+            .columns
+            .into_iter()
+            .map(|column| column.name)
+            .collect(),
+        result
+            .rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+                    .collect()
+            })
+            .collect(),
+    )
+}

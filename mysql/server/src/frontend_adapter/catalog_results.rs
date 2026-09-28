@@ -3853,6 +3853,36 @@ pub(super) fn flyway_schema_emptiness_text_result(
     }
 }
 
+/// The answer to sqlx's `select exists(SELECT 1 from
+/// INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?)`.
+pub(super) fn database_exists_text_result(
+    column: &str,
+    found: bool,
+    status_flags: u16,
+) -> TextResultSet {
+    TextResultSet {
+        columns: vec![database_exists_column(column)],
+        rows: vec![vec![Some(if found {
+            b"1".to_vec()
+        } else {
+            b"0".to_vec()
+        })]],
+        warnings: 0,
+        status_flags,
+    }
+}
+
+/// Measured on MySQL 8.4.11 over both protocols, through sqlx 0.8.6 for the
+/// binary one: a NOT NULL `LONGLONG` of 1 with the binary flag, named after
+/// the call as the statement wrote it.
+pub(super) fn database_exists_column(column: &str) -> ColumnDefinitionConfig {
+    let mut definition = ColumnDefinitionConfig::new(column, MYSQL_TYPE_LONGLONG);
+    definition.character_set = MYSQL_BINARY_COLLATION;
+    definition.column_length = 1;
+    definition.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG;
+    definition
+}
+
 /// Measured on MySQL 8.4.11 over both protocols: the `SUM` of whole numbers is
 /// a nullable `NEWDECIMAL` of 42 with no decimals and the binary flag.
 pub(super) fn flyway_schema_emptiness_column() -> ColumnDefinitionConfig {

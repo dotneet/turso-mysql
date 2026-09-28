@@ -1004,6 +1004,15 @@ impl MySqlPreparedStatementAuthority {
         Ok(())
     }
 
+    /// Takes one place in the quota for a statement prepared on no
+    /// database's connection, which gives it back when it is dropped.
+    pub fn take_a_place(
+        &self,
+    ) -> std::result::Result<MySqlPreparedStatementPlace, MySqlPreparedStatementError> {
+        self.reserve()
+            .map(|permit| MySqlPreparedStatementPlace { _permit: permit })
+    }
+
     fn reserve(
         &self,
     ) -> std::result::Result<MySqlPreparedStatementPermit, MySqlPreparedStatementError> {
@@ -1035,6 +1044,12 @@ fn validate_prepared_statement_maximum(
 
 struct MySqlPreparedStatementPermit {
     authority: Arc<Mutex<PreparedStatementAuthorityState>>,
+}
+
+/// One place in the server's prepared-statement quota, held by a statement
+/// the server answers itself rather than on a database's connection.
+pub struct MySqlPreparedStatementPlace {
+    _permit: MySqlPreparedStatementPermit,
 }
 
 impl Drop for MySqlPreparedStatementPermit {
