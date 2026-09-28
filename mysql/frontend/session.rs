@@ -2103,13 +2103,9 @@ impl MySqlConnection {
         let Ok(columns) = self.list_columns(&table) else {
             return Ok(());
         };
-        if columns.iter().any(|column| {
-            column.extra().contains("on update CURRENT_TIMESTAMP")
-                && !upsert
-                    .assigned
-                    .iter()
-                    .any(|assigned| assigned.eq_ignore_ascii_case(column.name()))
-        }) {
+        if !moments_the_clause_leaves(&columns, &upsert.assigned).is_empty()
+            && !self.stamps_the_rows_an_upsert_changes(sql, mode, &upsert.table)
+        {
             return Err(MySqlParseError::Unsupported {
                 feature: "an upsert on a table with an ON UPDATE CURRENT_TIMESTAMP column it does not assign",
             });
@@ -2143,6 +2139,45 @@ impl MySqlConnection {
             }
         }
         Ok(())
+    }
+
+    /// Whether this upsert is written where each row it changes is stamped
+    /// with the moment in the `ON UPDATE CURRENT_TIMESTAMP` columns its clause
+    /// leaves: an upsert on a counted table asking the counter for every id,
+    /// or written a row at a time, in a session reading the clock in UTC, on
+    /// a table carrying no trigger, which writing a changed row a second time
+    /// would set off twice.
+    fn stamps_the_rows_an_upsert_changes(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+        table: &str,
+    ) -> bool {
+        if self.time_zone_offset_seconds() != 0
+            || self
+                .inner
+                .current_schema()
+                .get_triggers_for_table(table)
+                .next()
+                .is_some()
+        {
+            return false;
+        }
+        let Ok(Some(counted)) = self.load_auto_increment_table(table) else {
+            return false;
+        };
+        let Ok(insert) = parse_prepared_auto_increment_insert(sql, mode) else {
+            return false;
+        };
+        let Ok(bound) = insert.bind_allocator_table_with(&counted.definition, self.written_zero())
+        else {
+            return false;
+        };
+        bound.rowwise_conflicts()
+            || bound
+                .row_values()
+                .iter()
+                .all(|value| *value == AutoIncrementRowValue::Generated)
     }
 
     /// Renders an `INSERT ... SELECT` whose `SELECT` has to know its columns'
@@ -3351,34 +3386,39 @@ impl MySqlConnection {
         )? {
             return Ok(MySqlPreparedExecutionResult::Write(result));
         }
+        let stamped = self.moments_an_upsert_stamps(&insert.sql)?;
         let reserved =
             self.write_counted_rows(&insert.sql, &bound, &table, values, deadline, |reserved| {
                 self.check_write_deadline(deadline)?;
                 let statement = bound
                     .inject_row_ids(&reserved.ids)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let options = injected_auto_increment_prepare_options(&table, statement.clone());
-                let mut statement = self.inner.prepare_translated_stmt_with_options(
-                    statement,
-                    &insert.sql,
-                    &options,
-                )?;
-                if statement.parameters_count() != insert.parameter_count {
-                    return Err(LimboError::InternalError(
-                        "prepared AUTO_INCREMENT INSERT changed its parameter count".to_string(),
-                    ));
-                }
-                bind_prepared_values(&mut statement, &reserved.bound_values)?;
-                let result = (|| -> Result<()> {
-                    let timeout = self
-                        .remaining_write_timeout(deadline)
-                        .map_err(Into::<LimboError>::into)?;
-                    run_checked_write_statement(&mut statement, timeout).map_err(|error| {
-                        self.map_unsigned_decimal_write_error(error, Some(&table.name))
-                    })
-                })();
-                let reset_result = statement.reset();
-                result.and(reset_result)
+                self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
+                    let options =
+                        injected_auto_increment_prepare_options(&table, statement.clone());
+                    let mut statement = self.inner.prepare_translated_stmt_with_options(
+                        statement,
+                        &insert.sql,
+                        &options,
+                    )?;
+                    if statement.parameters_count() != insert.parameter_count {
+                        return Err(LimboError::InternalError(
+                            "prepared AUTO_INCREMENT INSERT changed its parameter count"
+                                .to_string(),
+                        ));
+                    }
+                    bind_prepared_values(&mut statement, &reserved.bound_values)?;
+                    let result = (|| -> Result<()> {
+                        let timeout = self
+                            .remaining_write_timeout(deadline)
+                            .map_err(Into::<LimboError>::into)?;
+                        run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                            self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                        })
+                    })();
+                    let reset_result = statement.reset();
+                    result.and(reset_result)
+                })
             });
         match reserved {
             Err(error) => Err(error),
@@ -9175,21 +9215,25 @@ impl MySqlConnection {
         let bound = insert
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let stamped = self.moments_an_upsert_stamps(sql)?;
         let reserved = self.write_counted_rows(sql, &bound, &table, &[], deadline, |reserved| {
             self.check_write_deadline(deadline)
                 .map_err(Into::<LimboError>::into)?;
             let statement = bound
                 .inject_row_ids(&reserved.ids)
                 .map_err(|error| LimboError::ParseError(error.to_string()))?;
-            let options = injected_auto_increment_prepare_options(&table, statement.clone());
-            let mut statement = self
-                .inner
-                .prepare_translated_stmt_with_options(statement, sql, &options)?;
-            let timeout = self
-                .remaining_write_timeout(deadline)
-                .map_err(Into::<LimboError>::into)?;
-            run_checked_write_statement(&mut statement, timeout)
-                .map_err(|error| self.map_unsigned_decimal_write_error(error, Some(&table.name)))
+            self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
+                let options = injected_auto_increment_prepare_options(&table, statement.clone());
+                let mut statement = self
+                    .inner
+                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                let timeout = self
+                    .remaining_write_timeout(deadline)
+                    .map_err(Into::<LimboError>::into)?;
+                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                })
+            })
         })?;
         // Measured on MySQL 8.4.11: an upsert that changed a row reports that
         // row's own id back to the client and leaves `LAST_INSERT_ID()` where
@@ -9243,6 +9287,7 @@ impl MySqlConnection {
             None
         };
         let mut next_id = reserved.and_then(|reserved| reserved.first_generated);
+        let stamped = self.moments_an_upsert_stamps(sql)?;
         const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
         self.inner
             .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
@@ -9269,25 +9314,28 @@ impl MySqlConnection {
                 let statement = bound
                     .one_row(row, id)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let options = injected_auto_increment_prepare_options(&table, statement.clone());
-                let mut statement = self
-                    .inner
-                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
-                // One row keeps the numbers its `?`s had in the whole
-                // statement, so the values bound up to its highest one cover
-                // it and the upsert clause after every row.
-                let parameter_count = statement.parameters_count();
-                let bound_values = values.get(..parameter_count).ok_or_else(|| {
-                    LimboError::InternalError(
-                        "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
-                    )
-                })?;
-                bind_prepared_values(&mut statement, bound_values)?;
-                let timeout = self
-                    .remaining_write_timeout(deadline)
-                    .map_err(Into::<LimboError>::into)?;
-                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
-                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
+                    let options =
+                        injected_auto_increment_prepare_options(&table, statement.clone());
+                    let mut statement = self
+                        .inner
+                        .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                    // One row keeps the numbers its `?`s had in the whole
+                    // statement, so the values bound up to its highest one
+                    // cover it and the upsert clause after every row.
+                    let parameter_count = statement.parameters_count();
+                    let bound_values = values.get(..parameter_count).ok_or_else(|| {
+                        LimboError::InternalError(
+                            "rowwise AUTO_INCREMENT INSERT changed its parameter count".to_string(),
+                        )
+                    })?;
+                    bind_prepared_values(&mut statement, bound_values)?;
+                    let timeout = self
+                        .remaining_write_timeout(deadline)
+                        .map_err(Into::<LimboError>::into)?;
+                    run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                        self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                    })
                 })?;
                 affected_rows = affected_rows
                     .checked_add(
@@ -9411,6 +9459,72 @@ impl MySqlConnection {
             ));
         }
         Ok(row_values)
+    }
+
+    /// The `ON UPDATE CURRENT_TIMESTAMP` columns an upsert's clause leaves to
+    /// MySQL, each with the places of a second it keeps, or none for any
+    /// other statement.
+    fn moments_an_upsert_stamps(&self, sql: &str) -> Result<Vec<(String, u8)>> {
+        let Some(upsert) = turso_mysql_parser::parse_optional_upsert(sql, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?
+        else {
+            return Ok(Vec::new());
+        };
+        let table = MySqlTableName::parse(&upsert.table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = self
+            .list_columns(&table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok(moments_the_clause_leaves(&columns, &upsert.assigned))
+    }
+
+    /// Runs one counted upsert's statement and, where it changed the row it
+    /// met, runs it again writing the moment into the `ON UPDATE
+    /// CURRENT_TIMESTAMP` columns its clause leaves.
+    ///
+    /// Measured on MySQL 8.4.11: an upsert writes the moment there whenever
+    /// it changes the row it meets — a name differing only in case or by a
+    /// trailing space included — and leaves it when the row stands as it was,
+    /// a `DECIMAL` offered as `'100.0'` over 100.00 among them. Whether the
+    /// row changed is what the engine counts it by, comparing the row it
+    /// wrote with the one that stood, so the first run asks that, inside a
+    /// savepoint the second one is written in place of.
+    fn write_stamping_the_row_an_upsert_changes(
+        &self,
+        statement: Stmt,
+        stamped: &[(String, u8)],
+        run: impl Fn(Stmt) -> Result<()>,
+    ) -> Result<()> {
+        if stamped.is_empty() {
+            return run(statement);
+        }
+        const SAVEPOINT: &str = "\"__turso_stamped_upsert\"";
+        self.run_internal(&format!("SAVEPOINT {SAVEPOINT}"))?;
+        let leave = |kept: bool| -> Result<()> {
+            // A value the assignment check refuses ends the whole
+            // transaction, savepoint and all.
+            if self.inner.get_auto_commit() {
+                return Ok(());
+            }
+            if !kept {
+                self.run_internal(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?;
+            }
+            self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+            Ok(())
+        };
+        if let Err(error) = run(statement.clone()) {
+            leave(false)?;
+            return Err(error);
+        }
+        if self.inner.mysql_upserted_rowid() == 0 || self.inner.mysql_changed_rows() == 0 {
+            return leave(true);
+        }
+        self.run_internal(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?;
+        let stamping = turso_mysql_parser::stamping_the_moments(&statement, stamped)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let written = run(stamping);
+        leave(written.is_ok())?;
+        written
     }
 
     /// The id of the counted row the engine numbers `rowid`.
@@ -12525,6 +12639,29 @@ fn found_before_a_number_is_taken(error: &LimboError) -> bool {
 /// One name written the way the engine's own parser reads one.
 fn sqlite_quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The `ON UPDATE CURRENT_TIMESTAMP` columns an upsert's clause does not
+/// assign, each with the places of a second it keeps.
+fn moments_the_clause_leaves(
+    columns: &[MySqlColumnMetadata],
+    assigned: &[String],
+) -> Vec<(String, u8)> {
+    columns
+        .iter()
+        .filter(|column| {
+            column.extra().contains("on update CURRENT_TIMESTAMP")
+                && !assigned
+                    .iter()
+                    .any(|assigned| assigned.eq_ignore_ascii_case(column.name()))
+        })
+        .map(|column| {
+            (
+                column.name().to_owned(),
+                column.temporal_precision().unwrap_or(0),
+            )
+        })
+        .collect()
 }
 
 struct WrittenAutoIncrementIds {

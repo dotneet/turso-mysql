@@ -166,7 +166,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | An `UPDATE ... SET` writing a fraction into a whole-number column — `SET n = n / 3` | refused; MySQL rounds the fraction into the column and the engine will not store it. One that divides evenly writes the number MySQL writes |
 | An `UPDATE ... SET` value reading a column the same `SET` has written | refused; MySQL takes the assignments left to right and the engine reads the row as it stood |
 | A `<=>` in an `ON DUPLICATE KEY UPDATE` comparing a column of the row offered that is not a word offered for a `VARCHAR` or `TEXT`, a whole number for an integer column or a written number for a `DECIMAL` — a moment, a document, a bound value — and a `CASE` in the clause other than Rails' touch of a timestamp | refused; measured, MySQL puts the offered value into the column's type before it compares (`'2026-01-01'` equals a `DATETIME` holding that midnight) and the engine compares it as it was written |
-| `ON DUPLICATE KEY UPDATE` on a table with an `ON UPDATE CURRENT_TIMESTAMP` column the clause does not write — TypeORM's `repository.upsert()` over an `@UpdateDateColumn` | refused; measured, MySQL writes the moment there whenever the upsert changes the row, which the engine's upsert does not. An `UPDATE` already writes it under a condition asking whether any assigned column changes; the upsert needs the same, on the counted path too, which renders without the table's columns |
+| `ON DUPLICATE KEY UPDATE` on a table with an `ON UPDATE CURRENT_TIMESTAMP` column the clause does not write, on a table that does not count its ids, as one row naming its own id, in a session not in UTC, or on a table carrying a trigger | refused; measured, MySQL writes the moment there whenever the upsert changes the row. On a counted table an upsert asking for every id, or of several rows, is written a row at a time and a changed row written again with the moment; a statement written as one cannot say which of its rows changed, and a trigger would run twice |
 | An `ON DUPLICATE KEY UPDATE` value reading a column of the row already there that the same clause has written, or one column written twice | refused; measured, MySQL takes these assignments left to right too — `a = a + 10, b = a` over 1 leaves `b` at 11 — and the engine reads the row as it stood |
 | A double, or a word naming a fraction or nothing, bound into `UPDATE ... SET` arithmetic — `balance - ?` binding 0.5, `views + ?` binding `'2.5'` — or a `?` in arithmetic written into a column that holds no whole number or `DECIMAL` | refused; measured, MySQL does the arithmetic as a double's and rounds it into the column, which the engine's exact decimal arithmetic and its refusal to store a fraction in a whole-number column do not match. A bound whole number, a word naming one, NULL, and a word naming a decimal into a `DECIMAL` are taken |
 | An `UPDATE ... SET` value taken from `(SELECT COUNT(*) FROM ...)` | refused; a count says nothing about the kind of the column written, and the pair is held to one kind |
@@ -605,6 +605,12 @@ Behaviour that works but does not match MySQL lives in
   the millisecond, so digits past the third are zeros
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
+- On a table that counts its own ids, the first `UPDATE` of a row an `INSERT`
+  or an upsert wrote counts the row as changed even where nothing changed, and
+  so does the first upsert of a row an `UPDATE` wrote, which then also stamps
+  an `ON UPDATE CURRENT_TIMESTAMP` column the clause leaves; MySQL counts
+  neither. The engine stores such a row differently after the one than after
+  the other
 - complex compound projections still have conservative nullable metadata
 - complex window projections still have conservative source-column metadata
 - `SHOW FULL COLUMNS` derives `Privileges` from database or table grants;

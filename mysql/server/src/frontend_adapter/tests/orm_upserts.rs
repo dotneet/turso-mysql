@@ -760,10 +760,10 @@ fn an_upsert_comparison_the_engine_answers_otherwise_is_refused() {
 
 /// MySQL writes the moment into an `ON UPDATE CURRENT_TIMESTAMP` column
 /// whenever an upsert changes the row, which the engine's upsert does not, so
-/// such an upsert is refused unless its clause writes the column itself.
-/// Measured on MySQL 8.4.11 over a row stamped in 2000: offering the same name
-/// leaves it, a new name stamps it now, and a clause writing the column writes
-/// what it says.
+/// on a table that does not count its own ids such an upsert is refused unless
+/// its clause writes the column itself. Measured on MySQL 8.4.11 over a row
+/// stamped in 2000: offering the same name leaves it, a new name stamps it
+/// now, and a clause writing the column writes what it says.
 #[test]
 fn an_upsert_leaving_an_on_update_column_to_mysql_is_refused() {
     let (_directory, mut adapter) = adapter();
@@ -796,21 +796,6 @@ fn an_upsert_leaving_an_on_update_column_to_mysql_is_refused() {
     assert_eq!(
         rows(&mut adapter, "SELECT code, name, updated_at FROM plain"),
         vec![some(&["a", "C", "2000-01-01 00:00:00.000000"])]
-    );
-    // TypeORM's `@UpdateDateColumn`, on a table counting its own ids.
-    run(
-        &mut adapter,
-        "CREATE TABLE `users` (`id` bigint NOT NULL AUTO_INCREMENT, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), UNIQUE INDEX `IDX_97672ac88f789774dd47f7c8be` (`email`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
-    );
-    assert_eq!(
-        adapter.execute_query(
-            "INSERT INTO `users`(`id`, `email`, `name`, `updated_at`) VALUES (DEFAULT, 'a@x', 'A', DEFAULT), (DEFAULT, 'b@x', 'B', DEFAULT) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`), `name` = VALUES(`name`)"
-        ),
-        Err(FrontendErrorKind::Unsupported)
-    );
-    assert_eq!(
-        rows(&mut adapter, "SELECT COUNT(*) FROM users"),
-        vec![some(&["0"])]
     );
 }
 
@@ -1391,5 +1376,181 @@ fn typeorms_upsert_gives_default_in_some_rows_only() {
     assert_eq!(
         rows(&mut adapter, "SELECT COUNT(*) FROM plain"),
         vec![some(&["0"])]
+    );
+}
+
+const TYPEORM_USERS: &str = "CREATE TABLE `users` (`id` bigint NOT NULL AUTO_INCREMENT, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `balance` decimal(10,2) NOT NULL DEFAULT '0.00', `is_active` tinyint NOT NULL DEFAULT 1, `profile` json NULL, `created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), UNIQUE INDEX `IDX_97672ac88f789774dd47f7c8be` (`email`), PRIMARY KEY (`id`)) ENGINE=InnoDB";
+
+/// Each user's id, name, balance, and whether its `updated_at` was stamped
+/// after the 2020 every row starts from.
+fn stamped_users(adapter: &mut Adapter) -> Vec<(String, String, String, bool)> {
+    moments_of_users(adapter)
+        .into_iter()
+        .map(|(id, name, balance, updated_at)| {
+            (id, name, balance, !updated_at.starts_with("2020-"))
+        })
+        .collect()
+}
+
+/// Each user's id, name, balance and `updated_at`.
+fn moments_of_users(adapter: &mut Adapter) -> Vec<(String, String, String, String)> {
+    rows(
+        adapter,
+        "SELECT id, name, balance, updated_at FROM users ORDER BY id",
+    )
+    .into_iter()
+    .map(|row| {
+        let [id, name, balance, updated_at] = row.as_slice() else {
+            panic!("four columns");
+        };
+        (
+            id.clone().unwrap(),
+            name.clone().unwrap(),
+            balance.clone().unwrap(),
+            updated_at.clone().unwrap(),
+        )
+    })
+    .collect()
+}
+
+fn user(id: &str, name: &str, balance: &str, stamped: bool) -> (String, String, String, bool) {
+    (id.to_owned(), name.to_owned(), balance.to_owned(), stamped)
+}
+
+/// TypeORM's `repository.upsert` over its `@UpdateDateColumn`, which the
+/// clause does not assign. Measured on MySQL 8.4.11: the upsert writes the
+/// moment into the column of each row it changes — a name differing only in
+/// case or by a trailing space included — and leaves it in a row that stands
+/// as it was, a balance offered as `'100.0'` over 100.00 among them; a clause
+/// writing the column itself writes what it says.
+#[test]
+fn typeorms_upsert_stamps_the_rows_it_changes() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, TYPEORM_USERS);
+    run(
+        &mut adapter,
+        "INSERT INTO users (email, name, balance, updated_at) VALUES ('alice@example.com', 'Alice A.', '0.00', '2020-01-01 00:00:00'), ('bob@example.com', 'Bob', '20.25', '2020-01-01 00:00:00'), ('carol@example.com', 'Carol', '5.00', '2020-01-01 00:00:00'), ('dave@example.com', 'Dave', '0.00', '2020-01-01 00:00:00')",
+    );
+    run(
+        &mut adapter,
+        "DELETE FROM users WHERE email = 'dave@example.com'",
+    );
+    let upsert = |alice: &str, alice_balance: &str, erin_balance: &str| {
+        format!("INSERT INTO `users`(`id`, `email`, `name`, `balance`, `is_active`, `profile`, `created_at`, `updated_at`) VALUES (DEFAULT, 'alice@example.com', '{alice}', {alice_balance}, DEFAULT, DEFAULT, DEFAULT, DEFAULT), (DEFAULT, 'erin@example.com', 'Erin', {erin_balance}, DEFAULT, DEFAULT, DEFAULT, DEFAULT) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`), `name` = VALUES(`name`), `balance` = VALUES(`balance`)")
+    };
+    // The engine's clock reads to the millisecond.
+    let a_moment_later = || std::thread::sleep(std::time::Duration::from_millis(5));
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            &upsert("Alice Upserted", "'100.00'", "DEFAULT")
+        ),
+        (3, 5, 3)
+    );
+    assert_eq!(
+        stamped_users(&mut adapter),
+        vec![
+            user("1", "Alice Upserted", "100.00", true),
+            user("2", "Bob", "20.25", false),
+            user("3", "Carol", "5.00", false),
+            user("5", "Erin", "0.00", true),
+        ]
+    );
+    let before = moments_of_users(&mut adapter);
+    a_moment_later();
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            &upsert("Alice Upserted", "'100.00'", "DEFAULT")
+        ),
+        (0, 0, 3)
+    );
+    assert_eq!(moments_of_users(&mut adapter), before);
+    a_moment_later();
+    assert_eq!(
+        written_with_warnings(&mut adapter, &upsert("ALICE UPSERTED", "'100.0'", "'100'")),
+        (4, 5, 3)
+    );
+    let after = moments_of_users(&mut adapter);
+    assert_eq!(
+        after
+            .iter()
+            .zip(&before)
+            .map(|(now, then)| (now.1.as_str(), now.2.as_str(), now.3 != then.3))
+            .collect::<Vec<_>>(),
+        vec![
+            ("ALICE UPSERTED", "100.00", true),
+            ("Bob", "20.25", false),
+            ("Carol", "5.00", false),
+            ("Erin", "100.00", true),
+        ]
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO `users`(`email`, `name`) VALUES ('bob@example.com', 'Bob ') ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+        ),
+        (2, 2, 1)
+    );
+    assert_eq!(
+        stamped_users(&mut adapter)[1],
+        user("2", "Bob ", "20.25", true)
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO `users`(`email`, `name`, `balance`) VALUES ('carol@example.com', 'x', '5') ON DUPLICATE KEY UPDATE `balance` = VALUES(`balance`)"
+        ),
+        (0, 0, 1)
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO `users`(`email`, `name`) VALUES ('carol@example.com', 'Carol2') ON DUPLICATE KEY UPDATE `name` = VALUES(`name`), updated_at = updated_at"
+        ),
+        (2, 3, 1)
+    );
+    assert_eq!(
+        stamped_users(&mut adapter)[2],
+        user("3", "Carol2", "5.00", false)
+    );
+}
+
+/// The same stamp through a prepared upsert of one row, measured on MySQL
+/// 8.4.11 with go-sql-driver: a row left as it stood keeps its moment, a
+/// changed one is stamped, and a new one takes the column's default.
+#[test]
+fn a_prepared_upsert_of_one_row_stamps_the_row_it_changes() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, TYPEORM_USERS);
+    run(
+        &mut adapter,
+        "INSERT INTO users (email, name, updated_at) VALUES ('a@x', 'A', '2020-01-01 00:00:00'), ('b@x', 'B', '2020-01-01 00:00:00')",
+    );
+    let upsert = "INSERT INTO `users` (`email`, `name`) VALUES (?, ?) ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)";
+    let statement = adapter.execute_stmt_prepare(upsert).unwrap();
+    for (email, name, reported) in [
+        ("a@x", "A", (0, 0, 0)),
+        ("b@x", "B2", (2, 2, 0)),
+        ("c@x", "C", (1, 5, 0)),
+    ] {
+        assert_eq!(
+            executed(
+                &mut adapter,
+                statement.statement_id,
+                &bound(&[Bound::Word(email), Bound::Word(name)])
+            ),
+            reported,
+            "{email}"
+        );
+    }
+    adapter.execute_stmt_close(statement.statement_id);
+    assert_eq!(
+        stamped_users(&mut adapter),
+        vec![
+            user("1", "A", "0.00", false),
+            user("2", "B2", "0.00", true),
+            user("5", "C", "0.00", true),
+        ]
     );
 }

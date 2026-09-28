@@ -2540,10 +2540,26 @@ those actually changed. What each of the three counts is set out further down,
 where that change is described.
 
 A table with an `ON UPDATE CURRENT_TIMESTAMP` column — TypeORM's `@UpdateDateColumn` — takes
-an upsert only when the clause writes that column itself. Measured on 8.4.11, MySQL writes the
-moment into it whenever the upsert changes the row and leaves it when the row stands as it was,
-and the engine's upsert writes nothing there, so the rest is refused rather than answered with
-the old moment, which is what it was before this.
+an upsert the clause of which leaves that column when the table counts its own ids and the
+upsert asks the counter for every id or has several rows, which are the upserts written one
+row at a time. Measured on 8.4.11, MySQL writes the moment into the column whenever the upsert
+changes the row — a name differing only in case or by a trailing space included — and leaves
+it when the row stands as it was, a `DECIMAL` offered as `'100.0'` over 100.00 among them. The
+engine's upsert writes nothing there, so each row is written, and where the engine counts the
+row it met as changed — it compares the row it wrote with the one that stood, which is what
+decides the affected count too — the row is written again in its place with the moment in the
+column, read once for the whole statement. TypeORM's `repository.upsert` is answered as MySQL
+answers it, prepared or not. Refused still: the same upsert on a table that does not count its
+ids, whose rows are written in one statement; one row naming its own id; a session whose time
+zone is not UTC; and a table carrying a trigger, which the second writing would set off twice.
+An upsert whose clause writes the column itself is taken everywhere, as before, and answered
+with what the clause says.
+
+On a counted table a row an `UPDATE` wrote and a row an `INSERT` or an upsert wrote differ in
+how the engine stores them, so the first `UPDATE` of a row an `INSERT` wrote counts it as
+changed even where nothing changed, and so does the first upsert of a row an `UPDATE` wrote —
+and that upsert then stamps the moment too. MySQL counts neither and stamps nothing. This is
+listed under the known divergences in [TODO.md](TODO.md).
 
 The clause is refused where it would be dropped rather than answered: on the
 `SET` form and the empty-row form, which leave no room for it, and beside

@@ -7686,6 +7686,44 @@ pub fn moment_with_fraction_sql(digits: u8) -> String {
     )
 }
 
+/// The same upsert with its update half also writing the moment into each of
+/// `stamped`, a column with the places of a second it keeps, the way an
+/// `UPDATE` rewrites an `ON UPDATE CURRENT_TIMESTAMP` column.
+pub fn stamping_the_moments(
+    statement: &Stmt,
+    stamped: &[(String, u8)],
+) -> Result<Stmt, ParseError> {
+    let mut statement = statement.clone();
+    let Stmt::Insert {
+        body: turso_parser::ast::InsertBody::Select(_, Some(upsert)),
+        ..
+    } = &mut statement
+    else {
+        return unsupported("stamping the moment into a statement that is no upsert");
+    };
+    let turso_parser::ast::UpsertDo::Set { sets, .. } = &mut upsert.do_clause else {
+        return unsupported("stamping the moment into an upsert that changes nothing");
+    };
+    let assignments = stamped
+        .iter()
+        .map(|(column, places)| {
+            let moment = match places {
+                0 => "CURRENT_TIMESTAMP".to_owned(),
+                places => moment_with_fraction_sql(*places),
+            };
+            format!("{} = {moment}", render_ident_str(column))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Stmt::Update(update) = parse_normalized_dml(&format!("UPDATE t SET {assignments}"))? else {
+        return Err(ParseError::TursoParser(
+            "the moments stamped did not read as an UPDATE".to_string(),
+        ));
+    };
+    sets.extend(update.sets);
+    Ok(statement)
+}
+
 /// Whether an engine default is the reading of the clock written in
 /// parentheses, which is how a MySQL `DEFAULT (now())` is kept.
 pub fn reads_the_clock_as_an_expression(expr: &TursoExpr) -> bool {
