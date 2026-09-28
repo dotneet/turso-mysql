@@ -117,6 +117,46 @@ pub(super) fn render_json_null_test(
     ))
 }
 
+/// Renders `LIKE` over the text a JSON reading unquotes, or nothing when the
+/// matched side is not one.
+///
+/// Prisma's `string_starts_with` on a JSON member writes
+/// `JSON_UNQUOTE(JSON_EXTRACT(profile, ?)) LIKE ?`. Measured on MySQL 8.4.11,
+/// the text carries `utf8mb4_bin`, so the match tells case apart: `'Osa%'`
+/// finds `Osaka` and `'osa%'` does not, `'T_kyo'` finds `Tokyo`, and a path
+/// the document does not have finds nothing.
+pub(super) fn render_like_over_a_json_reading(
+    negated: bool,
+    expr: &Expr,
+    pattern: &Expr,
+    escape_argument: &str,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let Some(JsonAnswer::Text(reading)) = answered_by_json(expr) else {
+        return Ok(None);
+    };
+    // The reading is written first, so a path it binds takes the first `?`.
+    let rendered = reading.render(render_context)?;
+    let (rendered_pattern, rhs) = render_like_pattern(pattern, render_context)?;
+    let operator = if negated {
+        CheckedSelectComparisonOperator::NotLike
+    } else {
+        CheckedSelectComparisonOperator::Like
+    };
+    record_json_comparison(
+        render_context,
+        operator,
+        rhs,
+        crate::CheckedComparisonAnswer::JsonPattern,
+    );
+    let matched = format!("mysql_binary_like({rendered}, {rendered_pattern}, {escape_argument})");
+    Ok(Some(if negated {
+        format!("(NOT {matched})")
+    } else {
+        format!("({matched})")
+    }))
+}
+
 /// Renders a JSON reading tested against a list of written values —
 /// Django's `JSON_EXTRACT(profile, '$."city"') IN (JSON_EXTRACT('"Tokyo"',
 /// '$'), ...)` and SQLAlchemy's `CASE ... END IN ('Tokyo', 'Osaka')` — or
@@ -894,8 +934,10 @@ fn render_contains(
             // Measured on MySQL 8.4.11, it answers what `JSON_CONTAINS(profile,
             // '["a"]', '$."tags"')` answers, no value where the member is not
             // there included.
+            // Prisma binds the path: `JSON_CONTAINS(JSON_EXTRACT(profile,
+            // ?), ?)`.
             None => match read_json_reading(target) {
-                Some(reading) if !reading.unquoted && !reading.binds_its_path() => reading,
+                Some(reading) if !reading.unquoted => reading,
                 _ => return unsupported("JSON_CONTAINS over something other than a column"),
             },
         },
@@ -915,6 +957,8 @@ fn render_contains(
         }
         _ => return unsupported("JSON_CONTAINS over something other than a column"),
     };
+    // The target is written first, so a path it binds takes the first `?`.
+    let target = target.render(render_context)?;
     let candidate = arguments[1];
     let rendered_candidate = match candidate {
         Expr::Value(value) => match &value.value {
@@ -938,7 +982,6 @@ fn render_contains(
         },
         _ => return unsupported("JSON_CONTAINS looking for something other than a document"),
     };
-    let target = target.render(render_context)?;
     Ok(Some(format!(
         "mysql_json_holds({target}, {rendered_candidate})"
     )))
@@ -946,34 +989,51 @@ fn render_contains(
 
 /// Renders `JSON_CONTAINS('<document>', col)`, which asks whether a written
 /// document holds the column — Django's `profile__contained_by` — or nothing
-/// when the target is not a written document.
+/// when the target is not a written or bound document.
 ///
 /// Measured on MySQL 8.4.11: it holds the same rule the other way round, and a
-/// NULL column answers no value.
+/// NULL column answers no value. Prisma binds the document and reads the
+/// candidate out of the column: `JSON_CONTAINS(?, JSON_EXTRACT(profile, ?))`,
+/// which answers the rows whose member the document holds.
 fn render_contained_by(
     target: &Expr,
     candidate: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<Option<String>, ParseError> {
-    let Some(document) = written_word(target) else {
+    let rendered_target = if let Some(document) = written_word(target) {
+        if crate::normalize_json(document).is_err() {
+            return unsupported("JSON_CONTAINS in text that is not a document");
+        }
+        render_text(document)
+    } else if is_a_bare_placeholder(target) {
+        let ordinal = render_context.next_parameter_ordinal()?;
+        record_json_comparison(
+            render_context,
+            CheckedSelectComparisonOperator::Equal,
+            CheckedSelectComparisonRhs::Placeholder { ordinal },
+            crate::CheckedComparisonAnswer::JsonDocument,
+        );
+        "?".to_owned()
+    } else {
         return Ok(None);
     };
-    if crate::normalize_json(document).is_err() {
-        return unsupported("JSON_CONTAINS in text that is not a document");
-    }
-    let Some((qualifier, column)) = named_column(candidate) else {
-        return unsupported("JSON_CONTAINS of something other than a column in a document");
-    };
-    let candidate = JsonReading {
-        qualifier,
-        column,
-        path: None,
-        unquoted: false,
+    let candidate = match named_column(candidate) {
+        Some((qualifier, column)) => JsonReading {
+            qualifier,
+            column,
+            path: None,
+            unquoted: false,
+        },
+        None => match read_json_reading(candidate) {
+            Some(reading) if !reading.unquoted => reading,
+            _ => {
+                return unsupported("JSON_CONTAINS of something other than a column in a document")
+            }
+        },
     }
     .render(render_context)?;
     Ok(Some(format!(
-        "mysql_json_contains({}, {candidate})",
-        render_text(document)
+        "mysql_json_contains({rendered_target}, {candidate})"
     )))
 }
 

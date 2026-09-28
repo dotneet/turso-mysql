@@ -4923,7 +4923,21 @@ same rows:
   JSON_EXTRACT(col, 'path'), candidate)` for `profile__tags__contains`,
   which answers what the three-argument form answers, and
   `JSON_CONTAINS('<document>', col)` for `profile__contained_by`, which asks
-  the same question the other way round.
+  the same question the other way round. Prisma binds the path and the
+  document of both: `equals` on a member is `JSON_CONTAINS(JSON_EXTRACT(col,
+  ?), ?) AND JSON_CONTAINS(?, JSON_EXTRACT(col, ?))`, and `array_contains`
+  the first of those beside `JSON_TYPE(...) = 'ARRAY'`. Measured on 8.4.11,
+  `"Tokyo"` finds the member holding that string and neither `"tokyo"` nor a
+  missing path finds anything, `["Tokyo"]` finds an array holding it, and
+  `"a"`, `["a"]` and `["a", "b"]` each find `["a", "b"]`.
+- `LIKE` and `NOT LIKE` over the unquoted text of a member —
+  `JSON_UNQUOTE(JSON_EXTRACT(col, path))` or `col->>path`, which Prisma
+  writes for `string_starts_with`, `string_ends_with` and `string_contains`
+  — match under `utf8mb4_bin`, the text's collation. Measured on 8.4.11:
+  `'Osa%'` finds `Osaka` and `'osa%'` does not, `'T_kyo'` finds `Tokyo` and
+  `'T\_kyo'` does not, and a missing member or a NULL column matches neither
+  way. The pattern is written or bound as a word; MySQL reads a bound number
+  as its digits, which is refused here.
 - `JSON_LENGTH(col[, 'path'])` is compared with a number. A written word is
   refused: MySQL reads `json_length(doc) = '6'` as a number.
 

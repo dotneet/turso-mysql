@@ -11897,6 +11897,7 @@ fn checked_comparison_fits_column(
             | CheckedComparisonAnswer::JsonCount
             | CheckedComparisonAnswer::JsonDocument
             | CheckedComparisonAnswer::JsonPath
+            | CheckedComparisonAnswer::JsonPattern
             | CheckedComparisonAnswer::JsonValue => false,
         },
         CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Arithmetic) => matches!(
@@ -12297,9 +12298,11 @@ fn checked_comparison_meets_an_answer(
         (
             CheckedComparisonAnswer::JsonDocument
             | CheckedComparisonAnswer::JsonPath
+            | CheckedComparisonAnswer::JsonPattern
             | CheckedComparisonAnswer::JsonValue,
             CheckedSelectComparisonRhs::Placeholder { .. },
         ) => true,
+        (CheckedComparisonAnswer::JsonPattern, CheckedSelectComparisonRhs::Text(_)) => true,
         // What binds against a count is held to a whole number when the
         // statement runs.
         (
@@ -12355,6 +12358,10 @@ fn hold_json_reading_parameters(
             (CheckedComparisonAnswer::JsonPath, MySqlPreparedValue::Text(path)) => {
                 turso_mysql_parser::is_a_json_path_this_reads(path)
             }
+            // A pattern is matched as a word however the statement bound
+            // before, and a number bound there is refused, so what came before
+            // does not change how a word reads.
+            (CheckedComparisonAnswer::JsonPattern, MySqlPreparedValue::Text(_)) => true,
             (
                 CheckedComparisonAnswer::JsonText
                 | CheckedComparisonAnswer::JsonDocument
@@ -12405,6 +12412,7 @@ const fn answered_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
         CheckedComparisonAnswer::JsonCount => "a number",
         CheckedComparisonAnswer::JsonDocument => "a JSON document",
         CheckedComparisonAnswer::JsonPath => "a JSON path read the way MySQL reads it",
+        CheckedComparisonAnswer::JsonPattern => "a word",
         CheckedComparisonAnswer::JsonValue => "a word or a whole number",
         CheckedComparisonAnswer::RowCount => "a whole number",
     }
@@ -12456,6 +12464,7 @@ const fn answered_column_kind_name(answers: CheckedComparisonAnswer) -> &'static
         | CheckedComparisonAnswer::JsonCount
         | CheckedComparisonAnswer::JsonDocument
         | CheckedComparisonAnswer::JsonPath
+        | CheckedComparisonAnswer::JsonPattern
         | CheckedComparisonAnswer::JsonValue => "no column",
     }
 }
@@ -12793,6 +12802,7 @@ fn is_a_json_answer(answers: Option<CheckedComparisonAnswer>) -> bool {
                 | CheckedComparisonAnswer::JsonCount
                 | CheckedComparisonAnswer::JsonDocument
                 | CheckedComparisonAnswer::JsonPath
+                | CheckedComparisonAnswer::JsonPattern
                 | CheckedComparisonAnswer::JsonValue
         )
     )

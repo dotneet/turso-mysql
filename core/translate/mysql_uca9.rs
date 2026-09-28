@@ -28,77 +28,7 @@ pub(crate) fn sort_key(text: &str) -> Vec<u8> {
 /// Match MySQL LIKE one Unicode scalar at a time. Collation expansions do not
 /// change how many characters `_` and literal pattern characters consume.
 pub fn like(text: &str, pattern: &str, escape: Option<char>) -> crate::Result<bool> {
-    const MAX_PATTERN_BYTES: usize = 50_000;
-    const MAX_MATCH_STEPS: usize = 10_000_000;
-    if pattern.len() > MAX_PATTERN_BYTES {
-        return Err(crate::LimboError::Constraint(
-            "LIKE pattern too complex".to_owned(),
-        ));
-    }
-
-    let mut units = Vec::new();
-    let mut pattern_chars = pattern.chars();
-    while let Some(character) = pattern_chars.next() {
-        let unit = if escape == Some(character) {
-            LikeUnit::Literal(pattern_chars.next().unwrap_or(character))
-        } else {
-            match character {
-                '%' => LikeUnit::AnyMany,
-                '_' => LikeUnit::AnyOne,
-                _ => LikeUnit::Literal(character),
-            }
-        };
-        if unit != LikeUnit::AnyMany || units.last() != Some(&LikeUnit::AnyMany) {
-            units.push(unit);
-        }
-    }
-
-    let (mut text_index, mut pattern_index) = (0, 0);
-    let mut last_many = None;
-    let mut steps = 0;
-    while text_index < text.len() {
-        steps += 1;
-        if steps > MAX_MATCH_STEPS {
-            return Err(crate::LimboError::Constraint(
-                "LIKE match too complex".to_owned(),
-            ));
-        }
-        let character = text[text_index..].chars().next().unwrap();
-        match units.get(pattern_index) {
-            Some(LikeUnit::AnyMany) => {
-                pattern_index += 1;
-                last_many = Some((pattern_index, text_index));
-            }
-            Some(LikeUnit::AnyOne) => {
-                text_index += character.len_utf8();
-                pattern_index += 1;
-            }
-            Some(LikeUnit::Literal(pattern_character))
-                if same_primary_character(character, *pattern_character) =>
-            {
-                text_index += character.len_utf8();
-                pattern_index += 1;
-            }
-            _ => {
-                let Some((after_many, consumed)) = last_many else {
-                    return Ok(false);
-                };
-                text_index = consumed + text[consumed..].chars().next().unwrap().len_utf8();
-                pattern_index = after_many;
-                last_many = Some((after_many, text_index));
-            }
-        }
-    }
-    Ok(units[pattern_index..]
-        .iter()
-        .all(|unit| *unit == LikeUnit::AnyMany))
-}
-
-#[derive(PartialEq, Eq)]
-enum LikeUnit {
-    Literal(char),
-    AnyOne,
-    AnyMany,
+    super::mysql_like::like(text, pattern, escape, same_primary_character)
 }
 
 fn same_primary_character(lhs: char, rhs: char) -> bool {

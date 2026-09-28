@@ -509,6 +509,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
             return Ok(Some(Func::Dialect(MYSQL_UCA9_LIKE.to_string())));
         }
+        if arg_count == 3 && name.eq_ignore_ascii_case(MYSQL_BINARY_LIKE) {
+            return Ok(Some(Func::Dialect(MYSQL_BINARY_LIKE.to_string())));
+        }
         if arg_count == 1
             && (name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT))
         {
@@ -730,6 +733,8 @@ impl Dialect for MySqlDialect {
             Some(turso_core::mysql_uca9_like as fn(&str, &str, Option<char>) -> Result<bool>)
         } else if name.eq_ignore_ascii_case(MYSQL_UCA400_LIKE) {
             Some(turso_core::mysql_uca400_like as fn(&str, &str, Option<char>) -> Result<bool>)
+        } else if name.eq_ignore_ascii_case(MYSQL_BINARY_LIKE) {
+            Some(turso_core::mysql_binary_like as fn(&str, &str, Option<char>) -> Result<bool>)
         } else {
             None
         };
@@ -1644,6 +1649,9 @@ pub(crate) const MYSQL_ELT: &str = "mysql_elt";
 pub(crate) const MYSQL_REGEXP: &str = "mysql_regexp";
 pub(crate) const MYSQL_UCA9_LIKE: &str = "mysql_uca9_like";
 pub(crate) const MYSQL_UCA400_LIKE: &str = "mysql_uca400_like";
+/// `LIKE` under a binary collation, which the text a JSON reading unquotes
+/// carries.
+pub(crate) const MYSQL_BINARY_LIKE: &str = "mysql_binary_like";
 pub(crate) const MYSQL_LOWER: &str = "mysql_lower";
 pub(crate) const MYSQL_UPPER: &str = "mysql_upper";
 pub(crate) const MYSQL_INSTR: &str = "mysql_instr";

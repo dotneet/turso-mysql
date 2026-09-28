@@ -342,7 +342,8 @@ fn what_mysql_reads_some_other_way_is_refused() {
         "doc->>'$.tags[*]' = 'x'",
         "doc->>'$ . lang' = 'en'",
         "doc->>'$.lang' = 'en' COLLATE utf8mb4_0900_ai_ci",
-        "doc->>'$.lang' LIKE 'e%'",
+        "LOWER(doc->>'$.lang') LIKE 'e%'",
+        "doc->>'$.lang' LIKE BINARY 'e%'",
         // A document is only compared for equality here.
         "doc->'$.tags' > JSON_EXTRACT('[\"x\"]', '$')",
         "JSON_CONTAINS('not a document', doc)",

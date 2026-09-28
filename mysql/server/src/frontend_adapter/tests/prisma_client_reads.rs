@@ -154,3 +154,119 @@ fn a_total_compared_in_having_with_a_bound_value_finds_the_groups_mysql_finds() 
         [BinaryResultValue::Text("10".to_owned())]
     );
 }
+
+/// Prisma's JSON filters over `profile`, the path and the value each bound as
+/// a word. Measured on MySQL 8.4.11 over the rows above and a fourth whose
+/// `city` is an array holding `"Tokyo"` and whose `tags` is a word.
+#[test]
+fn json_filters_with_bound_paths_find_the_rows_mysql_finds() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query(
+            "INSERT INTO users (id, email, name, profile, updated_at) VALUES (4, 'dan@example.com', 'Dan', '{\"city\": [\"Tokyo\"], \"tags\": \"a\"}', '2026-09-28 04:02:18.123')",
+        )
+        .unwrap();
+    const EQUALS: &str = "SELECT `prisma`.`users`.`id`, `prisma`.`users`.`email`, `prisma`.`users`.`name`, `prisma`.`users`.`balance`, `prisma`.`users`.`is_active`, `prisma`.`users`.`profile`, `prisma`.`users`.`created_at`, `prisma`.`users`.`updated_at` FROM `prisma`.`users` WHERE (JSON_CONTAINS(JSON_EXTRACT(`prisma`.`users`.`profile`, ?), ?) AND JSON_CONTAINS(?, JSON_EXTRACT(`prisma`.`users`.`profile`, ?)))";
+    const ARRAY_CONTAINS: &str = "SELECT `prisma`.`users`.`id`, `prisma`.`users`.`email`, `prisma`.`users`.`name`, `prisma`.`users`.`balance`, `prisma`.`users`.`is_active`, `prisma`.`users`.`profile`, `prisma`.`users`.`created_at`, `prisma`.`users`.`updated_at` FROM `prisma`.`users` WHERE (JSON_CONTAINS(JSON_EXTRACT(`prisma`.`users`.`profile`, ?), ?) AND (JSON_TYPE(JSON_EXTRACT(`prisma`.`users`.`profile`, ?)) = ?))";
+    let equals = |adapter: &mut Adapter, path, value| {
+        ids(
+            adapter,
+            EQUALS,
+            &[
+                Bound::Word(path),
+                Bound::Word(value),
+                Bound::Word(value),
+                Bound::Word(path),
+            ],
+        )
+    };
+    let array_contains = |adapter: &mut Adapter, value| {
+        ids(
+            adapter,
+            ARRAY_CONTAINS,
+            &[
+                Bound::Word("$.tags"),
+                Bound::Word(value),
+                Bound::Word("$.tags"),
+                Bound::Word("ARRAY"),
+            ],
+        )
+    };
+
+    assert_eq!(equals(&mut adapter, "$.city", "\"Tokyo\""), [1]);
+    assert_eq!(equals(&mut adapter, "$.city", "\"Osaka\""), [2]);
+    assert_eq!(equals(&mut adapter, "$.city", "\"tokyo\""), NO_ROWS);
+    assert_eq!(equals(&mut adapter, "$.missing", "\"Tokyo\""), NO_ROWS);
+    assert_eq!(equals(&mut adapter, "$.city", "[\"Tokyo\"]"), [4]);
+
+    assert_eq!(array_contains(&mut adapter, "[\"a\"]"), [1]);
+    assert_eq!(array_contains(&mut adapter, "\"a\""), [1]);
+    assert_eq!(array_contains(&mut adapter, "[\"a\", \"b\"]"), [1]);
+    assert_eq!(array_contains(&mut adapter, "[\"z\"]"), NO_ROWS);
+}
+
+/// Prisma's `string_starts_with` and friends on a JSON member match the text
+/// the member unquotes to under `utf8mb4_bin`, telling case apart. Measured on
+/// MySQL 8.4.11 over the same rows.
+#[test]
+fn a_like_over_a_json_member_tells_case_apart_the_way_mysql_does() {
+    let (_directory, mut adapter) = adapter();
+    const STARTS_WITH: &str = "SELECT `prisma`.`users`.`id`, `prisma`.`users`.`email`, `prisma`.`users`.`name`, `prisma`.`users`.`balance`, `prisma`.`users`.`is_active`, `prisma`.`users`.`profile`, `prisma`.`users`.`created_at`, `prisma`.`users`.`updated_at` FROM `prisma`.`users` WHERE (JSON_UNQUOTE(JSON_EXTRACT(`prisma`.`users`.`profile`, ?)) LIKE ? AND (JSON_TYPE(JSON_EXTRACT(`prisma`.`users`.`profile`, ?)) = ?))";
+    let matching = |adapter: &mut Adapter, pattern| {
+        ids(
+            adapter,
+            STARTS_WITH,
+            &[
+                Bound::Word("$.city"),
+                Bound::Word(pattern),
+                Bound::Word("$.city"),
+                Bound::Word("STRING"),
+            ],
+        )
+    };
+
+    assert_eq!(matching(&mut adapter, "Osa%"), [2]);
+    assert_eq!(matching(&mut adapter, "osa%"), NO_ROWS);
+    assert_eq!(matching(&mut adapter, "%o"), [1]);
+    assert_eq!(matching(&mut adapter, "T_kyo"), [1]);
+    assert_eq!(matching(&mut adapter, "T\\_kyo"), NO_ROWS);
+
+    // A pattern binds as a word; MySQL would read a number as its digits.
+    assert_eq!(
+        prepared_rows(
+            &mut adapter,
+            STARTS_WITH,
+            &[
+                Bound::Word("$.city"),
+                Bound::Whole(5),
+                Bound::Word("$.city"),
+                Bound::Word("STRING"),
+            ],
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM users WHERE JSON_UNQUOTE(JSON_EXTRACT(profile, '$.city')) NOT LIKE 'T%'",
+            &[],
+        ),
+        [2]
+    );
+}
+
+const NO_ROWS: [i64; 0] = [];
+
+/// The ids of the rows a prepared statement answers, in order.
+fn ids(adapter: &mut Adapter, sql: &str, values: &[Bound<'_>]) -> Vec<i64> {
+    let mut ids = prepared_rows(adapter, sql, values)
+        .unwrap_or_else(|error| panic!("{sql} with {values:?}: {error:?}"))
+        .iter()
+        .map(|row| match row[0] {
+            BinaryResultValue::Integer(id) => id,
+            ref other => panic!("an id is a whole number, not {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids
+}

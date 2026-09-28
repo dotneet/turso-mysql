@@ -10985,6 +10985,19 @@ fn render_checked_like(
         None if render_context.no_backslash_escapes => None,
         None => Some('\\'),
     };
+    let escape_argument = match escape {
+        Some(character) => format!("'{}'", character.to_string().replace('\'', "''")),
+        None => "''".to_owned(),
+    };
+    if let Some(rendered) = json_condition::render_like_over_a_json_reading(
+        negated,
+        expr,
+        pattern,
+        &escape_argument,
+        render_context,
+    )? {
+        return Ok(rendered);
+    }
     let (qualifier, column) = match expr {
         Expr::Identifier(ident) => (None, ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
@@ -10998,6 +11011,41 @@ fn render_checked_like(
     {
         return unsupported("SELECT LIKE over DECIMAL requires decimal text conversion");
     }
+    let (rendered_pattern, rhs) = render_like_pattern(pattern, render_context)?;
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+        None => render_ident(column),
+    };
+    let matched =
+        format!("mysql_uca9_like({rendered_column}, {rendered_pattern}, {escape_argument})");
+    let rendered = if negated {
+        format!("(NOT {matched})")
+    } else {
+        format!("({matched})")
+    };
+    render_context
+        .checked_comparisons
+        .push(CheckedSelectComparison {
+            qualifier: qualifier.map(|q| q.value.clone()),
+            inner_sources: Vec::new(),
+            column_name: column.value.clone(),
+            operator: if negated {
+                CheckedSelectComparisonOperator::NotLike
+            } else {
+                CheckedSelectComparisonOperator::Like
+            },
+            rhs,
+            collated: false,
+            answers: None,
+        });
+    Ok(rendered)
+}
+
+/// Renders a `LIKE` pattern, written or bound, and says which it was.
+pub(super) fn render_like_pattern(
+    pattern: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
     let Some(pieces) = like_pattern_pieces(pattern) else {
         return unsupported("SELECT LIKE requires a string pattern");
     };
@@ -11033,37 +11081,7 @@ fn render_checked_like(
         (true, 1) => "?".to_owned(),
         (true, _) => format!("({})", rendered_pieces.join(" || ")),
     };
-    let rendered_column = match qualifier {
-        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
-        None => render_ident(column),
-    };
-    let escape_argument = match escape {
-        Some(character) => format!("'{}'", character.to_string().replace('\'', "''")),
-        None => "''".to_owned(),
-    };
-    let matched =
-        format!("mysql_uca9_like({rendered_column}, {rendered_pattern}, {escape_argument})");
-    let rendered = if negated {
-        format!("(NOT {matched})")
-    } else {
-        format!("({matched})")
-    };
-    render_context
-        .checked_comparisons
-        .push(CheckedSelectComparison {
-            qualifier: qualifier.map(|q| q.value.clone()),
-            inner_sources: Vec::new(),
-            column_name: column.value.clone(),
-            operator: if negated {
-                CheckedSelectComparisonOperator::NotLike
-            } else {
-                CheckedSelectComparisonOperator::Like
-            },
-            rhs,
-            collated: false,
-            answers: None,
-        });
-    Ok(rendered)
+    Ok((rendered_pattern, rhs))
 }
 
 /// One piece of a `LIKE` pattern.

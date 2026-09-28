@@ -1186,6 +1186,9 @@ pub enum CheckedComparisonAnswer {
     /// The path a JSON reading binds — `JSON_EXTRACT(doc, ?)` — which has to
     /// bind as a path this reads the way MySQL does, or as NULL.
     JsonPath,
+    /// The pattern a `LIKE` over text a JSON reading unquoted binds, which
+    /// has to bind as a word or as NULL.
+    JsonPattern,
     /// A JSON value read out of a column compared with a bound value, which
     /// MySQL compares as a JSON string when a word binds and as a JSON number
     /// when a whole number does — only while the statement has never bound a
