@@ -156,7 +156,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | A `CASE` or `IF` branch holding an aggregate or arithmetic | refused; only a written number and a column have been measured |
 | `SET n = DEFAULT` on an `UPDATE` | refused; MySQL writes the column's own default and this cannot work out what that is from the statement alone |
 | `DEFAULT` in one row of an `INSERT` and a value in another | supported for the `AUTO_INCREMENT` column in a checked `VALUES` insert; other columns remain refused because leaving the column out would take the default for every row |
-| `DEFAULT` beside `ON DUPLICATE KEY UPDATE` | refused; what the offered row carries for a column left out has not been measured |
+| `DEFAULT` beside `ON DUPLICATE KEY UPDATE` in every column, or an upsert reading a counted column off the offered row — `VALUES(id)` beside a `DEFAULT` id | refused; the engine's row of defaults has no room for the clause, and measured, MySQL's offered row carries the number the colliding row spent, which this is not held to |
 | `DEFAULT(col)` naming some other column | refused; that writes another column's default, which leaving the column out cannot say |
 | Several rows of defaults on an `AUTO_INCREMENT` table — `VALUES (DEFAULT), (DEFAULT)` | refused; which of the numbers the statement reports depends on the rows, and one row leaves no question |
 | An `UPDATE ... SET` dividing by a number read from the row, or by a written zero | refused; dividing by zero answers NULL in the engine where MySQL raises 1365 for a write, and only a written divisor says which of the two a statement would get |

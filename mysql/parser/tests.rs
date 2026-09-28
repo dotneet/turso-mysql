@@ -8921,6 +8921,12 @@ fn an_insert_takes_the_columns_own_default() {
             "REPLACE INTO d (id, n) VALUES (DEFAULT, DEFAULT)",
             "INSERT OR REPLACE INTO \"d\" DEFAULT VALUES",
         ),
+        // Beside an upsert the offered row carries the column's default, which
+        // is what the engine's `excluded` row carries for a column left out.
+        (
+            "INSERT INTO d (id, n) VALUES (1, DEFAULT) ON DUPLICATE KEY UPDATE n = VALUES(n) + 1",
+            "INSERT INTO \"d\" (\"id\") VALUES (1) ON CONFLICT DO UPDATE SET \"n\" = (\"excluded\".\"n\" + 1)",
+        ),
         // A quoted `default` is an ordinary column name, which is what MySQL
         // takes it for.
         (
@@ -8937,9 +8943,8 @@ fn an_insert_takes_the_columns_own_default() {
         // Leaving the column out would take the default for every row, so the
         // row that wrote a value would lose it.
         "INSERT INTO d (id, n) VALUES (1, DEFAULT), (2, 3)",
-        // What the offered row carries for a column left out has not been
-        // measured.
-        "INSERT INTO d (id, n) VALUES (1, DEFAULT) ON DUPLICATE KEY UPDATE n = 1",
+        // The engine's `DEFAULT VALUES` leaves no room for the upsert clause.
+        "INSERT INTO d (id, n) VALUES (DEFAULT, DEFAULT) ON DUPLICATE KEY UPDATE n = 1",
         // A default named after some other column writes that column's default
         // into this one, which leaving the column out cannot say.
         "INSERT INTO d (id, n) VALUES (1, DEFAULT(word))",

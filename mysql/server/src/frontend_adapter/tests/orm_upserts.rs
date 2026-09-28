@@ -291,3 +291,116 @@ fn values_in_an_upsert_warns_once_for_each_call() {
         vec![some(&["1", "SQL"])]
     );
 }
+
+/// TypeORM's `repository.upsert()` asks for the next id with `DEFAULT` in
+/// every row, beside an upsert that reads the offered row through `VALUES()`.
+#[test]
+fn typeorms_upsert_asks_the_counter_for_each_rows_id() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, UNIQUE INDEX `IDX_d90243459a697eadb8ad56e909` (`name`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO `tags`(`id`, `name`) VALUES (DEFAULT, 'news')"
+        ),
+        (1, 1)
+    );
+    let upsert = |rows: &str| {
+        format!(
+            "INSERT INTO `tags`(`id`, `name`) VALUES {rows} ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)"
+        )
+    };
+    assert_eq!(
+        written_with_warnings(&mut adapter, &upsert("(DEFAULT, 'go'), (DEFAULT, 'news')")),
+        (1, 2, 1)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["2"])]
+    );
+    assert_eq!(
+        written(&mut adapter, &upsert("(DEFAULT, 'go'), (DEFAULT, 'news')")),
+        (0, 0)
+    );
+    assert_eq!(written(&mut adapter, &upsert("(DEFAULT, 'go')")), (0, 0));
+    assert_eq!(written(&mut adapter, &upsert("(DEFAULT, 'rust')")), (1, 7));
+    // A row it changed reports that row's own id.
+    assert_eq!(written(&mut adapter, &upsert("(DEFAULT, 'Go')")), (2, 2));
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["7"])]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name FROM tags ORDER BY id"),
+        vec![
+            some(&["1", "news"]),
+            some(&["2", "Go"]),
+            some(&["7", "rust"])
+        ]
+    );
+    // Measured, the offered row carries the number a colliding row spent,
+    // which is not a number this is held to.
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO `tags`(`id`, `name`) VALUES (DEFAULT, 'zz') ON DUPLICATE KEY UPDATE `name` = CONCAT(VALUES(`name`), VALUES(`id`))"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO `tags`(`id`, `name`) VALUES (DEFAULT, 'zz') AS o ON DUPLICATE KEY UPDATE `name` = o.id"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+/// `DEFAULT` for an ordinary column beside an upsert offers the column's own
+/// default.
+#[test]
+fn a_default_beside_an_upsert_offers_the_columns_default() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE codes (code varchar(10) PRIMARY KEY, name varchar(20) NOT NULL, hits int NOT NULL DEFAULT 7)",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('b', 'B', DEFAULT) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('b', 'C', DEFAULT) ON DUPLICATE KEY UPDATE hits = VALUES(hits) + 1"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, name, hits FROM codes"),
+        vec![some(&["b", "B", "8"])]
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO codes (code, name, hits) VALUES ('b', 'C', DEFAULT) AS o ON DUPLICATE KEY UPDATE hits = o.hits + 2"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, name, hits FROM codes"),
+        vec![some(&["b", "B", "9"])]
+    );
+    // Every column given its default leaves the engine no row to hang the
+    // clause on.
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO codes (hits) VALUES (DEFAULT) ON DUPLICATE KEY UPDATE hits = 1"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}

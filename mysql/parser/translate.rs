@@ -2853,12 +2853,12 @@ pub(crate) fn translate_insert(
             return unsupported("INSERT VALUES column count");
         }
     }
+    // Beside an upsert, the offered row carries the column's own default for a
+    // column given `DEFAULT`, which is what the engine's `excluded` row
+    // carries for a column left out: measured on 8.4.11, `VALUES (..., DEFAULT)
+    // ... hits = VALUES(hits) + 1` over a column defaulting to 7 writes 8, and
+    // so does naming the offered row.
     let defaulted = columns_given_their_default(&column_names, values)?;
-    if defaulted.iter().any(|written| *written) && insert.on.is_some() {
-        // What the offered row carries for a column left out is a rule of its
-        // own, and it has not been measured.
-        return unsupported("INSERT DEFAULT with ON DUPLICATE KEY UPDATE");
-    }
     let kept = |at: usize| !defaulted[at];
     let rows = values
         .rows
@@ -2881,6 +2881,11 @@ pub(crate) fn translate_insert(
     // Every column was given `DEFAULT`, which is the row MySQL's own empty
     // column list writes.
     if columns.is_empty() {
+        // The engine's `DEFAULT VALUES` has no room for an upsert clause after
+        // it, and dropping the clause would turn an update into a key error.
+        if insert.on.is_some() {
+            return unsupported("INSERT of defaults alone with ON DUPLICATE KEY UPDATE");
+        }
         return Ok(RenderedInsert {
             sqlite_sql: format!("{verb} {table} DEFAULT VALUES"),
             read_tables: Vec::new(),
@@ -3335,38 +3340,87 @@ fn names_the_offered_row(function: &sqlparser::ast::Function) -> bool {
 /// Counts the `VALUES(col)` calls an `INSERT`'s `ON DUPLICATE KEY UPDATE`
 /// writes.
 pub(crate) fn offered_row_calls(insert: &Insert) -> usize {
-    let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
-        return 0;
-    };
-    assignments
+    offered_row_reads(insert)
         .iter()
-        .map(|assignment| offered_row_calls_in(&assignment.value))
-        .sum()
+        .filter(|read| read.through_a_values_call)
+        .count()
 }
 
-fn offered_row_calls_in(expr: &Expr) -> usize {
+/// One column an `ON DUPLICATE KEY UPDATE` reads off the row it was offered.
+pub(crate) struct OfferedRowRead {
+    pub(crate) column: String,
+    /// Read as `VALUES(col)` rather than through a name on the offered row.
+    pub(crate) through_a_values_call: bool,
+}
+
+/// Every column an `INSERT`'s `ON DUPLICATE KEY UPDATE` reads off the row it
+/// was offered, as `VALUES(col)` or as a column of the name the row carries.
+pub(crate) fn offered_row_reads(insert: &Insert) -> Vec<OfferedRowRead> {
+    let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
+        return Vec::new();
+    };
+    let offered =
+        insert
+            .insert_alias
+            .as_ref()
+            .and_then(|alias| match alias.row_alias.0.as_slice() {
+                [ObjectNamePart::Identifier(name)] => Some(name.value.as_str()),
+                _ => None,
+            });
+    let mut reads = Vec::new();
+    for assignment in assignments {
+        collect_offered_row_reads(&assignment.value, offered, &mut reads);
+    }
+    reads
+}
+
+fn collect_offered_row_reads(expr: &Expr, offered: Option<&str>, reads: &mut Vec<OfferedRowRead>) {
+    let mut collect = |inner: &Expr| collect_offered_row_reads(inner, offered, reads);
     match expr {
-        Expr::Function(function) if names_the_offered_row(function) => 1,
-        Expr::Function(function) => match &function.args {
-            FunctionArguments::List(arguments) => arguments
-                .args
-                .iter()
-                .map(|argument| match argument {
-                    sqlparser::ast::FunctionArg::Unnamed(
+        Expr::Function(function) if names_the_offered_row(function) => {
+            let column = match &function.args {
+                FunctionArguments::List(arguments) => match arguments.args.as_slice() {
+                    [sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(column)),
+                    )] => column.value.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            reads.push(OfferedRowRead {
+                column,
+                through_a_values_call: true,
+            });
+        }
+        Expr::CompoundIdentifier(parts)
+            if parts.len() == 2
+                && offered.is_some_and(|offered| parts[0].value.eq_ignore_ascii_case(offered)) =>
+        {
+            reads.push(OfferedRowRead {
+                column: parts[1].value.clone(),
+                through_a_values_call: false,
+            });
+        }
+        Expr::Function(function) => {
+            if let FunctionArguments::List(arguments) = &function.args {
+                for argument in &arguments.args {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
                         sqlparser::ast::FunctionArgExpr::Expr(inner),
-                    ) => offered_row_calls_in(inner),
-                    _ => 0,
-                })
-                .sum(),
-            _ => 0,
-        },
+                    ) = argument
+                    {
+                        collect(inner);
+                    }
+                }
+            }
+        }
         Expr::Nested(inner)
         | Expr::UnaryOp { expr: inner, .. }
         | Expr::IsNull(inner)
         | Expr::IsNotNull(inner)
-        | Expr::Cast { expr: inner, .. } => offered_row_calls_in(inner),
+        | Expr::Cast { expr: inner, .. } => collect(inner),
         Expr::BinaryOp { left, right, .. } => {
-            offered_row_calls_in(left) + offered_row_calls_in(right)
+            collect(left);
+            collect(right);
         }
         Expr::Case {
             operand,
@@ -3374,16 +3428,18 @@ fn offered_row_calls_in(expr: &Expr) -> usize {
             else_result,
             ..
         } => {
-            operand.as_deref().map_or(0, offered_row_calls_in)
-                + conditions
-                    .iter()
-                    .map(|arm| {
-                        offered_row_calls_in(&arm.condition) + offered_row_calls_in(&arm.result)
-                    })
-                    .sum::<usize>()
-                + else_result.as_deref().map_or(0, offered_row_calls_in)
+            if let Some(operand) = operand {
+                collect(operand);
+            }
+            for arm in conditions {
+                collect(&arm.condition);
+                collect(&arm.result);
+            }
+            if let Some(result) = else_result {
+                collect(result);
+            }
         }
-        _ => 0,
+        _ => {}
     }
 }
 

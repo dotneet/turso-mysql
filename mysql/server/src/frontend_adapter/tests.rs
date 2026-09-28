@@ -24606,8 +24606,6 @@ fn an_insert_takes_the_columns_own_default() {
     for sql in [
         // A row that wrote a value would lose it.
         "INSERT INTO d (id, n, tight) VALUES (5, DEFAULT, 1), (6, 3, 1)",
-        // What the offered row carries for a column left out is unmeasured.
-        "INSERT INTO d (id, n, tight) VALUES (7, DEFAULT, 1) ON DUPLICATE KEY UPDATE n = 1",
         // The default of some other column.
         "INSERT INTO d (id, n, tight) VALUES (8, DEFAULT(word), 1)",
         // The column's default cannot be worked out from the statement alone.

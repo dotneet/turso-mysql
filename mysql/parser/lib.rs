@@ -467,6 +467,8 @@ pub struct CheckedAutoIncrementInsert {
     ignored_null_columns: Vec<usize>,
     rowwise_conflicts: bool,
     upsert_columns: Vec<String>,
+    /// The columns the upsert clause reads off the row it was offered.
+    offered_columns: Vec<String>,
     reads_the_clock: bool,
 }
 
@@ -562,6 +564,19 @@ impl CheckedAutoIncrementInsert {
             .any(|column| column.eq_ignore_ascii_case(allocator_column.as_str()))
         {
             return unsupported("ON DUPLICATE KEY UPDATE changes the AUTO_INCREMENT column");
+        }
+        // Measured on MySQL 8.4.11, the offered row carries the number the
+        // row took — `VALUES(id)` beside a `DEFAULT` id reads the number the
+        // colliding row spent — and the number the engine's offered row
+        // carries here has not been held to that one.
+        if self
+            .offered_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(allocator_column.as_str()))
+        {
+            return unsupported(
+                "ON DUPLICATE KEY UPDATE reads the AUTO_INCREMENT column off the offered row",
+            );
         }
         let named_at = self.columns.iter().position(|column| {
             column
@@ -4709,6 +4724,10 @@ fn parse_checked_auto_increment_insert(
             .collect(),
         _ => Vec::new(),
     };
+    let offered_columns = translate::offered_row_reads(insert)
+        .into_iter()
+        .map(|read| read.column)
+        .collect();
     let mut normalized_insert = insert.clone();
     let mut mixed_default_columns = Vec::new();
     let mut ignored_null_columns = Vec::new();
@@ -4829,6 +4848,7 @@ fn parse_checked_auto_increment_insert(
         ignored_null_columns,
         rowwise_conflicts,
         upsert_columns,
+        offered_columns,
         reads_the_clock,
     })
 }
