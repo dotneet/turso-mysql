@@ -1064,3 +1064,46 @@ fn sequelizes_page_of_posts_is_cut_inside_a_derived_table() {
         );
     }
 }
+
+/// Sequelize's `sync({ force: true })` drops every foreign key by the name
+/// MySQL gave it before it drops the tables. A key written without a name is
+/// named `t_ibfk_N` in declaration order, and keeps that name when a key
+/// before it is dropped.
+#[test]
+fn a_key_written_without_a_name_is_dropped_by_the_name_mysql_gives_it() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `posts` (`id` BIGINT auto_increment , `title` VARCHAR(200) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` BIGINT auto_increment , `name` VARCHAR(200) NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `post_tags` (`post_id` BIGINT NOT NULL , `tag_id` BIGINT NOT NULL , PRIMARY KEY (`post_id`, `tag_id`), FOREIGN KEY (`post_id`) REFERENCES `posts` (`id`) ON DELETE CASCADE, FOREIGN KEY (`tag_id`) REFERENCES `tags` (`id`) ON DELETE CASCADE) ENGINE=InnoDB;",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE `post_tags` DROP FOREIGN KEY `post_tags_ibfk_1`;",
+    );
+    let after_the_first = created(&mut adapter, "post_tags");
+    assert!(
+        !after_the_first.contains("post_tags_ibfk_1")
+            && after_the_first.contains(
+                "CONSTRAINT `post_tags_ibfk_2` FOREIGN KEY (`tag_id`) REFERENCES `tags` (`id`) ON DELETE CASCADE"
+            ),
+        "{after_the_first}"
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE `post_tags` DROP FOREIGN KEY `post_tags_ibfk_2`;",
+    );
+    assert!(
+        !created(&mut adapter, "post_tags").contains("FOREIGN KEY"),
+        "the second key must be gone"
+    );
+    run(&mut adapter, "DROP TABLE IF EXISTS `tags`;");
+    run(&mut adapter, "DROP TABLE IF EXISTS `posts`;");
+}

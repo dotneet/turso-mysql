@@ -4148,6 +4148,13 @@ that name where there is one and MySQL's own `t_ibfk_N` where there is not, so
 a named `CONSTRAINT` in a `CREATE TABLE` is taken as well — it was refused
 before precisely because the name was dropped. `DROP FOREIGN KEY` and
 `DROP CONSTRAINT` are MySQL's two spellings and both find the key by that name.
+A key written without a name answers to the name MySQL gives it: measured on
+8.4.11, the unnamed keys of a table are `t_ibfk_1`, `t_ibfk_2`, ... in the
+order they are declared, `DROP FOREIGN KEY t_ibfk_1` drops the first, and the
+second keeps `t_ibfk_2`. Sequelize's `sync({ force: true })` drops every key
+that way before it drops the tables, which answered 1235 here. Dropping one
+such key writes each other unnamed key's name into the table, so none of
+them takes a new one.
 The key is enforced from the moment it is added: measured on 8.4.11, a child
 row naming no parent answers 1452, and this answers the same.
 

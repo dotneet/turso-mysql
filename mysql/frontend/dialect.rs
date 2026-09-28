@@ -53,6 +53,14 @@ impl Dialect for MySqlDialect {
         Some(Arc::new(MySqlIntegerValidator))
     }
 
+    /// Measured on MySQL 8.4.11: a foreign key written without a name is named
+    /// `t_ibfk_1`, `t_ibfk_2`, ... in declaration order — what `SHOW CREATE
+    /// TABLE` prints — and `DROP FOREIGN KEY t_ibfk_1` drops it, which is how
+    /// Sequelize's `sync({ force: true })` takes a table's keys apart.
+    fn unnamed_foreign_key_name(&self, table: &str, declaration_order: usize) -> Option<String> {
+        Some(format!("{table}_ibfk_{}", declaration_order + 1))
+    }
+
     fn validate_schema_catalog(
         &self,
         rows: &[SchemaCatalogRow],

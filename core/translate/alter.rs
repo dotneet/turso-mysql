@@ -1281,7 +1281,12 @@ pub fn translate_alter_table(
                 .dialect()
                 .parse_schema_sql(crate::dialect::SchemaSqlKind::Table, &previous_table_sql)?;
             let ast::Stmt::CreateTable {
-                body: ast::CreateTableBody::ColumnsAndConstraints { constraints, .. },
+                body:
+                    ast::CreateTableBody::ColumnsAndConstraints {
+                        columns,
+                        constraints,
+                        ..
+                    },
                 ..
             } = &mut rewritten_stmt
             else {
@@ -1289,6 +1294,16 @@ pub fn translate_alter_table(
                     "only an ordinary table carries table constraints".to_string(),
                 ));
             };
+            let column_foreign_keys = columns
+                .iter()
+                .flat_map(|column| &column.constraints)
+                .filter(|constraint| {
+                    matches!(
+                        &constraint.constraint,
+                        ast::ColumnConstraint::ForeignKey { .. }
+                    )
+                })
+                .count();
             let named = |constraint: &ast::NamedTableConstraint, wanted: &str| {
                 constraint
                     .name
@@ -1310,11 +1325,29 @@ pub fn translate_alter_table(
                     let Some(at) = constraints
                         .iter()
                         .position(|held| named(held, name.as_str()))
+                        .or_else(|| {
+                            unnamed_foreign_key_at(
+                                connection,
+                                table_name,
+                                column_foreign_keys,
+                                constraints.as_slice(),
+                                name.as_str(),
+                            )
+                        })
                     else {
                         return Err(LimboError::ParseError(format!(
                             "no such constraint: \"{name}\""
                         )));
                     };
+                    // A key the dialect names by its place would take another
+                    // name once a key before it is gone, so each keeps the one
+                    // it answers to now, as MySQL's keep theirs.
+                    name_unnamed_foreign_keys(
+                        connection,
+                        table_name,
+                        column_foreign_keys,
+                        constraints,
+                    );
                     constraints.remove(at);
                 }
                 _ => unreachable!("only a constraint change reaches here"),
@@ -2548,6 +2581,56 @@ pub fn translate_alter_table(
     };
 
     Ok(())
+}
+
+/// Where, among a table's constraints, the foreign key declared without a
+/// name that the connection's dialect calls `wanted` stands.
+fn unnamed_foreign_key_at(
+    connection: &Arc<crate::Connection>,
+    table_name: &str,
+    column_foreign_keys: usize,
+    constraints: &[ast::NamedTableConstraint],
+    wanted: &str,
+) -> Option<usize> {
+    let dialect = connection.dialect();
+    constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, held)| matches!(held.constraint, ast::TableConstraint::ForeignKey { .. }))
+        .enumerate()
+        .find_map(|(order, (at, held))| {
+            let answers_to =
+                dialect.unnamed_foreign_key_name(table_name, column_foreign_keys + order)?;
+            (held.name.is_none() && answers_to.eq_ignore_ascii_case(wanted)).then_some(at)
+        })
+}
+
+/// Writes into each foreign key declared without a name the name the
+/// connection's dialect calls it by where it stands now.
+fn name_unnamed_foreign_keys(
+    connection: &Arc<crate::Connection>,
+    table_name: &str,
+    column_foreign_keys: usize,
+    constraints: &mut [ast::NamedTableConstraint],
+) {
+    let dialect = connection.dialect();
+    for (order, held) in constraints
+        .iter_mut()
+        .filter(|held| matches!(held.constraint, ast::TableConstraint::ForeignKey { .. }))
+        .enumerate()
+    {
+        if held.name.is_some() {
+            continue;
+        }
+        if let Some(answers_to) =
+            dialect.unnamed_foreign_key_name(table_name, column_foreign_keys + order)
+        {
+            held.name = Some(ast::Name::from_string(format!(
+                "\"{}\"",
+                answers_to.replace('"', "\"\"")
+            )));
+        }
+    }
 }
 
 /// Returns the `UNIQUE`, and the `PRIMARY KEY` of a column that is not the

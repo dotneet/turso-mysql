@@ -187,6 +187,15 @@ pub trait Dialect: Send + Sync + 'static {
         self.database_file_owner().application_id()
     }
 
+    /// The name a foreign key declared without one answers to, which
+    /// `ALTER TABLE ... DROP CONSTRAINT` finds it by. `declaration_order`
+    /// counts the table's foreign keys from zero in the order they are
+    /// declared, those written on a column first. `None`, the default, leaves
+    /// such a key without a name.
+    fn unnamed_foreign_key_name(&self, _table: &str, _declaration_order: usize) -> Option<String> {
+        None
+    }
+
     /// Optionally validates evaluated table records before storage.
     ///
     /// A dialect must return `None` unless it can apply this rule to every
