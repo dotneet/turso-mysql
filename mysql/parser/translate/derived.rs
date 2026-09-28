@@ -10,6 +10,9 @@
 //! is written out into a table of its own first, and each column is that
 //! table's column; any other body is read straight through. Which of the two
 //! a body gets decides the shapes its columns report, so it is recorded here.
+//! A body joining tables is read straight through too, unless the statement
+//! drops repeated rows, which MySQL does by writing them into a table of its
+//! own.
 
 use super::*;
 
@@ -28,6 +31,47 @@ pub struct MySqlDerivedColumns {
     /// What each projected column answers when it is not one of the table's
     /// columns.
     answers: Vec<Option<StaticSelectMetadata>>,
+    /// The table each projected column is read from, in order, when the body
+    /// joins tables. Empty for a body reading one table.
+    joined: Vec<MySqlJoinedDerivedColumn>,
+    /// Whether the statement reading a body that joins tables drops repeated
+    /// rows, which MySQL does by writing them into a table of its own first.
+    repeats_dropped_through_a_table: bool,
+}
+
+/// One column of a derived table whose body joins tables, and the table it
+/// is read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlJoinedDerivedColumn {
+    table: MySqlTableName,
+    /// The name the body reads the table under — its alias when it gives one.
+    reference: String,
+    /// The column's own name in its table.
+    column: String,
+    /// Whether a `LEFT JOIN` can leave the column's row missing.
+    outer: bool,
+}
+
+impl MySqlJoinedDerivedColumn {
+    /// Returns the table the column belongs to.
+    pub const fn table(&self) -> &MySqlTableName {
+        &self.table
+    }
+
+    /// Returns the name the body reads the column's table under.
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+
+    /// Returns the column's own name in its table.
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    /// Reports whether a `LEFT JOIN` can leave the column's row missing.
+    pub const fn outer(&self) -> bool {
+        self.outer
+    }
 }
 
 impl MySqlDerivedColumns {
@@ -51,6 +95,18 @@ impl MySqlDerivedColumns {
     /// out rather than reading it from its table.
     pub fn answer(&self, ordinal: usize) -> Option<&StaticSelectMetadata> {
         self.answers.get(ordinal).and_then(Option::as_ref)
+    }
+
+    /// Returns the table each column is read from, when the body joins
+    /// tables, or nothing for a body reading one table.
+    pub fn joined(&self) -> &[MySqlJoinedDerivedColumn] {
+        &self.joined
+    }
+
+    /// Reports whether MySQL drops the statement's repeated rows by writing
+    /// them into a table of its own, which it does over a body joining tables.
+    pub const fn repeats_dropped_through_a_table(&self) -> bool {
+        self.repeats_dropped_through_a_table
     }
 }
 
@@ -97,6 +153,8 @@ pub(super) fn derived_columns(
                     materialized,
                     names: Vec::new(),
                     answers: Vec::new(),
+                    joined: Vec::new(),
+                    repeats_dropped_through_a_table: false,
                 },
             ));
         }
@@ -145,14 +203,7 @@ pub(super) fn derived_columns(
         names.push(name);
         answers.push(Some(answer));
     }
-    for (index, name) in names.iter().enumerate() {
-        if names[..index]
-            .iter()
-            .any(|earlier| earlier.eq_ignore_ascii_case(name))
-        {
-            return unsupported("derived table with two columns of one name");
-        }
-    }
+    refuse_two_columns_of_one_name(&names)?;
     Ok((
         projected_columns,
         MySqlDerivedColumns {
@@ -160,6 +211,8 @@ pub(super) fn derived_columns(
             materialized,
             names,
             answers,
+            joined: Vec::new(),
+            repeats_dropped_through_a_table: false,
         },
     ))
 }
@@ -173,7 +226,347 @@ pub(super) fn only_counted(inner: &MySqlSelectSource) -> MySqlDerivedColumns {
         materialized: false,
         names: Vec::new(),
         answers: Vec::new(),
+        joined: Vec::new(),
+        repeats_dropped_through_a_table: false,
     }
+}
+
+/// Returns a derived table's body when it is one `SELECT` joining tables.
+pub(super) fn body_joining_tables(
+    query: &sqlparser::ast::Query,
+) -> Option<&sqlparser::ast::Select> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    select
+        .from
+        .iter()
+        .any(|from| !from.joins.is_empty())
+        .then_some(select.as_ref())
+}
+
+/// Renders a derived table whose body joins tables, which is how TypeORM
+/// pages an entity loaded with its relations: `(SELECT Post.id AS Post_id,
+/// ..., Post__Post_tags.name AS Post__Post_tags_name FROM posts Post LEFT
+/// JOIN post_tag ... LEFT JOIN tags Post__Post_tags ON ...) distinctAlias`.
+///
+/// Each column is a column of one of the joined tables, named with its table,
+/// so each is traced to that table. Only a first table followed by `LEFT
+/// JOIN`s is taken: MySQL reads those tables in the order written, while it
+/// picks its own order for an inner join. A condition in the body is refused:
+/// measured on 8.4.11, `WHERE Post.id = 1` makes MySQL read `posts` as one
+/// constant row, and every column then reports another shape — one depending
+/// on whether that row exists.
+pub(super) fn render_derived_table_joining_tables(
+    subquery: &sqlparser::ast::Query,
+    select: &sqlparser::ast::Select,
+    alias: &sqlparser::ast::TableAlias,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, MySqlSelectSource), ParseError> {
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.limit_clause.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+        || !subquery.pipe_operators.is_empty()
+    {
+        return unsupported("derived table joining tables with a clause of its own");
+    }
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
+        return unsupported("derived table joining tables and grouping them");
+    };
+    if select.distinct.is_some()
+        || !group_by.is_empty()
+        || select.having.is_some()
+        || projects_an_aggregate(select)
+    {
+        return unsupported("derived table joining tables and grouping them");
+    }
+    if select.selection.is_some() {
+        return unsupported("derived table joining tables under a condition");
+    }
+    let [from] = select.from.as_slice() else {
+        return unsupported("derived table joining tables with a comma");
+    };
+    // Only an `ON` matching columns against each other, which is what TypeORM
+    // writes, has been measured both ways MySQL reads such a body.
+    if !from.joins.iter().all(|join| {
+        matches!(
+            &join.join_operator,
+            sqlparser::ast::JoinOperator::Left(sqlparser::ast::JoinConstraint::On(on))
+                | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(on))
+                if matches_columns_alone(on)
+        )
+    }) {
+        return unsupported("derived table joining tables other than by LEFT JOIN ... ON columns");
+    }
+    let comparisons_before = render_context.checked_comparisons.len();
+    let (body, sources) = super::render_select_body(select, render_context)?;
+    if sources.iter().any(|source| {
+        source.derived.is_some() || source.catalog.is_some() || !source.projected_columns.is_empty()
+    }) {
+        return unsupported("derived table joining anything but tables");
+    }
+    let references = sources
+        .iter()
+        .map(|source| source.reference.as_str())
+        .collect::<Vec<_>>();
+    for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
+        comparison.name_the_inner_sources(&references);
+    }
+    let mut names = Vec::with_capacity(select.projection.len());
+    let mut joined = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return unsupported("derived table joining tables projecting a wildcard"),
+        };
+        // A bare name belongs to whichever joined table has the column, which
+        // only the frontend can see.
+        let Expr::CompoundIdentifier(parts) = expr else {
+            return unsupported(
+                "derived table joining tables projecting anything but a column named with its table",
+            );
+        };
+        let [table, column] = parts.as_slice() else {
+            return unsupported(
+                "derived table joining tables projecting a column of another database",
+            );
+        };
+        let Some(source) = sources
+            .iter()
+            .find(|source| source.reference.eq_ignore_ascii_case(&table.value))
+        else {
+            return unsupported("derived table projecting a column of a table it does not join");
+        };
+        names.push(alias.unwrap_or(column).value.clone());
+        joined.push(MySqlJoinedDerivedColumn {
+            table: source.table.clone(),
+            reference: source.reference.clone(),
+            column: column.value.clone(),
+            outer: source.outer,
+        });
+    }
+    refuse_two_columns_of_one_name(&names)?;
+    let first = sources
+        .first()
+        .expect("a body joining tables reads a first table")
+        .clone();
+    for mut source in sources {
+        source.subquery = true;
+        if !render_context.subquery_tables.iter().any(|held| {
+            held.reference == source.reference
+                && held.table == source.table
+                && held.projected_columns.is_empty()
+        }) {
+            render_context.subquery_tables.push(source);
+        }
+    }
+    Ok((
+        format!("({body}) AS {}", render_ident(&alias.name)),
+        MySqlSelectSource {
+            reference: alias.name.value.clone(),
+            table: first.table,
+            outer: false,
+            branch: 0,
+            subquery: false,
+            read_by_a_result_subquery: false,
+            projected_columns: joined.iter().map(|column| column.column.clone()).collect(),
+            derived: Some(MySqlDerivedColumns {
+                inner_reference: first.reference,
+                materialized: false,
+                answers: vec![None; names.len()],
+                names,
+                joined,
+                repeats_dropped_through_a_table: false,
+            }),
+            catalog: None,
+            hinted_indexes: Vec::new(),
+        },
+    ))
+}
+
+/// Reports whether a join's `ON` matches columns of the tables against each
+/// other and nothing else — `a.x = b.y`, alone or joined by `AND`.
+fn matches_columns_alone(on: &Expr) -> bool {
+    match on {
+        Expr::Nested(inner) => matches_columns_alone(inner),
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => matches_columns_alone(left) && matches_columns_alone(right),
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::Eq,
+            right,
+        } => {
+            matches!(left.as_ref(), Expr::CompoundIdentifier(parts) if parts.len() == 2)
+                && matches!(right.as_ref(), Expr::CompoundIdentifier(parts) if parts.len() == 2)
+        }
+        _ => false,
+    }
+}
+
+/// Refuses two columns going by one name, which MySQL answers 1060 for.
+fn refuse_two_columns_of_one_name(names: &[String]) -> Result<(), ParseError> {
+    for (index, name) in names.iter().enumerate() {
+        if names[..index]
+            .iter()
+            .any(|earlier| earlier.eq_ignore_ascii_case(name))
+        {
+            return unsupported("derived table with two columns of one name");
+        }
+    }
+    Ok(())
+}
+
+/// Holds a statement reading a derived table whose body joins tables to the
+/// shapes measured over one, and notes whether it drops repeated rows.
+///
+/// Measured on MySQL 8.4.11: the statement's own `DISTINCT` makes MySQL write
+/// the rows into a table of its own, and every column then reports that
+/// table's shape, whatever the tables hold — none of them, one row each or
+/// thousands. An `ORDER BY` without it decides nothing so steady: MySQL sorts
+/// through such a table when it matches a joined table by hash rather than by
+/// its key, a choice it makes by how many rows each table holds, so it is
+/// refused, and a `LIMIT` with no order is refused with it, since which rows it
+/// keeps is each engine's own. Anything but columns of the derived table,
+/// `DISTINCT`, an order among the columns it projects and a `LIMIT` has not
+/// been measured and is refused.
+pub(super) fn hold_the_statement_reading_joined_tables_through_a_derived_table(
+    query: &sqlparser::ast::Query,
+    sources: &mut [MySqlSelectSource],
+) -> Result<(), ParseError> {
+    let Some(position) = sources.iter().position(|source| {
+        !source.subquery
+            && source
+                .derived
+                .as_ref()
+                .is_some_and(|derived| !derived.joined.is_empty())
+    }) else {
+        return Ok(());
+    };
+    if sources.iter().filter(|source| !source.subquery).count() != 1 {
+        return unsupported("derived table joining tables beside another table");
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return unsupported("derived table joining tables in a set operation");
+    };
+    let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
+        return unsupported("statement grouping a derived table joining tables");
+    };
+    if query.with.is_some()
+        || !query.locks.is_empty()
+        || select.selection.is_some()
+        || !group_by.is_empty()
+        || select.having.is_some()
+    {
+        return unsupported("statement narrowing or grouping a derived table joining tables");
+    }
+    let reference = sources[position].reference.clone();
+    let derived = sources[position]
+        .derived
+        .as_mut()
+        .expect("the derived table was found above");
+    let mut result_names = Vec::with_capacity(select.projection.len());
+    let mut projected = Vec::with_capacity(select.projection.len());
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return unsupported("wildcard over a derived table joining tables"),
+        };
+        let Some(ordinal) = derived_column_named(expr, &reference, &derived.names) else {
+            return unsupported(
+                "statement reading anything but the columns of a derived table joining tables",
+            );
+        };
+        result_names.push(alias.map_or_else(
+            || derived.names[ordinal].clone(),
+            |alias| alias.value.clone(),
+        ));
+        projected.push(ordinal);
+    }
+    let drops_repeats = select.distinct.is_some();
+    match &query.order_by {
+        Some(_) if !drops_repeats => {
+            return unsupported("ORDER BY over a derived table joining tables without DISTINCT");
+        }
+        Some(order_by) => {
+            let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+                return unsupported("SELECT ORDER BY option");
+            };
+            for expression in expressions {
+                if !orders_by_a_projected_column(
+                    &expression.expr,
+                    &reference,
+                    &derived.names,
+                    &result_names,
+                    &projected,
+                ) {
+                    return unsupported(
+                        "ORDER BY naming what a DISTINCT over a derived table joining tables does not project",
+                    );
+                }
+            }
+        }
+        None if query.limit_clause.is_some() => {
+            return unsupported("LIMIT without ORDER BY over a derived table joining tables");
+        }
+        None => {}
+    }
+    derived.repeats_dropped_through_a_table = drops_repeats;
+    Ok(())
+}
+
+/// Returns the place among a derived table's columns of the one an expression
+/// names, bare or with the derived table's name.
+fn derived_column_named(expr: &Expr, reference: &str, names: &[String]) -> Option<usize> {
+    let name = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(parts)
+            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(reference) =>
+        {
+            &parts[1]
+        }
+        _ => return None,
+    };
+    names
+        .iter()
+        .position(|candidate| candidate.eq_ignore_ascii_case(&name.value))
+}
+
+/// Reports whether an `ORDER BY` term names a column the statement projects:
+/// by its place, by the name it answers under, or as the derived table's
+/// column it reads. MySQL answers 3065 for any other beside a `DISTINCT`.
+fn orders_by_a_projected_column(
+    expr: &Expr,
+    reference: &str,
+    names: &[String],
+    result_names: &[String],
+    projected: &[usize],
+) -> bool {
+    if let Expr::Value(value) = expr {
+        return matches!(
+            &value.value,
+            sqlparser::ast::Value::Number(place, _)
+                if place.parse::<usize>().is_ok_and(|place| (1..=projected.len()).contains(&place))
+        );
+    }
+    if let Expr::Identifier(name) = expr {
+        if result_names
+            .iter()
+            .any(|result| result.eq_ignore_ascii_case(&name.value))
+        {
+            return true;
+        }
+    }
+    derived_column_named(expr, reference, names).is_some_and(|ordinal| projected.contains(&ordinal))
 }
 
 /// Reports whether an answer is one MySQL has been measured storing in the

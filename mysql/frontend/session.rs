@@ -7204,6 +7204,30 @@ impl MySqlConnection {
                     "SELECT expression needs a base table's column types".to_string(),
                 ));
             }
+            let Some(derived) = source.derived() else {
+                continue;
+            };
+            // A derived table joining tables reads each column out of a table
+            // of its own, so each name it gives carries that table's type.
+            for (joined, name) in derived.joined().iter().zip(derived.names()) {
+                let Some(column) = self
+                    .list_columns(joined.table())
+                    .map_err(|error| {
+                        MySqlQueryError::Unsupported(format!(
+                            "cannot read the columns a derived table joins: {error}"
+                        ))
+                    })?
+                    .into_iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(joined.column()))
+                else {
+                    return Err(MySqlQueryError::Unsupported(
+                        "a derived table projecting a column its table does not have".to_string(),
+                    ));
+                };
+                let mut renamed = column;
+                renamed.name.clone_from(name);
+                subquery_columns.push(renamed);
+            }
         }
         if self
             .inner
@@ -11490,7 +11514,12 @@ fn columns_under_derived_names(
 ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlQueryError> {
     let mut named = columns.to_vec();
     for source in sources {
-        let Some(derived) = source.derived() else {
+        // A derived table joining tables names columns of several tables,
+        // which are read out of each of them instead.
+        let Some(derived) = source
+            .derived()
+            .filter(|derived| derived.joined().is_empty())
+        else {
             continue;
         };
         for (ordinal, name) in derived.names().iter().enumerate() {

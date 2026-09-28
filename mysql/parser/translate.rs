@@ -22,7 +22,7 @@ mod one_table_columns;
 mod recursive;
 mod rollup;
 
-pub use derived::MySqlDerivedColumns;
+pub use derived::{MySqlDerivedColumns, MySqlJoinedDerivedColumn};
 pub use grouping::{MySqlColumnsTheKeysDecide, MySqlJoinedTable, MySqlNamedColumn};
 
 /// One table a `SELECT` reads, with the name the engine reports for it.
@@ -576,6 +576,10 @@ pub(crate) fn translate_select_query(
         }
     }
     source_tables.append(&mut render_context.subquery_tables);
+    derived::hold_the_statement_reading_joined_tables_through_a_derived_table(
+        query,
+        &mut source_tables,
+    )?;
     derived::resolve_comparisons_through_derived_columns(
         &mut render_context.checked_comparisons,
         &source_tables,
@@ -952,7 +956,13 @@ fn render_select_body(
 
     render_context.counts_the_rows_of_the_derived_table =
         outer_projection && only_counts_the_rows_of_a_derived_table(select);
-    let (from, mut source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
+    let outer_from = std::mem::replace(
+        &mut render_context.renders_the_statements_own_from,
+        outer_projection,
+    );
+    let from = render_from_clause_with(&select.from, Some(render_context));
+    render_context.renders_the_statements_own_from = outer_from;
+    let (from, mut source_tables) = from?;
     render_context.counts_the_rows_of_the_derived_table = false;
     if outer_projection {
         note_what_result_subqueries_read(select, &mut source_tables, render_context)?;
@@ -1692,6 +1702,17 @@ fn render_derived_table(
     };
     if std::mem::take(&mut render_context.counts_the_rows_of_the_derived_table) {
         return render_counted_derived_table(subquery, alias, render_context);
+    }
+    if let Some(select) = derived::body_joining_tables(subquery) {
+        if !render_context.renders_the_statements_own_from {
+            return unsupported("derived table joining tables inside another statement");
+        }
+        return derived::render_derived_table_joining_tables(
+            subquery,
+            select,
+            alias,
+            render_context,
+        );
     }
     let body = match unwrap_query_wrappers(subquery.body.as_ref())? {
         SetExpr::SetOperation { .. } => render_derived_catalog_union(subquery, render_context)?,
@@ -5803,6 +5824,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the next projection rendered is the statement's own result
     /// rather than a subquery's or a `UNION` branch's.
     renders_the_outer_projection: bool,
+    /// Whether the `FROM` being rendered is the statement's own rather than a
+    /// subquery's, a derived table's or a `UNION` branch's.
+    renders_the_statements_own_from: bool,
     /// Whether the derived table about to be rendered is one the statement
     /// only counts the rows of, which nothing reads a column of.
     counts_the_rows_of_the_derived_table: bool,
@@ -5933,6 +5957,7 @@ impl<'a> SelectRenderContext<'a> {
             rewritten_on_update,
             subquery_tables: Vec::new(),
             renders_the_outer_projection: false,
+            renders_the_statements_own_from: false,
             counts_the_rows_of_the_derived_table: false,
             derived_counts: Vec::new(),
             calculates_found_rows: false,

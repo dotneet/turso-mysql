@@ -83,8 +83,9 @@ use turso_mysql_parser::{
     ColumnAggregateKind, ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
     GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
     MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
-    MySqlInformationSchemaTablesColumn, MySqlLikePattern, MySqlLockTablesCommand,
-    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
+    MySqlInformationSchemaTablesColumn, MySqlJoinedDerivedColumn, MySqlLikePattern,
+    MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
+    ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
@@ -10004,17 +10005,33 @@ fn stored_in_a_derived_table(
 /// character set, four bytes to each character it spells — a `DATETIME` 76
 /// where on its own it reports 19 — and a JSON column in it too, at the widest
 /// length a document has in words.
+///
+/// A column of a body joining tables names the body's alias for its own table,
+/// and loses its NOT NULL where a `LEFT JOIN` can leave its row missing.
 #[cfg(unix)]
 fn read_through_a_derived_table(
     definition: &mut ColumnDefinitionConfig,
     derived: &MySqlDerivedColumns,
     ordinal: usize,
 ) {
+    let joined = derived.joined().get(ordinal);
+    if let Some(joined) = joined {
+        if joined.outer() {
+            definition.flags &= !MYSQL_NOT_NULL_FLAG;
+        }
+        if derived.repeats_dropped_through_a_table() {
+            written_out_to_drop_repeats(definition, joined);
+            return;
+        }
+    }
     if let Some(name) = derived.names().get(ordinal) {
         definition.original_name.clone_from(name);
     }
-    derived
-        .inner_reference()
+    joined
+        .map_or(
+            derived.inner_reference(),
+            MySqlJoinedDerivedColumn::reference,
+        )
         .clone_into(&mut definition.original_table);
     if derived.materialized() {
         definition.flags &= !(MYSQL_PRI_KEY_FLAG
@@ -10037,6 +10054,34 @@ fn read_through_a_derived_table(
         }
         _ => {}
     }
+}
+
+/// Gives a column of a derived table joining tables the shape MySQL reports
+/// once the statement's `DISTINCT` has written the rows into a table of its
+/// own.
+///
+/// Measured on MySQL 8.4.11 over TypeORM's pagination and over a table of
+/// every kind: the column names the table it came from under that table's own
+/// name, not the body's alias for it, goes by the statement's own name for it,
+/// and names no database. It keeps its type, length, decimals and character
+/// set — a moment stays a `DATETIME` of 19, not the words a derived table
+/// reads it as — and every flag but its keys and its auto-increment.
+#[cfg(unix)]
+fn written_out_to_drop_repeats(
+    definition: &mut ColumnDefinitionConfig,
+    joined: &MySqlJoinedDerivedColumn,
+) {
+    joined
+        .table()
+        .as_str()
+        .clone_into(&mut definition.original_table);
+    definition.original_name.clone_from(&definition.name);
+    definition.schema.clear();
+    definition.flags &= !(MYSQL_PRI_KEY_FLAG
+        | MYSQL_UNIQUE_KEY_FLAG
+        | MYSQL_MULTIPLE_KEY_FLAG
+        | MYSQL_PART_KEY_FLAG
+        | MYSQL_AUTO_INCREMENT_FLAG);
 }
 
 /// Gives an answer the shape MySQL reports for it once it has been read out of
@@ -10261,6 +10306,20 @@ fn table_result_metadata_for_references(
                 Err(_) => return Ok(None),
             }
         };
+        let joined = source
+            .derived()
+            .map(MySqlDerivedColumns::joined)
+            .unwrap_or_default();
+        // A derived table joining tables reads each column out of a table of
+        // its own, so its columns are gathered in the order it projects them.
+        let (columns, projected_columns) = if joined.is_empty() {
+            (columns, source.projected_columns().to_vec())
+        } else {
+            (
+                columns_read_through_joined_tables(connection, &listed, joined)?,
+                Vec::new(),
+            )
+        };
         tables.push(SourceTableColumns {
             source_table: source.table().as_str().to_owned(),
             table_reference: source.reference().to_owned(),
@@ -10271,7 +10330,7 @@ fn table_result_metadata_for_references(
             view_columns,
             outer: source.outer(),
             read_by_a_result_subquery: source.read_by_a_result_subquery(),
-            projected_columns: source.projected_columns().to_vec(),
+            projected_columns,
             derived: source.derived().cloned(),
         });
     }
@@ -10290,6 +10349,48 @@ fn table_result_metadata_for_references(
         }
     }
     Ok(Some(metadata))
+}
+
+/// Reads the column behind each column of a derived table joining tables, in
+/// the order the derived table projects them, each out of its own table.
+///
+/// Only base tables are read: a view's columns report shapes of their own,
+/// which have not been measured through such a derived table.
+#[cfg(unix)]
+fn columns_read_through_joined_tables(
+    connection: &MySqlConnection,
+    listed: &[turso_mysql::MySqlTable],
+    joined: &[MySqlJoinedDerivedColumn],
+) -> Result<Vec<MySqlColumnMetadata>, FrontendErrorKind> {
+    let mut read: Vec<(&MySqlTableName, Vec<MySqlColumnMetadata>)> = Vec::new();
+    let mut columns = Vec::with_capacity(joined.len());
+    for column in joined {
+        let table_kind = listed
+            .iter()
+            .find(|table| table.name().eq_ignore_ascii_case(column.table().as_str()))
+            .map(|table| table.kind())
+            .ok_or(FrontendErrorKind::MissingObject)?;
+        if table_kind != MySqlTableKind::BaseTable {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let position = match read.iter().position(|(table, _)| *table == column.table()) {
+            Some(position) => position,
+            None => {
+                let table_columns = connection
+                    .list_columns(column.table())
+                    .map_err(column_metadata_error_kind)?;
+                read.push((column.table(), table_columns));
+                read.len() - 1
+            }
+        };
+        let found = read[position]
+            .1
+            .iter()
+            .find(|candidate| candidate.name().eq_ignore_ascii_case(column.column()))
+            .ok_or(FrontendErrorKind::UnknownColumn)?;
+        columns.push(found.clone());
+    }
+    Ok(columns)
 }
 
 /// Works out the columns of a view grouping its rows, joining tables or

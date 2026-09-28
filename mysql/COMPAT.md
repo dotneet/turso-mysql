@@ -527,7 +527,7 @@ may narrow its rows; the columns may be read back in another order than the body
 them; a name needs no alias when only one source answers to it; and a derived table with no
 alias is 1248, as MySQL requires one.
 
-The body reads one table. What it projects decides what each column is, and the same holds for
+The body reads one table, or joins tables as a later paragraph says. What it projects decides what each column is, and the same holds for
 a CTE's body:
 
 - A column of the table, under its own name or an alias. `(SELECT u.id AS uid FROM users u) x`
@@ -566,6 +566,44 @@ aggregate over a column the body worked out; a `LATERAL` one; one naming its own
 in an `UPDATE` or a `DELETE`, each of which reads its own table. A name the body gives a column
 that is also another of the table's columns is refused where the statement needs the columns'
 types, since it would stand for two.
+
+A body may also join tables: a first table and `LEFT JOIN`s, each matched `ON` columns, every
+column named with its table — TypeORM's pagination over an entity loaded with its relations,
+`SELECT DISTINCT distinctAlias.Post_id AS ids_Post_id, distinctAlias.Post_id FROM (SELECT
+Post.id AS Post_id, ..., Post__Post_tags.name AS Post__Post_tags_name FROM posts Post LEFT JOIN
+post_tag ... LEFT JOIN tags Post__Post_tags ON ...) distinctAlias ORDER BY distinctAlias.Post_id
+ASC, Post_id ASC LIMIT 10`. Each column is traced to its own table. Measured on 8.4.11 and
+matched over the text and the binary protocol, MySQL reads such a body two ways, and neither
+depends on how many rows the tables hold — none, one each, or thousands:
+
+- The statement's own `DISTINCT` makes MySQL write the rows into a table of its own, and each
+  column reports that table's column: the original table is the column's own table under its
+  own name (`posts`, not the alias `Post`), the original name is the result column's
+  (`ids_Post_id`), no database is named, and the keys and the auto-increment are gone, while
+  the type, length, decimals, character set and every other flag are the table column's — a
+  moment stays a `DATETIME` of 19, a document a `JSON` of 4294967295 in the binary collation.
+  A `LIMIT` and an `ORDER BY` among the projected columns — by name, by the name the statement
+  gives, or by place — may follow; anything else in the `ORDER BY` is MySQL's 3065.
+- Without it the body is read straight through, as a body reading one table is: every flag
+  stays, the original table is the body's alias for the column's table and the original name
+  the body's name for the column, and a day, a moment or a document is reported in words.
+
+Either way a column on the side a `LEFT JOIN` can leave missing loses its NOT NULL, and a
+`DISTINCT` keeps the first of the words it counts as one, `Alpha` before `alpha`, as MySQL does.
+TypeORM's next two statements already worked: the page's posts read by id —
+`... WHERE Post.id IN ('1', '2') ORDER BY Post.id ASC` over the same joins — and the count,
+`SELECT COUNT(DISTINCT Post.id) AS cnt FROM posts Post LEFT JOIN ...`.
+
+Refused over a body joining tables, each measured or not measured: a condition in the body —
+measured, `WHERE Post.id = 1` makes MySQL read `posts` as one constant row, whose columns then
+report the table's own shapes, and a derived table's again when no such row exists; a value in
+a join's `ON`, only columns matched against each other having been measured; an inner join,
+whose order MySQL picks itself; an `ORDER BY` without `DISTINCT` — measured, MySQL sorts
+through a table of its own when it matches a joined table by hash rather than by a key, which it
+chose for a table of two rows that had a key; a `LIMIT` with no order; and anything but the
+derived table's own columns — a condition, a grouping, a count, an expression, `*`, a second
+table, or the derived table inside another statement. A statement needing its columns' types
+refuses a name two joined tables hold in different kinds, as a subquery's does.
 
 A statement that only counts the rows of its one derived table — `SELECT COUNT(*) FROM
 (SELECT 1 AS one FROM posts LIMIT 3 OFFSET 0) subquery_for_count`, which is how Rails counts a
@@ -6221,7 +6259,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `IFNULL` / `COALESCE` with a written word — `IFNULL(email, 'none')` | partial | partial | n/a | n/a | partial | [`defaulted classifier`](parser/static_select_metadata.rs), [oracle case](conformance/cases/p0/select-defaulted-word.json), [P0 manifest](conformance/Makefile) | The column's own width whatever the word's is, NOT NULL, and `VAR_STRING` even over a `CHAR`. A `TEXT` column and a word over a column of numbers are refused. |
 | A join `ON` naming a value — `ON t.id = u.team_id AND t.name = 'red'` | yes | yes | n/a | n/a | yes | [`join predicate renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-join-on-value.json), [P0 manifest](conformance/Makefile) | Goes through the reader a `WHERE` comparison goes through, so the value is held to the column's own type. Column against column stays equality; an `ON` in an `UPDATE` or `DELETE` takes columns alone. |
 | `ORDER BY` over a call — `ORDER BY LOWER(name)` | yes | yes | n/a | n/a | yes | [`ORDER BY renderer`](parser/translate.rs), [oracle case](conformance/cases/p0/select-order-by-call.json), [P0 manifest](conformance/Makefile) | Any call whose shape is already known, collated the way a text column is. A random number is refused. |
-| A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate/derived.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, aliased or not, `*`, or — when it aggregates — counts, totals, averages, largest and smallest values and days. A body that aggregates reports the shapes of the table MySQL writes it into, and any other body reports the table's own, a day or a moment in words. An expression in a body that does not aggregate, a `DISTINCT` body, a join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
+| A derived table — `FROM (SELECT ...) x` | partial | partial | n/a | n/a | partial | [`derived table renderer`](parser/translate/derived.rs), [oracle case](conformance/cases/p0/select-derived-table.json), [P0 manifest](conformance/Makefile) | The body reads one table and projects its columns, aliased or not, `*`, or — when it aggregates — counts, totals, averages, largest and smallest values and days. A body that aggregates reports the shapes of the table MySQL writes it into, and any other body reports the table's own, a day or a moment in words. A body may join a first table and `LEFT JOIN`s, each column named with its table, which is TypeORM's pagination over a relation: a `DISTINCT` over it reports the table MySQL writes the rows into, and any other statement reads it straight through; an `ORDER BY` without `DISTINCT` and a condition in such a body are refused. An expression in a body that does not aggregate, a `DISTINCT` body, an inner join inside the body, a `LATERAL` one and a missing alias are refused, the last being MySQL's own 1248. |
 | `DATE_ADD` / `DATE_SUB`, month ends and the week and quarter units | yes | yes | n/a | n/a | yes | [`shift arithmetic`](parser/shift_moment.rs), [oracle case](conformance/cases/p0/select-month-end-shift.json), [P0 manifest](conformance/Makefile) | The shift is worked out by the frontend rather than by the engine, whose month arithmetic overflows a day the target month has not got. A quarter is three months and a week seven days. A count worked out from a row is refused. |
 | `CONCAT` over a number — `CONCAT(name, id)` | partial | partial | n/a | n/a | partial | [`spelled characters`](../mysql/server/src/frontend_adapter.rs), [oracle case](conformance/cases/p0/select-concat-numbers.json), [P0 manifest](conformance/Makefile) | A number is laid end to end with the words, spelling as many characters as its type does. Integers, `BOOLEAN`, `YEAR` and the temporal types are taken; a `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused, MySQL spelling those its own way. |
 | `HAVING` naming a projection alias — `HAVING c > 1` | yes | yes | n/a | n/a | yes | [`alias resolver`](parser/translate.rs), [oracle case](conformance/cases/p0/select-having-alias.json), [P0 manifest](conformance/Makefile) | A name is the projection's alias before the table's column, measured, and is resolved to what it stands for before the clause is read. Covers an aggregate alias, the grouped column's alias, two at once, no `GROUP BY`, and an aliased column filtering rows. |

@@ -664,3 +664,1008 @@ fn a_recursive_cte_counting_through_numbers_answers_what_mysql_answers() {
         );
     }
 }
+
+/// TypeORM's tables as its schema sync writes them, holding the rows its
+/// harness run writes: two posts carrying tags and one carrying none. The
+/// foreign keys TypeORM adds afterwards are left out, the index MySQL makes
+/// for one changing a column's key flags.
+fn typeorm_adapter() -> (
+    tempfile::TempDir,
+    AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+) {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([153; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE `users` (`id` bigint NOT NULL AUTO_INCREMENT, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `balance` decimal(10,2) NOT NULL DEFAULT '0.00', `is_active` tinyint NOT NULL DEFAULT 1, `profile` json NULL, `created_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), UNIQUE INDEX `IDX_97672ac88f789774dd47f7c8be` (`email`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
+        "CREATE TABLE `posts` (`id` bigint NOT NULL AUTO_INCREMENT, `user_id` bigint NOT NULL, `title` varchar(200) NOT NULL, `body` text NULL, `published_at` datetime NULL, `views` int NOT NULL DEFAULT '0', PRIMARY KEY (`id`)) ENGINE=InnoDB",
+        "CREATE TABLE `tags` (`id` bigint NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, UNIQUE INDEX `IDX_d90243459a697eadb8ad56e909` (`name`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
+        "CREATE TABLE `post_tag` (`post_id` bigint NOT NULL, `tag_id` bigint NOT NULL, INDEX `IDX_b5ec92f15aaa1e371f2662f681` (`post_id`), INDEX `IDX_d2fd5340bb68556fe93650fedc` (`tag_id`), PRIMARY KEY (`post_id`, `tag_id`)) ENGINE=InnoDB",
+        "INSERT INTO `tags`(`id`, `name`) VALUES (DEFAULT, 'news'), (DEFAULT, 'rust'), (DEFAULT, 'sql')",
+        "INSERT INTO `users`(`email`, `name`, `balance`, `profile`) VALUES ('alice@example.com', 'Alice', '100.50', '{\"city\": \"Tokyo\"}'), ('bob@example.com', 'Bob', '20.25', NULL), ('carol@example.com', 'Carol', '5.00', NULL)",
+        "INSERT INTO `posts`(`id`, `user_id`, `title`, `body`, `published_at`, `views`) VALUES (DEFAULT, '1', 'Hello', 'First post', '2024-01-02 03:04:05.000', 10)",
+        "INSERT INTO `posts`(`id`, `user_id`, `title`, `body`, `published_at`, `views`) VALUES (DEFAULT, '1', 'Draft', 'Not yet', DEFAULT, 0)",
+        "INSERT INTO `post_tag`(`post_id`, `tag_id`) VALUES ('1', '1'), ('1', '2')",
+        "INSERT INTO `posts`(`id`, `user_id`, `title`, `body`, `published_at`, `views`) VALUES (DEFAULT, '2', 'Bob writes', DEFAULT, DEFAULT, 3)",
+        "INSERT INTO `post_tag`(`post_id`, `tag_id`) VALUES ('3', '3')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    (directory, adapter)
+}
+
+/// The body TypeORM pages a post and its tags through, each column renamed
+/// after the relation it belongs to.
+const POSTS_WITH_TAGS: &str = "SELECT `Post`.`id` AS `Post_id`, `Post`.`user_id` AS `Post_user_id`, `Post`.`title` AS `Post_title`, `Post`.`body` AS `Post_body`, `Post`.`published_at` AS `Post_published_at`, `Post`.`views` AS `Post_views`, `Post__Post_tags`.`id` AS `Post__Post_tags_id`, `Post__Post_tags`.`name` AS `Post__Post_tags_name` FROM `posts` `Post` LEFT JOIN `post_tag` `Post_Post__Post_tags` ON `Post_Post__Post_tags`.`post_id`=`Post`.`id` LEFT JOIN `tags` `Post__Post_tags` ON `Post__Post_tags`.`id`=`Post_Post__Post_tags`.`tag_id`";
+
+/// A body reading every user with the posts each wrote.
+const USERS_WITH_POSTS: &str = "SELECT u.id AS u_id, u.email AS u_email, u.balance AS u_balance, u.is_active AS u_active, u.profile AS u_profile, u.created_at AS u_created, p.id AS p_id, p.published_at AS p_published FROM users u LEFT JOIN posts p ON p.user_id = u.id";
+
+/// A column MySQL reads out of the table it writes the rows into to drop the
+/// repeated ones: it names its own table's name rather than the body's alias,
+/// goes by the statement's name for it, names no database and keeps none of
+/// its keys.
+#[allow(clippy::too_many_arguments)]
+fn written_out(
+    name: &'static str,
+    table: &'static str,
+    original_table: &'static str,
+    column_type: u8,
+    length: u32,
+    decimals: u8,
+    flags: u16,
+    character_set: u16,
+) -> Column {
+    Column {
+        name,
+        table,
+        original_table,
+        original_name: name,
+        names_the_database: false,
+        column_type,
+        length,
+        decimals,
+        flags,
+        character_set,
+    }
+}
+
+/// A column read straight through a derived table joining tables: it names
+/// the body's alias for its table and the body's name for it.
+#[allow(clippy::too_many_arguments)]
+fn read_through(
+    name: &'static str,
+    original_table: &'static str,
+    original_name: &'static str,
+    column_type: u8,
+    length: u32,
+    decimals: u8,
+    flags: u16,
+    character_set: u16,
+) -> Column {
+    Column {
+        name,
+        table: "d",
+        original_table,
+        original_name,
+        names_the_database: true,
+        column_type,
+        length,
+        decimals,
+        flags,
+        character_set,
+    }
+}
+
+/// Every row, sorted, for a statement whose order neither engine promises.
+fn sorted(mut answered: Rows) -> Rows {
+    answered.sort();
+    answered
+}
+
+/// `findAndCount` with `skip` and `take` over a post loaded with its tags:
+/// TypeORM reads the page's ids out of the whole query standing as a derived
+/// table, reads those posts with their tags, and counts the posts. Measured
+/// on MySQL 8.4.11 over these rows, each column of the page reporting the
+/// table MySQL writes the rows into to drop the repeated ones.
+#[test]
+fn typeorms_pagination_over_a_relation_answers_what_mysql_answers() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    let page = |limit: &str| {
+        format!("SELECT DISTINCT `distinctAlias`.`Post_id` AS `ids_Post_id`, `distinctAlias`.`Post_id` FROM ({POSTS_WITH_TAGS}) `distinctAlias` ORDER BY `distinctAlias`.`Post_id` ASC, `Post_id` ASC {limit}")
+    };
+    let id = |name| {
+        written_out(
+            name,
+            "distinctAlias",
+            "posts",
+            MYSQL_TYPE_LONGLONG,
+            20,
+            0,
+            MYSQL_NOT_NULL_FLAG,
+            BINARY,
+        )
+    };
+    let sql = page("LIMIT 1 OFFSET 0");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(&sql, &columns, &[id("ids_Post_id"), id("Post_id")]);
+    assert_eq!(answered, rows(&[&[Some("1"), Some("1")]]));
+    let sql = page("LIMIT 10");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(&sql, &columns, &[id("ids_Post_id"), id("Post_id")]);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("1"), Some("1")],
+            &[Some("2"), Some("2")],
+            &[Some("3"), Some("3")]
+        ])
+    );
+    let (_, answered) = read(&mut adapter, &page("LIMIT 1 OFFSET 1"));
+    assert_eq!(answered, rows(&[&[Some("2"), Some("2")]]));
+
+    // Ordered by a column, TypeORM reads that column beside the id; ordered
+    // by a relation's column, the column is on the side a LEFT JOIN can leave
+    // missing, and a post without tags sorts last going down.
+    let sql = format!("SELECT DISTINCT `distinctAlias`.`Post_id` AS `ids_Post_id`, `distinctAlias`.`Post_title` FROM ({POSTS_WITH_TAGS}) `distinctAlias` ORDER BY `distinctAlias`.`Post_title` ASC, `Post_id` ASC LIMIT 10");
+    let (columns, answered) = read(&mut adapter, &sql);
+    let title = written_out(
+        "Post_title",
+        "distinctAlias",
+        "posts",
+        MYSQL_TYPE_VAR_STRING,
+        800,
+        0,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        WORDS,
+    );
+    assert_columns(&sql, &columns, &[id("ids_Post_id"), title]);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("3"), Some("Bob writes")],
+            &[Some("2"), Some("Draft")],
+            &[Some("1"), Some("Hello")]
+        ])
+    );
+    let sql = format!("SELECT DISTINCT `distinctAlias`.`Post_id` AS `ids_Post_id`, `distinctAlias`.`Post__Post_tags_name` FROM ({POSTS_WITH_TAGS}) `distinctAlias` ORDER BY `distinctAlias`.`Post__Post_tags_name` DESC, `Post_id` ASC LIMIT 10");
+    let (columns, answered) = read(&mut adapter, &sql);
+    let tag_name = written_out(
+        "Post__Post_tags_name",
+        "distinctAlias",
+        "tags",
+        MYSQL_TYPE_VAR_STRING,
+        400,
+        0,
+        MYSQL_NO_DEFAULT_VALUE_FLAG,
+        WORDS,
+    );
+    assert_columns(&sql, &columns, &[id("ids_Post_id"), tag_name]);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("3"), Some("sql")],
+            &[Some("1"), Some("rust")],
+            &[Some("1"), Some("news")],
+            &[Some("2"), None]
+        ])
+    );
+
+    // TypeORM then reads the page's posts, naming each id as a word.
+    let sql = format!("{POSTS_WITH_TAGS} WHERE `Post`.`id` IN ('1', '2') ORDER BY `Post`.`id` ASC");
+    let (_, answered) = read(&mut adapter, &sql);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("First post"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("1"),
+                Some("news")
+            ],
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("First post"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("2"),
+                Some("rust")
+            ],
+            &[
+                Some("2"),
+                Some("1"),
+                Some("Draft"),
+                Some("Not yet"),
+                None,
+                Some("0"),
+                None,
+                None
+            ],
+        ])
+    );
+
+    // And counts the posts.
+    let sql = "SELECT COUNT(DISTINCT `Post`.`id`) AS `cnt` FROM `posts` `Post` LEFT JOIN `post_tag` `Post_Post__Post_tags` ON `Post_Post__Post_tags`.`post_id`=`Post`.`id` LEFT JOIN `tags` `Post__Post_tags` ON `Post__Post_tags`.`id`=`Post_Post__Post_tags`.`tag_id`";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_columns(
+        sql,
+        &columns,
+        &[Column {
+            name: "cnt",
+            table: "",
+            original_table: "",
+            original_name: "",
+            names_the_database: false,
+            column_type: MYSQL_TYPE_LONGLONG,
+            length: 21,
+            decimals: 0,
+            flags: MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            character_set: BINARY,
+        }],
+    );
+    assert_eq!(answered, rows(&[&[Some("3")]]));
+}
+
+/// With nothing dropping repeated rows, MySQL reads a derived table joining
+/// tables straight through: each column keeps every flag of its own table's
+/// column, names the body's alias for that table and the body's name for the
+/// column, and a day or a moment reports in words, as it does through a
+/// derived table reading one table. A column on the side a LEFT JOIN can leave
+/// missing loses its NOT NULL. Measured on MySQL 8.4.11.
+#[test]
+fn a_derived_table_joining_tables_reads_each_column_through_its_own_table() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    let sql = format!("SELECT d.Post_id AS ids_Post_id, d.Post_user_id, d.Post_title, d.Post_body, d.Post_published_at, d.Post_views, d.Post__Post_tags_id, d.Post__Post_tags_name FROM ({POSTS_WITH_TAGS}) d");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            read_through(
+                "ids_Post_id",
+                "Post",
+                "Post_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG
+                    | MYSQL_PRI_KEY_FLAG
+                    | MYSQL_AUTO_INCREMENT_FLAG
+                    | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "Post_user_id",
+                "Post",
+                "Post_user_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "Post_title",
+                "Post",
+                "Post_title",
+                MYSQL_TYPE_VAR_STRING,
+                800,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                WORDS,
+            ),
+            read_through(
+                "Post_body",
+                "Post",
+                "Post_body",
+                MYSQL_TYPE_BLOB,
+                262_140,
+                0,
+                MYSQL_BLOB_FLAG,
+                WORDS,
+            ),
+            read_through(
+                "Post_published_at",
+                "Post",
+                "Post_published_at",
+                MYSQL_TYPE_DATETIME,
+                76,
+                0,
+                MYSQL_BINARY_FLAG,
+                WORDS,
+            ),
+            read_through(
+                "Post_views",
+                "Post",
+                "Post_views",
+                MYSQL_TYPE_LONG,
+                11,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "Post__Post_tags_id",
+                "Post__Post_tags",
+                "Post__Post_tags_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_PRI_KEY_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "Post__Post_tags_name",
+                "Post__Post_tags",
+                "Post__Post_tags_name",
+                MYSQL_TYPE_VAR_STRING,
+                400,
+                0,
+                MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG,
+                WORDS,
+            ),
+        ],
+    );
+    assert_eq!(
+        sorted(answered),
+        rows(&[
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("First post"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("1"),
+                Some("news")
+            ],
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("First post"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("2"),
+                Some("rust")
+            ],
+            &[
+                Some("2"),
+                Some("1"),
+                Some("Draft"),
+                Some("Not yet"),
+                None,
+                Some("0"),
+                None,
+                None
+            ],
+            &[
+                Some("3"),
+                Some("2"),
+                Some("Bob writes"),
+                None,
+                None,
+                Some("3"),
+                Some("3"),
+                Some("sql")
+            ],
+        ])
+    );
+
+    // A column the body names without renaming goes by its own name.
+    let sql = "SELECT d.name, d.Post_id FROM (SELECT `Post`.`id` AS `Post_id`, `Post__Post_tags`.`name` FROM `posts` `Post` LEFT JOIN `post_tag` `Post_Post__Post_tags` ON `Post_Post__Post_tags`.`post_id`=`Post`.`id` LEFT JOIN `tags` `Post__Post_tags` ON `Post__Post_tags`.`id`=`Post_Post__Post_tags`.`tag_id`) d";
+    let (columns, _) = read(&mut adapter, sql);
+    assert_eq!(
+        (
+            columns[0].original_table.as_str(),
+            columns[0].original_name.as_str(),
+            columns[0].flags
+        ),
+        (
+            "Post__Post_tags",
+            "name",
+            MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG
+        )
+    );
+
+    // A number with decimals, a small whole number, a document and a moment
+    // with a fraction, read through the same way.
+    let sql = format!("SELECT d.u_id, d.u_balance, d.u_active, d.u_profile, d.u_created, d.p_id, d.p_published FROM ({USERS_WITH_POSTS}) d");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            read_through(
+                "u_id",
+                "u",
+                "u_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG
+                    | MYSQL_PRI_KEY_FLAG
+                    | MYSQL_AUTO_INCREMENT_FLAG
+                    | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "u_balance",
+                "u",
+                "u_balance",
+                MYSQL_TYPE_NEWDECIMAL,
+                12,
+                2,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "u_active",
+                "u",
+                "u_active",
+                MYSQL_TYPE_TINY,
+                4,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "u_profile",
+                "u",
+                "u_profile",
+                MYSQL_TYPE_JSON,
+                u32::MAX - 3,
+                0,
+                MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+                WORDS,
+            ),
+            read_through(
+                "u_created",
+                "u",
+                "u_created",
+                MYSQL_TYPE_DATETIME,
+                104,
+                6,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                WORDS,
+            ),
+            read_through(
+                "p_id",
+                "p",
+                "p_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_PRI_KEY_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            read_through(
+                "p_published",
+                "p",
+                "p_published",
+                MYSQL_TYPE_DATETIME,
+                76,
+                0,
+                MYSQL_BINARY_FLAG,
+                WORDS,
+            ),
+        ],
+    );
+    let balances = sorted(answered)
+        .into_iter()
+        .map(|row| (row[0].clone(), row[1].clone(), row[5].clone()))
+        .collect::<Vec<_>>();
+    let written = |id: &str, balance: &str, post: Option<&str>| {
+        (
+            Some(id.to_owned()),
+            Some(balance.to_owned()),
+            post.map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        balances,
+        [
+            written("1", "100.50", Some("1")),
+            written("1", "100.50", Some("2")),
+            written("2", "20.25", Some("3")),
+            written("3", "5.00", None),
+        ]
+    );
+}
+
+/// `DISTINCT` over a derived table joining tables makes MySQL write the rows
+/// into a table of its own, and each column reports that table's: its own
+/// table's name, the statement's name for it, no database and no keys, while
+/// its type, length and every other flag stay those of its table's column —
+/// a moment is not turned into words. Measured on MySQL 8.4.11 over empty
+/// tables, tables of one row and tables of thousands, which all answer alike.
+#[test]
+fn dropping_repeats_over_a_derived_table_joining_tables_reports_mysqls_own_table() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    let sql = format!("SELECT DISTINCT d.Post_id AS ids_Post_id, d.Post_user_id, d.Post_title, d.Post_published_at, d.Post_views, d.Post__Post_tags_id, d.Post__Post_tags_name FROM ({POSTS_WITH_TAGS}) d ORDER BY d.Post_id, d.Post__Post_tags_id");
+    let (columns, answered) = read(&mut adapter, &sql);
+    let no_default = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            written_out(
+                "ids_Post_id",
+                "d",
+                "posts",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "Post_user_id",
+                "d",
+                "posts",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                no_default,
+                BINARY,
+            ),
+            written_out(
+                "Post_title",
+                "d",
+                "posts",
+                MYSQL_TYPE_VAR_STRING,
+                800,
+                0,
+                no_default,
+                WORDS,
+            ),
+            written_out(
+                "Post_published_at",
+                "d",
+                "posts",
+                MYSQL_TYPE_DATETIME,
+                19,
+                0,
+                MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "Post_views",
+                "d",
+                "posts",
+                MYSQL_TYPE_LONG,
+                11,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "Post__Post_tags_id",
+                "d",
+                "tags",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                0,
+                BINARY,
+            ),
+            written_out(
+                "Post__Post_tags_name",
+                "d",
+                "tags",
+                MYSQL_TYPE_VAR_STRING,
+                400,
+                0,
+                MYSQL_NO_DEFAULT_VALUE_FLAG,
+                WORDS,
+            ),
+        ],
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("1"),
+                Some("news")
+            ],
+            &[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("2024-01-02 03:04:05"),
+                Some("10"),
+                Some("2"),
+                Some("rust")
+            ],
+            &[
+                Some("2"),
+                Some("1"),
+                Some("Draft"),
+                None,
+                Some("0"),
+                None,
+                None
+            ],
+            &[
+                Some("3"),
+                Some("2"),
+                Some("Bob writes"),
+                None,
+                Some("3"),
+                Some("3"),
+                Some("sql")
+            ],
+        ])
+    );
+    let sql = format!("SELECT DISTINCT d.Post_body FROM ({POSTS_WITH_TAGS}) d");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(
+        &sql,
+        &columns,
+        &[written_out(
+            "Post_body",
+            "d",
+            "posts",
+            MYSQL_TYPE_BLOB,
+            262_140,
+            0,
+            MYSQL_BLOB_FLAG,
+            WORDS,
+        )],
+    );
+    assert_eq!(
+        sorted(answered),
+        rows(&[&[None], &[Some("First post")], &[Some("Not yet")]])
+    );
+
+    // A number with decimals, a small whole number, a document and a moment
+    // with a fraction keep their own shapes.
+    let sql = format!("SELECT DISTINCT d.u_id, d.u_email, d.u_balance, d.u_active, d.u_created, d.p_id FROM ({USERS_WITH_POSTS}) d ORDER BY d.u_id, d.p_id");
+    let (columns, answered) = read(&mut adapter, &sql);
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            written_out(
+                "u_id",
+                "d",
+                "users",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "u_email",
+                "d",
+                "users",
+                MYSQL_TYPE_VAR_STRING,
+                764,
+                0,
+                no_default,
+                WORDS,
+            ),
+            written_out(
+                "u_balance",
+                "d",
+                "users",
+                MYSQL_TYPE_NEWDECIMAL,
+                12,
+                2,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "u_active",
+                "d",
+                "users",
+                MYSQL_TYPE_TINY,
+                4,
+                0,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            written_out(
+                "u_created",
+                "d",
+                "users",
+                MYSQL_TYPE_DATETIME,
+                26,
+                6,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            written_out("p_id", "d", "posts", MYSQL_TYPE_LONGLONG, 20, 0, 0, BINARY),
+        ],
+    );
+    let picked = answered
+        .into_iter()
+        .map(|row| (row[0].clone(), row[2].clone(), row[5].clone()))
+        .collect::<Vec<_>>();
+    let written = |id: &str, balance: &str, post: Option<&str>| {
+        (
+            Some(id.to_owned()),
+            Some(balance.to_owned()),
+            post.map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        picked,
+        [
+            written("1", "100.50", Some("1")),
+            written("1", "100.50", Some("2")),
+            written("2", "20.25", Some("3")),
+            written("3", "5.00", None),
+        ]
+    );
+    let sql = format!("SELECT DISTINCT d.u_profile FROM ({USERS_WITH_POSTS}) d");
+    let (columns, _) = read(&mut adapter, &sql);
+    assert_columns(
+        &sql,
+        &columns,
+        &[written_out(
+            "u_profile",
+            "d",
+            "users",
+            MYSQL_TYPE_JSON,
+            u32::MAX,
+            0,
+            MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+            BINARY,
+        )],
+    );
+
+    // An order by place, and by a name the body gave without renaming.
+    let sql = format!("SELECT DISTINCT d.Post_id FROM ({POSTS_WITH_TAGS}) d ORDER BY 1 DESC");
+    let (_, answered) = read(&mut adapter, &sql);
+    assert_eq!(answered, rows(&[&[Some("3")], &[Some("2")], &[Some("1")]]));
+    let sql = "SELECT DISTINCT Post_id FROM (SELECT `Post`.`id` AS `Post_id`, `Post__Post_tags`.`name` FROM `posts` `Post` LEFT JOIN `post_tag` `Post_Post__Post_tags` ON `Post_Post__Post_tags`.`post_id`=`Post`.`id` LEFT JOIN `tags` `Post__Post_tags` ON `Post__Post_tags`.`id`=`Post_Post__Post_tags`.`tag_id`) d ORDER BY Post_id";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_eq!(
+        (
+            columns[0].original_table.as_str(),
+            columns[0].original_name.as_str()
+        ),
+        ("posts", "Post_id")
+    );
+    assert_eq!(answered, rows(&[&[Some("1")], &[Some("2")], &[Some("3")]]));
+
+    // Words differing only in case are one value to drop, and the first met
+    // is the one kept; ordered, they sort without regard to case.
+    adapter
+        .execute_query("INSERT INTO posts (user_id, title) VALUES (1, 'beta'), (1, 'Alpha'), (2, 'alpha'), (2, 'Zulu'), (3, 'apple'), (3, 'ALPHA')")
+        .unwrap();
+    let sql =
+        format!("SELECT DISTINCT d.Post_title FROM ({POSTS_WITH_TAGS}) d ORDER BY d.Post_title");
+    let (_, answered) = read(&mut adapter, &sql);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("Alpha")],
+            &[Some("apple")],
+            &[Some("beta")],
+            &[Some("Bob writes")],
+            &[Some("Draft")],
+            &[Some("Hello")],
+            &[Some("Zulu")]
+        ])
+    );
+    let sql = format!("SELECT DISTINCT `distinctAlias`.`Post_id` AS `ids_Post_id`, `distinctAlias`.`Post_title` FROM ({POSTS_WITH_TAGS}) `distinctAlias` ORDER BY `distinctAlias`.`Post_title` ASC, `Post_id` ASC LIMIT 4");
+    let (_, answered) = read(&mut adapter, &sql);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("5"), Some("Alpha")],
+            &[Some("6"), Some("alpha")],
+            &[Some("9"), Some("ALPHA")],
+            &[Some("8"), Some("apple")]
+        ])
+    );
+}
+
+/// A table holding one column of each kind, and notes that can be missing
+/// for a row of it.
+#[test]
+fn dropping_repeats_keeps_every_kind_of_column_as_its_table_declares_it() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    for sql in [
+        "CREATE TABLE kinds (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, code CHAR(3) NOT NULL, day DATE NULL, stamp TIMESTAMP NULL, moved DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, mood ENUM('low','high') NOT NULL DEFAULT 'low', ratio DOUBLE NULL, small SMALLINT UNSIGNED NULL, price DECIMAL(8,3) UNSIGNED NULL, clock TIME NULL, blobby BLOB NULL, vb VARBINARY(16) NULL)",
+        "CREATE TABLE notes (id INT AUTO_INCREMENT PRIMARY KEY, kind_id BIGINT UNSIGNED NOT NULL, note VARCHAR(50) NULL, KEY (kind_id))",
+        "INSERT INTO kinds (code, day, stamp, mood, ratio, small, price, clock, blobby, vb) VALUES ('abc', '2024-01-02', '2024-01-02 03:04:05', 'high', 1.5, 7, 1.25, '10:11:12', 'xy', 'ab'), ('def', NULL, NULL, 'low', NULL, NULL, NULL, NULL, NULL, NULL)",
+        "INSERT INTO notes (kind_id, note) VALUES (1, 'n1'), (1, 'n2')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let body = "SELECT k.id AS k_id, k.code AS k_code, k.day AS k_day, k.stamp AS k_stamp, k.moved AS k_moved, k.mood AS k_mood, k.ratio AS k_ratio, k.small AS k_small, k.price AS k_price, k.clock AS k_clock, k.blobby AS k_blobby, k.vb AS k_vb, n.id AS n_id, n.kind_id AS n_kind, n.note AS n_note FROM kinds k LEFT JOIN notes n ON n.kind_id = k.id";
+    let sql = format!("SELECT DISTINCT d.k_id, d.k_code, d.k_day, d.k_stamp, d.k_moved, d.k_mood, d.k_ratio, d.k_small, d.k_price, d.k_clock, d.k_blobby, d.k_vb, d.n_id, d.n_kind, d.n_note FROM ({body}) d");
+    let (columns, answered) = read(&mut adapter, &sql);
+    let kind = |name, column_type, length, decimals, flags, character_set| {
+        written_out(
+            name,
+            "d",
+            "kinds",
+            column_type,
+            length,
+            decimals,
+            flags,
+            character_set,
+        )
+    };
+    let note = |name, column_type, length, flags, character_set| {
+        written_out(
+            name,
+            "d",
+            "notes",
+            column_type,
+            length,
+            0,
+            flags,
+            character_set,
+        )
+    };
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            kind(
+                "k_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG,
+                BINARY,
+            ),
+            kind(
+                "k_code",
+                MYSQL_TYPE_STRING,
+                12,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                WORDS,
+            ),
+            kind("k_day", MYSQL_TYPE_DATE, 10, 0, MYSQL_BINARY_FLAG, BINARY),
+            kind(
+                "k_stamp",
+                MYSQL_TYPE_TIMESTAMP,
+                19,
+                0,
+                MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            kind(
+                "k_moved",
+                MYSQL_TYPE_DATETIME,
+                19,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            kind(
+                "k_mood",
+                MYSQL_TYPE_STRING,
+                16,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_ENUM_FLAG,
+                WORDS,
+            ),
+            kind(
+                "k_ratio",
+                MYSQL_TYPE_DOUBLE,
+                22,
+                NOT_FIXED_DECIMALS,
+                0,
+                BINARY,
+            ),
+            kind(
+                "k_small",
+                MYSQL_TYPE_SHORT,
+                5,
+                0,
+                MYSQL_UNSIGNED_FLAG,
+                BINARY,
+            ),
+            kind(
+                "k_price",
+                MYSQL_TYPE_NEWDECIMAL,
+                9,
+                3,
+                MYSQL_UNSIGNED_FLAG,
+                BINARY,
+            ),
+            kind("k_clock", MYSQL_TYPE_TIME, 10, 0, MYSQL_BINARY_FLAG, BINARY),
+            kind(
+                "k_blobby",
+                MYSQL_TYPE_BLOB,
+                65_535,
+                0,
+                MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            kind(
+                "k_vb",
+                MYSQL_TYPE_VAR_STRING,
+                16,
+                0,
+                MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            note("n_id", MYSQL_TYPE_LONG, 11, 0, BINARY),
+            note(
+                "n_kind",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                BINARY,
+            ),
+            note("n_note", MYSQL_TYPE_VAR_STRING, 200, 0, WORDS),
+        ],
+    );
+    assert_eq!(answered.len(), 3);
+}
+
+#[test]
+fn a_derived_table_joining_tables_refuses_what_has_not_been_measured() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    let refused = [
+        // MySQL sorts through a table of its own when it matches a joined
+        // table by hash, which it picks by how many rows each table holds.
+        format!("SELECT d.Post_id FROM ({POSTS_WITH_TAGS}) d ORDER BY d.Post_id"),
+        // Which rows a limit with no order keeps is each engine's own.
+        format!("SELECT d.Post_id FROM ({POSTS_WITH_TAGS}) d LIMIT 1"),
+        format!("SELECT DISTINCT d.Post_id FROM ({POSTS_WITH_TAGS}) d LIMIT 1"),
+        // 3065: an order by a column a DISTINCT does not project.
+        format!("SELECT DISTINCT d.Post_id FROM ({POSTS_WITH_TAGS}) d ORDER BY d.Post_title"),
+        // A condition naming a key against a value makes MySQL read that
+        // table as one constant row.
+        "SELECT DISTINCT `distinctAlias`.`Post_id` FROM (SELECT `Post`.`id` AS `Post_id` FROM `posts` `Post` LEFT JOIN `post_tag` `pt` ON `pt`.`post_id`=`Post`.`id` WHERE `Post`.`id` = 1) `distinctAlias` ORDER BY `distinctAlias`.`Post_id`".to_owned(),
+        format!("SELECT DISTINCT d.Post_id FROM ({POSTS_WITH_TAGS}) d WHERE d.Post_id > 1"),
+        // Only columns matched against each other have been measured.
+        "SELECT DISTINCT d.Post_id FROM (SELECT `Post`.`id` AS `Post_id`, `t`.`name` AS `n` FROM `posts` `Post` LEFT JOIN `tags` `t` ON `t`.`id` = 1) d ORDER BY d.Post_id".to_owned(),
+        // MySQL picks its own order for an inner join.
+        "SELECT DISTINCT d.p_id FROM (SELECT p.id AS p_id, u.name AS u_name FROM posts p JOIN users u ON u.id = p.user_id) d".to_owned(),
+        // Anything but the derived table's own columns.
+        format!("SELECT COUNT(*) FROM ({POSTS_WITH_TAGS}) d"),
+        format!("SELECT COUNT(DISTINCT d.Post_id) FROM ({POSTS_WITH_TAGS}) d"),
+        format!("SELECT DISTINCT d.Post_id + 1 FROM ({POSTS_WITH_TAGS}) d"),
+        format!("SELECT * FROM ({POSTS_WITH_TAGS}) d"),
+        format!("SELECT d.Post_id, COUNT(*) FROM ({POSTS_WITH_TAGS}) d GROUP BY d.Post_id"),
+        format!("SELECT DISTINCT d.Post_id, t.name FROM ({POSTS_WITH_TAGS}) d JOIN tags t ON t.id = d.Post_id"),
+        // A derived table joining tables inside another statement.
+        format!("SELECT p.id FROM posts p WHERE p.id IN (SELECT d.Post_id FROM ({POSTS_WITH_TAGS}) d)"),
+        // 1060: two columns going by one name.
+        "SELECT d.id FROM (SELECT `Post`.`id`, `t`.`id` FROM `posts` `Post` LEFT JOIN `tags` `t` ON `t`.`id`=`Post`.`id`) d".to_owned(),
+        // A bare name in the body belongs to whichever table has the column.
+        "SELECT DISTINCT d.Post_id FROM (SELECT `Post`.`id` AS `Post_id`, `title` FROM `posts` `Post` LEFT JOIN `tags` `t` ON `t`.`id`=`Post`.`id`) d".to_owned(),
+        // A derived table joined inside the body.
+        "SELECT DISTINCT d.Post_id FROM (SELECT `Post`.`id` AS `Post_id` FROM `posts` `Post` LEFT JOIN (SELECT id FROM tags) `t` ON `t`.`id`=`Post`.`id`) d".to_owned(),
+    ];
+    for sql in refused {
+        assert!(
+            matches!(
+                adapter.execute_query(&sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

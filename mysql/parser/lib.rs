@@ -211,8 +211,8 @@ pub use temporal_value::{
     year_from_number,
 };
 pub use translate::{
-    MySqlCatalogTable, MySqlColumnsTheKeysDecide, MySqlDerivedColumns, MySqlJoinedTable,
-    MySqlNamedColumn, MySqlSelectSource,
+    MySqlCatalogTable, MySqlColumnsTheKeysDecide, MySqlDerivedColumns, MySqlJoinedDerivedColumn,
+    MySqlJoinedTable, MySqlNamedColumn, MySqlSelectSource,
 };
 pub use trigger_definition::{
     mysql_create_trigger_ddl, trigger_body_readings, trigger_written_as_mysql_keeps_it,
