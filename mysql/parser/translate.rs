@@ -12166,11 +12166,26 @@ fn render_checked_like(
     )? {
         return Ok(rendered);
     }
-    let (qualifier, column) = match expr {
+    // `LOWER(col) LIKE ...` is how Gitea searches users by name and email.
+    // Measured on MySQL 8.4.11, the call's answer carries the column's
+    // collation, whose `LIKE` ignores case, so changing the case first
+    // changes nothing it matches; the call is kept, over the column held to
+    // the same rules a bare one is.
+    let (case_call, matched_expr) = match expr {
+        Expr::Function(function) => match case_changed_column(function) {
+            Some((call, column)) => (Some(call), column),
+            None => return unsupported("SELECT LIKE requires one column"),
+        },
+        _ => (None, expr),
+    };
+    let (qualifier, column) = match matched_expr {
         Expr::Identifier(ident) => (None, ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
         _ => return unsupported("SELECT LIKE requires one column"),
     };
+    if case_call.is_some() && render_context.is_json_column(&column.value) {
+        return unsupported("SELECT LIKE over a case change of a JSON column");
+    }
     render_context.checks_type_sensitive_expression = true;
     if render_context
         .decimal_columns
@@ -12183,6 +12198,10 @@ fn render_checked_like(
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
         None => render_ident(column),
+    };
+    let rendered_column = match case_call {
+        Some(call) => format!("{call}({rendered_column})"),
+        None => rendered_column,
     };
     // A `JSON` column is matched as the text MySQL prints it as, which
     // carries `utf8mb4_bin` and so tells case apart: measured on 8.4.11,
@@ -12233,6 +12252,45 @@ fn render_checked_like(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// The column a `LOWER` or `UPPER` call changes the case of, with the call as
+/// the engine spells it, when the call is that and nothing more.
+fn case_changed_column(function: &sqlparser::ast::Function) -> Option<(&'static str, &Expr)> {
+    let [name] = function.name.0.as_slice() else {
+        return None;
+    };
+    let name = name.as_ident()?.value.to_ascii_uppercase();
+    let call = match name.as_str() {
+        "LOWER" | "LCASE" => "lower",
+        "UPPER" | "UCASE" => "upper",
+        _ => return None,
+    };
+    if function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(column))] =
+        list.args.as_slice()
+    else {
+        return None;
+    };
+    matches!(column, Expr::Identifier(_))
+        .then_some((call, column))
+        .or_else(|| {
+            matches!(column, Expr::CompoundIdentifier(parts) if parts.len() == 2)
+                .then_some((call, column))
+        })
 }
 
 /// Renders a `LIKE` pattern, written or bound, and says which it was.

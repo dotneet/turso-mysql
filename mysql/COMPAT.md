@@ -1338,6 +1338,16 @@ and the absence of an implicit escape under `NO_BACKSLASH_ESCAPES`. Written
 and bound patterns use the same matcher. Oversized or overly expensive
 patterns fail closed.
 
+A `LIKE` may match `LOWER(col)` or `UPPER(col)` as well as the column, which
+is how Gitea searches users by name and email — `lower_name LIKE ? OR
+LOWER(full_name) LIKE ?`. Measured on MySQL 8.4.11 the call's answer carries
+the column's collation, whose `LIKE` ignores case and accents and matches
+character by character, so changing the case first changes nothing it
+matches: `LOWER(full_name) LIKE '%emile%'` finds `ÉMILE Zola`, and `LIKE
+'%STRASSE%'` does not find `Straße`. The column is held to the same rules a
+bare one is; the engine's `lower` and `upper` change ASCII letters alone, each
+one letter for one, which under that collation matches the same rows.
+
 `REGEXP` has different rules from collation equality: MySQL uses ICU full case
 folding and remains accent-sensitive. The dialect accepts its checked ASCII
 forms. It refuses a non-ASCII subject or pattern rather than return a wrong

@@ -26,6 +26,8 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
 enum Bound<'a> {
     /// A Go `string`, bound as `STRING`.
     Word(&'a str),
+    /// A Go `int64`, bound as `LONGLONG`.
+    Whole(i64),
 }
 
 /// The null bitmap, the new-parameters flag, the types and the values, as
@@ -39,6 +41,7 @@ fn payload(values: &[Bound<'_>]) -> Vec<u8> {
     for value in values {
         let code = match value {
             Bound::Word(_) => MYSQL_TYPE_STRING,
+            Bound::Whole(_) => MYSQL_TYPE_LONGLONG,
         };
         payload.extend_from_slice(&[code, 0]);
     }
@@ -48,6 +51,7 @@ fn payload(values: &[Bound<'_>]) -> Vec<u8> {
                 payload.push(u8::try_from(text.len()).unwrap());
                 payload.extend_from_slice(text.as_bytes());
             }
+            Bound::Whole(number) => payload.extend_from_slice(&number.to_le_bytes()),
         }
     }
     payload
@@ -608,4 +612,56 @@ fn an_ordering_aggregate_reads_the_column_an_alias_shares_its_name_with() {
         ),
         ["9", "6", "3"]
     );
+}
+
+/// Gitea searches users with `LOWER(full_name) LIKE ?` beside `lower_name
+/// LIKE ?`. Measured on MySQL 8.4.11, the call's answer carries the column's
+/// collation, whose `LIKE` ignores case and accents and matches character by
+/// character; every answer here is MySQL's over the same rows.
+#[test]
+fn giteas_user_search_matches_a_case_changed_column() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `lower_name` VARCHAR(255) NOT NULL, `full_name` VARCHAR(255) NULL, `email` VARCHAR(255) NOT NULL, `type` INT NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO `user` (`lower_name`, `full_name`, `email`, `type`) VALUES ('ada', 'Ada Lovelace', 'ADA@example.com', 0), ('emile', 'ÉMILE Zola', 'emile@x.org', 0), ('bob', NULL, 'Bob@X.org', 1), ('org', 'Straße Org', 's@x.org', 0), ('under', 'a_b', 'u@x.org', 0)",
+    );
+    for (sql, found) in [
+        (
+            "SELECT id FROM `user` WHERE LOWER(full_name) LIKE '%emile%' ORDER BY id",
+            &["2"][..],
+        ),
+        (
+            "SELECT id FROM `user` WHERE LOWER(full_name) LIKE '%STRASSE%' ORDER BY id",
+            &[],
+        ),
+        (
+            "SELECT id FROM `user` WHERE UPPER(email) LIKE '%x.org' ORDER BY id",
+            &["2", "3", "4", "5"],
+        ),
+        (
+            "SELECT id FROM `user` WHERE LOWER(full_name) NOT LIKE '%a%' ORDER BY id",
+            &[],
+        ),
+        (
+            "SELECT id FROM `user` WHERE LOWER(full_name) LIKE 'a\\_b' ORDER BY id",
+            &["5"],
+        ),
+    ] {
+        assert_eq!(first_column(&mut adapter, sql), found, "{sql}");
+    }
+    let counted = prepared_rows(
+        &mut adapter,
+        "SELECT count(*) FROM `user` WHERE type IN (?) AND (lower_name LIKE ? OR LOWER(full_name) LIKE ? OR LOWER(email) LIKE ?)",
+        &[
+            Bound::Whole(0),
+            Bound::Word("%o%"),
+            Bound::Word("%o%"),
+            Bound::Word("%o%"),
+        ],
+    );
+    assert_eq!(counted.rows, [[BinaryResultValue::Integer(4)]]);
 }
