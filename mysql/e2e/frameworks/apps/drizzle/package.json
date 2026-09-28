@@ -1,0 +1,10 @@
+{
+  "name": "turso-e2e-drizzle",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "drizzle-kit": "0.31.11",
+    "drizzle-orm": "0.45.3",
+    "mysql2": "3.24.4"
+  }
+}

@@ -18,7 +18,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-all_apps=(mysqlcli mysqldump laravel prisma typeorm django rails sqlalchemy gorm sequelize)
+all_apps=(mysqlcli mysqldump laravel prisma typeorm django rails sqlalchemy gorm sequelize drizzle)
 rust_image=rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
 python_image=python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
 
@@ -30,7 +30,7 @@ prefix="${COMPOSE_PROJECT_NAME}"
 # another checkout must not share it (cargo would skip rebuilding changed crates).
 export E2E_CARGO_TARGET_VOLUME="${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}"
 # One database per app, plus the extra ones some apps need.
-export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize"
+export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize drizzle"
 
 main() {
   case "${1:-}" in

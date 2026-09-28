@@ -1,0 +1,13 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1790583068207,
+      "tag": "0000_create_blog",
+      "breakpoints": true
+    }
+  ]
+}

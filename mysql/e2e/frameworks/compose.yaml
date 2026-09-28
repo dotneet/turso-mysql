@@ -202,3 +202,10 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-sequelize:local
     working_dir: /app
     command: ["./run.sh"]
+
+  drizzle:
+    <<: *app
+    build: ./apps/drizzle
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-drizzle:local
+    working_dir: /app
+    command: ["./run.sh"]

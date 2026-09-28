@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1790583068207,
+      "tag": "0000_create_blog",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1790583068520,
+      "tag": "0001_add_slug_and_comments",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1790583068835,
+      "tag": "0002_revert_slug_and_comments",
+      "breakpoints": true
+    }
+  ]
+}
