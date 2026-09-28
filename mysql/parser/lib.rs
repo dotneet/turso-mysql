@@ -4903,8 +4903,9 @@ fn parse_checked_auto_increment_insert(
                 .filter_map(|(at, value)| {
                     // A `?` a `CAST(? AS JSON)` binds is written into its column as
                     // the document it reads as, NULL where it binds NULL.
-                    let parameter = is_a_bare_placeholder(value)
-                        || translate::json_cast_operand(value).is_some_and(is_a_bare_placeholder);
+                    let parameter = translate::is_a_bare_placeholder(value)
+                        || translate::json_cast_operand(value)
+                            .is_some_and(translate::is_a_bare_placeholder);
                     let source = if parameter {
                         let at_parameter = ordinal;
                         ordinal += 1;
@@ -5219,17 +5220,10 @@ fn is_direct_insert_literal(expr: &Expr) -> bool {
 
 fn is_prepared_insert_value(expr: &Expr) -> bool {
     is_direct_insert_literal(expr)
-        || is_a_bare_placeholder(expr)
+        || translate::is_a_bare_placeholder(expr)
         || translate::json_cast_operand(expr).is_some_and(|operand| {
-            is_direct_insert_literal(operand) || is_a_bare_placeholder(operand)
+            is_direct_insert_literal(operand) || translate::is_a_bare_placeholder(operand)
         })
-}
-
-fn is_a_bare_placeholder(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?")
-    )
 }
 
 /// Rebuilds strict signed-width metadata from normalized MySQL table DDL.

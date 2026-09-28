@@ -301,7 +301,7 @@ fn extracted_reading<'e>(arguments: &[&'e Expr], unquoted: bool) -> Option<JsonR
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
         _ => return None,
     };
-    let path = if is_a_placeholder(path) {
+    let path = if is_a_bare_placeholder(path) {
         JsonPath::Bound
     } else {
         JsonPath::Written(written_json_path(path)?)
@@ -312,10 +312,6 @@ fn extracted_reading<'e>(arguments: &[&'e Expr], unquoted: bool) -> Option<JsonR
         path: Some(path),
         unquoted,
     })
-}
-
-fn is_a_placeholder(expr: &Expr) -> bool {
-    matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"))
 }
 
 /// Reads the `CASE` SQLAlchemy writes to compare a JSON value as text:

@@ -4891,7 +4891,7 @@ fn render_set_arithmetic_operand(
 ) -> Result<String, ParseError> {
     let ordinal = render_context.parameter_count;
     let rendered = render_update_assignment_value(operand, written, assigned, render_context)?;
-    if is_a_bare_placeholder(operand) {
+    if is_a_bare_placeholder(unwrapped(operand)) {
         render_context
             .bound_arithmetic_operands
             .push(crate::BoundArithmeticOperand {
@@ -4902,12 +4902,16 @@ fn render_set_arithmetic_operand(
     Ok(rendered)
 }
 
-fn is_a_bare_placeholder(expr: &Expr) -> bool {
+/// Reads an expression without the parentheses written around it.
+fn unwrapped(expr: &Expr) -> &Expr {
     match expr {
-        Expr::Nested(inner) => is_a_bare_placeholder(inner),
-        Expr::Value(value) => matches!(&value.value, Value::Placeholder(marker) if marker == "?"),
-        _ => false,
+        Expr::Nested(inner) => unwrapped(inner),
+        _ => expr,
     }
+}
+
+pub(crate) fn is_a_bare_placeholder(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"))
 }
 
 /// Reports whether a value reads only columns this `SET` has not written yet.

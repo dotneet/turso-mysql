@@ -5328,8 +5328,10 @@ A `SELECT` over several tables was read without its columns' types, so it
 compared such a column by kind too: GORM's count of an association through its
 join table — `JOIN post_tags ON post_tags.tag_id = tags.id AND
 post_tags.post_id = ?` — found no row. It is now read knowing which of the
-columns it names are `BIGINT UNSIGNED`, and refused where that name is also a
-column of another kind. One reading a subquery beside such a comparison, which
+columns it names are `BIGINT UNSIGNED` or `DECIMAL` — a `DECIMAL` compared
+with a bound value in a join was compared by kind the same way,
+`users.balance > ?` finding every row binding 50 and none binding `'50'` —
+and refused where that name is also a column of another kind. One reading a subquery beside such a comparison, which
 is read without its columns' types, is refused.
 
 This internal type is created only for the MySQL frontend. An older MySQL

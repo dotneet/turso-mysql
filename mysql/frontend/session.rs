@@ -1117,13 +1117,6 @@ impl CopiedSelect {
     }
 }
 
-/// Returns the tables a comparison's column may belong to, nearest first.
-///
-/// A qualified comparison names one; an unqualified one written inside a
-/// subquery is the subquery's column when it has one and the outer
-/// statement's when it does not, which is how MySQL reads it — measured on
-/// 8.4.11, `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name` where
-/// `b` carries no `name`.
 /// The type an `information_schema` table the statement reads declares for
 /// the column one comparison names. Such a table's columns are named by the
 /// table itself rather than by stored DDL.
@@ -1138,6 +1131,13 @@ fn catalog_column_type(
     })
 }
 
+/// Returns the tables a comparison's column may belong to, nearest first.
+///
+/// A qualified comparison names one; an unqualified one written inside a
+/// subquery is the subquery's column when it has one and the outer
+/// statement's when it does not, which is how MySQL reads it — measured on
+/// 8.4.11, `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name` where
+/// `b` carries no `name`.
 fn comparison_tables(
     source_tables: &[MySqlSelectSource],
     comparison: &CheckedSelectComparison,
@@ -6949,7 +6949,7 @@ impl MySqlConnection {
                 .iter()
                 .any(|source| source.subquery() || !source.projected_columns().is_empty())
         {
-            if self.compares_a_bigint_unsigned_column_by_kind(&translated) {
+            if self.compares_an_exact_number_column_by_kind(&translated) {
                 return Err(MySqlQueryError::Unsupported(
                     "a BIGINT UNSIGNED column compared with a bound value or a list beside a subquery"
                         .to_string(),
@@ -6986,7 +6986,7 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
         }
         let Some(source_table) = translated.source_table() else {
-            return self.with_the_unsigned_columns_of_every_table(sql, translated);
+            return self.with_the_exact_number_columns_of_every_table(sql, translated);
         };
         let Ok(table) = MySqlTableName::parse(source_table) else {
             return Ok(translated);
@@ -7128,20 +7128,20 @@ impl MySqlConnection {
     }
 
     /// Renders a statement over several tables knowing which of the columns
-    /// it names are `BIGINT UNSIGNED`, when it compares one with a bound
-    /// value or a list, so that comparison goes through the exact-number
-    /// calls a statement over one table already uses. GORM counts and reads
-    /// an association through such a join — `JOIN post_tags ON
-    /// post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found
+    /// it names are `BIGINT UNSIGNED` or `DECIMAL`, when it compares one with
+    /// a bound value or a list, so that comparison goes through the
+    /// exact-number calls a statement over one table already uses. GORM
+    /// counts and reads an association through such a join — `JOIN post_tags
+    /// ON post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found
     /// no row. Nothing else about the tables' columns is read here, and a
-    /// name some table holds as anything but a whole number is refused, the
-    /// calls reading it as a number too.
-    fn with_the_unsigned_columns_of_every_table(
+    /// name some table holds as anything but a number is refused, the calls
+    /// reading it as a number too.
+    fn with_the_exact_number_columns_of_every_table(
         &self,
         sql: &str,
         translated: turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
-        if !self.compares_a_bigint_unsigned_column_by_kind(&translated) {
+        if !self.compares_an_exact_number_column_by_kind(&translated) {
             return Ok(translated);
         }
         let mut columns = Vec::new();
@@ -7151,24 +7151,31 @@ impl MySqlConnection {
             }
             columns.extend(self.list_columns(source.table()).map_err(|error| {
                 MySqlQueryError::Unsupported(format!(
-                    "cannot read the columns a BIGINT UNSIGNED comparison names: {error}"
+                    "cannot read the columns an exact-number comparison names: {error}"
                 ))
             })?);
         }
-        let unsigned = columns
+        let exact = columns
             .iter()
-            .filter(|column| column.type_name() == "BIGINT UNSIGNED")
-            .map(|column| (column.name().to_owned(), 0))
+            .filter_map(|column| {
+                column
+                    .decimal_size()
+                    .map(|(_, scale)| (column.name().to_owned(), scale))
+                    .or_else(|| {
+                        (column.type_name() == "BIGINT UNSIGNED")
+                            .then(|| (column.name().to_owned(), 0))
+                    })
+            })
             .collect::<Vec<_>>();
         if columns.iter().any(|column| {
             !is_integer_type(column.type_name())
-                && unsigned
+                && column.decimal_size().is_none()
+                && exact
                     .iter()
                     .any(|(name, _)| name.eq_ignore_ascii_case(column.name()))
         }) {
             return Err(MySqlQueryError::Unsupported(
-                "a BIGINT UNSIGNED column shares its name with a column of another kind"
-                    .to_string(),
+                "an exact-number column shares its name with a column of another kind".to_string(),
             ));
         }
         turso_mysql_parser::parse_select_knowing_decimal_columns(
@@ -7179,18 +7186,19 @@ impl MySqlConnection {
             &[],
             &[],
             &[],
-            &unsigned,
+            &exact,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
 
     /// Whether a statement read without its column types compares a
-    /// `BIGINT UNSIGNED` column in a way the engine answers by kind rather
-    /// than by value: against a bound value or a list. The engine keeps such
-    /// a column in a stored form of its own and compares it with a written
-    /// number, and nothing else, through the type's own calls — measured,
-    /// `user_id = ?` found no row and `id > ?` every row.
-    fn compares_a_bigint_unsigned_column_by_kind(
+    /// `BIGINT UNSIGNED` or `DECIMAL` column in a way the engine answers by
+    /// kind rather than by value: against a bound value or a list. The engine
+    /// keeps such a column in a stored form of its own and compares it with a
+    /// written number, and nothing else, through the type's own calls —
+    /// measured, `user_id = ?` found no row, `id > ?` every row, and
+    /// `balance > ?` every row binding 50 and none binding `'50'`.
+    fn compares_an_exact_number_column_by_kind(
         &self,
         translated: &turso_mysql_parser::TranslatedSelect,
     ) -> bool {
@@ -7211,7 +7219,8 @@ impl MySqlConnection {
                 !source.subquery()
                     && self.list_columns(source.table()).is_ok_and(|columns| {
                         columns.iter().any(|column| {
-                            column.type_name() == "BIGINT UNSIGNED"
+                            (column.type_name() == "BIGINT UNSIGNED"
+                                || column.decimal_size().is_some())
                                 && column.name().eq_ignore_ascii_case(comparison.column_name())
                         })
                     })
@@ -11305,8 +11314,6 @@ pub(crate) struct BoundTemporalParameter {
     form: BoundTemporalForm,
 }
 
-/// The whole number a bound word names, which is what MySQL reads it as
-/// against a column holding whole numbers.
 /// Holds each value an `UPDATE` does arithmetic with to what MySQL reads alike;
 /// see [`BoundOperandKind`].
 fn hold_bound_operands(
@@ -11346,6 +11353,8 @@ fn hold_bound_operands(
     Ok(())
 }
 
+/// The whole number a bound word names, which is what MySQL reads it as
+/// against a column holding whole numbers.
 fn bound_whole_number(written: &str) -> Option<i64> {
     match turso_mysql_parser::read_written_number(written)? {
         turso_mysql_parser::WrittenNumber::Whole(value) => Some(value),
@@ -12013,10 +12022,6 @@ fn refuse_dml_json_readings_mysql_reads_differently(
     refuse_json_readings_of_other_columns(schema, table, translated.json_reading_columns())
 }
 
-/// Holds every column a JSON reading reads to being a `JSON` column.
-///
-/// The readings are MySQL's over a document. Over a text column MySQL reads
-/// the text as a document first, which is not what this measured.
 /// Holds each column a `CAST(... AS JSON)` is written into to being a `JSON`
 /// column. What MySQL writes into any other kind has not been measured.
 fn refuse_json_casts_into_other_columns(
@@ -12038,6 +12043,10 @@ fn refuse_json_casts_into_other_columns(
     Ok(())
 }
 
+/// Holds every column a JSON reading reads to being a `JSON` column.
+///
+/// The readings are MySQL's over a document. Over a text column MySQL reads
+/// the text as a document first, which is not what this measured.
 fn refuse_json_readings_of_other_columns(
     schema: &turso_core::schema::Schema,
     table: &str,

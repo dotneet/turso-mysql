@@ -992,3 +992,31 @@ fn an_unsigned_id_bound_beside_a_subquery_is_refused() {
         [1, 2]
     );
 }
+
+/// A `DECIMAL` column compared with a bound value in a join was compared
+/// the way a `BIGINT UNSIGNED` one was, by kind: `users.balance > ?` found
+/// every post binding 50 and none binding `'50'`. Measured on MySQL 8.4.11,
+/// each compares the balance as the number it is.
+#[test]
+fn a_decimal_compared_with_a_bound_value_in_a_join_is_compared_by_value() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    let posts = |comparison: &str| {
+        format!(
+            "SELECT posts.id FROM posts JOIN users ON users.id = posts.user_id WHERE users.balance {comparison} ORDER BY posts.id"
+        )
+    };
+    for (comparison, bound, found) in [
+        ("= ?", Bound::Word("100.50"), vec![1, 2]),
+        ("= ?", Bound::Word("100.5"), vec![1, 2]),
+        ("> ?", Bound::Whole(50), vec![1, 2]),
+        ("> ?", Bound::Word("50"), vec![1, 2]),
+        ("<= ?", Bound::Whole(0), vec![3]),
+    ] {
+        assert_eq!(
+            ids(&mut adapter, &posts(comparison), &[bound]),
+            found,
+            "{comparison}"
+        );
+    }
+}
