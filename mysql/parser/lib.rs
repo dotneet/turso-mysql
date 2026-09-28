@@ -1018,6 +1018,7 @@ pub struct TranslatedSelect {
     columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
     bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
     collation_sensitive_call_columns: Vec<String>,
+    collation_sensitive_joined_columns: Vec<(String, String)>,
     json_reading_columns: Vec<String>,
     reads_table: bool,
     orders_a_bare_column: bool,
@@ -1881,6 +1882,13 @@ impl TranslatedSelect {
     /// which it may name only when the keys decide them.
     pub const fn columns_the_keys_decide(&self) -> Option<&MySqlColumnsTheKeysDecide> {
         self.columns_the_keys_decide.as_ref()
+    }
+
+    /// Returns each column named with its table whose words a `GROUP_CONCAT`
+    /// orders, as the name the table goes by and the column's name, which
+    /// has to be under the collation that order follows.
+    pub fn collation_sensitive_joined_columns(&self) -> &[(String, String)] {
+        &self.collation_sensitive_joined_columns
     }
 
     /// Returns each name a subquery standing as a result column reads without
@@ -4472,6 +4480,36 @@ pub fn parse_select_knowing_json_columns(
         integer_columns,
         real_columns,
         json_columns,
+        false,
+    )
+}
+
+/// Parses a checked `SELECT` over several tables, told the kinds of every
+/// table's columns by name: which hold words, which whole numbers, and which
+/// a `DECIMAL` or a `BIGINT UNSIGNED` keeps in a stored form of its own.
+///
+/// The frontend passes these only when each name is of one kind in every
+/// table, so a column named with its table is read knowing its kind.
+pub fn parse_select_knowing_the_kinds_of_joined_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+    text_columns: &[String],
+    integer_columns: &[String],
+    exact_columns: &[(String, u32)],
+) -> Result<TranslatedSelect, ParseError> {
+    parse_select_inner(
+        sql,
+        mode,
+        text_columns,
+        &[],
+        &[],
+        &[],
+        &[],
+        exact_columns,
+        integer_columns,
+        &[],
+        &[],
+        true,
     )
 }
 
@@ -4501,6 +4539,7 @@ pub fn parse_select_with_column_types(
         &[],
         &[],
         &[],
+        false,
     )
 }
 
@@ -4517,6 +4556,7 @@ fn parse_select_inner(
     integer_columns: &[String],
     real_columns: &[String],
     json_columns: &[String],
+    knows_the_kinds_of_joined_columns: bool,
 ) -> Result<TranslatedSelect, ParseError> {
     let sql = &*without_utf8mb4_introducers(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
@@ -4543,6 +4583,7 @@ fn parse_select_inner(
     let RenderedSelect {
         sqlite_sql,
         collation_sensitive_call_columns,
+        collation_sensitive_joined_columns,
         json_reading_columns,
         source_table,
         source_tables,
@@ -4579,9 +4620,11 @@ fn parse_select_inner(
         real_columns,
         json_columns,
         false,
+        knows_the_kinds_of_joined_columns,
     )?;
     Ok(TranslatedSelect {
         collation_sensitive_call_columns,
+        collation_sensitive_joined_columns,
         json_reading_columns,
         reads_table: !source_tables.is_empty(),
         orders_a_bare_column,

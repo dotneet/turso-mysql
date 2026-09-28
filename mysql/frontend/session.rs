@@ -7300,7 +7300,12 @@ impl MySqlConnection {
         translated: turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
         let compares_a_written_number = translated.compares_a_written_number();
-        if !self.compares_an_exact_number_column_by_kind(&translated)
+        // A `GROUP_CONCAT` over a joined column ordered by it is rendered by
+        // the kind of that column, which is the one order a join is read
+        // knowing its kinds for.
+        let orders_a_joined_column = translated.renders_a_condition_without_column_types();
+        if !orders_a_joined_column
+            && !self.compares_an_exact_number_column_by_kind(&translated)
             && !self.compares_a_column_of_words_with_a_bound_value(&translated)
             && !compares_a_written_number
         {
@@ -7354,6 +7359,32 @@ impl MySqlConnection {
             return Err(MySqlQueryError::Unsupported(
                 "a column of words shares its name with a column of another kind".to_string(),
             ));
+        }
+        if orders_a_joined_column {
+            let whole_numbers = columns
+                .iter()
+                .filter(|column| is_integer_type(column.type_name()))
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>();
+            if columns.iter().any(|column| {
+                !is_integer_type(column.type_name())
+                    && whole_numbers
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(column.name()))
+            }) {
+                return Err(MySqlQueryError::Unsupported(
+                    "a whole-number column shares its name with a column of another kind"
+                        .to_string(),
+                ));
+            }
+            return turso_mysql_parser::parse_select_knowing_the_kinds_of_joined_columns(
+                sql,
+                self.parser_mode(),
+                &words,
+                &whole_numbers,
+                &exact,
+            )
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
         }
         let whole_numbers = if compares_a_written_number {
             columns
@@ -7627,10 +7658,28 @@ impl MySqlConnection {
         &self,
         translated: &turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        for (reference, column) in translated.collation_sensitive_joined_columns() {
+            let table = translated
+                .source_tables()
+                .iter()
+                .find(|source| {
+                    !source.subquery() && source.reference().eq_ignore_ascii_case(reference)
+                })
+                .and_then(|source| schema.get_table(source.table().as_str()))
+                .ok_or_else(|| {
+                    MySqlQueryError::Unsupported(
+                        "text call needs a base table's column collation".to_string(),
+                    )
+                })?;
+            if let Some(refusal) = call_over_another_collation(&table, std::slice::from_ref(column))
+            {
+                return Err(MySqlQueryError::Unsupported(refusal));
+            }
+        }
         if translated.collation_sensitive_call_columns().is_empty() {
             return Ok(());
         }
-        let schema = self.inner.current_schema();
         for source in translated.source_tables() {
             if source.subquery() {
                 continue;

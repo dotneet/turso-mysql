@@ -6819,8 +6819,9 @@ impl TableResultMetadata {
         self.aggregate_definition_over(table, ordinal, name, kind)
     }
 
-    /// Builds the result column a `MIN`, `MAX` or `SUM` over a column named
-    /// with its table reports, in a statement reading several tables.
+    /// Builds the result column a `MIN`, `MAX`, `SUM` or `GROUP_CONCAT` over a
+    /// column named with its table reports, in a statement reading several
+    /// tables. A `GROUP_CONCAT` takes the columns it takes over one table.
     ///
     /// Measured on MySQL 8.4.11: each answers the shape it answers over that
     /// table alone — `SUM(posts.views)` over an `INT` a `NEWDECIMAL` of 33,
@@ -6857,7 +6858,12 @@ impl TableResultMetadata {
             .iter()
             .position(|column| column.name().eq_ignore_ascii_case(column_name))
             .ok_or(FrontendErrorKind::UnknownColumn)?;
-        if !is_signed_whole_number_column(table.columns[ordinal].type_name()) {
+        let column = &table.columns[ordinal];
+        let answered = match kind {
+            ColumnAggregateKind::Concatenated => joins_as_the_engine_writes_it(column),
+            _ => is_signed_whole_number_column(column.type_name()),
+        };
+        if !answered {
             return Err(FrontendErrorKind::Unsupported);
         }
         self.aggregate_definition_over(table, ordinal, name, kind)

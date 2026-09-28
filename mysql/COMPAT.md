@@ -4986,8 +4986,21 @@ the order come out in an order of MySQL's own — `a` before `A` under
 were read in — so a group whose tied values differ is refused when it is
 joined, answering 1235. An order by several columns, an expression, an
 ordinal, a column of another kind or words under another collation is
-refused, and so is one over a join or a subquery, where the column's kind is
-not read.
+refused, and so is one in a subquery, where the column's kind is not read.
+
+Over a join the call names its column with its table, and may be ordered by
+that same column: the mysql client's `GROUP_CONCAT(t.name ORDER BY t.name
+SEPARATOR ',')` over `users`, `posts`, `post_tag` and `tags`, grouped by `u.id,
+p.id`. Such a statement is read knowing the kinds of every table's columns by
+name when each name is of one kind in every table, and the column's own
+collation is held to `utf8mb4_0900_ai_ci`, whatever another table's column of
+that name is under. Measured on 8.4.11, it answers what the call over one
+table answers — in that collation's order, from the last with `DESC`, as
+numbers over whole numbers, NULL for a group the `LEFT JOIN` found nothing
+for. The column shape is the unordered call's; MySQL reports the one it sorts
+through when the statement's `ORDER BY` differs from its grouping, as the
+next paragraph but one says. An order by another column is refused over a
+join.
 
 The engine's `group_concat` gathers each group's rows, every one written with
 its length in bytes so no value can be mistaken for a separator — and, for an

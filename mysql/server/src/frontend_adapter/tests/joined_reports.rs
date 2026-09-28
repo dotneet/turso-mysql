@@ -775,3 +775,73 @@ fn laravel_asks_through_a_pivot_table_joined_inside_an_exists() {
         "select `name` from `users` where exists (select * from `tags` inner join `post_tag` on `tags`.`id` = `post_tag`.`tag_id` join posts on posts.id = post_tag.post_id where id = 1)"
     ));
 }
+
+/// The mysql client script's `join` step lists each post with its tags,
+/// joined in the order of their names: `GROUP_CONCAT(t.name ORDER BY t.name
+/// SEPARATOR ',')` over a join grouped by `u.id, p.id`, which decide the
+/// name and the title. Measured on MySQL 8.4.11: the tags join in the order
+/// of `utf8mb4_0900_ai_ci`, a post with none answers NULL, and a joined
+/// column ordered by itself answers what one table's does, from the last with
+/// `DESC` and as numbers over whole numbers.
+///
+/// MySQL sorts the first statement's groups by `p.id` through a table of its
+/// own, where the joined words are a `BLOB` of 16384 with the blob flag; this
+/// reports the shape they have unsorted, which the next two report in MySQL
+/// too.
+#[test]
+fn the_mysql_client_joins_each_posts_tags_in_the_order_of_their_names() {
+    let (_directory, mut adapter) = adapter_over(UNSIGNED_IDS);
+    let joined_words = shape("tags", MYSQL_TYPE_LONG_BLOB, 65536, 31, 0);
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT u.name, p.title, GROUP_CONCAT(t.name ORDER BY t.name SEPARATOR ',') AS tags FROM users u JOIN posts p ON p.user_id = u.id LEFT JOIN post_tag pt ON pt.post_id = p.id LEFT JOIN tags t ON t.id = pt.tag_id GROUP BY u.id, p.id ORDER BY p.id",
+    );
+    assert_eq!(
+        shapes,
+        [
+            shape("name", MYSQL_TYPE_VAR_STRING, 400, 0, WORDS),
+            shape("title", MYSQL_TYPE_VAR_STRING, 800, 0, WORDS),
+            joined_words.clone(),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("Alice"), Some("Hello"), Some("news,python")],
+            &[Some("Alice"), Some("Second"), Some("python,sql")],
+            &[Some("Bob"), Some("Bob post"), Some("news")],
+            &[Some("Bob"), Some("Draft"), None],
+        ])
+    );
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT p.id, GROUP_CONCAT(t.name ORDER BY t.name DESC) AS tags FROM posts p JOIN post_tag pt ON pt.post_id = p.id JOIN tags t ON t.id = pt.tag_id GROUP BY p.id ORDER BY p.id",
+    );
+    assert_eq!(shapes[1], joined_words);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("1"), Some("python,news")],
+            &[Some("2"), Some("sql,python")],
+            &[Some("3"), Some("news")],
+        ])
+    );
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT u.name, GROUP_CONCAT(p.id ORDER BY p.id DESC) AS ids FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.id ORDER BY u.id",
+    );
+    assert_eq!(
+        answered,
+        rows(&[&[Some("Alice"), Some("2,1")], &[Some("Bob"), Some("4,3")]])
+    );
+    // Words under `utf8mb4_unicode_ci` are ordered by a rule not followed
+    // here, as over one table; ordered by another column, or over a
+    // `DECIMAL`, has not been measured.
+    for sql in [
+        "SELECT u.name, GROUP_CONCAT(p.title ORDER BY p.title DESC) AS titles FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.id",
+        "SELECT u.name, GROUP_CONCAT(p.title ORDER BY p.id) AS titles FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.id",
+        "SELECT u.name, GROUP_CONCAT(u.balance ORDER BY u.balance) AS b FROM users u JOIN posts p ON p.user_id = u.id GROUP BY u.id",
+    ] {
+        assert!(is_refused(&mut adapter, sql), "{sql}");
+    }
+}

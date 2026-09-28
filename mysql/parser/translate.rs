@@ -393,6 +393,7 @@ impl MySqlSelectSource {
 pub(crate) struct RenderedSelect {
     pub(crate) sqlite_sql: String,
     pub(crate) collation_sensitive_call_columns: Vec<String>,
+    pub(crate) collation_sensitive_joined_columns: Vec<(String, String)>,
     pub(crate) json_reading_columns: Vec<String>,
     pub(crate) orders_a_bare_column: bool,
     pub(crate) checks_type_sensitive_expression: bool,
@@ -442,6 +443,7 @@ pub(crate) fn translate_select_query(
     real_columns: &[String],
     json_columns: &[String],
     writes_its_rows: bool,
+    knows_the_kinds_of_joined_columns: bool,
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -467,6 +469,7 @@ pub(crate) fn translate_select_query(
     render_context.real_columns = real_columns;
     render_context.json_columns = json_columns;
     render_context.writes_its_rows = writes_its_rows;
+    render_context.knows_the_kinds_of_joined_columns = knows_the_kinds_of_joined_columns;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     let mut sequence = None;
     if let Some(with) = &query.with {
@@ -671,6 +674,7 @@ pub(crate) fn translate_select_query(
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
+        collation_sensitive_joined_columns: render_context.collation_sensitive_joined_columns,
         json_reading_columns: render_context.json_reading_columns,
         orders_a_bare_column: render_context.orders_a_bare_column,
         checks_type_sensitive_expression: render_context.checks_type_sensitive_expression,
@@ -1132,8 +1136,8 @@ fn note_what_result_subqueries_read(
     Ok(())
 }
 
-/// Reports whether a projection item is a `MIN`, `MAX` or `SUM` over a
-/// column named with its table, standing on its own.
+/// Reports whether a projection item is a `MIN`, `MAX`, `SUM` or
+/// `GROUP_CONCAT` over a column named with its table, standing on its own.
 fn is_an_aggregate_over_a_joined_column(item: &SelectItem) -> bool {
     matches!(item,
         SelectItem::UnnamedExpr(Expr::Function(function))
@@ -2948,6 +2952,7 @@ pub(crate) fn translate_insert(
                     &[],
                     &[],
                     true,
+                    false,
                 )?;
                 // A SELECT that needs a second rendering pass to learn its
                 // column types is rendered by the frontend, which knows them,
@@ -5700,6 +5705,13 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the subquery about to be rendered stands in a `WHERE`'s
     /// `EXISTS`, the one subquery that may join tables.
     an_exists_may_join: bool,
+    /// Whether the statement is read knowing the kinds of every table's
+    /// columns by name, which the frontend gives a statement over several
+    /// tables only when each name is of one kind in all of them.
+    knows_the_kinds_of_joined_columns: bool,
+    /// Each column named with its table whose words a `GROUP_CONCAT` orders,
+    /// which the frontend holds to the collation that order follows.
+    collation_sensitive_joined_columns: Vec<(String, String)>,
     /// Whether the statement writes the rows it reads — `INSERT ... SELECT`
     /// — where a cut `GROUP_CONCAT` fails the statement rather than warning.
     writes_its_rows: bool,
@@ -5783,6 +5795,8 @@ impl<'a> SelectRenderContext<'a> {
             renders_a_projection_item: false,
             takes_a_joined_aggregate: false,
             an_exists_may_join: false,
+            knows_the_kinds_of_joined_columns: false,
+            collation_sensitive_joined_columns: Vec::new(),
             writes_its_rows: false,
             counts_group_concat_in_having: false,
             group_concat_counts: Vec::new(),
@@ -6121,19 +6135,24 @@ fn render_aggregate_call(
     )
 }
 
-/// Renders a `MIN`, `MAX` or `SUM` over a column named with its table.
+/// Renders a `MIN`, `MAX`, `SUM` or `GROUP_CONCAT` over a column named with
+/// its table.
 ///
 /// Which kind of column it reads is the server's to check once it knows the
-/// table, and only a signed whole number is answered: the engine sums and
-/// compares those as MySQL does, where a `DECIMAL` or a `BIGINT UNSIGNED` is
-/// kept in a stored form of its own and words are compared under a collation.
-/// Until then the statement is marked as one whose types matter.
+/// table, and only a signed whole number is answered by the first three: the
+/// engine sums and compares those as MySQL does, where a `DECIMAL` or a
+/// `BIGINT UNSIGNED` is kept in a stored form of its own and words are
+/// compared under a collation. Until then the statement is marked as one
+/// whose types matter.
 fn render_qualified_aggregate(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
 ) -> String {
-    let (_, table, column) = static_select_metadata::qualified_aggregate_argument(function)
+    let (kind, table, column) = static_select_metadata::qualified_aggregate_argument(function)
         .expect("a qualified aggregate was checked to name a table's column");
+    if kind == static_select_metadata::ColumnAggregateKind::Concatenated {
+        return render_group_concat(function, render_context);
+    }
     render_context.checks_type_sensitive_expression = true;
     format!(
         "{}({}.{})",
@@ -6161,10 +6180,21 @@ fn render_group_concat(
         .replace('\'', "''");
     render_context.group_concat_calls += 1;
     let call = render_context.group_concat_calls;
-    let (order, key) = match static_select_metadata::group_concat_order(function) {
-        Some((key, from_the_last)) => {
-            let order = group_concat_order_kind(key, from_the_last, render_context);
-            let key = render_ident(key);
+    let ordered = match static_select_metadata::group_concat_order(function) {
+        Some((key, from_the_last)) => Some((None, key, from_the_last)),
+        None => static_select_metadata::qualified_aggregate_argument(function)
+            .zip(static_select_metadata::qualified_group_concat_order(
+                function,
+            ))
+            .map(|((_, table, key), from_the_last)| (Some(table), key, from_the_last)),
+    };
+    let (order, key) = match ordered {
+        Some((table, key, from_the_last)) => {
+            let order = group_concat_order_kind(table, key, from_the_last, render_context);
+            let key = match table {
+                Some(table) => format!("{}.{}", render_ident(table), render_ident(key)),
+                None => render_ident(key),
+            };
             (
                 order,
                 format!(
@@ -6210,8 +6240,11 @@ fn render_group_concat(
 /// they are ordered by: words under `utf8mb4_0900_ai_ci`, which the frontend
 /// holds the column to, or whole numbers. Until the kinds are known the
 /// statement is marked to be read again knowing them, and a column of any
-/// other kind is refused once they are.
+/// other kind is refused once they are. A joined table's column, named with
+/// its table, is read knowing the kinds of every table's columns, which the
+/// frontend gives only when each name is of one kind in all of them.
 fn group_concat_order_kind(
+    table: Option<&Ident>,
     key: &Ident,
     from_the_last: bool,
     render_context: &mut SelectRenderContext<'_>,
@@ -6222,15 +6255,24 @@ fn group_concat_order_kind(
             .iter()
             .any(|column| column.eq_ignore_ascii_case(&key.value))
     };
-    let (first, last) = if render_context.table_columns.is_empty() {
+    let kinds_known = match table {
+        Some(_) => render_context.knows_the_kinds_of_joined_columns,
+        None => !render_context.table_columns.is_empty(),
+    };
+    let (first, last) = if !kinds_known {
         render_context.renders_a_condition_without_column_types = true;
         (GROUP_CONCAT_AS_READ, GROUP_CONCAT_AS_READ)
     } else if named(render_context.integer_columns) {
         (GROUP_CONCAT_BY_NUMBER, GROUP_CONCAT_BY_NUMBER_FROM_THE_LAST)
     } else if named(render_context.text_columns) {
-        render_context
-            .collation_sensitive_call_columns
-            .push(key.value.clone());
+        match table {
+            Some(table) => render_context
+                .collation_sensitive_joined_columns
+                .push((table.value.clone(), key.value.clone())),
+            None => render_context
+                .collation_sensitive_call_columns
+                .push(key.value.clone()),
+        }
         (GROUP_CONCAT_BY_WORD, GROUP_CONCAT_BY_WORD_FROM_THE_LAST)
     } else {
         render_context.group_concat_orders_by_another_kind = true;

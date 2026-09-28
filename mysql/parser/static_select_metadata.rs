@@ -58,9 +58,9 @@ pub enum StaticSelectMetadata {
         column_name: String,
         kind: ColumnAggregateKind,
     },
-    /// A `MIN`, `MAX` or `SUM` over a column named with its table in a
-    /// statement reading several tables — `SUM(posts.views)` over a join —
-    /// which the server finishes from that table's column.
+    /// A `MIN`, `MAX`, `SUM` or `GROUP_CONCAT` over a column named with its
+    /// table in a statement reading several tables — `SUM(posts.views)` over a
+    /// join — which the server finishes from that table's column.
     QualifiedAggregate {
         table: String,
         column_name: String,
@@ -3758,7 +3758,9 @@ pub(super) fn column_aggregate_argument(
         if arguments.duplicate_treatment.is_some() {
             return None;
         }
-        if !checked_group_concat_clauses(&arguments.clauses) {
+        if !checked_group_concat_clauses(&arguments.clauses, |key| {
+            matches!(key, Expr::Identifier(_))
+        }) {
             return None;
         }
     } else if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
@@ -3772,8 +3774,8 @@ pub(super) fn column_aggregate_argument(
     }
 }
 
-/// Returns the kind, the table and the column of a `MIN`, `MAX` or `SUM` over
-/// a column named with its table — `SUM(posts.views)`.
+/// Returns the kind, the table and the column of a `MIN`, `MAX`, `SUM` or
+/// `GROUP_CONCAT` over a column named with its table — `SUM(posts.views)`.
 ///
 /// A statement reading one table has that table's name left out before it is
 /// read, so this is how a join writes one, the name saying which table's
@@ -3796,6 +3798,8 @@ pub(crate) fn qualified_aggregate_argument(
         ColumnAggregateKind::MinMax
     } else if name.value.eq_ignore_ascii_case("SUM") {
         ColumnAggregateKind::Sum
+    } else if name.value.eq_ignore_ascii_case("GROUP_CONCAT") {
+        ColumnAggregateKind::Concatenated
     } else {
         return None;
     };
@@ -3805,15 +3809,47 @@ pub(crate) fn qualified_aggregate_argument(
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
-    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+    if arguments.duplicate_treatment.is_some() {
         return None;
     }
-    match arguments.args.as_slice() {
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::CompoundIdentifier(parts),
-        ))] if parts.len() == 2 => Some((kind, &parts[0], &parts[1])),
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::CompoundIdentifier(parts),
+    ))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let [table, column] = parts.as_slice() else {
+        return None;
+    };
+    // A `GROUP_CONCAT` over a joined column may be ordered by that column
+    // itself, the one order whose kind is the column's own.
+    let clauses_taken = match kind {
+        ColumnAggregateKind::Concatenated => {
+            checked_group_concat_clauses(&arguments.clauses, |key| {
+                matches!(key, Expr::CompoundIdentifier(key)
+                    if key.len() == 2
+                        && key[0].value.eq_ignore_ascii_case(&table.value)
+                        && key[1].value.eq_ignore_ascii_case(&column.value))
+            })
+        }
+        _ => arguments.clauses.is_empty(),
+    };
+    clauses_taken.then_some((kind, table, column))
+}
+
+/// Returns whether a `GROUP_CONCAT` over a joined column is ordered by that
+/// column from the last, when it is ordered at all.
+pub(crate) fn qualified_group_concat_order(function: &sqlparser::ast::Function) -> Option<bool> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    arguments.clauses.iter().find_map(|clause| match clause {
+        sqlparser::ast::FunctionArgumentClause::OrderBy(terms) => match terms.as_slice() {
+            [sqlparser::ast::OrderByExpr { options, .. }] => Some(options.asc == Some(false)),
+            _ => None,
+        },
         _ => None,
-    }
+    })
 }
 
 /// Classifies `CAST(col AS <type>)` and the `CONVERT(col, <type>)` spelling.
@@ -4115,6 +4151,7 @@ pub(super) fn checked_interval_count(interval: &sqlparser::ast::Interval) -> Opt
 /// joined; `NULLS FIRST` and `NULLS LAST` are no MySQL.
 pub(super) fn checked_group_concat_clauses(
     clauses: &[sqlparser::ast::FunctionArgumentClause],
+    orders_by: impl Fn(&Expr) -> bool,
 ) -> bool {
     use sqlparser::ast::FunctionArgumentClause;
     let separates = |clause: &FunctionArgumentClause| {
@@ -4133,13 +4170,13 @@ pub(super) fn checked_group_concat_clauses(
                 if matches!(
                     terms.as_slice(),
                     [sqlparser::ast::OrderByExpr {
-                        expr: Expr::Identifier(_),
+                        expr,
                         options: sqlparser::ast::OrderByOptions {
                             nulls_first: None,
                             ..
                         },
                         with_fill: None,
-                    }]
+                    }] if orders_by(expr)
                 )
         )
     };
