@@ -39,6 +39,13 @@ provision() {
     "$@"
 }
 
+# Docker Desktop's file sharing sometimes refuses to create a file in a
+# directory the host has just emptied, and takes it a moment later.
+for _ in $(seq 1 100); do
+  touch /log/authority.log /log/server.log 2>/dev/null && break
+  sleep 0.1
+done
+
 install -d -m 0700 -o "${service_uid}" -g "${shared_gid}" "${state}"
 install -d -m 0710 -o "${service_uid}" -g "${shared_gid}" "${sockets}"
 install -d -m 0700 -o "${client_uid}" -g "${shared_gid}" "${accounts}" "${data}" "${tls}"
