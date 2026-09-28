@@ -2500,6 +2500,16 @@ fn an_upsert_renders_the_row_it_was_offered() {
             "INSERT INTO up (id, hits) VALUES (4, 1), (5, 2) AS offered",
             "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (4, 1), (5, 2)",
         ),
+        // A column read before the clause writes it, and the offered row read
+        // after, answer the same whichever order the assignments run in.
+        (
+            "INSERT INTO up (id, a, b) VALUES (1, 5, 5) ON DUPLICATE KEY UPDATE b = a, a = a + 10, b2 = VALUES(a)",
+            "INSERT INTO \"up\" (\"id\", \"a\", \"b\") VALUES (1, 5, 5) ON CONFLICT DO UPDATE SET \"b\" = \"a\", \"a\" = (\"a\" + 10), \"b2\" = \"excluded\".\"a\"",
+        ),
+        (
+            "INSERT INTO up (id, a, b) VALUES (1, 5, 5) AS o ON DUPLICATE KEY UPDATE a = o.a, b = o.a + 1",
+            "INSERT INTO \"up\" (\"id\", \"a\", \"b\") VALUES (1, 5, 5) ON CONFLICT DO UPDATE SET \"a\" = \"excluded\".\"a\", \"b\" = (\"excluded\".\"a\" + 1)",
+        ),
     ] {
         let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
         assert_eq!(translated.as_sql(), normalized, "{sql}");
@@ -2512,6 +2522,11 @@ fn an_upsert_renders_the_row_it_was_offered() {
         "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = other.hits",
         // Renaming what the offered row carries has not been measured.
         "INSERT INTO up (id, hits) VALUES (2, 3) AS offered (a, b) ON DUPLICATE KEY UPDATE hits = offered.b",
+        // MySQL reads what the clause wrote a moment before; the engine reads
+        // the row as it stood.
+        "INSERT INTO up (id, a, b) VALUES (1, 5, 5) ON DUPLICATE KEY UPDATE a = a + 10, b = a",
+        "INSERT INTO up (id, a, b) VALUES (1, 5, 5) AS o ON DUPLICATE KEY UPDATE a = o.a, b = up.a + 1",
+        "INSERT INTO up (id, a, b) VALUES (1, 5, 5) ON DUPLICATE KEY UPDATE a = 1, a = 2",
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
     }

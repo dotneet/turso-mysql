@@ -2267,6 +2267,15 @@ the two rows — so only a qualified one names either, and the bare form is
 refused here as it is there. A qualifier naming neither row is refused, and so
 is renaming what that row carries, which has not been measured.
 
+The clause takes its assignments left to right, as an `UPDATE`'s `SET` does:
+measured on 8.4.11, `a = a + 10, b = a` over a row holding 1 and 1 leaves 11 and
+11, where the engine reads the row as it stood and would leave 11 and 1. So a
+value reading a column of the row already there that an earlier assignment of
+the same clause wrote is refused, and so is writing one column twice. Reading a
+column before the clause writes it answers the same in both — `b = a, a = a +
+10` leaves 11 and 1 in MySQL too — and the offered row is never written, so
+`VALUES(a)` and `o.a` are read anywhere in the clause.
+
 A name on the offered row with no upsert to use it names nothing, and Rails 8
 writes one on every `insert_all!` — `INSERT INTO tags (name) VALUES ('x') AS
 tags_values`. Measured on 8.4.11, such an insert writes, numbers its rows and

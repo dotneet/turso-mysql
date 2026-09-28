@@ -3025,6 +3025,7 @@ fn render_duplicate_key_update(
         return unsupported("INSERT ON DUPLICATE KEY UPDATE without assignments");
     }
     let mut rendered = Vec::with_capacity(assignments.len());
+    let mut assigned = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
             return unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target");
@@ -3032,6 +3033,22 @@ fn render_duplicate_key_update(
         let [ObjectNamePart::Identifier(column)] = name.0.as_slice() else {
             return unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target");
         };
+        // Measured on MySQL 8.4.11: the clause takes its assignments left to
+        // right, as an `UPDATE`'s `SET` does — `a = a + 10, b = a` over a row
+        // holding 1 leaves `b` at 11 — where the engine reads the row as it
+        // stood. The row offered is not written, so reading it is safe.
+        if reads_a_column_the_clause_wrote(&assignment.value, offered, &assigned) {
+            return unsupported(
+                "INSERT ON DUPLICATE KEY UPDATE value reading a column the clause already wrote",
+            );
+        }
+        if assigned
+            .iter()
+            .any(|earlier: &String| earlier.eq_ignore_ascii_case(&column.value))
+        {
+            return unsupported("INSERT ON DUPLICATE KEY UPDATE writing one column twice");
+        }
+        assigned.push(column.value.clone());
         let assigned_decimal = decimal_columns
             .iter()
             .any(|(known, _)| known.eq_ignore_ascii_case(&column.value));
@@ -3051,6 +3068,35 @@ fn render_duplicate_key_update(
         " ON CONFLICT DO UPDATE SET {}",
         rendered.join(", ")
     ))
+}
+
+/// Reports whether an `ON DUPLICATE KEY UPDATE` value reads a column of the
+/// row already there that an earlier assignment of the same clause wrote.
+///
+/// `VALUES(col)` and a column qualified by the offered row's name read the row
+/// offered, which the clause never writes.
+fn reads_a_column_the_clause_wrote(
+    value: &Expr,
+    offered: Option<&str>,
+    assigned: &[String],
+) -> bool {
+    match value {
+        Expr::Function(function) if names_the_offered_row(function) => false,
+        Expr::CompoundIdentifier(parts)
+            if parts.len() == 2
+                && offered.is_some_and(|offered| parts[0].value.eq_ignore_ascii_case(offered)) =>
+        {
+            false
+        }
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            reads_a_column_the_clause_wrote(inner, offered, assigned)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            reads_a_column_the_clause_wrote(left, offered, assigned)
+                || reads_a_column_the_clause_wrote(right, offered, assigned)
+        }
+        other => !reads_only_unassigned_columns(other, assigned),
+    }
 }
 
 /// Renders one `ON DUPLICATE KEY UPDATE` value.

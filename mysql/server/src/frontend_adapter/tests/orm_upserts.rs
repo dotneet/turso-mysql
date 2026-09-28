@@ -117,3 +117,53 @@ fn rails_insert_all_bang_names_a_row_nothing_reads() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// MySQL takes an upsert's assignments left to right, so a later one reads
+/// what an earlier one wrote, where the engine reads the row as it stood.
+#[test]
+fn an_upsert_reading_a_column_it_already_wrote_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE pairs (code varchar(10) PRIMARY KEY, a int NOT NULL, b int NOT NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO pairs (code, a, b) VALUES ('x', 1, 1)",
+    );
+    // MySQL leaves 11 and 11 here, the engine would leave 11 and 1.
+    for sql in [
+        "INSERT INTO pairs (code, a, b) VALUES ('x', 5, 5) ON DUPLICATE KEY UPDATE a = a + 10, b = a",
+        "INSERT INTO pairs (code, a, b) VALUES ('x', 5, 5) ON DUPLICATE KEY UPDATE a = 1, a = 2",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    // Reading a column before the clause writes it, and reading the offered
+    // row at any point, answer the same in both.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO pairs (code, a, b) VALUES ('x', 5, 5) ON DUPLICATE KEY UPDATE b = a, a = a + 10"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, a, b FROM pairs"),
+        vec![some(&["x", "11", "1"])]
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO pairs (code, a, b) VALUES ('x', 5, 7) AS o ON DUPLICATE KEY UPDATE a = o.a, b = o.a + o.b"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, a, b FROM pairs"),
+        vec![some(&["x", "5", "12"])]
+    );
+}
