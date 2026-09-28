@@ -3401,6 +3401,13 @@ because MySQL names the result column after the text as written —
 — and any other database, which the engine does not read from the selected
 database's connection.
 
+Prisma also writes each side of every join and of every key it compares in
+parentheses — `ON (j2.id) = (posts.user_id)`, `WHERE (posts.id) = (?)`.
+Measured on MySQL 8.4.11, those answer the rows and the columns the bare
+comparison does, so a column, a value or a `?` in parentheses on either side of
+a comparison is read as itself; parentheses around anything larger are kept as
+the expression they hold.
+
 Laravel's `Schema::getIndexes` and `Schema::getForeignKeys` — which `hasIndex`,
 `db:table` and a migration's introspection read — each group a table's rows of
 `STATISTICS`, or of `KEY_COLUMN_USAGE` joined to `REFERENTIAL_CONSTRAINTS`,

@@ -9476,6 +9476,8 @@ fn render_checked_select_comparison(
     right: &Expr,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    let left = without_parentheses(left);
+    let right = without_parentheses(right);
     if let Some(rendered) =
         json_condition::render_comparison_over_a_json_reading(left, op, right, render_context)?
     {
@@ -9713,6 +9715,20 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// A column, a value or a `?` in parentheses is the thing itself: MySQL reads
+/// `(a) = (b)` as `a = b`, which is how Prisma writes every join and every
+/// key it compares. Parentheses around anything larger are kept.
+fn without_parentheses(expr: &Expr) -> &Expr {
+    let mut inner = expr;
+    while let Expr::Nested(nested) = inner {
+        inner = nested;
+    }
+    match inner {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => inner,
+        _ => expr,
+    }
 }
 
 /// Renders a comparison whose one side reads a column through `+`, `-` or `*`

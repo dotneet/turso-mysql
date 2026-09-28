@@ -715,3 +715,29 @@ fn the_describer_reads_the_foreign_keys_and_indexes() {
         ]
     );
 }
+
+/// Prisma writes every join and every key it compares with each side in
+/// parentheses. Measured on MySQL 8.4.11: `(a) = (b)` is `a = b`, the rows
+/// and the columns alike.
+#[test]
+fn a_column_in_parentheses_is_compared_as_the_column() {
+    let (_directory, mut adapter) = migrated();
+    for sql in [
+        "INSERT INTO `users` (`email`, `name`, `updated_at`) VALUES ('a@x', 'A', '2026-09-28 00:00:00.000'), ('b@x', 'B', '2026-09-28 00:00:00.000')",
+        "INSERT INTO `posts` (`user_id`, `title`) VALUES (1, 'one'), (2, 'two'), (1, 'three')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let bare = described(
+        &mut adapter,
+        "SELECT `prisma`.`posts`.`id`, `j2`.`name` FROM `prisma`.`posts` LEFT JOIN `prisma`.`users` AS `j2` ON `j2`.`id` = `prisma`.`posts`.`user_id` WHERE `prisma`.`posts`.`id` >= ? ORDER BY `prisma`.`posts`.`id` ASC",
+        &["2"],
+    );
+    let parenthesized = described(
+        &mut adapter,
+        "SELECT `prisma`.`posts`.`id`, `j2`.`name` FROM `prisma`.`posts` LEFT JOIN `prisma`.`users` AS `j2` ON (`j2`.`id`) = (`prisma`.`posts`.`user_id`) WHERE (`prisma`.`posts`.`id`) >= (?) ORDER BY `prisma`.`posts`.`id` ASC",
+        &["2"],
+    );
+    assert_eq!(shown(&parenthesized), ["2|B", "3|A"]);
+    assert_eq!(parenthesized, bare);
+}
