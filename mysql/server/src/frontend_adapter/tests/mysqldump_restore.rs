@@ -3,13 +3,17 @@
 //! answering what `mysqldump` sends while it dumps the restored schema again.
 //!
 //! `mysqldump_probe.sql` is a real dump, taken with `mysqldump
-//! --single-transaction --databases probe` from MySQL 8.4.11, of a schema with
-//! counted tables, a foreign key, `JSON`, `DECIMAL` defaults, a
-//! `utf8mb4_unicode_ci` table beside `utf8mb4_0900_ai_ci` ones, a trigger
-//! writing a `CONCAT` of its row into another table, and a view of one table
-//! and a view joining two, both created by a latin1 client. Its objects were
-//! made by an account `dump_owner`@`%`, which is the `DEFINER` the dump names.
-//! Every expectation here was measured by restoring that same file there.
+//! --single-transaction --routines --triggers --events --databases probe` from
+//! MySQL 8.4.11, of a schema with counted tables, a foreign key, `JSON`,
+//! `DECIMAL` defaults, a `utf8mb4_unicode_ci` table beside `utf8mb4_0900_ai_ci`
+//! ones, a trigger writing a `CONCAT` of its row into another table, a view of
+//! one table and a view joining two, both created by a latin1 client, and an
+//! `articles` table shaped like the framework apps' posts — `ENUM`,
+//! `DATETIME(6)` — holding text with every escape `mysqldump` writes: `\'`,
+//! `\"`, `\\`, `\n`, `\r`, `\0` and `\Z`, a raw tab, emoji, and the empty
+//! word beside NULL. Its objects were made by an account `dump_owner`@`%`,
+//! which is the `DEFINER` the dump names. Every expectation here was measured
+//! by restoring that same file there.
 
 use super::*;
 
@@ -33,16 +37,23 @@ fn restoring_session() -> (tempfile::TempDir, Adapter) {
     (directory, adapter)
 }
 
-/// Splits a dump the way the `mysql` client does: comment lines are dropped,
-/// `DELIMITER` changes what ends a statement, and a statement ends at the
-/// line that ends with the delimiter.
+/// Splits a dump the way the `mysql` client 8.4.11 does, read from MySQL's
+/// general log while it restored this dump: a comment line between statements
+/// is sent as a statement of its own, since the client keeps comments by
+/// default; blank lines are dropped; `DELIMITER` changes what ends a
+/// statement and is not sent; and a statement ends at the line that ends with
+/// the delimiter, which is taken off.
 fn statements_the_client_sends(dump: &str) -> Vec<String> {
     let mut delimiter = ";".to_owned();
     let mut statements = Vec::new();
     let mut pending = String::new();
     for line in dump.lines() {
         if pending.is_empty() {
-            if line.trim().is_empty() || line.starts_with("--") {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.starts_with("--") {
+                statements.push(line.to_owned());
                 continue;
             }
             if let Some(new_delimiter) = line.strip_prefix("DELIMITER ") {
@@ -64,17 +75,33 @@ fn statements_the_client_sends(dump: &str) -> Vec<String> {
 
 fn restored() -> (tempfile::TempDir, Adapter) {
     let (directory, mut adapter) = restoring_session();
-    let refused = statements_the_client_sends(DUMP)
+    replay(&mut adapter, DUMP);
+    (directory, adapter)
+}
+
+/// Sends a dump as the client does, and fails on any statement refused.
+fn replay(adapter: &mut Adapter, dump: &str) {
+    let refused = statements_the_client_sends(dump)
         .into_iter()
         .filter_map(|sql| {
-            adapter
-                .execute_query(&sql)
+            send_as_the_client(adapter, &sql)
                 .err()
                 .map(|error| format!("{error:?}: {sql}"))
         })
         .collect::<Vec<_>>();
     assert!(refused.is_empty(), "{}", refused.join("\n"));
-    (directory, adapter)
+}
+
+/// Sends one statement, and after a `USE` what the client sends to learn the
+/// database it is in, as the general log shows: `SELECT DATABASE()` and then
+/// `COM_INIT_DB` naming it.
+fn send_as_the_client(adapter: &mut Adapter, sql: &str) -> Result<(), FrontendErrorKind> {
+    adapter.execute_query(sql)?;
+    if let Some(database) = sql.strip_prefix("USE ") {
+        adapter.execute_query("SELECT DATABASE()")?;
+        adapter.execute_init_db(database.trim_matches('`'))?;
+    }
+    Ok(())
 }
 
 fn run(adapter: &mut Adapter, sql: &str) {
@@ -180,6 +207,84 @@ fn a_standard_dump_restores_every_row_it_holds() {
             row(&[Some("1"), Some("post Hello")]),
             row(&[Some("2"), Some("post It's \"quoted\"")]),
             row(&[Some("3"), Some("post Café")]),
+        ]
+    );
+    // Every escape the dump wrote reads back as the byte it stands for.
+    assert_eq!(
+        rows(&mut adapter, "SELECT * FROM articles ORDER BY id"),
+        [
+            row(&[
+                Some("1"),
+                Some("1"),
+                Some("Hello"),
+                Some("First post"),
+                Some("published"),
+                Some("10"),
+                Some("2026-03-01 10:00:00.123456"),
+            ]),
+            row(&[
+                Some("2"),
+                Some("1"),
+                Some("Second"),
+                Some("More text"),
+                Some("draft"),
+                Some("0"),
+                None,
+            ]),
+            row(&[
+                Some("3"),
+                Some("3"),
+                Some("Carol's post"),
+                Some("It's quoted"),
+                Some("published"),
+                Some("5"),
+                Some("2026-09-28 01:45:12.786797"),
+            ]),
+            row(&[
+                Some("4"),
+                Some("2"),
+                Some(r#"Back\slash "double" 'single'"#),
+                Some("line one\nline two\r\n\ttabbed"),
+                Some("draft"),
+                Some("0"),
+                Some("2026-01-01 00:00:00.000000"),
+            ]),
+            row(&[
+                Some("5"),
+                Some("2"),
+                Some("Nul and Ctrl-Z"),
+                Some("a\0b\u{1a}c"),
+                Some("published"),
+                Some("7"),
+                Some("2026-01-01 00:00:00.500000"),
+            ]),
+            row(&[
+                Some("6"),
+                Some("3"),
+                Some("Emoji 😀 and ünïcödé"),
+                Some("percent % underscore _ backtick ` dollar $$"),
+                Some("published"),
+                Some("2147483647"),
+                Some("9999-12-31 23:59:59.999999"),
+            ]),
+            row(&[
+                Some("7"),
+                Some("1"),
+                Some(""),
+                Some(""),
+                Some("draft"),
+                Some("-1"),
+                Some("1000-01-01 00:00:00.000000"),
+            ]),
+            row(&[
+                Some("8"),
+                Some("2"),
+                Some(r#"JSON-like {"a": "b\"c"}"#),
+                Some(r#"{"q": "it's \"x\"\n"}"#),
+                Some("draft"),
+                Some("3"),
+                Some("2026-02-28 23:59:59.000001"),
+            ]),
         ]
     );
     assert_eq!(
@@ -525,9 +630,7 @@ fn restored_catalog() -> (tempfile::TempDir, Arc<MySqlDatabaseCatalog>) {
         ))
         .unwrap();
     adapter.authorize_connection().unwrap();
-    for sql in statements_the_client_sends(DUMP) {
-        run(&mut adapter, &sql);
-    }
+    replay(&mut adapter, DUMP);
     (directory, catalog)
 }
 
@@ -783,4 +886,74 @@ fn a_dump_finds_no_stored_programs_and_no_histograms() {
     );
     assert_eq!(histograms[1].column_type, MYSQL_TYPE_JSON);
     assert_eq!(histograms[1].column_length, 4_294_967_292);
+}
+
+/// The framework harness's `mysqldump` app, replayed here. `dump_src` was
+/// seeded on MySQL 8.4.11 with the apps' `schema.sql` and `data.sql`, plus 40
+/// posts written with a quote, a backslash, a double quote and a line break,
+/// and dumped without `--databases`, as the harness dumps it: with the default
+/// options, and with `--single-transaction --routines --triggers --events
+/// --hex-blob --complete-insert --net-buffer-length=4096`, which names every
+/// column and splits the posts into three `INSERT`s.
+const APPS_DEFAULT: &str = include_str!("mysqldump_apps_default.sql");
+const APPS_OPTIONS: &str = include_str!("mysqldump_apps_options.sql");
+/// The same database dumped with `--no-data`.
+const APPS_NO_DATA: &str = include_str!("mysqldump_apps_no_data.sql");
+/// What the harness's `rows_of` printed on MySQL for `dump_src`, and for the
+/// database each of the two dumps was replayed into there, byte for byte.
+const APPS_ROWS: &str = include_str!("mysqldump_apps_rows.tsv");
+
+/// The harness's `replay-default`, `same-rows-after-replay`, `replay-backup`
+/// and `same-rows-after-second-replay`: both dumps are replayed into one
+/// database the client names as it connects, the second over the first, and
+/// each leaves the rows MySQL left.
+#[test]
+fn the_framework_apps_dumps_replay_into_another_database_with_the_same_rows() {
+    assert_eq!(APPS_OPTIONS.matches("INSERT INTO `posts` (").count(), 3);
+    let (_directory, mut adapter) = restoring_session();
+    ok(&mut adapter, "CREATE DATABASE dump_dst");
+    adapter.execute_init_db("dump_dst").unwrap();
+    replay(&mut adapter, APPS_NO_DATA);
+    for table in ["users", "posts", "tags", "post_tag"] {
+        assert_eq!(
+            rows(&mut adapter, &format!("SELECT COUNT(*) FROM {table}")),
+            [row(&[Some("0")])],
+            "{table}"
+        );
+    }
+    for dump in [APPS_DEFAULT, APPS_OPTIONS] {
+        replay(&mut adapter, dump);
+        assert_eq!(rows_as_the_harness_prints(&mut adapter), APPS_ROWS);
+    }
+}
+
+/// The harness's `rows_of`, printed as `mysql --batch --skip-column-names`
+/// prints it: tab between values, `NULL` for NULL, and a backslash before a
+/// tab, a line break, a NUL and a backslash.
+fn rows_as_the_harness_prints(adapter: &mut Adapter) -> String {
+    let mut printed = String::new();
+    for sql in [
+        "SELECT id, email, name, balance, is_active, profile, created_at FROM users ORDER BY id",
+        "SELECT id, user_id, title, body, status, views, published_at FROM posts ORDER BY id",
+        "SELECT id, name FROM tags ORDER BY id",
+        "SELECT post_id, tag_id FROM post_tag ORDER BY post_id, tag_id",
+    ] {
+        for values in rows(adapter, sql) {
+            let line = values
+                .iter()
+                .map(|value| match value {
+                    None => "NULL".to_owned(),
+                    Some(value) => value
+                        .replace('\\', "\\\\")
+                        .replace('\t', "\\t")
+                        .replace('\n', "\\n")
+                        .replace('\0', "\\0"),
+                })
+                .collect::<Vec<_>>()
+                .join("\t");
+            printed.push_str(&line);
+            printed.push('\n');
+        }
+    }
+    printed
 }

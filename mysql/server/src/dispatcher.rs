@@ -713,6 +713,11 @@ fn split_query_statements(
     sql: &str,
     no_backslash_escapes: bool,
 ) -> Result<Vec<&str>, FrontendErrorKind> {
+    // The executor answers text with nothing to run, as it does any statement,
+    // since the answer changes the session's warnings and `ROW_COUNT()`.
+    if turso_mysql_parser::nothing_to_run(sql).is_some() {
+        return Ok(vec![sql]);
+    }
     if sql
         .trim_start()
         .get(.."CREATE TRIGGER".len())
@@ -2051,6 +2056,31 @@ mod tests {
             split_query_statements(sql, false).unwrap(),
             ["SELECT ';', `a;b`, \"c;d\" /* ; */", " # ;\n SELECT 2"]
         );
+    }
+
+    /// The `mysql` client sends each comment line of a dump as a query of its
+    /// own. The executor answers it, and an empty query, as MySQL does.
+    #[test]
+    fn text_with_nothing_to_run_reaches_the_executor() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        for sql in [
+            "-- MySQL dump 10.13  Distrib 8.4.11, for Linux (aarch64)",
+            "--",
+            "/*!99999 SET @a = 1 */",
+            "-- a\n;",
+            "",
+            " ; ",
+        ] {
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor::default();
+            dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_QUERY, sql.as_bytes()),
+            )
+            .unwrap();
+            assert_eq!(executor.query_calls, [sql], "{sql:?}");
+        }
     }
 
     #[test]

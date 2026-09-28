@@ -318,6 +318,8 @@ pub const MAX_PACKET_SEQUENCE_ID: u8 = u8::MAX;
 pub enum FrontendErrorKind {
     /// SQL syntax or statement-shape failure.
     Syntax,
+    /// A statement held no SQL and no comment.
+    EmptyQuery,
     /// A requested logical database does not exist or cannot be named safely.
     UnknownDatabase,
     /// A statement needs a selected logical database, but none is selected.
@@ -453,6 +455,8 @@ pub enum FrontendErrorKind {
 pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
     let (error_code, sql_state, message) = match kind {
         FrontendErrorKind::Syntax => (1064, *b"42000", b"syntax error".as_slice()),
+        // Measured on MySQL 8.4.11, message and all.
+        FrontendErrorKind::EmptyQuery => (1065, *b"42000", b"Query was empty".as_slice()),
         FrontendErrorKind::UnknownDatabase => (1049, *b"42000", b"unknown database".as_slice()),
         FrontendErrorKind::NoDatabaseSelected => {
             (1046, *b"3D000", b"no database selected".as_slice())

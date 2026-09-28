@@ -12,6 +12,7 @@ mod create_table_like;
 mod current_database;
 mod database_options;
 mod date_format;
+mod dollar_quote;
 mod drop_table;
 mod drop_view;
 mod dump_ddl;
@@ -25,6 +26,7 @@ mod moment_difference;
 mod mysql_ddl;
 mod named_tables;
 mod network_address;
+mod nothing_to_run;
 mod number_format;
 mod replace_view;
 mod select_projection_origins;
@@ -114,6 +116,7 @@ pub use current_database::write_the_current_database_in;
 pub use date_format::{
     days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,
 };
+pub use dollar_quote::opens_a_dollar_quote;
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::{parse_optional_drop_view, MySqlDropViewCommand};
 pub use dump_ddl::{
@@ -146,6 +149,7 @@ pub use mysql_ddl::{
 };
 pub use named_tables::{tables_named_by, NamedTable};
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
+pub use nothing_to_run::{nothing_to_run, NothingToRun};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
 pub use select_projection_origins::{

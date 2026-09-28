@@ -320,6 +320,13 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let status_flags = self.status_flags();
+        if let Some(answer) =
+            answer_what_is_not_a_statement(sql, self.connection.parser_mode(), status_flags)
+        {
+            self.raised_warnings.clear();
+            return answer;
+        }
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
@@ -2272,6 +2279,13 @@ where
         &mut self,
         sql: &str,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let status_flags = self.status_flags();
+        if let Some(answer) =
+            answer_what_is_not_a_statement(sql, self.session.session_sql_mode(), status_flags)
+        {
+            self.raised_warnings.clear();
+            return answer;
+        }
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
@@ -5022,6 +5036,30 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
     }
+}
+
+/// Answers text MySQL's parser answers before it reads any statement: only
+/// comments, which is an OK, nothing at all, which is 1065, and a word opening
+/// a dollar-quoted string, which is 1064 and is what the `mysql` client asks
+/// about as it connects. See [`turso_mysql_parser::nothing_to_run`].
+fn answer_what_is_not_a_statement(
+    sql: &str,
+    mode: SessionSqlMode,
+    status_flags: u16,
+) -> Option<Result<CommandExecutionResult, FrontendErrorKind>> {
+    match turso_mysql_parser::nothing_to_run(sql) {
+        Some(turso_mysql_parser::NothingToRun::OnlyComments) => {
+            return Some(Ok(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags,
+                ..CommandOkResult::default()
+            })));
+        }
+        Some(turso_mysql_parser::NothingToRun::Empty) => {
+            return Some(Err(FrontendErrorKind::EmptyQuery));
+        }
+        None => {}
+    }
+    turso_mysql_parser::opens_a_dollar_quote(sql, mode).then_some(Err(FrontendErrorKind::Syntax))
 }
 
 /// Refuses a statement that a session naming latin1 wrote outside ASCII, the

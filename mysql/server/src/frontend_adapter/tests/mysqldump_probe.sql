@@ -24,6 +24,36 @@ CREATE DATABASE /*!32312 IF NOT EXISTS*/ `probe` /*!40100 DEFAULT CHARACTER SET 
 USE `probe`;
 
 --
+-- Table structure for table `articles`
+--
+
+DROP TABLE IF EXISTS `articles`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `articles` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `user_id` int NOT NULL,
+  `title` varchar(200) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `body` text COLLATE utf8mb4_unicode_ci,
+  `status` enum('draft','published') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'draft',
+  `views` int NOT NULL DEFAULT '0',
+  `published_at` datetime(6) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `articles_user_id_index` (`user_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `articles`
+--
+
+LOCK TABLES `articles` WRITE;
+/*!40000 ALTER TABLE `articles` DISABLE KEYS */;
+INSERT INTO `articles` VALUES (1,1,'Hello','First post','published',10,'2026-03-01 10:00:00.123456'),(2,1,'Second','More text','draft',0,NULL),(3,3,'Carol\'s post','It\'s quoted','published',5,'2026-09-28 01:45:12.786797'),(4,2,'Back\\slash \"double\" \'single\'','line one\nline two\r\n	tabbed','draft',0,'2026-01-01 00:00:00.000000'),(5,2,'Nul and Ctrl-Z','a\0b\Zc','published',7,'2026-01-01 00:00:00.500000'),(6,3,'Emoji 😀 and ünïcödé','percent % underscore _ backtick ` dollar $$','published',2147483647,'9999-12-31 23:59:59.999999'),(7,1,'','','draft',-1,'1000-01-01 00:00:00.000000'),(8,2,'JSON-like {\"a\": \"b\\\"c\"}','{\"q\": \"it\'s \\\"x\\\"\\n\"}','draft',3,'2026-02-28 23:59:59.000001');
+/*!40000 ALTER TABLE `articles` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
 -- Table structure for table `audit`
 --
 
@@ -147,6 +177,14 @@ INSERT INTO `users` VALUES (1,'Ann','ann@example.com',12.50,'{\"lang\": \"en\", 
 UNLOCK TABLES;
 
 --
+-- Dumping events for database 'probe'
+--
+
+--
+-- Dumping routines for database 'probe'
+--
+
+--
 -- Current Database: `probe`
 --
 
@@ -197,4 +235,4 @@ USE `probe`;
 /*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
 /*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
 
--- Dump completed on 2026-09-27 23:51:59
+-- Dump completed on 2026-09-28  2:17:30

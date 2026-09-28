@@ -30791,3 +30791,6 @@ mod missing_tables;
 
 #[cfg(unix)]
 mod session_readings;
+
+#[cfg(unix)]
+mod mysql_client_statements;

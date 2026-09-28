@@ -9339,3 +9339,115 @@ fn json_unquote_answers_what_mysql_answers() {
     assert_eq!(json_unquote("1e300").as_deref(), Some("1e300"));
     assert_eq!(json_unquote("[1,  2]").as_deref(), Some("[1, 2]"));
 }
+
+/// Measured on MySQL 8.4.11 by sending each text as one `COM_QUERY`.
+#[test]
+fn text_holding_only_comments_or_nothing_is_told_apart_from_a_statement() {
+    for sql in [
+        "-- MySQL dump 10.13  Distrib 8.4.11, for Linux (aarch64)",
+        "--",
+        "-- ",
+        "--\tx",
+        "--\u{b}x",
+        "--\u{1}x",
+        "--\u{7f}x",
+        "\t-- x",
+        "\u{c}-- x",
+        "-- a\r\n",
+        "-- a\n-- b",
+        "#",
+        "# a\n# b\n",
+        "/* c */",
+        "/* a */ /* b */",
+        "/*+ x */",
+        "/*M!100000 SELECT 1 */",
+        "/*!99999 SET @a=1 */",
+        "/*!123456 x */",
+        "/*!80412 SELECT 1 */",
+        "-- a\n;",
+        "-- a\n;;",
+        "/* c */ ;",
+        "/*!99999 x */;",
+    ] {
+        assert_eq!(
+            nothing_to_run(sql),
+            Some(NothingToRun::OnlyComments),
+            "{sql:?}"
+        );
+    }
+    for sql in ["", "   ", "\n", "\u{b}", ";", ";;", " ; "] {
+        assert_eq!(nothing_to_run(sql), Some(NothingToRun::Empty), "{sql:?}");
+    }
+    // Each is a statement to MySQL, or an error other than 1065.
+    for sql in [
+        "select 1",
+        "-- x\nselect 1",
+        "--x",
+        "-\t- x",
+        "-- a\n\u{1c}",
+        "/* unterminated",
+        "/*!99999 unterminated",
+        "/*!40101 */",
+        "/*!80411 */",
+        "/*!*/",
+        "/*!50001 CREATE*/",
+        "; -- a",
+        ";/* c */",
+    ] {
+        assert_eq!(nothing_to_run(sql), None, "{sql:?}");
+    }
+}
+
+/// Measured on MySQL 8.4.11: each of the first list is 1064, each of the
+/// second a name, a word or a variable.
+#[test]
+fn a_word_opening_a_dollar_quote_is_told_apart_from_a_name_with_a_dollar() {
+    let mode = SessionSqlMode::default();
+    for sql in [
+        "select $$",
+        "select $$ ;",
+        "select $$a",
+        "select $a$",
+        "select $a$$",
+        "select $$$",
+        "select $$abc$$",
+        "select 1 as $$",
+        "select 1 $$",
+        "select $é$",
+        "select 1 from dual where 1=1 and $$x",
+    ] {
+        assert!(opens_a_dollar_quote(sql, mode), "{sql}");
+    }
+    for sql in [
+        "select $",
+        "select $a",
+        "select $ $",
+        "select a$$",
+        "select x$$y",
+        "select _$$",
+        "select é$$",
+        "select 1$$",
+        "select `$$`",
+        "select '$$'",
+        "select \"$$\"",
+        "select 'it\\'s $$'",
+        "select @$$",
+        "set @$a$ = 1",
+        "select x.$$ from (select 1 as x) x",
+        "select 1 -- $$",
+        "select 1 /* $$ */",
+        "select 1 # $$",
+    ] {
+        assert!(!opens_a_dollar_quote(sql, mode), "{sql}");
+    }
+    // Under NO_BACKSLASH_ESCAPES the quote after the backslash ends the
+    // string and leaves `$$` outside it.
+    assert!(!opens_a_dollar_quote("select '\\' $$ '", mode));
+    assert!(opens_a_dollar_quote(
+        "select '\\' $$ '",
+        SessionSqlMode {
+            no_backslash_escapes: true,
+            ..SessionSqlMode::default()
+        }
+    ));
+}

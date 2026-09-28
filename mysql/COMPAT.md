@@ -3556,8 +3556,45 @@ statement by statement, and every statement MySQL 8.4.11's writes for a schema
 of counted tables, a foreign key, `JSON`, `DECIMAL` defaults, `utf8mb4_unicode_ci`
 and `utf8mb4_0900_ai_ci` tables, a trigger writing a `CONCAT` of its row, a
 view of one table and a view joining two is taken; the rows read back as they
-were dumped, and the trigger and the views print as the dump wrote them.
+were dumped, and the trigger and the views print as the dump wrote them. So do
+an `ENUM`, `DATETIME(6)` values from year 1000 to 9999, and text holding every
+escape `mysqldump` writes — `\'`, `\"`, `\\`, `\n`, `\r`, `\0` and `\Z` — a raw
+tab, emoji, and the empty word beside NULL. The framework apps' own schema
+dumped without `--databases`, with the default options and with
+`--single-transaction --routines --triggers --events --hex-blob
+--complete-insert --net-buffer-length=4096` (which names every column and
+splits a table's rows over several `INSERT`s), and with `--no-data`, replays
+into another database the client names, one dump over another, leaving
+exactly the rows MySQL 8.4.11 leaves there, as `mysql --batch` prints them.
 Besides the settings above, that takes three forms.
+
+The `mysql` client 8.4 keeps comments by default, and read from MySQL's
+general log while it restored a dump, it sends each comment line between
+statements as a statement of its own — `-- MySQL dump 10.13 ...`, `--`, `--
+Dumping data for table ...` — and each statement with the delimiter taken
+off. Measured on 8.4.11 by sending each text as one `COM_QUERY`: text holding
+only comments — `-- `, `#`, `/* */`, `/*+ */`, a versioned comment naming a
+later version than 8.4.11 — optionally followed by semicolons, answers an OK
+with nothing affected; it clears the warnings and `ROW_COUNT()` reads 0 after
+it, and inside a transaction the transaction stays open. This answers the
+same, whatever character set the client named, a comment not being read.
+Text holding no comment — empty, whitespace, `;` — is 1065 `Query was empty`,
+SQLSTATE 42000, and so is an empty `COM_QUERY`, which was 1064 here. `--`
+starts a comment only before a space, a control character or the end;
+MySQL's whitespace takes in the vertical tab. A comment after a semicolon —
+`; -- a` — is 1064 in MySQL and is left to the statement path here, as is a
+versioned comment 8.4.11 runs: `/*!40101 */` is an OK with a deprecation
+warning there.
+
+The client also sends `select $$` as it connects, and only when the server
+answers 1064 does it read `$tag$ ... $tag$` as a quote while it splits a
+script, keeping a `;` between the two. MySQL 8.4.11 answers 1064 for a word
+that begins with `$` and holds a second `$` — `$$`, `$a$`, `$$a`, `$é$` —
+outside a string, a quoted name and a comment, and so does this; `$`, `$a`,
+`a$$`, `x$$y`, `` `$$` ``, `'$$'`, `@$$` and `x.$$` are names, words and
+variables there, which this leaves to the statement path. It used to answer
+1054 or 1046, which told the client the opposite. MySQL warns 1681 for a name
+beginning with `$`, which this does not.
 
 `CREATE DATABASE` takes `IF NOT EXISTS`, which over a database already there
 answers OK with note 1007, and the database options described under **A

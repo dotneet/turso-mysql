@@ -1166,6 +1166,9 @@ fn decode_command_packet<'a>(
         .split_first()
         .ok_or(CommandPacketError::EmptyPayload)?;
     let command = match command {
+        // Measured on MySQL 8.4.11: an empty query is answered 1065, as text
+        // holding nothing to run is, so it goes on to the executor.
+        COM_QUERY if body.is_empty() => ClassicCommand::Query { sql: "" },
         COM_QUERY => ClassicCommand::Query {
             sql: decode_command_text(body, command, "query")?,
         },
@@ -2790,6 +2793,14 @@ mod tests {
                 command: ClassicCommand::Query { sql: "SELECT 1" },
             }
         );
+        let empty_query = CODEC.encode(0, b"\x03").unwrap();
+        assert_eq!(
+            connection
+                .receive_command_frame(&empty_query)
+                .unwrap()
+                .command,
+            ClassicCommand::Query { sql: "" }
+        );
         let init_db = CODEC.encode(0, b"\x02test_db").unwrap();
         assert_eq!(
             connection.receive_command_frame(&init_db).unwrap().command,
@@ -3073,13 +3084,6 @@ mod tests {
     fn rejects_malformed_command_payloads() {
         let mut connection = ready_connection();
         let cases = [
-            (
-                b"\x03".as_slice(),
-                CommandPacketError::EmptyText {
-                    command: COM_QUERY,
-                    field: "query",
-                },
-            ),
             (
                 b"\x02".as_slice(),
                 CommandPacketError::EmptyText {
