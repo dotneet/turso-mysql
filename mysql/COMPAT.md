@@ -6294,6 +6294,13 @@ this server requires TLS over TCP and answers before any credential is read.
 A failure on this side, such as the account store being unreadable, still
 closes without an answer.
 
+The greeting announces `CLIENT_LONG_FLAG`, as MySQL 8.4.11's does: every
+column definition carries two bytes of flags, and a client reads both only
+when told to. Connector/J reads one byte otherwise and takes the second for
+the column's decimals, so before this a `BIGINT AUTO_INCREMENT` key read back
+through `ResultSetMetaData` with scale 66 and no auto-increment flag, and a
+`DECIMAL(10,2)` with precision 11 and scale 0.
+
 `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA` is honored instead of refused. Real
 clients set it on every connection. The two length forms agree below 251
 bytes, which is why real responses parsed correctly even while the capability

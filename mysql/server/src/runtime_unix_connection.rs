@@ -613,6 +613,7 @@ mod tests {
 
         assert_eq!(settings.connection_id, 7);
         assert_eq!(settings.capability_flags & CLIENT_SSL, 0);
+        assert_ne!(settings.capability_flags & crate::CLIENT_LONG_FLAG, 0);
         assert_eq!(
             settings.capability_flags,
             SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES & !CLIENT_SSL

@@ -32,6 +32,16 @@ pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 /// initial handshake, and the negotiated bit is retained for the lifetime of
 /// the authenticated command executor.
 pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
+/// Capability bit saying a column definition's flags are two bytes.
+///
+/// Every column definition this server writes carries two bytes of flags, as
+/// MySQL's do. A client reads both only when the greeting announces this bit:
+/// Connector/J otherwise reads one, takes the high byte of the flags for the
+/// column's decimals and loses the flags above the first eight — measured
+/// against this server before it announced the bit, a `BIGINT AUTO_INCREMENT`
+/// key read back with 66 decimals and no auto-increment flag, and a
+/// `DECIMAL(10,2)` as precision 11 and scale 0. MySQL 8.4.11 announces it.
+pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 /// Capability bit requesting the classic protocol TLS upgrade.
 pub const CLIENT_SSL: u32 = 0x0000_0800;
 /// Capability bit for the second authentication data part.

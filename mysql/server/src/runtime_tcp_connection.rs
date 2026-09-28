@@ -1039,7 +1039,7 @@ mod tests {
     use super::{read_command, read_ssl_request_packet, DeadlinePacketReader, PreTlsPacketError};
     use crate::{
         ClientSslRequestConfig, ClientSslRequestError, PacketCodec, CLIENT_HANDSHAKE_SEQUENCE_ID,
-        CLIENT_PLUGIN_AUTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
+        CLIENT_LONG_FLAG, CLIENT_PLUGIN_AUTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
         DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN,
         REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
@@ -1119,6 +1119,14 @@ mod tests {
         )
         .encode(test_codec(), sequence_id)
         .expect("valid SSLRequest")
+    }
+
+    /// Connector/J reads one byte of column flags unless the greeting says
+    /// they are two, and then takes the second for the column's decimals.
+    #[test]
+    fn the_greeting_says_column_flags_take_two_bytes() {
+        let settings = super::tcp_handshake_settings(1);
+        assert_ne!(settings.capability_flags & CLIENT_LONG_FLAG, 0);
     }
 
     #[test]
