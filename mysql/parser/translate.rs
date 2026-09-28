@@ -4769,6 +4769,7 @@ fn render_update_assignment_value(
                     .decimal_columns
                     .iter()
                     .any(|(column, _)| column.eq_ignore_ascii_case(written))
+                && !writes_whole_numbers_into_words(value, written, render_context)
             {
                 return unsupported("UPDATE DECIMAL value assigned to a non-DECIMAL column");
             }
@@ -4830,6 +4831,48 @@ fn render_update_assignment_value(
             Ok(rendered)
         }
     }
+}
+
+/// Whether a `SET` value is a call writing whole numbers out as words into a
+/// column of words — GORM's backfill `SET slug = CONCAT('post-', id)` over a
+/// `BIGINT UNSIGNED` id.
+///
+/// The engine reads a `BIGINT UNSIGNED` and a `DECIMAL` with no places out as
+/// the digits MySQL writes them with, which is why a projection takes these
+/// calls over one; written into a column of words, the word is the value.
+/// Measured on MySQL 8.4.11, `CONCAT('post-', id)` over an id of
+/// 18446744073709551615 writes `post-18446744073709551615`.
+fn writes_whole_numbers_into_words(
+    value: &Expr,
+    written: &str,
+    render_context: &SelectRenderContext<'_>,
+) -> bool {
+    let Expr::Function(function) = value else {
+        return false;
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return false;
+    };
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    let writes_words = ["CONCAT", "CONCAT_WS", "LPAD", "RPAD", "LEFT", "RIGHT"]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call));
+    let into_words = render_context
+        .text_columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case(written));
+    writes_words
+        && into_words
+        && arguments.args.iter().all(|argument| match argument {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                !contains_decimal_operand(expr, render_context.decimal_columns)
+                    || matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                        && decimal_operand_scale(expr, render_context.decimal_columns) == Some(0)
+            }
+            _ => false,
+        })
 }
 
 /// Renders `COALESCE(col, n)` in an `UPDATE`'s value — Rails counts a column

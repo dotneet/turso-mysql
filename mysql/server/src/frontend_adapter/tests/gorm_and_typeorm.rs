@@ -26,6 +26,14 @@ fn run(adapter: &mut Adapter, sql: &str) {
         .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
 }
 
+/// The affected rows and the id one write reports.
+fn written(adapter: &mut Adapter, sql: &str) -> (u64, u64) {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => (result.affected_rows, result.last_insert_id),
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
 fn result_set(adapter: &mut Adapter, sql: &str) -> TextResultSet {
     match adapter.execute_query(sql) {
         Ok(CommandExecutionResult::ResultSet(result)) => result,
@@ -43,6 +51,16 @@ fn rows(adapter: &mut Adapter, sql: &str) -> Vec<Vec<Option<String>>> {
                 .collect()
         })
         .collect()
+}
+
+fn refused(adapter: &mut Adapter, sql: &str) {
+    assert!(
+        matches!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported)
+        ),
+        "{sql} must be refused"
+    );
 }
 
 const GORM_USERS: &str = "CREATE TABLE `users` (`id` bigint unsigned AUTO_INCREMENT,`email` varchar(191) NOT NULL,`name` varchar(100) NOT NULL,`balance` decimal(10,2) NOT NULL DEFAULT 0,`is_active` boolean NOT NULL,`profile` JSON,`created_at` datetime(3) NULL,`updated_at` datetime(3) NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_users_email` (`email`))";
@@ -105,5 +123,69 @@ fn gorms_distinct_count_names_its_column_in_parentheses() {
             "SELECT COUNT(DISTINCT(`user_id`)) FROM `posts` WHERE `title` = 'none'"
         ),
         vec![vec![Some("0".to_owned())]]
+    );
+}
+
+/// GORM's alter migration backfills a new column with `CONCAT('post-', id)`
+/// over its `BIGINT UNSIGNED` id.
+#[test]
+fn gorms_backfill_writes_each_unsigned_id_out_as_a_word() {
+    let (_directory, mut adapter) = adapter();
+    gorm_posts(&mut adapter);
+    run(&mut adapter, "ALTER TABLE `posts` ADD `slug` varchar(200)");
+    assert_eq!(
+        written(&mut adapter, "UPDATE posts SET slug = CONCAT('post-', id)"),
+        (4, 0)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `id`, `slug` FROM `posts` ORDER BY `id`"
+        ),
+        (1..=4)
+            .map(|id| vec![Some(id.to_string()), Some(format!("post-{id}"))])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE posts SET slug = CONCAT('post-', id) WHERE id = 1"
+        ),
+        (0, 0)
+    );
+
+    run(
+        &mut adapter,
+        "CREATE TABLE numbers (id int PRIMARY KEY, big bigint unsigned, whole decimal(10,0), amount decimal(10,2), n int, word varchar(64))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO numbers (id, big, whole, amount) VALUES (1, 18446744073709551615, -3, 1.50), (2, 0, NULL, NULL)",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE numbers SET word = CONCAT('b-', big, '-', whole)"
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT word FROM numbers ORDER BY id"),
+        vec![
+            vec![Some("b-18446744073709551615--3".to_owned())],
+            vec![None],
+        ]
+    );
+    // A `DECIMAL` with places is written out by a rule not checked here, a
+    // number into a column of numbers is a conversion, and arithmetic over
+    // the id is held apart from a plain column.
+    refused(
+        &mut adapter,
+        "UPDATE numbers SET word = CONCAT('a-', amount)",
+    );
+    refused(&mut adapter, "UPDATE numbers SET n = CONCAT('1', big)");
+    refused(
+        &mut adapter,
+        "UPDATE numbers SET word = CONCAT('a-', big + 1)",
     );
 }

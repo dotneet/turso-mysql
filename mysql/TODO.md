@@ -183,7 +183,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `ROUND` naming its places with anything but a written whole number | refused; the answer's width is worked out from them |
 | `SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `EXP`, `LN`, `LOG`, `LOG2`, `LOG10` | refused; measured, `ATAN(10)` and `TAN(10)` differ from MySQL in the last place, and the rest come from the same maths library, so agreeing at the points tried is not a promise |
 | `BIN` or `OCT` over a word — `BIN(name)` | refused; MySQL reads the word as the number it names, which is 0 for a word that names none |
-| `CONCAT` over a `DECIMAL`, a `FLOAT` or a `DOUBLE` | refused; the generic text conversion of exact decimal blobs and floating values has not been verified against MySQL's numeric formatting |
+| `CONCAT` over a `DECIMAL` with places, a `FLOAT` or a `DOUBLE` | refused; the generic text conversion of exact decimal blobs and floating values has not been verified against MySQL's numeric formatting. A `DECIMAL` with no places and a `BIGINT UNSIGNED` are taken, in a projection and written by an `UPDATE` into a column of words |
 | `SUBSTRING`, `SUBSTRING_INDEX` and `CONCAT_WS` over a `TEXT` | refused; measured, MySQL answers a `MEDIUM_BLOB` of 1048560 for each, a shape this does not write |
 | `SUBSTRING_INDEX`, `SUBSTRING`, `MD5`, `SHA1` and `SHA2` over a number | refused; MySQL writes the number out first, and the engine would answer NULL or cut something else |
 | `CONCAT_WS` with a `NULL` or bound separator, or a `NULL` or bound part | refused; the width of each has not been measured |
