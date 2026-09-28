@@ -391,6 +391,16 @@ in the engine, so the two would write different numbers. Counting a column past 
 refused the way any oversized value is, and the row keeps what it had — MySQL answers 1690
 for the same statement.
 
+Rails' `increment_counter` counts through a fallback naming its column through
+its table, `SET posts.views = COALESCE(posts.views, 0) + 1`. A fallback naming
+the column alone was taken already; one naming it through its table is taken
+now over a column of whole numbers other than a `BIGINT UNSIGNED`, falling back
+on a written whole number, the kinds read on the second reading of the
+statement the frontend asks for. Measured on 8.4.11: a NULL counts up to 1 and
+5 to 6, and counting past the column's range is 1690, which is refused here the
+way `n + 1` is. Such a fallback over any other kind of column, or onto anything
+but a written whole number, is refused.
+
 A `?` in that arithmetic is how GORM writes `gorm.Expr("balance - ?", 10)`, and MySQL reads
 what binds there by the column the answer is written into. Measured on 8.4.11 with the binary
 types go-sql-driver sends: into a `DECIMAL(10,2)`, a bound whole number and a bound word

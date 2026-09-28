@@ -781,3 +781,77 @@ fn django_compares_a_json_value_with_a_written_document() {
         );
     }
 }
+
+/// Rails' `increment_counter` counts a column up through a fallback,
+/// `SET views = COALESCE(views, 0) + 1`, naming every column through its
+/// table. Measured on MySQL 8.4.11: a NULL counts up to 1, 5 to 6, and a
+/// fallback on its own writes itself over a NULL.
+#[test]
+fn rails_counts_a_column_up_through_a_fallback() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE counters (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, views int, hits bigint NOT NULL DEFAULT 0, big bigint, uid bigint unsigned, label varchar(20), price decimal(10,2))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO counters (id, views, hits) VALUES (1, NULL, 5), (2, 5, 0)",
+    );
+    run(
+        &mut adapter,
+        "UPDATE `counters` SET `counters`.`views` = COALESCE(`counters`.`views`, 0) + 1 WHERE `counters`.`id` = 1",
+    );
+    run(
+        &mut adapter,
+        "UPDATE `counters` SET `counters`.`views` = COALESCE(`counters`.`views`, 0) + 1, `counters`.`hits` = COALESCE(`counters`.`hits`, 0) - 2 WHERE `counters`.`id` IN (1, 2)",
+    );
+    run(
+        &mut adapter,
+        "UPDATE counters SET big = COALESCE(big, 7) WHERE id = 2",
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT views FROM counters ORDER BY id"),
+        ["2", "6"]
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT hits FROM counters ORDER BY id"),
+        ["3", "-2"]
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT big FROM counters ORDER BY id"),
+        ["NULL", "7"]
+    );
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE counters SET views = COALESCE(views, 0) + ? WHERE id = ?",
+            &[Bound::Whole(10), Bound::Whole(2)]
+        ),
+        1
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT views FROM counters ORDER BY id"),
+        ["2", "16"]
+    );
+}
+
+/// A fallback naming its column through its table over a column holding
+/// anything but whole numbers is refused: MySQL reads a word or a `DECIMAL`
+/// by rules of its own there, and the engine would hand a `BIGINT UNSIGNED`
+/// on in its stored form.
+#[test]
+fn a_fallback_in_a_set_over_another_kind_of_column_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE counters (id bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, views int, uid bigint unsigned, label varchar(20), price decimal(10,2))",
+    );
+    for sql in [
+        "UPDATE counters SET counters.uid = COALESCE(counters.uid, 0) + 1 WHERE id = 1",
+        "UPDATE counters SET counters.label = COALESCE(counters.label, 0) WHERE id = 1",
+        "UPDATE counters SET counters.price = COALESCE(counters.price, 0) + 1 WHERE id = 1",
+        "UPDATE counters SET counters.views = COALESCE(counters.views, 'x') WHERE id = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

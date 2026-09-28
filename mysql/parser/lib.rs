@@ -1352,6 +1352,9 @@ pub struct TranslatedDml {
     /// `CAST(... AS JSON)` into, which the frontend holds to being `JSON`
     /// columns.
     json_cast_columns: Option<(String, Vec<String>)>,
+    /// Whether an `UPDATE` reads a column through `COALESCE(col, n)`, which is
+    /// held to the column's kind only on a reading that knows it.
+    falls_back_in_a_set: bool,
 }
 
 /// A `?` an `UPDATE` adds to, takes from or multiplies a value by —
@@ -1380,6 +1383,13 @@ impl TranslatedDml {
     /// Returns each `?` the statement's `SET` does arithmetic with.
     pub fn bound_arithmetic_operands(&self) -> &[BoundArithmeticOperand] {
         &self.bound_arithmetic_operands
+    }
+
+    /// Reports whether an `UPDATE` reads a column through `COALESCE(col, n)`,
+    /// which a reading of the statement has to know the table's column kinds
+    /// to take.
+    pub fn falls_back_in_a_set(&self) -> bool {
+        self.falls_back_in_a_set
     }
 
     /// Returns the table the statement writes and the columns it writes a
@@ -4534,7 +4544,13 @@ pub fn parse_dml_knowing_decimal_columns(
     rewritten_on_update: &[(String, u8)],
     decimal_columns: &[(String, u32)],
 ) -> Result<TranslatedDml, ParseError> {
-    parse_dml_knowing_column_types(sql, mode, rewritten_on_update, decimal_columns, &[], &[])
+    translate_dml(
+        sql,
+        mode,
+        SelectRenderContext::new(sql, mode, &[], &[], &[], &[], &[], rewritten_on_update)
+            .knowing_decimal_columns(decimal_columns),
+        decimal_columns,
+    )
 }
 
 /// Parses one checked DML statement knowing its table's columns: which an
@@ -4549,19 +4565,32 @@ pub fn parse_dml_knowing_column_types(
     integer_columns: &[String],
     text_columns: &[String],
 ) -> Result<TranslatedDml, ParseError> {
-    let statement = parse_one_statement(sql, mode)?;
-    let mut render_context = SelectRenderContext::new(
+    translate_dml(
         sql,
         mode,
-        text_columns,
-        &[],
-        &[],
-        &[],
-        &[],
-        rewritten_on_update,
+        SelectRenderContext::new(
+            sql,
+            mode,
+            text_columns,
+            &[],
+            &[],
+            &[],
+            &[],
+            rewritten_on_update,
+        )
+        .knowing_decimal_columns(decimal_columns)
+        .knowing_the_integer_columns(integer_columns),
+        decimal_columns,
     )
-    .knowing_decimal_columns(decimal_columns)
-    .knowing_integer_columns(integer_columns);
+}
+
+fn translate_dml(
+    sql: &str,
+    mode: SessionSqlMode,
+    mut render_context: SelectRenderContext<'_>,
+    decimal_columns: &[(String, u32)],
+) -> Result<TranslatedDml, ParseError> {
+    let statement = parse_one_statement(sql, mode)?;
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let mut row_count_parameters = Vec::new();
@@ -4649,6 +4678,7 @@ pub fn parse_dml_knowing_column_types(
         copies_a_select_rendered_knowing_its_types: false,
         bound_arithmetic_operands: render_context.bound_arithmetic_operands,
         json_cast_columns,
+        falls_back_in_a_set: render_context.falls_back_in_a_set,
     })
 }
 
@@ -4692,6 +4722,7 @@ pub fn parse_insert_select_knowing_its_select(
         copies_a_select_rendered_knowing_its_types: true,
         bound_arithmetic_operands: Vec::new(),
         json_cast_columns: None,
+        falls_back_in_a_set: false,
     })
 }
 

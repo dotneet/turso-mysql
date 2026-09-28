@@ -4782,6 +4782,12 @@ fn render_update_assignment_value(
             }
             render_select_expr(value, render_context)
         }
+        // A fallback the arm above cannot read the shape of on its own — one
+        // naming its column through its table, the way Rails does — is held
+        // to the column's kind once the frontend has said what it is.
+        _ if fallback_over_a_column(value).is_some() => {
+            render_set_fallback(value, &refuse_if_assigned, render_context)
+        }
         // `SET n = (SELECT MAX(m) FROM other)` takes one value out of another
         // table. An aggregate over one implicit group answers exactly one row,
         // which is what makes it a value; a plain column does not, and MySQL
@@ -4824,6 +4830,53 @@ fn render_update_assignment_value(
             Ok(rendered)
         }
     }
+}
+
+/// Renders `COALESCE(col, n)` in an `UPDATE`'s value — Rails counts a column
+/// up with `SET views = COALESCE(views, 0) + 1`.
+///
+/// Measured on MySQL 8.4.11: over a whole-number column the fallback stands
+/// for a NULL and the column's own value for anything else, so a NULL counts
+/// up to 1 and 5 to 6, and counting past the column's range is 1690, which
+/// the engine refuses the way it refuses `n + 1` there. The fallback has to be
+/// a written whole number, and the column one of whole numbers the engine
+/// does not hold as an exact number — a `BIGINT UNSIGNED` is held in a form
+/// of its own, which `coalesce` would hand on as it is; the kinds are known
+/// only on the second reading the frontend asks for.
+fn render_set_fallback(
+    value: &Expr,
+    refuse_if_assigned: &impl Fn(&str) -> bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let (column, fallback) = fallback_over_a_column(value).expect("the caller read a fallback");
+    let (qualifier, name) = named_column(column).expect("a fallback is read over a column");
+    if refuse_if_assigned(&name.value) {
+        return unsupported("UPDATE assignment reading a column it has already assigned");
+    }
+    let Some(fallback) = direct_signed_integer(fallback) else {
+        return unsupported(
+            "COALESCE in a SET falling back on something other than a whole number",
+        );
+    };
+    render_context.falls_back_in_a_set = true;
+    if render_context.knows_the_integer_columns {
+        let holds_whole_numbers = render_context
+            .integer_columns
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&name.value))
+            && !render_context
+                .decimal_columns
+                .iter()
+                .any(|(known, _)| known.eq_ignore_ascii_case(&name.value));
+        if !holds_whole_numbers {
+            return unsupported("COALESCE in a SET over a column that holds no whole number");
+        }
+    }
+    let rendered_column = match qualifier {
+        Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(name)),
+        None => render_ident(name),
+    };
+    Ok(format!("coalesce({rendered_column}, {fallback})"))
 }
 
 /// Renders one side of `+`, `-` or `*` in an `UPDATE`'s value, noting a `?`
@@ -5378,6 +5431,12 @@ pub(crate) struct SelectRenderContext<'a> {
     pub(crate) bound_arithmetic_operands: Vec<crate::BoundArithmeticOperand>,
     /// The columns an `UPDATE` writes a `CAST(... AS JSON)` into.
     pub(crate) json_cast_columns: Vec<String>,
+    /// Whether an `UPDATE` reads a column through `COALESCE(col, n)`, which is
+    /// only taken once the kinds of the table's columns are known.
+    pub(crate) falls_back_in_a_set: bool,
+    /// Whether the caller said which of the table's columns hold whole
+    /// numbers, which a second reading of a DML statement does.
+    knows_the_integer_columns: bool,
     parameter_count: usize,
     /// How many `GROUP_CONCAT` calls the statement has rendered, which tells
     /// each one's count of joined values apart from the others'.
@@ -5458,6 +5517,8 @@ impl<'a> SelectRenderContext<'a> {
             ordered_columns: Vec::new(),
             bound_arithmetic_operands: Vec::new(),
             json_cast_columns: Vec::new(),
+            falls_back_in_a_set: false,
+            knows_the_integer_columns: false,
             parameter_count: 0,
             group_concat_calls: 0,
             renders_a_projection_item: false,
@@ -5475,8 +5536,11 @@ impl<'a> SelectRenderContext<'a> {
         self
     }
 
-    pub(crate) fn knowing_integer_columns(mut self, integer_columns: &'a [String]) -> Self {
+    /// Says which of a DML statement's table's columns hold whole numbers,
+    /// having read every column.
+    pub(crate) fn knowing_the_integer_columns(mut self, integer_columns: &'a [String]) -> Self {
         self.integer_columns = integer_columns;
+        self.knows_the_integer_columns = true;
         self
     }
 

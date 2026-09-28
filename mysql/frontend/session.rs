@@ -1912,7 +1912,16 @@ impl MySqlConnection {
                         .and_then(|name| MySqlTableName::parse(name).ok())
                 })
         };
+        let refuse_an_unknown_fallback = |translated: &TranslatedDml| {
+            if translated.falls_back_in_a_set() {
+                return Err(MySqlParseError::Unsupported {
+                    feature: "COALESCE in a SET over a table whose columns are not known",
+                });
+            }
+            Ok(())
+        };
         let Some(table) = table else {
+            refuse_an_unknown_fallback(&translated)?;
             return Ok((translated, DmlColumnTypes::default(), None));
         };
         let table_definition = self
@@ -1921,6 +1930,7 @@ impl MySqlConnection {
             .get_btree_table(table.as_str())
             .map(|stored| (table.as_str().to_owned(), stored.to_sql()));
         let Ok(columns) = self.list_columns(&table) else {
+            refuse_an_unknown_fallback(&translated)?;
             return Ok((translated, DmlColumnTypes::default(), table_definition));
         };
         let rewritten = if translated.checked_update().is_some() {
@@ -1985,6 +1995,7 @@ impl MySqlConnection {
             || (column_types.rewritten_on_update.is_empty()
                 && column_types.decimal.is_empty()
                 && !translated.compares_a_written_number()
+                && !translated.falls_back_in_a_set()
                 && (column_types.text.is_empty() || !compares_a_placeholder))
         {
             return Ok((translated, column_types, table_definition));
