@@ -468,8 +468,14 @@ pub struct CheckedAutoIncrementInsert {
     sqlite_statement: Stmt,
     source_values: Vec<Vec<AutoIncrementSourceValue>>,
     mixed_default_columns: Vec<usize>,
+    /// For each row, the columns of `mixed_default_columns` it gives
+    /// `DEFAULT`.
+    defaults_in_each_row: Vec<Vec<usize>>,
     ignored_null_columns: Vec<usize>,
     rowwise_conflicts: bool,
+    /// Whether the statement carries `ON DUPLICATE KEY UPDATE`, rather than
+    /// `IGNORE` or nothing.
+    upserts: bool,
     upsert_columns: Vec<String>,
     /// The columns the upsert clause reads off the row it was offered.
     offered_columns: Vec<String>,
@@ -520,6 +526,11 @@ impl CheckedAutoIncrementInsert {
 
     pub fn rowwise_conflicts(&self) -> bool {
         self.rowwise_conflicts
+    }
+
+    /// Whether the statement carries `ON DUPLICATE KEY UPDATE`.
+    pub fn upserts(&self) -> bool {
+        self.upserts
     }
 
     /// Whether a row writes a reading of the clock, such as `NOW()`.
@@ -581,10 +592,15 @@ impl CheckedAutoIncrementInsert {
                 .as_str()
                 .eq_ignore_ascii_case(allocator_column.as_str())
         });
+        // Each row of an upsert is written by a statement of its own, which
+        // leaves out the columns that row gives `DEFAULT` — what MySQL writes
+        // for them, measured on 8.4.11, both in the row and in the row the
+        // clause is offered.
+        let each_row_alone = self.rowwise_conflicts && self.upserts;
         if self
             .mixed_default_columns
             .iter()
-            .any(|column| Some(*column) != named_at)
+            .any(|column| Some(*column) != named_at && !each_row_alone)
             || self
                 .ignored_null_columns
                 .iter()
@@ -622,11 +638,12 @@ impl CheckedAutoIncrementInsert {
                 .collect::<Result<Vec<_>, _>>()?,
         };
         if self.rowwise_conflicts
+            && !self.upserts
             && row_values
                 .iter()
                 .any(|value| *value != AutoIncrementRowValue::Generated)
         {
-            return unsupported("multirow IGNORE or ON DUPLICATE with explicit AUTO_INCREMENT IDs");
+            return unsupported("multirow IGNORE with explicit AUTO_INCREMENT IDs");
         }
         let insert = match named_at {
             None => self.with_a_row_to_be_numbered()?,
@@ -794,8 +811,18 @@ impl BoundAutoIncrementInsert {
     }
 
     pub fn inject_one_row(&self, row_number: usize, id: u64) -> Result<Stmt, ParseError> {
+        self.one_row(row_number, Some(id))
+    }
+
+    /// One row of the statement written alone, with `id` in its counted
+    /// column, or with the id it names itself where `id` is `None`, and
+    /// without the columns it gives `DEFAULT`.
+    pub fn one_row(&self, row_number: usize, id: Option<u64>) -> Result<Stmt, ParseError> {
         if row_number >= self.row_count().get() {
             return unsupported("AUTO_INCREMENT rowwise INSERT shape changed");
+        }
+        if id.is_none() && self.allocator_at.is_none() {
+            return unsupported("AUTO_INCREMENT rowwise INSERT row names no id of its own");
         }
         let mut statement = self.insert.sqlite_statement.clone();
         let Stmt::Insert { columns, body, .. } = &mut statement else {
@@ -814,11 +841,33 @@ impl BoundAutoIncrementInsert {
                 feature: "AUTO_INCREMENT rowwise INSERT row is missing",
             })?;
         *rows = vec![row];
-        if let Some(at) = self.allocator_at {
-            rows[0][at] = Box::new(self.id_literal(id));
-        } else {
-            columns.insert(0, self.allocator_column.clone());
-            rows[0].insert(0, Box::new(self.id_literal(id)));
+        let defaults = self
+            .insert
+            .defaults_in_each_row
+            .get(row_number)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for &at in defaults.iter().rev() {
+            if Some(at) == self.allocator_at {
+                continue;
+            }
+            if at >= columns.len() || at >= rows[0].len() {
+                return unsupported("AUTO_INCREMENT rowwise INSERT default column is missing");
+            }
+            columns.remove(at);
+            rows[0].remove(at);
+        }
+        let allocator_at = self
+            .allocator_at
+            .map(|at| at - defaults.iter().filter(|dropped| **dropped < at).count());
+        match (allocator_at, id) {
+            (Some(at), Some(id)) => rows[0][at] = Box::new(self.id_literal(id)),
+            (Some(_), None) => {}
+            (None, Some(id)) => {
+                columns.insert(0, self.allocator_column.clone());
+                rows[0].insert(0, Box::new(self.id_literal(id)));
+            }
+            (None, None) => unreachable!("a row naming no id of its own was refused above"),
         }
         Ok(statement)
     }
@@ -4929,9 +4978,21 @@ fn parse_checked_auto_increment_insert(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let still_written = |at: usize| at - defaulted[..at].iter().filter(|removed| **removed).count();
+    let defaults_in_each_row = values
+        .rows
+        .iter()
+        .map(|row| {
+            mixed_default_columns
+                .iter()
+                .filter(|at| names_the_columns_default(&row[**at], columns[**at].as_str()))
+                .map(|at| still_written(*at))
+                .collect()
+        })
+        .collect();
     let mixed_default_columns = mixed_default_columns
         .into_iter()
-        .map(|at| at - defaulted[..at].iter().filter(|removed| **removed).count())
+        .map(still_written)
         .collect();
     let ignored_null_columns = ignored_null_columns
         .into_iter()
@@ -4970,8 +5031,10 @@ fn parse_checked_auto_increment_insert(
         sqlite_statement,
         source_values,
         mixed_default_columns,
+        defaults_in_each_row,
         ignored_null_columns,
         rowwise_conflicts,
+        upserts: insert.on.is_some(),
         upsert_columns,
         offered_columns,
         reads_the_clock,
@@ -5128,6 +5191,9 @@ pub struct CheckedUpsert {
     pub table: String,
     pub assigned: Vec<String>,
     pub comparisons: Vec<OfferedRowComparison>,
+    /// Whether some column is given `DEFAULT` in some rows and a value in
+    /// others, which only a counted table writes, a row at a time.
+    pub defaults_in_some_rows: bool,
 }
 
 /// One column an upsert compares between the two rows, and the values each

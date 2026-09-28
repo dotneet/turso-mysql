@@ -2091,6 +2091,15 @@ impl MySqlConnection {
             Ok(None) | Err(_) => return Ok(()),
         };
         let table = MySqlTableName::parse(&upsert.table).map_err(|_| UPSERT_REFUSED)?;
+        // Only a counted table writes an upsert's rows one at a time, which
+        // is what leaves out the columns each row gives `DEFAULT`.
+        if upsert.defaults_in_some_rows
+            && !matches!(self.load_auto_increment_table(&upsert.table), Ok(Some(_)))
+        {
+            return Err(MySqlParseError::Unsupported {
+                feature: "INSERT DEFAULT in some rows only",
+            });
+        }
         let Ok(columns) = self.list_columns(&table) else {
             return Ok(());
         };
@@ -8979,6 +8988,13 @@ impl MySqlConnection {
         sql: &str,
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<Option<WrittenAutoIncrementIds>, MySqlQueryError> {
+        // Several rows of an upsert are written one at a time, each row's id
+        // reported as MySQL reports it, which one statement cannot do.
+        if parse_auto_increment_insert(sql, self.parser_mode())
+            .is_ok_and(|insert| insert.rowwise_conflicts() && insert.upserts())
+        {
+            return Ok(None);
+        }
         let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)?
         else {
@@ -9214,20 +9230,19 @@ impl MySqlConnection {
         let bound = insert
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        if !bound.rowwise_conflicts()
-            || bound
-                .row_values()
-                .iter()
-                .any(|value| *value != AutoIncrementRowValue::Generated)
-        {
+        if !bound.rowwise_conflicts() {
             return Err(LimboError::ParseError(
-                "multirow conflict INSERT requires generated IDs in every row".to_string(),
+                "a counted insert written row by row has to meet a conflict in some row"
+                    .to_string(),
             ));
         }
-        let reserved = self.reserve_insert_row_ids(&bound, &table, values, deadline)?;
-        let mut next_id = reserved.first_generated.ok_or_else(|| {
-            LimboError::InternalError("rowwise AUTO_INCREMENT INSERT reserved no ID".to_string())
-        })?;
+        let row_values = self.rows_naming_ids_the_counter_can_follow(&bound, &table, values)?;
+        let reserved = if row_values.contains(&InsertAutoIncrementValue::Generated) {
+            Some(self.reserve_insert_row_ids(&bound, &table, values, deadline)?)
+        } else {
+            None
+        };
+        let mut next_id = reserved.and_then(|reserved| reserved.first_generated);
         const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
         self.inner
             .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
@@ -9238,13 +9253,21 @@ impl MySqlConnection {
         let result = turso_core::read_the_clock_once(|| -> Result<MySqlWriteResult> {
             let mut affected_rows = 0_u64;
             let mut first_inserted = None;
-            let mut last_matched = None;
-            let mut changed_a_row = false;
-            for row in 0..bound.row_count().get() {
+            let mut last_row = None;
+            let mut wrote_a_row = false;
+            for (row, row_value) in row_values.iter().enumerate() {
                 self.check_write_deadline(deadline)
                     .map_err(Into::<LimboError>::into)?;
+                let id = match row_value {
+                    InsertAutoIncrementValue::Generated => Some(next_id.ok_or_else(|| {
+                        LimboError::InternalError(
+                            "rowwise AUTO_INCREMENT INSERT reserved no ID".to_string(),
+                        )
+                    })?),
+                    InsertAutoIncrementValue::Explicit(_) => None,
+                };
                 let statement = bound
-                    .inject_one_row(row, next_id)
+                    .one_row(row, id)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
                 let options = injected_auto_increment_prepare_options(&table, statement.clone());
                 let mut statement = self
@@ -9273,12 +9296,25 @@ impl MySqlConnection {
                     )
                     .ok_or(LimboError::IntegerOverflow)?;
                 let upserted = self.inner.mysql_upserted_rowid();
-                if self.inner.changes() > 0 && upserted == 0 {
-                    first_inserted.get_or_insert(next_id);
-                    next_id = next_id.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
-                }
-                last_matched = (upserted > 0).then_some(upserted);
-                changed_a_row |= upserted > 0 && self.inner.mysql_changed_rows() > 0;
+                let inserted = self.inner.changes() > 0 && upserted == 0;
+                // A colliding row hands the number it asked for on to the
+                // next row asking for one, as MySQL does within a statement.
+                last_row = match (row_value, inserted) {
+                    (_, false) if upserted > 0 => Some(RowAnUpsertMet::Matched(upserted)),
+                    (_, false) => None,
+                    (InsertAutoIncrementValue::Explicit(id), true) => {
+                        self.advance_auto_increment_past(&table, *id, deadline)
+                            .map_err(Into::<LimboError>::into)?;
+                        Some(RowAnUpsertMet::Written(*id))
+                    }
+                    (InsertAutoIncrementValue::Generated, true) => {
+                        let id = id.expect("a row asking for a number was given one");
+                        first_inserted.get_or_insert(id);
+                        next_id = Some(id.checked_add(1).ok_or(LimboError::IntegerOverflow)?);
+                        Some(RowAnUpsertMet::Written(id))
+                    }
+                };
+                wrote_a_row |= inserted || (upserted > 0 && self.inner.mysql_changed_rows() > 0);
             }
             self.inner
                 .prepare(format!("RELEASE SAVEPOINT {SAVEPOINT}"))?
@@ -9286,12 +9322,17 @@ impl MySqlConnection {
             if let Some(id) = first_inserted {
                 self.inner.set_mysql_last_insert_id(id);
             }
-            // Measured on MySQL 8.4.11: a statement that added no row but
-            // changed one reports the id of the last row it matched, changed
-            // or not, and one that changed nothing reports none.
-            let last_insert_id = match (first_inserted, last_matched) {
+            // Measured on MySQL 8.4.11: a statement that added a row asking
+            // for its number reports the first such number. One that added
+            // none but wrote some row — one naming its own id, or one it
+            // changed — reports the id of the last row it met, written, changed
+            // or left as it stood, and one that wrote nothing reports none.
+            let last_insert_id = match (first_inserted, last_row) {
                 (Some(id), _) => id,
-                (None, Some(rowid)) if changed_a_row => self.id_of_counted_row(&table, rowid)?,
+                (None, Some(RowAnUpsertMet::Written(id))) if wrote_a_row => id,
+                (None, Some(RowAnUpsertMet::Matched(rowid))) if wrote_a_row => {
+                    self.id_of_counted_row(&table, rowid)?
+                }
                 _ => 0,
             };
             Ok(MySqlWriteResult {
@@ -9308,6 +9349,68 @@ impl MySqlConnection {
                 .run_ignore_rows()?;
         }
         result
+    }
+
+    /// What each row of a counted upsert written row by row asks the counter
+    /// for, holding the ids rows name to ones the counter can follow.
+    ///
+    /// Measured on MySQL 8.4.11 with GORM's association writes: a row naming
+    /// an id at or below the counter leaves the counter where it is, whether
+    /// it is written or collides, while the rows asking for a number take the
+    /// whole statement's batch at the first of them. A row naming an id past
+    /// the counter moves it past that id once the row is written, and not
+    /// when it collides. Beside a row asking for a number that decides which
+    /// number the next row takes, which the numbers reserved here before any
+    /// row is written cannot follow, so the pair is refused, and so are a
+    /// negative id and a 0 stored as itself.
+    fn rows_naming_ids_the_counter_can_follow(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+    ) -> Result<Vec<InsertAutoIncrementValue>> {
+        let row_values = self.auto_increment_row_values(bound, table, values)?;
+        let highest_named = row_values
+            .iter()
+            .filter_map(|value| match value {
+                InsertAutoIncrementValue::Explicit(id) => Some(*id),
+                InsertAutoIncrementValue::Generated => None,
+            })
+            .max();
+        let Some(highest_named) = highest_named else {
+            return Ok(row_values);
+        };
+        // A negative id is read as 0 here, and so is a 0 the session stores
+        // as itself.
+        if row_values.contains(&InsertAutoIncrementValue::Explicit(0))
+            || highest_named > i64::MAX as u64
+        {
+            return Err(LimboError::ParseError(
+                "a counted upsert row naming an id below 1 or past the engine's integers is unsupported"
+                    .to_string(),
+            ));
+        }
+        if highest_named > auto_increment_ceiling(table) {
+            return Err(LimboError::Constraint(
+                "AUTO_INCREMENT value is outside the column's type".to_string(),
+            ));
+        }
+        if !row_values.contains(&InsertAutoIncrementValue::Generated) {
+            return Ok(row_values);
+        }
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let mut peek = capability.allocator.peek_high_water(table.key)?;
+        if highest_named > capability.io.block(|| peek.step())? {
+            return Err(LimboError::ParseError(
+                "a counted upsert naming an id past the counter beside a row asking for one is unsupported"
+                    .to_string(),
+            ));
+        }
+        Ok(row_values)
     }
 
     /// The id of the counted row the engine numbers `rowid`.
@@ -12434,6 +12537,14 @@ struct ReservedAutoIncrementRows {
     bound_values: Vec<Value>,
     first_generated: Option<u64>,
     last_explicit: Option<u64>,
+}
+
+/// What one row of a counted upsert written row by row came to: a row it
+/// wrote under the id it took, or the row already there it met, by the
+/// engine's number for it.
+enum RowAnUpsertMet {
+    Written(u64),
+    Matched(i64),
 }
 
 struct CountedTableAssignmentValidator {

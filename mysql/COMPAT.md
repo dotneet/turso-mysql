@@ -2660,6 +2660,38 @@ stood: 0 rows and no id, `LAST_INSERT_ID()` left where it was, the number the
 row asked for spent, and a session counting found rows counting the row 1 and
 still reporting no id. This reports the same.
 
+Rows of such an upsert may name their own ids, which is how GORM writes an
+association: `Append(&goTag, &Tag{Name: "news"})` upserts `(name, id) VALUES
+(?, ?), (?, DEFAULT)`, naming the id of a tag it read back beside a new one, and
+`Replace` names both. Measured on 8.4.11 with go-sql-driver and matched: a row
+naming an id at or below the counter leaves the counter where it is whether it
+is written or collides; the rows asking for a number take the statement's whole
+batch at the first of them, a colliding one handing its number on as above; a
+statement that added a row asking for a number reports the first such number
+and sets `LAST_INSERT_ID()` to it; one that added none but wrote some row — one
+naming its own id, or one it changed — reports the id of the last row it met,
+written, changed or left as it stood, the id of the row already there for one
+that collided; and one that wrote nothing reports 0, leaving
+`LAST_INSERT_ID()` alone. Rows that all name their own ids may name ids past the
+counter too, which moves past each one once its row is written and past none
+that collides — measured, `(50, ...), (60, ...)` where the second collides on
+another key leaves the next number at 51. A row naming an id past the counter
+beside one asking for a number is refused: MySQL moves the counter as the rows
+go by, so the number that row takes depends on the ones before it, and the
+numbers here are reserved before any row is written. `IGNORE` over several rows
+naming ids stays refused.
+
+Rows of such an upsert may also give a column `DEFAULT` in some rows and a value
+in others, which is how TypeORM's `repository.upsert` writes entities that set
+different columns — `VALUES (DEFAULT, 'alice@example.com', 'Alice', '100.00'),
+(DEFAULT, 'erin@example.com', 'Erin', DEFAULT)`. Each row is written by a
+statement of its own, which leaves out the columns that row gives `DEFAULT`, so
+the row takes the column's own default and so does the row offered to the
+clause: measured on 8.4.11 and matched, `balance = VALUES(balance)` over a row
+offering `DEFAULT` writes the column's default, 0.00. A table that does not
+count its own ids writes the rows in one statement, which cannot leave a column
+out of one row only, so there it is refused.
+
 `INSERT IGNORE` into a table that counts its own ids is taken over one row.
 The allocator reserves its range before the rows are written, so a row `IGNORE`
 skips has already taken a number — and that is what MySQL does too: measured on

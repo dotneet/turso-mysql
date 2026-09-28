@@ -817,30 +817,40 @@ fn an_upsert_leaving_an_on_update_column_to_mysql_is_refused() {
 /// One value bound to a prepared statement.
 enum Bound<'a> {
     Id(i64),
+    /// A Go `uint64`, which go-sql-driver binds as a LONGLONG flagged
+    /// unsigned.
+    UnsignedId(u64),
     Word(&'a str),
+    Null,
 }
 
-/// The null bitmap, the new-parameters flag, and each value as a LONGLONG or
-/// a VAR_STRING.
+/// The null bitmap, the new-parameters flag, and each value as a LONGLONG,
+/// a VAR_STRING or a NULL.
 fn bound(values: &[Bound<'_>]) -> Vec<u8> {
     let mut payload = vec![0; values.len().div_ceil(8)];
+    for (at, value) in values.iter().enumerate() {
+        if matches!(value, Bound::Null) {
+            payload[at / 8] |= 1 << (at % 8);
+        }
+    }
     payload.push(1);
     for value in values {
-        payload.extend_from_slice(&[
-            match value {
-                Bound::Id(_) => MYSQL_TYPE_LONGLONG,
-                Bound::Word(_) => MYSQL_TYPE_VAR_STRING,
-            },
-            0,
-        ]);
+        payload.extend_from_slice(&match value {
+            Bound::Id(_) => [MYSQL_TYPE_LONGLONG, 0],
+            Bound::UnsignedId(_) => [MYSQL_TYPE_LONGLONG, 0x80],
+            Bound::Word(_) => [MYSQL_TYPE_VAR_STRING, 0],
+            Bound::Null => [MYSQL_TYPE_NULL, 0],
+        });
     }
     for value in values {
         match value {
             Bound::Id(id) => payload.extend_from_slice(&id.to_le_bytes()),
+            Bound::UnsignedId(id) => payload.extend_from_slice(&id.to_le_bytes()),
             Bound::Word(word) => {
                 payload.push(u8::try_from(word.len()).unwrap());
                 payload.extend_from_slice(word.as_bytes());
             }
+            Bound::Null => {}
         }
     }
     payload
@@ -981,5 +991,405 @@ fn sqlalchemys_upsert_names_the_offered_row_new() {
             some(&["1", "alice@example.com", "Alice Updated", "200.00", "1"]),
             some(&["2", "erin@example.com", "Erin", "3.00", "1"]),
         ]
+    );
+}
+
+const GORM_TAGS: &str = "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))";
+
+fn probe(adapter: &mut Adapter, name: &str) -> (u64, u64) {
+    prepared_write(
+        adapter,
+        "INSERT INTO `tags` (`name`) VALUES (?)",
+        &bound(&[Bound::Word(name)]),
+    )
+}
+
+/// GORM's `Association("Tags").Append(&goTag, &Tag{Name: "news"})` upserts a
+/// tag it read back, naming its id, beside a new one asking for its number,
+/// and `Replace` two it read back, naming both. Measured on MySQL 8.4.11 with
+/// go-sql-driver, one statement after the other: a named id at or below the
+/// counter leaves the counter alone and collides as it stood, the rows asking
+/// for a number take the whole statement's batch at the first of them, and
+/// the id reported is the first number a row took, or none.
+#[test]
+fn gorms_association_upserts_name_the_ids_of_tags_already_there() {
+    let (_directory, mut adapter, mut found_rows) = adapter_and_one_counting_found_rows();
+    run(&mut adapter, GORM_TAGS);
+    run(
+        &mut adapter,
+        "INSERT INTO `tags` (`name`) VALUES ('go'), ('sql'), ('batch-0'), ('batch-1'), ('batch-2')",
+    );
+    let append = "INSERT INTO `tags` (`name`,`id`) VALUES (?,?),(?,DEFAULT) ON DUPLICATE KEY UPDATE `id`=`id`";
+    let replace =
+        "INSERT INTO `tags` (`name`,`id`) VALUES (?,?),(?,?) ON DUPLICATE KEY UPDATE `id`=`id`";
+    let append_bound = |named: &str, id: u64, asking: &str| {
+        bound(&[
+            Bound::Word(named),
+            Bound::UnsignedId(id),
+            Bound::Word(asking),
+        ])
+    };
+    assert_eq!(
+        prepared_write(&mut adapter, append, &append_bound("go", 1, "news")),
+        (1, 6)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["6"])]
+    );
+    // The number the batch did not use is spent.
+    assert_eq!(probe(&mut adapter, "probe1"), (1, 8));
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            replace,
+            &bound(&[
+                Bound::Word("batch-0"),
+                Bound::UnsignedId(3),
+                Bound::Word("batch-1"),
+                Bound::UnsignedId(4),
+            ]),
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["8"])]
+    );
+    assert_eq!(probe(&mut adapter, "probe2"), (1, 9));
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO `tags` (`name`,`id`) VALUES (?,DEFAULT),(?,?) ON DUPLICATE KEY UPDATE `id`=`id`",
+            &bound(&[
+                Bound::Word("c-new"),
+                Bound::Word("go"),
+                Bound::UnsignedId(1),
+            ]),
+        ),
+        (1, 10)
+    );
+    assert_eq!(probe(&mut adapter, "probe3"), (1, 12));
+    run(&mut adapter, "DELETE FROM `tags` WHERE `name` = 'batch-2'");
+    assert_eq!(
+        prepared_write(&mut adapter, append, &append_bound("d-old", 5, "d-new")),
+        (2, 13)
+    );
+    assert_eq!(probe(&mut adapter, "probe4"), (1, 15));
+    // Measured, a named id past the counter moves it once its row is
+    // written, which decides the number the next row takes — 100 beside a
+    // row asking for one gives it 101 — and the numbers here are reserved
+    // before any row is written.
+    for (named, id) in [("e-high", 100), ("go", 200)] {
+        let statement = adapter.execute_stmt_prepare(append).unwrap();
+        assert!(adapter
+            .execute_stmt_execute(statement.statement_id, &append_bound(named, id, "e-new"))
+            .is_err());
+        adapter.execute_stmt_close(statement.statement_id);
+    }
+    assert_eq!(probe(&mut adapter, "probe5"), (1, 16));
+    // Counting the rows it found, the two rows left as they stood count 1
+    // each and report no id, and the batch is spent.
+    assert_eq!(
+        prepared_write(&mut found_rows, append, &append_bound("go", 1, "news")),
+        (2, 0)
+    );
+    assert_eq!(probe(&mut adapter, "probe6"), (1, 19));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `id`, `name` FROM `tags` ORDER BY `id`"
+        ),
+        vec![
+            some(&["1", "go"]),
+            some(&["2", "sql"]),
+            some(&["3", "batch-0"]),
+            some(&["4", "batch-1"]),
+            some(&["5", "d-old"]),
+            some(&["6", "news"]),
+            some(&["8", "probe1"]),
+            some(&["9", "probe2"]),
+            some(&["10", "c-new"]),
+            some(&["12", "probe3"]),
+            some(&["13", "d-new"]),
+            some(&["15", "probe4"]),
+            some(&["16", "probe5"]),
+            some(&["19", "probe6"]),
+        ]
+    );
+}
+
+/// A counted upsert of several rows, some naming their own ids, reports the
+/// id of the last row it met once it wrote a row and added none asking for a
+/// number. Measured on MySQL 8.4.11 with go-sql-driver.
+#[test]
+fn an_upsert_naming_ids_reports_the_last_row_it_met() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,`hits` int NOT NULL DEFAULT 0,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO `tags` (`name`) VALUES ('go'), ('sql'), ('batch-0'), ('batch-1'), ('batch-2')",
+    );
+    run(&mut adapter, "DELETE FROM `tags` WHERE `name` = 'batch-2'");
+    let upsert = |rows: &str, clause: &str| {
+        format!("INSERT INTO `tags` (`name`,`id`) VALUES {rows} ON DUPLICATE KEY UPDATE {clause}")
+    };
+    let (named_twice, named_then_asking, asking_then_named) =
+        ("(?,?),(?,?)", "(?,?),(?,DEFAULT)", "(?,DEFAULT),(?,?)");
+    let id = Bound::UnsignedId;
+    let word = Bound::Word;
+    // A row written under the id it names, then one left as it stood.
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(named_twice, "`id`=`id`"),
+            &bound(&[word("h-old"), id(5), word("go"), id(1)]),
+        ),
+        (1, 1)
+    );
+    assert_eq!(probe(&mut adapter, "probe1"), (1, 6));
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(named_twice, "`hits`=`hits`+1"),
+            &bound(&[word("sql"), id(2), word("go"), id(1)]),
+        ),
+        (4, 1)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(named_then_asking, "`hits`=`hits`+1"),
+            &bound(&[word("sql"), id(2), word("j-new")]),
+        ),
+        (3, 7)
+    );
+    assert_eq!(probe(&mut adapter, "probe2"), (1, 9));
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(asking_then_named, "`hits`=`hits`+1"),
+            &bound(&[word("sql"), word("go"), id(1)]),
+        ),
+        (4, 1)
+    );
+    assert_eq!(probe(&mut adapter, "probe3"), (1, 12));
+    run(&mut adapter, "DELETE FROM `tags` WHERE `name` = 'probe1'");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(asking_then_named, "`hits`=`hits`+1"),
+            &bound(&[word("sql"), word("l-old"), id(6)]),
+        ),
+        (3, 6)
+    );
+    assert_eq!(probe(&mut adapter, "probe4"), (1, 15));
+    run(&mut adapter, "DELETE FROM `tags` WHERE `name` = 'probe2'");
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(named_then_asking, "`id`=`id`"),
+            &bound(&[word("m-old"), id(8), word("go")]),
+        ),
+        (1, 1)
+    );
+    assert_eq!(probe(&mut adapter, "probe5"), (1, 18));
+    // A bound NULL asks for the next number, as DEFAULT does.
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &upsert(named_twice, "`id`=`id`"),
+            &bound(&[word("n-new"), Bound::Null, word("go"), id(1)]),
+        ),
+        (1, 19)
+    );
+    assert_eq!(probe(&mut adapter, "probe6"), (1, 21));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `id`, `name`, `hits` FROM `tags` ORDER BY `id`"
+        ),
+        vec![
+            some(&["1", "go", "2"]),
+            some(&["2", "sql", "4"]),
+            some(&["3", "batch-0", "0"]),
+            some(&["4", "batch-1", "0"]),
+            some(&["5", "h-old", "0"]),
+            some(&["6", "l-old", "0"]),
+            some(&["7", "j-new", "0"]),
+            some(&["8", "m-old", "0"]),
+            some(&["12", "probe3", "0"]),
+            some(&["15", "probe4", "0"]),
+            some(&["18", "probe5", "0"]),
+            some(&["19", "n-new", "0"]),
+            some(&["21", "probe6", "0"]),
+        ]
+    );
+}
+
+/// Rows that all name their own ids move the counter past each one written,
+/// and past none that collides. Measured on MySQL 8.4.11, prepared and as
+/// text.
+#[test]
+fn an_upsert_naming_every_id_moves_the_counter_past_the_rows_it_writes() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, GORM_TAGS);
+    run(
+        &mut adapter,
+        "INSERT INTO `tags` (`name`) VALUES ('go'), ('sql'), ('batch-0'), ('batch-1'), ('batch-2')",
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT INTO `tags` (`name`,`id`) VALUES (?,?),(?,?) ON DUPLICATE KEY UPDATE `id`=`id`",
+            &bound(&[
+                Bound::Word("p"),
+                Bound::UnsignedId(50),
+                Bound::Word("go"),
+                Bound::UnsignedId(60),
+            ]),
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["1"])]
+    );
+    assert_eq!(probe(&mut adapter, "probe1"), (1, 51));
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO tags (id, name) VALUES (70, 'q1'), (80, 'q2') ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        ),
+        (2, 80, 1)
+    );
+    assert_eq!(probe(&mut adapter, "probe2"), (1, 81));
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO tags (id, name) VALUES (70, 'q1x'), (90, 'q3') ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        ),
+        (3, 90, 1)
+    );
+    assert_eq!(probe(&mut adapter, "probe3"), (1, 91));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `id`, `name` FROM `tags` WHERE `id` >= 50 ORDER BY `id`"
+        ),
+        vec![
+            some(&["50", "p"]),
+            some(&["51", "probe1"]),
+            some(&["70", "q1x"]),
+            some(&["80", "q2"]),
+            some(&["81", "probe2"]),
+            some(&["90", "q3"]),
+            some(&["91", "probe3"]),
+        ]
+    );
+}
+
+/// TypeORM's `repository.upsert` writes `DEFAULT` for every column an entity
+/// leaves unset, so a column set in one entity and not in another takes a
+/// value in one row and `DEFAULT` in the next. Measured on MySQL 8.4.11 over
+/// a counted table: each row takes its own default where it says `DEFAULT`,
+/// the row offered to the clause carries that default too — Bob's balance
+/// goes to 0.00 — and the rows asking for a number take the statement's
+/// batch, a colliding one handing its number to the next.
+#[test]
+fn typeorms_upsert_gives_default_in_some_rows_only() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `accounts` (`id` bigint NOT NULL AUTO_INCREMENT, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `balance` decimal(10,2) NOT NULL DEFAULT '0.00', `is_active` tinyint NOT NULL DEFAULT 1, `profile` json NULL, UNIQUE INDEX `IDX_email` (`email`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO accounts (email, name, balance) VALUES ('alice@example.com', 'Alice A.', '0.00'), ('bob@example.com', 'Bob', '20.25'), ('carol@example.com', 'Carol', '5.00'), ('dave@example.com', 'Dave', '0.00')",
+    );
+    run(
+        &mut adapter,
+        "DELETE FROM accounts WHERE email = 'dave@example.com'",
+    );
+    let upsert = "INSERT INTO `accounts`(`id`, `email`, `name`, `balance`, `is_active`, `profile`) VALUES (DEFAULT, 'alice@example.com', 'Alice Upserted', '100.00', DEFAULT, DEFAULT), (DEFAULT, 'erin@example.com', 'Erin', DEFAULT, DEFAULT, DEFAULT) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`), `name` = VALUES(`name`), `balance` = VALUES(`balance`)";
+    assert_eq!(written_with_warnings(&mut adapter, upsert), (3, 5, 3));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, email, name, balance, is_active, profile FROM accounts ORDER BY id"
+        ),
+        vec![
+            vec![
+                Some("1".to_owned()),
+                Some("alice@example.com".to_owned()),
+                Some("Alice Upserted".to_owned()),
+                Some("100.00".to_owned()),
+                Some("1".to_owned()),
+                None,
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("bob@example.com".to_owned()),
+                Some("Bob".to_owned()),
+                Some("20.25".to_owned()),
+                Some("1".to_owned()),
+                None,
+            ],
+            vec![
+                Some("3".to_owned()),
+                Some("carol@example.com".to_owned()),
+                Some("Carol".to_owned()),
+                Some("5.00".to_owned()),
+                Some("1".to_owned()),
+                None,
+            ],
+            vec![
+                Some("5".to_owned()),
+                Some("erin@example.com".to_owned()),
+                Some("Erin".to_owned()),
+                Some("0.00".to_owned()),
+                Some("1".to_owned()),
+                None,
+            ],
+        ]
+    );
+    assert_eq!(written_with_warnings(&mut adapter, upsert), (0, 0, 3));
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "INSERT INTO `accounts`(`id`, `email`, `name`, `balance`, `is_active`, `profile`) VALUES (DEFAULT, 'bob@example.com', 'Bob', DEFAULT, DEFAULT, DEFAULT), (DEFAULT, 'frank@example.com', 'Frank', '7.5', 0, DEFAULT) ON DUPLICATE KEY UPDATE `balance` = VALUES(`balance`), `is_active` = VALUES(`is_active`)"
+        ),
+        (3, 9, 2)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, balance, is_active FROM accounts WHERE id IN (2, 9) ORDER BY id"
+        ),
+        vec![some(&["2", "0.00", "1"]), some(&["9", "7.50", "0"])]
+    );
+    // A table that does not count its own ids writes an upsert's rows in one
+    // statement, which cannot leave a column out of one row only.
+    run(
+        &mut adapter,
+        "CREATE TABLE plain (code varchar(10) PRIMARY KEY, name varchar(20) NOT NULL DEFAULT 'none')",
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO plain (code, name) VALUES ('a', 'A'), ('b', DEFAULT) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert!(adapter
+        .execute_stmt_prepare(
+            "INSERT INTO plain (code, name) VALUES (?, ?), (?, DEFAULT) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        )
+        .is_err());
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM plain"),
+        vec![some(&["0"])]
     );
 }

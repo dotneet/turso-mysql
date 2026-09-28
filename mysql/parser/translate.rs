@@ -2886,7 +2886,17 @@ pub(crate) fn translate_insert(
     // carries for a column left out: measured on 8.4.11, `VALUES (..., DEFAULT)
     // ... hits = VALUES(hits) + 1` over a column defaulting to 7 writes 8, and
     // so does naming the offered row.
-    let defaulted = columns_given_their_default(&column_names, values)?;
+    //
+    // Several rows of an upsert on a counted table are written one statement
+    // to a row, each leaving out the columns that row gives `DEFAULT`, so a
+    // column may take it in some rows only. Written here as one statement,
+    // such a row reads NULL there; the frontend refuses the statement on any
+    // other table.
+    let defaulted = if insert.on.is_some() && values.rows.len() > 1 {
+        columns_given_their_default_in_every_row(&column_names, values)
+    } else {
+        columns_given_their_default(&column_names, values)?
+    };
     let kept = |at: usize| !defaulted[at];
     let mut json_cast_columns = Vec::new();
     let rows = values
@@ -2900,6 +2910,9 @@ pub(crate) fn translate_insert(
                     Some(operand) => {
                         json_cast_columns.push(column_names[at].to_owned());
                         render_json_cast(operand)
+                    }
+                    None if names_the_columns_default(value, column_names[at]) => {
+                        Ok("NULL".to_owned())
                     }
                     None => render_inserted_value(value),
                 })
@@ -2984,6 +2997,26 @@ pub(crate) fn columns_given_their_default(
                 return unsupported("INSERT DEFAULT in some rows only");
             }
             Ok(first)
+        })
+        .collect()
+}
+
+/// Which columns are given `DEFAULT` in every row of an `INSERT`, where the
+/// others may be given it in some rows only.
+///
+/// The caller has to have checked that every row is as wide as `names`.
+fn columns_given_their_default_in_every_row(
+    names: &[&str],
+    values: &sqlparser::ast::Values,
+) -> Vec<bool> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(at, name)| {
+            values
+                .rows
+                .iter()
+                .all(|row| names_the_columns_default(&row[at], name))
         })
         .collect()
 }
@@ -3318,10 +3351,21 @@ pub(crate) fn checked_upsert(insert: &Insert) -> Result<Option<crate::CheckedUps
             }
         })
         .collect();
+    let defaults_in_some_rows = insert.columns.iter().enumerate().any(|(at, column)| {
+        let [ObjectNamePart::Identifier(column)] = column.0.as_slice() else {
+            return false;
+        };
+        let given_default = |row: &[Expr]| {
+            row.get(at)
+                .is_some_and(|value| names_the_columns_default(value, &column.value))
+        };
+        rows.iter().any(|row| given_default(row)) && !rows.iter().all(|row| given_default(row))
+    });
     Ok(Some(crate::CheckedUpsert {
         table: table.value.clone(),
         assigned,
         comparisons,
+        defaults_in_some_rows,
     }))
 }
 
