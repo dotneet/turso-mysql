@@ -29,6 +29,7 @@ mod network_address;
 mod nothing_to_run;
 mod number_format;
 mod prisma_catalog;
+mod raw_bytes_in_words;
 mod replace_view;
 mod select_projection_origins;
 mod session_queries;
@@ -85,6 +86,7 @@ use mysql_ddl::render_mysql_column;
 pub use prisma_catalog::{
     parse_optional_prisma_information_schema_query, PrismaInformationSchemaQuery,
 };
+pub use raw_bytes_in_words::raw_bytes_in_words_as_hexadecimal;
 use static_select_metadata::classify_static_select_expr;
 use translate::{
     columns_given_their_default, delete_source_table, direct_signed_integer,

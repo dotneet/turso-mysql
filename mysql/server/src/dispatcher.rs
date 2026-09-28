@@ -383,7 +383,9 @@ impl CommandDispatcher {
     ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
         executor.command_arrived(match &command {
             Ok(command) => match command.command {
-                ClassicCommand::Query { .. } => ArrivedCommand::Query,
+                ClassicCommand::Query { .. } | ClassicCommand::QueryHoldingRawBytes { .. } => {
+                    ArrivedCommand::Query
+                }
                 ClassicCommand::InitDb { .. } => ArrivedCommand::InitDb,
                 ClassicCommand::Ping => ArrivedCommand::Ping,
                 _ => ArrivedCommand::Other,
@@ -462,6 +464,30 @@ impl CommandDispatcher {
                         sql,
                     ),
                 )
+            }
+            ClassicCommand::QueryHoldingRawBytes { text } => {
+                let capabilities = negotiated_capabilities(connection)?;
+                let answer = match turso_mysql_parser::raw_bytes_in_words_as_hexadecimal(
+                    text,
+                    executor.no_backslash_escapes(),
+                ) {
+                    Some(sql) => execute_query_batch(
+                        connection.response_packet_codec(),
+                        capabilities,
+                        executor,
+                        &sql,
+                    ),
+                    // Measured on MySQL 8.4.11, raw bytes in a word without
+                    // `_binary` are kept with warning 1300, and refused with
+                    // 1366 by a column of words; in a comment they are passed
+                    // over. Neither is followed here.
+                    None => encode_frontend_error(
+                        connection.response_packet_codec(),
+                        capabilities,
+                        FrontendErrorKind::Unsupported,
+                    ),
+                };
+                close_on_response_error(connection, answer)
             }
             ClassicCommand::ResetConnection => {
                 let capabilities = negotiated_capabilities(connection)?;
@@ -1983,6 +2009,35 @@ mod tests {
         }
     }
 
+    /// `mysqldump` writes a column of bytes as `_binary '...'` holding the
+    /// raw bytes, which are not UTF-8; each such word reaches the session in
+    /// hexadecimal, read under the session's backslash mode.
+    #[test]
+    fn a_query_holding_raw_bytes_in_a_binary_word_reaches_the_session_in_hexadecimal() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        for (no_backslash_escapes, expected) in [
+            (false, "INSERT INTO t VALUES (_binary X'FF00')"),
+            (true, "INSERT INTO t VALUES (_binary X'FF5C30')"),
+        ] {
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor {
+                no_backslash_escapes,
+                ..TestExecutor::default()
+            };
+            let frames = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(
+                    crate::COM_QUERY,
+                    b"INSERT INTO t VALUES (_binary '\xff\\0')",
+                ),
+            )
+            .unwrap();
+            assert_eq!(executor.query_calls, [expected]);
+            assert!(crate::AuthOkPacket::decode(CODEC, &frames[0]).is_ok());
+        }
+    }
+
     #[test]
     fn multi_query_needs_negotiation_before_any_statement_runs() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
@@ -3020,18 +3075,18 @@ mod tests {
     }
 
     #[test]
-    fn malformed_utf8_query_gets_syntax_err_and_connection_stays_ready() {
+    fn a_query_holding_raw_bytes_outside_a_binary_word_is_refused_and_connection_stays_ready() {
         let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
         let mut connection = ready_connection(capabilities);
         let mut executor = TestExecutor::default();
         let frames = dispatch_command_frame(
             &mut connection,
             &mut executor,
-            &command(crate::COM_QUERY, &[0xff]),
+            &command(crate::COM_QUERY, b"INSERT INTO t VALUES ('\xff')"),
         )
         .unwrap();
         let decoded = crate::ErrPacket::decode(CODEC, &frames[0], capabilities).unwrap();
-        assert_eq!(decoded.error_code, 1064);
+        assert_eq!(decoded.error_code, 1235);
         assert_eq!(connection.state(), ConnectionState::Ready);
         assert!(executor.query_calls.is_empty());
     }
@@ -3047,13 +3102,13 @@ mod tests {
         let frames = dispatch_command_frame(
             &mut connection,
             &mut executor,
-            &command(crate::COM_QUERY, &[0xff]),
+            &command(crate::COM_STMT_PREPARE, &[0xff]),
         )
         .unwrap();
         let decoded = crate::ErrPacket::decode(CODEC, &frames[0], capabilities).unwrap();
         assert_eq!(decoded.error_code, 1064);
         assert_eq!(connection.state(), ConnectionState::Ready);
-        assert!(executor.query_calls.is_empty());
+        assert!(executor.prepare_calls.is_empty());
     }
 
     #[test]

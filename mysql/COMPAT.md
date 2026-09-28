@@ -4085,6 +4085,24 @@ into another database the client names, one dump over another, leaving
 exactly the rows MySQL 8.4.11 leaves there, as `mysql --batch` prints them.
 Besides the settings above, that takes three forms.
 
+A statement whose text is not UTF-8 is read when what is not UTF-8 sits in a
+`_binary '...'` word, which is how `mysqldump` writes a column of bytes by
+default: the raw bytes, with `\0`, `\'`, `\"`, `\\`, `\n`, `\r` and `\Z`
+escaped and a backslash before any byte that would begin a character.
+Measured on MySQL 8.4.11 under a utf8mb4 client, such a word is its own bytes;
+the same bytes in a word without the introducer are kept with warning 1300
+and refused with 1366 by a column of words, and in a comment are passed over.
+The command reader writes each `_binary '...'` word of such a statement again
+as `_binary X'...'` before anything else reads it — MySQL reads the two as
+the same binary string, `_binary X'41'` answering 1366 in an `INT` as
+`_binary 'A'` does — working out its escapes byte by byte as MySQL does
+(`\%` and `\_` keep their backslash, and a backslash before any other byte
+is dropped) under the session's backslash mode. Raw bytes anywhere else, a
+`_binary` word in double quotes and a word written straight after one, which
+MySQL joins to it, are refused with 1235 and the connection stays open, where
+the whole statement used to be answered 1064. A prepared statement's text is
+still held to UTF-8.
+
 The `mysql` client 8.4 keeps comments by default, and read from MySQL's
 general log while it restored a dump, it sends each comment line between
 statements as a statement of its own — `-- MySQL dump 10.13 ...`, `--`, `--

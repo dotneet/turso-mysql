@@ -76,6 +76,10 @@ const STMT_SEND_LONG_DATA_FIXED_BODY_LENGTH: usize = 4 + 2;
 pub enum ClassicCommand<'a> {
     /// A text query. Execution belongs to a higher layer.
     Query { sql: &'a str },
+    /// A text query that is not UTF-8, which `mysqldump` sends for a
+    /// `_binary '...'` word holding raw bytes. Where those bytes may stand
+    /// turns on whether a backslash escapes, which only the session knows.
+    QueryHoldingRawBytes { text: &'a [u8] },
     /// A request to create a server-side prepared statement.
     StmtPrepare { sql: &'a str },
     /// A request to execute a server-side prepared statement.
@@ -1169,8 +1173,11 @@ fn decode_command_packet<'a>(
         // Measured on MySQL 8.4.11: an empty query is answered 1065, as text
         // holding nothing to run is, so it goes on to the executor.
         COM_QUERY if body.is_empty() => ClassicCommand::Query { sql: "" },
-        COM_QUERY => ClassicCommand::Query {
-            sql: decode_command_text(body, command, "query")?,
+        COM_QUERY => match decode_command_text(body, command, "query") {
+            Err(CommandPacketError::InvalidUtf8 { .. }) => {
+                ClassicCommand::QueryHoldingRawBytes { text: body }
+            }
+            sql => ClassicCommand::Query { sql: sql? },
         },
         COM_INIT_DB => ClassicCommand::InitDb {
             database: decode_command_text(body, command, "database")?,
@@ -3156,15 +3163,12 @@ mod tests {
             assert_eq!(connection.state(), ConnectionState::Ready);
         }
 
-        let invalid_utf8 = CODEC.encode(COMMAND_SEQUENCE_ID, b"\x03\xff").unwrap();
+        let raw_bytes = CODEC.encode(COMMAND_SEQUENCE_ID, b"\x03\xff").unwrap();
         assert_eq!(
-            connection.receive_command_frame(&invalid_utf8),
-            Err(ConnectionStateError::Command(
-                CommandPacketError::InvalidUtf8 {
-                    command: COM_QUERY,
-                    field: "query"
-                }
-            ))
+            connection
+                .receive_command_frame(&raw_bytes)
+                .map(|packet| packet.command),
+            Ok(ClassicCommand::QueryHoldingRawBytes { text: b"\xff" })
         );
         let invalid_prepare_utf8 = CODEC.encode(COMMAND_SEQUENCE_ID, b"\x16\xff").unwrap();
         assert_eq!(
