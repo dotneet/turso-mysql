@@ -3,7 +3,8 @@ use super::{
     tokenize_admin_command, AdminToken, MySqlTableName, ParseError, SessionMySqlDialect,
     SessionSqlMode,
 };
-use sqlparser::tokenizer::{Token, Tokenizer};
+use crate::statement_reads;
+use sqlparser::tokenizer::Token;
 
 /// One checked `TRUNCATE TABLE` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,9 +29,9 @@ pub fn parse_optional_truncate_table(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlTruncateTableCommand>, ParseError> {
-    let sql_tokens = Tokenizer::new(&SessionMySqlDialect::without_executable_comments(mode), sql)
-        .tokenize()
-        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let sql_tokens =
+        statement_reads::tokens(&SessionMySqlDialect::without_executable_comments(mode), sql)
+            .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let mut words = sql_tokens
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)));

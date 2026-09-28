@@ -343,6 +343,7 @@ impl CommandExecutor for MySqlCommandAdapter {
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         let status_flags = self.status_flags();
         if let Some(answer) =
             answer_what_is_not_a_statement(sql, self.connection.parser_mode(), status_flags)
@@ -377,6 +378,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         if is_internal_catalog_select(sql) {
             return Err(FrontendErrorKind::Unsupported);
         }
@@ -445,6 +447,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
@@ -2282,6 +2285,7 @@ where
     }
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         self.error_message = None;
         if let Some(listed) = &self.listed {
             listed.statement_began(RunningStatement {
@@ -2334,6 +2338,7 @@ where
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         self.error_message = None;
         let result = self.follow_a_dropped_database().and_then(|()| {
             let connection = self.session.connection().ok().cloned();
@@ -2397,6 +2402,7 @@ where
         statement_id: u32,
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+        let _kept_reads = turso_mysql_parser::keep_reads();
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.follow_a_dropped_database()?;
         self.session_variables

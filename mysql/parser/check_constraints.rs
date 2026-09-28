@@ -1,11 +1,12 @@
 //! `CHECK` constraints: the names MySQL gives them, the text it reads them
 //! back as, and adding and dropping one with `ALTER TABLE`.
 
+use crate::statement_reads;
 use sqlparser::ast::{
     AlterTableOperation, BinaryOperator, CheckConstraint, ColumnOption, CreateTable, Expr, Ident,
     Spanned, Statement, TableConstraint, UnaryOperator, Value,
 };
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::Token;
 
 use super::{
     parse_one_statement, render_table_written_again, unsupported, MySqlTableRewrite, ParseError,
@@ -259,7 +260,7 @@ fn dropped_check_name(sql: &str, mode: SessionSqlMode) -> Option<String> {
 /// Reads `ALTER TABLE <table> DROP CHECK <name>` as the table and the name.
 fn dropped_check(sql: &str, mode: SessionSqlMode) -> Option<(String, String)> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let tokens = statement_reads::tokens(&dialect, sql).ok()?;
     let mut words = tokens
         .into_iter()
         .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));

@@ -18,6 +18,7 @@
 //! by the frontend, through [`MySqlTriggerBody`], when the trigger is made.
 
 use super::*;
+use crate::statement_reads;
 use sqlparser::ast::{ConditionalStatements, FromTable, TableWithJoins};
 
 /// Writes a `CREATE TRIGGER` the way MySQL keeps it, or answers nothing for
@@ -414,8 +415,7 @@ fn one_name(name: &ObjectName) -> Result<MySqlTableName, ParseError> {
 /// statement — `VALUES (OLD.id, 2) ;` keeps `VALUES (OLD.id, 2)`.
 fn written_body(sql: &str, mode: SessionSqlMode) -> Result<String, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
     let words = tokens
         .iter()

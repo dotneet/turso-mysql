@@ -1,4 +1,5 @@
 use super::*;
+use crate::statement_reads;
 
 /// A `CREATE OR REPLACE VIEW` or an `ALTER VIEW`: the view it names and the
 /// `CREATE VIEW` that writes the view again.
@@ -70,8 +71,7 @@ pub fn parse_optional_view_replacement(
 /// `ALTER VIEW`, before it is parsed whole.
 fn names_a_view_replacement(sql: &str, mode: SessionSqlMode) -> Result<bool, ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let words = tokens
         .iter()

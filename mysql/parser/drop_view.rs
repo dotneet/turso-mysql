@@ -1,4 +1,5 @@
 use super::*;
+use crate::statement_reads;
 
 /// One checked `DROP VIEW` command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,8 +30,7 @@ pub fn parse_optional_drop_view(
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlDropViewCommand>, ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let sql_tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let sql_tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let mut words = sql_tokens
         .iter()

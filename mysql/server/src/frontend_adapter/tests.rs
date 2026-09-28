@@ -30853,3 +30853,20 @@ mod concurrent_transactions;
 
 #[cfg(unix)]
 mod prisma_client_reads;
+
+/// How many times each kind of reading read a statement of `length` bytes
+/// whole, from what the thread had read before and after it ran. A shorter
+/// text read along the way, such as a table's definition, adds less than one.
+fn whole_readings(
+    before: turso_mysql_parser::BytesRead,
+    after: turso_mysql_parser::BytesRead,
+    length: usize,
+) -> turso_mysql_parser::BytesRead {
+    turso_mysql_parser::BytesRead {
+        tokenized: (after.tokenized - before.tokenized) / length,
+        parsed: (after.parsed - before.parsed) / length,
+        parsed_by_the_engine: (after.parsed_by_the_engine - before.parsed_by_the_engine) / length,
+        tokenized_as_a_command: (after.tokenized_as_a_command - before.tokenized_as_a_command)
+            / length,
+    }
+}

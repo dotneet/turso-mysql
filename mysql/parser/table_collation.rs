@@ -13,10 +13,11 @@
 //! each column's collation itself, and reading it back never has to know which
 //! column took the table's.
 
+use crate::statement_reads;
 use sqlparser::ast::{
     AlterTableOperation, ColumnOption, CreateTableOptions, DataType, Ident, SqlOption, Statement,
 };
-use sqlparser::tokenizer::{Token, Tokenizer};
+use sqlparser::tokenizer::Token;
 
 use super::{
     a_column_of_words, byte_offset_of_location, parse_one_statement, unsupported, ParseError,
@@ -119,7 +120,7 @@ pub fn table_comment_change(
     mode: SessionSqlMode,
 ) -> Result<Option<(super::MySqlTableName, Option<String>)>, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+    let Ok(tokens) = statement_reads::tokens(&dialect, sql) else {
         return Ok(None);
     };
     let mut words = tokens
@@ -219,7 +220,7 @@ fn one_table_option(
     mode: SessionSqlMode,
 ) -> Option<(super::MySqlTableName, String, Token)> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
+    let tokens = statement_reads::tokens(&dialect, sql).ok()?;
     let mut words = tokens
         .into_iter()
         .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
@@ -293,8 +294,7 @@ pub fn create_table_with_the_database_collation(
         return Ok(None);
     }
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let Some(last) = tokens.iter().rev().find(|token| {
         !matches!(
@@ -427,8 +427,7 @@ fn write_collation_after(
         return Ok(None);
     }
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let tokens = tokens
         .iter()

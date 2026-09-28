@@ -41,6 +41,7 @@ mod show_server_activity;
 mod show_stored_programs;
 mod show_table_status;
 mod show_triggers;
+mod statement_reads;
 mod static_select_metadata;
 mod str_to_date;
 mod table_collation;
@@ -194,6 +195,7 @@ pub use show_triggers::{
     parse_optional_show_create_trigger, parse_optional_show_triggers,
     MySqlShowCreateTriggerCommand, MySqlShowTriggersCommand,
 };
+pub use statement_reads::{bytes_read, keep_reads, BytesRead, KeptReads};
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
     ScalarFunction, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
@@ -260,7 +262,7 @@ use sqlparser::{
     dialect::{Dialect, MySqlDialect},
     keywords::Keyword,
     parser::{Parser, ParserError},
-    tokenizer::{Token, TokenWithSpan, Tokenizer, Whitespace},
+    tokenizer::{Token, TokenWithSpan, Whitespace},
 };
 use turso_parser::{
     ast::{
@@ -3483,8 +3485,7 @@ pub fn parse_optional_autocommit_setting(
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAutocommitSetting>, ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let tokens = tokens
         .iter()
@@ -3548,7 +3549,7 @@ pub fn parse_optional_autocommit_setting(
 /// takes every write the text path does, so one it refuses is refused as it is
 /// prepared.
 pub fn answers_no_rows_and_binds_nothing(sql: &str, mode: SessionSqlMode) -> bool {
-    let Ok(tokens) = Tokenizer::new(&SessionMySqlDialect::new(mode), sql).tokenize() else {
+    let Ok(tokens) = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql) else {
         return false;
     };
     if tokens
@@ -4196,8 +4197,7 @@ fn alter_without_its_column_position(
     mode: SessionSqlMode,
 ) -> Result<String, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let words = tokens
         .iter()
@@ -4236,8 +4236,7 @@ fn without_utf8mb4_introducers(
     if !sql.to_ascii_lowercase().contains("_utf8mb4") {
         return Ok(std::borrow::Cow::Borrowed(sql));
     }
-    let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&SessionMySqlDialect::new(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let mut cuts = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
@@ -4320,8 +4319,7 @@ pub fn parse_auto_increment_create_table(
 
 fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Result<(), ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     if tokens.iter().any(|token| {
         matches!(
@@ -4631,8 +4629,7 @@ fn parse_select_inner(
     };
     translate::name_the_columns_grouped_by_place(&mut query)?;
     translate::leave_the_one_table_out(&mut query);
-    let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let significant = tokens
         .iter()
@@ -5383,8 +5380,7 @@ fn validate_auto_increment_insert_token_shape(
     mode: SessionSqlMode,
 ) -> Result<(), ParseError> {
     let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     if tokens.iter().any(|token| {
         matches!(
@@ -5875,22 +5871,23 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
 }
 
 fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, ParseError> {
-    let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
-        .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
-    let tokens =
-        count_a_column_in_parentheses_as_the_column(spell_lock_in_share_mode_as_for_share(tokens));
-    let statements = Parser::new(&dialect)
-        .with_tokens_with_locations(tokens)
-        .parse_statements()
-        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
-    let [statement] = statements.as_slice() else {
-        return Err(ParseError::ExpectedOneStatement {
-            actual: statements.len(),
-        });
-    };
-    Ok(statement.clone())
+    statement_reads::statement(sql, mode, || {
+        let dialect = SessionMySqlDialect::new(mode);
+        let tokens = statement_reads::tokens_with_location(&dialect, sql)
+            .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
+        let tokens = count_a_column_in_parentheses_as_the_column(
+            spell_lock_in_share_mode_as_for_share(tokens),
+        );
+        let mut statements = Parser::new(&dialect)
+            .with_tokens_with_locations(tokens)
+            .parse_statements()
+            .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+        let actual = statements.len();
+        match statements.pop() {
+            Some(statement) if actual == 1 => Ok(statement),
+            _ => Err(ParseError::ExpectedOneStatement { actual }),
+        }
+    })
 }
 
 /// `LOCK IN SHARE MODE` is MySQL's older spelling of `FOR SHARE`, and
@@ -6019,20 +6016,14 @@ fn parse_normalized_create_table(sql: &str) -> Result<Stmt, ParseError> {
 }
 
 fn parse_normalized_select(sql: &str) -> Result<Stmt, ParseError> {
-    let mut parser = TursoParser::new(sql.as_bytes());
-    let command = parser
-        .next_cmd()
-        .map_err(|error| ParseError::TursoParser(error.to_string()))?;
+    let reading = statement_reads::engine_reading(sql);
+    let command = reading.first.map_err(ParseError::TursoParser)?;
     let Some(TursoCmd::Stmt(statement @ Stmt::Select(_))) = command else {
         return Err(ParseError::TursoParser(
             "normalized SELECT did not produce a SELECT AST".to_string(),
         ));
     };
-    if parser
-        .next_cmd()
-        .map_err(|error| ParseError::TursoParser(error.to_string()))?
-        .is_some()
-    {
+    if reading.another_follows.map_err(ParseError::TursoParser)? {
         return Err(ParseError::ExpectedOneStatement { actual: 2 });
     }
     Ok(statement)
@@ -6048,10 +6039,8 @@ pub fn parse_engine_statement(sql: &str) -> Result<Stmt, ParseError> {
 }
 
 fn parse_normalized_dml(sql: &str) -> Result<Stmt, ParseError> {
-    let mut parser = TursoParser::new(sql.as_bytes());
-    let command = parser
-        .next_cmd()
-        .map_err(|error| ParseError::TursoParser(error.to_string()))?;
+    let reading = statement_reads::engine_reading(sql);
+    let command = reading.first.map_err(ParseError::TursoParser)?;
     let Some(TursoCmd::Stmt(
         statement @ (Stmt::Insert { .. } | Stmt::Update(_) | Stmt::Delete { .. }),
     )) = command
@@ -6060,11 +6049,7 @@ fn parse_normalized_dml(sql: &str) -> Result<Stmt, ParseError> {
             "normalized DML did not produce an INSERT, UPDATE, or DELETE AST".to_string(),
         ));
     };
-    if parser
-        .next_cmd()
-        .map_err(|error| ParseError::TursoParser(error.to_string()))?
-        .is_some()
-    {
+    if reading.another_follows.map_err(ParseError::TursoParser)? {
         return Err(ParseError::ExpectedOneStatement { actual: 2 });
     }
     Ok(statement)

@@ -6,6 +6,7 @@
 
 use super::database_options::consume_database_options;
 use super::*;
+use crate::statement_reads;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransactionTokenKind {
@@ -22,8 +23,7 @@ pub(crate) fn transaction_token_kind(
     mode: SessionSqlMode,
 ) -> Result<TransactionTokenKind, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let significant = tokens
         .iter()
@@ -107,8 +107,7 @@ pub(crate) fn savepoint_command(
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlTransactionCommand>, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize()
+    let tokens = statement_reads::tokens(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let significant = tokens
         .iter()
@@ -386,7 +385,7 @@ pub(crate) fn tokenize_lock_tables_command(
 /// What the tokenizer makes of a `/*!NNNNN ... */` comment, which MySQL runs
 /// on any server at or past the version it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VersionedComments {
+pub(crate) enum VersionedComments {
     /// Every comment is one [`AdminToken::Comment`].
     Kept,
     /// `/*!32311 LOCAL */`, which `mysqldump` writes into `LOCK TABLES`, is
@@ -402,6 +401,16 @@ enum VersionedComments {
 const MYSQL_VERSION_ID: u32 = 80_411;
 
 fn tokenize_admin_text(
+    sql: &str,
+    mode: SessionSqlMode,
+    versioned_comments: VersionedComments,
+) -> Result<Vec<AdminToken>, ParseError> {
+    statement_reads::admin_tokens(sql, mode, versioned_comments, || {
+        read_admin_text(sql, mode, versioned_comments)
+    })
+}
+
+fn read_admin_text(
     sql: &str,
     mode: SessionSqlMode,
     versioned_comments: VersionedComments,

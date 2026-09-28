@@ -9380,6 +9380,46 @@ fn the_last_select_read_is_answered_without_reading_it_again() {
     assert_eq!(reads(), before + 3);
 }
 
+/// While reads are kept, a text read again answers what reading it afresh
+/// answers, a failure as well, without being read again; a nested guard keeps
+/// them no longer than the outer one, and they are let go of with it.
+#[test]
+fn a_kept_reading_answers_what_reading_afresh_would() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO kept_reads (a, b) VALUES (1, 'it''s'), (2, 'two')";
+    let broken = "INSERT INTO kept_reads (a) VALUES ('never closed";
+    let read_afresh = (
+        parse_dml(sql, mode),
+        parse_dml(broken, mode),
+        parse_optional_drop_table(broken, mode),
+        parse_auto_increment_insert(sql, mode),
+    );
+    let read_everything = || {
+        (
+            parse_dml(sql, mode),
+            parse_dml(broken, mode),
+            parse_optional_drop_table(broken, mode),
+            parse_auto_increment_insert(sql, mode),
+        )
+    };
+
+    let kept = keep_reads();
+    assert_eq!(read_everything(), read_afresh);
+    let first_reading = bytes_read();
+    {
+        let _nested = keep_reads();
+        assert_eq!(read_everything(), read_afresh);
+    }
+    assert_eq!(read_everything(), read_afresh);
+    assert_eq!(bytes_read(), first_reading);
+    drop(kept);
+
+    assert_eq!(read_everything(), read_afresh);
+    assert!(bytes_read().tokenized > first_reading.tokenized);
+    assert!(bytes_read().parsed > first_reading.parsed);
+    assert!(bytes_read().parsed_by_the_engine > first_reading.parsed_by_the_engine);
+}
+
 /// `LOCK IN SHARE MODE` is read as `FOR SHARE`, the lock Laravel's
 /// `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` ask for. Measured on
 /// MySQL 8.4.11: it follows `LIMIT`, may be written in any case and with a

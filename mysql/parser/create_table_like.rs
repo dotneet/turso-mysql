@@ -1,7 +1,8 @@
 //! `CREATE TABLE <new> LIKE <old>`, which makes an empty table shaped like
 //! another one in the same database.
 
-use sqlparser::tokenizer::{Token, Tokenizer};
+use crate::statement_reads;
+use sqlparser::tokenizer::Token;
 
 use super::{MySqlTableName, ParseError, SessionMySqlDialect, SessionSqlMode};
 
@@ -41,7 +42,7 @@ pub fn parse_optional_create_table_like(
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlCreateTableLike>, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() else {
+    let Ok(tokens) = statement_reads::tokens(&dialect, sql) else {
         return Ok(None);
     };
     let mut words = tokens

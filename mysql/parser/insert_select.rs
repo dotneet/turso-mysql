@@ -2,11 +2,12 @@ use super::{
     parse_one_statement, unsupported, MySqlTableName, ParseError, SessionMySqlDialect,
     SessionSqlMode,
 };
+use crate::statement_reads;
 use sqlparser::ast::{
     BinaryOperator, Expr, ObjectNamePart, SelectFlavor, SelectItem, SetExpr, Statement,
     TableFactor, Value,
 };
-use sqlparser::tokenizer::{Location, Token, Tokenizer};
+use sqlparser::tokenizer::{Location, Token};
 
 /// One `INSERT INTO t <SELECT>` written with no column list.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -337,8 +338,7 @@ pub fn insert_select_source_sql(
         return unsupported("INSERT SELECT option");
     }
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let mut depth = 0_usize;
     let mut column_list_closed = false;
@@ -447,8 +447,7 @@ pub fn parse_optional_insert_values_without_columns(
 /// defaults rather than every column.
 fn where_the_values_begin(sql: &str, mode: SessionSqlMode) -> Result<Option<usize>, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let words = tokens
         .iter()

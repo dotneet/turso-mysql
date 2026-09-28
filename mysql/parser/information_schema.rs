@@ -5,13 +5,13 @@
 //! this is all validation and no rendering.
 
 use super::*;
+use crate::statement_reads;
 
 pub(crate) fn tokenize_information_schema_query(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<Token>, ParseError> {
-    Tokenizer::new(&SessionMySqlDialect::without_executable_comments(mode), sql)
-        .tokenize()
+    statement_reads::tokens(&SessionMySqlDialect::without_executable_comments(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))
 }
 

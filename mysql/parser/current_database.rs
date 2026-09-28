@@ -13,8 +13,9 @@
 //! Those name the same table and column the bare names do, so the database is
 //! left out before the statement is read.
 
+use crate::statement_reads;
 use sqlparser::ast::Statement;
-use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer};
+use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan};
 
 use super::{
     named_tables::database_qualifiers_in, parse_one_statement, ParseError, SessionMySqlDialect,
@@ -34,8 +35,7 @@ pub fn write_the_current_database_in(
     mode: SessionSqlMode,
 ) -> Result<Option<String>, ParseError> {
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let words = tokens
         .iter()
@@ -106,8 +106,7 @@ pub fn leave_out_the_current_database(
         return Ok(None);
     };
     let dialect = SessionMySqlDialect::new(mode);
-    let tokens = Tokenizer::new(&dialect, sql)
-        .tokenize_with_location()
+    let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let words = tokens
         .iter()

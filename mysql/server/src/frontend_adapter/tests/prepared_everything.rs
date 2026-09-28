@@ -120,6 +120,75 @@ fn only_a_statement_without_parameters_or_rows_is_run_as_text() {
     }
 }
 
+/// An ORM's batch insert is one long statement with a `?` for each value, and
+/// every reading of a statement costs time in proportion to its length. When
+/// it is prepared it is tokenized once by each of the two ways the recognizers
+/// read it there, parsed once and read by the engine once; when it is executed
+/// it is read once more, to number its rows. Before the readings were kept
+/// while a statement is answered, preparing it tokenized it 13 times, parsed
+/// it 9 times and had the engine read it 4.
+#[test]
+fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("create table `users` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)")
+        .unwrap();
+    let rows = 1000;
+    let sql = format!(
+        "insert into `users` (`name`, `email`) values {}",
+        vec!["(?, ?)"; rows].join(", ")
+    );
+    let values = (0..rows)
+        .flat_map(|row| [format!("user {row}"), format!("user{row}@example.com")])
+        .collect::<Vec<_>>();
+
+    let before = turso_mysql_parser::bytes_read();
+    let statement = adapter.execute_stmt_prepare(&sql).unwrap();
+    let prepared_at = turso_mysql_parser::bytes_read();
+    let result = adapter
+        .execute_stmt_execute(statement.statement_id, &batch_of_words(&values))
+        .unwrap();
+    let executed_at = turso_mysql_parser::bytes_read();
+
+    let PreparedStatementExecutionResult::Ok(result) = result else {
+        panic!("the insert must answer OK");
+    };
+    assert_eq!((result.affected_rows, result.last_insert_id), (1000, 1));
+    assert_eq!(
+        whole_readings(before, prepared_at, sql.len()),
+        turso_mysql_parser::BytesRead {
+            tokenized: 2,
+            parsed: 1,
+            parsed_by_the_engine: 1,
+            tokenized_as_a_command: 0,
+        }
+    );
+    assert_eq!(
+        whole_readings(prepared_at, executed_at, sql.len()),
+        turso_mysql_parser::BytesRead {
+            tokenized: 1,
+            parsed: 1,
+            parsed_by_the_engine: 0,
+            tokenized_as_a_command: 0,
+        }
+    );
+}
+
+/// The null bitmap, the new-parameters flag and one VAR_STRING parameter for
+/// each word.
+fn batch_of_words(words: &[String]) -> Vec<u8> {
+    let mut payload = vec![0; words.len().div_ceil(8)];
+    payload.push(1);
+    for _ in words {
+        payload.extend_from_slice(&[MYSQL_TYPE_VAR_STRING, 0]);
+    }
+    for word in words {
+        payload.push(u8::try_from(word.len()).unwrap());
+        payload.extend_from_slice(word.as_bytes());
+    }
+    payload
+}
+
 /// Laravel's `migrate:fresh` lists every table and drops them in one
 /// statement. Measured on MySQL 8.4.11: a parent and its child go together
 /// whatever order they are named in; a statement naming a table that is not
