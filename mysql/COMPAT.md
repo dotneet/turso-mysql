@@ -4185,7 +4185,13 @@ name — `DATABASE()` answers it — and a statement on the database answers 104
 `Unknown database 'name'`, until a database is made under the name again, which
 it then reads. The session that drops its own database is left in none,
 `DATABASE()` answering NULL. A database that is not there answers 1008 `Can't
-drop database 'name'; database doesn't exist`. The files are removed while the
+drop database 'name'; database doesn't exist`, and `DROP DATABASE IF EXISTS`
+(or `DROP SCHEMA`) of it answers OK. Measured on 8.4.11 and matched, oddly: that
+OK counts one warning, yet `SHOW WARNINGS` lists none and `@@warning_count`
+reads 0 after it — where `DROP TABLE IF EXISTS` lists its note 1051 — and under
+`sql_notes = 0` it counts none. It commits the transaction first too, and a
+session whose database another session dropped is left in none by it, where
+the plain form's 1008 leaves it the name. The files are removed while the
 other sessions still hold them open, which Unix allows without either side
 seeing the other, and nothing runs on them again: every statement first checks
 that its database is still there, under the same lock the drop takes. The wait

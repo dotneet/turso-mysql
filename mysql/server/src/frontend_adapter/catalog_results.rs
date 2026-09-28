@@ -19,6 +19,7 @@ pub(super) fn admin_result_to_execution_result(
         | MySqlAdminCommandResult::AlreadyExists { .. }
         | MySqlAdminCommandResult::Altered { .. }
         | MySqlAdminCommandResult::Dropped { .. }
+        | MySqlAdminCommandResult::AlreadyGone { .. }
         | MySqlAdminCommandResult::Selected { .. } => {
             Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
         }

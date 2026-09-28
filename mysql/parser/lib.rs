@@ -2251,7 +2251,11 @@ pub enum MySqlAdminCommand {
         collation: Option<MySqlTableCollation>,
     },
     /// Drop one logical database.
-    DropDatabase { name: MySqlDatabaseName },
+    DropDatabase {
+        name: MySqlDatabaseName,
+        /// `IF EXISTS`: a database that is not there is a note, not an error.
+        only_if_present: bool,
+    },
     /// Print the `CREATE DATABASE` that makes a database as it is now.
     ShowCreateDatabase {
         name: MySqlDatabaseName,
@@ -2270,7 +2274,7 @@ impl MySqlAdminCommand {
     pub fn name(&self) -> Option<&MySqlDatabaseName> {
         match self {
             Self::CreateDatabase { name, .. }
-            | Self::DropDatabase { name }
+            | Self::DropDatabase { name, .. }
             | Self::ShowCreateDatabase { name, .. }
             | Self::Use { name } => Some(name),
             Self::AlterDatabase { name, .. } => name.as_ref(),

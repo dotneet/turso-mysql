@@ -7193,8 +7193,29 @@ fn parses_strict_database_management_commands_and_canonicalizes_names() {
         parse_admin_command("DROP DATABASE Reports", SessionSqlMode::default()).unwrap(),
         MySqlAdminCommand::DropDatabase {
             name: MySqlDatabaseName::parse("reports").unwrap(),
+            only_if_present: false,
         }
     );
+    for sql in [
+        "DROP DATABASE IF EXISTS Reports",
+        "drop schema if exists `reports`;",
+    ] {
+        assert_eq!(
+            parse_admin_command(sql, SessionSqlMode::default()),
+            Ok(MySqlAdminCommand::DropDatabase {
+                name: MySqlDatabaseName::parse("reports").unwrap(),
+                only_if_present: true,
+            }),
+            "{sql}"
+        );
+    }
+    for sql in ["DROP DATABASE IF reports", "DROP DATABASE IF EXISTS"] {
+        assert_eq!(
+            parse_admin_command(sql, SessionSqlMode::default()),
+            Err(ParseError::ExpectedAdminCommand),
+            "{sql}"
+        );
+    }
     let command = parse_admin_command("USE reports", SessionSqlMode::default()).unwrap();
     assert!(matches!(command, MySqlAdminCommand::Use { .. }));
     assert_eq!(command.name().unwrap().as_str(), "reports");
@@ -8187,7 +8208,6 @@ fn rejects_comments_options_qualified_names_and_trailing_junk() {
         "CREATE DATABASE reports # hidden",
         "CREATE DATABASE reports /* hidden */",
         "CREATE DATABASE reports CHARACTER SET utf8mb4 /* hidden */",
-        "DROP DATABASE IF EXISTS reports",
         "CREATE DATABASE IF EXISTS reports",
         "USE tenant.reports",
         "CREATE DATABASE reports; DROP DATABASE other",

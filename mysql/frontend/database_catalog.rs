@@ -91,6 +91,8 @@ pub enum MySqlAdminCommandResult {
     Altered { database: String },
     /// A logical database was dropped.
     Dropped { database: String },
+    /// `DROP DATABASE IF EXISTS` found no database of that name.
+    AlreadyGone { database: String },
     /// The `CREATE DATABASE` that makes a database as it is now, beside the
     /// name it was asked for by.
     CreateStatement { database: String, statement: String },
@@ -460,10 +462,14 @@ impl MySqlDatabaseSession {
                 }
                 Ok(MySqlAdminCommandResult::Altered { database })
             }
-            MySqlAdminCommand::DropDatabase { name } => {
+            MySqlAdminCommand::DropDatabase {
+                name,
+                only_if_present,
+            } => {
                 let database = name.into_string();
                 // Measured on MySQL 8.4.11: `DROP DATABASE` commits the
-                // session's transaction first, whichever database it names.
+                // session's transaction first, whichever database it names,
+                // and `IF EXISTS` of one that is not there does too.
                 if let Ok(connection) = self.connection() {
                     connection
                         .execute_transaction_command("COMMIT")
@@ -475,15 +481,24 @@ impl MySqlDatabaseSession {
                         selected.connection.stop_using_the_database();
                     }
                 }
-                self.catalog
-                    .drop_database(&database, Self::DROP_DATABASE_WAIT)?;
+                let result = match self
+                    .catalog
+                    .drop_database(&database, Self::DROP_DATABASE_WAIT)
+                {
+                    Ok(()) => MySqlAdminCommandResult::Dropped { database },
+                    Err(MySqlDatabaseError::DatabaseNotFound(_)) if only_if_present => {
+                        MySqlAdminCommandResult::AlreadyGone { database }
+                    }
+                    Err(error) => return Err(error),
+                };
                 // Measured on MySQL 8.4.11: the session that drops the
                 // database it is in is left in none, `DATABASE()` answering
-                // NULL.
+                // NULL — also when another session dropped it first and this
+                // one's `IF EXISTS` found nothing to drop.
                 if drops_its_own {
                     self.selected = None;
                 }
-                Ok(MySqlAdminCommandResult::Dropped { database })
+                Ok(result)
             }
             MySqlAdminCommand::ShowCreateDatabase {
                 name,
@@ -1782,7 +1797,7 @@ mod tests {
         for sql in [
             "CREATE DATABASE one; DROP DATABASE two",
             "CREATE DATABASE one -- comment",
-            "DROP DATABASE IF EXISTS one",
+            "DROP DATABASE IF one",
             "USE one /* comment */",
         ] {
             let error = session.execute_admin_command(sql).unwrap_err();

@@ -1343,12 +1343,13 @@ where
                     database: &canonical_name,
                 })?;
             }
-            MySqlAdminCommand::DropDatabase { name } => {
+            MySqlAdminCommand::DropDatabase { name, .. } => {
                 let canonical_name =
                     canonicalize_database_name(name.as_str()).map_err(database_error_kind)?;
                 self.authorize(DatabaseAction::Drop {
                     database: &canonical_name,
                 })?;
+                self.raised_warnings.clear();
             }
             // Measured on MySQL 8.4.11: any privilege in the database lets a
             // session print its `CREATE DATABASE`, a grant on one table of it
@@ -1430,6 +1431,16 @@ where
             }
             return Ok(CommandExecutionResult::Ok(CommandOkResult {
                 warnings: u16::from(noted),
+                ..CommandOkResult::default()
+            }));
+        }
+        // Measured on MySQL 8.4.11: `DROP DATABASE IF EXISTS` of a database
+        // that is not there answers OK counting one warning, yet `SHOW
+        // WARNINGS` lists none and `@@warning_count` reads 0 after it.
+        // `sql_notes = 0` leaves the count at 0.
+        if let MySqlAdminCommandResult::AlreadyGone { .. } = &result {
+            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                warnings: u16::from(self.session_variables.sql_notes()),
                 ..CommandOkResult::default()
             }));
         }

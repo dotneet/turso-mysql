@@ -209,13 +209,13 @@ fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
 /// Parses one strict MySQL database-management command.
 ///
 /// The accepted grammar is exactly one of `CREATE DATABASE [IF NOT EXISTS]
-/// name [options]`, `ALTER DATABASE [name] options`, `DROP DATABASE name`,
-/// `SHOW CREATE DATABASE [IF NOT EXISTS] name`, `USE name`, or `SHOW
+/// name [options]`, `ALTER DATABASE [name] options`, `DROP DATABASE [IF
+/// EXISTS] name`, `SHOW CREATE DATABASE [IF NOT EXISTS] name`, `USE name`, or `SHOW
 /// DATABASES`, `SCHEMA` standing for `DATABASE` in each, followed by an
 /// optional semicolon. A versioned comment MySQL runs is read as the text it
 /// holds, which is how `mysqldump` writes its `CREATE DATABASE`. Database
 /// options naming a character set, collation or encryption a database here
-/// cannot keep, `IF EXISTS` clauses, other comments, qualified names, and all
+/// cannot keep, `CREATE DATABASE IF EXISTS`, other comments, qualified names, and all
 /// trailing tokens are rejected. Names are checked and returned in canonical
 /// ASCII-lowercase form.
 pub fn parse_admin_command(
@@ -290,9 +290,16 @@ pub fn parse_optional_admin_command(
             }
             MySqlAdminCommand::AlterDatabase { name, collation }
         }
-        AdminStatementKind::DropDatabase => MySqlAdminCommand::DropDatabase {
-            name: consume_admin_database_name(&tokens, &mut cursor)?,
-        },
+        AdminStatementKind::DropDatabase => {
+            let only_if_present = consume_admin_word(&tokens, &mut cursor, "IF");
+            if only_if_present && !consume_admin_word(&tokens, &mut cursor, "EXISTS") {
+                return Err(ParseError::ExpectedAdminCommand);
+            }
+            MySqlAdminCommand::DropDatabase {
+                name: consume_admin_database_name(&tokens, &mut cursor)?,
+                only_if_present,
+            }
+        }
         AdminStatementKind::ShowCreateDatabase => {
             let only_if_missing = consume_admin_word(&tokens, &mut cursor, "IF");
             if only_if_missing

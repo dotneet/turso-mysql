@@ -30807,6 +30807,8 @@ mod character_set_listings;
 
 #[cfg(unix)]
 mod check_constraints;
+
+#[cfg(unix)]
 mod database_collation;
 
 #[cfg(unix)]
@@ -30853,6 +30855,9 @@ mod concurrent_transactions;
 
 #[cfg(unix)]
 mod prisma_client_reads;
+
+#[cfg(unix)]
+mod dropped_databases;
 
 /// How many times each kind of reading read a statement of `length` bytes
 /// whole, from what the thread had read before and after it ran. A shorter
