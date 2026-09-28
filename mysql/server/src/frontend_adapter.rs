@@ -222,6 +222,7 @@ struct PendingLongData {
     retained_bytes: usize,
 }
 
+#[derive(Clone)]
 struct StatementLongData {
     values: Vec<Option<Vec<u8>>>,
     error: Option<PendingLongDataError>,
@@ -2965,6 +2966,18 @@ where
         {
             return Ok(());
         }
+        self.prepare_again(statement_id)
+    }
+
+    /// Prepares a statement's text again over the database the session is in
+    /// and puts it in the old one's place, keeping its number and the
+    /// parameter types the client sent for it.
+    fn prepare_again(&mut self, statement_id: u32) -> Result<(), FrontendErrorKind> {
+        let statement = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
         let text = statement.text.clone();
         let parameter_count = statement
             .connection
@@ -4970,6 +4983,43 @@ where
             }
         }
         let long_data = self.pending_long_data.take_statement(statement_id);
+        let result = self.execute_authorized_prepared_statement(
+            statement_id,
+            parameter_payload,
+            long_data.clone(),
+        );
+        // Measured on MySQL 8.4.11: a write prepared before its table was
+        // dropped and made again — Sequelize's `sync({ force: true })` under
+        // mysql2's cache of prepared statements — is prepared again over the
+        // new table and runs, keeping its number.
+        let selects = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .is_some_and(|statement| statement.selects);
+        let result = match result {
+            Err(FrontendErrorKind::PreparedOverAChangedTable) if !selects => {
+                self.prepare_again(statement_id)?;
+                self.execute_authorized_prepared_statement(
+                    statement_id,
+                    parameter_payload,
+                    long_data,
+                )
+            }
+            result => result,
+        };
+        result.map_err(|error| match error {
+            FrontendErrorKind::PreparedOverAChangedTable => FrontendErrorKind::Unsupported,
+            error => error,
+        })
+    }
+
+    fn execute_authorized_prepared_statement(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+        long_data: StatementLongData,
+    ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         let statement = self
             .prepared_statements
             .statements
@@ -5797,6 +5847,8 @@ fn execute_prepared_values(
                 )
             {
                 FrontendErrorKind::QueryTimeout
+            } else if was_prepared_over_a_changed_table(&error) {
+                FrontendErrorKind::PreparedOverAChangedTable
             } else {
                 prepared_statement_error(error)
             }
@@ -5910,6 +5962,23 @@ fn execute_prepared_values(
             status_flags: connection_status_flags(connection),
         },
     ))
+}
+
+/// Whether a prepared write failed because a table it names is not the one
+/// it was prepared over — dropped and made again, or altered. The session
+/// says so with `SchemaUpdated` from its counted-insert path, and with the
+/// message of the parser that reads a write again over a changed schema.
+fn was_prepared_over_a_changed_table(error: &MySqlPreparedStatementError) -> bool {
+    match error {
+        MySqlPreparedStatementError::Engine(LimboError::SchemaUpdated)
+        | MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(
+            LimboError::SchemaUpdated,
+        )) => true,
+        MySqlPreparedStatementError::Engine(LimboError::ParseError(message)) => {
+            message.starts_with("prepared DML") && message.ends_with("prepare the statement again")
+        }
+        _ => false,
+    }
 }
 
 fn shift_binary_timestamp_value(

@@ -493,8 +493,9 @@ fn laravels_prepared_insert_using_copies_the_rows_its_bindings_choose() {
 }
 
 /// A prepared copy whose `SELECT` was read knowing its columns' types runs
-/// again after another table is made, and is refused once a table it reads
-/// changes, where it would have to be read again.
+/// again after another table is made, and once a table it reads changes it
+/// is read again over the table as it stands, as MySQL 8.4.11 prepares it
+/// again, measured.
 #[test]
 fn a_prepared_copy_keeps_its_reading_of_the_tables_it_names() {
     let (_directory, mut adapter) = adapter();
@@ -533,10 +534,16 @@ fn a_prepared_copy_keeps_its_reading_of_the_tables_it_names() {
         vec![some(&["A"]), some(&["A"]), some(&["b"])]
     );
     run(&mut adapter, "ALTER TABLE src ADD COLUMN note TEXT");
-    assert!(execute(&mut adapter, "9", 2).is_err());
+    assert_eq!(execute(&mut adapter, "9", 2), Ok(2));
     assert_eq!(
-        rows(&mut adapter, "SELECT COUNT(*) FROM dst"),
-        vec![some(&["3"])]
+        rows(&mut adapter, "SELECT name FROM dst"),
+        vec![
+            some(&["A"]),
+            some(&["A"]),
+            some(&["b"]),
+            some(&["A"]),
+            some(&["b"])
+        ]
     );
 }
 

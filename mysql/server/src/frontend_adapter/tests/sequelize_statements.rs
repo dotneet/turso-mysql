@@ -887,3 +887,89 @@ fn sequelizes_max_over_an_include_projects_the_columns_its_condition_decides() {
         );
     }
 }
+
+/// A post as mysql2 binds Sequelize's `Post.create`: the title and the two
+/// moments as words, the views and the user as doubles.
+fn a_new_post(title: &str, user: f64) -> Vec<u8> {
+    let mut payload = vec![0, 1];
+    for code in [
+        MYSQL_TYPE_VAR_STRING,
+        MYSQL_TYPE_DOUBLE,
+        MYSQL_TYPE_VAR_STRING,
+        MYSQL_TYPE_VAR_STRING,
+        MYSQL_TYPE_DOUBLE,
+    ] {
+        payload.extend([code, 0]);
+    }
+    payload.push(title.len() as u8);
+    payload.extend_from_slice(title.as_bytes());
+    payload.extend_from_slice(&0f64.to_le_bytes());
+    for moment in ["2026-09-28 11:24:57.348", "2026-09-28 11:24:57.348"] {
+        payload.push(moment.len() as u8);
+        payload.extend_from_slice(moment.as_bytes());
+    }
+    payload.extend_from_slice(&user.to_le_bytes());
+    payload
+}
+
+fn written(result: Result<PreparedStatementExecutionResult, FrontendErrorKind>) -> (u64, u64) {
+    match result {
+        Ok(PreparedStatementExecutionResult::Ok(result)) => {
+            (result.affected_rows, result.last_insert_id)
+        }
+        other => panic!("the write must be taken, answered {other:?}"),
+    }
+}
+
+/// mysql2 keeps each statement it prepared for as long as its connection
+/// lives, and `sequelize.sync({ force: true })` drops every table and makes
+/// it again, in another column order, under it. Measured on MySQL 8.4.11: a
+/// write prepared before is prepared again over the new table and runs,
+/// counting ids from 1 again, and once the table is gone it answers 1146.
+#[test]
+fn sequelizes_writes_prepared_before_sync_force_run_over_the_new_tables() {
+    let (_directory, mut adapter) = blog();
+    let insert = adapter
+        .execute_stmt_prepare("INSERT INTO `posts` (`id`,`title`,`views`,`created_at`,`updated_at`,`user_id`) VALUES (DEFAULT,?,?,?,?,?);")
+        .unwrap()
+        .statement_id;
+    let update = adapter
+        .execute_stmt_prepare("UPDATE `posts` SET `views`=`views` + 2 WHERE `user_id` = ?")
+        .unwrap()
+        .statement_id;
+    assert_eq!(
+        written(adapter.execute_stmt_execute(insert, &a_new_post("x", 1.0))),
+        (1, 4)
+    );
+    for sql in [
+        "DROP TABLE IF EXISTS `post_tags`;",
+        "DROP TABLE IF EXISTS `posts`;",
+        "DROP TABLE IF EXISTS `tags`;",
+        "DROP TABLE IF EXISTS `users`;",
+        "CREATE TABLE IF NOT EXISTS `users` (`id` BIGINT auto_increment , `email` VARCHAR(191) NOT NULL UNIQUE, `name` VARCHAR(100) NOT NULL, `balance` DECIMAL(10,2) NOT NULL DEFAULT 0, `is_active` TINYINT(1) NOT NULL DEFAULT true, `profile` JSON, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, `version` INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+        "CREATE TABLE IF NOT EXISTS `posts` (`id` BIGINT auto_increment , `title` VARCHAR(200) NOT NULL, `body` TEXT, `published_at` DATETIME, `views` INTEGER NOT NULL DEFAULT 0, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, `user_id` BIGINT NOT NULL, PRIMARY KEY (`id`), FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE) ENGINE=InnoDB;",
+        "ALTER TABLE `posts` ADD INDEX `posts_user_published` (`user_id`, `published_at`)",
+        "INSERT INTO users (id, email, name, created_at, updated_at) VALUES (1, 'x@example.com', 'X', '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        written(adapter.execute_stmt_execute(insert, &a_new_post("y", 1.0))),
+        (1, 1)
+    );
+    assert_eq!(
+        written(adapter.execute_stmt_execute(update, &one_double(1.0))),
+        (1, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, title, views, user_id FROM posts"),
+        words(&[&["1", "y", "2", "1"]])
+    );
+    run(&mut adapter, "DROP TABLE `posts`");
+    for (statement, payload) in [(insert, a_new_post("z", 1.0)), (update, one_double(1.0))] {
+        assert!(matches!(
+            adapter.execute_stmt_execute(statement, &payload),
+            Err(FrontendErrorKind::MissingObject)
+        ));
+    }
+}

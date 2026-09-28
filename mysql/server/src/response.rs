@@ -449,6 +449,10 @@ pub enum FrontendErrorKind {
     LongDataTooLarge,
     /// The statement or feature is not implemented.
     Unsupported,
+    /// A prepared write's table was dropped and made again, or altered, since
+    /// it was prepared. The adapter prepares it again and runs it once more,
+    /// so a client meets this only when that cannot be done, as a 1235.
+    PreparedOverAChangedTable,
     /// A packet before sign-in did not read as the one the client owed.
     BadHandshake,
     /// A command packet too short to hold what its command needs.
@@ -744,7 +748,9 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             b"Parameter of prepared statement which is set through mysql_send_long_data() is longer than 'max_allowed_packet' bytes"
                 .as_slice(),
         ),
-        FrontendErrorKind::Unsupported => (1235, *b"42000", b"feature not supported".as_slice()),
+        FrontendErrorKind::Unsupported | FrontendErrorKind::PreparedOverAChangedTable => {
+            (1235, *b"42000", b"feature not supported".as_slice())
+        }
         // Measured on MySQL 8.4.11, message and all, for a packet that does
         // not read as an SSLRequest or a handshake response.
         FrontendErrorKind::BadHandshake => (1043, *b"08S01", b"Bad handshake".as_slice()),
