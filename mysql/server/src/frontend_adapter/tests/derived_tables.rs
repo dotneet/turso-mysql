@@ -859,9 +859,115 @@ fn typeorms_pagination_over_a_relation_answers_what_mysql_answers() {
         ])
     );
 
-    // TypeORM then reads the page's posts, naming each id as a word.
+    // TypeORM then reads the page's posts, naming each id as a word. Each
+    // column names its table's alias as written, `Post`.
     let sql = format!("{POSTS_WITH_TAGS} WHERE `Post`.`id` IN ('1', '2') ORDER BY `Post`.`id` ASC");
-    let (_, answered) = read(&mut adapter, &sql);
+    let (columns, answered) = read(&mut adapter, &sql);
+    let joined =
+        |name, table, original_table, original_name, column_type, length, flags, character_set| {
+            Column {
+                name,
+                table,
+                original_table,
+                original_name,
+                names_the_database: true,
+                column_type,
+                length,
+                decimals: 0,
+                flags,
+                character_set,
+            }
+        };
+    let no_default = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    assert_columns(
+        &sql,
+        &columns,
+        &[
+            joined(
+                "Post_id",
+                "Post",
+                "posts",
+                "id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                MYSQL_NOT_NULL_FLAG
+                    | MYSQL_PRI_KEY_FLAG
+                    | MYSQL_AUTO_INCREMENT_FLAG
+                    | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            joined(
+                "Post_user_id",
+                "Post",
+                "posts",
+                "user_id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                no_default,
+                BINARY,
+            ),
+            joined(
+                "Post_title",
+                "Post",
+                "posts",
+                "title",
+                MYSQL_TYPE_VAR_STRING,
+                800,
+                no_default,
+                WORDS,
+            ),
+            joined(
+                "Post_body",
+                "Post",
+                "posts",
+                "body",
+                MYSQL_TYPE_BLOB,
+                262_140,
+                MYSQL_BLOB_FLAG,
+                WORDS,
+            ),
+            joined(
+                "Post_published_at",
+                "Post",
+                "posts",
+                "published_at",
+                MYSQL_TYPE_DATETIME,
+                19,
+                MYSQL_BINARY_FLAG,
+                BINARY,
+            ),
+            joined(
+                "Post_views",
+                "Post",
+                "posts",
+                "views",
+                MYSQL_TYPE_LONG,
+                11,
+                MYSQL_NOT_NULL_FLAG,
+                BINARY,
+            ),
+            joined(
+                "Post__Post_tags_id",
+                "Post__Post_tags",
+                "tags",
+                "id",
+                MYSQL_TYPE_LONGLONG,
+                20,
+                MYSQL_PRI_KEY_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG,
+                BINARY,
+            ),
+            joined(
+                "Post__Post_tags_name",
+                "Post__Post_tags",
+                "tags",
+                "name",
+                MYSQL_TYPE_VAR_STRING,
+                400,
+                MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG,
+                WORDS,
+            ),
+        ],
+    );
     assert_eq!(
         answered,
         rows(&[

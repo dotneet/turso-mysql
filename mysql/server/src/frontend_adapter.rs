@@ -6544,7 +6544,16 @@ impl TableResultMetadata {
             // The engine reports the name the statement read the table under,
             // spelled the way it was declared. A derived table's name was
             // declared by the statement, and MySQL reports it as written.
-            definition.table = table_reference;
+            // So is an alias, which the engine reports in lower case:
+            // measured, `FROM posts Post` names `Post`.
+            definition.table = if table
+                .table_reference
+                .eq_ignore_ascii_case(&table.source_table)
+            {
+                table_reference
+            } else {
+                table.table_reference.clone()
+            };
         }
         if let Some(derived) = &table.derived {
             read_through_a_derived_table(&mut definition, derived, ordinal);

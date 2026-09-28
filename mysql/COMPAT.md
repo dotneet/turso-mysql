@@ -2565,7 +2565,10 @@ engine spells it the same way. It mixes with a plain column and with a second
 wildcard, and every column keeps the metadata it would carry on its own: on the
 outer side of a `LEFT JOIN` the unmatched row answers NULL throughout and the
 NOT_NULL flag is dropped, and under an alias the columns report the alias as
-their table and the real name as the original table. Naming the table an alias
+their table and the real name as the original table. The alias is reported as
+written, as MySQL reports it — measured, `FROM posts Post` names `Post`; the
+engine reads an alias in lower case, and `post` used to be reported for any
+column read under one. Naming the table an alias
 renamed — `SELECT a.* FROM a AS t` — answers 1051 in MySQL and is refused here
 too. A qualifier carrying a schema, `db.t.*`, is answered by MySQL but refused
 here, being a source name that has to be resolved across databases first.
