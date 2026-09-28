@@ -12533,6 +12533,9 @@ fn checked_comparison_fits_column(
             type_name,
             "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BOOLEAN"
         ),
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Count) => {
+            is_integer_type(type_name) && type_name != "BIGINT UNSIGNED"
+        }
         // The engine answers the fallback in the column's own form for these;
         // a DECIMAL, a moment and an unsigned BIGINT are each held in a form
         // of their own that a written fallback is not.
@@ -13103,6 +13106,9 @@ fn checked_comparison_column_refusal(
         }
         CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Fallback) => {
             "a whole-number, DOUBLE or text column"
+        }
+        CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Count) => {
+            "a whole-number column other than a BIGINT UNSIGNED"
         }
     };
     LimboError::InvalidArgument(format!(

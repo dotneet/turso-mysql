@@ -1198,6 +1198,11 @@ pub enum CheckedComparisonOperand {
     /// By `COALESCE(col, value)` or `IFNULL(col, value)`. The written value
     /// is held to the column as a comparison of its own would be.
     Fallback,
+    /// Against a `COUNT` subquery, which answers a whole number the engine
+    /// holds as a plain integer. The column has to hold whole numbers in that
+    /// same form, which a `BIGINT UNSIGNED`, held as a blob of its own, does
+    /// not.
+    Count,
 }
 
 /// What a call answering the moment the statement runs answers.

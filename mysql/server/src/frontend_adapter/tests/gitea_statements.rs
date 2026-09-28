@@ -427,3 +427,84 @@ fn xorms_column_listing_answers_its_version_test() {
         ]
     );
 }
+
+fn first_column(adapter: &mut Adapter, sql: &str) -> Vec<String> {
+    rows(adapter, sql)
+        .into_iter()
+        .map(|row| row[0].clone().unwrap())
+        .collect()
+}
+
+/// Gitea's consistency checks find the rows whose kept count is off by
+/// comparing the count column with a correlated `COUNT(*)`. A count answers
+/// exactly one whole number per row, so it meets a column held to a whole
+/// number the way a written one does. Every answer here was measured on
+/// MySQL 8.4.11 over the same rows, a NULL count column answering no row.
+#[test]
+fn giteas_consistency_checks_compare_a_count_column_with_a_count() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `num_watches` INT NULL, `num_stars` INT NULL)",
+        "CREATE TABLE `watch` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `user_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL, `mode` SMALLINT DEFAULT 1 NOT NULL)",
+        "CREATE TABLE `star` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `uid` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+        "INSERT INTO `repository` (`num_watches`, `num_stars`) VALUES (1, 0), (2, 1), (0, NULL), (3, 2)",
+        "INSERT INTO `watch` (`user_id`, `repo_id`, `mode`) VALUES (1, 1, 1), (2, 2, 1), (3, 2, 2), (4, 4, 1), (5, 4, 1), (6, 4, 1)",
+        "INSERT INTO `star` (`uid`, `repo_id`) VALUES (1, 2), (2, 4), (3, 4), (4, 3)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT repo.id FROM `repository` repo WHERE repo.num_watches!=(SELECT COUNT(*) FROM `watch` WHERE repo_id=repo.id AND mode<>2)"
+        ),
+        ["2"]
+    );
+    assert!(first_column(
+        &mut adapter,
+        "SELECT repo.id FROM `repository` repo WHERE repo.num_stars!=(SELECT COUNT(*) FROM `star` WHERE repo_id=repo.id)"
+    )
+    .is_empty());
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT id FROM repository WHERE num_watches = (SELECT COUNT(*) FROM watch WHERE watch.repo_id = repository.id) ORDER BY id"
+        ),
+        ["1", "2", "3", "4"]
+    );
+    assert!(first_column(
+        &mut adapter,
+        "SELECT id FROM repository WHERE (SELECT COUNT(*) FROM star WHERE star.repo_id = repository.id) < num_stars"
+    )
+    .is_empty());
+    // A word meets a count by being read as a number, which is not worked
+    // out here.
+    run(
+        &mut adapter,
+        "CREATE TABLE `label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `name` VARCHAR(10) NULL)",
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT id FROM label WHERE name != (SELECT COUNT(*) FROM star WHERE star.repo_id = label.id)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+    // A `BIGINT UNSIGNED` is held in a form of its own, which a count the
+    // engine answers as a plain integer does not compare with.
+    run(
+        &mut adapter,
+        "CREATE TABLE `counted` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `big` BIGINT UNSIGNED NULL)",
+    );
+    for sql in [
+        "SELECT id FROM counted WHERE big > (SELECT COUNT(*) FROM star)",
+        "UPDATE counted SET big = (SELECT COUNT(*) FROM star) WHERE id = 1",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql} must be refused"
+        );
+    }
+}

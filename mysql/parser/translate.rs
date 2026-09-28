@@ -11566,6 +11566,27 @@ fn render_comparison_over_a_scalar_subquery(
         (ScalarSubqueryAnswer::AWholeNumber, other) if names_a_whole_number(other) => {
             render_dml_expr(other)?
         }
+        // A column held to a whole number meets a count the way it meets a
+        // written one: Gitea's consistency checks find the rows whose kept
+        // count is off, `num_stars != (SELECT COUNT(*) FROM star WHERE
+        // repo_id = repo.id)`.
+        (ScalarSubqueryAnswer::AWholeNumber, Expr::Identifier(column)) => {
+            render_context
+                .checked_comparisons
+                .push(compared_with_a_count(None, &column.value));
+            render_select_expr(other, render_context)?
+        }
+        (ScalarSubqueryAnswer::AWholeNumber, Expr::CompoundIdentifier(parts))
+            if parts.len() == 2 =>
+        {
+            render_context
+                .checked_comparisons
+                .push(compared_with_a_count(
+                    Some(parts[0].value.clone()),
+                    &parts[1].value,
+                ));
+            render_select_expr(other, render_context)?
+        }
         _ => return Ok(None),
     };
     let Some(inner_table) = subquery_source_table(select) else {
@@ -11654,21 +11675,15 @@ fn render_comparison_against_an_average(
         .ok_or(ParseError::Unsupported {
             feature: "SELECT comparison against an average of an unknown table",
         })?;
-    let whole_number = |qualifier, column_name: &str| CheckedSelectComparison {
-        qualifier,
-        inner_sources: Vec::new(),
-        column_name: column_name.to_owned(),
-        operator: CheckedSelectComparisonOperator::Equal,
-        rhs: CheckedSelectComparisonRhs::SignedInteger(1),
-        collated: false,
-        answers: None,
-    };
     render_context
         .checked_comparisons
-        .push(whole_number(qualifier, &column.value));
+        .push(held_to_a_whole_number(qualifier, &column.value));
     render_context
         .checked_comparisons
-        .push(whole_number(Some(inner_reference), inner_column_name));
+        .push(held_to_a_whole_number(
+            Some(inner_reference),
+            inner_column_name,
+        ));
     let rendered_column = render_select_expr(other, render_context)?;
     let average = format!("({rendered_subquery})");
     // The operator reads left to right, whichever side the subquery is on.
@@ -11686,6 +11701,34 @@ fn render_comparison_against_an_average(
         BinaryOperator::NotEq => format!("(NOT numeric_eq({lhs}, {rhs}))"),
         _ => return unsupported("SELECT comparison against an average with this operator"),
     }))
+}
+
+/// A check that holds one column to a whole number, the way comparing it
+/// with a written one does.
+fn held_to_a_whole_number(qualifier: Option<String>, column_name: &str) -> CheckedSelectComparison {
+    CheckedSelectComparison {
+        qualifier,
+        inner_sources: Vec::new(),
+        column_name: column_name.to_owned(),
+        operator: CheckedSelectComparisonOperator::Equal,
+        rhs: CheckedSelectComparisonRhs::SignedInteger(1),
+        collated: false,
+        answers: None,
+    }
+}
+
+/// A check that holds one column to whole numbers the engine holds as plain
+/// integers, which is what a count it is compared with answers.
+fn compared_with_a_count(qualifier: Option<String>, column_name: &str) -> CheckedSelectComparison {
+    CheckedSelectComparison {
+        qualifier,
+        inner_sources: Vec::new(),
+        column_name: column_name.to_owned(),
+        operator: CheckedSelectComparisonOperator::Equal,
+        rhs: CheckedSelectComparisonRhs::Operand(crate::CheckedComparisonOperand::Count),
+        collated: false,
+        answers: None,
+    }
 }
 
 /// What a subquery standing where a value stands answers.

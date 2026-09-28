@@ -3022,6 +3022,22 @@ fn a_comparison_renders_a_subquery_that_answers_one_value() {
     assert_eq!(pair.inner_table(), "teams");
     assert_eq!(pair.inner_column_name(), "points");
 
+    // A COUNT meets a column the way a written whole number does, so the
+    // column is held to a whole number; the frontend refuses a word there.
+    let translated = parse_select(
+        "SELECT id FROM users WHERE name = (SELECT COUNT(*) FROM teams)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated
+            .checked_comparisons()
+            .iter()
+            .map(|comparison| (comparison.qualifier(), comparison.column_name()))
+            .collect::<Vec<_>>(),
+        [(None, "name")]
+    );
+
     // MySQL rounds AVG to four places and compares the column against that
     // decimal, so the engine's exact decimal average is compared as a number.
     let translated = parse_select(
@@ -3049,8 +3065,6 @@ fn a_comparison_renders_a_subquery_that_answers_one_value() {
         "SELECT id FROM users WHERE score > (SELECT SUM(score) FROM users)",
         // A grouped subquery answers a row per group.
         "SELECT id FROM users WHERE score = (SELECT MAX(score) FROM users GROUP BY team)",
-        // A COUNT meets a whole number and nothing else.
-        "SELECT id FROM users WHERE name = (SELECT COUNT(*) FROM teams)",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_err(),
