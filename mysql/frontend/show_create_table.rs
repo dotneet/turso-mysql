@@ -56,10 +56,11 @@ pub fn render_create_table(
         })
         .unwrap_or_default();
     Some(format!(
-        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET={} COLLATE={}{comment}",
+        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET={} COLLATE={}{}{comment}",
         quoted(table),
         options.collation.character_set(),
-        options.collation.name()
+        options.collation.name(),
+        options.written_row_format(),
     ))
 }
 

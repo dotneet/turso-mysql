@@ -6024,7 +6024,7 @@ fn takes_the_table_options_that_name_what_a_table_is_written_back_as() {
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
-        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=COMPACT",
         // The same option twice says nothing more the second time, and MySQL
         // takes the last one written, which this would have to read as well.
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) CHARSET=utf8mb4 CHARSET=utf8mb4",

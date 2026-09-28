@@ -204,3 +204,66 @@ fn giteas_collation_check_joins_its_tests_by_or() {
         Err(FrontendErrorKind::UnknownColumn)
     ));
 }
+
+fn create_table(adapter: &mut Adapter, table: &str) -> String {
+    rows(adapter, &format!("SHOW CREATE TABLE `{table}`"))[0][1]
+        .clone()
+        .unwrap()
+}
+
+/// xorm writes `ROW_FORMAT=DYNAMIC` after every table Gitea makes, and
+/// `ALTER TABLE t ROW_FORMAT=dynamic` over each when Gitea converts a
+/// database. Measured on MySQL 8.4.11: it is printed back upper-cased after
+/// the collation and before the comment, kept across a rewrite and by `LIKE`,
+/// reported as `row_format=DYNAMIC` in `SHOW TABLE STATUS`, and `DEFAULT`
+/// takes it away.
+#[test]
+fn xorms_dynamic_row_format_is_kept_and_printed_back() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `version` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `version` BIGINT(20) NULL) ROW_FORMAT=DYNAMIC",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `session` (`key` CHAR(16) PRIMARY KEY NOT NULL, `data` BLOB NULL, `expiry` BIGINT(20) NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC COMMENT='kept'",
+    );
+    assert_eq!(
+        create_table(&mut adapter, "version"),
+        "CREATE TABLE `version` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `version` bigint DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC"
+    );
+    run(&mut adapter, "ALTER TABLE `session` ADD COLUMN `n` INT");
+    assert!(create_table(&mut adapter, "session").ends_with(
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC COMMENT='kept'"
+    ));
+    let status = rows(&mut adapter, "SHOW TABLE STATUS LIKE 'session'");
+    assert_eq!(status[0][16].as_deref(), Some("row_format=DYNAMIC"));
+    run(&mut adapter, "CREATE TABLE `copied` LIKE `session`");
+    assert!(create_table(&mut adapter, "copied").ends_with("ROW_FORMAT=DYNAMIC COMMENT='kept'"));
+    run(&mut adapter, "ALTER TABLE `session` ROW_FORMAT=DEFAULT");
+    assert!(create_table(&mut adapter, "session")
+        .ends_with("COLLATE=utf8mb4_0900_ai_ci COMMENT='kept'"));
+    run(&mut adapter, "ALTER TABLE `session` ROW_FORMAT=dynamic");
+    assert!(create_table(&mut adapter, "session").ends_with("ROW_FORMAT=DYNAMIC COMMENT='kept'"));
+    assert_eq!(
+        rows(&mut adapter, "SHOW TABLE STATUS LIKE 'version'")[0][16].as_deref(),
+        Some("row_format=DYNAMIC")
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE `plain` (`id` INT) ROW_FORMAT=DEFAULT",
+    );
+    assert!(create_table(&mut adapter, "plain").ends_with("COLLATE=utf8mb4_0900_ai_ci"));
+    for sql in [
+        "CREATE TABLE `compact` (`id` INT) ROW_FORMAT=COMPACT",
+        "ALTER TABLE `session` ROW_FORMAT=COMPRESSED",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql} must be refused"
+        );
+    }
+}

@@ -236,7 +236,8 @@ pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column, character_set_of_collation,
     create_table_with_its_collation_on_each_text_column, create_table_with_the_database_collation,
     table_collation_of, table_comment_change, table_counter_change, table_engine_restated,
-    table_options_of, widest_character_of_collation, MySqlTableCollation, MySqlTableOptions,
+    table_options_of, table_row_format_change, widest_character_of_collation, MySqlTableCollation,
+    MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
@@ -7541,9 +7542,14 @@ pub(crate) fn reject_attributes_and_check_options(
 /// `COLLATE=utf8mb4_unicode_ci` is taken as well, and is what the table's text
 /// columns are compared under unless they name their own.
 ///
+/// `ROW_FORMAT=DYNAMIC` is taken and kept: it is how InnoDB stores every
+/// table here anyway, and measured on 8.4.11 it is printed back after the
+/// collation, and `ROW_FORMAT=DEFAULT` is taken and not printed. xorm writes
+/// `ROW_FORMAT=DYNAMIC` on every table Gitea makes.
+///
 /// Anything else is a claim about storage, ordering or case this cannot keep:
 /// measured, `COLLATE=utf8mb4_bin`, `DEFAULT CHARSET=latin1` and
-/// `ROW_FORMAT=DYNAMIC` are each printed back, so each is refused rather than
+/// `ROW_FORMAT=COMPACT` are each printed back, so each is refused rather than
 /// quietly dropped.
 pub(crate) fn check_table_options(
     options: &CreateTableOptions,
@@ -7601,6 +7607,21 @@ pub(crate) fn check_table_options(
                 checked.collation = collation;
                 "COLLATE"
             }
+            SqlOption::KeyValue { key, value } if key.value.eq_ignore_ascii_case("ROW_FORMAT") => {
+                let format = written_word(value);
+                if format
+                    .as_deref()
+                    .is_some_and(|format| format.eq_ignore_ascii_case("DYNAMIC"))
+                {
+                    checked.dynamic_row_format = true;
+                } else if !format
+                    .as_deref()
+                    .is_some_and(|format| format.eq_ignore_ascii_case("DEFAULT"))
+                {
+                    return unsupported("CREATE TABLE ROW_FORMAT other than DYNAMIC");
+                }
+                "ROW_FORMAT"
+            }
             // Measured on MySQL 8.4.11: the comment is printed last, after
             // the collation, and an empty one is not printed at all.
             SqlOption::Comment(CommentDef::WithEq(comment) | CommentDef::WithoutEq(comment)) => {
@@ -7634,6 +7655,7 @@ pub(crate) fn check_table_options(
 pub(crate) struct CheckedTableOptions {
     pub(crate) starts_the_counter_at: Option<u64>,
     pub(crate) collation: MySqlTableCollation,
+    pub(crate) dynamic_row_format: bool,
     pub(crate) comment: Option<String>,
 }
 
@@ -7642,6 +7664,7 @@ impl CheckedTableOptions {
     pub(crate) fn kept(&self) -> MySqlTableOptions {
         MySqlTableOptions {
             collation: self.collation,
+            dynamic_row_format: self.dynamic_row_format,
             comment: self.comment.clone(),
         }
     }

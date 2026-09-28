@@ -544,20 +544,30 @@ impl turso_core::SchemaSqlFormatter for CreatorSchemaSqlFormatter {
     }
 }
 
-/// Writes one table's schema again with another `COMMENT`, which is how an
-/// `ALTER TABLE t COMMENT = '...'` changes it.
+/// Writes one table's schema again with another `COMMENT` or row format, which
+/// is how an `ALTER TABLE t COMMENT = '...'` or `ALTER TABLE t ROW_FORMAT=...`
+/// changes it.
 ///
-/// The engine keeps no comment, so the comment lives at the end of the stored
-/// MySQL `CREATE TABLE` and is carried across every rewrite of it; this
-/// replaces it in the rewrite of the one table named, and leaves every other
-/// row the statement rewrites as the session's own formatter writes it.
-pub struct TableCommentSchemaSqlFormatter {
+/// The engine keeps neither, so they live at the end of the stored MySQL
+/// `CREATE TABLE` and are carried across every rewrite of it; this replaces
+/// one in the rewrite of the one table named, and leaves every other row the
+/// statement rewrites as the session's own formatter writes it.
+pub struct TableOptionSchemaSqlFormatter {
     pub context: SchemaSqlSessionContext,
     pub table: String,
-    pub comment: Option<String>,
+    pub change: TableOptionChange,
 }
 
-impl turso_core::SchemaSqlFormatter for TableCommentSchemaSqlFormatter {
+/// The one table option an `ALTER TABLE` changes.
+#[derive(Debug, Clone)]
+pub enum TableOptionChange {
+    /// The new comment, `None` taking it away.
+    Comment(Option<String>),
+    /// Whether the table is now `ROW_FORMAT=DYNAMIC`.
+    DynamicRowFormat(bool),
+}
+
+impl turso_core::SchemaSqlFormatter for TableOptionSchemaSqlFormatter {
     fn format_schema_sql(
         &self,
         kind: SchemaSqlKind,
@@ -597,9 +607,15 @@ impl turso_core::SchemaSqlFormatter for TableCommentSchemaSqlFormatter {
                 "stored MySQL table does not end with its own options".into(),
             ));
         };
-        let changed = turso_mysql_parser::MySqlTableOptions {
-            comment: self.comment.clone(),
-            ..carried
+        let changed = match &self.change {
+            TableOptionChange::Comment(comment) => turso_mysql_parser::MySqlTableOptions {
+                comment: comment.clone(),
+                ..carried
+            },
+            TableOptionChange::DynamicRowFormat(dynamic) => turso_mysql_parser::MySqlTableOptions {
+                dynamic_row_format: *dynamic,
+                ..carried
+            },
         };
         reencode_schema_sql(decoded, &format!("{definition}{}", changed.written()))
             .map_err(schema_sql_error_to_limbo)

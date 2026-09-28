@@ -39,7 +39,7 @@ use std::time::Duration;
 use turso_core::Statement;
 use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
-use turso_mysql::schema_sql::SchemaSqlCreator;
+use turso_mysql::schema_sql::{SchemaSqlCreator, TableOptionChange};
 #[cfg(unix)]
 use turso_mysql::session_registry::{MySqlSessionRegistration, RunningStatement};
 use turso_mysql::session_registry::{MySqlSessionRegistry, MySqlSessionSnapshot};
@@ -81,13 +81,13 @@ use turso_mysql_parser::{
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     renamed_tables, select_projection_origins, table_comment_change, table_counter_change,
-    table_engine_restated, ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch,
-    ColumnAggregateKind, ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
-    ConnectorJTables, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
-    MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
-    MySqlInformationSchemaTablesColumn, MySqlJoinedDerivedColumn, MySqlLikePattern,
-    MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
-    ScalarFunction,
+    table_engine_restated, table_row_format_change, ArithmeticOperand, ArithmeticOperator,
+    ArithmeticShape, Branch, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
+    ConnectorJSchemataListingQuery, ConnectorJTables, GormInformationSchemaPreparedQuery,
+    MySqlAccountAdminCommand, MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns,
+    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
+    MySqlJoinedDerivedColumn, MySqlLikePattern, MySqlLockTablesCommand,
+    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
@@ -4017,6 +4017,7 @@ where
                         rows: 0,
                         auto_increment: None,
                         collation: "",
+                        dynamic_row_format: false,
                         comment: String::new(),
                     });
                     continue;
@@ -4033,6 +4034,7 @@ where
                     rows: counted,
                     auto_increment: None,
                     collation: table.collation().unwrap_or_default().name(),
+                    dynamic_row_format: table.dynamic_row_format(),
                     comment: table.comment().unwrap_or_default().to_owned(),
                 });
             }
@@ -5451,11 +5453,17 @@ fn execute_checked_statement(
         Ok(false) => {}
         Err(_) => return Err(FrontendErrorKind::Unsupported),
     }
-    if let Some((table, comment)) = table_comment_change(sql, connection.parser_mode())
+    let option_change = match table_comment_change(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Unsupported)?
     {
+        Some((table, comment)) => Some((table, TableOptionChange::Comment(comment))),
+        None => table_row_format_change(sql, connection.parser_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+            .map(|(table, dynamic)| (table, TableOptionChange::DynamicRowFormat(dynamic))),
+    };
+    if let Some((table, change)) = option_change {
         connection
-            .execute_table_comment(&table, comment)
+            .execute_table_option(&table, change)
             .map_err(|error| match error {
                 MySqlQueryError::MissingTable => FrontendErrorKind::MissingObject,
                 error => frontend_query_error(error),

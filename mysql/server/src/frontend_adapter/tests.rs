@@ -27485,7 +27485,7 @@ fn a_table_takes_the_trailer_it_is_printed_with() {
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
-        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=COMPACT",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }

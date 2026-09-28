@@ -107,21 +107,33 @@ pub fn widest_character_of_collation(collation: &str) -> u64 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MySqlTableOptions {
     pub collation: MySqlTableCollation,
+    /// Whether the table was declared `ROW_FORMAT=DYNAMIC`, which MySQL prints
+    /// back though it is InnoDB's own default.
+    pub dynamic_row_format: bool,
     /// The table's `COMMENT`, `None` where it has none or an empty one.
     pub comment: Option<String>,
 }
 
 impl MySqlTableOptions {
     /// What ends the stored `CREATE TABLE` of a table with these options, in
-    /// the order MySQL prints them: the collation, then the comment.
+    /// the order MySQL prints them: the collation, the row format, then the
+    /// comment.
     pub fn written(&self) -> String {
-        match &self.comment {
-            Some(comment) => format!(
-                "{} COMMENT={}",
-                self.collation.table_option(),
-                super::quoted_mysql_text(comment)
-            ),
-            None => self.collation.table_option().to_owned(),
+        let mut written = self.collation.table_option().to_owned();
+        written.push_str(self.written_row_format());
+        if let Some(comment) = &self.comment {
+            written.push_str(" COMMENT=");
+            written.push_str(&super::quoted_mysql_text(comment));
+        }
+        written
+    }
+
+    /// ` ROW_FORMAT=DYNAMIC` for a table declared with it, nothing otherwise.
+    pub const fn written_row_format(&self) -> &'static str {
+        if self.dynamic_row_format {
+            " ROW_FORMAT=DYNAMIC"
+        } else {
+            ""
         }
     }
 }
@@ -193,6 +205,37 @@ pub fn table_comment_change(
             feature: "ALTER TABLE name",
         })?;
     Ok(Some((table, super::checked_table_comment(comment)?)))
+}
+
+/// Reads an `ALTER TABLE t ROW_FORMAT=...` that does nothing else, as the
+/// table and whether it is to be `DYNAMIC`.
+///
+/// xorm writes `ALTER TABLE t ROW_FORMAT=dynamic` over every table when Gitea
+/// converts a database. Measured on MySQL 8.4.11, `DYNAMIC` in any case is
+/// printed back upper-cased after the collation and `DEFAULT` takes it away.
+/// Every other format is refused: InnoDB stores those rows another way, and
+/// MySQL prints them back too. Answers `None` for any other statement.
+pub fn table_row_format_change(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<(super::MySqlTableName, bool)>, ParseError> {
+    let Some((table, option, value)) = one_table_option(sql, mode) else {
+        return Ok(None);
+    };
+    if !option.eq_ignore_ascii_case("ROW_FORMAT") {
+        return Ok(None);
+    }
+    match value {
+        Token::Word(format) if format.value.eq_ignore_ascii_case("DYNAMIC") => {
+            Ok(Some((table, true)))
+        }
+        Token::Word(format) if format.value.eq_ignore_ascii_case("DEFAULT") => {
+            Ok(Some((table, false)))
+        }
+        _ => Err(ParseError::Unsupported {
+            feature: "ALTER TABLE ROW_FORMAT other than DYNAMIC",
+        }),
+    }
 }
 
 /// Reads an `ALTER TABLE t ENGINE=InnoDB` that does nothing else, as the table

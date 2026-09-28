@@ -2419,7 +2419,13 @@ pub(super) fn show_table_status_result_to_execution_result(
                 None,
                 Some(row.collation.as_bytes().to_vec()),
                 None,
-                Some(Vec::new()),
+                // Measured on MySQL 8.4.11: `row_format=DYNAMIC` for a table
+                // declared with it, and empty for one declared with none.
+                Some(if row.dynamic_row_format {
+                    b"row_format=DYNAMIC".to_vec()
+                } else {
+                    Vec::new()
+                }),
                 Some(row.comment.into_bytes()),
             ]
         })
@@ -2444,6 +2450,8 @@ pub(super) struct ShowTableStatusRow {
     pub auto_increment: Option<u64>,
     /// The collation the table was declared with.
     pub collation: &'static str,
+    /// Whether the table was declared `ROW_FORMAT=DYNAMIC`.
+    pub dynamic_row_format: bool,
     /// The table's `COMMENT`, empty where it has none.
     pub comment: String,
 }

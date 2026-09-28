@@ -697,6 +697,13 @@ impl MySqlTable {
             .as_ref()
             .map(|options| options.comment.as_deref().unwrap_or_default())
     }
+
+    /// Returns whether a base table was declared `ROW_FORMAT=DYNAMIC`.
+    pub fn dynamic_row_format(&self) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.dynamic_row_format)
+    }
 }
 
 /// Metadata returned after a checked MySQL statement is prepared.
@@ -5329,17 +5336,17 @@ impl MySqlConnection {
         Ok((high_water > 0).then_some(high_water))
     }
 
-    /// Runs one `ALTER TABLE t COMMENT = '...'`, `None` taking the comment
-    /// away.
+    /// Runs one `ALTER TABLE t COMMENT = '...'` or `ALTER TABLE t
+    /// ROW_FORMAT=...`.
     ///
-    /// The comment lives at the end of the stored MySQL `CREATE TABLE`, which
-    /// the engine writes again whenever it changes the table. So the engine is
+    /// Both live at the end of the stored MySQL `CREATE TABLE`, which the
+    /// engine writes again whenever it changes the table. So the engine is
     /// asked for the one change that alters nothing — a column renamed to its
-    /// own name — and the table is written back with the new comment.
-    pub fn execute_table_comment(
+    /// own name — and the table is written back with the new option.
+    pub fn execute_table_option(
         &self,
         table: &MySqlTableName,
-        comment: Option<String>,
+        change: crate::schema_sql::TableOptionChange,
     ) -> std::result::Result<(), MySqlQueryError> {
         let schema = self.inner.current_schema();
         let Some(btree) = schema.get_btree_table(table.as_str()) else {
@@ -5374,10 +5381,10 @@ impl MySqlConnection {
                 mode: self.parser_mode(),
             }))
             .with_schema_sql_formatter(Arc::new(
-                crate::schema_sql::TableCommentSchemaSqlFormatter {
+                crate::schema_sql::TableOptionSchemaSqlFormatter {
                     context: self.schema_context,
                     table: btree.name.clone(),
-                    comment,
+                    change,
                 },
             ));
         // DDL commits what came before it, which is what MySQL does.
@@ -5389,7 +5396,7 @@ impl MySqlConnection {
             .inner
             .prepare_translated_stmt_with_options(
                 stmt,
-                &format!("ALTER TABLE {} COMMENT", mysql_quoted(table.as_str())),
+                &format!("ALTER TABLE {} option", mysql_quoted(table.as_str())),
                 &options,
             )
             .and_then(|mut statement| statement.run_ignore_rows())
