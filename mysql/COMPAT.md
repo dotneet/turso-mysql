@@ -2890,7 +2890,10 @@ leaves out takes its default. It is rendered as the other form rather than given
 rules of its own, so one set of rules covers both: the same value kinds, the
 same required-column check, the same refusals. An `AUTO_INCREMENT` table takes
 it too: the allocator reads only the column-list form, so the SET one is written
-out as that before it reaches the allocator, where the table is known. Measured
+out as that before it reaches the allocator, where the table is known. A word
+holding a backslash is refused there while backslashes escape: sqlparser writes
+a word out again with its quotes doubled and its backslashes as they stand, so
+`'a\\\'b'` would come back as `'a\''b'` and be read as another word. Measured
 on 8.4.11, `INSERT INTO ai SET v = 1, s = 'a'` numbers the row 1 and
 `LAST_INSERT_ID()` answers 1, which this matches, and naming the key itself is
 refused on both forms alike — the allocator reserves before the row is written,
@@ -3307,6 +3310,20 @@ bytes. `HEX(NULL)` answers NULL over any column, where the engine's own `hex`
 answers an empty word. A `VARBINARY` or a `BLOB` written before this frontend
 stored bytes may hold text, which a written word no longer compares equal to;
 an `UPDATE` of the row stores it as bytes.
+
+Bytes written out are a column of bytes' own values: `X'616263'`, `0x616263`,
+`b'01100001'`, `_binary 'abc'` and `_binary X'616263'` are stored as those
+bytes by an `INSERT` — with its columns named or not, as a dump writes its
+rows, a counted table's among them — an `INSERT ... SET`, an `ON DUPLICATE KEY
+UPDATE` and an `UPDATE`, and found by a comparison, `IN` included, written the
+same ways. A word after `_binary` is the bytes it is written in, its escapes
+worked out. Written into any other column they are refused: measured on
+8.4.11, `X'41'` is the number 65 in an `INT` and the word `A` in a `VARCHAR`,
+while `_binary X'41'` is a word even in an `INT`, answering 1366 there, and
+compared with a column of words each follows its own rule. A hexadecimal
+literal with an odd count of digits is refused, MySQL answering 1064 for
+`X'ABC'` and reading `0xABC` as `0x0ABC`, which reach this spelled alike. In a
+projection they stay refused.
 
 `BINARY(n)` is refused. Measured on the same server, it pads a shorter value
 with NUL bytes to the declared width — `'ab'` in a `BINARY(16)` reads back

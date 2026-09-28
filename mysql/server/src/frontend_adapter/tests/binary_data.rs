@@ -299,3 +299,94 @@ fn hex_and_length_read_the_bytes() {
         ]]
     );
 }
+
+/// Bytes written out — `X'..'`, `0x..`, `b'..'`, and a word or hexadecimal
+/// literal after `_binary` — are stored as those bytes, in an `INSERT` with
+/// or without its columns named, an `INSERT ... SET` and an `UPDATE`, and
+/// found by a comparison written the same ways. A word after `_binary` is the
+/// bytes it is written in, its escapes worked out.
+#[test]
+fn bytes_written_out_are_stored_and_found() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "INSERT INTO t (id, b, vb) VALUES (1, X'FF00', 0x0001), (2, b'0100000101000010', _binary 'ab')",
+        "INSERT INTO t VALUES (3, _binary X'', NULL, NULL, NULL, X'')",
+        "INSERT INTO t (id, b) VALUES (4, _binary '\\0\\n\\Z\\\\\\'é')",
+        "INSERT INTO t SET id = 5, vb = _binary 'x'",
+        "UPDATE t SET b = _binary'zz', vb = 0xFFFF WHERE id = 5",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, HEX(b), HEX(vb) FROM t ORDER BY id"
+        ),
+        [
+            ["1", "FF00", "0001"],
+            ["2", "4142", "6162"],
+            ["3", "", ""],
+            ["4", "000A1A5C27C3A9", ""],
+            ["5", "7A7A", "FFFF"],
+        ]
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(at, value)| {
+                    (at == 0 || !value.is_empty() || row[0] == "3")
+                        .then(|| value.as_bytes().to_vec())
+                })
+                .collect::<Vec<_>>()
+        })
+    );
+    for (sql, expected) in [
+        ("SELECT id FROM t WHERE b = X'FF00'", &["1"][..]),
+        ("SELECT id FROM t WHERE vb = _binary'ab'", &["2"]),
+        (
+            "SELECT id FROM t WHERE vb IN (0x0001, X'') ORDER BY id",
+            &["1", "3"],
+        ),
+        ("SELECT id FROM t WHERE b = b'0100000101000010'", &["2"]),
+    ] {
+        assert_eq!(ids(&mut adapter, sql), expected, "{sql}");
+    }
+    // sqlparser writes a word out again with its backslashes as they stand,
+    // so an `INSERT ... SET`, which is written out again as the column-list
+    // form, would read `'\\\''` back as another word.
+    assert_eq!(
+        adapter.execute_query("INSERT INTO t SET id = 6, b = _binary '\\\\\\''"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    run(&mut adapter, "DELETE FROM t WHERE vb = 0xFFFF");
+    assert_eq!(ids(&mut adapter, "SELECT COUNT(*) FROM t"), ["4"]);
+}
+
+/// Measured on MySQL 8.4.11: `X'41'` is the number 65 in an `INT` and the
+/// word `A` in a `VARCHAR`, and `_binary X'41'` is a word even in an `INT`,
+/// answering 1366 there — rules not followed here, so bytes written out are
+/// taken by a column of bytes alone. A hexadecimal literal with an odd count
+/// of digits is refused too: MySQL answers 1064 for `X'ABC'` and reads `0xABC`
+/// as `0x0ABC`, which reach this spelled alike.
+#[test]
+fn bytes_written_out_meet_a_column_of_bytes_alone() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE w (id INT PRIMARY KEY, word VARCHAR(10), n INT)",
+    );
+    for sql in [
+        "INSERT INTO w (id, word) VALUES (1, X'41')",
+        "INSERT INTO w VALUES (1, 'a', 2), (2, 'b', 0x01)",
+        "INSERT INTO w (id, n) VALUES (1, _binary X'41')",
+        "UPDATE w SET word = b'01000001'",
+        "SELECT id FROM w WHERE word = X'41'",
+        "INSERT INTO t (id, b) VALUES (1, X'ABC')",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    assert!(rows(&mut adapter, "SELECT id FROM w").is_empty());
+}

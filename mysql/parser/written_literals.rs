@@ -30,7 +30,17 @@ pub struct WrittenLiterals {
     pub tables: Vec<String>,
     /// Each column one of these literals is written into, in the order
     /// written.
-    pub columns: Vec<(String, ColumnLiteral)>,
+    pub columns: Vec<(WrittenColumn, ColumnLiteral)>,
+}
+
+/// A column a literal is written into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WrittenColumn {
+    /// Named by the statement.
+    Named(String),
+    /// The column at this place, counting from 0, in the table's own order —
+    /// an `INSERT` that names no columns, as a dump writes its rows.
+    AtPlace(usize),
 }
 
 /// Reads what a statement writes these literals into; `None` when it writes
@@ -54,12 +64,19 @@ pub fn literals_written_into_columns(
             if let Some(source) = insert.source.as_deref() {
                 if let SetExpr::Values(values) = source.body.as_ref() {
                     for row in &values.rows {
-                        for (column, value) in insert.columns.iter().zip(row.iter()) {
-                            if let (Some(column), Some(literal)) =
-                                (last_name(column), column_literal(value))
-                            {
-                                written.push((column, literal));
-                            }
+                        for (place, value) in row.iter().enumerate() {
+                            let Some(literal) = column_literal(value) else {
+                                continue;
+                            };
+                            let column = if insert.columns.is_empty() {
+                                WrittenColumn::AtPlace(place)
+                            } else {
+                                match insert.columns.get(place).and_then(last_name) {
+                                    Some(name) => WrittenColumn::Named(name),
+                                    None => continue,
+                                }
+                            };
+                            written.push((column, literal));
                         }
                     }
                 }
@@ -93,13 +110,13 @@ pub fn literals_written_into_columns(
 fn note_assignment(
     target: &AssignmentTarget,
     value: &Expr,
-    written: &mut Vec<(String, ColumnLiteral)>,
+    written: &mut Vec<(WrittenColumn, ColumnLiteral)>,
 ) {
     let AssignmentTarget::ColumnName(column) = target else {
         return;
     };
     if let (Some(column), Some(literal)) = (last_name(column), column_literal(value)) {
-        written.push((column, literal));
+        written.push((WrittenColumn::Named(column), literal));
     }
 }
 

@@ -113,6 +113,44 @@ pub(crate) fn read_written_value(expr: &Expr) -> Option<(WrittenValue, String)> 
     }
 }
 
+/// Reads a string of bytes written out — `X'616263'`, `0x616263`,
+/// `b'01100001'`, `_binary 'abc'` or `_binary X'616263'` — as the blob the
+/// engine writes for the same bytes, or `None` for any other value.
+///
+/// Measured on MySQL 8.4.11, each of these is a binary string wherever it is
+/// written as a string, and a word after `_binary` is the bytes it is written
+/// in. A hexadecimal literal with an odd count of digits is refused: MySQL
+/// answers 1064 for `X'ABC'` and reads `0xABC` as `0x0ABC`, and the two reach
+/// this spelled the same.
+pub(crate) fn written_byte_string(expr: &Expr) -> Option<Option<String>> {
+    let hexadecimal = |digits: &str| written_hexadecimal(digits).map(|(_, sql)| sql);
+    match expr {
+        Expr::Value(value) => match &value.value {
+            Value::HexStringLiteral(digits) => Some(hexadecimal(digits)),
+            Value::SingleQuotedByteStringLiteral(bits) => {
+                Some(written_bits(bits).map(|(_, sql)| sql))
+            }
+            _ => None,
+        },
+        Expr::Prefixed { prefix, value } if prefix.value.eq_ignore_ascii_case("_binary") => {
+            let Expr::Value(value) = value.as_ref() else {
+                return Some(None);
+            };
+            Some(match &value.value {
+                Value::HexStringLiteral(digits) => hexadecimal(digits),
+                Value::SingleQuotedString(word) | Value::DoubleQuotedString(word) => Some(format!(
+                    "x'{}'",
+                    word.bytes()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<String>()
+                )),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// The name MySQL gives the column of a word written in quotes with no alias.
 ///
 /// Measured on MySQL 8.4.11: the word as it reads once its escapes are

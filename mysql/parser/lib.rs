@@ -92,7 +92,9 @@ use translate::{
     select_static_result_metadata, translate_delete, translate_insert, translate_select_query,
     translate_update, RenderedSelect, SelectRenderContext,
 };
-pub use written_literals::{literals_written_into_columns, ColumnLiteral, WrittenLiterals};
+pub use written_literals::{
+    literals_written_into_columns, ColumnLiteral, WrittenColumn, WrittenLiterals,
+};
 
 pub use account_admin::{
     parse_optional_account_admin_command, AccountAdminPassword, MySqlAccountAdminCommand,
@@ -1098,6 +1100,9 @@ pub enum CheckedSelectComparisonRhs {
     Decimal(String),
     /// One string literal, compared without regard to case.
     Text(String),
+    /// One string of bytes written out — `X'..'`, `0x..`, `b'..'` or after
+    /// `_binary` — which meets a column of bytes alone.
+    Bytes,
     /// One call answering the moment the statement runs, which needs no
     /// argument and answers a value in the form the column it meets holds.
     Now(CheckedComparisonNow),
@@ -5452,6 +5457,9 @@ fn is_written_insert_value(expr: &Expr) -> bool {
 }
 
 fn is_direct_insert_literal(expr: &Expr) -> bool {
+    if let Some(bytes) = written_value::written_byte_string(expr) {
+        return bytes.is_some();
+    }
     match expr {
         Expr::Value(value) => match &value.value {
             Value::Number(value, false) => {

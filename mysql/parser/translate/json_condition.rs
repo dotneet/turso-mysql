@@ -589,6 +589,9 @@ fn render_text_comparison(
         CheckedSelectComparisonRhs::Now(_) => {
             return unsupported("JSON text comparison with a clock reading")
         }
+        CheckedSelectComparisonRhs::Bytes => {
+            return unsupported("JSON text comparison with a string of bytes")
+        }
         CheckedSelectComparisonRhs::Column { .. }
         | CheckedSelectComparisonRhs::Call(_)
         | CheckedSelectComparisonRhs::Operand(_) => {
@@ -636,7 +639,9 @@ fn render_count_comparison(
         CheckedSelectComparisonRhs::Null => {
             return Ok(render_against_null(rendered, op, operator));
         }
-        CheckedSelectComparisonRhs::Text(_) | CheckedSelectComparisonRhs::Now(_) => {
+        CheckedSelectComparisonRhs::Text(_)
+        | CheckedSelectComparisonRhs::Now(_)
+        | CheckedSelectComparisonRhs::Bytes => {
             return unsupported("JSON_LENGTH comparison with something other than a number")
         }
         CheckedSelectComparisonRhs::Column { .. }

@@ -525,7 +525,7 @@ pub fn parse_optional_insert_set_as_values(
             return unsupported("qualified INSERT SET assignment target");
         };
         columns.push(mysql_quoted(&column.value));
-        values.push(assignment.value.to_string());
+        values.push(written_again(&assignment.value, mode)?);
     }
     // REPLACE and IGNORE both take the SET form, and mean there what they mean
     // on the other one.
@@ -537,17 +537,31 @@ pub fn parse_optional_insert_set_as_values(
     // An upsert clause says what happens to a row that collides, which is the
     // same whichever way the row itself was written, so it comes along as it
     // stands and is held to the rules the other form holds it to.
-    let upsert = insert
-        .on
-        .as_ref()
-        .map(ToString::to_string)
-        .unwrap_or_default();
+    let upsert = match &insert.on {
+        Some(on) => written_again(on, mode)?,
+        None => String::new(),
+    };
     Ok(Some(format!(
         "{verb} {} ({}) VALUES ({}){upsert}",
         mysql_quoted(&table.value),
         columns.join(", "),
         values.join(", ")
     )))
+}
+
+/// Writes a part of the statement out again. sqlparser writes a word back
+/// with its quotes doubled but its backslashes as they stand, so where a
+/// backslash escapes, a word holding one would read back as another word —
+/// `'a\\\'b'` comes back `'a\''b'` — and is refused.
+fn written_again(
+    part: &impl std::fmt::Display,
+    mode: SessionSqlMode,
+) -> Result<String, ParseError> {
+    let written = part.to_string();
+    if !mode.no_backslash_escapes && written.contains('\\') {
+        return unsupported("INSERT SET with a backslash in a word");
+    }
+    Ok(written)
 }
 
 fn mysql_quoted(identifier: &str) -> String {

@@ -2251,11 +2251,14 @@ impl MySqlConnection {
             let Ok(columns) = self.list_columns(&table) else {
                 continue;
             };
-            for (name, literal) in &written {
-                let Some(column) = columns
-                    .iter()
-                    .find(|column| column.name().eq_ignore_ascii_case(name))
-                else {
+            for (written_column, literal) in &written {
+                let column = match written_column {
+                    turso_mysql_parser::WrittenColumn::Named(name) => columns
+                        .iter()
+                        .find(|column| column.name().eq_ignore_ascii_case(name)),
+                    turso_mysql_parser::WrittenColumn::AtPlace(place) => columns.get(*place),
+                };
+                let Some(column) = column else {
                     continue;
                 };
                 let holds_bytes = turso_mysql_parser::holds_bytes(column.type_name());
@@ -12277,6 +12280,10 @@ fn checked_comparison_fits_column(
                 || turso_mysql_parser::holds_bytes(type_name)
                 || stores_a_canonical_form(type_name)
         }
+        // Measured on MySQL 8.4.11, a string of bytes is a binary string
+        // wherever it is compared with one — `b = X'00'` finds the one byte
+        // — and a number or a word by rules not measured anywhere else.
+        CheckedSelectComparisonRhs::Bytes => meets_bytes(type_name, operator),
         // A parameter carries no type until it is bound. A column of words
         // compares a bound word under the collation it was declared with, and
         // what binds there is held to a word when the statement runs; a column
@@ -12865,6 +12872,7 @@ fn checked_comparison_column_refusal(
         }
         CheckedSelectComparisonRhs::Now(CheckedComparisonNow::TimeOfDay) => "a TIME column",
         CheckedSelectComparisonRhs::Text(_) => "a text column",
+        CheckedSelectComparisonRhs::Bytes => "a column of bytes",
         CheckedSelectComparisonRhs::Null => "a signed integer or text column",
         CheckedSelectComparisonRhs::Placeholder { .. } => {
             "a signed integer column, because a parameter carries no type"

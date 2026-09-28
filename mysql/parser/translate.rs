@@ -5207,6 +5207,13 @@ fn render_update_assignment_value(
                 });
             Ok(format!("({rendered})"))
         }
+        _ if crate::written_value::written_byte_string(value).is_some() => {
+            crate::written_value::written_byte_string(value)
+                .expect("the guard read a string of bytes")
+                .ok_or(ParseError::Unsupported {
+                    feature: "a string of bytes spelled some other way",
+                })
+        }
         // What is left is a value rather than a reading of the row, so none of
         // it can name a column. Each `?` in it still takes its place among the
         // statement's parameters.
@@ -5482,6 +5489,11 @@ fn written_only_as_a_reading(value: &Expr) -> bool {
 /// 8.4.11, `NOW(6)` into a `DATETIME(2)` rounds to two places and into a
 /// `DATETIME` to the whole second.
 fn render_inserted_value(expr: &Expr) -> Result<String, ParseError> {
+    if let Some(bytes) = crate::written_value::written_byte_string(expr) {
+        return bytes.ok_or(ParseError::Unsupported {
+            feature: "a string of bytes spelled some other way",
+        });
+    }
     match expr {
         Expr::Function(function) if moment_read_to_places(function).is_some() => {
             match moment_read_to_places(function).expect("the guard read the places") {
@@ -11513,6 +11525,14 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
     allow_large_integer: bool,
 ) -> Result<(String, CheckedSelectComparisonRhs), ParseError> {
     match expr {
+        _ if crate::written_value::written_byte_string(expr).is_some() => {
+            let rendered = crate::written_value::written_byte_string(expr)
+                .expect("the guard read a string of bytes")
+                .ok_or(ParseError::Unsupported {
+                    feature: "a string of bytes spelled some other way",
+                })?;
+            Ok((rendered, CheckedSelectComparisonRhs::Bytes))
+        }
         Expr::Nested(expr) => {
             let (rendered, rhs) = render_checked_select_comparison_rhs_allowing_large_integer(
                 expr,

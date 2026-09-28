@@ -6668,7 +6668,7 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         "INSERT INTO users (name) VALUES (other)",
         "INSERT INTO users (name) VALUES (LOWER('Ada'))",
         "INSERT INTO users (name) VALUES ((1))",
-        "INSERT INTO users (name) VALUES (X'01')",
+        "INSERT INTO users (name) VALUES (X'ABC')",
         "INSERT INTO users (name) VALUES (1), (2, 3)",
         "INSERT INTO users (name, NAME) VALUES ('a', 'b')",
         "INSERT INTO app.users (name) VALUES ('a')",
