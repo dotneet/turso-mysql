@@ -282,6 +282,7 @@ impl RuntimeTcpListener {
         let connection_id = stream.connection_id();
         let handle = thread::Builder::new()
             .name(format!("turso-mysql-tcp-{connection_id}"))
+            .stack_size(crate::CONNECTION_THREAD_STACK_BYTES)
             .spawn(move || {
                 let _completion = TcpWorkerCompletionGuard::new(completion);
                 RuntimeTcpConnection::new(stream)?.run()

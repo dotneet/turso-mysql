@@ -7249,6 +7249,13 @@ server counts none of them; the `mysql` client prints whatever follows
 counts its own threads, the event scheduler's among them, and connections
 still signing in. A session the runtime did not accept answers 1235.
 
+Each connection runs on a thread of its own with a 16 MiB stack. A statement is
+read and planned by recursion over its nesting, and a thread's default 2 MiB ran
+out on statements a real application sends — Gitea's listing of the branches a
+user pushed nests five subqueries, joins inside two and ORs a dozen tests —
+which aborted the whole server where MySQL answers the statement. The stack is
+reserved rather than committed, so an idle connection costs no more memory.
+
 Account administration has a deliberately narrow SQL surface: `CREATE USER
 'name'@'%' IDENTIFIED BY 'password'`, `GRANT SELECT ON db.table TO
 'name'@'%'`, and the matching `REVOKE`. The offline provisioner must explicitly

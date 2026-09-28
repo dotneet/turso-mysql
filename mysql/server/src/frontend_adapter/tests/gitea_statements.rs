@@ -874,3 +874,61 @@ fn a_membership_test_inside_a_subquery_reads_the_subquerys_column() {
         Err(FrontendErrorKind::Unsupported)
     ));
 }
+
+/// Gitea's listing of the branches a user recently pushed nests five
+/// subqueries, joins inside two of them and ORs a dozen tests. Reading and
+/// planning it recurses deeper than a thread's default 2 MiB stack holds,
+/// which aborted the whole server; on a connection's own stack it is read
+/// and answered.
+#[test]
+fn giteas_deepest_branch_listing_fits_a_connections_stack() {
+    let answered = std::thread::Builder::new()
+        .stack_size(crate::CONNECTION_THREAD_STACK_BYTES)
+        .spawn(|| {
+            let (_directory, mut adapter) = adapter();
+            for sql in [
+                "CREATE TABLE `branch` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL, `commit_id` VARCHAR(255) NULL, `commit_message` TEXT NULL, `pusher_id` BIGINT(20) NULL, `is_deleted` TINYINT(1) NULL, `deleted_by_id` BIGINT(20) NULL, `deleted_unix` BIGINT(20) NULL, `commit_time` BIGINT(20) NULL, `created_unix` BIGINT(20) NULL, `updated_unix` BIGINT(20) NULL)",
+                "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NULL, `is_private` TINYINT(1) NULL, `is_fork` TINYINT(1) DEFAULT 0 NOT NULL, `fork_id` BIGINT(20) NULL, `is_archived` TINYINT(1) NULL)",
+                "CREATE TABLE `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `visibility` INT DEFAULT 0 NOT NULL)",
+                "CREATE TABLE `collaboration` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NOT NULL, `user_id` BIGINT(20) NOT NULL)",
+                "CREATE TABLE `team_repo` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+                "CREATE TABLE `team_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `uid` BIGINT(20) NULL)",
+                "CREATE TABLE `team` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `authorize` INT NULL)",
+                "CREATE TABLE `team_unit` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `type` INT NULL, `access_mode` INT NULL)",
+                "CREATE TABLE `org_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `uid` BIGINT(20) NULL, `org_id` BIGINT(20) NULL)",
+            ] {
+                run(&mut adapter, sql);
+            }
+            let whole = Bound::Whole;
+            prepared_rows(
+                &mut adapter,
+                "SELECT `id`, `repo_id`, `name`, `commit_id`, `commit_message`, `pusher_id`, `is_deleted`, `deleted_by_id`, `deleted_unix`, `commit_time`, `created_unix`, `updated_unix` FROM `branch` WHERE is_deleted=? AND pusher_id=? AND updated_unix>=? AND repo_id IN (SELECT id FROM repository WHERE is_fork=? AND fork_id=? AND is_archived=? AND ((`repository`.is_private=? AND `repository`.owner_id NOT IN (SELECT id FROM `user` WHERE visibility IN (?))) OR `repository`.id IN (SELECT repo_id FROM `collaboration` WHERE `collaboration`.user_id=?) OR `repository`.id IN (SELECT `team_repo`.repo_id FROM team_repo INNER JOIN team_user ON `team_user`.team_id = `team_repo`.team_id INNER JOIN team ON `team`.id = `team_repo`.team_id LEFT JOIN team_unit ON `team_unit`.team_id = `team_repo`.team_id AND `team_unit`.`type` = ? WHERE `team_user`.uid=? AND (`team`.authorize>=? OR `team_unit`.`access_mode`>?)) OR `repository`.owner_id=? OR (`repository`.is_private=? AND `repository`.owner_id IN (SELECT `org_user`.org_id FROM org_user WHERE `org_user`.uid=?))) AND id=?) AND commit_id NOT IN (?) ORDER BY updated_unix DESC",
+                &[
+                    whole(0),
+                    whole(2),
+                    whole(0),
+                    whole(1),
+                    whole(1),
+                    whole(0),
+                    whole(1),
+                    whole(2),
+                    whole(2),
+                    whole(1),
+                    whole(2),
+                    whole(1),
+                    whole(1),
+                    whole(2),
+                    whole(1),
+                    whole(2),
+                    whole(1),
+                    Bound::Word("abc"),
+                ],
+            )
+            .rows
+            .len()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(answered, 0);
+}

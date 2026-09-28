@@ -159,6 +159,7 @@ where
 {
     let handle = thread::Builder::new()
         .name(format!("turso-mysql-{connection_id}"))
+        .stack_size(crate::CONNECTION_THREAD_STACK_BYTES)
         .spawn(move || {
             let _completion = CompletionGuard::new(completion);
             run()

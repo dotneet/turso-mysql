@@ -105,6 +105,16 @@ pub const PACKET_HEADER_LEN: usize = 4;
 /// The largest payload length representable by MySQL's three-byte header.
 pub const MAX_PACKET_PAYLOAD_LEN: usize = 0xFF_FFFF;
 
+/// The stack each connection's thread runs on.
+///
+/// A statement is read and planned by recursion over its nesting, and a
+/// thread's default 2 MiB runs out on statements a real application sends —
+/// Gitea's branch listing nests five subqueries, joins inside two of them
+/// and ORs twelve tests — which aborts the whole server rather than refuse the
+/// one statement. The stack is reserved, not committed, so an idle connection
+/// costs no more memory than before.
+pub(crate) const CONNECTION_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 /// Returns the maximum payload size reported by `mysql_common`.
 ///
 /// Keeping this check in one place makes a dependency version change fail
