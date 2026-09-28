@@ -113,13 +113,14 @@ use crate::{
     AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
 };
 use crate::{
-    decode_statement_execute_parameters_with_long_data, ArrivedCommand, BinaryResultSet,
-    BinaryResultValue, ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult,
-    CommandExecutor, CommandOkResult, FrontendErrorKind, InitialDatabaseSelector,
-    PreparedStatementExecutionResult, PreparedStatementResult, StatementExecuteDecodeError,
-    StatementParameterType, StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION,
-    MAX_DISPATCH_RESULT_ROWS, MAX_RESULT_COLUMNS, MAX_ROW_PAYLOAD_LENGTH,
-    MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
+    decode_statement_execute_parameters, decode_statement_execute_parameters_with_long_data,
+    ArrivedCommand, BinaryResultSet, BinaryResultValue, ColumnDefinitionConfig,
+    CommandExecutionOptions, CommandExecutionResult, CommandExecutor, CommandOkResult,
+    FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
+    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
+    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
+    MAX_RESULT_COLUMNS, MAX_ROW_PAYLOAD_LENGTH, MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT,
+    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -269,6 +270,9 @@ enum RunAsText {
     /// The rows of one of Prisma's catalog reads, worked out the same way for
     /// the databases it binds.
     PrismaCatalog(turso_mysql_parser::PrismaInformationSchemaQuery),
+    /// A `SET` of session settings whose values are bound, run with the
+    /// bound whole numbers written in.
+    SessionSettings(turso_mysql_parser::SessionSettingsWithParameters),
 }
 
 #[cfg(unix)]
@@ -1749,6 +1753,43 @@ where
             .collect()
     }
 
+    /// The whole numbers bound to a `SET`. Measured on MySQL 8.4.11, a bound
+    /// word or `NULL` there follows rules of its own — `'OFF'` is taken for
+    /// `foreign_key_checks` with a warning, and a `DOUBLE` answers 1232 — so
+    /// anything but a whole number is refused.
+    fn bound_whole_numbers(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+        long_data: StatementLongData,
+        parameter_count: usize,
+    ) -> Result<Vec<i128>, FrontendErrorKind> {
+        if long_data.error.is_some() || long_data.values.iter().any(Option::is_some) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let statement = self
+            .prepared_statements
+            .statements
+            .get_mut(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        let decoded = decode_statement_execute_parameters(
+            parameter_payload,
+            parameter_count,
+            statement.parameter_types.as_deref(),
+        )
+        .map_err(statement_execute_decode_error)?;
+        statement.parameter_types = Some(decoded.types);
+        decoded
+            .values
+            .into_iter()
+            .map(|value| match value {
+                StatementParameterValue::Integer(value) => Ok(i128::from(value)),
+                StatementParameterValue::UnsignedInteger(value) => Ok(i128::from(value)),
+                _ => Err(FrontendErrorKind::Unsupported),
+            })
+            .collect()
+    }
+
     fn gorm_catalog_table_visible(
         &self,
         schema: &str,
@@ -2822,6 +2863,24 @@ where
                 ) =>
             {
                 self.prepare_text_statement(sql, RunAsText::NoRows(sql.to_owned()), Vec::new())
+            }
+            Err(error @ (FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)) => {
+                let Some(settings) =
+                    turso_mysql_parser::parse_optional_session_settings_with_parameters(
+                        sql,
+                        self.session.session_sql_mode(),
+                    )
+                else {
+                    return Err(error);
+                };
+                let parameter_count = settings.parameter_count();
+                let mut prepared = self.prepare_text_statement(
+                    sql,
+                    RunAsText::SessionSettings(settings),
+                    Vec::new(),
+                )?;
+                prepared.parameters = vec![set_parameter_definition(); parameter_count];
+                Ok(prepared)
             }
             prepared => prepared,
         }
@@ -4094,6 +4153,20 @@ where
                     )?;
                     self.prisma_catalog_result(query, &schemas)
                         .map(PreparedStatementExecutionResult::ResultSet)
+                }
+                RunAsText::SessionSettings(settings) => {
+                    let numbers = self.bound_whole_numbers(
+                        statement_id,
+                        parameter_payload,
+                        long_data,
+                        settings.parameter_count(),
+                    )?;
+                    match self.execute_query_statement(&settings.written_with(&numbers))? {
+                        CommandExecutionResult::Ok(result) => {
+                            Ok(PreparedStatementExecutionResult::Ok(result))
+                        }
+                        CommandExecutionResult::ResultSet(_) => Err(FrontendErrorKind::Internal),
+                    }
                 }
             };
         }
@@ -12078,6 +12151,17 @@ const fn type_only_column_flags(column_type: u8) -> u16 {
 /// Sets a column's flags, keeping the one its type carries on its own.
 fn set_column_flags(definition: &mut ColumnDefinitionConfig, flags: u16) {
     definition.flags = flags | type_only_column_flags(definition.column_type);
+}
+
+/// What a prepared `SET` describes each `?` as. Measured on MySQL 8.4.11:
+/// named `?`, a `VAR_STRING` of 65532 in utf8mb4_general_ci with 31
+/// decimals, whatever the setting.
+fn set_parameter_definition() -> ColumnDefinitionConfig {
+    let mut definition = ColumnDefinitionConfig::new("?", MYSQL_TYPE_VAR_STRING);
+    definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    definition.column_length = 65_532;
+    definition.decimals = 31;
+    definition
 }
 
 fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {

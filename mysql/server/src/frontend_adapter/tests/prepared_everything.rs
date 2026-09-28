@@ -672,6 +672,64 @@ fn every_bound_value_of_a_set_is_compared_with_its_own_column() {
     );
 }
 
+/// Flyway saves and restores two settings with one prepared `SET` whose values
+/// are bound, as Connector/J with server-side prepared statements sends it.
+/// Measured on MySQL 8.4.11: it prepares with two parameters described as
+/// `VAR_STRING`s of 65532 named `?` and no columns, and the bound numbers set
+/// the session's values. A bound word follows rules of its own there and is
+/// refused.
+#[test]
+fn flyway_sets_its_settings_with_bound_numbers() {
+    let (_directory, mut adapter) = adapter();
+    let sql = "SET foreign_key_checks=?, sql_safe_updates=?";
+    let statement = adapter.execute_stmt_prepare(sql).unwrap();
+    assert!(statement.columns.is_empty());
+    assert_eq!(statement.parameters.len(), 2);
+    for parameter in &statement.parameters {
+        assert_eq!(
+            (
+                parameter.name.as_str(),
+                parameter.column_type,
+                parameter.column_length,
+                parameter.character_set,
+                parameter.decimals
+            ),
+            ("?", MYSQL_TYPE_VAR_STRING, 65_532, 45, 31)
+        );
+    }
+    let run = |adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+               values: &[Bound<'_>]| {
+        adapter.execute_stmt_execute(statement.statement_id, &bound(values))
+    };
+    assert!(matches!(
+        run(&mut adapter, &[Bound::Number(0), Bound::Number(0)]),
+        Ok(PreparedStatementExecutionResult::Ok(_))
+    ));
+    let Ok(CommandExecutionResult::ResultSet(read)) =
+        adapter.execute_query("SELECT @@foreign_key_checks, @@sql_safe_updates")
+    else {
+        panic!("the settings must read back");
+    };
+    assert_eq!(read.rows, [[Some(b"0".to_vec()), Some(b"0".to_vec())]]);
+    assert!(matches!(
+        run(&mut adapter, &[Bound::Number(1), Bound::Number(0)]),
+        Ok(PreparedStatementExecutionResult::Ok(_))
+    ));
+    assert_eq!(
+        run(&mut adapter, &[Bound::Word("OFF"), Bound::Number(0)]).err(),
+        Some(FrontendErrorKind::Unsupported)
+    );
+    assert!(run(&mut adapter, &[Bound::Number(2), Bound::Number(0)]).is_err());
+    let Ok(CommandExecutionResult::ResultSet(read)) =
+        adapter.execute_query("SELECT @@foreign_key_checks")
+    else {
+        panic!("the setting must read back");
+    };
+    assert_eq!(read.rows, [[Some(b"1".to_vec())]]);
+    // Measured: `SET NAMES ?` answers 1064 at prepare.
+    assert!(adapter.execute_stmt_prepare("SET NAMES ?").is_err());
+}
+
 /// Laravel's `->exists()`, `firstOrCreate`, `updateOrCreate` and the `unique`
 /// validation rule ask whether a row is there with a subquery comparing a
 /// column of words with a bound word. Measured on MySQL 8.4.11 over

@@ -183,6 +183,94 @@ pub fn parse_optional_session_settings(
     Ok(Some(settings))
 }
 
+/// A `SET` of session settings whose values are `?`, as a client that
+/// prepares every statement sends it — Flyway's
+/// `SET foreign_key_checks=?, sql_safe_updates=?`.
+///
+/// Only whole numbers are written into it, so what runs is the statement the
+/// text protocol would have carried with those numbers in place, and nothing
+/// bound can change what kind of statement it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSettingsWithParameters {
+    /// The text around each `?`, one piece more than there are parameters.
+    pieces: Vec<String>,
+}
+
+impl SessionSettingsWithParameters {
+    /// How many `?` the statement holds.
+    pub fn parameter_count(&self) -> usize {
+        self.pieces.len() - 1
+    }
+
+    /// The statement with each `?` replaced by its number, in order.
+    pub fn written_with(&self, numbers: &[i128]) -> String {
+        assert_eq!(
+            numbers.len(),
+            self.parameter_count(),
+            "every parameter of a SET is bound"
+        );
+        let mut written = self.pieces[0].clone();
+        for (number, piece) in numbers.iter().zip(&self.pieces[1..]) {
+            written.push_str(&number.to_string());
+            written.push_str(piece);
+        }
+        written
+    }
+}
+
+/// Reads a `SET` of session settings holding at least one `?` in the place
+/// of a value, or `None` for any other statement.
+///
+/// Measured on MySQL 8.4.11: such a `SET` prepares with one parameter for
+/// each `?` and no columns, and runs as the `SET` with the bound values would;
+/// `SET NAMES ?` answers 1064. The statement is taken only when every `?`
+/// stands right after an `=` and a `0` in each place reads as session
+/// settings, which is what makes each `?` a value.
+pub fn parse_optional_session_settings_with_parameters(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Option<SessionSettingsWithParameters> {
+    let dialect = crate::SessionMySqlDialect::without_executable_comments(mode);
+    let tokens = crate::statement_reads::tokens_with_location(&dialect, sql).ok()?;
+    let mut pieces = Vec::new();
+    let mut copied_up_to = 0;
+    let mut after_equals = false;
+    for token in &tokens {
+        match &token.token {
+            sqlparser::tokenizer::Token::Placeholder(placeholder) if placeholder == "?" => {
+                if !after_equals {
+                    return None;
+                }
+                let at = crate::byte_offset_of_location(sql, token.span.start)?;
+                pieces.push(sql[copied_up_to..at].to_owned());
+                copied_up_to = at + 1;
+            }
+            sqlparser::tokenizer::Token::Placeholder(_)
+            | sqlparser::tokenizer::Token::Whitespace(
+                sqlparser::tokenizer::Whitespace::SingleLineComment { .. }
+                | sqlparser::tokenizer::Whitespace::MultiLineComment(_),
+            ) => return None,
+            _ => {}
+        }
+        if !matches!(token.token, sqlparser::tokenizer::Token::Whitespace(_)) {
+            after_equals = matches!(
+                token.token,
+                sqlparser::tokenizer::Token::Eq | sqlparser::tokenizer::Token::Assignment
+            );
+        }
+    }
+    if pieces.is_empty() {
+        return None;
+    }
+    pieces.push(sql[copied_up_to..].to_owned());
+    let with_parameters = SessionSettingsWithParameters { pieces };
+    let zeros = vec![0; with_parameters.parameter_count()];
+    parse_optional_session_settings(&with_parameters.written_with(&zeros), mode)
+        .ok()
+        .flatten()
+        .map(|_| with_parameters)
+}
+
 /// Reads what follows `SET [SESSION] TRANSACTION`: an isolation level, an
 /// access mode, or one of each separated by a comma.
 ///
@@ -1579,6 +1667,44 @@ mod tests {
         // A variable this reader does not know leaves the whole statement to
         // the other readers, which refuse it.
         assert_eq!(parse_all("SET time_zone = '+00:00' , x = 1"), None);
+    }
+
+    #[test]
+    fn reads_a_set_whose_values_are_bound() {
+        let mode = SessionSqlMode::default();
+        let flyway = parse_optional_session_settings_with_parameters(
+            "SET foreign_key_checks=?, sql_safe_updates=?",
+            mode,
+        )
+        .unwrap();
+        assert_eq!(flyway.parameter_count(), 2);
+        assert_eq!(
+            flyway.written_with(&[1, 0]),
+            "SET foreign_key_checks=1, sql_safe_updates=0"
+        );
+        let wait =
+            parse_optional_session_settings_with_parameters("SET SESSION wait_timeout = ?;", mode)
+                .unwrap();
+        assert_eq!(
+            wait.written_with(&[28_800]),
+            "SET SESSION wait_timeout = 28800;"
+        );
+        for sql in [
+            // A zone is written as a word, so a number bound there is no zone.
+            "SET time_zone = ?",
+            "SET NAMES ?",
+            "SET foreign_key_checks = 1",
+            "SELECT ?",
+            "SET autocommit = ?",
+            "SET foreign_key_checks = ? /* ? */",
+            "SET foreign_key_checks = '?'",
+        ] {
+            assert_eq!(
+                parse_optional_session_settings_with_parameters(sql, mode),
+                None,
+                "{sql}"
+            );
+        }
     }
 
     /// sqlx opens every connection with this, verbatim from its log: the

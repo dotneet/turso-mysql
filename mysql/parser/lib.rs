@@ -176,8 +176,9 @@ pub use session_queries::{
     MySqlUserVariableRead,
 };
 pub use session_settings::{
-    parse_optional_session_settings, MySqlSessionSetting, MySqlUserVariableAssignment,
-    MySqlUserVariableValue, SqlModeValue,
+    parse_optional_session_settings, parse_optional_session_settings_with_parameters,
+    MySqlSessionSetting, MySqlUserVariableAssignment, MySqlUserVariableValue,
+    SessionSettingsWithParameters, SqlModeValue,
 };
 pub use shift_moment::shifted_moment;
 pub use show_character_sets::{
