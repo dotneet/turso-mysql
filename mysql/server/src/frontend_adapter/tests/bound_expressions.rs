@@ -1020,3 +1020,47 @@ fn a_decimal_compared_with_a_bound_value_in_a_join_is_compared_by_value() {
         );
     }
 }
+
+/// GORM's `Joins("JOIN emails ON emails.user_id = users.id AND emails.email =
+/// ?", ...)` compares a column of words in a join with a bound word, which
+/// was refused. Measured on MySQL 8.4.11: the word is compared under the
+/// column's collation — without regard to case, a trailing space
+/// significant — and so it is here.
+#[test]
+fn gorm_joins_on_a_bound_word() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    run(&mut adapter, "UPDATE users SET name = 'Group' WHERE id = 2");
+    run(
+        &mut adapter,
+        "CREATE TABLE `emails` (`id` bigint unsigned AUTO_INCREMENT,`user_id` bigint unsigned,`email` varchar(191),PRIMARY KEY (`id`))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO emails (user_id, email) VALUES (1, 'x@x'), (2, 'Y@x')",
+    );
+    let joined = "SELECT `users`.`id` FROM `users` JOIN emails ON emails.user_id = users.id AND emails.email = ?";
+    assert_eq!(ids(&mut adapter, joined, &[Bound::Word("x@x")]), [1]);
+    assert_eq!(ids(&mut adapter, joined, &[Bound::Word("y@X")]), [2]);
+    let posts = |comparison: &str| {
+        format!(
+            "SELECT `posts`.`id` FROM `posts` JOIN users ON users.id = posts.user_id WHERE users.name {comparison} ORDER BY `posts`.`id`"
+        )
+    };
+    for (comparison, bound, found) in [
+        ("= ?", vec![Bound::Word("group")], vec![3]),
+        ("= ?", vec![Bound::Word("group ")], vec![]),
+        ("> ?", vec![Bound::Word("h")], vec![]),
+        (
+            "IN (?, ?)",
+            vec![Bound::Word("group"), Bound::Word("x")],
+            vec![3],
+        ),
+    ] {
+        assert_eq!(
+            ids(&mut adapter, &posts(comparison), &bound),
+            found,
+            "{comparison}"
+        );
+    }
+}

@@ -6986,7 +6986,7 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
         }
         let Some(source_table) = translated.source_table() else {
-            return self.with_the_exact_number_columns_of_every_table(sql, translated);
+            return self.with_the_column_kinds_of_every_table(sql, translated);
         };
         let Ok(table) = MySqlTableName::parse(source_table) else {
             return Ok(translated);
@@ -7128,20 +7128,25 @@ impl MySqlConnection {
     }
 
     /// Renders a statement over several tables knowing which of the columns
-    /// it names are `BIGINT UNSIGNED` or `DECIMAL`, when it compares one with
-    /// a bound value or a list, so that comparison goes through the
-    /// exact-number calls a statement over one table already uses. GORM
-    /// counts and reads an association through such a join — `JOIN post_tags
-    /// ON post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found
-    /// no row. Nothing else about the tables' columns is read here, and a
-    /// name some table holds as anything but a number is refused, the calls
-    /// reading it as a number too.
-    fn with_the_exact_number_columns_of_every_table(
+    /// it names hold words, and which are `BIGINT UNSIGNED` or `DECIMAL`, when
+    /// it compares one of those with a bound value or one of the last with a
+    /// list, the way a statement over one table is rendered.
+    ///
+    /// A number column then goes through the exact-number calls: GORM counts
+    /// and reads an association through such a join — `JOIN post_tags ON
+    /// post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found no
+    /// row. A column of words takes a bound word under its own collation, as
+    /// GORM's `Joins("JOIN emails ON emails.user_id = users.id AND
+    /// emails.email = ?", ...)` asks, which was refused. A name some table
+    /// holds as another kind is refused.
+    fn with_the_column_kinds_of_every_table(
         &self,
         sql: &str,
         translated: turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
-        if !self.compares_an_exact_number_column_by_kind(&translated) {
+        if !self.compares_an_exact_number_column_by_kind(&translated)
+            && !self.compares_a_column_of_words_with_a_bound_value(&translated)
+        {
             return Ok(translated);
         }
         let mut columns = Vec::new();
@@ -7151,7 +7156,7 @@ impl MySqlConnection {
             }
             columns.extend(self.list_columns(source.table()).map_err(|error| {
                 MySqlQueryError::Unsupported(format!(
-                    "cannot read the columns an exact-number comparison names: {error}"
+                    "cannot read the columns a comparison over several tables names: {error}"
                 ))
             })?);
         }
@@ -7178,10 +7183,25 @@ impl MySqlConnection {
                 "an exact-number column shares its name with a column of another kind".to_string(),
             ));
         }
+        let words = columns
+            .iter()
+            .filter(|column| is_text_type(column.type_name()))
+            .map(|column| column.name().to_owned())
+            .collect::<Vec<_>>();
+        if columns.iter().any(|column| {
+            !is_text_type(column.type_name())
+                && words
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(column.name()))
+        }) {
+            return Err(MySqlQueryError::Unsupported(
+                "a column of words shares its name with a column of another kind".to_string(),
+            ));
+        }
         turso_mysql_parser::parse_select_knowing_decimal_columns(
             sql,
             self.parser_mode(),
-            &[],
+            &words,
             &[],
             &[],
             &[],
@@ -7225,6 +7245,31 @@ impl MySqlConnection {
                         })
                     })
             })
+        })
+    }
+
+    /// Whether a statement compares a column of words one of its tables holds
+    /// with a bound value, which is taken only once the statement is read
+    /// knowing that the column holds words.
+    fn compares_a_column_of_words_with_a_bound_value(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> bool {
+        translated.checked_comparisons().iter().any(|comparison| {
+            comparison.answers().is_none()
+                && matches!(
+                    comparison.rhs(),
+                    CheckedSelectComparisonRhs::Placeholder { .. }
+                )
+                && translated.source_tables().iter().any(|source| {
+                    !source.subquery()
+                        && self.list_columns(source.table()).is_ok_and(|columns| {
+                            columns.iter().any(|column| {
+                                is_text_type(column.type_name())
+                                    && column.name().eq_ignore_ascii_case(comparison.column_name())
+                            })
+                        })
+                })
         })
     }
 

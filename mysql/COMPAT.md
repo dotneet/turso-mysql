@@ -5324,15 +5324,22 @@ views=views + ? WHERE user_id = ?`, `WHERE id > ?`, `BETWEEN ? AND ?`, a
 detach's `post_id = ? AND tag_id NOT IN (?,?)` and a written `id IN (1, 2)`,
 each of which used to change no row or every row; measured on 8.4.11, each
 finds the rows whose ids compare as numbers.
+
 A `SELECT` over several tables was read without its columns' types, so it
 compared such a column by kind too: GORM's count of an association through its
 join table — `JOIN post_tags ON post_tags.tag_id = tags.id AND
 post_tags.post_id = ?` — found no row. It is now read knowing which of the
 columns it names are `BIGINT UNSIGNED` or `DECIMAL` — a `DECIMAL` compared
 with a bound value in a join was compared by kind the same way,
-`users.balance > ?` finding every row binding 50 and none binding `'50'` —
-and refused where that name is also a column of another kind. One reading a subquery beside such a comparison, which
-is read without its columns' types, is refused.
+`users.balance > ?` finding every row binding 50 and none binding `'50'` — and
+refused where that name is also a column of another kind. One reading a
+subquery beside such a comparison, which is read without its columns' types,
+is refused. The same second reading knows which names are columns of words, so
+a bound word meets one in a join under the column's own collation — GORM's
+`Joins("JOIN emails ON emails.user_id = users.id AND emails.email = ?", ...)`,
+which was refused — without regard to case and with a trailing space
+significant, as measured on 8.4.11; a name that is words in one table and
+another kind in another is refused.
 
 This internal type is created only for the MySQL frontend. An older MySQL
 table declared as `BIGINT UNSIGNED` used signed integer storage; its original
