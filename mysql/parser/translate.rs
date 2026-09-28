@@ -44,6 +44,9 @@ pub struct MySqlSelectSource {
     derived: Option<MySqlDerivedColumns>,
     catalog: Option<MySqlCatalogTable>,
     hinted_indexes: Vec<String>,
+    /// Whether MySQL writes the statement's rows into a table of its own to
+    /// sort them, which every column of this table then reports the shape of.
+    sorted_through_a_table: bool,
 }
 
 /// One `information_schema` table, which the engine scans and whose columns
@@ -446,6 +449,16 @@ impl MySqlSelectSource {
     /// catalog table; what it does not do is name any of the result columns.
     pub const fn subquery(&self) -> bool {
         self.subquery
+    }
+
+    /// Reports whether MySQL sorts the statement's rows through a table of its
+    /// own, which leaves this table's columns without their keys.
+    ///
+    /// Measured on MySQL 8.4.11, a statement ordered by columns of more than
+    /// one of the tables it joins does, whatever the tables hold: only the
+    /// first table MySQL reads can hand rows over in an order.
+    pub const fn sorted_through_a_table(&self) -> bool {
+        self.sorted_through_a_table
     }
 
     /// Returns which branch of a `UNION` reads this table, counting from zero.
@@ -2006,7 +2019,9 @@ fn render_derived_table(
         return render_counted_derived_table(subquery, alias, render_context);
     }
     if let Some(select) = derived::body_joining_tables(subquery) {
-        if !render_context.renders_the_statements_own_from {
+        if !render_context.renders_the_statements_own_from
+            && !render_context.renders_a_joined_derived_body
+        {
             return unsupported("derived table joining tables inside another statement");
         }
         return derived::render_derived_table_joining_tables(
@@ -2042,6 +2057,7 @@ fn render_derived_table(
             derived: Some(derived),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
+            sorted_through_a_table: false,
         },
     ))
 }
@@ -2195,6 +2211,7 @@ fn render_counted_derived_table(
             projected_columns: Vec::new(),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
+            sorted_through_a_table: false,
         },
     ))
 }
@@ -2282,6 +2299,7 @@ fn render_common_table_expressions(
             derived: Some(derived),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
+            sorted_through_a_table: false,
         });
     }
     Ok((format!("WITH {} ", rendered.join(", ")), sources))
@@ -6463,6 +6481,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// its shape is reported there, where the server checks the column's
     /// kind.
     takes_a_joined_aggregate: bool,
+    /// Whether the `FROM` being rendered is the body of a derived table joining
+    /// tables, where a derived table joining tables may stand as one of them.
+    pub(crate) renders_a_joined_derived_body: bool,
     /// Whether the subquery about to be rendered stands in a `WHERE`'s
     /// `EXISTS`, the one subquery that may join tables.
     an_exists_may_join: bool,
@@ -6557,6 +6578,7 @@ impl<'a> SelectRenderContext<'a> {
             group_concat_calls: 0,
             renders_a_projection_item: false,
             takes_a_joined_aggregate: false,
+            renders_a_joined_derived_body: false,
             an_exists_may_join: false,
             knows_the_kinds_of_joined_columns: false,
             collation_sensitive_joined_columns: Vec::new(),
@@ -7246,6 +7268,7 @@ fn render_select_table(
             derived: None,
             catalog,
             hinted_indexes,
+            sorted_through_a_table: false,
         },
     ))
 }

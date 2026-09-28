@@ -7566,6 +7566,9 @@ struct SourceTableColumns {
     /// A subquery standing as a result column names this table's columns,
     /// which takes the `NOT NULL` flag off the columns read straight from it.
     read_by_a_result_subquery: bool,
+    /// MySQL sorts the statement's rows through a table of its own, which
+    /// takes the key flags off this table's columns.
+    sorted_through_a_table: bool,
 }
 
 #[cfg(unix)]
@@ -8050,6 +8053,16 @@ impl TableResultMetadata {
             // a subquery in the projection names drops NOT_NULL, keeping its
             // key flags; see `MySqlSelectSource::read_by_a_result_subquery`.
             definition.flags &= !MYSQL_NOT_NULL_FLAG;
+        }
+        if table.sorted_through_a_table {
+            // Measured on MySQL 8.4.11: the table MySQL sorts the rows in keeps
+            // every flag of the column but its keys; see
+            // `MySqlSelectSource::sorted_through_a_table`.
+            definition.flags &= !(MYSQL_PRI_KEY_FLAG
+                | MYSQL_UNIQUE_KEY_FLAG
+                | MYSQL_MULTIPLE_KEY_FLAG
+                | MYSQL_PART_KEY_FLAG
+                | MYSQL_AUTO_INCREMENT_FLAG);
         }
         Ok(definition)
     }
@@ -11663,8 +11676,8 @@ fn read_through_a_derived_table(
         if joined.outer() {
             definition.flags &= !MYSQL_NOT_NULL_FLAG;
         }
-        if derived.repeats_dropped_through_a_table() {
-            written_out_to_drop_repeats(definition, joined);
+        if derived.written_through_a_table() {
+            written_out_through_a_table(definition, joined);
             return;
         }
     }
@@ -11706,17 +11719,17 @@ fn read_through_a_derived_table(
 }
 
 /// Gives a column of a derived table joining tables the shape MySQL reports
-/// once the statement's `DISTINCT` has written the rows into a table of its
-/// own.
+/// once the statement has written the rows into a table of its own, for its
+/// `DISTINCT` or to sort them by columns of more than one table.
 ///
-/// Measured on MySQL 8.4.11 over TypeORM's pagination and over a table of
-/// every kind: the column names the table it came from under that table's own
+/// Measured on MySQL 8.4.11 over TypeORM's pagination, Entity Framework
+/// Core's `Include` and a table of every kind: the column names the table it came from under that table's own
 /// name, not the body's alias for it, goes by the statement's own name for it,
 /// and names no database. It keeps its type, length, decimals and character
 /// set — a moment stays a `DATETIME` of 19, not the words a derived table
 /// reads it as — and every flag but its keys and its auto-increment.
 #[cfg(unix)]
-fn written_out_to_drop_repeats(
+fn written_out_through_a_table(
     definition: &mut ColumnDefinitionConfig,
     joined: &MySqlJoinedDerivedColumn,
 ) {
@@ -11928,6 +11941,7 @@ fn table_result_metadata_for_references(
                 view_columns: Vec::new(),
                 outer: source.outer(),
                 read_by_a_result_subquery: source.read_by_a_result_subquery(),
+                sorted_through_a_table: source.sorted_through_a_table(),
                 projected_columns: source.projected_columns().to_vec(),
                 derived: source.derived().cloned(),
             });
@@ -11981,6 +11995,7 @@ fn table_result_metadata_for_references(
             view_columns,
             outer: source.outer(),
             read_by_a_result_subquery: source.read_by_a_result_subquery(),
+            sorted_through_a_table: source.sorted_through_a_table(),
             projected_columns,
             derived: source.derived().cloned(),
         });
@@ -12128,6 +12143,7 @@ fn written_view_columns(
                 projected_columns: Vec::new(),
                 outer: source.outer(),
                 read_by_a_result_subquery: false,
+                sorted_through_a_table: false,
                 derived: None,
             })
             .collect(),

@@ -638,6 +638,116 @@ fn a_projection_sums_a_relation_through_a_fallen_back_subquery() {
     );
 }
 
+/// `Include(u => u.Posts).ThenInclude(p => p.Tags)` reads the relations
+/// through derived tables nested in each other, an inner join inside, and
+/// sorts by columns of more than one table; `AsSplitQuery()` joins the inner
+/// derived table beside two tables. Both were refused.
+///
+/// Measured on MySQL 8.4.11 over no rows, three and thousands, the shapes the
+/// same each time: MySQL sorts the rows through a table of its own, so no
+/// column keeps a key, a derived table's column names no database and its
+/// own table by name, and a column a `LEFT JOIN` can leave missing loses its
+/// NOT NULL.
+#[test]
+fn include_reads_relations_through_derived_tables_sorted_across_them() {
+    let (_directory, mut adapter) = adapter();
+    let shapes = |set: &TextResultSet| {
+        set.columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "{} {}.{} {} {} {} {:#x}",
+                    column.name,
+                    column.schema,
+                    column.table,
+                    column.original_table,
+                    column.column_type,
+                    column.column_length,
+                    column.flags
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let include = result_set(
+        &mut adapter,
+        "SELECT `u`.`Id`, `u`.`Balance`, `u`.`CreatedAt`, `u`.`Email`, `u`.`IsActive`, `u`.`Name`, `u`.`Profile`, `u`.`UpdatedAt`, `s0`.`Id`, `s0`.`Body`, `s0`.`PublishedAt`, `s0`.`Title`, `s0`.`UserId`, `s0`.`Views`, `s0`.`PostsId`, `s0`.`TagsId`, `s0`.`Id0`, `s0`.`Name`\nFROM `Users` AS `u`\nLEFT JOIN (\n    SELECT `p`.`Id`, `p`.`Body`, `p`.`PublishedAt`, `p`.`Title`, `p`.`UserId`, `p`.`Views`, `s`.`PostsId`, `s`.`TagsId`, `s`.`Id` AS `Id0`, `s`.`Name`\n    FROM `Posts` AS `p`\n    LEFT JOIN (\n        SELECT `p0`.`PostsId`, `p0`.`TagsId`, `t`.`Id`, `t`.`Name`\n        FROM `PostTags` AS `p0`\n        INNER JOIN `Tags` AS `t` ON `p0`.`TagsId` = `t`.`Id`\n    ) AS `s` ON `p`.`Id` = `s`.`PostsId`\n) AS `s0` ON `u`.`Id` = `s0`.`UserId`\nORDER BY `u`.`Id`, `s0`.`Id`, `s0`.`PostsId`, `s0`.`TagsId`",
+    );
+    assert_eq!(
+        shapes(&include),
+        [
+            "Id reports.u users 8 20 0x1",
+            "Balance reports.u users 246 12 0x1",
+            "CreatedAt reports.u users 12 26 0x81",
+            "Email reports.u users 253 764 0x1001",
+            "IsActive reports.u users 1 1 0x1",
+            "Name reports.u users 253 400 0x1001",
+            "Profile reports.u users 245 4294967295 0x90",
+            "UpdatedAt reports.u users 12 26 0x81",
+            "Id .s0 posts 8 20 0x0",
+            "Body .s0 posts 252 262140 0x10",
+            "PublishedAt .s0 posts 12 26 0x80",
+            "Title .s0 posts 253 800 0x1000",
+            "UserId .s0 posts 8 20 0x1000",
+            "Views .s0 posts 3 11 0x1000",
+            "PostsId .s0 posttags 8 20 0x1000",
+            "TagsId .s0 posttags 8 20 0x1000",
+            "Id0 .s0 tags 8 20 0x0",
+            "Name .s0 tags 253 400 0x1000",
+        ]
+    );
+    let read = |set: &TextResultSet, columns: &[usize]| {
+        set.rows
+            .iter()
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|at| match &row[*at] {
+                        Some(value) => String::from_utf8(value.clone()).unwrap(),
+                        None => "NULL".to_owned(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        read(&include, &[0, 11, 17]),
+        [
+            "1 Draft news",
+            "1 Draft rust",
+            "2 Bob writes sql",
+            "3 NULL NULL"
+        ]
+    );
+
+    let split = result_set(
+        &mut adapter,
+        "SELECT `s`.`PostsId`, `s`.`TagsId`, `s`.`Id`, `s`.`Name`, `u`.`Id`, `p`.`Id`\nFROM `Users` AS `u`\nINNER JOIN `Posts` AS `p` ON `u`.`Id` = `p`.`UserId`\nINNER JOIN (\n    SELECT `p0`.`PostsId`, `p0`.`TagsId`, `t`.`Id`, `t`.`Name`\n    FROM `PostTags` AS `p0`\n    INNER JOIN `Tags` AS `t` ON `p0`.`TagsId` = `t`.`Id`\n) AS `s` ON `p`.`Id` = `s`.`PostsId`\nORDER BY `u`.`Id`, `p`.`Id`",
+    );
+    assert_eq!(
+        shapes(&split),
+        [
+            "PostsId .s posttags 8 20 0x1001",
+            "TagsId .s posttags 8 20 0x1001",
+            "Id .s tags 8 20 0x1",
+            "Name .s tags 253 400 0x1001",
+            "Id reports.u users 8 20 0x1",
+            "Id reports.p posts 8 20 0x1",
+        ]
+    );
+    assert_eq!(read(&split, &[0, 3]), ["1 news", "1 rust", "2 sql"]);
+
+    // A condition may make MySQL read a table as one constant row, and an
+    // order within one table leaves which table it reads first to MySQL.
+    for refused in [
+        "SELECT `u`.`Id`, `s`.`Name` FROM `Users` AS `u` INNER JOIN (SELECT `p0`.`PostsId`, `t`.`Name` FROM `PostTags` AS `p0` INNER JOIN `Tags` AS `t` ON `p0`.`TagsId` = `t`.`Id`) AS `s` ON `u`.`Id` = `s`.`PostsId` WHERE `u`.`Id` = 1 ORDER BY `u`.`Id`, `s`.`Name`",
+        "SELECT `u`.`Id`, `s`.`Name` FROM `Users` AS `u` INNER JOIN (SELECT `p0`.`PostsId`, `t`.`Name` FROM `PostTags` AS `p0` INNER JOIN `Tags` AS `t` ON `p0`.`TagsId` = `t`.`Id`) AS `s` ON `u`.`Id` = `s`.`PostsId` ORDER BY `u`.`Id`",
+        "SELECT `u`.`Id`, `s`.`Name` FROM `Users` AS `u` INNER JOIN (SELECT `p0`.`PostsId`, `t`.`Name` FROM `PostTags` AS `p0` INNER JOIN `Tags` AS `t` ON `p0`.`TagsId` = `t`.`Id`) AS `s` ON `u`.`Id` = `s`.`PostsId`",
+    ] {
+        assert!(adapter.execute_query(refused).is_err(), "{refused}");
+    }
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

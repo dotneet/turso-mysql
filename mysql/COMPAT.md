@@ -650,6 +650,22 @@ depends on how many rows the tables hold — none, one each, or thousands:
 
 Either way a column on the side a `LEFT JOIN` can leave missing loses its NOT NULL, and a
 `DISTINCT` keeps the first of the words it counts as one, `Alpha` before `alpha`, as MySQL does.
+
+Entity Framework Core loads relations through such bodies differently: a derived table joining
+tables stands beside the statement's own tables or inside another such body, and a body may
+join with `INNER JOIN` — `Include(u => u.Posts).ThenInclude(p => p.Tags)` is `SELECT u.Id, ...,
+s0.Name FROM Users AS u LEFT JOIN (SELECT p.Id, ..., s.Id AS Id0, s.Name FROM Posts AS p LEFT
+JOIN (SELECT p0.PostsId, p0.TagsId, t.Id, t.Name FROM PostTags AS p0 INNER JOIN Tags AS t ON
+p0.TagsId = t.Id) AS s ON p.Id = s.PostsId) AS s0 ON u.Id = s0.UserId ORDER BY u.Id, s0.Id,
+s0.PostsId, s0.TagsId`. Such a statement is taken when it projects and orders by columns of its
+tables alone and its order names columns read from at least two tables. Measured on 8.4.11 over
+no rows, three and thousands, the shapes the same each time: MySQL then sorts the rows through
+a table of its own, only the first table it reads being able to hand rows over in an order, so
+every column loses its keys, a derived table's column names no database and its own table by
+name (`posts`, not `p`), and a column a `LEFT JOIN` can leave missing, at any depth, loses its
+NOT NULL. A condition is refused — one naming a key could make MySQL read a table as one
+constant row — and so is an order within one table, a `DISTINCT`, a grouping, an unordered
+statement, and two tables read under one name.
 TypeORM's next two statements already worked: the page's posts read by id —
 `... WHERE Post.id IN ('1', '2') ORDER BY Post.id ASC` over the same joins — and the count,
 `SELECT COUNT(DISTINCT Post.id) AS cnt FROM posts Post LEFT JOIN ...`.
@@ -658,7 +674,8 @@ Refused over a body joining tables, each measured or not measured: a condition i
 measured, `WHERE Post.id = 1` makes MySQL read `posts` as one constant row, whose columns then
 report the table's own shapes, and a derived table's again when no such row exists; a value in
 a join's `ON`, only columns matched against each other having been measured; an inner join,
-whose order MySQL picks itself; an `ORDER BY` without `DISTINCT` — measured, MySQL sorts
+whose order MySQL picks itself, but in a statement sorting across tables (below); an `ORDER BY`
+without `DISTINCT` over the derived table's columns alone — measured, MySQL sorts
 through a table of its own when it matches a joined table by hash rather than by a key, which it
 chose for a table of two rows that had a key; a `LIMIT` with no order; and anything but the
 derived table's own columns — a condition, a grouping, a count, an expression, `*`, a second
