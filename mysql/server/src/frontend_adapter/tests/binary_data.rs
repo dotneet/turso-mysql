@@ -694,12 +694,12 @@ fn bytes_a_driver_binds_into_a_column_of_words_are_refused() {
         (
             "INSERT INTO w (id, word) VALUES (1, ?)",
             MYSQL_TYPE_BLOB,
-            b"abc",
+            &[0x61, 0xFF],
         ),
         (
             "INSERT INTO w (id, body) VALUES (1, ?)",
             MYSQL_TYPE_BLOB,
-            b"abc",
+            &[0xE3, 0x81],
         ),
     ] {
         assert_eq!(
@@ -709,4 +709,38 @@ fn bytes_a_driver_binds_into_a_column_of_words_are_refused() {
         );
     }
     assert!(rows(&mut adapter, "SELECT id FROM w").is_empty());
+}
+
+/// mysql2 binds a `Buffer`, and drivers send long text through
+/// `COM_STMT_SEND_LONG_DATA`, as `MYSQL_TYPE_BLOB`. MySQL 8.4.11 reads those
+/// bytes as utf8mb4 into a column of words and stores the text.
+#[test]
+fn utf8_bytes_bound_as_a_blob_are_stored_as_words() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE w (id INT PRIMARY KEY, word VARCHAR(10), body TEXT)",
+    );
+    execute_bound(
+        &mut adapter,
+        "INSERT INTO w (id, word, body) VALUES (1, 'x', ?)",
+        MYSQL_TYPE_BLOB,
+        &[DriverValue::Bytes("あいう".as_bytes())],
+    )
+    .unwrap();
+    execute_bound(
+        &mut adapter,
+        "UPDATE w SET word = ? WHERE id = 1",
+        MYSQL_TYPE_BLOB,
+        &[DriverValue::Bytes(b"abc")],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&mut adapter, "SELECT word, body, CHAR_LENGTH(body) FROM w"),
+        [[
+            Some(b"abc".to_vec()),
+            Some("あいう".as_bytes().to_vec()),
+            Some(b"3".to_vec())
+        ]]
+    );
 }

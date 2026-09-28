@@ -3251,6 +3251,16 @@ impl MySqlConnection {
             });
         }
         observe_parameter_markers(&mut prepared.result_column_type_metadata, values);
+        let written_values;
+        let values = if matches!(
+            prepared.execution_plan,
+            PreparedExecutionPlan::Select { .. }
+        ) {
+            values
+        } else {
+            written_values = utf8_bytes_as_words(values);
+            &written_values
+        };
 
         if let Some(statement) = prepared.statement.as_mut() {
             statement
@@ -13331,6 +13341,27 @@ fn read_table_names(translated: &TranslatedDml) -> Vec<String> {
         .read_tables()
         .iter()
         .map(|source| source.table().as_str().to_owned())
+        .collect()
+}
+
+/// Bytes a statement that writes binds — a `Buffer` mysql2 binds as a
+/// `MYSQL_TYPE_BLOB`, long text a driver sends through
+/// `COM_STMT_SEND_LONG_DATA` — are read as a word when they are UTF-8.
+///
+/// Measured on MySQL 8.4.11, bytes bound into a column of words are read as
+/// utf8mb4 and stored as that text, and bytes that are not UTF-8 answer 1366.
+/// A column of bytes turns the word back into the same bytes, so what lands
+/// there is unchanged. A `SELECT` keeps them bytes: `SELECT ?` answers a
+/// `BLOB`, and a comparison takes bytes only against a column of bytes.
+fn utf8_bytes_as_words(values: &[MySqlPreparedValue]) -> Vec<MySqlPreparedValue> {
+    values
+        .iter()
+        .map(|value| match value {
+            MySqlPreparedValue::Blob(bytes) => std::str::from_utf8(bytes)
+                .map(|word| MySqlPreparedValue::Text(word.to_owned()))
+                .unwrap_or_else(|_| value.clone()),
+            value => value.clone(),
+        })
         .collect()
 }
 

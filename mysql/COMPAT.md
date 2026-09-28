@@ -3316,14 +3316,16 @@ through a proxy: go-sql-driver 1.10.1 binds a `[]byte` as
 `MYSQL_TYPE_STRING`, mysql2 3.24.4 a Node `Buffer` as `MYSQL_TYPE_BLOB`, and
 PHP 8.3's PDO a string as `MYSQL_TYPE_VAR_STRING` whether bound as
 `PDO::PARAM_LOB` or not, each with its raw bytes, and MySQL stores those bytes
-in a column of bytes and finds them again by a bound comparison. A string
-parameter that is not UTF-8 is therefore read as bytes rather than refused,
-and bytes of any parameter type go into a `BLOB`, a `VARBINARY` or a
+in a column of bytes and finds them again by a bound comparison. A string or
+`BLOB` parameter that is not UTF-8 is therefore read as bytes rather than
+refused, and bytes of any parameter type go into a `BLOB`, a `VARBINARY` or a
 `BINARY` and come back whole over both protocols — a `VARBINARY` and a
 `BINARY` crossing the binary protocol as length-encoded bytes, which they
-could not before. Bytes bound into a column of words are refused: measured,
-MySQL reads them as utf8mb4, storing that text when they are and answering
-1366 when they are not, and stored as bytes no word would ever meet them.
+could not before. Into a column of words MySQL reads bound bytes as utf8mb4,
+storing that text when they are and answering 1366 when they are not; a
+`BLOB` parameter that is UTF-8 — a `Buffer`, or long text a driver sends
+through `COM_STMT_SEND_LONG_DATA` — is stored as that text, and one that is
+not is refused, since stored as bytes no word would ever meet it.
 
 Bytes written out are a column of bytes' own values: `X'616263'`, `0x616263`,
 `b'01100001'`, `_binary 'abc'` and `_binary X'616263'` are stored as those
