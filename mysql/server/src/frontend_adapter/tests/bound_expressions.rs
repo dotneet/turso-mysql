@@ -30,11 +30,13 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
 const GORM_USERS: &str = "CREATE TABLE `users` (`id` bigint unsigned AUTO_INCREMENT,`email` varchar(191) NOT NULL,`name` varchar(100) NOT NULL,`balance` decimal(10,2) NOT NULL DEFAULT 0,`is_active` boolean NOT NULL,`profile` JSON,`created_at` datetime(3) NULL,`updated_at` datetime(3) NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_users_email` (`email`))";
 const GORM_POSTS: &str = "CREATE TABLE `posts` (`id` bigint unsigned AUTO_INCREMENT,`user_id` bigint unsigned NOT NULL,`title` varchar(200) NOT NULL,`body` text,`published_at` datetime(3) NULL,`views` bigint NOT NULL DEFAULT 0,`created_at` datetime(3) NULL,`updated_at` datetime(3) NULL,PRIMARY KEY (`id`),INDEX `idx_posts_user_id` (`user_id`),CONSTRAINT `fk_users_posts` FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON DELETE CASCADE)";
 
-/// One value as go-sql-driver binds it.
+/// One value as go-sql-driver binds it. GORM's ids are Go `uint`s, which it
+/// binds as a `LONGLONG` flagged unsigned.
 #[derive(Clone, Copy)]
 enum Bound<'a> {
     Word(&'a str),
     Whole(i64),
+    Id(u64),
     Real(f64),
     Null,
 }
@@ -50,13 +52,14 @@ fn payload(values: &[Bound<'_>]) -> Vec<u8> {
     let mut payload = bitmap;
     payload.push(1);
     for value in values {
-        let code = match value {
-            Bound::Word(_) => MYSQL_TYPE_STRING,
-            Bound::Whole(_) => MYSQL_TYPE_LONGLONG,
-            Bound::Real(_) => MYSQL_TYPE_DOUBLE,
-            Bound::Null => MYSQL_TYPE_NULL,
+        let (code, flags) = match value {
+            Bound::Word(_) => (MYSQL_TYPE_STRING, 0),
+            Bound::Whole(_) => (MYSQL_TYPE_LONGLONG, 0),
+            Bound::Id(_) => (MYSQL_TYPE_LONGLONG, 0x80),
+            Bound::Real(_) => (MYSQL_TYPE_DOUBLE, 0),
+            Bound::Null => (MYSQL_TYPE_NULL, 0),
         };
-        payload.extend_from_slice(&[code, 0]);
+        payload.extend_from_slice(&[code, flags]);
     }
     for value in values {
         match value {
@@ -65,6 +68,7 @@ fn payload(values: &[Bound<'_>]) -> Vec<u8> {
                 payload.extend_from_slice(word.as_bytes());
             }
             Bound::Whole(number) => payload.extend_from_slice(&number.to_le_bytes()),
+            Bound::Id(number) => payload.extend_from_slice(&number.to_le_bytes()),
             Bound::Real(number) => payload.extend_from_slice(&number.to_le_bytes()),
             Bound::Null => {}
         }
@@ -385,4 +389,108 @@ fn the_second_bound_value_in_a_set_stamps_the_row() {
         1
     );
     assert_eq!(one_value(&mut adapter, stamped), "1");
+}
+
+/// GORM finds every row it changes by an id, a `BIGINT UNSIGNED` it binds.
+/// The engine keeps such a column in a form of its own, and compared it with
+/// a bound number by kind: `WHERE user_id = ?` changed no row, `WHERE id > ?`
+/// every row, and a written `id IN (1, 2)` none either. Measured on MySQL
+/// 8.4.11, each finds the rows whose ids compare as numbers.
+#[test]
+fn gorm_finds_the_rows_it_changes_by_a_bound_id() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE `post_tags` (`post_id` bigint unsigned,`tag_id` bigint unsigned,PRIMARY KEY (`post_id`,`tag_id`),CONSTRAINT `fk_post_tags_post` FOREIGN KEY (`post_id`) REFERENCES `posts`(`id`),CONSTRAINT `fk_post_tags_tag` FOREIGN KEY (`tag_id`) REFERENCES `tags`(`id`))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO tags (id, name) VALUES (1, 'go'), (2, 'sql'), (3, 'db')",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO post_tags (post_id, tag_id) VALUES (1, 1), (1, 2), (1, 3), (2, 1)",
+    );
+    let views = "SELECT views FROM posts ORDER BY id";
+
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `posts` SET `views`=views + ? WHERE user_id = ?",
+            &[Bound::Whole(3), Bound::Id(1)]
+        ),
+        2
+    );
+    assert_eq!(first_column(&mut adapter, views), ["8", "10", "1"]);
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "DELETE FROM `post_tags` WHERE `post_tags`.`post_id` = ? AND `post_tags`.`tag_id` NOT IN (?,?)",
+            &[Bound::Id(1), Bound::Id(1), Bound::Id(2)]
+        ),
+        1
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT CONCAT(post_id, '-', tag_id) FROM post_tags ORDER BY post_id, tag_id"
+        ),
+        ["1-1", "1-2", "2-1"]
+    );
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `posts` SET `views`=0 WHERE id > ?",
+            &[Bound::Id(1)]
+        ),
+        2
+    );
+    assert_eq!(first_column(&mut adapter, views), ["8", "0", "0"]);
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `posts` SET `views`=1 WHERE id BETWEEN ? AND ?",
+            &[Bound::Id(2), Bound::Id(3)]
+        ),
+        2
+    );
+    assert_eq!(first_column(&mut adapter, views), ["8", "1", "1"]);
+    assert!(matches!(
+        adapter.execute_query("UPDATE posts SET views = 100 WHERE id IN (1, 2)"),
+        Ok(CommandExecutionResult::Ok(result)) if result.affected_rows == 2
+    ));
+    assert_eq!(first_column(&mut adapter, views), ["100", "100", "1"]);
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `users` SET `name`=?,`updated_at`=? WHERE `id` = ?",
+            &[
+                Bound::Word("Rob"),
+                Bound::Word("2026-09-28 01:46:13.123"),
+                Bound::Id(2)
+            ]
+        ),
+        1
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT name FROM users ORDER BY id"),
+        ["A", "Rob"]
+    );
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "DELETE FROM `users` WHERE `users`.`id` = ?",
+            &[Bound::Id(2)]
+        ),
+        1
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT id FROM posts ORDER BY id"),
+        ["1", "2"]
+    );
 }

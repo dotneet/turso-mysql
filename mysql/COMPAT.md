@@ -5279,6 +5279,12 @@ pivot's `post_id = ? and tag_id in (?)` — compares it the way a prepared
 `SELECT` does; it used to match no row, the engine comparing the bound number
 with the column's stored form.
 
+GORM's statements of the same kind are covered too: `UPDATE posts SET
+views=views + ? WHERE user_id = ?`, `WHERE id > ?`, `BETWEEN ? AND ?`, a
+detach's `post_id = ? AND tag_id NOT IN (?,?)` and a written `id IN (1, 2)`,
+each of which used to change no row or every row; measured on 8.4.11, each
+finds the rows whose ids compare as numbers.
+
 This internal type is created only for the MySQL frontend. An older MySQL
 table declared as `BIGINT UNSIGNED` used signed integer storage; its original
 high values cannot be recovered from that representation, so opening it now
