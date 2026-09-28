@@ -4567,7 +4567,12 @@ later one, a `ROLLBACK TO` forgets every savepoint taken after the one it names,
 and a `COMMIT` forgets them all. A name that is not there answers 1305, SQLSTATE
 42000, as MySQL does; MySQL's message names the savepoint where this one does
 not, the way every other message here stays fixed. Names are matched whatever
-their case on both sides.
+their case on both sides. A backquoted name may hold any printable ASCII
+character — Sequelize names a nested transaction's savepoint
+`` `ae10d62c-ada2-47cf-99ae-f2d02c8ea9a1-sp-1` ``, and `` `a b.c!` `` and
+`` `x``y` `` are taken as well, measured; a letter outside ASCII, whose case
+MySQL folds by rules not measured here, and a space at either end are
+refused.
 
 With autocommit on and no transaction open, `SAVEPOINT s1` answers OK and
 nothing survives it — the statement is its own transaction, so the next

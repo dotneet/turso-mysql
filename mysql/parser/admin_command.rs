@@ -178,9 +178,14 @@ fn checked_savepoint_name(tokens: &[&Token]) -> Result<String, ParseError> {
 /// Validates and canonicalizes one savepoint name.
 ///
 /// Measured on MySQL 8.4.11: savepoint names are matched whatever their case,
-/// so `ROLLBACK TO S1` finds the savepoint `s1`. The engine matches them the
-/// same way, and the name is lowercased here so the two agree about a name
-/// this frontend has already canonicalized.
+/// so `ROLLBACK TO S1` finds the savepoint `s1`, and a backquoted name may
+/// hold any other character — Sequelize names a nested transaction
+/// `` `09189cf0-191c-4e19-8090-a15ad6701cc0-sp-1` ``, and `` `a b.c!` `` and
+/// `` `x``y` `` are taken too. The engine matches ASCII letters without regard
+/// to case the same way, and the name is lowercased here so the two agree
+/// about a name this frontend has already canonicalized. A letter outside
+/// ASCII, whose case MySQL folds by rules not measured here, is refused, and
+/// so is a space at either end.
 fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
     if name.is_empty() {
         return Err(ParseError::InvalidSavepointName { reason: "empty" });
@@ -190,14 +195,19 @@ fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
             reason: "longer than 64 bytes",
         });
     }
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return Err(ParseError::InvalidSavepointName {
+            reason: "space at an end",
+        });
+    }
     let mut canonical = String::with_capacity(name.len());
     for byte in name.bytes() {
         let byte = match byte {
             b'A'..=b'Z' => byte.to_ascii_lowercase(),
-            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => byte,
+            b' '..=b'~' => byte,
             _ => {
                 return Err(ParseError::InvalidSavepointName {
-                    reason: "character outside [A-Za-z0-9_$]",
+                    reason: "character outside printable ASCII",
                 });
             }
         };

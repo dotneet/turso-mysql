@@ -382,6 +382,75 @@ fn sequelize_lists_indexes_naming_the_database_after_the_table() {
     ));
 }
 
+/// One word bound as mysql2 binds a string: the null bitmap, the
+/// new-parameters flag and one `VAR_STRING`.
+fn one_word(word: &str) -> Vec<u8> {
+    let mut payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0, word.len() as u8];
+    payload.extend_from_slice(word.as_bytes());
+    payload
+}
+
+/// A transaction started inside another is a savepoint Sequelize names after
+/// the outer transaction's id, dashes and all.
+#[test]
+fn sequelizes_nested_transaction_is_a_savepoint_named_with_dashes() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `tags` (`id` BIGINT auto_increment , `name` VARCHAR(100) NOT NULL UNIQUE, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+    );
+    let insert = adapter
+        .execute_stmt_prepare("INSERT INTO `tags` (`id`,`name`) VALUES (DEFAULT,?);")
+        .unwrap()
+        .statement_id;
+    run(&mut adapter, "START TRANSACTION;");
+    adapter
+        .execute_stmt_execute(insert, &one_word("kept"))
+        .unwrap();
+    run(
+        &mut adapter,
+        "SAVEPOINT `ae10d62c-ada2-47cf-99ae-f2d02c8ea9a1-sp-1`;",
+    );
+    adapter
+        .execute_stmt_execute(insert, &one_word("dropped"))
+        .unwrap();
+    assert!(matches!(
+        adapter.execute_stmt_execute(insert, &one_word("kept")),
+        Err(FrontendErrorKind::ConstraintViolation)
+    ));
+    // Measured: the name matches whatever the case of its letters.
+    run(
+        &mut adapter,
+        "ROLLBACK TO SAVEPOINT `AE10D62C-ADA2-47CF-99AE-F2D02C8EA9A1-SP-1`;",
+    );
+    adapter
+        .execute_stmt_execute(insert, &one_word("after"))
+        .unwrap();
+    run(&mut adapter, "COMMIT;");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `id`, `name` FROM `tags` AS `Tag` WHERE `Tag`.`name` IN ('kept', 'dropped', 'after') ORDER BY `Tag`.`name` ASC;"
+        )
+        .into_iter()
+        .map(|row| row[1].clone().unwrap())
+        .collect::<Vec<_>>(),
+        ["after", "kept"]
+    );
+
+    run(&mut adapter, "START TRANSACTION");
+    run(&mut adapter, "SAVEPOINT `a b.c!`");
+    run(&mut adapter, "RELEASE SAVEPOINT `A B.C!`");
+    // Released, so there is nothing to roll back to: 1305.
+    assert!(matches!(
+        adapter.execute_query("ROLLBACK TO SAVEPOINT `a b.c!`"),
+        Err(FrontendErrorKind::NoSuchSavepoint)
+    ));
+    run(&mut adapter, "SAVEPOINT `x``y`");
+    run(&mut adapter, "ROLLBACK TO `X``Y`");
+    run(&mut adapter, "COMMIT");
+}
+
 /// The engine names the columns of the index behind a key as it folds them,
 /// `id` for a column written `Id`; that index is still the key and no other.
 #[test]
