@@ -1,0 +1,10 @@
+{
+  "name": "turso-e2e-sequelize",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "mysql2": "3.24.4",
+    "sequelize": "6.37.8",
+    "sequelize-cli": "6.6.5"
+  }
+}

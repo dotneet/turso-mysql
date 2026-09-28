@@ -9,16 +9,28 @@
 #   mysql/e2e/frameworks/run.sh --down          # stop the servers
 #
 # E2E_KEEP=1 leaves the servers running after a full run.
+#
+# To run a second copy of the harness next to this one (another checkout or
+# worktree), give it its own names so neither touches the other's containers,
+# network or build cache:
+#
+#   COMPOSE_PROJECT_NAME=turso-e2e-more E2E_CARGO_TARGET_VOLUME=turso-e2e-more-cargo-target run.sh ...
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-all_apps=(mysqlcli mysqldump laravel prisma typeorm django rails sqlalchemy gorm)
+all_apps=(mysqlcli mysqldump laravel prisma typeorm django rails sqlalchemy gorm sequelize)
 rust_image=rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
 python_image=python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c
 
 export E2E_RUN_DIR="${E2E_RUN_DIR:-${here}/.run}"
+# Prefix of every container, network and app image of this copy of the harness.
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-turso-e2e-fw}"
+prefix="${COMPOSE_PROJECT_NAME}"
+# The build cache records which source it was built from, so a copy built from
+# another checkout must not share it (cargo would skip rebuilding changed crates).
+export E2E_CARGO_TARGET_VOLUME="${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}"
 # One database per app, plus the extra ones some apps need.
-export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst"
+export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize"
 
 main() {
   case "${1:-}" in
@@ -62,15 +74,15 @@ up() {
   (umask 077 && printf '%s' "${E2E_PASSWORD}" >"${E2E_RUN_DIR}/password")
 
   log "generating throwaway TLS material"
-  docker run --rm --name turso-e2e-fw-tls \
+  docker run --rm --name "${prefix}-tls" \
     -v "${here}/server/gen-tls.sh:/gen-tls.sh:ro" -v "${E2E_RUN_DIR}/tls:/out" \
     --entrypoint /gen-tls.sh "${rust_image}"
   cp "${E2E_RUN_DIR}/tls/"{ca.pem,server-chain.pem,server-key.pem} "${E2E_RUN_DIR}/tls-mysql/"
 
   log "building turso-mysql (debug) and the SQL proxy"
-  compose --profile build run --rm --name turso-e2e-fw-build build >"${E2E_RUN_DIR}/build.log" 2>&1 \
+  compose --profile build run --rm --name "${prefix}-build" build >"${E2E_RUN_DIR}/build.log" 2>&1 \
     || { tail -30 "${E2E_RUN_DIR}/build.log"; exit 1; }
-  compose --profile build run --rm --name turso-e2e-fw-sqlproxy-build sqlproxy-build
+  compose --profile build run --rm --name "${prefix}-sqlproxy-build" sqlproxy-build
 
   log "starting turso and mysql"
   compose --profile servers down --remove-orphans --timeout 10 >/dev/null 2>&1 || true
@@ -107,10 +119,10 @@ run_apps() {
       # A server that stopped fails the reset; that is reported and the next
       # target still runs, rather than `set -e` ending the whole run silently.
       # shellcheck disable=SC2046
-      compose --profile apps run --rm --name "turso-e2e-fw-dbadmin-${app}-${target}" \
+      compose --profile apps run --rm --name "${prefix}-dbadmin-${app}-${target}" \
         dbadmin "${target}" $(databases_of "${app}") >/dev/null \
         || { log "${app} against ${target}: resetting its databases failed"; server_still_running "${target}"; continue; }
-      compose --profile apps run --rm --name "turso-e2e-fw-${app}-${target}" \
+      compose --profile apps run --rm --name "${prefix}-${app}-${target}" \
         -e E2E_APP="${app}" -e E2E_TARGET="${target}" -e E2E_UPSTREAM="${target}:3306" \
         "${app}" >"${E2E_RUN_DIR}/results/${app}-${target}.run.log" 2>&1 \
         || log "${app} against ${target}: container failed, see results/${app}-${target}.run.log"
@@ -124,7 +136,7 @@ run_apps() {
 server_still_running() {
   local target="$1"
   local state
-  state="$(docker inspect -f '{{.State.Status}}' "turso-e2e-fw-${target}-1" 2>/dev/null || echo missing)"
+  state="$(docker inspect -f '{{.State.Status}}' "${prefix}-${target}-1" 2>/dev/null || echo missing)"
   if [[ "${state}" != "running" ]]; then
     log "SERVER ${target} IS ${state}"
     if [[ "${target}" == "turso" && -f "${E2E_RUN_DIR}/turso-log/server.log" ]]; then
@@ -135,7 +147,7 @@ server_still_running() {
 
 report() {
   log "writing the report"
-  docker run --rm --name turso-e2e-fw-report \
+  docker run --rm --name "${prefix}-report" \
     -v "${here}/common/report.py:/report.py:ro" -v "${E2E_RUN_DIR}/results:/results" \
     "${python_image}" python /report.py /results
 }

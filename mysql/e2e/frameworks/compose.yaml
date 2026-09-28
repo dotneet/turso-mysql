@@ -1,6 +1,8 @@
 # Real frameworks against a live turso-mysql server and a real MySQL 8.4.
 # Driven by run.sh; see README.md. Every container, network and volume is
-# prefixed with turso-e2e-.
+# prefixed with turso-e2e-. COMPOSE_PROJECT_NAME (which overrides `name`)
+# and E2E_CARGO_TARGET_VOLUME let a second copy of the harness run beside
+# this one.
 name: turso-e2e-fw
 
 x-rust-image: &rust-image rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0
@@ -24,7 +26,7 @@ x-app: &app
 
 networks:
   net:
-    name: turso-e2e-fw-net
+    name: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-net
 
 volumes:
   cargo-registry:
@@ -32,7 +34,7 @@ volumes:
   cargo-git:
     name: turso-e2e-cargo-git
   cargo-target:
-    name: turso-e2e-cargo-target
+    name: ${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}
   go-cache:
     name: turso-e2e-go-cache
 
@@ -148,48 +150,55 @@ services:
   laravel:
     <<: *app
     build: ./apps/laravel
-    image: turso-e2e-fw-laravel:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-laravel:local
     working_dir: /app
     command: ["./run.sh"]
 
   prisma:
     <<: *app
     build: ./apps/prisma
-    image: turso-e2e-fw-prisma:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-prisma:local
     working_dir: /app
     command: ["./run.sh"]
 
   typeorm:
     <<: *app
     build: ./apps/typeorm
-    image: turso-e2e-fw-typeorm:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-typeorm:local
     working_dir: /app
     command: ["./run.sh"]
 
   django:
     <<: *app
     build: ./apps/django
-    image: turso-e2e-fw-django:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-django:local
     working_dir: /app
     command: ["./run.sh"]
 
   rails:
     <<: *app
     build: ./apps/rails
-    image: turso-e2e-fw-rails:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-rails:local
     working_dir: /app
     command: ["./run.sh"]
 
   sqlalchemy:
     <<: *app
     build: ./apps/sqlalchemy
-    image: turso-e2e-fw-sqlalchemy:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-sqlalchemy:local
     working_dir: /app
     command: ["./run.sh"]
 
   gorm:
     <<: *app
     build: ./apps/gorm
-    image: turso-e2e-fw-gorm:local
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-gorm:local
+    working_dir: /app
+    command: ["./run.sh"]
+
+  sequelize:
+    <<: *app
+    build: ./apps/sequelize
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-sequelize:local
     working_dir: /app
     command: ["./run.sh"]
