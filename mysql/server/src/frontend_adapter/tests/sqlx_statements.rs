@@ -489,3 +489,58 @@ fn sqlx_appends_to_a_column_that_may_hold_nothing() {
         );
     }
 }
+
+/// sqlx's transaction step copies a user's id beside a bound title, `INSERT
+/// INTO posts (user_id, title) SELECT id, ? FROM users WHERE email = ?`, out
+/// of a table holding a `DECIMAL` balance it does not read. Measured on MySQL
+/// 8.4.11: one row, the next post id, and the balance left alone.
+#[test]
+fn sqlx_copies_an_id_beside_a_bound_title_out_of_a_table_holding_a_decimal() {
+    let (_directory, mut adapter) = adapter();
+    migrate(&mut adapter, CREATE_BLOG);
+    for sql in [
+        "INSERT INTO users (email, name, balance) VALUES ('alice@example.com', 'Alice', 100.50), ('bob@example.com', 'Bob', 20.25)",
+        "INSERT INTO posts (user_id, title) VALUES (1, 'Hello'), (1, 'Draft'), (2, 'Bob writes')",
+        "BEGIN",
+    ] {
+        run(&mut adapter, sql);
+    }
+    prepared_changes(
+        &mut adapter,
+        "UPDATE users SET balance = balance + 10 WHERE email = ?",
+        &[Bound::Word("bob@example.com")],
+    );
+    let copied = prepared_changes(
+        &mut adapter,
+        "INSERT INTO posts (user_id, title) SELECT id, ? FROM users WHERE email = ?",
+        &[
+            Bound::Word("In a transaction"),
+            Bound::Word("bob@example.com"),
+        ],
+    );
+    assert_eq!((copied.affected_rows, copied.last_insert_id), (1, 4));
+    run(&mut adapter, "COMMIT");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT p.id, p.user_id, p.title, u.balance FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = 4"
+        ),
+        [[
+            Some("4".to_owned()),
+            Some("2".to_owned()),
+            Some("In a transaction".to_owned()),
+            Some("30.25".to_owned()),
+        ]]
+    );
+
+    // A `?` written into the `DECIMAL` itself goes through the copy path's
+    // own rule for one, which reads a `DECIMAL` only out of another.
+    assert_eq!(
+        prepared(
+            &mut adapter,
+            "INSERT INTO users (email, name, balance) SELECT 'carol@example.com', name, ? FROM users WHERE id = ?",
+            &[Bound::Word("5.00"), Bound::Whole(1)],
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}

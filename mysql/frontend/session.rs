@@ -2569,21 +2569,23 @@ impl MySqlConnection {
                     })
                 });
         }
+        // A value reading nothing of the source — a written whole number,
+        // NULL, a `?` — lands in a column that holds no `DECIMAL`, as every
+        // column written here has to.
         let projected = match projection {
             turso_mysql_parser::MySqlDirectInsertSelectProjection::All => return false,
-            turso_mysql_parser::MySqlDirectInsertSelectProjection::Columns(columns) => columns,
+            turso_mysql_parser::MySqlDirectInsertSelectProjection::Columns(columns) => {
+                columns.into_iter().map(Some).collect::<Vec<_>>()
+            }
             turso_mysql_parser::MySqlDirectInsertSelectProjection::ColumnsAndLiterals(values) => {
-                if values.iter().any(Option::is_none) {
-                    return false;
-                }
-                values.into_iter().map(Option::unwrap).collect()
+                values
             }
             turso_mysql_parser::MySqlDirectInsertSelectProjection::IntegerArithmetic(_) => {
                 unreachable!()
             }
         };
         projected.len() == target.columns.len()
-            && projected.iter().all(|read| {
+            && projected.iter().flatten().all(|read| {
                 source_columns
                     .iter()
                     .any(|column| column.name().eq_ignore_ascii_case(read))

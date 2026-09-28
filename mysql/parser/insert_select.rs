@@ -21,6 +21,8 @@ pub struct MySqlInsertSelectWithoutColumns {
 pub enum MySqlDirectInsertSelectProjection {
     All,
     Columns(Vec<String>),
+    /// Each value a column read, or `None` for a written whole number, NULL
+    /// or a `?`, which reads nothing of the source.
     ColumnsAndLiterals(Vec<Option<String>>),
     IntegerArithmetic(Vec<Vec<String>>),
 }
@@ -132,12 +134,15 @@ fn insert_select_projection(
                 expr: Expr::Identifier(column),
                 ..
             } => Some(Some(column.value.clone())),
+            // A `?` reads nothing of the source either: sqlx copies a user's
+            // id beside a bound title with `SELECT id, ? FROM users ...`.
             SelectItem::UnnamedExpr(Expr::Value(value))
                 if matches!(&value.value,
                     Value::Number(written, false)
                         if written.bytes().all(|byte| byte.is_ascii_digit())
                             && written.parse::<i64>().is_ok())
-                    || matches!(&value.value, Value::Null) =>
+                    || matches!(&value.value, Value::Null)
+                    || matches!(&value.value, Value::Placeholder(marker) if marker == "?") =>
             {
                 Some(None)
             }

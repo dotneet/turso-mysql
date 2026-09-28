@@ -2786,6 +2786,15 @@ rows that get written — measured on 8.4.11 over (1,10),(2,20),(3,30),
 `INSERT INTO dst (id, n) SELECT id, n FROM src WHERE n > 15` writes two rows and
 counts 2, which this matches.
 
+A copy out of or into a table holding a `DECIMAL` is taken where no
+`DECIMAL` is read and none is written, and where a `DECIMAL` is copied into
+one of the same size. A value reading nothing of the source counts as reading
+no `DECIMAL`: sqlx copies a user's id beside a bound title with `INSERT INTO
+posts (user_id, title) SELECT id, ? FROM users WHERE email = ?`, `users`
+holding a `DECIMAL` balance, and measured on 8.4.11 it writes one row with the
+next post id, as it does here. A `?`, a written number or another kind of
+column written into a `DECIMAL` is refused.
+
 The part that had to be built rather than reused is authorization. A statement's
 tables were found by asking the SELECT parser, and an `INSERT ... SELECT` is not
 a SELECT, so it would have answered nothing: with database-wide `Query` granted

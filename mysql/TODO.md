@@ -352,6 +352,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `INSERT ... SELECT` into an `AUTO_INCREMENT` table in a session whose time zone is not UTC | refused; the copy path does not shift `TIMESTAMP` values between zones |
 | `INSERT ... SELECT` into an `AUTO_INCREMENT` table whose batch of numbers would pass the column's highest | refused; measured, MySQL cuts the last batch short there and writes the rows that fit |
 | `INSERT IGNORE` coercing a value MySQL would clamp | refused instead; needs the coercion `INSERT` does not have either |
+| `INSERT ... SELECT` writing a `DECIMAL` column from anything but a `DECIMAL` column of the same size — a `?`, a written number, another kind of column | refused; the copy writes a `DECIMAL` only from the stored form of one of its own size |
 | `INSERT ... SELECT` without a column list, carrying `IGNORE` or an upsert clause | refused; those forms are refused wherever they are written |
 | `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` | refused; the copy is rendered with no upsert clause, and what a colliding copied row updates and reports has not been measured |
 | `INSERT ... SELECT` whose `SELECT` needs its column types (a bound value, an `ORDER BY` over a column) and has a `GROUP_CONCAT` | refused; that `SELECT` is rendered as a bare one, which warns about a cut where MySQL fails a statement writing the cut value with 1260 |
