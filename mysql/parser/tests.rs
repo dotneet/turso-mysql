@@ -5634,9 +5634,10 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT SUM(id + 1) FROM users",
         "SELECT SUM(DISTINCT id) FROM users",
         "SELECT MIN(u.id) FROM users u JOIN posts p ON p.user_id = u.id",
-        // MySQL orders the parts it joins and the engine's group_concat has no
-        // way to say in what order, so the ORDER BY form stays refused.
-        "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM users",
+        // An order of one bare column is worked out when the parts are
+        // joined; one of more has not been measured.
+        "SELECT GROUP_CONCAT(name ORDER BY name, id) FROM users",
+        "SELECT GROUP_CONCAT(name ORDER BY UPPER(name)) FROM users",
         // MySQL drops values equal under the column's collation and joins
         // the rest in its order, which the engine's DISTINCT does not.
         "SELECT GROUP_CONCAT(DISTINCT name) FROM users",
@@ -5664,7 +5665,7 @@ fn select_group_concat_translates_plain_call() {
         translated.as_sql(),
         "SELECT mysql_group_concat(group_concat(CASE WHEN \"name\" IS NULL THEN 'N' \
          ELSE 'V' || length(CAST((\"name\" || '') AS BLOB)) || ':' || \"name\" END, ''), \
-         ',', 1, 1) AS \"GROUP_CONCAT(name)\" FROM \"users\""
+         ',', 0, 1, 1) AS \"GROUP_CONCAT(name)\" FROM \"users\""
     );
     assert_eq!(
         translated.static_result_metadata(),

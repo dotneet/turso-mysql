@@ -4519,9 +4519,25 @@ An `INSERT ... SELECT` writing a cut value fails with 1260 instead and writes
 nothing, as MySQL does under the strict mode this server runs; MySQL's message
 names the row, where this one's stays fixed.
 
+`GROUP_CONCAT(col ORDER BY key [ASC | DESC] [SEPARATOR s])` joins the values
+in the order of one bare column, a whole number or a word under
+`utf8mb4_0900_ai_ci`, which a report of each post's tags writes. Measured on
+8.4.11, a NULL the values are ordered by comes first, and last from the last,
+and the cut and the row its warning names count in that order: at 4, values
+ordered by `n DESC` into `b,a,A,c` answer `b,a,` and warn `Row 3`. The answer
+has the shape the unordered call answers, named as written. Values tying in
+the order come out in an order of MySQL's own — `a` before `A` under
+`utf8mb4_0900_ai_ci` whichever way the order runs, which is not the order they
+were read in — so a group whose tied values differ is refused when it is
+joined, answering 1235. An order by several columns, an expression, an
+ordinal, a column of another kind or words under another collation is
+refused, and so is one over a join or a subquery, where the column's kind is
+not read.
+
 The engine's `group_concat` gathers each group's rows, every one written with
-its length in bytes so no value can be mistaken for a separator, and
-`mysql_group_concat` joins them and cuts. Numbering a cut needs what the call
+its length in bytes so no value can be mistaken for a separator — and, for an
+ordered call, after the value it is ordered by — and `mysql_group_concat`
+orders them, joins them and cuts. Numbering a cut needs what the call
 joined in earlier groups, which the function leaves on the engine connection
 between groups; the adapter resets it before each statement and reads the
 cuts back after.
@@ -4539,8 +4555,7 @@ for the cut and its column alike, which is what MySQL does over
 Refused, each measured to differ: `DISTINCT`, which MySQL applies under the
 column's collation and joins in that collation's order — over `b`, `B`, `é`,
 `e`, `A` it answers `A,b,é`, where the engine keeps identical values apart
-from the others and joins them in the order it read them; an `ORDER BY`
-inside the call, which the engine's planner refuses inside any aggregate; a
+from the others and joins them in the order it read them; a
 `DOUBLE` or `FLOAT` column, which MySQL writes the shortest way (`1e20`,
 `0.1`) and the engine does not (`1.0e+20`, `0.100000001490116`); a `BLOB`, a
 binary string and a `JSON` column, each answering a binary result of a width

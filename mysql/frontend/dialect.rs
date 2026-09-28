@@ -554,7 +554,7 @@ impl Dialect for MySqlDialect {
         {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
-        if arg_count == 4
+        if arg_count == 5
             && (name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT)
                 || name.eq_ignore_ascii_case(group_concat::MYSQL_GROUP_CONCAT_COUNT))
         {

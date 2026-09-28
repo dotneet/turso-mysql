@@ -506,3 +506,80 @@ fn a_group_concat_mysql_joins_by_a_rule_of_its_own_is_refused() {
         assert!(adapter.execute_stmt_prepare(sql).is_err(), "{sql}");
     }
 }
+
+/// `GROUP_CONCAT(... ORDER BY ...)`, which the mysql command-line run's
+/// report of each post's tags writes. MySQL orders the parts before joining
+/// them, so the cut and the row its warning names count in that order: at 4,
+/// the parts ordered by `n DESC` into `b,a,A,c` are cut in the third. A NULL
+/// the parts are ordered by comes first, and last from the last. The answer
+/// has the shape the unordered call answers.
+#[test]
+fn an_ordered_group_concat_joins_and_cuts_in_its_order() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE gc (id INT PRIMARY KEY, g INT, name VARCHAR(20), n INT)",
+        "INSERT INTO gc VALUES (1, 1, 'b', 3), (2, 1, 'A', 1), (3, 1, 'a', 2), (4, 2, 'é', 5), (5, 2, 'e', 4), (6, 2, NULL, 6), (7, 1, 'c', NULL)",
+        "CREATE TABLE binned (id INT PRIMARY KEY, name VARCHAR(20) COLLATE utf8mb4_bin)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (sql, joined) in [
+        (
+            "SELECT g, GROUP_CONCAT(name ORDER BY n) FROM gc GROUP BY g ORDER BY g",
+            [["1", "c,A,a,b"], ["2", "e,é"]],
+        ),
+        (
+            "SELECT g, GROUP_CONCAT(name ORDER BY n DESC) FROM gc GROUP BY g ORDER BY g",
+            [["1", "b,a,A,c"], ["2", "é,e"]],
+        ),
+        (
+            "SELECT g, GROUP_CONCAT(name ORDER BY n SEPARATOR '; ') FROM gc GROUP BY g ORDER BY g",
+            [["1", "c; A; a; b"], ["2", "e; é"]],
+        ),
+        (
+            "SELECT g, GROUP_CONCAT(name ORDER BY name DESC SEPARATOR ',') FROM gc WHERE id IN (1, 3, 4, 7) GROUP BY g ORDER BY g",
+            [["1", "c,b,a"], ["2", "é"]],
+        ),
+    ] {
+        assert_eq!(rows(&mut adapter, sql), joined, "{sql}");
+        assert_eq!(cut_rows(&mut adapter), Vec::<u64>::new(), "{sql}");
+    }
+    let named = result(&mut adapter, "SELECT GROUP_CONCAT(name ORDER BY n) FROM gc");
+    assert_eq!(named.columns[0].name, "GROUP_CONCAT(name ORDER BY n)");
+    assert_eq!(
+        shape(&named.columns[0]),
+        shape(&result(&mut adapter, "SELECT GROUP_CONCAT(name) FROM gc").columns[0])
+    );
+    run(&mut adapter, "SET SESSION group_concat_max_len = 4");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT g, GROUP_CONCAT(name ORDER BY n DESC) FROM gc GROUP BY g ORDER BY g"
+        ),
+        [["1", "b,a,"], ["2", "é,e"]]
+    );
+    assert_eq!(cut_rows(&mut adapter), [3]);
+    run(&mut adapter, "SET SESSION group_concat_max_len = 1024");
+    // Measured: parts tying in the order come out in an order of MySQL's own,
+    // `a,A,b,c` under `utf8mb4_0900_ai_ci`, which is not the order they were
+    // read in, so a group tying on different values is refused.
+    assert_eq!(
+        adapter.execute_query(
+            "SELECT g, GROUP_CONCAT(name ORDER BY name SEPARATOR ',') FROM gc GROUP BY g ORDER BY g"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    for sql in [
+        // An order by more than one column, by an expression, by an ordinal
+        // or by a column of another kind has not been measured.
+        "SELECT GROUP_CONCAT(name ORDER BY g, n) FROM gc",
+        "SELECT GROUP_CONCAT(name ORDER BY n + 1) FROM gc",
+        "SELECT GROUP_CONCAT(name ORDER BY 1) FROM gc",
+        "SELECT GROUP_CONCAT(a ORDER BY dbl) FROM f JOIN kinds ON kinds.id = f.id",
+        "SELECT GROUP_CONCAT(id ORDER BY dbl) FROM kinds",
+        // Words ordered under another collation than `utf8mb4_0900_ai_ci`.
+        "SELECT GROUP_CONCAT(id ORDER BY name) FROM binned",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

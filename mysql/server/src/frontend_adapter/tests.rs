@@ -1241,12 +1241,12 @@ fn group_concat_answers_blob_length_65536_decimals_31_and_skips_nulls_matching_m
         );
     }
 
-    // Refused: an ORDER BY, which MySQL applies to the parts it joins and
-    // the engine has no way to say; a DISTINCT, which MySQL applies under
-    // the column's collation and joins in that collation's order; and
-    // several columns.
+    // Refused: an ORDER BY of more than one column; a DISTINCT, which MySQL
+    // applies under the column's collation and joins in that collation's
+    // order; and several columns. An order of one column is covered in
+    // cut_group_concat.
     for sql in [
-        "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM t",
+        "SELECT GROUP_CONCAT(name ORDER BY name DESC, n) FROM t",
         "SELECT GROUP_CONCAT(DISTINCT team) FROM t",
         "SELECT GROUP_CONCAT(DISTINCT name SEPARATOR '-') FROM t",
         "SELECT GROUP_CONCAT(team, name) FROM t",

@@ -6595,7 +6595,7 @@ impl MySqlConnection {
         let typed = self.with_column_types(sql, untyped)?;
         if typed.renders_a_condition_without_column_types() {
             return Err(MySqlQueryError::Unsupported(
-                "a CASE, IF, IFNULL or COALESCE over a column needs its table's column types"
+                "a CASE, IF, IFNULL or COALESCE over a column, or a GROUP_CONCAT ordered by one, needs its table's column types"
                     .to_owned(),
             ));
         }

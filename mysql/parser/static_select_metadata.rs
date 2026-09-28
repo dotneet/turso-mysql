@@ -3908,22 +3908,48 @@ pub(super) fn checked_interval_count(interval: &sqlparser::ast::Interval) -> Opt
     crate::translate::direct_signed_integer(&interval.value)
 }
 
-/// Reports whether a `GROUP_CONCAT` carries nothing but a separator.
+/// Reports whether a `GROUP_CONCAT` carries nothing but an order of one bare
+/// column, a separator, or both, in that order.
 ///
-/// Its `ORDER BY` is left out: MySQL orders the parts it joins, and the
-/// engine's `group_concat` has no way to say in what order it joins them.
+/// MySQL joins the parts in the order named, which the engine's own
+/// `group_concat` cannot say, so the order is worked out when the parts are
+/// joined; `NULLS FIRST` and `NULLS LAST` are no MySQL.
 pub(super) fn checked_group_concat_clauses(
     clauses: &[sqlparser::ast::FunctionArgumentClause],
 ) -> bool {
-    matches!(
-        clauses,
-        [] | [sqlparser::ast::FunctionArgumentClause::Separator(
-            sqlparser::ast::ValueWithSpan {
+    use sqlparser::ast::FunctionArgumentClause;
+    let separates = |clause: &FunctionArgumentClause| {
+        matches!(
+            clause,
+            FunctionArgumentClause::Separator(sqlparser::ast::ValueWithSpan {
                 value: sqlparser::ast::Value::SingleQuotedString(_),
                 ..
-            },
-        )]
-    )
+            })
+        )
+    };
+    let orders_by_a_column = |clause: &FunctionArgumentClause| {
+        matches!(
+            clause,
+            FunctionArgumentClause::OrderBy(terms)
+                if matches!(
+                    terms.as_slice(),
+                    [sqlparser::ast::OrderByExpr {
+                        expr: Expr::Identifier(_),
+                        options: sqlparser::ast::OrderByOptions {
+                            nulls_first: None,
+                            ..
+                        },
+                        with_fill: None,
+                    }]
+                )
+        )
+    };
+    match clauses {
+        [] => true,
+        [only] => separates(only) || orders_by_a_column(only),
+        [order, separator] => orders_by_a_column(order) && separates(separator),
+        _ => false,
+    }
 }
 
 /// Returns the separator a checked `GROUP_CONCAT` was given, if any.
@@ -3931,13 +3957,34 @@ pub(super) fn group_concat_separator(function: &sqlparser::ast::Function) -> Opt
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         return None;
     };
-    match arguments.clauses.as_slice() {
-        [sqlparser::ast::FunctionArgumentClause::Separator(sqlparser::ast::ValueWithSpan {
+    arguments.clauses.iter().find_map(|clause| match clause {
+        sqlparser::ast::FunctionArgumentClause::Separator(sqlparser::ast::ValueWithSpan {
             value: sqlparser::ast::Value::SingleQuotedString(separator),
             ..
-        })] => Some(separator),
+        }) => Some(separator.as_str()),
         _ => None,
-    }
+    })
+}
+
+/// Returns the column a checked `GROUP_CONCAT` orders its parts by, and
+/// whether it orders them from the last, if it names one.
+pub(super) fn group_concat_order(
+    function: &sqlparser::ast::Function,
+) -> Option<(&sqlparser::ast::Ident, bool)> {
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    arguments.clauses.iter().find_map(|clause| match clause {
+        sqlparser::ast::FunctionArgumentClause::OrderBy(terms) => match terms.as_slice() {
+            [sqlparser::ast::OrderByExpr {
+                expr: Expr::Identifier(column),
+                options,
+                ..
+            }] => Some((column, options.asc == Some(false))),
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 fn is_plain_aggregate(function: &sqlparser::ast::Function) -> bool {

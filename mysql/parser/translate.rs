@@ -642,6 +642,9 @@ pub(crate) fn translate_select_query(
     if render_context.names_an_unprojected_group_concat {
         return unsupported("GROUP_CONCAT outside the projection");
     }
+    if render_context.group_concat_orders_by_another_kind {
+        return unsupported("GROUP_CONCAT ordered by a column holding neither words nor numbers");
+    }
     Ok(RenderedSelect {
         sqlite_sql: normalized,
         collation_sensitive_call_columns: render_context.collation_sensitive_call_columns,
@@ -4679,6 +4682,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the statement's own `SELECT` asked with `SQL_CALC_FOUND_ROWS`
     /// for the rows it would answer without its `LIMIT`.
     calculates_found_rows: bool,
+    /// Whether a `GROUP_CONCAT` is ordered by a column holding neither words
+    /// nor whole numbers, whose order has not been measured.
+    group_concat_orders_by_another_kind: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
     /// Whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column was
@@ -4768,6 +4774,7 @@ impl<'a> SelectRenderContext<'a> {
             renders_the_outer_projection: false,
             counts_the_rows_of_the_derived_table: false,
             calculates_found_rows: false,
+            group_concat_orders_by_another_kind: false,
             orders_a_bare_column: false,
             checks_type_sensitive_expression: false,
             renders_a_condition_without_column_types: false,
@@ -5135,16 +5142,31 @@ fn render_group_concat(
         .replace('\'', "''");
     render_context.group_concat_calls += 1;
     let call = render_context.group_concat_calls;
+    let (order, key) = match static_select_metadata::group_concat_order(function) {
+        Some((key, from_the_last)) => {
+            let order = group_concat_order_kind(key, from_the_last, render_context);
+            let key = render_ident(key);
+            (
+                order,
+                format!(
+                    "CASE WHEN {key} IS NULL THEN 'Z' \
+                     ELSE 'K' || length(CAST(({key} || '') AS BLOB)) || ':' || {key} END || "
+                ),
+            )
+        }
+        None => (GROUP_CONCAT_AS_READ, String::new()),
+    };
     let gathered = format!(
-        "group_concat(CASE WHEN {column} IS NULL THEN 'N' \
+        "group_concat({key}CASE WHEN {column} IS NULL THEN 'N' \
          ELSE 'V' || length(CAST(({column} || '') AS BLOB)) || ':' || {column} END, '')"
     );
+
     let on_cut = if render_context.writes_its_rows {
         GROUP_CONCAT_CUT_FAILS
     } else {
         GROUP_CONCAT_CUT_WARNS
     };
-    let named = format!("{gathered}, '{separator}'");
+    let named = format!("{gathered}, '{separator}', {order}");
     if !render_context.renders_a_projection_item {
         if !render_context.projected_group_concats.contains(&named)
             && !render_context.last_projected_group_concats.contains(&named)
@@ -5156,14 +5178,60 @@ fn render_group_concat(
     render_context.projected_group_concats.push(named);
     if render_context.counts_group_concat_in_having {
         render_context.group_concat_counts.push(format!(
-            "mysql_group_concat_count({gathered}, '{separator}', {call}, {on_cut})"
+            "mysql_group_concat_count({gathered}, '{separator}', {order}, {call}, {on_cut})"
         ));
         return format!(
-            "mysql_group_concat({gathered}, '{separator}', {call}, {GROUP_CONCAT_NAMED_AGAIN})"
+            "mysql_group_concat({gathered}, '{separator}', {order}, {call}, {GROUP_CONCAT_NAMED_AGAIN})"
         );
     }
-    format!("mysql_group_concat({gathered}, '{separator}', {call}, {on_cut})")
+    format!("mysql_group_concat({gathered}, '{separator}', {order}, {call}, {on_cut})")
 }
+
+/// Says how a `GROUP_CONCAT`'s parts are ordered, from the kind of column
+/// they are ordered by: words under `utf8mb4_0900_ai_ci`, which the frontend
+/// holds the column to, or whole numbers. Until the kinds are known the
+/// statement is marked to be read again knowing them, and a column of any
+/// other kind is refused once they are.
+fn group_concat_order_kind(
+    key: &Ident,
+    from_the_last: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> u8 {
+    render_context.checks_type_sensitive_expression = true;
+    let named = |columns: &[String]| {
+        columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(&key.value))
+    };
+    let (first, last) = if render_context.table_columns.is_empty() {
+        render_context.renders_a_condition_without_column_types = true;
+        (GROUP_CONCAT_AS_READ, GROUP_CONCAT_AS_READ)
+    } else if named(render_context.integer_columns) {
+        (GROUP_CONCAT_BY_NUMBER, GROUP_CONCAT_BY_NUMBER_FROM_THE_LAST)
+    } else if named(render_context.text_columns) {
+        render_context
+            .collation_sensitive_call_columns
+            .push(key.value.clone());
+        (GROUP_CONCAT_BY_WORD, GROUP_CONCAT_BY_WORD_FROM_THE_LAST)
+    } else {
+        render_context.group_concat_orders_by_another_kind = true;
+        (GROUP_CONCAT_AS_READ, GROUP_CONCAT_AS_READ)
+    };
+    if from_the_last {
+        last
+    } else {
+        first
+    }
+}
+
+/// How `mysql_group_concat` orders the parts it joins: as the engine read
+/// them, or by the words or the whole numbers each was gathered with, from
+/// the first or from the last.
+const GROUP_CONCAT_AS_READ: u8 = 0;
+const GROUP_CONCAT_BY_WORD: u8 = 1;
+const GROUP_CONCAT_BY_WORD_FROM_THE_LAST: u8 = 2;
+const GROUP_CONCAT_BY_NUMBER: u8 = 3;
+const GROUP_CONCAT_BY_NUMBER_FROM_THE_LAST: u8 = 4;
 
 /// What `mysql_group_concat` does about a cut: nothing more for a call named
 /// again in a `HAVING` or an `ORDER BY`, which MySQL does not count or warn
