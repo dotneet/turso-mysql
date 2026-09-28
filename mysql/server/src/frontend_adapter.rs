@@ -5535,10 +5535,14 @@ fn apply_raw_column_collations(
     }
     let mut tables = HashMap::<String, Vec<turso_mysql::MySqlColumnMetadata>>::new();
     for definition in columns {
+        // A catalog column MySQL works out rather than reads names its
+        // `information_schema` table and no database — `VIEWS`'s
+        // `VIEW_DEFINITION` — and holds no user table's collation.
         if definition.character_set != u16::from(DEFAULT_UTF8MB4_COLLATION)
             || definition.original_table.is_empty()
             || definition.original_name.is_empty()
             || definition.schema.eq_ignore_ascii_case("information_schema")
+            || MySqlCatalogTable::from_reported_name(&definition.original_table).is_some()
         {
             continue;
         }

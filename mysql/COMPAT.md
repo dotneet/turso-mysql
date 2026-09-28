@@ -6783,7 +6783,13 @@ connection. The announced number selects the modern MySQL 8 driver path; it
 does not claim full MySQL 8.0.36 SQL compatibility. Connector/J also sends
 `SET character_set_results = NULL`, which disables conversion here and reads
 back as NULL through `SELECT @@character_set_results` (an empty value through
-`SHOW VARIABLES`), matching the measured MySQL 8.4.11 behavior.
+`SHOW VARIABLES`), matching the measured MySQL 8.4.11 behavior. Under it a column
+read from a table reports the table column's own collation; an
+`information_schema` column keeps the connection's, and so does one MySQL's
+catalog works out rather than reads, which names its catalog table and no
+database — `VIEWS`'s `VIEW_DEFINITION`, `EVENTS`'s `EVENT_BODY`. That one was
+looked up as a user table and answered 1235, so DBeaver could not list a
+database's views over Connector/J.
 
 The crate-private pre-TLS helper reads and validates exactly one fixed
 SSLRequest using one absolute deadline and leaves coalesced TLS ClientHello

@@ -163,6 +163,31 @@ fn dbeaver_reads_the_triggers_of_a_database() {
     assert_eq!(read.rows[0][7], BinaryResultValue::Integer(1));
 }
 
+/// Connector/J asks for results in each column's own character set, and a
+/// catalog column MySQL works out rather than reads — `VIEWS`'s
+/// `VIEW_DEFINITION`, `EVENTS`'s `EVENT_BODY` — names its table and no
+/// database. The server looked for a user table of that name to read the
+/// column's collation from, and answered 1235: DBeaver could not list a
+/// database's views.
+#[test]
+fn a_jdbc_session_reads_the_views_and_events_of_a_database() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("SET character_set_results = NULL")
+        .unwrap();
+    let views = rows(
+        &mut adapter,
+        "SELECT * FROM information_schema.VIEWS WHERE TABLE_SCHEMA='dbtools'",
+    );
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0][2].as_deref(), Some("active_users"));
+    assert!(rows(
+        &mut adapter,
+        "SELECT * FROM information_schema.EVENTS WHERE EVENT_SCHEMA='dbtools'"
+    )
+    .is_empty());
+}
+
 /// MySQL lists a trigger only to a session holding the `TRIGGER` privilege on
 /// its table, which a session here holds only through the whole database: one
 /// granted the table alone sees no trigger.

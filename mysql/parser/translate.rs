@@ -321,6 +321,16 @@ impl MySqlCatalogTable {
         }
     }
 
+    /// Reads a table back from the name MySQL reports as a column's original
+    /// table, which is the upper-case name MySQL declares it under — a name
+    /// no table this server makes can have, every one being folded to lower
+    /// case.
+    pub fn from_reported_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|table| table.mysql_name() == name)
+    }
+
     /// Reads a table back from the name the engine knows it by.
     pub fn from_engine_name(name: &str) -> Option<Self> {
         Self::ALL
