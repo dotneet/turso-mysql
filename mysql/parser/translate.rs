@@ -11788,9 +11788,15 @@ fn render_comparison_over_a_scalar_subquery(
         }
         _ => return Ok(None),
     };
-    let Some(inner_table) = subquery_source_table(select) else {
+    // A count reads no column of its tables, so it may join them the way an
+    // `EXISTS` may — Gitea counts a label's closed issues over `issue_label,
+    // issue`.
+    let counts = matches!(answered, ScalarSubqueryAnswer::AWholeNumber);
+    let inner_table = subquery_source_table(select);
+    if inner_table.is_none() && !counts {
         return Ok(None);
-    };
+    }
+    render_context.an_exists_may_join = counts;
     let (rendered_subquery, _) = render_subquery(query, render_context)?;
     let (inner_column_name, fixed_columns) = match &answered {
         ScalarSubqueryAnswer::TheColumnsOwnKind(inner_column_name) => {
@@ -11806,7 +11812,8 @@ fn render_comparison_over_a_scalar_subquery(
         }
         _ => None,
     };
-    if let (Some(inner_column_name), Some((qualifier, column))) = (inner_column_name, outer_column)
+    if let (Some(inner_column_name), Some((qualifier, column)), Some(inner_table)) =
+        (inner_column_name, outer_column, inner_table)
     {
         render_context
             .checked_subquery_comparisons

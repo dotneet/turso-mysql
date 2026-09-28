@@ -2552,8 +2552,10 @@ its own that a count, answered as a plain integer, does not compare with. Gitea'
 consistency checks are written so, finding the rows whose kept count is off:
 `repo.num_watches != (SELECT COUNT(*) FROM watch WHERE repo_id = repo.id AND
 mode <> 2)`; measured on 8.4.11, a NULL count column answers no row, as the
-engine's comparison answers it. `SUM` is left out, not having been measured
-against a column.
+engine's comparison answers it. A count reads no column of its tables, so its
+subquery may join them, as Gitea's check of a label's closed issues does over
+`issue_label, issue`. `SUM` is left out, not having been measured against a
+column.
 
 An `AVG` is taken against a column, which is how a statement asks for the rows
 above average — `WHERE views > (SELECT AVG(views) FROM posts)`, written either

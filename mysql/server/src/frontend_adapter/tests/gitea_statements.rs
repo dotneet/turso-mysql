@@ -970,3 +970,29 @@ fn a_membership_test_reads_the_largest_of_each_group() {
         Err(FrontendErrorKind::Unsupported)
     ));
 }
+
+/// Gitea's consistency check of a label's closed issues counts over a comma
+/// join, `(SELECT COUNT(*) FROM issue_label, issue WHERE ...)`. A count reads
+/// no column of its tables, so it may join them; the answer is MySQL
+/// 8.4.11's over the same rows.
+#[test]
+fn a_count_compared_with_a_column_may_join_tables() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `num_closed_issues` INT NULL)",
+        "CREATE TABLE `issue_label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `issue_id` BIGINT(20) NULL, `label_id` BIGINT(20) NULL)",
+        "CREATE TABLE `issue` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `is_closed` TINYINT(1) NULL)",
+        "INSERT INTO `label` (`num_closed_issues`) VALUES (2), (0), (1)",
+        "INSERT INTO `issue` (`is_closed`) VALUES (0), (1), (1)",
+        "INSERT INTO `issue_label` (`issue_id`, `label_id`) VALUES (1, 1), (2, 1), (3, 1), (2, 2), (1, 3)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT `label`.id FROM `label` WHERE `label`.num_closed_issues!=(SELECT COUNT(*) FROM `issue_label`,`issue` WHERE `issue_label`.label_id=`label`.id AND `issue_label`.issue_id=`issue`.id AND `issue`.is_closed=1) ORDER BY id"
+        ),
+        ["2", "3"]
+    );
+}
