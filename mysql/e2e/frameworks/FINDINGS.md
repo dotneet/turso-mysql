@@ -535,3 +535,41 @@ What still fails on turso alone:
 - Drizzle: relational queries built from `LATERAL` joins of JSON aggregates.
 - dbtools: `getTablePrivileges`, `SHOW PLUGINS`, `information_schema.PARTITIONS`,
   Workbench's `performance_schema` join and `EXPLAIN`, left refused on purpose.
+
+# Gitea's own integration suite
+
+2026-09-29. Gitea v1.27.3's `tests/integration`, run through the harness
+(`run.sh gitea`, `E2E_GITEA_SHARDS=60`), with the 115 tests that drive Gitea
+Actions through a mock runner left out (they fail against MySQL here too).
+
+| | MySQL 8.4.11 | turso |
+|---|---|---|
+| tests reported | 484 | 468 |
+| tests passing | 395 | 352 |
+| wall time | 231 s | 4300 s (debug build) |
+
+352 of the 395 tests that pass on MySQL pass on turso (89%); 33 fail, 10 are not
+reported because a turso-caused panic in another test ended their shard, and
+no test passes on turso that fails on MySQL. MySQL's own 89 failures are this
+setup's (LFS, SSH, some git operations), not the database's.
+
+Before this round the suite stopped before any test, in xorm's first catalog
+read (`information_schema.TABLES.AUTO_INCREMENT`, 1054). Getting through setup
+took the catalog columns xorm reads, `SHOW COLLATION WHERE`, `ROW_FORMAT=DYNAMIC`,
+`BIGINT(20)` keys, and a stream of query shapes Gitea's permission, search and
+issue pages use (see the commits). Two server faults came out of it that no
+scripted app had reached: a deep query overflowing a connection thread's stack
+aborted the whole server, and opening a database while another connection's
+insert held its id counter marked the database registry broken, answering 1105
+to every connection until restart (3 of 5 full runs). Both are fixed.
+
+What still stops the rest, by tests affected (TODO.md has the statements):
+
+- the package registry's aggregates and derived tables over joins;
+- a derived table inside the `DELETE` every repository and user deletion runs;
+- `COALESCE(SUM(...), 0)` over a join on every issue list;
+- `COUNT(DISTINCT ...)` grouped over a join, the heatmap's `DIV ... GROUP BY`;
+- concurrency: a write whose snapshot went stale answers 1213 where MySQL's row
+  locks let both commit, and Gitea does not retry; a counted insert can take an
+  id another open transaction then writes explicitly (1062). These come from
+  the one database-wide write lock and are the real gap for a busy instance.
