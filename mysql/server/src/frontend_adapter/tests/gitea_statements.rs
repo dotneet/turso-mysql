@@ -996,3 +996,50 @@ fn a_count_compared_with_a_column_may_join_tables() {
         ["2", "3"]
     );
 }
+
+/// Gitea lists an issue's dependencies from its own repository first with
+/// `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END` over a
+/// join, on every issue page. Each branch is a written whole number or a
+/// column holding them, so the rows order as MySQL's `BIGINT` answer does;
+/// every order here was measured on MySQL 8.4.11 over the same rows.
+#[test]
+fn an_ordering_case_over_whole_numbers_reads_joined_columns() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `issue` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL, `created_unix` BIGINT(20) NULL)",
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `name` VARCHAR(255) NULL)",
+        "CREATE TABLE `issue_dependency` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `user_id` BIGINT(20) NOT NULL, `issue_id` BIGINT(20) NOT NULL, `dependency_id` BIGINT(20) NOT NULL)",
+        "INSERT INTO `repository` (`name`) VALUES ('a'), ('b'), ('c')",
+        "INSERT INTO `issue` (`repo_id`, `name`, `created_unix`) VALUES (1, 'i1', 10), (3, 'i2', 20), (2, 'i3', 30), (2, 'i4', 40), (1, 'i5', 50), (3, 'i6', 60)",
+        "INSERT INTO `issue_dependency` (`user_id`, `issue_id`, `dependency_id`) VALUES (1, 4, 1), (1, 4, 2), (1, 4, 3), (1, 4, 5), (1, 4, 6)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let blocked_by = prepared_rows(
+        &mut adapter,
+        "SELECT * FROM `issue` INNER JOIN `repository` ON repository.id = issue.repo_id INNER JOIN `issue_dependency` ON issue_dependency.dependency_id = issue.id WHERE (issue_id = ?) ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END, issue.created_unix DESC",
+        &[Bound::Whole(4), Bound::Whole(2)],
+    );
+    assert_eq!(
+        blocked_by
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        [3, 5, 1, 6, 2].map(BinaryResultValue::Integer)
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT issue.id FROM `issue` ORDER BY CASE WHEN issue.repo_id = 3 THEN -1 WHEN issue.repo_id = 1 THEN 7 ELSE issue.repo_id END DESC, id"
+        ),
+        ["1", "5", "3", "4", "2", "6"]
+    );
+    // A branch of words orders by a collation, which this does not read.
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT issue.id FROM `issue` INNER JOIN `repository` ON repository.id = issue.repo_id ORDER BY CASE WHEN issue.repo_id = 1 THEN 0 ELSE issue.name END"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}

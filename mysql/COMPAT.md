@@ -2226,6 +2226,13 @@ that being written out as comparisons whose collation has not been measured.
 The rest are a collation over a number, over a bound value — which carries no
 text until it binds — and one from another character set, which is 1253 there.
 
+An ordering may be a `CASE` whose every branch is a written whole number or a
+column holding whole numbers, in a join too, each condition read as a `WHERE`
+reads it — Gitea lists an issue's dependencies from its own repository first
+with `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END`. The
+rows order as the numbers MySQL's `BIGINT` answer holds; a branch of words, a
+`DECIMAL` or a `BIGINT UNSIGNED` is refused.
+
 An ordering may name an aggregate over a column whose name a result column's
 alias shares — xorm writes `max(index) AS index ... GROUP BY context_hash ORDER
 BY max(index)` for Gitea's commit statuses. Measured on MySQL 8.4.11 the name

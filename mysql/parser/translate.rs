@@ -3304,6 +3304,31 @@ fn render_order_by_expr(
                 render_select_expr(expr, render_context)?
             ));
         }
+        // `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END`
+        // is how Gitea lists an issue's dependencies from its own repository
+        // first. Each branch is a written whole number or a column held to
+        // plain whole numbers, so the rows order as the numbers MySQL's
+        // `BIGINT` answer holds; each condition is read as a `WHERE` reads it.
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } if conditions
+            .iter()
+            .map(|when| &when.result)
+            .chain(std::iter::once(otherwise.as_ref()))
+            .all(|result| names_a_whole_number(result) || named_column(result).is_some()) =>
+        {
+            let mut rendered = String::from("CASE");
+            for when in conditions {
+                let condition = render_select_predicate(&when.condition, render_context)?;
+                let result = render_ordering_branch(&when.result, render_context)?;
+                rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
+            }
+            let otherwise = render_ordering_branch(otherwise, render_context)?;
+            return Ok(format!("{rendered} ELSE {otherwise} END {direction}"));
+        }
         _ => return unsupported("SELECT ORDER BY expression"),
     }
     let collation = match expr {
@@ -3373,6 +3398,24 @@ fn render_order_by_expr(
         _ => render_select_expr(expr, render_context)?,
     };
     Ok(format!("{ordered}{collation} {direction}"))
+}
+
+/// One branch of an ordering `CASE` over whole numbers: a written one as it
+/// stands, a column held to plain whole numbers.
+fn render_ordering_branch(
+    result: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if let Some((qualifier, column)) = named_column(result) {
+        render_context
+            .checked_comparisons
+            .push(held_to_plain_whole_numbers(
+                qualifier.map(|qualifier| qualifier.value.clone()),
+                &column.value,
+            ));
+        return render_select_expr(result, render_context);
+    }
+    render_dml_expr(result)
 }
 
 fn order_expression_uses_decimal(expr: &Expr, decimal_columns: &[(String, u32)]) -> bool {
@@ -11772,7 +11815,7 @@ fn render_comparison_over_a_scalar_subquery(
         (ScalarSubqueryAnswer::AWholeNumber, Expr::Identifier(column)) => {
             render_context
                 .checked_comparisons
-                .push(compared_with_a_count(None, &column.value));
+                .push(held_to_plain_whole_numbers(None, &column.value));
             render_select_expr(other, render_context)?
         }
         (ScalarSubqueryAnswer::AWholeNumber, Expr::CompoundIdentifier(parts))
@@ -11780,7 +11823,7 @@ fn render_comparison_over_a_scalar_subquery(
         {
             render_context
                 .checked_comparisons
-                .push(compared_with_a_count(
+                .push(held_to_plain_whole_numbers(
                     Some(parts[0].value.clone()),
                     &parts[1].value,
                 ));
@@ -11926,13 +11969,16 @@ fn held_to_a_whole_number(qualifier: Option<String>, column_name: &str) -> Check
 
 /// A check that holds one column to whole numbers the engine holds as plain
 /// integers, which is what a count it is compared with answers.
-fn compared_with_a_count(qualifier: Option<String>, column_name: &str) -> CheckedSelectComparison {
+fn held_to_plain_whole_numbers(
+    qualifier: Option<String>,
+    column_name: &str,
+) -> CheckedSelectComparison {
     CheckedSelectComparison {
         qualifier,
         inner_sources: Vec::new(),
         column_name: column_name.to_owned(),
         operator: CheckedSelectComparisonOperator::Equal,
-        rhs: CheckedSelectComparisonRhs::Operand(crate::CheckedComparisonOperand::Count),
+        rhs: CheckedSelectComparisonRhs::Operand(crate::CheckedComparisonOperand::PlainWholeNumber),
         collated: false,
         answers: None,
     }
