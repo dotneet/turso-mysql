@@ -13,7 +13,12 @@ export E2E_HOST=127.0.0.1
 export E2E_PORT=3306
 export E2E_CA=/e2e/tls/ca.pem
 
-/e2e/bin/sqlproxy \
+# E2E_PROXY_DUMP=1 also writes every packet, in hex, to packets.txt.
+dump=""
+rm -f "${out}/packets.txt"
+[ "${E2E_PROXY_DUMP:-0}" = 1 ] && dump="-dump ${out}/packets.txt"
+# shellcheck disable=SC2086
+/e2e/bin/sqlproxy ${dump} \
   -listen 127.0.0.1:3306 \
   -upstream "${E2E_UPSTREAM}" \
   -cert /e2e/proxy-tls/server-chain.pem \

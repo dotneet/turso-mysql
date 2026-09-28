@@ -17,6 +17,7 @@ x-app: &app
   environment:
     E2E_PASSWORD: ${E2E_PASSWORD:-}
     E2E_USER: e2e
+    E2E_PROXY_DUMP: ${E2E_PROXY_DUMP:-0}
   volumes:
     - .:/e2e/src:ro
     - ${E2E_RUN_DIR:-./.run}/tls/ca.pem:/e2e/tls/ca.pem:ro

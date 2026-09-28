@@ -55,6 +55,32 @@ type entry struct {
 	Message  string `json:"message,omitempty"`
 }
 
+// packetDump writes every packet in hex when -dump is given; it is nil otherwise.
+type packetDump struct {
+	mu sync.Mutex
+	f  *os.File
+}
+
+var dump *packetDump
+
+func (d *packetDump) write(conn int64, from string, p packet) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	fmt.Fprintf(d.f, "conn %d %s seq %d len %d: %x\n", conn, from, p.seq, len(p.payload), p.payload[:min(len(p.payload), 512)])
+}
+
+func (d *packetDump) closed(conn int64, side string, err error) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	fmt.Fprintf(d.f, "conn %d %s closed: %v\n", conn, side, err)
+}
+
 type logWriter struct {
 	mu  sync.Mutex
 	enc *json.Encoder
@@ -80,6 +106,7 @@ func main() {
 	ca := flag.String("ca", "", "CA that signed the upstream certificate")
 	logPath := flag.String("log", "", "JSON-lines statement log")
 	readyPath := flag.String("ready", "", "file created once the proxy listens")
+	dumpPath := flag.String("dump", "", "optional file that gets every packet after TLS, in hex, for debugging")
 	flag.Parse()
 	if *upstream == "" || *cert == "" || *key == "" || *ca == "" || *logPath == "" {
 		log.Fatal("-upstream, -cert, -key, -ca and -log are required")
@@ -116,6 +143,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+	if *dumpPath != "" {
+		d, err := os.OpenFile(*dumpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+		if err != nil {
+			log.Fatalf("open dump: %v", err)
+		}
+		dump = &packetDump{f: d}
+	}
 	if *readyPath != "" {
 		if err := os.WriteFile(*readyPath, nil, 0o644); err != nil {
 			log.Fatalf("write ready file: %v", err)
@@ -148,6 +182,7 @@ func relay(id int64, client net.Conn, upstream string, serverTLS, clientTLS *tls
 	if err != nil {
 		return fmt.Errorf("read greeting: %w", err)
 	}
+	dump.write(id, "server", greeting)
 	if err := writePacket(client, greeting); err != nil {
 		return err
 	}
@@ -156,8 +191,10 @@ func relay(id int64, client net.Conn, upstream string, serverTLS, clientTLS *tls
 	}
 	first, err := readPacket(client)
 	if err != nil {
+		dump.closed(id, "client", err)
 		return fmt.Errorf("read client handshake: %w", err)
 	}
+	dump.write(id, "client", first)
 	if err := writePacket(server, first); err != nil {
 		return err
 	}
@@ -219,8 +256,10 @@ func (st *connState) clientToServer(c, s net.Conn) error {
 	for {
 		p, err := readPacket(c)
 		if err != nil {
+			dump.closed(st.id, "client", err)
 			return err
 		}
+		dump.write(st.id, "client", p)
 		st.noteHandshake(p)
 		st.noteCommand(p)
 		if err := writePacket(s, p); err != nil {
@@ -274,8 +313,10 @@ func (st *connState) serverToClient(s, c net.Conn) error {
 	for {
 		p, err := readPacket(s)
 		if err != nil {
+			dump.closed(st.id, "server", err)
 			return err
 		}
+		dump.write(st.id, "server", p)
 		st.noteAnswer(p)
 		if err := writePacket(c, p); err != nil {
 			return err
