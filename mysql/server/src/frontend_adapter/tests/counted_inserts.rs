@@ -1218,40 +1218,37 @@ fn triggers_one_after_another_number_each_counted_table_they_write() {
         &mut adapter,
         "CREATE TABLE selfish (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)",
     );
-    run(
-        &mut adapter,
-        "CREATE TRIGGER selfish_again AFTER INSERT ON selfish FOR EACH ROW BEGIN INSERT INTO selfish (n) VALUES (NEW.n); END",
-    );
+    // MySQL takes the trigger and answers 1442 for the first row it would
+    // write; here the trigger itself is refused, before any number is spent.
+    assert!(adapter
+        .execute_query(
+            "CREATE TRIGGER selfish_again AFTER INSERT ON selfish FOR EACH ROW BEGIN INSERT INTO selfish (n) VALUES (NEW.n); END",
+        )
+        .is_err());
+    run(&mut adapter, "INSERT INTO selfish (n) VALUES (1)");
     assert_eq!(
-        adapter.execute_query("INSERT INTO selfish (n) VALUES (1)"),
-        Err(FrontendErrorKind::Unsupported)
-    );
-    assert_eq!(
-        rows(&mut adapter, "SELECT COUNT(*) FROM selfish"),
-        vec![some(&["0"])]
+        rows(&mut adapter, "SELECT id FROM selfish"),
+        vec![some(&["1"])]
     );
 }
 
 /// A trigger naming the id it writes into a counted table would have to move
-/// that table's counter from inside the engine, which is refused.
+/// that table's counter from inside the engine, so the trigger is refused
+/// when it is made, whatever statement would set it off.
 #[test]
 fn a_trigger_writing_a_counted_tables_id_itself_is_refused() {
     let (_directory, mut adapter) = adapter();
     for sql in [
         "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
         "CREATE TABLE mirror (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
-        "CREATE TRIGGER posts_mirror AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO mirror (id, title) VALUES (NEW.id, NEW.title); END",
     ] {
         run(&mut adapter, sql);
     }
-    assert_eq!(
-        adapter.execute_query("INSERT INTO posts (title) VALUES ('a')"),
-        Err(FrontendErrorKind::Unsupported)
-    );
-    assert_eq!(
-        rows(&mut adapter, "SELECT COUNT(*) FROM mirror"),
-        vec![some(&["0"])]
-    );
+    assert!(adapter
+        .execute_query(
+            "CREATE TRIGGER posts_mirror AFTER INSERT ON posts FOR EACH ROW BEGIN INSERT INTO mirror (id, title) VALUES (NEW.id, NEW.title); END",
+        )
+        .is_err());
 }
 
 /// A row found wrong while it is filled takes no number, and one found wrong

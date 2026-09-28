@@ -320,7 +320,7 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
     assert_eq!((new_post.affected_rows, new_post.last_insert_id), (1, 4));
     assert_eq!(
         rows(&mut adapter, "SELECT id, note FROM audit WHERE id > 3"),
-        [row(&[Some("4"), Some("New")])]
+        [row(&[Some("4"), Some("post New")])]
     );
 }
 

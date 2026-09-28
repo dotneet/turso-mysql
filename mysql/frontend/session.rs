@@ -9289,50 +9289,76 @@ impl MySqlConnection {
     /// Follows the triggers an `INSERT` into `target` sets off and answers
     /// whether any of them writes a table that counts its own ids.
     ///
-    /// Only an `AFTER INSERT` trigger whose body is one `INSERT` can be made
-    /// here, so what a trigger writes is the table its `INSERT` names, which
-    /// may set off that table's own trigger in turn. Measured on MySQL 8.4.11,
-    /// a trigger writing a table its statement writes or reads — the target,
-    /// or the table an `INSERT ... SELECT` copies from — is answered 1442, so
-    /// that is refused here. A counted table a trigger writes is numbered by
-    /// its own counter when the row is written, which needs the counted column
-    /// left for the counter to fill and the row number to be the id.
+    /// A `BEFORE` trigger only changes the row it runs for. An `AFTER` trigger
+    /// writes the tables its `INSERT`, `UPDATE` and `DELETE` name, which sets
+    /// off those tables' own triggers for that kind of write in turn; a
+    /// table's triggers for other kinds of write do not run. Measured on MySQL
+    /// 8.4.11, a trigger writing a table its statement writes or reads — the
+    /// target, or the table an `INSERT ... SELECT` copies from — is answered
+    /// 1442, so that is refused here. A counted table a trigger inserts into
+    /// is numbered by its own counter when the row is written, which needs
+    /// the counted column left for the counter to fill and the row number to
+    /// be the id.
     fn check_the_triggers_an_insert_sets_off(
         &self,
         target: &str,
         read_tables: &[String],
     ) -> Result<bool> {
+        use turso_parser::ast::{TriggerCmd, TriggerEvent, TriggerTime};
+
         let schema = self.inner.current_schema();
-        let mut written = vec![target.to_owned()];
+        let mut written = vec![(target.to_owned(), TriggerEvent::Insert)];
         let mut writes_a_counted_table = false;
         let mut next = 0;
-        while let Some(table) = written.get(next).cloned() {
+        while let Some((table, event)) = written.get(next).cloned() {
             next += 1;
             for trigger in schema.get_triggers_for_table(&table) {
-                if trigger.time != turso_parser::ast::TriggerTime::After
-                    || trigger.event != turso_parser::ast::TriggerEvent::Insert
-                    || !trigger.for_each_row
-                    || trigger.when_clause.is_some()
-                {
+                let fires = matches!(
+                    (&trigger.event, &event),
+                    (TriggerEvent::Insert, TriggerEvent::Insert)
+                        | (TriggerEvent::Delete, TriggerEvent::Delete)
+                        | (
+                            TriggerEvent::Update | TriggerEvent::UpdateOf(_),
+                            TriggerEvent::Update
+                        )
+                );
+                if !fires {
+                    continue;
+                }
+                if !trigger.for_each_row || trigger.when_clause.is_some() {
                     return Err(LimboError::ParseError(
-                        "an INSERT setting off a trigger other than AFTER INSERT FOR EACH ROW is unsupported"
-                            .to_string(),
+                        "a trigger other than FOR EACH ROW with no WHEN is unsupported".to_string(),
+                    ));
+                }
+                if trigger.time != TriggerTime::After {
+                    if trigger.time == TriggerTime::Before
+                        && trigger
+                            .commands
+                            .iter()
+                            .all(|command| matches!(command, TriggerCmd::SetNew { .. }))
+                    {
+                        continue;
+                    }
+                    return Err(LimboError::ParseError(
+                        "a BEFORE trigger doing anything but SET NEW is unsupported".to_string(),
                     ));
                 }
                 for command in &trigger.commands {
-                    let turso_parser::ast::TriggerCmd::Insert {
-                        tbl_name,
-                        col_names,
-                        ..
-                    } = command
-                    else {
-                        return Err(LimboError::ParseError(
-                            "a trigger doing anything but an INSERT is unsupported".to_string(),
-                        ));
+                    let (into, writes) = match command {
+                        TriggerCmd::Insert { tbl_name, .. } => (tbl_name, TriggerEvent::Insert),
+                        TriggerCmd::Update { tbl_name, .. } => (tbl_name, TriggerEvent::Update),
+                        TriggerCmd::Delete { tbl_name, .. } => (tbl_name, TriggerEvent::Delete),
+                        _ => {
+                            return Err(LimboError::ParseError(
+                                "a trigger doing anything but INSERT, UPDATE or DELETE is unsupported"
+                                    .to_string(),
+                            ));
+                        }
                     };
-                    let into = tbl_name.as_str();
+                    let into = into.as_str();
                     if written
                         .iter()
+                        .map(|(table, _)| table)
                         .chain(read_tables)
                         .any(|table| table.eq_ignore_ascii_case(into))
                     {
@@ -9340,22 +9366,24 @@ impl MySqlConnection {
                             "a trigger writing {into}, which the statement setting it off already uses, is refused"
                         )));
                     }
-                    if let Some(counted) = self.load_auto_increment_table(into)? {
-                        if counted.definition.allocator_column_type
-                            == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
-                            || col_names.iter().any(|column| {
-                                column
-                                    .as_str()
-                                    .eq_ignore_ascii_case(&counted.definition.allocator_column_name)
-                            })
-                        {
-                            return Err(LimboError::ParseError(format!(
-                                "a trigger writing {into} is unsupported unless the counter numbers its rows"
-                            )));
+                    if let TriggerCmd::Insert { col_names, .. } = command {
+                        if let Some(counted) = self.load_auto_increment_table(into)? {
+                            if counted.definition.allocator_column_type
+                                == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+                                || col_names.iter().any(|column| {
+                                    column.as_str().eq_ignore_ascii_case(
+                                        &counted.definition.allocator_column_name,
+                                    )
+                                })
+                            {
+                                return Err(LimboError::ParseError(format!(
+                                    "a trigger writing {into} is unsupported unless the counter numbers its rows"
+                                )));
+                            }
+                            writes_a_counted_table = true;
                         }
-                        writes_a_counted_table = true;
                     }
-                    written.push(into.to_owned());
+                    written.push((into.to_owned(), writes));
                 }
             }
         }
