@@ -605,8 +605,7 @@ Behaviour that works but does not match MySQL lives in
   refused as listed above
 - A `REPEATABLE READ` transaction that writes after another session committed
   since its first read is rolled back with 1213, where MySQL writes and keeps
-  reading the old snapshot for the rows it did not touch. A `SAVEPOINT` counts
-  as that first read here, where MySQL takes no read view for it
+  reading the old snapshot for the rows it did not touch
 - `CURRENT_TIMESTAMP(n)` as a default or on update, `NOW(n)` and its
   spellings as a result column or a value an `INSERT` writes, and
   `CURTIME(n)` as a result column, read the engine's clock, which stops at

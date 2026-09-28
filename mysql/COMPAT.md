@@ -4368,11 +4368,15 @@ commits, leaving the transaction open; both hold here, except that the second
 insert waits for the first transaction's commit where MySQL's does not wait at
 all, the write lock being one over the whole database. So under `READ
 COMMITTED`, whose snapshot is new at every statement, a write is no longer
-given up at all. Under `REPEATABLE READ` one thing still counts as a first read
-where MySQL's does not: a `SAVEPOINT`. Measured on 8.4.11, a transaction that
-begins with one still sees a row another session commits after it; here the
-savepoint takes the snapshot, so such a transaction reads and writes as though
-it had read at the savepoint.
+given up at all. A `SAVEPOINT` is not a first read either. Measured on 8.4.11,
+a transaction that begins with one still sees a row another session commits
+after it, and holds what it reads from its first read on; so it does here. The
+engine takes the snapshot to open a savepoint, and a transaction that had not
+read lets it go again at once. That leaves the savepoint whole, as every `READ
+COMMITTED` statement does: it keeps each page the transaction changes from the
+change and its place in the WAL from the transaction's first write, both on
+the snapshot the transaction writes from, so `ROLLBACK TO` it undoes the
+transaction's writes and none of what other sessions committed meanwhile.
 
 A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
 with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and

@@ -118,6 +118,62 @@ fn a_transaction_given_up_with_1213_takes_its_savepoints_with_it() {
     );
 }
 
+/// Measured on MySQL 8.4.11: a `SAVEPOINT` takes no read view, so a
+/// transaction that begins with one sees what another session commits until
+/// its first read, and holds what it read from then on.
+#[test]
+fn a_savepoint_before_the_first_read_takes_no_snapshot() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "SAVEPOINT early");
+    run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "5");
+    run(&mut two, "UPDATE c SET n = 6 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "5");
+    run(&mut one, "COMMIT");
+
+    // The savepoint still undoes what the transaction wrote after it, over
+    // the rows another session committed after it was taken.
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "SAVEPOINT early");
+    for id in 100..300 {
+        run(
+            &mut two,
+            &format!("INSERT INTO c (id, n) VALUES ({id}, {})", id * 1000),
+        );
+    }
+    run(&mut one, "UPDATE c SET n = 8 WHERE id = 1");
+    run(&mut one, "INSERT INTO c (id, n) VALUES (3, 3)");
+    run(&mut one, "ROLLBACK TO SAVEPOINT early");
+    run(&mut one, "INSERT INTO c (id, n) VALUES (4, 4)");
+    run(&mut one, "COMMIT");
+    let Ok(CommandExecutionResult::ResultSet(counted)) =
+        two.execute_query("SELECT COUNT(*), SUM(n) FROM c")
+    else {
+        panic!("the count must return rows");
+    };
+    assert_eq!(
+        counted.rows,
+        [[
+            Some(b"203".to_vec()),
+            Some(
+                ((100..300).map(|id| id * 1000).sum::<i64>() + 6 + 4)
+                    .to_string()
+                    .into_bytes()
+            )
+        ]]
+    );
+    assert_eq!(n_of(&mut two, 1), "0");
+    let Ok(CommandExecutionResult::ResultSet(checked)) = two.execute_query("CHECK TABLE c") else {
+        panic!("CHECK TABLE must return rows");
+    };
+    assert_eq!(checked.rows[0][3], Some(b"OK".to_vec()));
+}
+
 #[test]
 fn read_committed_reads_each_statement_afresh_and_writes_after_another_commit() {
     let TwoSessions {

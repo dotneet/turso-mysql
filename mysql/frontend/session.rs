@@ -3976,6 +3976,16 @@ impl MySqlConnection {
     /// The read-only flag is left alone on purpose: a savepoint does not settle
     /// what the next transaction is, and a `START TRANSACTION READ ONLY` is
     /// still in force after one.
+    ///
+    /// The engine takes the transaction's read snapshot to open a savepoint.
+    /// MySQL takes no read view for one: measured on 8.4.11, a transaction
+    /// that begins with `SAVEPOINT` still sees a row another session commits
+    /// after it. So a transaction that had not read lets the snapshot go
+    /// again, and takes one at its first read. That is safe with the savepoint
+    /// open, as it is for every `READ COMMITTED` statement: the savepoint
+    /// keeps the pages the transaction changes from their first change after
+    /// it and its place in the WAL from the transaction's first write, both
+    /// taken on the snapshot the transaction writes from.
     fn execute_savepoint_command(
         &self,
         command: &MySqlTransactionCommand,
@@ -4011,8 +4021,16 @@ impl MySqlConnection {
             }
             _ => unreachable!("only a savepoint command reaches this"),
         };
-        self.run_transaction_statement(statement, sql)
-            .map_err(no_such_savepoint_error)
+        let unread = !self.inner.has_read_snapshot();
+        let result = self
+            .run_transaction_statement(statement, sql)
+            .map_err(no_such_savepoint_error);
+        if unread {
+            self.inner
+                .release_read_snapshot()
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        result
     }
 
     fn run_transaction_statement(
