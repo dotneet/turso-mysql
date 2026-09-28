@@ -204,13 +204,6 @@ impl RuntimeTcpListener {
         if self.is_shutting_down() {
             return Err(RuntimeTcpListenerError::ShuttingDown);
         }
-        if !self.is_ready_for_new_connections() {
-            return Err(if self.is_shutting_down() {
-                RuntimeTcpListenerError::ShuttingDown
-            } else {
-                RuntimeTcpListenerError::AccountNotReady
-            });
-        }
         let permits = ConnectionPermits::acquire(&self.control.permits)
             .map_err(RuntimeTcpListenerError::ConnectionLimit)?;
         stream
@@ -229,10 +222,7 @@ impl RuntimeTcpListener {
         stream
             .set_write_timeout(Some(self.config.timeouts().write()))
             .map_err(|_| RuntimeTcpListenerError::TransportConfiguration)?;
-        let registration = self
-            .accounts
-            .while_ready_for_new_connection(|| self.control.register_connection(&stream))
-            .ok_or(RuntimeTcpListenerError::AccountNotReady)??;
+        let registration = self.register_once_ready(&stream)?;
         let tls_deadline = Instant::now() + self.config.timeouts().tls();
         drop(accept_waiter);
         Ok(AcceptedTcpStream {
@@ -250,6 +240,32 @@ impl RuntimeTcpListener {
             limits: self.config.limits(),
             timeouts: self.config.timeouts(),
         })
+    }
+
+    /// Registers an accepted stream once the account store is ready.
+    ///
+    /// A reload can begin while accept waits for a client. Dropping the stream
+    /// then would close the connection before the client sees a greeting, so
+    /// this waits for the reload as the accept loop does before accepting.
+    fn register_once_ready(
+        &self,
+        stream: &TcpStream,
+    ) -> Result<ConnectionRegistration, RuntimeTcpListenerError> {
+        loop {
+            if let Some(registration) = self
+                .accounts
+                .while_ready_for_new_connection(|| self.control.register_connection(stream))
+            {
+                return registration;
+            }
+            if !self.wait_until_ready_or_shutdown() {
+                return Err(if self.is_shutting_down() {
+                    RuntimeTcpListenerError::ShuttingDown
+                } else {
+                    RuntimeTcpListenerError::AccountNotReady
+                });
+            }
+        }
     }
 
     pub(crate) fn spawn_protocol<F>(
@@ -1311,7 +1327,10 @@ mod tests {
         io::{Read, Write},
         net::TcpStream,
         os::unix::fs::PermissionsExt,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
         thread,
         time::Duration,
     };
@@ -1323,15 +1342,16 @@ mod tests {
     use super::*;
     use crate::{
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
-        AuthMoreData, AuthMoreDataKind, AuthOkPacket, CheckpointAuthorityId, CheckpointPersistence,
-        CheckpointReadError, ClientHandshakeResponseConfig, ClientSslRequestConfig,
-        ColumnCountPacket, ColumnDefinitionPacket, DatabasePrivileges, ErrPacket, GlobalPrivileges,
-        InitialHandshake, OfflineAccountProvisioner, PacketCodec, ProtectedPassword,
-        ResponseOkPacket, ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
-        TcpConfig, TextRowPacket, TextRowValue, TlsConfig, CACHING_SHA2_PASSWORD_PLUGIN,
-        CLIENT_DEPRECATE_EOF, CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL, COMMAND_SEQUENCE_ID,
-        COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT,
-        PACKET_HEADER_LEN, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        AccountStoreCheckpointResponse, AuthMoreData, AuthMoreDataKind, AuthOkPacket,
+        CheckpointAuthorityId, CheckpointPersistence, CheckpointReadError,
+        ClientHandshakeResponseConfig, ClientSslRequestConfig, ColumnCountPacket,
+        ColumnDefinitionPacket, DatabasePrivileges, ErrPacket, GlobalPrivileges, InitialHandshake,
+        OfflineAccountProvisioner, PacketCodec, ProtectedPassword, ResponseOkPacket,
+        ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts, TcpConfig,
+        TextRowPacket, TextRowValue, TlsConfig, CACHING_SHA2_PASSWORD_PLUGIN, CLIENT_DEPRECATE_EOF,
+        CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL, COMMAND_SEQUENCE_ID, COM_INIT_DB, COM_PING,
+        COM_QUERY, COM_QUIT, DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT, PACKET_HEADER_LEN,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
 
     struct TestCheckpointReader {
@@ -1360,6 +1380,47 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(CheckpointReadError::Missing));
             Ok(AccountStoreCheckpointRequest::completed(result))
+        }
+    }
+
+    /// Answers the two checkpoint reads a listener makes while it binds at
+    /// once, and holds every later one until the test answers it, as a slow
+    /// checkpoint authority would.
+    struct HeldCheckpointReader {
+        checkpoint: AccountStoreCheckpoint,
+        reads_at_bind: AtomicUsize,
+        held: Mutex<Option<AccountStoreCheckpointResponse>>,
+    }
+
+    impl HeldCheckpointReader {
+        fn take_held(&self) -> AccountStoreCheckpointResponse {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(response) = self.held.lock().expect("held checkpoint").take() {
+                    return response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no reload asked for a checkpoint"
+                );
+                thread::yield_now();
+            }
+        }
+    }
+
+    impl AccountStoreCheckpointReader for HeldCheckpointReader {
+        fn request_checkpoint(
+            &self,
+            _authority: &CheckpointAuthorityId,
+        ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError> {
+            if self.reads_at_bind.fetch_add(1, Ordering::AcqRel) < 2 {
+                return Ok(AccountStoreCheckpointRequest::completed(
+                    Ok(self.checkpoint),
+                ));
+            }
+            let (response, request) = AccountStoreCheckpointRequest::channel();
+            *self.held.lock().expect("held checkpoint") = Some(response);
+            Ok(request)
         }
     }
 
@@ -1444,6 +1505,52 @@ mod tests {
         timeouts: RuntimeTimeouts,
         maximum: usize,
     ) -> ProtocolRuntime {
+        protocol_runtime_from(
+            limits,
+            timeouts,
+            maximum,
+            Duration::from_secs(1),
+            |checkpoint| Arc::new(TestCheckpointReader::new([Ok(checkpoint), Ok(checkpoint)])),
+        )
+    }
+
+    /// A runtime whose account reloads wait for the test to answer their
+    /// checkpoint read, and which never reloads on its own during a test.
+    fn protocol_runtime_with_held_reloads() -> (ProtocolRuntime, Arc<HeldCheckpointReader>) {
+        let mut held_reader = None;
+        let runtime = protocol_runtime_from(
+            RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).expect("test limits"),
+            RuntimeTimeouts::new(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .expect("test timeouts"),
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+            Duration::from_secs(60),
+            |checkpoint| {
+                let reader = Arc::new(HeldCheckpointReader {
+                    checkpoint,
+                    reads_at_bind: AtomicUsize::new(0),
+                    held: Mutex::new(None),
+                });
+                held_reader = Some(Arc::clone(&reader));
+                reader
+            },
+        );
+        (runtime, held_reader.expect("held checkpoint reader"))
+    }
+
+    fn protocol_runtime_from(
+        limits: RuntimeLimits,
+        timeouts: RuntimeTimeouts,
+        maximum: usize,
+        reload_interval: Duration,
+        checkpoint_reader: impl FnOnce(AccountStoreCheckpoint) -> Arc<dyn AccountStoreCheckpointReader>,
+    ) -> ProtocolRuntime {
         let data_root = private_directory();
         let account_root = private_directory();
         let mut password = b"secret".to_vec();
@@ -1483,17 +1590,16 @@ mod tests {
             data_root.path().canonicalize().expect("data root"),
             account_root.path().canonicalize().expect("account root"),
             CheckpointAuthorityId::new("runtime-checkpoints").expect("authority ID"),
-            Duration::from_secs(1),
+            reload_interval,
             limits,
             timeouts,
         )
         .expect("test runtime config")
         .with_max_prepared_statement_count(maximum)
         .expect("test prepared statement maximum");
-        let reader = Arc::new(TestCheckpointReader::new([Ok(checkpoint), Ok(checkpoint)]));
         let listener = RuntimeTcpListener::bind_with_tls(
             &config,
-            reader,
+            checkpoint_reader(checkpoint),
             crate::runtime_tls::test_server_config(),
         )
         .expect("test TCP listener");
@@ -1624,6 +1730,15 @@ mod tests {
         rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
         Vec<u8>,
     ) {
+        send_password(send_handshake_response(client, collation), password)
+    }
+
+    /// Reads the greeting, moves to TLS and sends the handshake response,
+    /// then reads the server's request for the password.
+    fn send_handshake_response(
+        client: TcpStream,
+        collation: u8,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
         let codec = packet_codec();
         let mut client = start_tls(client, collation);
         let capabilities =
@@ -1645,7 +1760,17 @@ mod tests {
             .expect("full authentication request");
         assert_eq!(auth_more.kind, AuthMoreDataKind::FullAuthenticationRequired);
         client
-            .write_all(&codec.encode(4, password).expect("password frame"))
+    }
+
+    fn send_password(
+        mut client: rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        password: &[u8],
+    ) -> (
+        rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        Vec<u8>,
+    ) {
+        client
+            .write_all(&packet_codec().encode(4, password).expect("password frame"))
             .expect("password write");
         let answer = read_frame(&mut client);
         (client, answer)
@@ -1825,6 +1950,124 @@ mod tests {
             RuntimeTcpReloadSupervisorShutdown::Stopped
         );
         assert!(report.drained());
+    }
+
+    #[test]
+    fn a_client_accepted_while_a_reload_is_under_way_gets_its_greeting() {
+        let (runtime, reader) = protocol_runtime_with_held_reloads();
+        let listener = Arc::clone(&runtime.listener);
+        let accepting = thread::spawn(move || loop {
+            match listener.accept() {
+                Ok(stream) => return listener.spawn_protocol(stream, || {}).expect("worker"),
+                Err(RuntimeTcpListenerError::AccountNotReady) => {
+                    assert!(listener.wait_until_ready_or_shutdown());
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        });
+        wait_for_accept_waiter(&runtime.listener);
+
+        let reloading = Arc::clone(&runtime.listener);
+        let reload = thread::spawn(move || reloading.reload_accounts_once());
+        let checkpoint_read = reader.take_held();
+        let client = TcpStream::connect(runtime.listener.local_addr()).expect("test client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client read timeout");
+        wait_for_readiness_waits(&runtime.listener, 1);
+        assert!(checkpoint_read.complete(Ok(reader.checkpoint)));
+        assert_eq!(
+            reload.join().expect("reload thread"),
+            RuntimeAccountReload::Healthy(crate::ReloadOutcome::Unchanged)
+        );
+
+        quit(authenticate_over_tls(client));
+        accepting
+            .join()
+            .expect("accept thread")
+            .join()
+            .expect("TCP protocol worker");
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    #[test]
+    fn a_handshake_response_that_arrives_during_a_reload_is_let_in() {
+        let (runtime, reader) = protocol_runtime_with_held_reloads();
+        let (client, worker) = start_worker(&runtime.listener);
+
+        let (client, answer) = during_a_reload(&runtime, &reader, move || {
+            sign_in_over_tls(client, DEFAULT_UTF8MB4_COLLATION)
+        });
+
+        AuthOkPacket::decode(packet_codec(), &answer).expect("authentication OK");
+        quit(client);
+        worker.join().expect("TCP protocol worker");
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    #[test]
+    fn a_password_that_arrives_during_a_reload_is_let_in() {
+        let (runtime, reader) = protocol_runtime_with_held_reloads();
+        let (client, worker) = start_worker(&runtime.listener);
+        let client = send_handshake_response(client, DEFAULT_UTF8MB4_COLLATION);
+
+        let (client, answer) = during_a_reload(&runtime, &reader, move || {
+            send_password(client, b"secret\0")
+        });
+
+        AuthOkPacket::decode(packet_codec(), &answer).expect("authentication OK");
+        quit(client);
+        worker.join().expect("TCP protocol worker");
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// Starts a reload, runs `client` while the reload waits for its
+    /// checkpoint, and lets the reload finish once the server waits for it.
+    fn during_a_reload<T: Send + 'static>(
+        runtime: &ProtocolRuntime,
+        reader: &HeldCheckpointReader,
+        client: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let reloading = Arc::clone(&runtime.listener);
+        let reload = thread::spawn(move || reloading.reload_accounts_once());
+        let checkpoint_read = reader.take_held();
+        let client = thread::spawn(client);
+        wait_for_readiness_waits(&runtime.listener, 1);
+        assert!(checkpoint_read.complete(Ok(reader.checkpoint)));
+        assert_eq!(
+            reload.join().expect("reload thread"),
+            RuntimeAccountReload::Healthy(crate::ReloadOutcome::Unchanged)
+        );
+        client.join().expect("client thread")
+    }
+
+    fn quit(mut client: rustls::StreamOwned<rustls::ClientConnection, TcpStream>) {
+        client
+            .write_all(
+                &packet_codec()
+                    .encode(COMMAND_SEQUENCE_ID, &[COM_QUIT])
+                    .expect("quit"),
+            )
+            .expect("quit write");
+    }
+
+    fn wait_for_accept_waiter(listener: &RuntimeTcpListener) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while listener.control.lock().accept_waiters == 0 {
+            assert!(Instant::now() < deadline, "accept did not start");
+            thread::yield_now();
+        }
+        // Give accept time to pass its readiness check and wait for a client,
+        // so the reload begins while it waits.
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    fn wait_for_readiness_waits(listener: &RuntimeTcpListener, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while listener.accounts.readiness_wait_count() < expected {
+            assert!(Instant::now() < deadline, "nothing waited for the reload");
+            thread::yield_now();
+        }
     }
 
     #[test]

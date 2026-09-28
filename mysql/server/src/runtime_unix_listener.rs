@@ -340,14 +340,6 @@ impl RuntimeUnixListener {
             return Err(RuntimeUnixListenerError::ShuttingDown);
         }
         self.peer_verifier.verify(&stream).map_err(map_peer_error)?;
-        // A reload can mark the store unready while the blocking accept waits.
-        if !self.is_ready_for_new_connections() {
-            return Err(if self.is_shutting_down() {
-                RuntimeUnixListenerError::ShuttingDown
-            } else {
-                RuntimeUnixListenerError::AccountNotReady
-            });
-        }
         let permits = ConnectionPermits::acquire(&self.control.permits)
             .map_err(RuntimeUnixListenerError::ConnectionLimit)?;
         stream
@@ -360,10 +352,7 @@ impl RuntimeUnixListener {
             .set_write_timeout(Some(self.timeouts.write()))
             .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
 
-        let registration = self
-            .accounts
-            .while_ready_for_new_connection(|| self.control.register_connection(&stream))
-            .ok_or(RuntimeUnixListenerError::AccountNotReady)??;
+        let registration = self.register_once_ready(&stream)?;
         let authentication_deadline = Instant::now() + self.timeouts.authentication();
         drop(accept_waiter);
         Ok(AcceptedUnixStream {
@@ -381,6 +370,32 @@ impl RuntimeUnixListener {
             limits: self.limits,
             timeouts: self.timeouts,
         })
+    }
+
+    /// Registers an accepted stream once the account store is ready.
+    ///
+    /// A reload can begin while accept waits for a client. Dropping the stream
+    /// then would close the connection before the client sees a greeting, so
+    /// this waits for the reload as the accept loop does before accepting.
+    fn register_once_ready(
+        &self,
+        stream: &UnixStream,
+    ) -> Result<ConnectionRegistration, RuntimeUnixListenerError> {
+        loop {
+            if let Some(registration) = self
+                .accounts
+                .while_ready_for_new_connection(|| self.control.register_connection(stream))
+            {
+                return registration;
+            }
+            if !self.wait_until_ready_or_shutdown() {
+                return Err(if self.is_shutting_down() {
+                    RuntimeUnixListenerError::ShuttingDown
+                } else {
+                    RuntimeUnixListenerError::AccountNotReady
+                });
+            }
+        }
     }
 }
 
@@ -1480,16 +1495,20 @@ mod tests {
         fs,
         os::fd::AsRawFd,
         os::unix::fs::PermissionsExt,
-        sync::{mpsc, Arc, Barrier, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc, Arc, Barrier, Mutex,
+        },
         thread,
     };
 
     use super::*;
     use crate::{
         AccountDefinition, AccountGenerationBuilder, AccountId, AccountStoreCheckpoint,
-        AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest, CheckpointAuthorityId,
-        CheckpointPersistence, CheckpointReadError, GlobalPrivileges, OfflineAccountProvisioner,
-        RuntimeTimeouts, UnixSocketConfig, MIN_WRITE_LIMIT,
+        AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
+        AccountStoreCheckpointResponse, CheckpointAuthorityId, CheckpointPersistence,
+        CheckpointReadError, GlobalPrivileges, OfflineAccountProvisioner, RuntimeTimeouts,
+        UnixSocketConfig, MIN_WRITE_LIMIT,
     };
 
     struct FakeCheckpointReader {
@@ -1522,6 +1541,47 @@ mod tests {
                 .pop_front()
                 .unwrap_or(Err(CheckpointReadError::Missing));
             Ok(AccountStoreCheckpointRequest::completed(result))
+        }
+    }
+
+    /// Answers the two checkpoint reads a listener makes while it binds at
+    /// once, and holds every later one until the test answers it, as a slow
+    /// checkpoint authority would.
+    struct HeldCheckpointReader {
+        checkpoint: AccountStoreCheckpoint,
+        reads_at_bind: AtomicUsize,
+        held: Mutex<Option<AccountStoreCheckpointResponse>>,
+    }
+
+    impl HeldCheckpointReader {
+        fn take_held(&self) -> AccountStoreCheckpointResponse {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(response) = self.held.lock().unwrap().take() {
+                    return response;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no reload asked for a checkpoint"
+                );
+                thread::yield_now();
+            }
+        }
+    }
+
+    impl AccountStoreCheckpointReader for HeldCheckpointReader {
+        fn request_checkpoint(
+            &self,
+            _authority: &CheckpointAuthorityId,
+        ) -> Result<AccountStoreCheckpointRequest, CheckpointReadError> {
+            if self.reads_at_bind.fetch_add(1, Ordering::AcqRel) < 2 {
+                return Ok(AccountStoreCheckpointRequest::completed(
+                    Ok(self.checkpoint),
+                ));
+            }
+            let (response, request) = AccountStoreCheckpointRequest::channel();
+            *self.held.lock().unwrap() = Some(response);
+            Ok(request)
         }
     }
 
@@ -2217,6 +2277,60 @@ mod tests {
             listener.accept(),
             Err(RuntimeUnixListenerError::AccountNotReady)
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_client_accepted_while_a_reload_is_under_way_is_kept() {
+        let data_root = private_directory();
+        let account_root = private_directory();
+        let socket_directory = private_directory();
+        let checkpoint = checkpoint(account_root.path());
+        let config = config(
+            data_root.path(),
+            account_root.path(),
+            socket_directory.path(),
+            limits(1, 1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let endpoint = config.unix_socket().unwrap().socket_path();
+        let reader = Arc::new(HeldCheckpointReader {
+            checkpoint,
+            reads_at_bind: AtomicUsize::new(0),
+            held: Mutex::new(None),
+        });
+        let checkpoint_reader: Arc<dyn AccountStoreCheckpointReader> = reader.clone();
+        let listener = Arc::new(RuntimeUnixListener::bind(&config, checkpoint_reader).unwrap());
+        let accepting = Arc::clone(&listener);
+        let accept_thread = thread::spawn(move || accepting.accept());
+        wait_for_accept_waiter(&listener);
+        // Give accept time to pass its readiness check and wait for a client,
+        // so the reload begins while it waits.
+        thread::sleep(Duration::from_millis(20));
+
+        let reloading = Arc::clone(&listener);
+        let reload = thread::spawn(move || reloading.accounts.reload_once());
+        let checkpoint_read = reader.take_held();
+        let client = UnixStream::connect(&endpoint).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while listener.accounts.readiness_wait_count() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "accept did not wait for the reload"
+            );
+            thread::yield_now();
+        }
+        assert!(checkpoint_read.complete(Ok(checkpoint)));
+        assert!(matches!(
+            reload.join().unwrap(),
+            RuntimeAccountReload::Healthy(_)
+        ));
+
+        let accepted = accept_thread.join().unwrap().unwrap();
+        drop(accepted);
+        drop(client);
+        assert!(listener.shutdown().drained());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

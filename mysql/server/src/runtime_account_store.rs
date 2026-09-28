@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::runtime_config::{AccountStoreCheckpointWait, AccountStoreCheckpointWake};
@@ -29,6 +29,7 @@ pub struct RuntimeAccountStore {
     authority: CheckpointAuthorityId,
     checkpoint_reader: Arc<dyn AccountStoreCheckpointReader>,
     checkpoint_timeout: Duration,
+    sign_in_wait: Duration,
     store: Arc<PersistentAccountStore>,
     reload_gate: Mutex<()>,
     outstanding_checkpoint: Mutex<Option<crate::AccountStoreCheckpointRequest>>,
@@ -76,6 +77,7 @@ impl RuntimeAccountStore {
             authority,
             checkpoint_reader,
             checkpoint_timeout: config.timeouts().checkpoint(),
+            sign_in_wait: config.timeouts().authentication(),
             store: Arc::new(store),
             reload_gate: Mutex::new(()),
             outstanding_checkpoint: Mutex::new(None),
@@ -243,6 +245,45 @@ impl RuntimeAccountStore {
         readiness.ready
     }
 
+    /// Waits for the reloads under way to finish, then returns whether a new
+    /// sign-in may consult this store.
+    ///
+    /// Every reload marks the store unready while it asks the authority for
+    /// the checkpoint, so a client signing in during those milliseconds of the
+    /// periodic reload would otherwise be refused with a valid password.
+    /// Waiting still never answers a sign-in from a generation older than a
+    /// reload that has begun: it is answered from what that reload installs.
+    /// A store left degraded by a failed reload is refused at once, and the
+    /// wait is bounded by the authentication timeout.
+    fn ready_once_reloads_finish(&self) -> bool {
+        if self.is_ready_for_new_connections() {
+            return true;
+        }
+        let deadline = Instant::now() + self.sign_in_wait;
+        let mut readiness = self
+            .readiness
+            .lock()
+            .expect("runtime account readiness state must not be poisoned");
+        while readiness.pending_reloads > 0 && !readiness.shutdown_requested {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            #[cfg(test)]
+            self.readiness_wait_count.fetch_add(1, Ordering::Release);
+            readiness = self
+                .readiness_wake
+                .wait_timeout(readiness, remaining)
+                .expect("runtime account readiness state must not be poisoned")
+                .0;
+        }
+        readiness.ready
+    }
+
+    #[cfg(test)]
+    pub(crate) fn readiness_wait_count(&self) -> usize {
+        self.readiness_wait_count.load(Ordering::Acquire)
+    }
+
     /// Returns the revision currently serving authentication and authorization.
     pub fn revision(&self) -> Result<u64, RuntimeAccountStoreError> {
         self.store
@@ -338,7 +379,7 @@ impl CredentialProvider for RuntimeAccountStore {
         &self,
         username: &str,
     ) -> Result<Option<CredentialSnapshot>, CredentialProviderError> {
-        if !self.is_ready_for_new_connections() {
+        if !self.ready_once_reloads_finish() {
             return Err(CredentialProviderError::BackendUnavailable);
         }
         self.store.lookup(username)
@@ -351,8 +392,7 @@ impl DatabaseAuthorizer for RuntimeAccountStore {
         principal: &AuthenticatedPrincipal,
         action: DatabaseAction<'_>,
     ) -> Result<(), AuthorizationError> {
-        if matches!(action, DatabaseAction::Connect { .. }) && !self.is_ready_for_new_connections()
-        {
+        if matches!(action, DatabaseAction::Connect { .. }) && !self.ready_once_reloads_finish() {
             return Err(AuthorizationError::Unavailable);
         }
         self.store.authorize(principal, action)
@@ -1374,5 +1414,126 @@ mod tests {
         );
         assert!(store.is_ready_for_new_connections());
         assert!(store.lookup("alice").unwrap().is_some());
+    }
+
+    fn pending_reader(checkpoint: AccountStoreCheckpoint) -> Arc<PendingAfterFirstReader> {
+        Arc::new(PendingAfterFirstReader {
+            first: checkpoint,
+            first_sent: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            recovery: Mutex::new(None),
+        })
+    }
+
+    fn start_reload(store: &Arc<RuntimeAccountStore>) -> thread::JoinHandle<RuntimeAccountReload> {
+        let store = Arc::clone(store);
+        thread::spawn(move || store.reload_once())
+    }
+
+    fn start_sign_in<T: Send + 'static>(
+        store: &Arc<RuntimeAccountStore>,
+        sign_in: impl FnOnce(&RuntimeAccountStore) -> T + Send + 'static,
+    ) -> mpsc::Receiver<T> {
+        let (sender, receiver) = mpsc::channel();
+        let store = Arc::clone(store);
+        thread::spawn(move || sender.send(sign_in(&store)).unwrap());
+        receiver
+    }
+
+    #[test]
+    fn a_sign_in_during_a_reload_waits_for_it_instead_of_being_refused() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = pending_reader(checkpoint);
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+
+        let reload = start_reload(&store);
+        let response = pending_response(&reader);
+        let lookup = start_sign_in(&store, |store| {
+            store.lookup("alice").map(|snapshot| snapshot.is_some())
+        });
+        let connect = start_sign_in(&store, |store| {
+            store.authorize(&principal(), DatabaseAction::Connect { database: None })
+        });
+        wait_for_readiness_waits(&store, 2);
+        assert!(lookup.try_recv().is_err());
+        assert!(connect.try_recv().is_err());
+
+        assert!(response.complete(Ok(checkpoint)));
+        assert_eq!(
+            reload.join().unwrap(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Unchanged)
+        );
+        assert_eq!(lookup.recv_timeout(Duration::from_secs(1)), Ok(Ok(true)));
+        assert_eq!(connect.recv_timeout(Duration::from_secs(1)), Ok(Ok(())));
+    }
+
+    #[test]
+    fn a_sign_in_during_a_reload_is_answered_from_the_generation_it_installs() {
+        let root = root();
+        let (mut provisioner, mut authority, checkpoint) = provision(root.path(), true);
+        let reader = pending_reader(checkpoint);
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+        let connect_revoked = AccountGenerationBuilder::new().with_account(
+            AccountDefinition::new("alice", AccountId::from_bytes([7; 32]), true, [0x11; 32])
+                .with_global_privileges(GlobalPrivileges::new(false, false)),
+        );
+        provisioner
+            .replace(connect_revoked, &mut authority)
+            .unwrap();
+        let replacement = provisioner.checkpoint().unwrap();
+        assert_eq!(
+            store.authorize(&principal(), DatabaseAction::Connect { database: None }),
+            Ok(())
+        );
+
+        let reload = start_reload(&store);
+        let response = pending_response(&reader);
+        let connect = start_sign_in(&store, |store| {
+            store.authorize(&principal(), DatabaseAction::Connect { database: None })
+        });
+        wait_for_readiness_waits(&store, 1);
+
+        assert!(response.complete(Ok(replacement)));
+        assert_eq!(
+            reload.join().unwrap(),
+            RuntimeAccountReload::Healthy(ReloadOutcome::Reloaded { revision: 1 })
+        );
+        assert_eq!(
+            connect.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(AuthorizationError::Denied))
+        );
+    }
+
+    #[test]
+    fn a_sign_in_during_a_reload_that_fails_is_refused() {
+        let root = root();
+        let (_provisioner, _authority, checkpoint) = provision(root.path(), true);
+        let reader = pending_reader(checkpoint);
+        let store =
+            Arc::new(RuntimeAccountStore::open(&config(root.path()), reader.clone()).unwrap());
+
+        let reload = start_reload(&store);
+        let response = pending_response(&reader);
+        let lookup = start_sign_in(&store, |store| {
+            store.lookup("alice").map(|snapshot| snapshot.is_some())
+        });
+        wait_for_readiness_waits(&store, 1);
+
+        assert!(response.complete(Err(CheckpointReadError::Unavailable)));
+        assert!(matches!(
+            reload.join().unwrap(),
+            RuntimeAccountReload::Degraded(_)
+        ));
+        assert_eq!(
+            lookup.recv_timeout(Duration::from_secs(1)),
+            Ok(Err(CredentialProviderError::BackendUnavailable))
+        );
+        assert_eq!(
+            store.authorize(&principal(), DatabaseAction::Connect { database: None }),
+            Err(AuthorizationError::Unavailable)
+        );
     }
 }
