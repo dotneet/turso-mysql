@@ -17,7 +17,7 @@ use crate::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
         MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
     },
-    handshake::{SERVER_VERSION, SERVER_VERSION_COMMENT},
+    handshake::{is_supported_utf8mb4_collation, SERVER_VERSION, SERVER_VERSION_COMMENT},
     statement_execute::{
         MYSQL_TYPE_LONGLONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_MEDIUM_BLOB, MYSQL_TYPE_NEWDECIMAL,
         MYSQL_TYPE_VAR_STRING,
@@ -66,6 +66,12 @@ impl ConnectionCollation {
             .find(|collation| collation.name().eq_ignore_ascii_case(name))
     }
 
+    fn from_id(id: u8) -> Option<Self> {
+        [Self::General, Self::Unicode9, Self::Unicode4]
+            .into_iter()
+            .find(|collation| collation.id() == u16::from(id))
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::General => "utf8mb4_general_ci",
@@ -82,6 +88,37 @@ impl ConnectionCollation {
         }
     }
 }
+
+/// latin1_swedish_ci's collation ID, the one a `mysql` client left on a
+/// latin1 locale names in its handshake.
+const LATIN1_SWEDISH_CI_ID: u8 = 8;
+
+/// The collation IDs of ucs2, utf16, utf16le and utf32, which MySQL 8.4.11
+/// refuses as a client's.
+const NEVER_A_CLIENTS_COLLATION_IDS: [std::ops::RangeInclusive<u8>; 8] = [
+    35..=35,
+    54..=56,
+    60..=62,
+    90..=90,
+    101..=124,
+    128..=151,
+    159..=159,
+    160..=183,
+];
+
+/// The collation IDs below 256 MySQL 8.4.11 has, from
+/// `information_schema.COLLATIONS`. A handshake naming any other ID is given
+/// the server's default collation.
+const MYSQL_COLLATION_IDS: [std::ops::RangeInclusive<u8>; 8] = [
+    1..=16,
+    18..=99,
+    101..=124,
+    128..=151,
+    159..=183,
+    192..=215,
+    223..=250,
+    255..=255,
+];
 
 /// The collation a table this server writes is declared with, which is the one
 /// `SHOW CREATE TABLE` and every `information_schema` reading already report.
@@ -307,6 +344,44 @@ impl MySqlSessionVariables {
     /// does not convert them to.
     pub(crate) const fn wants_latin1_results(&self) -> bool {
         self.latin1_results
+    }
+
+    /// Sets the session's character sets from the collation a client named in
+    /// its handshake, as MySQL does, or refuses the collation.
+    ///
+    /// Measured on MySQL 8.4.11: the handshake's collation sets
+    /// `character_set_client`, `character_set_connection`,
+    /// `character_set_results` and `collation_connection` — 8 reads back
+    /// latin1 and latin1_swedish_ci, 224 utf8mb4_unicode_ci — and an ID MySQL
+    /// has no collation for gives the server's default. A collation of ucs2,
+    /// utf16, utf16le or utf32 answers 1231. The utf8mb4 collations this
+    /// server does not keep go on reading back `utf8mb4_general_ci`, as they
+    /// always have here, and a character set it does not keep is refused.
+    /// latin1_swedish_ci is kept as `SET NAMES latin1` would leave it, with
+    /// the refusals that come with naming latin1.
+    pub(crate) fn take_handshake_collation(&mut self, id: u8) -> Result<(), FrontendErrorKind> {
+        match id {
+            LATIN1_SWEDISH_CI_ID => {
+                self.latin1_client = true;
+                self.latin1_results = true;
+                self.latin1_connection = true;
+                Ok(())
+            }
+            id if is_supported_utf8mb4_collation(id) => {
+                self.connection_collation = ConnectionCollation::from_id(id).unwrap_or_default();
+                Ok(())
+            }
+            id if NEVER_A_CLIENTS_COLLATION_IDS
+                .iter()
+                .any(|range| range.contains(&id)) =>
+            {
+                Err(FrontendErrorKind::ClientCharacterSetNotAllowed)
+            }
+            id if MYSQL_COLLATION_IDS.iter().any(|range| range.contains(&id)) => {
+                Err(FrontendErrorKind::UnsupportedClientCharacterSet)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Takes the foreign-key switch this session last asked for, if it asked
@@ -2556,6 +2631,69 @@ mod tests {
             read_row(&mut session, "SELECT @@time_zone"),
             [Some("+01:00".to_owned())]
         );
+    }
+
+    /// Measured on MySQL 8.4.11: the collation a client's handshake names sets
+    /// `character_set_client`, `character_set_results`,
+    /// `character_set_connection` and `collation_connection`, and an ID MySQL
+    /// has no collation for — 0, 17, 254 — gives the server's default.
+    #[test]
+    fn the_handshake_collation_sets_the_sessions_character_sets() {
+        let names = "SELECT @@character_set_client, @@character_set_results, \
+                     @@character_set_connection, @@collation_connection";
+        let utf8mb4 = |collation: &str| {
+            vec![
+                Some("utf8mb4".to_owned()),
+                Some("utf8mb4".to_owned()),
+                Some("utf8mb4".to_owned()),
+                Some(collation.to_owned()),
+            ]
+        };
+        for (id, expected, reported_id) in [
+            (45, utf8mb4("utf8mb4_general_ci"), 45),
+            (224, utf8mb4("utf8mb4_unicode_ci"), 224),
+            (255, utf8mb4("utf8mb4_0900_ai_ci"), 255),
+            (46, utf8mb4("utf8mb4_general_ci"), 45),
+            (0, utf8mb4("utf8mb4_general_ci"), 45),
+            (17, utf8mb4("utf8mb4_general_ci"), 45),
+            (254, utf8mb4("utf8mb4_general_ci"), 45),
+        ] {
+            let mut session = MySqlSessionVariables::default();
+            session.take_handshake_collation(id).unwrap();
+            assert_eq!(read_row(&mut session, names), expected, "{id}");
+            assert_eq!(session.connection_collation_id(), reported_id, "{id}");
+            assert!(!session.reads_statements_as_latin1(), "{id}");
+            assert!(!session.wants_latin1_results(), "{id}");
+        }
+
+        let mut latin1 = MySqlSessionVariables::default();
+        latin1.take_handshake_collation(8).unwrap();
+        assert_eq!(
+            read_row(&mut latin1, names),
+            [
+                Some("latin1".to_owned()),
+                Some("latin1".to_owned()),
+                Some("latin1".to_owned()),
+                Some("latin1_swedish_ci".to_owned()),
+            ]
+        );
+        assert!(latin1.reads_statements_as_latin1());
+        assert!(latin1.wants_latin1_results());
+
+        for id in [35, 54, 56, 60, 62, 90, 101, 128, 159, 160, 183] {
+            assert_eq!(
+                MySqlSessionVariables::default().take_handshake_collation(id),
+                Err(FrontendErrorKind::ClientCharacterSetNotAllowed),
+                "{id}"
+            );
+        }
+        for id in [1, 5, 28, 33, 47, 63, 83, 192, 248, 250] {
+            assert_eq!(
+                MySqlSessionVariables::default().take_handshake_collation(id),
+                Err(FrontendErrorKind::UnsupportedClientCharacterSet),
+                "{id}"
+            );
+        }
     }
 
     /// latin1 is what a view created by a client left at its default carries

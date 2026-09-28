@@ -431,6 +431,11 @@ pub enum FrontendErrorKind {
     PacketTooLarge,
     /// A `SET` named the session's `max_allowed_packet`.
     SessionMaxAllowedPacketIsReadOnly,
+    /// A client's handshake named ucs2, utf16, utf16le or utf32, which MySQL
+    /// never takes as a client's character set.
+    ClientCharacterSetNotAllowed,
+    /// A client's handshake named a character set this server does not keep.
+    UnsupportedClientCharacterSet,
     /// A prepared statement's parameter sent with `COM_STMT_SEND_LONG_DATA`
     /// ran past `max_allowed_packet`.
     LongDataTooLarge,
@@ -674,6 +679,23 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1621,
             *b"HY000",
             b"SESSION variable 'max_allowed_packet' is read-only. Use SET GLOBAL to assign the value"
+                .as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: 1231 in answer to the handshake, where
+        // MySQL's message names the character set —
+        // `Variable 'character_set_client' can't be set to the value of 'ucs2'`.
+        FrontendErrorKind::ClientCharacterSetNotAllowed => (
+            1231,
+            *b"42000",
+            b"Variable 'character_set_client' can't be set to the value the client asked for"
+                .as_slice(),
+        ),
+        // MySQL takes every character set it has; this one keeps utf8mb4 and
+        // latin1_swedish_ci alone, and says so rather than closing.
+        FrontendErrorKind::UnsupportedClientCharacterSet => (
+            1235,
+            *b"42000",
+            b"This server does not take the character set the client asked for; connect with utf8mb4"
                 .as_slice(),
         ),
         // Measured on MySQL 8.4.11: answered by the `COM_STMT_EXECUTE` that
@@ -2604,6 +2626,16 @@ mod tests {
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
             (FrontendErrorKind::PacketTooLarge, 1153, *b"08S01"),
+            (
+                FrontendErrorKind::ClientCharacterSetNotAllowed,
+                1231,
+                *b"42000",
+            ),
+            (
+                FrontendErrorKind::UnsupportedClientCharacterSet,
+                1235,
+                *b"42000",
+            ),
             (
                 FrontendErrorKind::SessionMaxAllowedPacketIsReadOnly,
                 1621,

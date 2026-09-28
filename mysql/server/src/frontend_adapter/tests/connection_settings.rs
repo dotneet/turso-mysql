@@ -243,3 +243,24 @@ fn max_allowed_packet_reads_back_64_mib_and_the_session_cannot_set_it() {
         ]]
     );
 }
+
+/// The `mysql` client on a shell without a UTF-8 locale names latin1 in its
+/// handshake. The session then reads its statements and sends its results in
+/// latin1, as after `SET NAMES latin1`, so a result is refused rather than
+/// sent in utf8mb4, and the `SET NAMES utf8mb4` every driver sends makes the
+/// session whole.
+#[test]
+fn a_latin1_handshake_refuses_results_until_set_names_utf8mb4() {
+    let (_directory, mut adapter) = adapter();
+    adapter.take_client_collation(8).unwrap();
+    assert_eq!(
+        adapter.execute_query("SELECT 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    run(&mut adapter, "SET NAMES utf8mb4");
+    assert_eq!(rows(&mut adapter, "SELECT 1"), [[Some("1".to_owned())]]);
+    assert_eq!(
+        adapter.take_client_collation(33),
+        Err(FrontendErrorKind::UnsupportedClientCharacterSet)
+    );
+}

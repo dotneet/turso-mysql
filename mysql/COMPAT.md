@@ -2702,10 +2702,13 @@ runs on any server past the named version.
 `utf8mb4_general_ci`, `utf8mb4_0900_ai_ci` or `utf8mb4_unicode_ci`, and so is
 `SET collation_connection` naming one of those three. Laravel opens every
 connection with `SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci'`. The
-connection keeps `utf8mb4_general_ci`, the collation the handshake sends,
-until the session names another, and a `SET NAMES` without a collation goes
-back to it, where MySQL 8.4 would go to `utf8mb4_0900_ai_ci`. Any other
-character set or collation is refused, but for latin1 below.
+connection starts on the collation the client's handshake names when it is one
+of those three, as in MySQL, and on `utf8mb4_general_ci`, the collation this
+server's greeting names, for any other utf8mb4 collation and for an ID MySQL
+has no collation for, where MySQL gives the session `utf8mb4_0900_ai_ci`. A
+`SET NAMES` without a collation goes back to `utf8mb4_general_ci`, where
+MySQL 8.4 would go to `utf8mb4_0900_ai_ci`. Any other character set or
+collation is refused, but for latin1 below.
 
 `SET character_set_client`, `character_set_results` and `collation_connection`
 also take `latin1` and `latin1_swedish_ci`, which is what a dump sets around
@@ -4454,10 +4457,13 @@ here is the short one.
 
 Each name past `@@version` is something this server decides for itself rather
 than a default copied from MySQL, which is what makes it worth answering. It
-speaks `utf8mb4` and refuses any other character set, so all five
-`@@character_set_*` names read `utf8mb4`. The handshake sends collation 45, so
-`@@collation_connection` reads `utf8mb4_general_ci` until the session names
-another, and a table written here is
+speaks `utf8mb4` and refuses any other character set but latin1 below, so all
+five `@@character_set_*` names read `utf8mb4` unless the session named latin1.
+The greeting names collation 45, so `@@collation_connection` reads
+`utf8mb4_general_ci` for a client whose handshake names it, or a utf8mb4
+collation this server does not keep, until the session names another; a
+handshake naming `utf8mb4_0900_ai_ci` or `utf8mb4_unicode_ci` reads it back,
+as in MySQL. A table written here is
 declared the way MySQL declares one, so `@@collation_server` reads
 `utf8mb4_0900_ai_ci` — which is what every `SHOW CREATE TABLE` and
 `information_schema` reading here already says — and `@@collation_database`
@@ -5073,12 +5079,30 @@ clients set it on every connection. The two length forms agree below 251
 bytes, which is why real responses parsed correctly even while the capability
 was being refused, so the bit is read rather than assumed away.
 
-One wall remains between this server and MySQL's own interactive client: it
-sends the character set from the shell's locale, and a shell with no UTF-8
-locale sends latin1, which is refused. `mysqldump` sends utf8mb4 whatever the
-locale. Both captured responses are pinned as tests, the accepted one and the
-refused one. That refusal is currently silent: the server closes without an
-error packet, so the client reports a lost connection rather than a reason.
+The character set a client names in its handshake no longer shuts it out.
+MySQL's own interactive client sends the one from the shell's locale, and a
+shell with no UTF-8 locale sends latin1; `mysqldump` sends utf8mb4 whatever
+the locale. Measured on MySQL 8.4.11, a server takes any collation ID in the
+SSLRequest and the handshake response and sets `character_set_client`,
+`character_set_connection`, `character_set_results` and
+`collation_connection` from it: 8 reads back latin1 and `latin1_swedish_ci`,
+224 `utf8mb4_unicode_ci`; an ID it has no collation for — 0, 17, 254 — gives
+its default; and ucs2, utf16, utf16le and utf32 are answered 1231, SQLSTATE
+`42000`, `Variable 'character_set_client' can't be set to the value of
+'ucs2'`, in place of the final OK. `COM_RESET_CONNECTION` then puts the
+session back on the server's default rather than the handshake's. This server
+does the same for utf8mb4's collations, as described under `SET NAMES`, and
+for `latin1_swedish_ci`, and answers 1231 for those four, with a message that
+does not name the character set. latin1 is kept as `SET NAMES latin1` would
+leave it, with the refusals that come with naming latin1: a statement outside
+ASCII and every result set are refused until the session names utf8mb4, which
+the `SET NAMES utf8mb4` a driver sends does. Any other character set —
+utf8mb3, binary, another latin1 collation — is answered 1235, `This server
+does not take the character set the client asked for; connect with utf8mb4`,
+in place of the final OK once the credentials are checked. Before, the server
+closed the socket at the SSLRequest with no answer and the client reported
+`SSL connection error: unexpected eof`. The two captured handshakes, utf8mb4
+and latin1, are pinned as tests and both decode.
 
 Verified against a live server on Linux with Oracle's own `mysql` 8.4.11: with
 a UTF-8 locale the handshake and caching-SHA-2 authentication complete and

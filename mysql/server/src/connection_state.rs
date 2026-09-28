@@ -8,12 +8,13 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    map_frontend_error, AuthMoreData, AuthMoreDataKind, AuthOkPacketConfig, AuthPacketError,
-    ClientAuthResponse, ClientHandshakeResponse, ClientHandshakeResponseError, ClientSslRequest,
-    ClientSslRequestError, CredentialVerificationError, FrontendErrorKind, HandshakeNonceSource,
-    InitialHandshakeConfig, InitialHandshakeError, InitialHandshakeNonceError,
-    InitialHandshakeSettings, OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError,
-    ResponsePacketError, AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
+    is_supported_utf8mb4_collation, map_frontend_error, AuthMoreData, AuthMoreDataKind,
+    AuthOkPacketConfig, AuthPacketError, ClientAuthResponse, ClientHandshakeResponse,
+    ClientHandshakeResponseError, ClientSslRequest, ClientSslRequestError,
+    CredentialVerificationError, FrontendErrorKind, HandshakeNonceSource, InitialHandshakeConfig,
+    InitialHandshakeError, InitialHandshakeNonceError, InitialHandshakeSettings,
+    OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError, ResponsePacketError,
+    AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
     MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
     MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
 };
@@ -266,6 +267,22 @@ pub enum FullAuthenticationResult {
 pub trait InitialDatabaseSelector {
     /// Selects the database requested in the client handshake response.
     fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind>;
+
+    /// Takes the collation the client named in its handshake response, which
+    /// sets the session's character sets as `SET NAMES` would, before the
+    /// database is selected.
+    ///
+    /// Measured on MySQL 8.4.11, a server takes any collation ID there: an ID
+    /// it does not know gives the session the server's default, and one of
+    /// ucs2, utf16, utf16le or utf32 answers 1231, those never being a
+    /// client's. The default here takes utf8mb4's collations alone.
+    fn take_client_collation(&mut self, collation: u8) -> Result<(), FrontendErrorKind> {
+        if is_supported_utf8mb4_collation(collation) {
+            Ok(())
+        } else {
+            Err(FrontendErrorKind::UnsupportedClientCharacterSet)
+        }
+    }
 }
 
 impl<F> InitialDatabaseSelector for F
@@ -734,6 +751,7 @@ impl ClassicConnection {
             self.state = ConnectionState::Closing;
             return Err(ConnectionStateError::InitialDatabaseSelectorRequired);
         }
+        self.require_utf8mb4_without_a_selector()?;
         self.encode_authentication_ok()
     }
 
@@ -751,6 +769,9 @@ impl ClassicConnection {
             ConnectionState::AuthenticateFast,
             ConnectionEvent::SendAuthenticationOk,
         )?;
+        if let Err(kind) = selector.take_client_collation(self.client_collation()?) {
+            return self.authentication_error_response(kind);
+        }
         if let Some(database) = self.initial_database.clone() {
             return match selector.select_initial_database(&database) {
                 Ok(()) => Ok(AuthenticationResponse::Ok(self.encode_authentication_ok()?)),
@@ -758,6 +779,24 @@ impl ClassicConnection {
             };
         }
         Ok(AuthenticationResponse::Ok(self.encode_authentication_ok()?))
+    }
+
+    fn client_collation(&self) -> Result<u8, ConnectionStateError> {
+        self.client_response
+            .as_ref()
+            .map(|response| response.character_set)
+            .ok_or(ConnectionStateError::ClientResponseRequired)
+    }
+
+    /// Without a selector nothing can take another character set, so the
+    /// handshake must have named one of utf8mb4's collations.
+    fn require_utf8mb4_without_a_selector(&mut self) -> Result<(), ConnectionStateError> {
+        let collation = self.client_collation()?;
+        if !is_supported_utf8mb4_collation(collation) {
+            self.state = ConnectionState::Closing;
+            return Err(ConnectionStateError::CharacterSetSelectorRequired { collation });
+        }
+        Ok(())
     }
 
     fn encode_authentication_ok(&mut self) -> Result<Vec<u8>, ConnectionStateError> {
@@ -841,6 +880,9 @@ impl ClassicConnection {
             self.state = ConnectionState::Closing;
             return Err(ConnectionStateError::InitialDatabaseSelectorRequired);
         }
+        if result == FullAuthenticationResult::Authenticated {
+            self.require_utf8mb4_without_a_selector()?;
+        }
         self.apply_full_authentication_result_unchecked(result)
     }
 
@@ -858,6 +900,9 @@ impl ClassicConnection {
         if result == FullAuthenticationResult::Rejected {
             self.state = ConnectionState::Closing;
             return Err(ConnectionStateError::AuthenticationRejected);
+        }
+        if let Err(kind) = selector.take_client_collation(self.client_collation()?) {
+            return self.authentication_error_response(kind);
         }
         if let Some(database) = self.initial_database.clone() {
             return match selector.select_initial_database(&database) {
@@ -1352,6 +1397,9 @@ pub enum ConnectionStateError {
     /// The handshake requested a database, but the compatibility API without
     /// a selector was used to complete authentication.
     InitialDatabaseSelectorRequired,
+    /// The handshake named a collation outside utf8mb4's, which only a
+    /// selector can take.
+    CharacterSetSelectorRequired { collation: u8 },
     /// The credential provider or verifier failed before a protocol decision.
     CredentialVerification(CredentialVerificationError),
 }
@@ -1546,6 +1594,10 @@ impl fmt::Display for ConnectionStateError {
             Self::AuthenticationRejected => f.write_str("authentication was rejected"),
             Self::InitialDatabaseSelectorRequired => f.write_str(
                 "initial database selection is required before authentication completes",
+            ),
+            Self::CharacterSetSelectorRequired { collation } => write!(
+                f,
+                "client collation {collation} needs a selector before authentication completes"
             ),
             Self::CredentialVerification(error) => {
                 write!(f, "credential verification failed: {error}")
@@ -2484,6 +2536,91 @@ mod tests {
         assert_eq!(connection.state(), ConnectionState::AwaitClientResponse);
     }
 
+    /// A handshake may name any collation; what the session makes of it is
+    /// decided once the credentials are accepted, and a refusal is an error
+    /// packet in place of the final OK rather than a closed socket.
+    #[test]
+    fn the_client_collation_is_taken_or_refused_in_place_of_the_final_ok() {
+        let with_collation = |collation| {
+            let mut connection = ClassicConnection::with_test_nonce(
+                server_config(),
+                PacketCodec::new(MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH).unwrap(),
+                TransportSecurity::Secure,
+                [0x5a; AUTH_PLUGIN_DATA_LENGTH],
+            )
+            .unwrap();
+            connection.send_initial_handshake().unwrap();
+            let mut response = client_response(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES);
+            response.character_set = collation;
+            connection
+                .receive_client_handshake_response(response)
+                .unwrap();
+            connection
+                .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
+                .unwrap();
+            connection
+        };
+
+        let mut taken = Vec::new();
+        let mut latin1 = with_collation(8);
+        let mut selector = CollationRecordingSelector {
+            taken: &mut taken,
+            answer: Ok(()),
+        };
+        assert!(matches!(
+            latin1.send_authentication_ok_with_selector(&mut selector),
+            Ok(AuthenticationResponse::Ok(_))
+        ));
+        assert_eq!(latin1.state(), ConnectionState::Ready);
+        assert_eq!(taken, [8]);
+
+        let mut ucs2 = with_collation(35);
+        let mut selector = CollationRecordingSelector {
+            taken: &mut taken,
+            answer: Err(FrontendErrorKind::ClientCharacterSetNotAllowed),
+        };
+        let Ok(AuthenticationResponse::Err { kind, frame }) =
+            ucs2.send_authentication_ok_with_selector(&mut selector)
+        else {
+            panic!("a refused collation answers an error packet");
+        };
+        assert_eq!(kind, FrontendErrorKind::ClientCharacterSetNotAllowed);
+        assert_eq!(&frame[4..7], [0xff, 0xcf, 0x04]);
+        assert_eq!(ucs2.state(), ConnectionState::Closing);
+
+        let mut without_selector = with_collation(33);
+        assert_eq!(
+            without_selector.send_authentication_ok(),
+            Err(ConnectionStateError::CharacterSetSelectorRequired { collation: 33 })
+        );
+        assert_eq!(without_selector.state(), ConnectionState::Closing);
+
+        let mut rejecting = with_collation(33);
+        assert!(matches!(
+            rejecting.send_authentication_ok_with_selector(&mut |_: &str| Ok(())),
+            Ok(AuthenticationResponse::Err {
+                kind: FrontendErrorKind::UnsupportedClientCharacterSet,
+                ..
+            })
+        ));
+    }
+
+    struct CollationRecordingSelector<'a> {
+        taken: &'a mut Vec<u8>,
+        answer: Result<(), FrontendErrorKind>,
+    }
+
+    impl InitialDatabaseSelector for CollationRecordingSelector<'_> {
+        fn select_initial_database(&mut self, _database: &str) -> Result<(), FrontendErrorKind> {
+            Ok(())
+        }
+
+        fn take_client_collation(&mut self, collation: u8) -> Result<(), FrontendErrorKind> {
+            self.taken.push(collation);
+            self.answer
+        }
+    }
+
     #[test]
     fn rejects_client_limits_and_collations_before_authentication() {
         let mut connection =
@@ -2501,17 +2638,6 @@ mod tests {
                     ..
                 }
             )) if max_packet_size == MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1
-        ));
-        assert_eq!(connection.state(), ConnectionState::AwaitClientResponse);
-
-        let mut unsupported_charset =
-            client_response(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES);
-        unsupported_charset.character_set = 33;
-        assert!(matches!(
-            connection.receive_client_handshake_response(unsupported_charset),
-            Err(ConnectionStateError::ClientHandshakeResponse(
-                ClientHandshakeResponseError::UnsupportedCharacterSet { character_set: 33 }
-            ))
         ));
         assert_eq!(connection.state(), ConnectionState::AwaitClientResponse);
 

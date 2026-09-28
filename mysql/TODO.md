@@ -443,7 +443,8 @@ speaks; anything measured here from now on has to pass that flag.
 | `SET time_zone` | accepts `UTC`, `SYSTEM` and fixed offsets from `-13:59` through `+14:00`; see the TIMESTAMP boundaries below |
 | `SET unique_checks` | works; with it off, a duplicate key is refused as MySQL 8.4 refuses one under its default `innodb_change_buffering=none` |
 | `SET character_set_client`, `character_set_results` or `collation_connection` to latin1 | taken for what a dump sets around a view: a statement outside ASCII, a result set, and a prepared statement are refused while it is named, and a view made then records utf8mb4 rather than latin1 |
-| Any character set or collation but utf8mb4's three and latin1 | refused |
+| Any character set or collation but utf8mb4's three and latin1 | refused, a client's handshake naming one — utf8mb3, which older drivers send for `utf8`, binary, another latin1 collation — with 1235 in place of the final OK; MySQL takes every character set it has there |
+| A client's handshake naming latin1 | taken as `SET NAMES latin1`, so every result is refused until the session names utf8mb4 — `SELECT @@version_comment` too, which the `mysql` client sends as it starts. MySQL converts its results to latin1 |
 | `SHOW WARNINGS` with no database selected | refused as 1046, where MySQL answers it |
 | Any other `@@name` | refused as 1193 rather than answered with a value the server does not have |
 | A user variable set to anything but a literal — `SET @y := @x + 1`, `SET @x = (SELECT ...)` | refused; taking it needs an expression evaluated without a table under it |

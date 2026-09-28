@@ -3172,6 +3172,10 @@ where
     fn select_initial_database(&mut self, database: &str) -> Result<(), FrontendErrorKind> {
         self.select_database(database)
     }
+
+    fn take_client_collation(&mut self, collation: u8) -> Result<(), FrontendErrorKind> {
+        self.session_variables.take_handshake_collation(collation)
+    }
 }
 
 #[cfg(unix)]

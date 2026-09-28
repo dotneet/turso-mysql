@@ -1246,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_max_packet_size_and_charset_are_rejected_before_tls() {
+    fn a_small_max_packet_size_is_rejected_before_tls_and_any_charset_passes() {
         let mut too_small = valid_ssl_request_frame(CLIENT_HANDSHAKE_SEQUENCE_ID);
         too_small[8..12].copy_from_slice(&(MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1).to_le_bytes());
         let mut too_small_reader = ScriptedReader::new(&too_small, too_small.len());
@@ -1273,10 +1273,9 @@ mod tests {
                 &mut charset_reader,
                 test_codec(),
                 Instant::now() + Duration::from_secs(5)
-            ),
-            Err(PreTlsPacketError::InvalidSslRequest(
-                ClientSslRequestError::UnsupportedCharacterSet { character_set: 33 }
-            ))
+            )
+            .map(|request| request.character_set),
+            Ok(33)
         );
     }
 

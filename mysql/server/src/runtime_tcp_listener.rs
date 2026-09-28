@@ -1591,8 +1591,22 @@ mod tests {
     }
 
     fn authenticate_over_tls(
-        mut client: TcpStream,
+        client: TcpStream,
     ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+        let (client, answer) = sign_in_over_tls(client, DEFAULT_UTF8MB4_COLLATION);
+        AuthOkPacket::decode(packet_codec(), &answer).expect("authentication OK");
+        client
+    }
+
+    /// Signs in naming `collation` in the SSLRequest and the handshake
+    /// response, and returns the stream and the server's final answer.
+    fn sign_in_over_tls(
+        mut client: TcpStream,
+        collation: u8,
+    ) -> (
+        rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        Vec<u8>,
+    ) {
         let codec = packet_codec();
         let greeting =
             InitialHandshake::decode(codec, &read_frame(&mut client)).expect("initial handshake");
@@ -1600,7 +1614,7 @@ mod tests {
         assert_ne!(greeting.capability_flags() & CLIENT_SSL, 0);
         let capabilities =
             REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL | CLIENT_DEPRECATE_EOF;
-        let ssl_request = ClientSslRequestConfig::new(capabilities, 0, DEFAULT_UTF8MB4_COLLATION)
+        let ssl_request = ClientSslRequestConfig::new(capabilities, 0, collation)
             .encode(codec, CLIENT_HANDSHAKE_SEQUENCE_ID)
             .expect("SSLRequest");
         client.write_all(&ssl_request).expect("SSLRequest write");
@@ -1615,7 +1629,7 @@ mod tests {
         let response = ClientHandshakeResponseConfig::new(
             capabilities,
             0,
-            DEFAULT_UTF8MB4_COLLATION,
+            collation,
             "alice",
             vec![0; 32],
             None::<String>,
@@ -1631,8 +1645,8 @@ mod tests {
         client
             .write_all(&codec.encode(4, b"secret\0").expect("password frame"))
             .expect("password write");
-        AuthOkPacket::decode(codec, &read_frame(&mut client)).expect("authentication OK");
-        client
+        let answer = read_frame(&mut client);
+        (client, answer)
     }
 
     #[test]
@@ -1928,6 +1942,59 @@ mod tests {
             0
         );
         assert!(worker.join().is_ok());
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// The `mysql` client on a shell without a UTF-8 locale names latin1 in
+    /// its SSLRequest and handshake. Measured on MySQL 8.4.11, the server takes
+    /// it, and refuses ucs2 with 1231 in answer to the handshake; this server
+    /// used to close the socket at the SSLRequest instead.
+    #[test]
+    fn tls_sign_in_takes_latin1_and_answers_a_refused_character_set() {
+        let runtime = protocol_runtime(Duration::from_secs(1));
+        let codec = packet_codec();
+        let capabilities =
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL | CLIENT_DEPRECATE_EOF;
+
+        let (client, worker) = start_worker(&runtime.listener);
+        let (mut client, answer) = sign_in_over_tls(client, 8);
+        AuthOkPacket::decode(codec, &answer).expect("latin1 is taken");
+        let mut names = vec![COM_QUERY];
+        names.extend_from_slice(b"SET NAMES utf8mb4");
+        client
+            .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &names).expect("query"))
+            .expect("query write");
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("SET NAMES OK");
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &[COM_QUIT])
+                    .expect("quit"),
+            )
+            .expect("quit write");
+        drop(client);
+        assert!(worker.join().is_ok());
+
+        let (client, worker) = start_worker(&runtime.listener);
+        let (mut client, answer) = sign_in_over_tls(client, 35);
+        let refused = ErrPacket::decode(codec, &answer, capabilities).expect("1231");
+        assert_eq!(refused.error_code, 1231);
+        assert_eq!(refused.sql_state, Some(*b"42000"));
+        let mut rest = Vec::new();
+        assert_eq!(
+            client
+                .read_to_end(&mut rest)
+                .map(|_| rest.len())
+                .unwrap_or(0),
+            0
+        );
+        let _ = worker.join();
+
+        let (client, worker) = start_worker(&runtime.listener);
+        let (_client, answer) = sign_in_over_tls(client, 33);
+        let refused = ErrPacket::decode(codec, &answer, capabilities).expect("1235");
+        assert_eq!(refused.error_code, 1235);
+        let _ = worker.join();
         assert!(runtime.listener.shutdown().drained());
     }
 

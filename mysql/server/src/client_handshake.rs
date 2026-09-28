@@ -3,11 +3,10 @@
 use std::{error::Error, fmt, str};
 
 use crate::{
-    is_supported_utf8mb4_collation, PacketCodec, PacketCodecError, CLIENT_COMPRESS,
-    CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS,
-    CLIENT_PLUGIN_AUTH, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_PROTOCOL_41,
-    CLIENT_SECURE_CONNECTION, CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM,
-    DEFAULT_UTF8MB4_COLLATION,
+    PacketCodec, PacketCodecError, CLIENT_COMPRESS, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS,
+    CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS, CLIENT_PLUGIN_AUTH,
+    CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA, CLIENT_PROTOCOL_41, CLIENT_SECURE_CONNECTION,
+    CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM, DEFAULT_UTF8MB4_COLLATION,
 };
 
 /// Capability bit for a database name in the handshake response.
@@ -145,7 +144,6 @@ impl ClientHandshakeResponseConfig {
     pub fn validate(&self) -> Result<(), ClientHandshakeResponseError> {
         validate_capabilities(self.capability_flags)?;
         validate_max_packet_size(self.max_packet_size)?;
-        validate_character_set(self.character_set)?;
         validate_reserved(&self.reserved)?;
         validate_text(&self.username, "username", MAX_CLIENT_USERNAME_LENGTH, true)?;
         if self.auth_response.len() > MAX_CLIENT_AUTH_RESPONSE_LENGTH {
@@ -416,7 +414,6 @@ impl ClientSslRequestConfig {
             });
         }
         validate_ssl_max_packet_size(self.max_packet_size)?;
-        validate_ssl_character_set(self.character_set)?;
         validate_reserved(&self.reserved).map_err(|_| ClientSslRequestError::NonZeroReservedBytes)
     }
 
@@ -489,7 +486,6 @@ impl ClientSslRequest {
         ]);
         let character_set = packet.payload[8];
         validate_ssl_max_packet_size(max_packet_size)?;
-        validate_ssl_character_set(character_set)?;
         let mut reserved = [0; CLIENT_HANDSHAKE_RESPONSE_RESERVED_LENGTH];
         reserved.copy_from_slice(&packet.payload[9..]);
         if reserved.iter().any(|byte| *byte != 0) {
@@ -533,8 +529,6 @@ pub enum ClientSslRequestError {
     MissingCapabilities { flags: u32, missing: u32 },
     /// The peer cannot receive the smallest protocol-4.1 server response.
     MaxPacketSizeTooSmall { max_packet_size: u32, minimum: u32 },
-    /// The peer selected a collation outside this UTF-8-only slice.
-    UnsupportedCharacterSet { character_set: u8 },
     /// Reserved bytes must be zero.
     NonZeroReservedBytes,
 }
@@ -568,10 +562,6 @@ impl fmt::Display for ClientSslRequestError {
             } => write!(
                 f,
                 "client maximum packet size {max_packet_size} is below required minimum {minimum}"
-            ),
-            Self::UnsupportedCharacterSet { character_set } => write!(
-                f,
-                "unsupported client character-set/collation id {character_set}"
             ),
             Self::NonZeroReservedBytes => f.write_str("SSLRequest reserved bytes must be zero"),
         }
@@ -638,7 +628,6 @@ fn decode_payload(
     let max_packet_size = reader.read_u32("maximum packet size")?;
     let character_set = reader.read_u8("character set")?;
     validate_max_packet_size(max_packet_size)?;
-    validate_character_set(character_set)?;
     let reserved_bytes =
         reader.read_exact(CLIENT_HANDSHAKE_RESPONSE_RESERVED_LENGTH, "reserved bytes")?;
     let mut reserved = [0; CLIENT_HANDSHAKE_RESPONSE_RESERVED_LENGTH];
@@ -706,14 +695,6 @@ fn validate_max_packet_size(max_packet_size: u32) -> Result<(), ClientHandshakeR
     Ok(())
 }
 
-fn validate_character_set(character_set: u8) -> Result<(), ClientHandshakeResponseError> {
-    if is_supported_utf8mb4_collation(character_set) {
-        Ok(())
-    } else {
-        Err(ClientHandshakeResponseError::UnsupportedCharacterSet { character_set })
-    }
-}
-
 fn validate_ssl_max_packet_size(max_packet_size: u32) -> Result<(), ClientSslRequestError> {
     if max_packet_size != 0 && max_packet_size < MIN_SERVER_RESPONSE_PAYLOAD_LENGTH {
         return Err(ClientSslRequestError::MaxPacketSizeTooSmall {
@@ -722,14 +703,6 @@ fn validate_ssl_max_packet_size(max_packet_size: u32) -> Result<(), ClientSslReq
         });
     }
     Ok(())
-}
-
-fn validate_ssl_character_set(character_set: u8) -> Result<(), ClientSslRequestError> {
-    if is_supported_utf8mb4_collation(character_set) {
-        Ok(())
-    } else {
-        Err(ClientSslRequestError::UnsupportedCharacterSet { character_set })
-    }
 }
 
 fn validate_reserved(
@@ -1224,8 +1197,6 @@ pub enum ClientHandshakeResponseError {
     MissingCapabilities { flags: u32, missing: u32 },
     /// The peer cannot receive the smallest protocol-4.1 server response.
     MaxPacketSizeTooSmall { max_packet_size: u32, minimum: u32 },
-    /// The peer selected a collation outside this UTF-8-only slice.
-    UnsupportedCharacterSet { character_set: u8 },
     /// A capability is not part of this bounded response model.
     UnsupportedCapabilities { flags: u32, unsupported: u32 },
     /// Reserved bytes must be zero.
@@ -1300,10 +1271,6 @@ impl fmt::Display for ClientHandshakeResponseError {
             } => write!(
                 f,
                 "client maximum packet size {max_packet_size} is below required minimum {minimum}"
-            ),
-            Self::UnsupportedCharacterSet { character_set } => write!(
-                f,
-                "unsupported client character-set/collation id {character_set}"
             ),
             Self::UnsupportedCapabilities { flags, unsupported } => write!(
                 f,
@@ -1551,10 +1518,10 @@ mod tests {
             );
         }
 
-        assert!(matches!(
-            CODEC.decode_client_handshake_response(&frame(MYSQL_LATIN1)),
-            Err(ClientHandshakeResponseError::UnsupportedCharacterSet { character_set: 8 })
-        ));
+        let latin1 = CODEC
+            .decode_client_handshake_response(&frame(MYSQL_LATIN1))
+            .expect("the latin1 handshake decodes, the server deciding later what to make of it");
+        assert_eq!(latin1.character_set, 8);
     }
 
     #[test]
@@ -1606,7 +1573,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_small_packet_limits_and_non_utf8_collations() {
+    fn rejects_too_small_packet_limits_and_keeps_any_collation_for_later() {
         let below_minimum = MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1;
         let mut too_small = config();
         too_small.max_packet_size = below_minimum;
@@ -1633,10 +1600,14 @@ mod tests {
 
         let mut charset = config();
         charset.character_set = 33;
-        assert!(matches!(
-            CODEC.encode_client_handshake_response(0, &charset),
-            Err(ClientHandshakeResponseError::UnsupportedCharacterSet { character_set: 33 })
-        ));
+        let frame = CODEC.encode_client_handshake_response(0, &charset).unwrap();
+        assert_eq!(
+            CODEC
+                .decode_client_handshake_response(&frame)
+                .unwrap()
+                .character_set,
+            33
+        );
 
         let mut ssl = ClientSslRequestConfig::new(
             REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
@@ -1652,10 +1623,14 @@ mod tests {
         ));
         ssl.max_packet_size = 0;
         ssl.character_set = 33;
-        assert!(matches!(
-            CODEC.encode_client_ssl_request(0, &ssl),
-            Err(ClientSslRequestError::UnsupportedCharacterSet { character_set: 33 })
-        ));
+        let frame = CODEC.encode_client_ssl_request(0, &ssl).unwrap();
+        assert_eq!(
+            CODEC
+                .decode_client_ssl_request(&frame)
+                .unwrap()
+                .character_set,
+            33
+        );
     }
 
     #[test]
