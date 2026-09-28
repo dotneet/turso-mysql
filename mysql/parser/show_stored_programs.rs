@@ -102,6 +102,20 @@ fn consume_database_test(tokens: &[AdminToken], cursor: &mut usize) -> bool {
         return false;
     }
     *cursor += 3;
+    // Connector/J's `getProcedures` and `getFunctions` without
+    // information_schema add the name pattern, `AND Name LIKE '%'`.
+    let names_the_name = matches!(
+        tokens.get(*cursor + 1),
+        Some(AdminToken::Word(name) | AdminToken::QuotedIdentifier(name))
+            if name.eq_ignore_ascii_case("Name")
+    );
+    if matches!(tokens.get(*cursor), Some(AdminToken::Word(word)) if word.eq_ignore_ascii_case("AND"))
+        && names_the_name
+        && matches!(tokens.get(*cursor + 2), Some(AdminToken::Word(word)) if word.eq_ignore_ascii_case("LIKE"))
+        && matches!(tokens.get(*cursor + 3), Some(AdminToken::StringLiteral(_)))
+    {
+        *cursor += 4;
+    }
     true
 }
 
@@ -126,6 +140,16 @@ mod tests {
         );
         assert_eq!(
             kind("SHOW PROCEDURE STATUS WHERE Db = 'probe'"),
+            Some(MySqlStoredProgramKind::Procedures)
+        );
+        // What Connector/J sends for `getFunctions` and `getProcedures`
+        // with `useInformationSchema=false`.
+        assert_eq!(
+            kind("SHOW FUNCTION STATUS WHERE Db = 'dbtools' AND Name LIKE '%'"),
+            Some(MySqlStoredProgramKind::Functions)
+        );
+        assert_eq!(
+            kind("SHOW PROCEDURE STATUS WHERE Db = 'dbtools' AND Name LIKE '%'"),
             Some(MySqlStoredProgramKind::Procedures)
         );
         assert_eq!(

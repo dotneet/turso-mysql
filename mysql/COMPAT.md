@@ -3006,7 +3006,10 @@ be preserved in DML rendering) and non-ordinal column identifiers. A `LIMIT` wit
 refused as non-deterministic.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
-`SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
+`SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes,
+and the selected database written before the table or, as Connector/J writes
+it without information_schema, after it: `SHOW KEYS FROM `posts` FROM `db``,
+which measured on 8.4.11 reads what `db.posts` reads.
 The fifteen columns come back in MySQL's order, with the primary key first,
 the other unique indexes next in creation order, and the non-unique ones
 last; an index the engine created for an inline UNIQUE is named after its

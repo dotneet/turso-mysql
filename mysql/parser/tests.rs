@@ -7851,11 +7851,28 @@ fn accepts_every_spelling_mysql_takes_for_show_index() {
     );
     assert_eq!(qualified.table().as_str(), "reports");
 
+    // Connector/J's `getPrimaryKeys` and `getIndexInfo` without
+    // information_schema name the database after the table.
+    for sql in [
+        "SHOW KEYS FROM `posts` FROM `dbtools`",
+        "SHOW INDEX FROM `posts` IN dbtools",
+    ] {
+        let command = parse_show_index(sql, mode).unwrap();
+        assert_eq!(
+            command.database().map(MySqlDatabaseName::as_str),
+            Some("dbtools"),
+            "{sql}"
+        );
+        assert_eq!(command.table().as_str(), "posts", "{sql}");
+    }
+
     for sql in [
         "SHOW INDEX",
         "SHOW INDEX FROM",
         "SHOW INDEX reports",
         "SHOW INDEX FROM reports extra",
+        "SHOW INDEX FROM a.reports FROM b",
+        "SHOW INDEX FROM reports FROM",
         "SHOW INDEX FROM reports WHERE Key_name = 'PRIMARY'",
     ] {
         assert!(parse_show_index(sql, mode).is_err(), "{sql}");

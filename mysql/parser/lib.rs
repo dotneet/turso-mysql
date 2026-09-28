@@ -3201,7 +3201,17 @@ pub fn parse_optional_show_index(
     {
         return Err(ParseError::ExpectedAdminCommand);
     }
-    let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    let (mut database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
+    // Connector/J writes the database after the table, `SHOW KEYS FROM
+    // `posts` FROM `db``, which measured on MySQL 8.4.11 reads the same
+    // indexes `db.posts` does.
+    if database.is_none()
+        && ["FROM", "IN"]
+            .iter()
+            .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    {
+        database = Some(consume_admin_database_name(&tokens, &mut cursor)?);
+    }
     if !admin_command_ends(&tokens, cursor) {
         return Err(ParseError::TrailingAdminCommandTokens);
     }

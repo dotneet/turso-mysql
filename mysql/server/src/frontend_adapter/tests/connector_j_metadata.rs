@@ -1560,3 +1560,40 @@ fn best_row_identifier_answers_the_primary_key() {
         ]
     );
 }
+
+/// With `useInformationSchema=false` Connector/J reads keys and indexes with
+/// `SHOW KEYS` and `SHOW INDEX` naming the database after the table, and the
+/// routines with `SHOW ... STATUS` narrowed to a name pattern. Each answered
+/// 1064. Measured on MySQL 8.4.11: the database after the table reads what
+/// `db.table` reads, and the routine listings hold no row here.
+#[test]
+fn the_show_path_names_the_database_after_the_table() {
+    let (_directory, mut adapter) = adapter();
+    for (written, qualified) in [
+        (
+            "SHOW KEYS FROM `posts` FROM `dbtools`",
+            "SHOW KEYS FROM `dbtools`.`posts`",
+        ),
+        (
+            "SHOW INDEX FROM `users` FROM `dbtools`",
+            "SHOW INDEX FROM `dbtools`.`users`",
+        ),
+    ] {
+        let (columns, read) = rows(&mut adapter, written);
+        assert_eq!((columns, read), rows(&mut adapter, qualified), "{written}");
+    }
+    assert_eq!(
+        rows(&mut adapter, "SHOW KEYS FROM `posts` FROM `dbtools`")
+            .1
+            .len(),
+        2
+    );
+    for sql in [
+        "SHOW FUNCTION STATUS WHERE Db = 'dbtools' AND Name LIKE '%'",
+        "SHOW PROCEDURE STATUS WHERE Db = 'dbtools' AND Name LIKE '%'",
+    ] {
+        let (columns, read) = rows(&mut adapter, sql);
+        assert!(read.is_empty(), "{sql}");
+        assert_eq!(columns.len(), 12, "{sql}");
+    }
+}
