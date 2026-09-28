@@ -513,7 +513,10 @@ straight through: every column keeps every flag, and a day, a moment and a time 
 in the connection's character set, four bytes to each character they spell — a `DATETIME` 76
 where on its own it reports 19 — and a JSON column in it too. Either way a column of the table
 goes by the name the body gave it and names the table under the name the body read it under,
-its alias when there is one: TypeORM's `ids_User_id` names `User` and `User_id`.
+its alias when there is one: TypeORM's `ids_User_id` names `User` and `User_id`. On the outer
+side of a `LEFT JOIN` an answer the body worked out is nullable, as MySQL reports it: Prisma's
+relation count, `LEFT JOIN (SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id) AS t`,
+reads NULL for a user with no posts, and the count reported NOT NULL there used to be wrong.
 
 A comparison the outer statement makes on a derived column is held to what the column is: a
 column of the table to its declared type under the body's name for it, a count to a whole

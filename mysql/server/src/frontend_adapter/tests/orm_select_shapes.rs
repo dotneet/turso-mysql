@@ -485,3 +485,43 @@ fn typeorm_writes_a_statement_out_of_the_catalog_s_words() {
         )
         .is_err());
 }
+
+/// Prisma counts each user's posts in a derived table joined on the outer
+/// side of a `LEFT JOIN`. Measured on MySQL 8.4.11: a user with no posts
+/// reads NULL there, and the count is reported nullable — a `LONGLONG` of 21
+/// naming the derived table and no original table — where the same count
+/// read straight out of the derived table is NOT NULL.
+#[test]
+fn a_count_on_the_outer_side_of_a_left_join_is_nullable() {
+    let (_directory, mut adapter) = adapter();
+    let joined = result_set(
+        &mut adapter,
+        "SELECT `users`.`id`, `aggr_selection_0_Post`.`_aggr_count_posts` FROM `users` LEFT JOIN (SELECT `posts`.`user_id`, COUNT(*) AS `_aggr_count_posts` FROM `posts` WHERE 1=1 GROUP BY `posts`.`user_id`) AS `aggr_selection_0_Post` ON (`users`.`id` = `aggr_selection_0_Post`.`user_id`) WHERE 1=1 ORDER BY `users`.`id` ASC",
+    );
+    assert_eq!(
+        text_rows(&joined),
+        [
+            [Some("1".to_owned()), Some("2".to_owned())],
+            [Some("2".to_owned()), None],
+            [Some("3".to_owned()), Some("1".to_owned())],
+        ]
+    );
+    let count = &joined.columns[1];
+    assert_eq!(
+        (
+            count.column_type,
+            count.column_length,
+            count.flags & MYSQL_NOT_NULL_FLAG,
+            count.table.as_str(),
+            count.original_table.as_str()
+        ),
+        (MYSQL_TYPE_LONGLONG, 21, 0, "aggr_selection_0_Post", "")
+    );
+    // Prisma writes the count as `COALESCE(..., 0)`, which MySQL answers NOT
+    // NULL; a fallback over a derived table's column is not read here.
+    assert!(adapter
+        .execute_query(
+            "SELECT `users`.`id`, COALESCE(`aggr_selection_0_Post`.`_aggr_count_posts`, 0) AS `_aggr_count_posts` FROM `users` LEFT JOIN (SELECT `posts`.`user_id`, COUNT(*) AS `_aggr_count_posts` FROM `posts` WHERE 1=1 GROUP BY `posts`.`user_id`) AS `aggr_selection_0_Post` ON (`users`.`id` = `aggr_selection_0_Post`.`user_id`) WHERE 1=1 ORDER BY `users`.`id` ASC"
+        )
+        .is_err());
+}

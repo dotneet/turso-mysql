@@ -6357,6 +6357,14 @@ impl TableResultMetadata {
             None => aggregate_column_definition(Some(self), name, answer)?,
         };
         stored_in_a_derived_table(&mut definition, answer)?;
+        // Measured on MySQL 8.4.11: Prisma's relation count, a derived table
+        // counting each user's posts on the outer side of a `LEFT JOIN`,
+        // answers NULL for a user with no posts, and its count is reported
+        // nullable there.
+        if table.outer {
+            let flags = definition.flags & !MYSQL_NOT_NULL_FLAG;
+            set_column_flags(&mut definition, flags);
+        }
         definition.schema.clear();
         definition.table.clone_from(&table.table_reference);
         definition.original_table.clear();
