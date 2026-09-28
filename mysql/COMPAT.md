@@ -4759,6 +4759,17 @@ validator, beside the one that already holds a signed integer to its width, so
 it sees the record every insert and update builds rather than one statement
 shape.
 
+A value the validator refuses fails its statement and nothing else. Measured on
+MySQL 8.4.11 inside a transaction: a value too long (1406), out of range (1264),
+not a number (1366), not a moment (1292), not a member (1265) or not a document
+(3140) each leaves the transaction open with its earlier rows and its
+savepoints; a multi-row `INSERT` refused on its second row keeps none of its
+rows, and an `UPDATE` refused on a later row leaves the rows before it as they
+were. So it is here. The engine checks a row just before writing it, after the
+row's index entries and any earlier rows are in, so every write under the
+validator takes a statement savepoint inside a transaction and a refusal rolls
+back to it, the way a failed `CHECK` or `NOT NULL` does.
+
 Two differences from MySQL, both measured. MySQL truncates an overflow made only
 of trailing spaces and reports note 1265 instead of refusing it; this refuses
 that case as well, because a validator sees the record after it is built and

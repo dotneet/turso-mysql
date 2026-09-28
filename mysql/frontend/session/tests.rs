@@ -7249,3 +7249,72 @@ fn strict_bigint_assignments_use_durable_mysql_ddl() -> Result<()> {
     connection.inner().close()?;
     Ok(())
 }
+
+#[test]
+fn refused_value_ends_only_its_statement_inside_a_transaction() -> Result<()> {
+    let (connection, _allocator, _io) = open_allocator_connection(
+        "mysql-session-refused-value-keeps-transaction.db",
+        [0x67; 16],
+    )?;
+    connection.execute("CREATE TABLE p (n INT NOT NULL, s VARCHAR(3), t TINYINT)")?;
+    connection.execute("CREATE INDEX p_s ON p (s)")?;
+    connection.execute("CREATE TABLE kinds (d DATETIME, e ENUM('a','b'), j JSON)")?;
+    connection.execute_transaction_command("BEGIN").unwrap();
+    connection
+        .execute_checked_write("INSERT INTO p (n, s) VALUES (1, 'a'), (2, 'b')", None)
+        .unwrap();
+    connection
+        .execute_transaction_command("SAVEPOINT before_refused")
+        .unwrap();
+
+    // Measured on MySQL 8.4.11: each fails with its own error (1406, 1264,
+    // 1366, 1292, 1265, 3140) and the transaction, its rows and its
+    // savepoint stay; a statement that fails on a later row keeps none of
+    // its own rows.
+    for sql in [
+        "INSERT INTO p (n, s) VALUES (3, 'toolong')",
+        "INSERT INTO p (n, t) VALUES (3, 1000)",
+        "INSERT INTO p (n) VALUES ('abc')",
+        "INSERT INTO kinds (d) VALUES ('2024-13-45 99:99:99')",
+        "INSERT INTO kinds (e) VALUES ('zzz')",
+        "INSERT INTO kinds (j) VALUES ('{bad')",
+        "INSERT INTO p (n, s) VALUES (3, 'ok'), (4, 'toolong'), (5, 'ok')",
+        "UPDATE p SET t = n * 100",
+    ] {
+        let error = connection.execute_checked_write(sql, None).unwrap_err();
+        assert!(
+            matches!(error, MySqlQueryError::Engine(LimboError::Assignment(_))),
+            "{sql}: {error}"
+        );
+        assert!(!connection.is_auto_commit(), "{sql} ended the transaction");
+    }
+    assert_eq!(
+        connection
+            .prepare_select("SELECT n, s, t FROM p ORDER BY n")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1), Value::from_text("a"), Value::Null],
+            vec![Value::from_i64(2), Value::from_text("b"), Value::Null],
+        ]
+    );
+    assert!(connection
+        .prepare_select("SELECT d FROM kinds")?
+        .run_collect_rows()?
+        .is_empty());
+
+    connection
+        .execute_checked_write("INSERT INTO p (n) VALUES (6)", None)
+        .unwrap();
+    connection
+        .execute_transaction_command("ROLLBACK TO SAVEPOINT before_refused")
+        .unwrap();
+    connection.execute_transaction_command("COMMIT").unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT n FROM p ORDER BY n")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+    connection.close()?;
+    Ok(())
+}

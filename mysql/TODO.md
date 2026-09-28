@@ -348,6 +348,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 |---|---|
 | `BEGIN` / `START TRANSACTION`, `COMMIT`, `ROLLBACK` | works |
 | `SET autocommit = 0 \| 1` | works |
+| A value a column refuses inside a transaction — 1406, 1264, 1366, 1292, 1265, 3140 | works; the statement fails and is undone, and the transaction, its earlier rows and its savepoints stay, as MySQL's do |
 | `LOCK TABLES` / `UNLOCK TABLES` | works, and the lock is held until the unlock. One lock over the whole database rather than one for each table, so it locks more than was asked for — see COMPAT.md |
 | Touching a table `LOCK TABLES` did not name | taken; MySQL answers 1100 and holds the session to the tables it locked, where one lock over everything has no reason to |
 | `START TRANSACTION` / `COMMIT` / `ROLLBACK` while tables are locked | refused; the lock is held by the transaction they would end, and MySQL keeps the two apart |
