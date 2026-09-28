@@ -14,6 +14,8 @@ use std::thread::JoinHandle;
 
 use turso_core::{CheckpointMode, Database, LimboError, Result};
 
+use crate::database_users::DatabaseUser;
+
 /// The thread one catalog empties its databases' WALs on, stopped and joined
 /// when the catalog goes.
 pub(crate) struct WalKeeper {
@@ -33,8 +35,11 @@ pub(crate) struct WalKeeperHandle {
 }
 
 enum Request {
-    /// The database is held weakly, so a request never keeps one open.
-    Truncate(Weak<Database>),
+    /// The database is held weakly, so a request never keeps one open. The
+    /// user counts the keeper as using a catalog's database while it empties
+    /// the WAL, which writes the database file, so that a drop never runs
+    /// beside it; a database dropped, or being dropped, is left alone.
+    Truncate(Weak<Database>, Option<DatabaseUser>),
     #[cfg(test)]
     Answer(Sender<()>),
     Stop,
@@ -81,7 +86,11 @@ impl Drop for WalKeeper {
 impl WalKeeperHandle {
     /// Asks for one database's WAL to be emptied, and answers a failure the
     /// thread met since a session was last told, if there was one.
-    pub(crate) fn ask_to_truncate(&self, database: &Weak<Database>) -> Result<()> {
+    pub(crate) fn ask_to_truncate(
+        &self,
+        database: &Weak<Database>,
+        user: Option<DatabaseUser>,
+    ) -> Result<()> {
         if let Some(failure) = self
             .failure
             .lock()
@@ -93,7 +102,9 @@ impl WalKeeperHandle {
         // The thread outlives every session of its catalog, so a request only
         // goes unread once the catalog is closing, when there is nothing left
         // to empty the WAL for.
-        let _ = self.requests.send(Request::Truncate(database.clone()));
+        let _ = self
+            .requests
+            .send(Request::Truncate(database.clone(), user));
         Ok(())
     }
 
@@ -113,15 +124,15 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
         // Every statement past the bound asks until the WAL is emptied, so
         // the requests that piled up meanwhile are read together and each
         // database is emptied once.
-        let mut databases: Vec<Weak<Database>> = Vec::new();
+        let mut databases: Vec<(Weak<Database>, Option<DatabaseUser>)> = Vec::new();
         let mut stop = false;
         #[cfg(test)]
         let mut answers = Vec::new();
         for request in std::iter::once(request).chain(received.try_iter()) {
             match request {
-                Request::Truncate(database) => {
-                    if !databases.iter().any(|kept| kept.ptr_eq(&database)) {
-                        databases.push(database);
+                Request::Truncate(database, user) => {
+                    if !databases.iter().any(|(kept, _)| kept.ptr_eq(&database)) {
+                        databases.push((database, user));
                     }
                 }
                 #[cfg(test)]
@@ -129,11 +140,19 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
                 Request::Stop => stop = true,
             }
         }
-        for database in databases {
+        for (database, user) in databases {
             let Some(database) = database.upgrade() else {
                 continue;
             };
-            match truncate(&database) {
+            if user
+                .as_ref()
+                .is_some_and(|user| user.start_using(std::time::Duration::ZERO).is_err())
+            {
+                continue;
+            }
+            let truncated = truncate(&database);
+            drop(user);
+            match truncated {
                 Ok(()) => {
                     #[cfg(test)]
                     handle

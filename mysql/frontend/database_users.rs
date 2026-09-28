@@ -273,6 +273,12 @@ impl DatabaseUser {
         self.users.changed.notify_all();
     }
 
+    /// A user of the same database that counts apart from this one, for
+    /// work done on the database beside the connection's own statements.
+    pub(crate) fn another_on_the_same_database(&self) -> DatabaseUser {
+        DatabaseUser::new(Arc::clone(&self.users), self.database.clone())
+    }
+
     pub(crate) fn database_was_dropped(&self) -> bool {
         self.users.lock().dropped
     }

@@ -390,6 +390,9 @@ struct SelectedDatabase {
     /// DATABASE` another session runs reaches this session's next `CREATE
     /// TABLE` but not this reading until the database is selected again.
     collation_when_selected: MySqlTableCollation,
+    /// Once another session dropped the database, the empty database the
+    /// statements reading none of its tables run on.
+    stand_in: Option<MySqlConnection>,
 }
 
 impl MySqlDatabaseSession {
@@ -585,6 +588,7 @@ impl MySqlDatabaseSession {
                 name: canonical_name,
                 connection,
                 collation_when_selected: collation.get(),
+                stand_in: None,
             }
         };
         // Measured on MySQL 8.4.11: selecting a database a `DROP DATABASE` is
@@ -645,10 +649,74 @@ impl MySqlDatabaseSession {
         Ok(&selected.connection)
     }
 
+    /// Opens the empty database a session runs what reads none of its
+    /// database's tables on, once another session dropped that database.
+    ///
+    /// Measured on MySQL 8.4.11: a session whose database another session
+    /// dropped still runs `SELECT 1`, `BEGIN` and `COMMIT`, and reads
+    /// `information_schema` as though the database had no table. Nothing may
+    /// run on the dropped database's files, which the stand-in keeps apart:
+    /// it is held in memory and refuses every write.
+    pub fn stand_in_for_a_dropped_database(&mut self) -> Result<(), MySqlDatabaseError> {
+        let schema_context = self.schema_context;
+        let authority = self.prepared_statement_authority.clone();
+        let Some(selected) = self
+            .selected
+            .as_mut()
+            .filter(|selected| selected.connection.database_was_dropped())
+        else {
+            return Ok(());
+        };
+        if selected.stand_in.is_none() {
+            let stand_in = MySqlConnection::stand_in_for_a_dropped_database(
+                &selected.name,
+                schema_context,
+                authority,
+                &selected.connection,
+            )
+            .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
+            selected.stand_in = Some(stand_in);
+        }
+        Ok(())
+    }
+
+    /// The connection a statement reading none of the selected database's
+    /// tables runs on: the database's own, or, once another session dropped
+    /// it, the stand-in [`Self::stand_in_for_a_dropped_database`] opened.
+    pub fn connection_reading_no_table(&self) -> Result<&MySqlConnection, MySqlDatabaseError> {
+        match self
+            .selected
+            .as_ref()
+            .and_then(|selected| selected.stand_in.as_ref())
+        {
+            Some(stand_in) => Ok(stand_in),
+            None => self.connection(),
+        }
+    }
+
+    /// Whether the session has `autocommit` on, and whether it is in a
+    /// transaction, even once another session dropped its database: both are
+    /// kept in memory, not read from the database's files.
+    pub fn autocommit_and_open_transaction(&self) -> Option<(bool, bool)> {
+        let selected = self.selected.as_ref()?;
+        let connection = selected.stand_in.as_ref().unwrap_or(&selected.connection);
+        Some((
+            connection.session_autocommit(),
+            !connection.is_auto_commit(),
+        ))
+    }
+
     /// Resets connection state while retaining the selected logical database.
     pub fn reset_connection(&mut self) -> Result<(), MySqlQueryError> {
         if let Ok(connection) = self.connection() {
             connection.reset_connection()?;
+        }
+        if let Some(stand_in) = self
+            .selected
+            .as_ref()
+            .and_then(|selected| selected.stand_in.as_ref())
+        {
+            stand_in.reset_connection()?;
         }
         self.last_insert_id = 0;
         Ok(())
@@ -2020,5 +2088,60 @@ mod tests {
             catalog.drop_database("held", Duration::ZERO),
             Err(MySqlDatabaseError::DatabaseNotFound(name)) if name == "held"
         ));
+    }
+
+    /// A session still holding a dropped database's files open lets them go
+    /// without writing them: neither the WAL keeper's emptying of the WAL,
+    /// asked for before the drop, nor the engine's closing checkpoint copies
+    /// the WAL into the database file of a database that is gone.
+    #[test]
+    fn a_session_lets_a_dropped_database_go_without_writing_it() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        catalog.create("gone").unwrap();
+        catalog.create("kept").unwrap();
+        let mut left = catalog.new_session(binary_context());
+        left.select_database("gone").unwrap();
+        let connection = left.connection().unwrap().clone();
+        connection
+            .execute("CREATE TABLE rows_written (id INT, body TEXT)")
+            .unwrap();
+        for id in 0..50 {
+            connection
+                .execute(&format!(
+                    "INSERT INTO rows_written (id, body) VALUES ({id}, '{}')",
+                    "x".repeat(500)
+                ))
+                .unwrap();
+        }
+        let held = held_files_of(directory.path());
+
+        catalog.drop_database("gone", Duration::ZERO).unwrap();
+        connection.truncate_the_wal_past(0).unwrap();
+        catalog.wal_keeper.handle().wait_for_the_requests_before();
+        drop(connection);
+        left.select_database("kept").unwrap();
+
+        for (path, file, length) in held {
+            assert_eq!(file.metadata().unwrap().len(), length, "{path:?}");
+        }
+    }
+
+    fn held_files_of(directory: &std::path::Path) -> Vec<(std::path::PathBuf, fs::File, u64)> {
+        let mut held = Vec::new();
+        let mut directories = vec![directory.to_path_buf()];
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let file = fs::File::open(&path).unwrap();
+                let length = file.metadata().unwrap().len();
+                held.push((path, file, length));
+            }
+        }
+        held
     }
 }

@@ -92,6 +92,9 @@ pub struct MySqlConnection {
     /// The transaction command the statement running now ran, if any, which
     /// decides whether its transaction keeps the database from a drop.
     transaction_command_ran: Arc<Mutex<TransactionCommandRan>>,
+    /// Whether this is an empty database standing in for one another session
+    /// dropped, which the statements reading no table run on.
+    stands_in_for_a_dropped_database: bool,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -168,7 +171,12 @@ impl SchemaReadings {
 /// was, however large a write made it, and the next open reads every frame of
 /// it again: measured, 6.7 GB after one UPDATE of a million rows, and over a
 /// second added to the next start.
-struct CloseOnLastDrop(Arc<Connection>);
+struct CloseOnLastDrop {
+    connection: Arc<Connection>,
+    /// The connection's use of its database, when it belongs to a catalog
+    /// that may drop the database while the connection still holds it.
+    database_user: std::sync::OnceLock<Arc<DatabaseUser>>,
+}
 
 /// A transaction command a statement ran, which [`MySqlConnection::finish_a_statement`]
 /// reads.
@@ -199,9 +207,23 @@ impl Drop for RestoresLockWait<'_> {
 
 impl Drop for CloseOnLastDrop {
     fn drop(&mut self) {
+        // Closing runs the engine's closing checkpoint, which writes the
+        // database file. A dropped database's files are written by nobody,
+        // so a connection to one, or to one a drop is under way on, is let go
+        // without closing; the checkpoint is not needed, the next open reading
+        // the WAL either way. A closing counts as using the database, so that
+        // a drop never runs beside it.
+        let Some(user) = self.database_user.get() else {
+            let _ = self.connection.close();
+            return;
+        };
+        if user.start_using(Duration::ZERO).is_err() {
+            return;
+        }
         // A drop has nowhere to report a failure to. A closing checkpoint that
         // fails leaves the WAL for the next open, which recovers it.
-        let _ = self.0.close();
+        let _ = self.connection.close();
+        user.stop_using();
     }
 }
 
@@ -1531,7 +1553,10 @@ impl MySqlConnection {
         // durable MySQL table carries one.
         inner.set_foreign_keys_enabled(true);
         Ok(Self {
-            _closes_on_last_drop: Arc::new(CloseOnLastDrop(Arc::clone(&inner))),
+            _closes_on_last_drop: Arc::new(CloseOnLastDrop {
+                connection: Arc::clone(&inner),
+                database_user: std::sync::OnceLock::new(),
+            }),
             inner,
             schema_context,
             auto_increment: None,
@@ -1549,6 +1574,7 @@ impl MySqlConnection {
             database_user: None,
             metadata_lock_wait: Arc::new(Mutex::new(DEFAULT_METADATA_LOCK_WAIT)),
             transaction_command_ran: Arc::default(),
+            stands_in_for_a_dropped_database: false,
         })
     }
 
@@ -1656,8 +1682,68 @@ impl MySqlConnection {
     /// Lets a catalog's `DROP DATABASE` know when this connection uses its
     /// database.
     pub(crate) fn with_database_user(mut self, user: DatabaseUser) -> Self {
-        self.database_user = Some(Arc::new(user));
+        let user = Arc::new(user);
+        self._closes_on_last_drop
+            .database_user
+            .set(Arc::clone(&user))
+            .unwrap_or_else(|_| panic!("a connection belongs to one database"));
+        self.database_user = Some(user);
         self
+    }
+
+    /// Opens an empty database named `name`, held in memory and refusing
+    /// every write, for a session whose database another session dropped to
+    /// run what reads none of its tables on, carrying over the session's
+    /// settings and its open transaction from `dropped`.
+    ///
+    /// Measured on MySQL 8.4.11: such a session still runs `SELECT 1`,
+    /// `BEGIN` and `COMMIT`, and its `information_schema` reads find no table
+    /// of the database. Nothing may run on the dropped database's files.
+    pub(crate) fn stand_in_for_a_dropped_database(
+        name: &str,
+        schema_context: SchemaSqlSessionContext,
+        prepared_statement_authority: MySqlPreparedStatementAuthority,
+        dropped: &MySqlConnection,
+    ) -> Result<Self> {
+        let database = turso_core::Database::open_file_with_flags(
+            Arc::new(turso_core::MemoryIO::new()),
+            ":memory:",
+            turso_core::OpenFlags::Create,
+            turso_core::DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(crate::MySqlDialect),
+        )?;
+        crate::catalog_tables::register_catalog_tables(&database, name)?;
+        let mut stand_in = Self::new_with_prepared_statement_authority(
+            database.connect()?,
+            schema_context,
+            prepared_statement_authority,
+        )?;
+        stand_in.stands_in_for_a_dropped_database = true;
+        stand_in.set_time_zone_offset_seconds(dropped.time_zone_offset_seconds());
+        stand_in.set_last_insert_id(dropped.last_insert_id());
+        stand_in.set_metadata_lock_wait(dropped.metadata_lock_wait());
+        *stand_in.session_autocommit.lock().unwrap() = dropped.session_autocommit();
+        if !dropped.is_auto_commit() {
+            stand_in
+                .inner
+                .prepare("BEGIN")
+                .and_then(|mut statement| statement.run_ignore_rows())?;
+        }
+        stand_in.inner.set_query_only(true);
+        Ok(stand_in)
+    }
+
+    /// Whether this is the empty database a session whose database another
+    /// session dropped runs what reads no table on.
+    pub fn stands_in_for_a_dropped_database(&self) -> bool {
+        self.stands_in_for_a_dropped_database
+    }
+
+    /// Whether `other` is a clone of this connection, running on the same
+    /// engine connection.
+    pub fn is_the_same_connection_as(&self, other: &MySqlConnection) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Marks a statement starting on this connection's database, which a
@@ -1732,7 +1818,12 @@ impl MySqlConnection {
             return Ok(());
         }
         if let Some((keeper, database)) = &self.wal_keeper {
-            return keeper.ask_to_truncate(database);
+            return keeper.ask_to_truncate(
+                database,
+                self.database_user
+                    .as_ref()
+                    .map(|user| user.another_on_the_same_database()),
+            );
         }
         match self.inner.checkpoint(turso_core::CheckpointMode::Truncate {
             upper_bound_inclusive: None,

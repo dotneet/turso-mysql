@@ -45,8 +45,8 @@ use turso_mysql::session_registry::{MySqlSessionRegistry, MySqlSessionSnapshot};
 use turso_mysql::MySqlTableKind;
 #[cfg(unix)]
 use turso_mysql::{
-    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
-    MySqlPreparedStatementAuthority, MySqlStatementNotStarted,
+    canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseDropped, MySqlDatabaseError,
+    MySqlDatabaseSession, MySqlPreparedStatementAuthority, MySqlStatementNotStarted,
 };
 #[cfg(unix)]
 use turso_mysql::{
@@ -999,7 +999,7 @@ where
             CatalogVisibility::GrantedTables => {
                 let tables = self
                     .session
-                    .connection()
+                    .connection_reading_no_table()
                     .map_err(database_error_kind)?
                     .list_tables()
                     .map_err(|_| FrontendErrorKind::Internal)?;
@@ -1016,7 +1016,7 @@ where
             }
         };
         self.session
-            .connection()
+            .connection_reading_no_table()
             .map_err(database_error_kind)?
             .set_visible_tables(visible);
         Ok(())
@@ -1044,7 +1044,7 @@ where
             _ => unreachable!("only COLUMNS and SCHEMATA take their rows from the session"),
         };
         self.session
-            .connection()
+            .connection_reading_no_table()
             .map_err(database_error_kind)?
             .set_catalog_rows(catalog, rows);
         Ok(())
@@ -1062,7 +1062,10 @@ where
         selected_database: &str,
         visibility: CatalogVisibility,
     ) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
-        let connection = self.session.connection().map_err(database_error_kind)?;
+        let connection = self
+            .session
+            .connection_reading_no_table()
+            .map_err(database_error_kind)?;
         let tables = connection
             .list_tables()
             .map_err(|_| FrontendErrorKind::Internal)?;
@@ -1191,7 +1194,7 @@ where
     ) -> Result<Vec<MySqlColumnMetadata>, FrontendErrorKind> {
         match self
             .session
-            .connection()
+            .connection_reading_no_table()
             .map_err(database_error_kind)?
             .list_columns(table)
         {
@@ -2244,7 +2247,7 @@ where
             0
         };
         self.session
-            .connection()
+            .connection_reading_no_table()
             .map(connection_status_flags)
             .unwrap_or(SERVER_STATUS_AUTOCOMMIT)
             | awaiting
@@ -2308,6 +2311,7 @@ where
             .ok()
             .and_then(MySqlConnection::take_found_rows_before_the_limit);
         let result = self.answer_what_is_missing(sql, result);
+        let result = self.name_the_dropped_database(sql, result);
         self.session_variables.note_statement_outcome(sql, &result);
         if let (Some(found), Ok(CommandExecutionResult::ResultSet(_))) =
             (found_rows_before_the_limit, &result)
@@ -2346,18 +2350,11 @@ where
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         let _kept_reads = turso_mysql_parser::keep_reads();
         self.error_message = None;
-        let result = self.follow_a_dropped_database().and_then(|()| {
-            let connection = self.session.connection().ok().cloned();
-            let Some(connection) = connection else {
-                return self.prepare_client_statement(sql);
-            };
-            self.start_a_statement_on(&connection)?;
-            let result = connection
-                .prepare_without_starting_the_snapshot(|| self.prepare_client_statement(sql));
-            connection.finish_a_statement();
-            result
-        });
-        self.answer_what_is_missing(sql, result)
+        let result = self
+            .follow_a_dropped_database()
+            .and_then(|()| self.prepare_on_the_session(sql));
+        let result = self.answer_what_is_missing(sql, result);
+        self.name_the_dropped_database(sql, result)
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
@@ -2411,6 +2408,7 @@ where
         let _kept_reads = turso_mysql_parser::keep_reads();
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.follow_a_dropped_database()?;
+        self.prepare_again_when_its_database_went(statement_id)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
         let connection = self
@@ -2474,7 +2472,7 @@ where
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
-        let connection = self.session.connection().ok().cloned();
+        let connection = self.session.connection_reading_no_table().ok().cloned();
         if let Some(connection) = &connection {
             self.start_a_statement_on(connection)?;
             if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
@@ -2500,6 +2498,88 @@ where
         answer_a_result_in_latin1(&self.session_variables, result)
     }
 
+    fn prepare_on_the_session(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let connection = self.session.connection_reading_no_table().ok().cloned();
+        let Some(connection) = connection else {
+            return self.prepare_client_statement(sql);
+        };
+        self.start_a_statement_on(&connection)?;
+        let result =
+            connection.prepare_without_starting_the_snapshot(|| self.prepare_client_statement(sql));
+        connection.finish_a_statement();
+        result
+    }
+
+    /// Prepares a statement again over the database the session is in when
+    /// the one it was prepared over is gone: another session dropped it, and
+    /// maybe made one under the same name since.
+    ///
+    /// Measured on MySQL 8.4.11: a statement prepared before its database was
+    /// dropped runs `SELECT 1` while there is none, answers 1049 for a table
+    /// of it, and once one is made again reads that one, answering 1146 for a
+    /// table it does not have yet and its rows once it does. The statement
+    /// keeps its number and the parameter types it was sent.
+    fn prepare_again_when_its_database_went(
+        &mut self,
+        statement_id: u32,
+    ) -> Result<(), FrontendErrorKind> {
+        let Some(statement) = self.prepared_statements.statements.get(&statement_id) else {
+            return Ok(());
+        };
+        let went = statement.connection.database_was_dropped()
+            || statement.connection.stands_in_for_a_dropped_database();
+        if !went || Some(statement.database.as_str()) != self.session.selected_database() {
+            return Ok(());
+        }
+        if self
+            .session
+            .connection_reading_no_table()
+            .is_ok_and(|connection| connection.is_the_same_connection_as(&statement.connection))
+        {
+            return Ok(());
+        }
+        let text = statement.text.clone();
+        let parameter_count = statement
+            .connection
+            .prepared_statement_metadata(statement.connection_statement_id)
+            .map(|metadata| usize::from(metadata.parameter_count));
+        let prepared = self.prepare_on_the_session(&text);
+        let prepared = self.answer_what_is_missing(&text, prepared)?;
+        let fresh = self
+            .prepared_statements
+            .statements
+            .remove(&prepared.statement_id)
+            .expect("a statement just prepared is registered");
+        // The client was told the statement's parameters when it prepared
+        // it, and the same text prepared again has the same ones.
+        if parameter_count.is_some_and(|count| count != prepared.parameters.len()) {
+            fresh
+                .connection
+                .remove_prepared_statement(fresh.connection_statement_id);
+            return Err(FrontendErrorKind::Internal);
+        }
+        let stale = self
+            .prepared_statements
+            .statements
+            .remove(&statement_id)
+            .expect("the statement prepared again was registered");
+        stale
+            .connection
+            .remove_prepared_statement(stale.connection_statement_id);
+        self.prepared_statements.statements.insert(
+            statement_id,
+            DatabasePreparedStatement {
+                parameter_types: stale.parameter_types,
+                group_concat_max_len: stale.group_concat_max_len.max(fresh.group_concat_max_len),
+                ..fresh
+            },
+        );
+        Ok(())
+    }
+
     /// Counts a statement against the database it runs on, which a `DROP
     /// DATABASE` waits for, or answers 1049 when another session dropped it.
     fn start_a_statement_on(
@@ -2513,6 +2593,40 @@ where
             }
             MySqlStatementNotStarted::WaitTimedOut => FrontendErrorKind::DatabaseBusy,
         })
+    }
+
+    /// Names the database in a 1049 a statement on a database another session
+    /// dropped answered, as MySQL's message does. A database-management
+    /// command names a database of its own, and is left alone.
+    fn name_the_dropped_database<T>(
+        &mut self,
+        sql: &str,
+        result: Result<T, FrontendErrorKind>,
+    ) -> Result<T, FrontendErrorKind> {
+        if !matches!(result, Err(FrontendErrorKind::UnknownDatabase))
+            || self.error_message.is_some()
+        {
+            return result;
+        }
+        let Some(database) = self.session.dropped_database().map(str::to_owned) else {
+            return result;
+        };
+        if !matches!(self.session.parse_admin_command(sql), Ok(None)) {
+            return result;
+        }
+        Err(self.unknown_database(&database))
+    }
+
+    /// MySQL's 1049 for a statement on a database another session dropped.
+    fn unknown_database(&mut self, database: &str) -> FrontendErrorKind {
+        self.error_message = Some(
+            MySqlDatabaseDropped {
+                database: database.to_owned(),
+            }
+            .to_string()
+            .into_bytes(),
+        );
+        FrontendErrorKind::UnknownDatabase
     }
 
     /// Selects the session's database again when another session dropped it
@@ -2529,13 +2643,45 @@ where
             })
             .is_err()
         {
-            return Ok(());
+            return self.stand_in_for_the_dropped_database();
         }
+        let (autocommit, in_a_transaction) = self
+            .session
+            .autocommit_and_open_transaction()
+            .expect("a session whose database went has it selected");
         match self.session.select_database(&name) {
-            Ok(()) => self.carry_the_session_onto_its_connection(),
-            Err(MySqlDatabaseError::DatabaseNotFound(_)) => Ok(()),
+            Ok(()) => {
+                self.carry_the_session_onto_its_connection()?;
+                // Measured on MySQL 8.4.11: the session is still in the
+                // transaction it had open, and `autocommit` as it set it.
+                let connection = self.session.connection().map_err(database_error_kind)?;
+                connection
+                    .set_autocommit(autocommit)
+                    .map_err(frontend_query_error)?;
+                if in_a_transaction {
+                    connection
+                        .execute_transaction_command("BEGIN")
+                        .map_err(frontend_query_error)?;
+                }
+                Ok(())
+            }
+            Err(MySqlDatabaseError::DatabaseNotFound(_)) => {
+                self.stand_in_for_the_dropped_database()
+            }
             Err(error) => Err(database_error_kind(error)),
         }
+    }
+
+    fn stand_in_for_the_dropped_database(&mut self) -> Result<(), FrontendErrorKind> {
+        self.session
+            .stand_in_for_a_dropped_database()
+            .map_err(database_error_kind)?;
+        let stand_in = self
+            .session
+            .connection_reading_no_table()
+            .map_err(database_error_kind)?;
+        stand_in.set_foreign_key_checks(self.session_variables.foreign_key_checks());
+        Ok(())
     }
 
     fn prepare_client_statement(
@@ -2976,7 +3122,7 @@ where
             let visibility = self.authorize_catalog_visibility(&selected_database)?;
             let tables = self
                 .session
-                .connection()
+                .connection_reading_no_table()
                 .map_err(database_error_kind)?
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
@@ -3112,7 +3258,14 @@ where
                 .selected_database()
                 .ok_or(FrontendErrorKind::NoDatabaseSelected)?
                 .to_owned();
-            let connection = self.session.connection().map_err(database_error_kind)?;
+            // Measured on MySQL 8.4.11: in a session whose database another
+            // session dropped, `UNLOCK TABLES` answers OK and `LOCK TABLES`
+            // 1049.
+            let connection = match command {
+                MySqlLockTablesCommand::Lock => self.session.connection(),
+                MySqlLockTablesCommand::Unlock => self.session.connection_reading_no_table(),
+            }
+            .map_err(database_error_kind)?;
             match command {
                 MySqlLockTablesCommand::Lock => {
                     self.authorize(DatabaseAction::Query {
@@ -3544,7 +3697,20 @@ where
             self.publish_catalog_rows(&selected_database, visibility, catalog)?;
         }
         self.raised_warnings.clear();
-        let connection = self.session.connection().map_err(database_error_kind)?;
+        let dropped = self.session.dropped_database().map(str::to_owned);
+        if let Some(database) = &dropped {
+            if writes_to_the_database(sql)
+                || source_tables
+                    .iter()
+                    .any(|source| source.catalog().is_none())
+            {
+                return Err(self.unknown_database(database));
+            }
+        }
+        let connection = self
+            .session
+            .connection_reading_no_table()
+            .map_err(database_error_kind)?;
         let replacement = if may_create_a_view_or_trigger(sql) {
             turso_mysql_parser::parse_optional_view_replacement(sql, connection.parser_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?
@@ -3619,7 +3785,7 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
-        let mut result = execute_checked_query(
+        let result = execute_checked_query(
             connection,
             sql,
             Some(&selected_database),
@@ -3632,7 +3798,15 @@ where
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
                 raised: &mut self.raised_warnings,
             },
-        )?;
+        );
+        // A table the statement reads is not on the stand-in, which is how
+        // MySQL's 1049 for it is found.
+        let mut result = match (result, &dropped) {
+            (Err(FrontendErrorKind::MissingObject), Some(database)) => {
+                return Err(self.unknown_database(database));
+            }
+            (result, _) => result?,
+        };
         if let CommandExecutionResult::ResultSet(rows) = &mut result {
             shift_text_timestamp_columns(connection, rows)?;
             apply_raw_column_collations(
@@ -3662,9 +3836,21 @@ where
         {
             return Err(FrontendErrorKind::AccessDenied);
         }
+        // Measured on MySQL 8.4.11: a session whose database another session
+        // dropped prepares `SELECT 1` and answers 1049 for a statement naming
+        // one of its tables.
+        if let Some(database) = self.session.dropped_database().map(str::to_owned) {
+            if writes_to_the_database(sql)
+                || source_tables
+                    .iter()
+                    .any(|source| source.catalog().is_none())
+            {
+                return Err(self.unknown_database(&database));
+            }
+        }
         let connection = self
             .session
-            .connection()
+            .connection_reading_no_table()
             .map_err(database_error_kind)?
             .clone();
         connection.set_group_concat_max_len(self.session_variables.group_concat_max_len());
@@ -4051,16 +4237,35 @@ fn execute_checked_query(
     execute_checked_statement(connection, sql, selected_database, source_tables, options)
 }
 
+/// Whether a statement writes a table or makes one, which a database another
+/// session dropped answers 1049 for. Measured on MySQL 8.4.11: `INSERT`,
+/// `UPDATE`, `DELETE`, `REPLACE`, `CREATE TABLE`, `CREATE VIEW`, `CREATE
+/// INDEX`, `ALTER TABLE` and `RENAME TABLE` each answer 1049 there, while
+/// `DROP TABLE`, `DROP VIEW` and `TRUNCATE TABLE` answer what they answer for
+/// a table that is not there.
+fn writes_to_the_database(sql: &str) -> bool {
+    let first_word = first_word(sql);
+    [
+        "INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "ALTER", "RENAME", "LOAD",
+    ]
+    .iter()
+    .any(|word| first_word.eq_ignore_ascii_case(word))
+}
+
 /// Whether a statement is one MySQL runs under a table's exclusive metadata
 /// lock, which every `CREATE`, `ALTER`, `DROP`, `TRUNCATE` and `RENAME` is.
 fn changes_a_table_definition(sql: &str) -> bool {
-    let first_word = strip_leading_sql_comments(sql)
-        .split(|character: char| !character.is_ascii_alphabetic())
-        .next()
-        .unwrap_or_default();
+    let first_word = first_word(sql);
     ["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"]
         .iter()
         .any(|word| first_word.eq_ignore_ascii_case(word))
+}
+
+fn first_word(sql: &str) -> &str {
+    strip_leading_sql_comments(sql)
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
 }
 
 fn execute_checked_statement(

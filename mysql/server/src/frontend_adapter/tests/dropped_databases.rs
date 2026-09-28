@@ -346,3 +346,188 @@ fn only_a_transaction_that_read_the_database_holds_a_drop_up() {
         );
     }
 }
+
+/// A session whose database another session dropped still runs what reads
+/// none of the database's tables, and answers 1049 naming the database for
+/// what does.
+#[test]
+fn a_session_whose_database_went_runs_what_reads_no_table() {
+    let (_directory, catalog, authorizer) = catalog();
+    let mut left = session(&catalog, &authorizer, "shop");
+    run(&mut left, "CREATE TABLE t (id INT PRIMARY KEY)");
+    let mut dropper = session(&catalog, &authorizer, "other");
+    run(&mut dropper, "DROP DATABASE shop");
+
+    assert_eq!(words(&mut left, "SELECT 1"), one("1"));
+    assert_eq!(words(&mut left, "SELECT DATABASE()"), one("shop"));
+    assert_eq!(
+        run(&mut left, "BEGIN").status_flags & SERVER_STATUS_IN_TRANS,
+        SERVER_STATUS_IN_TRANS
+    );
+    assert_eq!(words(&mut left, "SELECT 2"), one("2"));
+    assert_eq!(
+        run(&mut left, "COMMIT").status_flags & SERVER_STATUS_IN_TRANS,
+        0
+    );
+    run(&mut left, "START TRANSACTION");
+    run(&mut left, "SAVEPOINT s");
+    run(&mut left, "ROLLBACK");
+    run(&mut left, "UNLOCK TABLES");
+    run(&mut left, "SET @kept = 1");
+    assert_eq!(words(&mut left, "SELECT @kept"), one("1"));
+    let shop = vec![Some("shop".to_owned())];
+    assert!(!words(&mut left, "SHOW DATABASES").contains(&shop));
+    assert!(!words(
+        &mut left,
+        "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA"
+    )
+    .contains(&shop));
+    assert!(words(
+        &mut left,
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'shop'"
+    )
+    .is_empty());
+    assert_eq!(
+        words(
+            &mut left,
+            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()"
+        ),
+        one("0")
+    );
+
+    for statement in [
+        "SELECT * FROM t",
+        "SELECT * FROM shop.t",
+        "INSERT INTO t VALUES (2)",
+        "UPDATE t SET id = 3",
+        "DELETE FROM t",
+        "CREATE TABLE u (id INT)",
+        "CREATE VIEW w AS SELECT 1 AS one",
+        "ALTER TABLE t ADD COLUMN c INT",
+        "SHOW TABLES",
+        "SHOW TABLE STATUS",
+        "SHOW CREATE TABLE t",
+        "DESCRIBE t",
+        "LOCK TABLES t READ",
+    ] {
+        assert_eq!(
+            refusal(&mut left, statement),
+            (
+                FrontendErrorKind::UnknownDatabase,
+                "Unknown database 'shop'".to_owned()
+            ),
+            "{statement}"
+        );
+    }
+    // Measured on MySQL 8.4.11: dropping a table answers what it answers for
+    // a table that is not there.
+    assert_eq!(
+        refusal(&mut left, "DROP TABLE t").0,
+        FrontendErrorKind::UnknownTable
+    );
+    assert_eq!(run(&mut left, "DROP TABLE IF EXISTS t").warnings, 1);
+}
+
+/// A transaction open when the database went stays open until the session
+/// ends it, and `autocommit = 0` stays set, whether or not a database is made
+/// again under the name meanwhile.
+#[test]
+fn a_transaction_open_when_the_database_went_stays_open() {
+    let (_directory, catalog, authorizer) = catalog();
+    let mut left = session(&catalog, &authorizer, "shop");
+    run(&mut left, "CREATE TABLE t (id INT PRIMARY KEY)");
+    run(&mut left, "BEGIN");
+    assert_eq!(words(&mut left, "SELECT 1"), one("1"));
+    let mut dropper = session(&catalog, &authorizer, "other");
+    run(&mut dropper, "DROP DATABASE shop");
+
+    assert_eq!(
+        left.execute_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        Err(FrontendErrorKind::TransactionCharacteristicsInProgress)
+    );
+    assert_eq!(
+        refusal(&mut left, "SELECT id FROM t").0,
+        FrontendErrorKind::UnknownDatabase
+    );
+    run(&mut dropper, "CREATE DATABASE shop");
+    assert_eq!(
+        left.execute_query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        Err(FrontendErrorKind::TransactionCharacteristicsInProgress)
+    );
+    assert!(words(&mut left, "SHOW TABLES").is_empty());
+    run(&mut left, "COMMIT");
+    run(&mut left, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+
+    run(&mut left, "SET autocommit = 0");
+    assert_eq!(words(&mut left, "SELECT 3"), one("3"));
+    run(&mut dropper, "DROP DATABASE shop");
+    run(&mut dropper, "CREATE DATABASE shop");
+    run(&mut dropper, "USE shop");
+    run(&mut dropper, "CREATE TABLE fresh (id INT)");
+    assert_eq!(words(&mut left, "SELECT @@autocommit"), one("0"));
+    assert_eq!(words(&mut left, "SHOW TABLES"), one("fresh"));
+    run(&mut left, "COMMIT");
+}
+
+/// A statement prepared before its database was dropped runs `SELECT 1`
+/// while there is none and answers 1049 for a table of it; once a database is
+/// made again under the name it is prepared again over that one, answering
+/// 1146 for a table it has not got yet and its rows once it has.
+#[test]
+fn a_statement_prepared_before_the_drop_is_prepared_again() {
+    let (_directory, catalog, authorizer) = catalog();
+    let mut left = session(&catalog, &authorizer, "shop");
+    run(&mut left, "CREATE TABLE t (id INT PRIMARY KEY)");
+    run(&mut left, "INSERT INTO t VALUES (1)");
+    let reading = left.execute_stmt_prepare("SELECT id FROM t").unwrap();
+    let constant = left.execute_stmt_prepare("SELECT 1").unwrap();
+    assert_eq!(executed(&mut left, reading.statement_id), [1]);
+    let mut dropper = session(&catalog, &authorizer, "other");
+    run(&mut dropper, "DROP DATABASE shop");
+
+    assert_eq!(executed(&mut left, constant.statement_id), [1]);
+    assert_eq!(
+        left.execute_stmt_execute(reading.statement_id, &[]),
+        Err(FrontendErrorKind::UnknownDatabase)
+    );
+    assert_eq!(
+        left.take_error_message(),
+        Some(b"Unknown database 'shop'".to_vec())
+    );
+    let prepared_while_gone = left.execute_stmt_prepare("SELECT 2").unwrap();
+    assert_eq!(executed(&mut left, prepared_while_gone.statement_id), [2]);
+    assert_eq!(
+        left.execute_stmt_prepare("SELECT id FROM t").err(),
+        Some(FrontendErrorKind::UnknownDatabase)
+    );
+
+    run(&mut dropper, "CREATE DATABASE shop");
+    assert_eq!(
+        left.execute_stmt_execute(reading.statement_id, &[]),
+        Err(FrontendErrorKind::MissingObject)
+    );
+    assert_eq!(
+        left.take_error_message(),
+        Some(b"Table 'shop.t' doesn't exist".to_vec())
+    );
+    run(&mut left, "CREATE TABLE t (id INT PRIMARY KEY)");
+    run(&mut left, "INSERT INTO t VALUES (9)");
+    assert_eq!(executed(&mut left, reading.statement_id), [9]);
+    assert_eq!(executed(&mut left, constant.statement_id), [1]);
+    assert_eq!(executed(&mut left, prepared_while_gone.statement_id), [2]);
+}
+
+fn executed(adapter: &mut Adapter, statement_id: u32) -> Vec<i64> {
+    let result = adapter.execute_stmt_execute(statement_id, &[]);
+    let Ok(PreparedStatementExecutionResult::ResultSet(result)) = result else {
+        panic!("the statement must return rows: {result:?}");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| match row[0] {
+            BinaryResultValue::Integer(value) => value,
+            ref other => panic!("a whole number, not {other:?}"),
+        })
+        .collect()
+}

@@ -4181,9 +4181,9 @@ whichever database it names; it waits for a session running a statement on the
 database or holding a transaction open that has read it, and a statement another session
 starts on the database while it waits waits behind it; a session that merely
 has the database selected holds nothing up. Afterwards that session keeps the
-name — `DATABASE()` answers it — and a statement on the database answers 1049
-`Unknown database 'name'`, until a database is made under the name again, which
-it then reads. The session that drops its own database is left in none,
+name — `DATABASE()` answers it — and a statement on one of the database's
+tables answers 1049 `Unknown database 'name'`, until a database is made under
+the name again, which it then reads. The session that drops its own database is left in none,
 `DATABASE()` answering NULL. A database that is not there answers 1008 `Can't
 drop database 'name'; database doesn't exist`, and `DROP DATABASE IF EXISTS`
 (or `DROP SCHEMA`) of it answers OK. Measured on 8.4.11 and matched, oddly: that
@@ -4207,14 +4207,34 @@ then ended by a `BEGIN`, while a read before a `SAVEPOINT` still holds the drop
 after `ROLLBACK TO` it — each measured on 8.4.11 with two sessions and matched.
 The engine takes a transaction's snapshot at its first read, so a statement
 that leaves one behind has read; a transaction command's snapshot, which `WITH
-CONSISTENT SNAPSHOT` takes, is not counted. Four things differ, each listed in
+CONSISTENT SNAPSHOT` takes, is not counted. Two things differ, each listed in
 TODO.md: after `WITH CONSISTENT SNAPSHOT`, and after a `SAVEPOINT` taken before
 the first read and rolled back to after it, the transaction holds the drop even
-though MySQL's has read no table or has let it go; a statement that reads no
-table at all — `SELECT 1`, `BEGIN` — in a session whose database was dropped
-answers 1049 rather than running; and a statement prepared before the drop
-answers 1049 even once the database is made again, where MySQL prepares it over
-the new one.
+though MySQL's has read no table or has let it go.
+
+A session whose database another session dropped runs what reads none of the
+database's tables, measured on 8.4.11 with two sessions and matched: `SELECT
+1`, `SELECT DATABASE()`, `BEGIN`, `COMMIT`, `SAVEPOINT`, `SET autocommit`,
+`UNLOCK TABLES`, `SHOW DATABASES` and `information_schema` reads, which find
+no table of the database. What reads or writes one of its tables, makes one, or
+lists them — `SELECT ... FROM t`, `INSERT`, `CREATE TABLE`, `CREATE VIEW`,
+`CREATE INDEX`, `ALTER TABLE`, `RENAME TABLE`, `SHOW TABLES`, `SHOW CREATE
+TABLE`, `DESCRIBE`, `LOCK TABLES` — answers 1049 naming the database, and
+`DROP TABLE` and `DROP VIEW` answer what they answer for a table that is not
+there, `IF EXISTS` noting it. A transaction open when the database went stays
+open, and `autocommit = 0` stays set, also once a database is made again under
+the name. Such statements run on a stand-in: an empty database of the same name
+held in memory, which refuses every write, so nothing runs on the dropped
+database's files. Nor is anything written to them: a session letting its
+connection to a dropped database go skips the engine's closing checkpoint, and
+the thread that empties large WALs leaves a dropped database alone, both of
+which used to copy the WAL into the unlinked database file. A statement
+prepared before the drop runs `SELECT 1` meanwhile and answers 1049 for a table,
+and once a database is made again under the name it is prepared again over that
+one, keeping its number and parameter types — it answers 1146 `Table
+'name.t' doesn't exist` until the table is made there, then its rows; measured
+on 8.4.11 and matched. A `PREPARE` of `SELECT 1` works meanwhile, and one
+naming a table answers 1049.
 
 `SET [SESSION] lock_wait_timeout = <n>` is taken, from one second to a year,
 and `DEFAULT`; `@@lock_wait_timeout` and `SHOW VARIABLES` read it back, an
