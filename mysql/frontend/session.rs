@@ -1776,7 +1776,9 @@ impl MySqlConnection {
         sql: &str,
         mode: SessionSqlMode,
     ) -> std::result::Result<CheckedDmlTranslation, MySqlParseError> {
-        if self.time_zone_offset_seconds() != 0 && uses_session_local_clock(sql) {
+        if self.time_zone_offset_seconds() != 0
+            && (uses_session_local_clock(sql) || self.a_trigger_reads_the_clock())
+        {
             return Err(MySqlParseError::Unsupported {
                 feature: "session-local clock functions in a non-UTC time zone",
             });
@@ -1789,6 +1791,14 @@ impl MySqlConnection {
             }
             translated => translated?,
         };
+        if translated
+            .parse_ast()
+            .is_ok_and(|statement| self.writes_a_value_a_trigger_replaces(&statement))
+        {
+            return Err(MySqlParseError::Unsupported {
+                feature: "a statement writing a value a BEFORE trigger writes over",
+            });
+        }
         let insert_target = translated
             .parse_ast()
             .ok()
@@ -8170,9 +8180,16 @@ impl MySqlConnection {
                 LimboError::ParseError("unsupported INSERT table metadata".into())
             }
         })?;
+        let set_by_a_trigger = self.columns_set_before_insert(table.as_str());
         Ok(columns
             .into_iter()
-            .find(|column| !column.nullable && column.default_value.is_none())
+            .find(|column| {
+                !column.nullable
+                    && column.default_value.is_none()
+                    && !set_by_a_trigger
+                        .iter()
+                        .any(|set| set.eq_ignore_ascii_case(&column.name))
+            })
             .map(|column| column.name))
     }
 
@@ -8211,6 +8228,7 @@ impl MySqlConnection {
         let core_table = schema
             .get_table(table.as_str())
             .ok_or(LimboError::SchemaUpdated)?;
+        let set_by_a_trigger = self.columns_set_before_insert(table.as_str());
         let mut rules = InsertColumnRules::default();
         for column in core_table.columns() {
             // A rowid alias and a generated column are filled in by the engine,
@@ -8221,7 +8239,11 @@ impl MySqlConnection {
             let Some(name) = column.name.clone() else {
                 continue;
             };
-            if column.default.is_none() {
+            if column.default.is_none()
+                && !set_by_a_trigger
+                    .iter()
+                    .any(|set| set.eq_ignore_ascii_case(&name))
+            {
                 rules.required.push(name.clone());
             }
             rules.not_null.push(name);

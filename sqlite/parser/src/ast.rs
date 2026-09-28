@@ -2046,6 +2046,15 @@ pub enum TriggerCmd {
     },
     /// `SELECT`
     Select(Select),
+    /// `SET NEW.column = expr, ...`, which changes the row a `BEFORE INSERT`
+    /// or `BEFORE UPDATE` trigger runs for before it is written. SQLite has
+    /// no such command and the parser reads none; a frontend whose dialect
+    /// has one builds it, and a trigger carrying one carries nothing else.
+    SetNew {
+        /// Each column of the row and the value it takes, in order: a later
+        /// value reads what an earlier one wrote.
+        sets: Vec<Set>,
+    },
 }
 
 /// Conflict resolution types

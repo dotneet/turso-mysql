@@ -351,6 +351,14 @@ fn prepare_update_plan(
     }
     read_scope_tables.extend(from_tables);
 
+    set_the_columns_before_triggers_set(
+        &mut body,
+        resolver,
+        database_id,
+        &table,
+        &target_identifier,
+    );
+
     for set in &mut body.sets {
         bind_and_rewrite_expr(
             &mut set.expr,
@@ -448,6 +456,59 @@ fn prepare_update_plan(
         non_from_clause_subqueries,
         safety: DmlSafety::default(),
     })
+}
+
+/// Sets each column a `BEFORE UPDATE` trigger sets in `NEW` to itself, where
+/// the statement does not set it already.
+///
+/// Such a trigger writes the registers the row is written from, and every
+/// column the statement does not set is read from the table again once the
+/// `BEFORE` triggers have run, which would undo what the trigger wrote.
+/// Setting the column to itself keeps it out of that reading and gives it the
+/// index upkeep and the NOT NULL check a column the statement sets gets; it
+/// changes nothing where no trigger writes it.
+fn set_the_columns_before_triggers_set(
+    body: &mut ast::Update,
+    resolver: &Resolver,
+    database_id: usize,
+    table: &Table,
+    target_identifier: &str,
+) {
+    let Some(btree) = table.btree() else {
+        return;
+    };
+    let triggers = crate::translate::trigger_exec::get_triggers_including_temp(
+        resolver,
+        database_id,
+        ast::TriggerEvent::Update,
+        ast::TriggerTime::Before,
+        None,
+        &btree,
+    );
+    for trigger in triggers {
+        for command in &trigger.commands {
+            let ast::TriggerCmd::SetNew { sets } = command else {
+                continue;
+            };
+            for column in sets.iter().flat_map(|set| set.col_names.iter()) {
+                let already_set = body.sets.iter().any(|set| {
+                    set.col_names
+                        .iter()
+                        .any(|set_column| set_column.as_str().eq_ignore_ascii_case(column.as_str()))
+                });
+                if already_set {
+                    continue;
+                }
+                body.sets.push(ast::Set {
+                    col_names: vec![column.clone()],
+                    expr: Box::new(Expr::Qualified(
+                        ast::Name::exact(target_identifier.to_owned()),
+                        column.clone(),
+                    )),
+                });
+            }
+        }
+    }
 }
 
 fn collect_update_set_clauses(

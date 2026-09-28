@@ -189,6 +189,7 @@ pub fn translate_create_trigger(
     {
         bail_parse_error!("INSTEAD OF triggers are not supported yet");
     }
+    validate_set_new_commands(&table, time, &event, for_each_row, commands)?;
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
@@ -263,6 +264,58 @@ pub fn translate_create_trigger(
     Ok(())
 }
 
+/// Holds a trigger that changes the row it runs for to the only shape that is
+/// run: a `BEFORE INSERT` or `BEFORE UPDATE` row trigger whose every command
+/// sets columns of the row, each an ordinary stored column.
+///
+/// The commands are run in place, writing the registers the row is written
+/// from, so a command reading or writing another table has nowhere to go
+/// beside them, and a rowid alias is chosen after the trigger has run.
+fn validate_set_new_commands(
+    table: &crate::schema::Table,
+    time: Option<ast::TriggerTime>,
+    event: &ast::TriggerEvent,
+    for_each_row: bool,
+    commands: &[ast::TriggerCmd],
+) -> Result<()> {
+    let sets_new = |command: &ast::TriggerCmd| matches!(command, ast::TriggerCmd::SetNew { .. });
+    if !commands.iter().any(sets_new) {
+        return Ok(());
+    }
+    if !commands.iter().all(sets_new) {
+        bail_parse_error!("a trigger setting NEW carries no other command");
+    }
+    if time != Some(ast::TriggerTime::Before)
+        || !for_each_row
+        || !matches!(event, ast::TriggerEvent::Insert | ast::TriggerEvent::Update)
+    {
+        bail_parse_error!("only a BEFORE INSERT or BEFORE UPDATE row trigger sets NEW");
+    }
+    let Some(table) = table.btree() else {
+        bail_parse_error!("only a table's trigger sets NEW");
+    };
+    for command in commands {
+        let ast::TriggerCmd::SetNew { sets } = command else {
+            unreachable!("every command was checked to set NEW");
+        };
+        for set in sets {
+            let [column] = set.col_names.as_slice() else {
+                bail_parse_error!("SET NEW names one column at a time");
+            };
+            let Some((_, column)) = table.get_column(column.as_str()) else {
+                bail_parse_error!("no such column: {}", column.as_str());
+            };
+            if column.is_rowid_alias() || column.is_generated() {
+                bail_parse_error!(
+                    "SET NEW cannot write the rowid or a generated column: {}",
+                    column.name.as_deref().unwrap_or_default()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_create_trigger_database_id(
     resolver: &Resolver,
     trigger_name: &QualifiedName,
@@ -333,6 +386,11 @@ fn validate_trigger_no_cross_db_refs(
             }
             ast::TriggerCmd::Select(select) => {
                 ctx.check_select(select)?;
+            }
+            ast::TriggerCmd::SetNew { sets } => {
+                for set in sets {
+                    ctx.check_expr(&set.expr)?;
+                }
             }
         }
     }

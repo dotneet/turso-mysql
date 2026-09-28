@@ -5265,8 +5265,7 @@ pub fn parse_create_view_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Pa
 pub fn parse_create_trigger_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
     let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
     let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
-    let normalized = trigger_definition::translate_create_trigger(sql, mode)?;
-    parse_normalized_create_trigger(&normalized)
+    trigger_definition::engine_trigger(sql, mode)
 }
 
 /// Parses exactly one supported MySQL schema DDL statement into Turso's SQLite AST.
@@ -5278,9 +5277,7 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
         Ok(statement) => statement,
         Err(error) => {
             return match trigger_definition::parse_trigger(sql, mode) {
-                Ok(Some(_)) => parse_normalized_create_trigger(
-                    &trigger_definition::translate_create_trigger(sql, mode)?,
-                ),
+                Ok(Some(_)) => trigger_definition::engine_trigger(sql, mode),
                 _ => Err(error),
             }
         }
@@ -5300,10 +5297,7 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
             let normalized = translate_create_view(&view, mode)?;
             parse_normalized_create_view(&normalized)
         }
-        Statement::CreateTrigger(_) => {
-            let normalized = trigger_definition::translate_create_trigger(sql, mode)?;
-            parse_normalized_create_trigger(&normalized)
-        }
+        Statement::CreateTrigger(_) => trigger_definition::engine_trigger(sql, mode),
         Statement::AlterTable(alter) => {
             let normalized = translate_alter_table(&alter)?;
             let [normalized] = normalized.as_slice() else {

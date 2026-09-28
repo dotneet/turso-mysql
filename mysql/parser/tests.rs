@@ -6959,6 +6959,61 @@ fn translates_a_trigger_body_the_same_whatever_its_columns_hold() {
 }
 
 #[test]
+fn reads_a_before_trigger_setting_the_row_it_runs_for() {
+    use turso_parser::ast::{TriggerCmd, TriggerTime};
+
+    let mode = SessionSqlMode::default();
+    let sql = "CREATE TRIGGER t1 BEFORE INSERT ON posts FOR EACH ROW SET NEW.slug = CONCAT(NEW.title, '-x')";
+    assert_eq!(
+        trigger_written_as_mysql_keeps_it(sql, mode).unwrap().as_deref(),
+        Some("CREATE TRIGGER `t1` BEFORE INSERT ON `posts` FOR EACH ROW SET NEW.slug = CONCAT(NEW.title, '-x')")
+    );
+    let Stmt::CreateTrigger { time, commands, .. } = parse_create_trigger_ast(sql, mode).unwrap()
+    else {
+        panic!("a CREATE TRIGGER");
+    };
+    assert_eq!(time, Some(TriggerTime::Before));
+    let [TriggerCmd::SetNew { sets }] = commands.as_slice() else {
+        panic!("one SET NEW: {commands:?}");
+    };
+    assert_eq!(sets.len(), 1);
+    assert_eq!(sets[0].col_names[0].as_str(), "slug");
+
+    let Stmt::CreateTrigger { commands, .. } = parse_create_trigger_ast(
+        "CREATE TRIGGER t3 BEFORE UPDATE ON posts FOR EACH ROW BEGIN SET NEW.a = 1, NEW.b = NOW(); SET NEW.c = OLD.c + 1; END",
+        mode,
+    )
+    .unwrap() else {
+        panic!("a CREATE TRIGGER");
+    };
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| match command {
+                TriggerCmd::SetNew { sets } => sets
+                    .iter()
+                    .map(|set| set.col_names[0].as_str().to_owned())
+                    .collect::<Vec<_>>(),
+                _ => panic!("only SET NEW: {command:?}"),
+            })
+            .collect::<Vec<_>>(),
+        [vec!["a", "b"], vec!["c"]]
+    );
+
+    for sql in [
+        // 1362 and 1363 in MySQL.
+        "CREATE TRIGGER t AFTER INSERT ON posts FOR EACH ROW SET NEW.slug = 'x'",
+        "CREATE TRIGGER t BEFORE DELETE ON posts FOR EACH ROW SET NEW.slug = 'x'",
+        "CREATE TRIGGER t BEFORE UPDATE ON posts FOR EACH ROW SET OLD.slug = 'x'",
+        "CREATE TRIGGER t BEFORE INSERT ON posts FOR EACH ROW SET @slug = 'x'",
+        "CREATE TRIGGER t BEFORE INSERT ON posts FOR EACH ROW SET NEW.slug = LOWER(NEW.title)",
+        "CREATE TRIGGER t BEFORE INSERT ON posts FOR EACH ROW UPDATE counters SET n = n + 1 WHERE id = NEW.id",
+    ] {
+        assert!(parse_create_trigger_ast(sql, mode).is_err(), "{sql}");
+    }
+}
+
+#[test]
 fn rejects_unsafe_create_trigger_forms() {
     for sql in [
         // A `BEFORE` trigger can change the row, which the engine has no

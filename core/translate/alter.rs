@@ -4328,6 +4328,37 @@ fn apply_trigger_cmd_for_column_rename(
                 resolver,
             )?;
         }
+        ast::TriggerCmd::SetNew { sets } => {
+            // The columns set are the trigger's own table's.
+            if trigger_table_name.eq_ignore_ascii_case(target_table_name) {
+                for set in sets.iter_mut() {
+                    for col_name in &mut set.col_names {
+                        if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
+                            if let Some(new_col_norm) = mode.rewritten_name() {
+                                *col_name = ast::Name::from_string(new_col_norm);
+                            } else {
+                                return Err(no_such_column_error(old_col_norm));
+                            }
+                        }
+                    }
+                }
+            }
+            for set in sets.iter_mut() {
+                apply_expr_for_column_rename(
+                    mode,
+                    &mut set.expr,
+                    ColumnRenameExprTraversal::Normal,
+                    trigger_table,
+                    trigger_table_name,
+                    target_table_name,
+                    old_col_norm,
+                    None,
+                    &[],
+                    database_id,
+                    resolver,
+                )?;
+            }
+        }
     }
 
     Ok(())
@@ -4705,6 +4736,34 @@ fn validate_trigger_columns_after_drop(
                     return Ok(Some(bad));
                 }
             }
+            // The columns set are the owning table's, and a value reads NEW
+            // and OLD, so each is checked against that table.
+            ast::TriggerCmd::SetNew { sets } => {
+                for set in sets {
+                    if let Some(owning) = &owning_table_columns {
+                        if let Some(missing) = set
+                            .col_names
+                            .iter()
+                            .find(|column| !owning.contains(&normalize_ident(column.as_str())))
+                        {
+                            return Ok(Some(missing.as_str().to_owned()));
+                        }
+                    }
+                    if let Some(bad) = validate_expr_column_refs_after_drop(
+                        &set.expr,
+                        &[],
+                        &owning_table_columns,
+                        allow_bare_owning_columns,
+                        altered_table_norm,
+                        post_drop_table,
+                        resolver,
+                        trigger_database_id,
+                        altered_database_id,
+                    )? {
+                        return Ok(Some(bad));
+                    }
+                }
+            }
         }
     }
 
@@ -4893,6 +4952,19 @@ fn validate_trigger_cmd_table_refs_after_rename(
                 altered_database_id,
             )? {
                 return Ok(Some(missing_table));
+            }
+        }
+        ast::TriggerCmd::SetNew { sets } => {
+            for set in sets {
+                if let Some(missing_table) = validate_expr_table_refs_after_rename(
+                    &set.expr,
+                    altered_table_norm,
+                    resolver,
+                    trigger_database_id,
+                    altered_database_id,
+                )? {
+                    return Ok(Some(missing_table));
+                }
             }
         }
     }

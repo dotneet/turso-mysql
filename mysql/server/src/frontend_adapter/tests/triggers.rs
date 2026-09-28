@@ -207,3 +207,174 @@ fn a_trigger_body_this_cannot_follow_is_refused() {
         "CREATE TRIGGER t3 AFTER UPDATE ON users FOR EACH ROW INSERT INTO audit (msg) VALUES (NEW.name)",
     );
 }
+
+fn before_triggers(adapter: &mut Adapter) {
+    for sql in [
+        "CREATE TABLE n1 (id INT PRIMARY KEY, title VARCHAR(20) NOT NULL, slug VARCHAR(10) NOT NULL, n INT, updated DATETIME, UNIQUE KEY (slug))",
+        "CREATE TRIGGER b1 BEFORE INSERT ON n1 FOR EACH ROW SET NEW.slug = CONCAT(NEW.title, '-x')",
+        "CREATE TRIGGER b2 BEFORE UPDATE ON n1 FOR EACH ROW SET NEW.n = OLD.n + 1, NEW.slug = NEW.title",
+    ] {
+        run(adapter, sql);
+    }
+}
+
+/// Measured on MySQL 8.4.11: a `BEFORE` trigger changes the row before it is
+/// written, and the row is then held to its columns as it stands — a `NOT
+/// NULL` column the statement left out or gave NULL is taken from the
+/// trigger, a value the trigger makes too long is 1406, and a `UNIQUE` key
+/// over a column only the trigger writes is 1062.
+#[test]
+fn a_before_trigger_sets_the_row_it_runs_for() {
+    let (directory, mut adapter) = adapter();
+    before_triggers(&mut adapter);
+    run(&mut adapter, "INSERT INTO n1 (id, title) VALUES (1, 'a')");
+    run(
+        &mut adapter,
+        "INSERT INTO n1 (id, title, slug) VALUES (2, 'b', NULL)",
+    );
+    for (sql, error) in [
+        (
+            "INSERT INTO n1 (id, title) VALUES (4, 'dddddddddd')",
+            FrontendErrorKind::DataTooLong,
+        ),
+        (
+            "INSERT INTO n1 (id, title) VALUES (5, 'a')",
+            FrontendErrorKind::ConstraintViolation,
+        ),
+        // MySQL holds a value the statement writes to its column before the
+        // trigger writes over it — this one is 1406 there — and here a value
+        // is held to its column only as the row is written.
+        (
+            "INSERT INTO n1 (id, title, slug) VALUES (3, 'c', 'zzzzzzzzzzzzzzzz')",
+            FrontendErrorKind::Unsupported,
+        ),
+        (
+            "UPDATE n1 SET n = 7 WHERE id = 1",
+            FrontendErrorKind::Unsupported,
+        ),
+    ] {
+        assert_eq!(adapter.execute_query(sql), Err(error), "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, title, slug, n FROM n1 ORDER BY id"
+        ),
+        ["1|a|a-x|NULL", "2|b|b-x|NULL"]
+    );
+
+    // A row whose every column comes out as it was is not counted as changed.
+    assert_eq!(
+        run(&mut adapter, "UPDATE n1 SET title = 'zz' WHERE id = 2").affected_rows,
+        1
+    );
+    assert_eq!(
+        run(&mut adapter, "UPDATE n1 SET title = 'zz' WHERE id = 2").affected_rows,
+        0
+    );
+    run(&mut adapter, "UPDATE n1 SET title = 'a' WHERE id = 2");
+    assert_eq!(
+        adapter.execute_query("UPDATE n1 SET title = 'a' WHERE id = 1"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, title, slug, n FROM n1 ORDER BY id"
+        ),
+        ["1|a|a-x|NULL", "2|a|a|NULL"]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM n1 WHERE slug = 'a'"),
+        ["2"]
+    );
+
+    // A prepared statement is held to the same rule.
+    assert_eq!(
+        adapter
+            .execute_stmt_prepare("INSERT INTO n1 (id, title, slug) VALUES (?, ?, ?)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    let prepared = adapter
+        .execute_stmt_prepare("INSERT INTO n1 (id, title) VALUES (6, 'p')")
+        .unwrap();
+    adapter
+        .execute_stmt_execute(prepared.statement_id, &[])
+        .unwrap();
+    adapter.execute_stmt_close(prepared.statement_id);
+    assert_eq!(
+        rows(&mut adapter, "SELECT slug FROM n1 WHERE id = 6"),
+        ["p-x"]
+    );
+
+    let mut adapter = reopened(&directory, adapter);
+    run(&mut adapter, "INSERT INTO n1 (id, title) VALUES (3, 'zz')");
+    assert_eq!(
+        rows(&mut adapter, "SELECT slug FROM n1 WHERE id = 3"),
+        ["zz-x"]
+    );
+    let listed = rows(&mut adapter, "SHOW TRIGGERS")
+        .into_iter()
+        .map(|row| row.split('|').take(5).collect::<Vec<_>>().join("|"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            "b1|INSERT|n1|SET NEW.slug = CONCAT(NEW.title, '-x')|BEFORE",
+            "b2|UPDATE|n1|SET NEW.n = OLD.n + 1, NEW.slug = NEW.title|BEFORE",
+        ]
+    );
+}
+
+/// A trigger reading the clock runs under the time zone of the session whose
+/// statement fires it, which the engine's clock does not follow.
+#[test]
+fn a_before_trigger_stamps_the_moment_a_row_is_changed() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE stamped (id INT PRIMARY KEY, title VARCHAR(20), updated DATETIME)",
+        "CREATE TRIGGER s1 BEFORE UPDATE ON stamped FOR EACH ROW SET NEW.updated = NOW()",
+        "INSERT INTO stamped (id, title) VALUES (1, 'a')",
+        "UPDATE stamped SET title = 'b' WHERE id = 1",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let [stamp] = rows(&mut adapter, "SELECT updated FROM stamped")
+        .try_into()
+        .unwrap();
+    assert_eq!(stamp.len(), "2026-09-28 00:00:00".len(), "{stamp}");
+    run(&mut adapter, "SET time_zone = '+09:00'");
+    assert_eq!(
+        adapter.execute_query("UPDATE stamped SET title = 'c' WHERE id = 1"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+#[test]
+fn a_before_trigger_this_cannot_follow_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE touched (id INT PRIMARY KEY, title VARCHAR(20), fine DATETIME(3), at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)",
+    );
+    for sql in [
+        // A `BEFORE` trigger writing another table, `SET NEW` in an `AFTER`
+        // one (1362) and in a `DELETE` one (1363).
+        "CREATE TRIGGER b BEFORE INSERT ON users FOR EACH ROW INSERT INTO audit (msg) VALUES (NEW.name)",
+        "CREATE TRIGGER b AFTER INSERT ON users FOR EACH ROW SET NEW.name = 'x'",
+        "CREATE TRIGGER b BEFORE DELETE ON users FOR EACH ROW SET NEW.name = 'x'",
+        // The key, a column the trigger sets read before it is set, and a
+        // clock into a word or a fraction of a second.
+        "CREATE TRIGGER b BEFORE INSERT ON users FOR EACH ROW SET NEW.id = 1",
+        "CREATE TRIGGER b BEFORE INSERT ON users FOR EACH ROW SET NEW.name = CONCAT(NEW.name, 'x')",
+        "CREATE TRIGGER b BEFORE INSERT ON touched FOR EACH ROW SET NEW.title = NOW()",
+        "CREATE TRIGGER b BEFORE INSERT ON touched FOR EACH ROW SET NEW.fine = NOW()",
+        // A table whose `UPDATE` stamps a column of its own.
+        "CREATE TRIGGER b BEFORE UPDATE ON touched FOR EACH ROW SET NEW.title = 'x'",
+        "CREATE TRIGGER b BEFORE INSERT ON users FOR EACH ROW SET @x = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert!(rows(&mut adapter, "SHOW TRIGGERS").is_empty());
+}

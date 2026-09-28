@@ -3665,6 +3665,11 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
         ast::TriggerCmd::Select(select) => {
             rewrite_select_table_refs(select, old_tbl, new_tbl);
         }
+        ast::TriggerCmd::SetNew { sets } => {
+            for set in sets {
+                rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
+            }
+        }
     }
 }
 
@@ -4749,6 +4754,29 @@ pub fn trigger_still_references_renamed_column(
                     return true;
                 }
             }
+            ast::TriggerCmd::SetNew { sets } => {
+                let sets_renamed_table = trigger.table_name.eq_ignore_ascii_case(target_table);
+                for set in sets {
+                    if sets_renamed_table
+                        && set
+                            .col_names
+                            .iter()
+                            .any(|col_name| col_name.as_str().eq_ignore_ascii_case(old_col))
+                    {
+                        return true;
+                    }
+                    if expr_still_references_renamed_column(
+                        &set.expr,
+                        target_table,
+                        &trigger.table_name,
+                        old_col,
+                        false,
+                        &[],
+                    ) {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
@@ -4952,6 +4980,26 @@ pub fn rewrite_trigger_cmd_column_refs(
                 new_col,
                 &mut Vec::new(),
             );
+        }
+        ast::TriggerCmd::SetNew { sets } => {
+            // The columns set are the trigger's own table's.
+            let targets_renamed_table = trigger_table.eq_ignore_ascii_case(table);
+            for set in sets {
+                if targets_renamed_table {
+                    for col_name in &mut set.col_names {
+                        if col_name.as_str().eq_ignore_ascii_case(old_col) {
+                            *col_name = ast::Name::exact(new_col.to_owned());
+                        }
+                    }
+                }
+                rename_identifiers_scoped_when_clause(
+                    &mut set.expr,
+                    table,
+                    trigger_table,
+                    old_col,
+                    new_col,
+                );
+            }
         }
     }
 }

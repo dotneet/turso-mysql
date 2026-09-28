@@ -392,6 +392,9 @@ fn trigger_cmd_to_stmt_for_subprogram(
             rewrite_expressions_in_select_for_subprogram(&mut select_clone, subprogram_ctx)?;
             Ok(ast::Stmt::Select(select_clone))
         }
+        ast::TriggerCmd::SetNew { .. } => Err(crate::LimboError::InternalError(
+            "a trigger setting NEW runs in place, not as a subprogram".to_string(),
+        )),
     }
 }
 
@@ -945,7 +948,7 @@ pub fn fire_trigger(
             });
 
             // Execute trigger commands if WHEN clause is true
-            execute_trigger_commands(
+            run_trigger_commands(
                 program,
                 resolver,
                 &trigger,
@@ -958,7 +961,7 @@ pub fn fire_trigger(
             program.preassign_label_to_next_insn(skip_label);
         } else {
             // No WHEN clause - always execute
-            execute_trigger_commands(
+            run_trigger_commands(
                 program,
                 resolver,
                 &trigger,
@@ -978,6 +981,102 @@ pub fn fire_trigger(
     result
 }
 
+/// Runs a trigger's commands: in place when they set `NEW`, which writes the
+/// registers the row is written from, and as a subprogram otherwise.
+fn run_trigger_commands(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Arc<Trigger>,
+    ctx: &TriggerContext,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    ignore_jump_target: BranchOffset,
+) -> Result<()> {
+    if trigger
+        .commands
+        .iter()
+        .any(|command| matches!(command, ast::TriggerCmd::SetNew { .. }))
+    {
+        return set_new_in_place(program, resolver, trigger, ctx);
+    }
+    execute_trigger_commands(
+        program,
+        resolver,
+        trigger,
+        ctx,
+        connection,
+        database_id,
+        ignore_jump_target,
+    )?;
+    Ok(())
+}
+
+/// Writes each value a trigger sets in `NEW` into the register its column is
+/// written from, in order, so a later value reads what an earlier one wrote.
+///
+/// A value reads `NEW` and `OLD` the way a `WHEN` clause does, and each is
+/// given its column's affinity, as the statement's own values were before the
+/// trigger ran.
+fn set_new_in_place(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    trigger: &Arc<Trigger>,
+    ctx: &TriggerContext,
+) -> Result<()> {
+    let Some(new_registers) = &ctx.new_registers else {
+        bail_parse_error!("a trigger setting NEW runs where the statement has a NEW row");
+    };
+    for command in &trigger.commands {
+        let ast::TriggerCmd::SetNew { sets } = command else {
+            bail_parse_error!("a trigger setting NEW carries no other command");
+        };
+        for set in sets {
+            let [column_name] = set.col_names.as_slice() else {
+                bail_parse_error!("SET NEW names one column at a time");
+            };
+            let Some((index, column)) = ctx.table.get_column(column_name.as_str()) else {
+                bail_parse_error!("no such column: {}", column_name.as_str());
+            };
+            if column.is_rowid_alias() || column.is_generated() {
+                bail_parse_error!(
+                    "SET NEW cannot write the rowid or a generated column: {}",
+                    column_name.as_str()
+                );
+            }
+            let mut value = set.expr.as_ref().clone();
+            let mut reads_a_table = false;
+            expr::walk_expr(&value, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                if matches!(
+                    e,
+                    ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. }
+                ) {
+                    reads_a_table = true;
+                }
+                Ok(WalkControl::Continue)
+            })?;
+            if reads_a_table {
+                bail_parse_error!("a value SET NEW writes reads no table");
+            }
+            rewrite_trigger_expr_for_when_clause(&mut value, &ctx.table, ctx)?;
+            let value_register = program.alloc_register();
+            translate_expr(program, None, &value, value_register, resolver)?;
+            if !ctx.table.is_strict {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: value_register,
+                    count: NonZero::new(1).expect("one is not zero"),
+                    affinities: std::iter::once(column.affinity().aff_mask()).collect(),
+                });
+            }
+            program.emit_insn(Insn::Copy {
+                src_reg: value_register,
+                dst_reg: new_registers[index],
+                extra_amount: 0,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn trigger_event_kind(event: &TriggerEvent) -> &'static str {
     match event {
         TriggerEvent::Delete => "delete",
@@ -993,6 +1092,7 @@ fn trigger_command_kind(command: &ast::TriggerCmd) -> &'static str {
         ast::TriggerCmd::Update { .. } => "update",
         ast::TriggerCmd::Delete { .. } => "delete",
         ast::TriggerCmd::Select(_) => "select",
+        ast::TriggerCmd::SetNew { .. } => "set_new",
     }
 }
 

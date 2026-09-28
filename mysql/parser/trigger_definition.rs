@@ -9,12 +9,13 @@
 //! that header and the body as written, and the engine's trigger is
 //! translated from it each time the database is opened.
 //!
-//! A body is one statement or a `BEGIN ... END` list of them. Each is an
-//! `INSERT ... VALUES` of one row, an `UPDATE` or a `DELETE` of another table,
-//! and each value it writes or compares is one this translates the same way
-//! whatever the columns' types are — the types are held to what the value
-//! means in MySQL by the frontend, through [`MySqlTriggerBody`], when the
-//! trigger is made.
+//! A body is one statement or a `BEGIN ... END` list of them. An `AFTER`
+//! trigger's statements are each an `INSERT ... VALUES` of one row, an
+//! `UPDATE` or a `DELETE` of another table; a `BEFORE` trigger's are each a
+//! `SET NEW.column = value`, which changes the row before it is written. Each
+//! value written or compared is one this translates the same way whatever the
+//! columns' types are — the types are held to what the value means in MySQL
+//! by the frontend, through [`MySqlTriggerBody`], when the trigger is made.
 
 use super::*;
 use sqlparser::ast::{ConditionalStatements, FromTable, TableWithJoins};
@@ -40,8 +41,43 @@ pub fn trigger_written_as_mysql_keeps_it(
     Ok(Some(header.written(&body)))
 }
 
-/// Translates a trigger kept the way MySQL keeps it into the statement the
-/// engine makes it with.
+/// Translates a trigger into the statement the engine makes it with.
+///
+/// The engine's own statements have no spelling for setting a column of the
+/// row a trigger runs for, so each `SET NEW` is written as an `UPDATE` of a
+/// table no MySQL table can be named, and read back into the command that
+/// sets `NEW`.
+pub(crate) fn engine_trigger(sql: &str, mode: SessionSqlMode) -> Result<Stmt, ParseError> {
+    let mut statement = parse_normalized_create_trigger(&translate_create_trigger(sql, mode)?)?;
+    let Stmt::CreateTrigger { commands, .. } = &mut statement else {
+        return Err(ParseError::ExpectedCreateTrigger);
+    };
+    for command in commands.iter_mut() {
+        let turso_parser::ast::TriggerCmd::Update {
+            or_conflict: None,
+            tbl_name,
+            sets,
+            from: None,
+            where_clause: None,
+        } = command
+        else {
+            continue;
+        };
+        if tbl_name.as_str() == NEW_ROW {
+            *command = turso_parser::ast::TriggerCmd::SetNew {
+                sets: std::mem::take(sets),
+            };
+        }
+    }
+    Ok(statement)
+}
+
+/// The table name a `SET NEW` is written as an `UPDATE` of. A MySQL table
+/// here is named with letters, digits, `_` and `$` alone, so none has it.
+const NEW_ROW: &str = "mysql new row";
+
+/// Translates a trigger into the text of the statement the engine makes it
+/// with, each `SET NEW` written as an `UPDATE` of [`NEW_ROW`].
 pub(crate) fn translate_create_trigger(
     sql: &str,
     mode: SessionSqlMode,
@@ -182,6 +218,7 @@ pub fn written_trigger(sql: &str, mode: SessionSqlMode) -> Result<MySqlWrittenTr
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlTriggerBody {
     table: MySqlTableName,
+    timing: MySqlTriggerTiming,
     event: MySqlTriggerEvent,
     writes: Vec<MySqlTriggerWrite>,
 }
@@ -190,6 +227,10 @@ impl MySqlTriggerBody {
     /// The table the trigger runs for.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
+    }
+
+    pub const fn timing(&self) -> MySqlTriggerTiming {
+        self.timing
     }
 
     pub const fn event(&self) -> MySqlTriggerEvent {
@@ -215,7 +256,8 @@ pub struct MySqlTriggerWrite {
 }
 
 impl MySqlTriggerWrite {
-    /// The table the statement writes.
+    /// The table the statement writes, which is the trigger's own for a
+    /// `SET NEW`.
     pub fn table(&self) -> &MySqlTableName {
         &self.table
     }
@@ -238,6 +280,8 @@ pub enum MySqlTriggerWriteKind {
     Insert,
     Update,
     Delete,
+    /// `SET NEW.column = value`, which changes the row the trigger runs for.
+    SetNew,
 }
 
 /// One value a trigger's body writes or compares.
@@ -261,6 +305,9 @@ pub enum MySqlTriggerValue {
         column: Box<MySqlTriggerValue>,
         by: i64,
     },
+    /// A reading of the clock — `NOW()`, `CURDATE()` and their other
+    /// spellings.
+    Clock(CheckedComparisonNow),
 }
 
 /// Reads what a trigger kept the way MySQL keeps it writes and reads.
@@ -325,9 +372,8 @@ impl TriggerHeader {
         {
             return unsupported("CREATE TRIGGER option");
         }
-        // A `BEFORE` trigger can change the row before it is written, which the
-        // engine has no statement for.
         let timing = match trigger.period {
+            Some(TriggerPeriod::Before) => MySqlTriggerTiming::Before,
             Some(TriggerPeriod::After) => MySqlTriggerTiming::After,
             _ => return unsupported("CREATE TRIGGER timing"),
         };
@@ -438,23 +484,39 @@ fn trigger_body(
     };
     let writes = statements
         .iter()
-        .map(|statement| {
-            let write = match statement {
-                Statement::Insert(insert) => trigger_insert(insert, rows)?,
-                Statement::Update(update) => trigger_update(update, rows)?,
-                Statement::Delete(delete) => trigger_delete(delete, rows)?,
-                _ => return unsupported("CREATE TRIGGER body statement"),
-            };
-            // MySQL answers 1442 when a trigger writes the table whose
-            // statement fired it.
-            if write.table == header.table {
-                return unsupported("CREATE TRIGGER writing its own table");
+        .map(|statement| match (header.timing, statement) {
+            // A `BEFORE DELETE` trigger has no row to set, and MySQL answers
+            // 1363 for `SET NEW` there.
+            (MySqlTriggerTiming::Before, Statement::Set(set))
+                if header.event != MySqlTriggerEvent::Delete =>
+            {
+                trigger_set_new(set, &header.table, rows)
             }
-            Ok(write)
+            // A `BEFORE` trigger writing another table runs before the row it
+            // fires for is checked, which has not been measured, and MySQL
+            // answers 1362 for `SET NEW` in an `AFTER` one.
+            (MySqlTriggerTiming::Before, _) | (MySqlTriggerTiming::After, Statement::Set(_)) => {
+                unsupported("CREATE TRIGGER body statement for its timing")
+            }
+            (MySqlTriggerTiming::After, statement) => {
+                let write = match statement {
+                    Statement::Insert(insert) => trigger_insert(insert, rows)?,
+                    Statement::Update(update) => trigger_update(update, rows)?,
+                    Statement::Delete(delete) => trigger_delete(delete, rows)?,
+                    _ => return unsupported("CREATE TRIGGER body statement"),
+                };
+                // MySQL answers 1442 when a trigger writes the table whose
+                // statement fired it.
+                if write.table == header.table {
+                    return unsupported("CREATE TRIGGER writing its own table");
+                }
+                Ok(write)
+            }
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(MySqlTriggerBody {
         table: header.table.clone(),
+        timing: header.timing,
         event: header.event,
         writes,
     })
@@ -466,6 +528,67 @@ fn trigger_body(
 struct TriggerRows {
     new: bool,
     old: bool,
+}
+
+/// Reads `SET NEW.a = value, NEW.b = value`, each value reading what the
+/// ones before it wrote, as MySQL's do.
+fn trigger_set_new(
+    set: &sqlparser::ast::Set,
+    table: &MySqlTableName,
+    rows: TriggerRows,
+) -> Result<MySqlTriggerWrite, ParseError> {
+    let assignments = match set {
+        sqlparser::ast::Set::SingleAssignment {
+            scope: None,
+            hivevar: false,
+            variable,
+            values,
+        } => {
+            let [value] = values.as_slice() else {
+                return unsupported("CREATE TRIGGER SET form");
+            };
+            vec![(variable, value)]
+        }
+        sqlparser::ast::Set::MultipleAssignments { assignments } => assignments
+            .iter()
+            .map(|assignment| match assignment.scope {
+                None => Ok((&assignment.name, &assignment.value)),
+                Some(_) => unsupported("CREATE TRIGGER SET form"),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return unsupported("CREATE TRIGGER SET form"),
+    };
+    let reading = TriggerReading {
+        rows,
+        own_columns: false,
+    };
+    let assigned = assignments
+        .into_iter()
+        .map(|(variable, value)| match variable.0.as_slice() {
+            [ObjectNamePart::Identifier(row), ObjectNamePart::Identifier(column)]
+                if row.value.eq_ignore_ascii_case("NEW") =>
+            {
+                Ok((column.value.clone(), reading.value(value)?))
+            }
+            _ => unsupported("CREATE TRIGGER SET of anything but a NEW column"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let engine_sql = format!(
+        "UPDATE {} SET {}",
+        render_ident_str(NEW_ROW),
+        assigned
+            .iter()
+            .map(|(column, value)| format!("{} = {}", render_ident_str(column), value.engine_sql()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(MySqlTriggerWrite {
+        table: table.clone(),
+        kind: MySqlTriggerWriteKind::SetNew,
+        assigned,
+        compared: Vec::new(),
+        engine_sql,
+    })
 }
 
 fn trigger_insert(insert: &Insert, rows: TriggerRows) -> Result<MySqlTriggerWrite, ParseError> {
@@ -798,7 +921,10 @@ impl TriggerReading {
                     by,
                 })
             }
-            Expr::Function(function) => self.joined(function),
+            Expr::Function(function) => match CheckedComparisonNow::read(function) {
+                Some(clock) => Ok(MySqlTriggerValue::Clock(clock)),
+                None => self.joined(function),
+            },
             _ => unsupported("CREATE TRIGGER value"),
         }
     }
@@ -911,6 +1037,7 @@ impl MySqlTriggerValue {
                 format!("({} - {})", column.engine_sql(), by.unsigned_abs())
             }
             Self::Shifted { column, by } => format!("({} + {by})", column.engine_sql()),
+            Self::Clock(clock) => clock.engine_call().to_owned(),
         }
     }
 
@@ -919,7 +1046,11 @@ impl MySqlTriggerValue {
             Self::Column(column) => column.eq_ignore_ascii_case(name),
             Self::Joined(parts) => parts.iter().any(|part| part.reads_own_column(name)),
             Self::Shifted { column, .. } => column.reads_own_column(name),
-            Self::Null | Self::Word(_) | Self::WholeNumber(_) | Self::Row { .. } => false,
+            Self::Null
+            | Self::Word(_)
+            | Self::WholeNumber(_)
+            | Self::Row { .. }
+            | Self::Clock(_) => false,
         }
     }
 }

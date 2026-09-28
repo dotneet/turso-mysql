@@ -2376,6 +2376,25 @@ impl ToTokens for TriggerCmd {
                 Ok(())
             }
             Self::Select(select) => select.to_tokens(s, context),
+            Self::SetNew { sets } => {
+                s.append(TK_SET, None)?;
+                for (at, set) in sets.iter().enumerate() {
+                    if at > 0 {
+                        s.append(TK_COMMA, None)?;
+                    }
+                    for (at, column) in set.col_names.iter().enumerate() {
+                        if at > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        s.append(TK_ID, Some("NEW"))?;
+                        s.append(TK_DOT, None)?;
+                        column.to_tokens(s, context)?;
+                    }
+                    s.append(TK_EQ, None)?;
+                    set.expr.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
         }
     }
 }
