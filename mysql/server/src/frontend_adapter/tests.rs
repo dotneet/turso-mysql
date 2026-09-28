@@ -30872,3 +30872,6 @@ fn whole_readings(
 
 #[cfg(unix)]
 mod binary_data;
+
+#[cfg(unix)]
+mod mysqldump_bytes;

@@ -4094,6 +4094,15 @@ dumped without `--databases`, with the default options and with
 splits a table's rows over several `INSERT`s), and with `--no-data`, replays
 into another database the client names, one dump over another, leaving
 exactly the rows MySQL 8.4.11 leaves there, as `mysql --batch` prints them.
+A dump of columns of bytes — a `BLOB` of each size, a `VARBINARY` under a
+unique key, a `BINARY(8)` and a `BINARY(16)` key — holding every byte from
+0x00 to 0xFF, the empty value, NULL and bytes that begin a character without
+finishing it restores byte for byte, whether written the default way, as
+`_binary '...'` holding the raw bytes, or under `--hex-blob` as `0x...`; the
+restored tables print the `CREATE TABLE` the dump wrote, and the
+`SELECT * FROM t` a second `mysqldump` reads them with answers the same bytes
+in columns described in the binary collation, which is what makes it write
+each value the way the first dump did.
 Besides the settings above, that takes three forms.
 
 A statement whose text is not UTF-8 is read when what is not UTF-8 sits in a
