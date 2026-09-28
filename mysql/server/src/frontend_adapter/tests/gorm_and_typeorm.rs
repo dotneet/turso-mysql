@@ -189,3 +189,114 @@ fn gorms_backfill_writes_each_unsigned_id_out_as_a_word() {
         "UPDATE numbers SET word = CONCAT('a-', big + 1)",
     );
 }
+
+const TYPEORM_POSTS: &str = "CREATE TABLE `posts` (`id` bigint NOT NULL AUTO_INCREMENT, `user_id` bigint NOT NULL, `title` varchar(200) NOT NULL, `body` text NULL, `published_at` datetime NULL, `views` int NOT NULL DEFAULT '0', PRIMARY KEY (`id`)) ENGINE=InnoDB";
+const TYPEORM_TAGS: &str = "CREATE TABLE `tags` (`id` bigint NOT NULL AUTO_INCREMENT, `name` varchar(100) NOT NULL, UNIQUE INDEX `IDX_d90243459a697eadb8ad56e909` (`name`), PRIMARY KEY (`id`)) ENGINE=InnoDB";
+const TYPEORM_POST_TAG: &str = "CREATE TABLE `post_tag` (`post_id` bigint NOT NULL, `tag_id` bigint NOT NULL, INDEX `IDX_b5ec92f15aaa1e371f2662f681` (`post_id`), INDEX `IDX_d2fd5340bb68556fe93650fedc` (`tag_id`), PRIMARY KEY (`post_id`, `tag_id`)) ENGINE=InnoDB";
+
+/// TypeORM loads a many-to-many relation before it deletes a row, writing the
+/// id it holds as a word inside the join's `ON`, and its pagination reads the
+/// page's ids back as words in an `IN` over a `LEFT JOIN`.
+#[test]
+fn typeorms_relation_loading_compares_a_joined_id_with_a_word() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [TYPEORM_POSTS, TYPEORM_TAGS, TYPEORM_POST_TAG] {
+        run(&mut adapter, sql);
+    }
+    run(
+        &mut adapter,
+        "INSERT INTO posts (user_id, title) VALUES (1, 'a'), (1, 'b')",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO tags (name) VALUES ('x'), ('y'), ('z'), ('w')",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO post_tag (post_id, tag_id) VALUES (1, 4), (2, 4), (1, 1)",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Tag_posts_rid`.`post_id` AS `post_id`, `Tag_posts_rid`.`tag_id` AS `tag_id` FROM `posts` `posts` INNER JOIN `post_tag` `Tag_posts_rid` ON (`Tag_posts_rid`.`tag_id` = '4' AND `Tag_posts_rid`.`post_id` = `posts`.`id`) ORDER BY `Tag_posts_rid`.`post_id` ASC, `Tag_posts_rid`.`tag_id` ASC"
+        ),
+        vec![
+            vec![Some("1".to_owned()), Some("4".to_owned())],
+            vec![Some("2".to_owned()), Some("4".to_owned())],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `t`.`post_id` FROM `posts` `posts` INNER JOIN `post_tag` `t` ON `t`.`post_id` = `posts`.`id` WHERE `t`.`tag_id` = '04' ORDER BY `t`.`post_id`"
+        ),
+        vec![vec![Some("1".to_owned())], vec![Some("2".to_owned())]]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Post`.`id` AS `Post_id`, `Post`.`title` AS `Post_title`, `pt`.`tag_id` FROM `posts` `Post` LEFT JOIN `post_tag` `pt` ON `pt`.`post_id`=`Post`.`id` WHERE `Post`.`id` IN ('1') ORDER BY `Post`.`id` ASC, `pt`.`tag_id` ASC"
+        ),
+        vec![
+            vec![Some("1".to_owned()), Some("a".to_owned()), Some("1".to_owned())],
+            vec![Some("1".to_owned()), Some("a".to_owned()), Some("4".to_owned())],
+        ]
+    );
+    assert_eq!(
+        written(&mut adapter, "DELETE FROM `post_tag` WHERE `tag_id` = '4'"),
+        (2, 0)
+    );
+    // MySQL reads these as doubles, `'4x'` with warning 1292, by rules a
+    // statement over one table refuses too.
+    refused(
+        &mut adapter,
+        "SELECT `t`.`post_id` FROM `posts` `posts` INNER JOIN `post_tag` `t` ON `t`.`post_id` = `posts`.`id` WHERE `t`.`tag_id` = '4.0'",
+    );
+    refused(
+        &mut adapter,
+        "SELECT `t`.`post_id` FROM `posts` `posts` INNER JOIN `post_tag` `t` ON `t`.`post_id` = `posts`.`id` WHERE `t`.`tag_id` = '4x'",
+    );
+    // A name holding whole numbers in one table and words in another would
+    // be read one way for both.
+    run(
+        &mut adapter,
+        "CREATE TABLE labels (id int PRIMARY KEY, tag_id varchar(10))",
+    );
+    refused(
+        &mut adapter,
+        "SELECT `t`.`post_id` FROM `post_tag` `t` JOIN `labels` `l` ON `l`.`id` = `t`.`post_id` WHERE `t`.`tag_id` = '4'",
+    );
+}
+
+/// GORM's association reads join on a `BIGINT UNSIGNED` id, which a word
+/// naming the id finds too.
+#[test]
+fn a_word_naming_an_unsigned_id_finds_it_through_a_join() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE `post_tags` (`post_id` bigint unsigned,`tag_id` bigint unsigned,PRIMARY KEY (`post_id`,`tag_id`))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO tags (name) VALUES ('go'), ('sql')",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO post_tags (post_id, tag_id) VALUES (1, 1), (1, 2), (2, 2)",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `tags`.`id`,`tags`.`name` FROM `tags` JOIN `post_tags` ON `post_tags`.`tag_id` = `tags`.`id` AND `post_tags`.`post_id` = '1' ORDER BY `tags`.`id`"
+        ),
+        vec![
+            vec![Some("1".to_owned()), Some("go".to_owned())],
+            vec![Some("2".to_owned()), Some("sql".to_owned())],
+        ]
+    );
+}

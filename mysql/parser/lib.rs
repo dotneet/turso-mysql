@@ -1696,6 +1696,13 @@ impl TranslatedSelect {
         self.renders_a_condition_without_column_types
     }
 
+    /// Reports whether a comparison names a column against a word naming a
+    /// number, which a second reading knowing which columns hold numbers
+    /// renders as that number.
+    pub fn compares_a_written_number(&self) -> bool {
+        self.compares_a_written_number
+    }
+
     /// Reports whether this statement's rendering depends on a column's type.
     ///
     /// An `ORDER BY` over a bare column and a comparison against a `?` are the

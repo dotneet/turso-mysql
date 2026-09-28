@@ -2275,7 +2275,12 @@ word bound as a string against a whole-number column is bound as its number,
 and `YEAR(created_at) = '2026'` reads the word against the whole number the
 call answers — MySQL compares those as doubles, so only a number nearer zero
 than 2^53 is read there. Each is rendered a second time knowing the column's
-type, the way a written day is.
+type, the way a written day is. A `SELECT` over several tables reads such a
+word the same way, in a join's `ON` as in its `WHERE` — TypeORM loads a
+relation with `` INNER JOIN `post_tag` `t` ON (`t`.`tag_id` = '4' AND ...) ``
+and reads a page back with `` WHERE `Post`.`id` IN ('1') `` over a `LEFT
+JOIN`, measured on 8.4.11 and matched — and refuses one whose column name
+holds whole numbers in one of its tables and another kind in another.
 
 Every other word keeps the refusal: MySQL reads `age = '1.5'` as a comparison
 between doubles, `' 30'`, `'30 '`, `'3e1'` and `''` without a warning by rules

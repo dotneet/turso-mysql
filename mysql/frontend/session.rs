@@ -7189,15 +7189,19 @@ impl MySqlConnection {
     /// post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found no
     /// row. A column of words takes a bound word under its own collation, as
     /// GORM's `Joins("JOIN emails ON emails.user_id = users.id AND
-    /// emails.email = ?", ...)` asks, which was refused. A name some table
-    /// holds as another kind is refused.
+    /// emails.email = ?", ...)` asks, which was refused. A column of whole
+    /// numbers compared with a word naming one reads the word as that number,
+    /// as TypeORM's relation loading writes `ON (t.tag_id = '1' AND ...)`. A
+    /// name some table holds as another kind is refused.
     fn with_the_column_kinds_of_every_table(
         &self,
         sql: &str,
         translated: turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
+        let compares_a_written_number = translated.compares_a_written_number();
         if !self.compares_an_exact_number_column_by_kind(&translated)
             && !self.compares_a_column_of_words_with_a_bound_value(&translated)
+            && !compares_a_written_number
         {
             return Ok(translated);
         }
@@ -7250,7 +7254,27 @@ impl MySqlConnection {
                 "a column of words shares its name with a column of another kind".to_string(),
             ));
         }
-        turso_mysql_parser::parse_select_knowing_decimal_columns(
+        let whole_numbers = if compares_a_written_number {
+            columns
+                .iter()
+                .filter(|column| is_integer_type(column.type_name()))
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if columns.iter().any(|column| {
+            !is_integer_type(column.type_name())
+                && whole_numbers
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(column.name()))
+        }) {
+            return Err(MySqlQueryError::Unsupported(
+                "a column of whole numbers shares its name with a column of another kind"
+                    .to_string(),
+            ));
+        }
+        turso_mysql_parser::parse_select_knowing_numeric_columns(
             sql,
             self.parser_mode(),
             &words,
@@ -7259,6 +7283,8 @@ impl MySqlConnection {
             &[],
             &[],
             &exact,
+            &whole_numbers,
+            &[],
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
