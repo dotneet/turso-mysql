@@ -272,6 +272,14 @@ struct AfterTheCopy {
     rename_the_new_one: Option<String>,
 }
 
+/// Whether a table's rewrite commits on its own, or runs inside the
+/// transaction an `ALTER TABLE` of several clauses holds for all of them.
+#[derive(Clone, Copy)]
+enum TableRewriteCommits {
+    OnItsOwn,
+    InTheCallersTransaction,
+}
+
 #[derive(Clone)]
 pub(crate) struct AutoIncrementExecutionCapability {
     allocator: DurableRangeAllocator,
@@ -5066,6 +5074,15 @@ impl MySqlConnection {
         table: &str,
         rewrite: &turso_mysql_parser::MySqlTableRewrite,
     ) -> std::result::Result<(), MySqlQueryError> {
+        self.write_the_table_again(table, rewrite, TableRewriteCommits::OnItsOwn)
+    }
+
+    fn write_the_table_again(
+        &self,
+        table: &str,
+        rewrite: &turso_mysql_parser::MySqlTableRewrite,
+        commits: TableRewriteCommits,
+    ) -> std::result::Result<(), MySqlQueryError> {
         // A trigger is not the table's own row and would not come back with
         // it, where MySQL leaves one where it stood.
         self.reject_insert_target_triggers(table)
@@ -5146,13 +5163,18 @@ impl MySqlConnection {
         );
         let checks = self.inner.foreign_keys_enabled();
         self.set_foreign_key_checks(false);
-        let written = self.write_the_table_again_between_commits(
-            &before,
-            &copy,
-            &after_copy,
-            &copied_into,
-            &indexes,
-        );
+        let written = match commits {
+            TableRewriteCommits::OnItsOwn => self.write_the_table_again_between_commits(
+                &before,
+                &copy,
+                &after_copy,
+                &copied_into,
+                &indexes,
+            ),
+            TableRewriteCommits::InTheCallersTransaction => {
+                self.write_the_table_again_now(&before, &copy, &after_copy, &copied_into, &indexes)
+            }
+        };
         self.set_foreign_key_checks(checks);
         written?;
         // The table counts from where it counted before: a table made again
@@ -5545,6 +5567,9 @@ impl MySqlConnection {
         let applied = statements
             .iter()
             .try_for_each(|statement| {
+                if let Some(placement) = self.column_an_alter_places(statement)? {
+                    return self.place_a_column_in_this_transaction(statement, placement);
+                }
                 if let Some(indexes) = turso_mysql_parser::parse_optional_alter_table_indexes(
                     statement,
                     self.parser_mode(),
@@ -5588,6 +5613,40 @@ impl MySqlConnection {
             self.run_internal("ROLLBACK")?;
         }
         Ok(())
+    }
+
+    /// Adds one clause's column where it asks to stand, inside the
+    /// transaction the rest of its `ALTER TABLE` runs in.
+    fn place_a_column_in_this_transaction(
+        &self,
+        statement: &str,
+        placement: turso_mysql_parser::MySqlColumnPlacement,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        match placement {
+            turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite) => self
+                .write_the_table_again(
+                    turso_mysql_parser::alter_table_target(statement, self.parser_mode())
+                        .unwrap_or_default()
+                        .as_str(),
+                    &rewrite,
+                    TableRewriteCommits::InTheCallersTransaction,
+                ),
+            turso_mysql_parser::MySqlColumnPlacement::AlreadyAtTheEnd(written) => {
+                let mut prepared = self
+                    .prepare(&written)
+                    .map_err(|error| self.json_schema_prepare_error(&written, error))?;
+                prepared
+                    .run_ignore_rows()
+                    .map_err(MySqlQueryError::Engine)?;
+                Ok(())
+            }
+            turso_mysql_parser::MySqlColumnPlacement::NoSuchColumn(name) => {
+                Err(MySqlQueryError::Engine(LimboError::NoSuchColumn { name }))
+            }
+            turso_mysql_parser::MySqlColumnPlacement::DuplicateColumn(name) => {
+                Err(MySqlQueryError::DuplicateColumn(name))
+            }
+        }
     }
 
     fn added_foreign_key_table(&self, sql: &str) -> Option<MySqlTableName> {

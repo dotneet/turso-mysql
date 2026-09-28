@@ -252,6 +252,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `RENAME INDEX` of the key a column declares for itself — `email VARCHAR(255) UNIQUE` | refused; the engine keeps that one with no statement of its own to write again under the new name |
 | `ALTER COLUMN ... SET DEFAULT` on a column with a `COMMENT` or `ON UPDATE CURRENT_TIMESTAMP`, or on the primary-key column | refused, for the reasons a `MODIFY COLUMN` of one is |
 | Moving the column a table counts on, or the one its key is over | refused; the counted column stands for the engine's rowid and the key is what the rows are found by, and neither survives being written somewhere else |
+| An `ALTER TABLE` placing an added column `AFTER` a column another of its clauses renames or drops — `ADD a AFTER b, RENAME COLUMN b TO c` | refused; measured on 8.4.11, MySQL answers 1054, renaming and dropping before it reads the place, and the clauses run in turn here |
 | `ALTER TABLE ... ADD COLUMN ... FIRST`/`AFTER` on a table carrying a trigger | refused; the table is written again and a trigger is not the table's own row, where MySQL leaves one where it stood |
 | `ALTER TABLE ... MODIFY/CHANGE COLUMN` on the primary-key column | refused; MySQL keeps the key through one and replacing the column would drop it |
 | `ALTER TABLE` taking an `AUTO_INCREMENT` table's counted column away | refused; `DROP COLUMN`, `RENAME COLUMN` and `MODIFY COLUMN` of that column would write back a table counting on a column that is not there, where MySQL drops it and leaves an ordinary table |

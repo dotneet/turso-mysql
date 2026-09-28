@@ -6047,12 +6047,85 @@ pub fn split_alter_table_operations(
             if is_index_operation(operation) {
                 checked_index_operation(operation)?;
                 Ok(format!("ALTER TABLE {table_name} {operation}"))
+            } else if let Some((unplaced, position)) = column_added_in_place(operation) {
+                a_place_no_other_clause_moves(position, &alter.operations)?;
+                translate_alter_table_operation(&table_name, &unplaced)?;
+                let place = match position {
+                    sqlparser::ast::MySQLColumnPosition::First => "FIRST".to_owned(),
+                    sqlparser::ast::MySQLColumnPosition::After(after) => {
+                        format!("AFTER {}", render_mysql_sqlparser_ident(after))
+                    }
+                };
+                Ok(format!(
+                    "{} {place}",
+                    render_mysql_alter_table_operation(&table_name, &unplaced, mode)?
+                ))
             } else {
                 translate_alter_table_operation(&table_name, operation)?;
                 render_mysql_alter_table_operation(&table_name, operation, mode)
             }
         })
         .collect()
+}
+
+/// An `ADD COLUMN` naming a place — sqlx's `ADD COLUMN slug ... AFTER title`
+/// beside a `RENAME COLUMN` and a `MODIFY` — as the column it adds and the
+/// place, which its own statement puts back once the column is rendered.
+fn column_added_in_place(
+    operation: &AlterTableOperation,
+) -> Option<(AlterTableOperation, &sqlparser::ast::MySQLColumnPosition)> {
+    let AlterTableOperation::AddColumn {
+        column_keyword,
+        if_not_exists: false,
+        column_def,
+        column_position: Some(position),
+    } = operation
+    else {
+        return None;
+    };
+    Some((
+        AlterTableOperation::AddColumn {
+            column_keyword: *column_keyword,
+            if_not_exists: false,
+            column_def: column_def.clone(),
+            column_position: None,
+        },
+        position,
+    ))
+}
+
+/// Refuses a place naming a column another clause of the statement renames
+/// or drops.
+///
+/// Each clause runs in turn here, each against the table the ones before it
+/// left. MySQL renames and drops first and reads every place against what
+/// is left: measured on 8.4.11, `ADD a AFTER b, RENAME COLUMN b TO bb` is
+/// 1054 there, and so is `ADD z AFTER c, DROP COLUMN c`, where running the
+/// clauses in turn would take both. A place naming a column no clause moves
+/// comes out the same either way.
+fn a_place_no_other_clause_moves(
+    position: &sqlparser::ast::MySQLColumnPosition,
+    operations: &[AlterTableOperation],
+) -> Result<(), ParseError> {
+    let sqlparser::ast::MySQLColumnPosition::After(after) = position else {
+        return Ok(());
+    };
+    let names_it = |name: &Ident| name.value.eq_ignore_ascii_case(&after.value);
+    let moved = operations.iter().any(|operation| match operation {
+        AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        } => names_it(old_column_name) || names_it(new_column_name),
+        AlterTableOperation::ChangeColumn {
+            old_name, new_name, ..
+        } => names_it(old_name) || names_it(new_name),
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.iter().any(names_it),
+        _ => false,
+    });
+    if moved {
+        return unsupported("a column placed after one the same ALTER TABLE renames or drops");
+    }
+    Ok(())
 }
 
 /// Renders one `ALTER TABLE` operation as a MySQL statement of its own.

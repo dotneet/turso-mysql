@@ -49,6 +49,23 @@ const MIGRATIONS_TABLE: &str = "\nCREATE TABLE IF NOT EXISTS _sqlx_migrations (\
 
 const RECORD_MIGRATION: &str = "\n    INSERT INTO _sqlx_migrations ( version, description, success, checksum, execution_time )\n    VALUES ( ?, ?, FALSE, ?, -1 )\n                ";
 
+/// The app's first migration, which sqlx sends as one text query of four
+/// statements.
+const CREATE_BLOG: &str = "CREATE TABLE users (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n  email VARCHAR(191) NOT NULL,\n  name VARCHAR(100) NOT NULL,\n  balance DECIMAL(10,2) NOT NULL DEFAULT 0.00,\n  is_active BOOLEAN NOT NULL DEFAULT TRUE,\n  profile JSON NULL,\n  avatar BLOB NULL,\n  created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),\n  updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),\n  UNIQUE KEY users_email (email)\n);\n\nCREATE TABLE posts (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n  user_id BIGINT UNSIGNED NOT NULL,\n  title VARCHAR(200) NOT NULL,\n  body TEXT NULL,\n  published_at DATETIME NULL,\n  views INT NOT NULL DEFAULT 0,\n  INDEX posts_user_published (user_id, published_at),\n  CONSTRAINT posts_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE\n);\n\nCREATE TABLE tags (\n  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,\n  name VARCHAR(100) NOT NULL,\n  UNIQUE KEY tags_name (name)\n);\n\nCREATE TABLE post_tags (\n  post_id BIGINT UNSIGNED NOT NULL,\n  tag_id BIGINT UNSIGNED NOT NULL,\n  PRIMARY KEY (post_id, tag_id),\n  CONSTRAINT post_tags_post FOREIGN KEY (post_id) REFERENCES posts (id) ON DELETE CASCADE,\n  CONSTRAINT post_tags_tag FOREIGN KEY (tag_id) REFERENCES tags (id) ON DELETE CASCADE\n);\n";
+
+/// The app's second migration and its revert.
+const ADD_SLUG: &str = "ALTER TABLE posts\n  ADD COLUMN slug VARCHAR(220) NULL AFTER title,\n  RENAME COLUMN views TO view_count,\n  MODIFY title VARCHAR(255) NOT NULL;\nCREATE UNIQUE INDEX posts_slug ON posts (slug);\n";
+const DROP_SLUG: &str = "DROP INDEX posts_slug ON posts;\nALTER TABLE posts\n  DROP COLUMN slug,\n  RENAME COLUMN view_count TO views,\n  MODIFY title VARCHAR(200) NOT NULL;\n";
+
+/// Runs a migration's statements one after another, the way the server
+/// splits the one text query sqlx sends them in. None of them holds a `;`
+/// inside a word.
+fn migrate(adapter: &mut Adapter, script: &str) {
+    for statement in script.split(';').filter(|text| !text.trim().is_empty()) {
+        run(adapter, statement);
+    }
+}
+
 /// One value as sqlx 0.8.6 binds it.
 #[derive(Clone, Copy, Debug)]
 enum Bound<'a> {
@@ -320,4 +337,107 @@ fn shapes(columns: &[ColumnDefinitionConfig]) -> Vec<(u8, u16, u32, u8)> {
             )
         })
         .collect()
+}
+
+/// The app's second migration adds a column after `title` in the same
+/// `ALTER TABLE` that renames `views` and restates `title`, all inside the
+/// transaction `sqlx migrate run` holds, and a table's foreign key names
+/// `posts`. Measured on MySQL 8.4.11, both the migration and its revert print
+/// the tables below, keep every row, and leave `post_tags` still cascading
+/// from `posts`.
+///
+/// MySQL renames and drops before it reads a place, where this runs each
+/// clause in turn, so a place naming a column the statement renames or drops
+/// is refused; MySQL answers 1054 for both.
+#[test]
+fn sqlx_places_a_column_beside_a_rename_and_a_restatement() {
+    let (_directory, mut adapter) = adapter();
+    migrate(&mut adapter, CREATE_BLOG);
+    for sql in [
+        "INSERT INTO users (email, name) VALUES ('bob@example.com', 'Bob')",
+        "INSERT INTO posts (user_id, title, body, views) VALUES (1, 'Hello', 'First post', 11), (1, 'Draft', NULL, 4)",
+        "INSERT INTO tags (name) VALUES ('news')",
+        "INSERT INTO post_tags VALUES (1, 1), (2, 1)",
+        "BEGIN",
+    ] {
+        run(&mut adapter, sql);
+    }
+    migrate(&mut adapter, ADD_SLUG);
+    run(&mut adapter, "COMMIT");
+    assert_eq!(
+        rows(&mut adapter, "SHOW CREATE TABLE posts")[0][1].as_deref(),
+        Some(
+            "CREATE TABLE `posts` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `title` varchar(255) NOT NULL,\n  `slug` varchar(220) DEFAULT NULL,\n  `body` text,\n  `published_at` datetime DEFAULT NULL,\n  `view_count` int NOT NULL DEFAULT '0',\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `posts_slug` (`slug`),\n  KEY `posts_user_published` (`user_id`,`published_at`),\n  CONSTRAINT `posts_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    run(&mut adapter, "UPDATE posts SET slug = CONCAT('post-', id)");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, title, slug, body, view_count FROM posts ORDER BY id"
+        ),
+        [
+            [
+                Some("1".to_owned()),
+                Some("Hello".to_owned()),
+                Some("post-1".to_owned()),
+                Some("First post".to_owned()),
+                Some("11".to_owned()),
+            ],
+            [
+                Some("2".to_owned()),
+                Some("Draft".to_owned()),
+                Some("post-2".to_owned()),
+                None,
+                Some("4".to_owned()),
+            ],
+        ]
+    );
+    assert!(matches!(
+        adapter.execute_query("UPDATE posts SET slug = 'post-1' WHERE id = 2"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    ));
+
+    run(&mut adapter, "BEGIN");
+    migrate(&mut adapter, DROP_SLUG);
+    run(&mut adapter, "COMMIT");
+    assert_eq!(
+        rows(&mut adapter, "SHOW CREATE TABLE posts")[0][1].as_deref(),
+        Some(
+            "CREATE TABLE `posts` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  `title` varchar(200) NOT NULL,\n  `body` text,\n  `published_at` datetime DEFAULT NULL,\n  `views` int NOT NULL DEFAULT '0',\n  PRIMARY KEY (`id`),\n  KEY `posts_user_published` (`user_id`,`published_at`),\n  CONSTRAINT `posts_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
+    run(&mut adapter, "DELETE FROM posts WHERE id = 1");
+    assert_eq!(
+        rows(&mut adapter, "SELECT post_id FROM post_tags"),
+        [[Some("2".to_owned())]]
+    );
+
+    for sql in [
+        "ALTER TABLE posts ADD COLUMN a INT AFTER title, RENAME COLUMN title TO headline",
+        "ALTER TABLE posts ADD COLUMN a INT AFTER body, DROP COLUMN body",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        adapter.execute_query(
+            "ALTER TABLE posts ADD COLUMN a INT AFTER nope, RENAME COLUMN views TO v"
+        ),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_NAME = 'posts' ORDER BY ORDINAL_POSITION"),
+        [
+            [Some("id".to_owned())],
+            [Some("user_id".to_owned())],
+            [Some("title".to_owned())],
+            [Some("body".to_owned())],
+            [Some("published_at".to_owned())],
+            [Some("views".to_owned())],
+        ]
+    );
 }

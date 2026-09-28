@@ -3703,8 +3703,19 @@ order written, each placed in the table the ones before it left, so `ADD a
 AFTER x, ADD b AFTER a` leaves `x, a, b` and `ADD h AFTER y, ADD i AFTER y`
 leaves `y, i, h`; a clause naming no place puts its column last at its turn;
 and `AFTER` a column only a later clause adds is 1054, leaving the table as it
-was. Such a statement is taken when every clause adds a column; one mixing a
-placed `ADD` with any other operation is refused. A rewrite of any table is
+was. Such a statement is taken when every clause adds a column.
+
+A placed `ADD` beside other operations — sqlx's migration writes `ADD COLUMN
+slug ... AFTER title, RENAME COLUMN views TO view_count, MODIFY title
+VARCHAR(255) NOT NULL` — runs its clauses in turn inside one transaction, the
+placed one writing the table again there, and the whole statement applies or
+none of it does. Measured on 8.4.11 and matched: the table prints the same
+after it and after its revert (`DROP COLUMN slug, RENAME COLUMN view_count TO
+views, MODIFY title VARCHAR(200) NOT NULL`), the rows keep their values, and a
+child's foreign key still cascades. MySQL renames and drops before it reads a
+place, so `ADD a AFTER b, RENAME COLUMN b TO c` and `ADD z AFTER c, DROP
+COLUMN c` are 1054 there where clauses run in turn would take them; a place
+naming a column the statement renames or drops is refused. A rewrite of any table is
 refused in a database holding a view or a trigger written through this
 server, the engine refusing to rename a table there.
 
