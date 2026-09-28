@@ -532,3 +532,181 @@ fn a_column_of_bytes_describes_itself_the_way_mysql_does() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// How a driver binds bytes, read off the wire on MySQL 8.4.11 through a
+/// proxy: go-sql-driver 1.10.1 sends a `[]byte` as `MYSQL_TYPE_STRING`,
+/// mysql2 3.24.4 a Node `Buffer` as `MYSQL_TYPE_BLOB`, and PHP 8.3's PDO a
+/// string bound as `PDO::PARAM_LOB` or `PDO::PARAM_STR` alike as
+/// `MYSQL_TYPE_VAR_STRING`, each with its raw bytes; each binds a whole
+/// number as a `MYSQL_TYPE_LONGLONG` and nil or null as `MYSQL_TYPE_NULL`.
+const DRIVER_BYTE_TYPES: [(&str, u8); 3] = [
+    ("go-sql-driver", MYSQL_TYPE_STRING),
+    ("mysql2", MYSQL_TYPE_BLOB),
+    ("PDO", MYSQL_TYPE_VAR_STRING),
+];
+
+/// A value bound the way one of those drivers binds it.
+enum DriverValue<'a> {
+    Whole(i64),
+    Bytes(&'a [u8]),
+    Null,
+}
+
+/// The parameters of a `COM_STMT_EXECUTE` past its fixed header: the null
+/// bitmap, the new-parameters flag, the types, and the values, bytes carried
+/// as a length and the bytes.
+fn driver_payload(bytes_type: u8, values: &[DriverValue<'_>]) -> Vec<u8> {
+    let mut payload = vec![0; values.len().div_ceil(8)];
+    for (at, value) in values.iter().enumerate() {
+        if matches!(value, DriverValue::Null) {
+            payload[at / 8] |= 1 << (at % 8);
+        }
+    }
+    payload.push(1);
+    for value in values {
+        let type_code = match value {
+            DriverValue::Whole(_) => MYSQL_TYPE_LONGLONG,
+            DriverValue::Bytes(_) => bytes_type,
+            DriverValue::Null => MYSQL_TYPE_NULL,
+        };
+        payload.extend_from_slice(&[type_code, 0]);
+    }
+    for value in values {
+        match value {
+            DriverValue::Whole(number) => payload.extend_from_slice(&number.to_le_bytes()),
+            DriverValue::Bytes(bytes) if bytes.len() < 251 => {
+                payload.push(u8::try_from(bytes.len()).unwrap());
+                payload.extend_from_slice(bytes);
+            }
+            DriverValue::Bytes(bytes) => {
+                payload.push(0xFC);
+                payload.extend_from_slice(&u16::try_from(bytes.len()).unwrap().to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+            DriverValue::Null => {}
+        }
+    }
+    payload
+}
+
+fn execute_bound(
+    adapter: &mut Adapter,
+    sql: &str,
+    bytes_type: u8,
+    values: &[DriverValue<'_>],
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    let statement = adapter.execute_stmt_prepare(sql)?;
+    let result =
+        adapter.execute_stmt_execute(statement.statement_id, &driver_payload(bytes_type, values));
+    adapter.execute_stmt_close(statement.statement_id);
+    result
+}
+
+/// Bytes each driver binds — every byte value, bytes that are not UTF-8,
+/// the empty value — are stored as they are into a `BLOB`, a `VARBINARY`
+/// and a `BINARY(16)`, found again by a bound comparison, and read back
+/// whole over the binary protocol, as they are on MySQL.
+#[test]
+fn bytes_a_driver_binds_are_stored_and_found() {
+    let every: Vec<u8> = (0..=255).collect();
+    let token = [
+        0x00, 0xFF, 0x27, 0x5C, 0x0A, 0x0D, 0x1A, 0x22, 0x80, 0xC3, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06,
+    ];
+    for (driver, bytes_type) in DRIVER_BYTE_TYPES {
+        let (_directory, mut adapter) = adapter();
+        run(
+            &mut adapter,
+            "CREATE TABLE drv (id INT PRIMARY KEY, b BLOB, vb VARBINARY(16), bn BINARY(16))",
+        );
+        const INSERT: &str = "INSERT INTO drv (id, b, vb, bn) VALUES (?, ?, ?, ?)";
+        for values in [
+            [
+                DriverValue::Whole(1),
+                DriverValue::Bytes(&every),
+                DriverValue::Bytes(&token),
+                DriverValue::Bytes(&token),
+            ],
+            [
+                DriverValue::Whole(2),
+                DriverValue::Bytes(&[]),
+                DriverValue::Bytes(&[]),
+                DriverValue::Null,
+            ],
+        ] {
+            execute_bound(&mut adapter, INSERT, bytes_type, &values)
+                .unwrap_or_else(|error| panic!("{driver}: {error:?}"));
+        }
+        let found = execute_bound(
+            &mut adapter,
+            "SELECT id, b, vb, bn FROM drv WHERE vb = ?",
+            bytes_type,
+            &[DriverValue::Bytes(&token)],
+        );
+        let Ok(PreparedStatementExecutionResult::ResultSet(found)) = found else {
+            panic!("{driver}: the SELECT must return rows, answered {found:?}");
+        };
+        assert_eq!(
+            found.rows,
+            [[
+                BinaryResultValue::Integer(1),
+                BinaryResultValue::Blob(every.clone()),
+                BinaryResultValue::Blob(token.to_vec()),
+                BinaryResultValue::Blob(token.to_vec()),
+            ]],
+            "{driver}"
+        );
+        assert_eq!(
+            rows(&mut adapter, "SELECT id, b, vb, bn FROM drv WHERE id = 2"),
+            [[
+                Some(b"2".to_vec()),
+                Some(Vec::new()),
+                Some(Vec::new()),
+                None
+            ]],
+            "{driver}"
+        );
+    }
+}
+
+/// Measured on MySQL 8.4.11: bytes bound into a column of words are read as
+/// utf8mb4, stored as that text when they are and answered 1366 when they are
+/// not. Stored as bytes here, a word would never meet them, so both are
+/// refused, whichever type the driver sent.
+#[test]
+fn bytes_a_driver_binds_into_a_column_of_words_are_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE w (id INT PRIMARY KEY, word VARCHAR(10), body TEXT)",
+    );
+    for (sql, bytes_type, bytes) in [
+        (
+            "INSERT INTO w (id, word) VALUES (1, ?)",
+            MYSQL_TYPE_STRING,
+            &[0xFF][..],
+        ),
+        (
+            "INSERT INTO w (id, body) VALUES (1, ?)",
+            MYSQL_TYPE_VAR_STRING,
+            &[0xC3],
+        ),
+        (
+            "INSERT INTO w (id, word) VALUES (1, ?)",
+            MYSQL_TYPE_BLOB,
+            b"abc",
+        ),
+        (
+            "INSERT INTO w (id, body) VALUES (1, ?)",
+            MYSQL_TYPE_BLOB,
+            b"abc",
+        ),
+    ] {
+        assert_eq!(
+            execute_bound(&mut adapter, sql, bytes_type, &[DriverValue::Bytes(bytes)]),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql} binding {bytes:?} as {bytes_type}"
+        );
+    }
+    assert!(rows(&mut adapter, "SELECT id FROM w").is_empty());
+}

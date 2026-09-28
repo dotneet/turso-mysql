@@ -3311,6 +3311,20 @@ answers an empty word. A `VARBINARY` or a `BLOB` written before this frontend
 stored bytes may hold text, which a written word no longer compares equal to;
 an `UPDATE` of the row stores it as bytes.
 
+Bytes a driver binds are stored as they are. Read off the wire on 8.4.11
+through a proxy: go-sql-driver 1.10.1 binds a `[]byte` as
+`MYSQL_TYPE_STRING`, mysql2 3.24.4 a Node `Buffer` as `MYSQL_TYPE_BLOB`, and
+PHP 8.3's PDO a string as `MYSQL_TYPE_VAR_STRING` whether bound as
+`PDO::PARAM_LOB` or not, each with its raw bytes, and MySQL stores those bytes
+in a column of bytes and finds them again by a bound comparison. A string
+parameter that is not UTF-8 is therefore read as bytes rather than refused,
+and bytes of any parameter type go into a `BLOB`, a `VARBINARY` or a
+`BINARY` and come back whole over both protocols — a `VARBINARY` and a
+`BINARY` crossing the binary protocol as length-encoded bytes, which they
+could not before. Bytes bound into a column of words are refused: measured,
+MySQL reads them as utf8mb4, storing that text when they are and answering
+1366 when they are not, and stored as bytes no word would ever meet them.
+
 Bytes written out are a column of bytes' own values: `X'616263'`, `0x616263`,
 `b'01100001'`, `_binary 'abc'` and `_binary X'616263'` are stored as those
 bytes by an `INSERT` — with its columns named or not, as a dump writes its

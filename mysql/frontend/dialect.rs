@@ -2375,6 +2375,16 @@ pub(crate) fn check_mysql_assignment(
             check_byte_string(table_name, column_index, column, value)?;
             continue;
         }
+        // Measured on MySQL 8.4.11, bytes bound into a column of words are
+        // read as utf8mb4 — stored as that text when they are, 1366 when they
+        // are not. Stored as bytes here, no word would ever meet them, so they
+        // are refused.
+        if spec.holds_words(column_index) && matches!(value, Value::Blob(_)) {
+            return Err(LimboError::InvalidArgument(format!(
+                "bytes written into column {} of {table_name}, which holds words",
+                column_index + 1
+            )));
+        }
         if spec.is_bit(column_index) {
             reject_what_one_bit_cannot_hold(table_name, column_index, value)?;
             continue;

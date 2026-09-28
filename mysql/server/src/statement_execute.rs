@@ -201,7 +201,8 @@ fn read_external_long_data(
     bytes: &[u8],
 ) -> Result<StatementParameterValue, StatementExecuteDecodeError> {
     match parameter_type.type_code {
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => {
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => Ok(word_or_bytes(bytes)),
+        MYSQL_TYPE_NEWDECIMAL => {
             let value = str::from_utf8(bytes)
                 .map_err(|_| StatementExecuteDecodeError::InvalidUtf8 { index })?;
             Ok(StatementParameterValue::String(value.to_owned()))
@@ -292,7 +293,10 @@ fn read_value(
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]))
         }
-        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => {
+        MYSQL_TYPE_VARCHAR | MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING => {
+            word_or_bytes(reader.read_lenenc_bytes(index)?)
+        }
+        MYSQL_TYPE_NEWDECIMAL => {
             let bytes = reader.read_lenenc_bytes(index)?;
             let value = str::from_utf8(bytes)
                 .map_err(|_| StatementExecuteDecodeError::InvalidUtf8 { index })?;
@@ -312,6 +316,21 @@ fn read_value(
         type_code => return Err(StatementExecuteDecodeError::UnsupportedType { index, type_code }),
     };
     Ok(value)
+}
+
+/// Reads a string parameter as a word, or as bytes when it is not UTF-8.
+///
+/// Measured on MySQL 8.4.11 through a proxy: go-sql-driver binds a `[]byte`
+/// as `MYSQL_TYPE_STRING` and PHP's PDO binds a string as
+/// `MYSQL_TYPE_VAR_STRING` whether it was bound as a LOB or not, each with
+/// its raw bytes, and MySQL stores those bytes as they are in a column of
+/// bytes. What is not UTF-8 is bytes and nothing else; a column of words
+/// refuses it where it lands.
+fn word_or_bytes(bytes: &[u8]) -> StatementParameterValue {
+    match str::from_utf8(bytes) {
+        Ok(word) => StatementParameterValue::String(word.to_owned()),
+        Err(_) => StatementParameterValue::Bytes(bytes.to_vec()),
+    }
 }
 
 /// Reads a binary date parameter as the day it names.
@@ -1049,9 +1068,21 @@ mod tests {
     }
 
     #[test]
-    fn strings_require_utf8_but_blobs_do_not() {
+    fn a_string_that_is_not_utf8_is_bytes() {
+        for type_code in [MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_STRING, MYSQL_TYPE_VARCHAR] {
+            assert_eq!(
+                decode(&[0, 1, type_code, 0, 1, 0xff], 1).unwrap().values,
+                [StatementParameterValue::Bytes(vec![0xff])]
+            );
+            assert_eq!(
+                decode(&[0, 1, type_code, 0, 2, 0xc3, 0xa9], 1)
+                    .unwrap()
+                    .values,
+                [StatementParameterValue::String("é".to_owned())]
+            );
+        }
         assert_eq!(
-            decode(&[0, 1, MYSQL_TYPE_VAR_STRING, 0, 1, 0xff], 1),
+            decode(&[0, 1, MYSQL_TYPE_NEWDECIMAL, 0, 1, 0xff], 1),
             Err(StatementExecuteDecodeError::InvalidUtf8 { index: 0 })
         );
         assert_eq!(
@@ -1162,8 +1193,10 @@ mod tests {
         let text_payload = [0, 1, MYSQL_TYPE_STRING, 0];
         let external = [Some(&[0xff][..])];
         assert_eq!(
-            decode_statement_execute_parameters_with_long_data(&text_payload, 1, None, &external,),
-            Err(StatementExecuteDecodeError::InvalidUtf8 { index: 0 })
+            decode_statement_execute_parameters_with_long_data(&text_payload, 1, None, &external)
+                .unwrap()
+                .values,
+            [StatementParameterValue::Bytes(vec![0xff])]
         );
     }
 

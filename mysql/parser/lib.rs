@@ -1729,6 +1729,7 @@ pub struct MySqlNumericSpec {
     character_lengths: Vec<Option<u32>>,
     fixed_widths: Vec<bool>,
     byte_strings: Vec<Option<ByteStringColumn>>,
+    words: Vec<bool>,
     datetimes: Vec<bool>,
     timestamps: Vec<bool>,
     dates: Vec<bool>,
@@ -1759,6 +1760,12 @@ impl MySqlNumericSpec {
     /// written with.
     pub fn is_fixed_width(&self, index: usize) -> bool {
         self.fixed_widths.get(index).copied().unwrap_or(false)
+    }
+
+    /// Reports whether a stored column holds words: a `VARCHAR`, a `CHAR` or
+    /// a `TEXT` of any size.
+    pub fn holds_words(&self, index: usize) -> bool {
+        self.words.get(index).copied().unwrap_or(false)
     }
 
     /// Returns how a column holding bytes rather than characters holds them.
@@ -5574,6 +5581,21 @@ pub fn parse_mysql_numeric_spec(
             .columns
             .iter()
             .map(|column| ByteStringColumn::of_declared_type(&column.data_type))
+            .collect(),
+        words: table
+            .columns
+            .iter()
+            .map(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::Varchar(_)
+                        | DataType::Char(_)
+                        | DataType::Text
+                        | DataType::TinyText
+                        | DataType::MediumText
+                        | DataType::LongText
+                )
+            })
             .collect(),
         datetimes: table
             .columns
