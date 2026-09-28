@@ -1339,9 +1339,37 @@ pub struct TranslatedDml {
     /// by the frontend knowing its columns' types, which a statement read
     /// again without a connection cannot do.
     copies_a_select_rendered_knowing_its_types: bool,
+    bound_arithmetic_operands: Vec<BoundArithmeticOperand>,
+}
+
+/// A `?` an `UPDATE` adds to, takes from or multiplies a value by —
+/// GORM's `gorm.Expr("balance - ?", 10)` — and the column the answer is
+/// written into. MySQL reads the bound value by that column's type, so the
+/// frontend holds what binds there to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundArithmeticOperand {
+    pub(crate) ordinal: usize,
+    pub(crate) written_column: String,
+}
+
+impl BoundArithmeticOperand {
+    /// The zero-based place of the `?` among the statement's parameters.
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    /// The column the arithmetic's answer is written into.
+    pub fn written_column(&self) -> &str {
+        &self.written_column
+    }
 }
 
 impl TranslatedDml {
+    /// Returns each `?` the statement's `SET` does arithmetic with.
+    pub fn bound_arithmetic_operands(&self) -> &[BoundArithmeticOperand] {
+        &self.bound_arithmetic_operands
+    }
+
     /// Reports whether the `SELECT` this `INSERT ... SELECT` copies from was
     /// rendered knowing its columns' types.
     pub fn copies_a_select_rendered_knowing_its_types(&self) -> bool {
@@ -4583,6 +4611,7 @@ pub fn parse_dml_knowing_column_types(
         compares_a_written_number: render_context.compares_a_written_number,
         row_count_parameters,
         copies_a_select_rendered_knowing_its_types: false,
+        bound_arithmetic_operands: render_context.bound_arithmetic_operands,
     })
 }
 
@@ -4624,6 +4653,7 @@ pub fn parse_insert_select_knowing_its_select(
         compares_a_written_number: false,
         row_count_parameters: rendered.row_count_parameters,
         copies_a_select_rendered_knowing_its_types: true,
+        bound_arithmetic_operands: Vec::new(),
     })
 }
 

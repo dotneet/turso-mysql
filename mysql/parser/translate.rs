@@ -4712,19 +4712,19 @@ fn render_update_assignment_value(
                 };
                 return Ok(format!(
                     "{function}({}, {})",
-                    render_update_assignment_value(left, written, assigned, render_context)?,
-                    render_update_assignment_value(right, written, assigned, render_context)?
+                    render_set_arithmetic_operand(left, written, assigned, render_context)?,
+                    render_set_arithmetic_operand(right, written, assigned, render_context)?
                 ));
             }
             Ok(format!(
                 "({} {} {})",
-                render_update_assignment_value(left, written, assigned, render_context)?,
+                render_set_arithmetic_operand(left, written, assigned, render_context)?,
                 match op {
                     BinaryOperator::Plus => "+",
                     BinaryOperator::Minus => "-",
                     _ => "*",
                 },
-                render_update_assignment_value(right, written, assigned, render_context)?
+                render_set_arithmetic_operand(right, written, assigned, render_context)?
             ))
         }
         // A call or a `CASE` writes a value worked out from the row, which is
@@ -4791,9 +4791,64 @@ fn render_update_assignment_value(
             Ok(format!("({rendered})"))
         }
         // What is left is a value rather than a reading of the row, so none of
-        // it can name a column.
-        _ => render_dml_expr(value),
+        // it can name a column. Each `?` in it still takes its place among the
+        // statement's parameters.
+        _ => {
+            let rendered = render_dml_expr(value)?;
+            for _ in 0..parameters_in_rendered_sql(&rendered) {
+                render_context.next_parameter_ordinal()?;
+            }
+            Ok(rendered)
+        }
     }
+}
+
+/// Renders one side of `+`, `-` or `*` in an `UPDATE`'s value, noting a `?`
+/// there with the column the answer is written into: what MySQL does with the
+/// value bound there depends on that column's type, which only the frontend
+/// knows.
+fn render_set_arithmetic_operand(
+    operand: &Expr,
+    written: &str,
+    assigned: &[String],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let ordinal = render_context.parameter_count;
+    let rendered = render_update_assignment_value(operand, written, assigned, render_context)?;
+    if is_a_bare_placeholder(operand) {
+        render_context
+            .bound_arithmetic_operands
+            .push(crate::BoundArithmeticOperand {
+                ordinal,
+                written_column: written.to_owned(),
+            });
+    }
+    Ok(rendered)
+}
+
+fn is_a_bare_placeholder(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_a_bare_placeholder(inner),
+        Expr::Value(value) => matches!(&value.value, Value::Placeholder(marker) if marker == "?"),
+        _ => false,
+    }
+}
+
+/// Counts the `?` markers in rendered SQL, leaving out any inside a quoted
+/// word or name.
+fn parameters_in_rendered_sql(rendered: &str) -> usize {
+    let mut count = 0;
+    let mut quote = None;
+    for character in rendered.chars() {
+        match quote {
+            Some(delimiter) if character == delimiter => quote = None,
+            Some(_) => {}
+            None if character == '\'' || character == '"' => quote = Some(character),
+            None if character == '?' => count += 1,
+            None => {}
+        }
+    }
+    count
 }
 
 /// Reports whether a value reads only columns this `SET` has not written yet.
@@ -5267,6 +5322,9 @@ pub(crate) struct SelectRenderContext<'a> {
     pub(crate) checked_subquery_comparisons: Vec<CheckedSubqueryComparison>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     pub(crate) ordered_columns: Vec<(Option<String>, String)>,
+    /// Each `?` an `UPDATE` adds to, takes from or multiplies a value by,
+    /// with the column the answer is written into.
+    pub(crate) bound_arithmetic_operands: Vec<crate::BoundArithmeticOperand>,
     parameter_count: usize,
     /// How many `GROUP_CONCAT` calls the statement has rendered, which tells
     /// each one's count of joined values apart from the others'.
@@ -5345,6 +5403,7 @@ impl<'a> SelectRenderContext<'a> {
             checked_subquery_comparisons: Vec::new(),
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
+            bound_arithmetic_operands: Vec::new(),
             parameter_count: 0,
             group_concat_calls: 0,
             renders_a_projection_item: false,

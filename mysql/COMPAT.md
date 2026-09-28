@@ -391,6 +391,22 @@ in the engine, so the two would write different numbers. Counting a column past 
 refused the way any oversized value is, and the row keeps what it had — MySQL answers 1690
 for the same statement.
 
+A `?` in that arithmetic is how GORM writes `gorm.Expr("balance - ?", 10)`, and MySQL reads
+what binds there by the column the answer is written into. Measured on 8.4.11 with the binary
+types go-sql-driver sends: into a `DECIMAL(10,2)`, a bound whole number and a bound word
+naming a number are taken exactly and the answer rounded half away from zero, so 90.50 less
+`'0.005'` stores 90.50 and changes nothing; a bound double makes the arithmetic a double's, so
+1.97 plus 0.145 stores 2.11 where exact arithmetic stores 2.12. Into a `BIGINT`, a bound whole
+number is added exactly and a double or a word naming a fraction is added as a double and
+rounded into the column, 8 plus 1.5 storing 10. A word naming no number fails the statement
+with 1292 either way, and a NULL with 1048. So a bound whole number, a word naming one, and
+NULL are taken against either column, a word naming a decimal against a `DECIMAL` as well,
+and everything else is refused when the statement runs; a `?` in arithmetic written into any
+other kind of column is refused when it is prepared. Every `?` in a `SET` holds its own place
+among the statement's parameters: they used to be counted from the `WHERE` alone, so an
+`ON UPDATE CURRENT_TIMESTAMP` column compared the second of two bound values against the
+first's and missed the change.
+
 `SET ratio = score / 2` scales a column down, and MySQL's `/` is decimal division where the
 engine's is integer division. What lands in the column is rounded to the column's own scale on
 the way in, which is what makes the two agree: measured on 8.4.11, 10 divided by 3 into a

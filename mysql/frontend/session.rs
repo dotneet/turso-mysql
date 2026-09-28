@@ -1033,6 +1033,9 @@ enum PreparedExecutionPlan {
         copied_select: Option<CopiedSelect>,
         /// The parameters compared with a column of words, which bind a word.
         word_parameters: Vec<usize>,
+        /// Each `?` an `UPDATE` does arithmetic with, and how MySQL reads
+        /// what binds there.
+        bound_operands: Vec<(usize, BoundOperandKind)>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
     CountedInsertSelect(Box<PreparedCountedInsertSelect>),
@@ -1061,6 +1064,25 @@ impl PreparedExecutionPlan {
             Self::OrdinaryWrite { .. } | Self::AutoIncrementInsert(_) => None,
         }
     }
+}
+
+/// How MySQL reads a value bound as one side of `+`, `-` or `*` in an
+/// `UPDATE`, which depends on the column the answer is written into.
+///
+/// Measured on 8.4.11 with go-sql-driver's binary types: `balance - ?` into
+/// a `DECIMAL(10,2)` reads a bound whole number and a bound word exactly —
+/// 90.49 less `'0.005'` is 90.485, stored as 90.49 — while a bound double
+/// makes the arithmetic a double's, so 1.97 plus 0.145 is 2.1149999... and
+/// stores 2.11 where exact arithmetic stores 2.12. `views + ?` into a `BIGINT`
+/// adds a bound whole number exactly and rounds anything else into the
+/// column, 8 plus 1.5 storing 10. A word naming no number fails the statement
+/// with 1292. So a whole number, a word naming one, and NULL are taken
+/// against either, a word naming a decimal against a `DECIMAL` too, and
+/// everything else is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundOperandKind {
+    WholeNumber,
+    ExactNumber,
 }
 
 struct SelectComparisons<'a> {
@@ -2372,6 +2394,9 @@ impl MySqlConnection {
         let word_parameters = self
             .dml_word_parameters(&translated)
             .map_err(MySqlPreparedStatementError::Engine)?;
+        let bound_operands = self
+            .bound_operand_kinds(&translated)
+            .map_err(MySqlPreparedStatementError::Prepare)?;
         Ok((
             Some(statement),
             PreparedExecutionPlan::OrdinaryWrite {
@@ -2382,8 +2407,49 @@ impl MySqlConnection {
                 written_table,
                 read_tables: read_table_names(&translated),
                 word_parameters,
+                bound_operands,
             },
         ))
+    }
+
+    /// Reads how MySQL takes each `?` an `UPDATE` does arithmetic with, from
+    /// the type of the column the answer is written into.
+    fn bound_operand_kinds(
+        &self,
+        translated: &TranslatedDml,
+    ) -> std::result::Result<Vec<(usize, BoundOperandKind)>, MySqlQueryError> {
+        let operands = translated.bound_arithmetic_operands();
+        let Some(update) = translated.checked_update().filter(|_| !operands.is_empty()) else {
+            return Ok(Vec::new());
+        };
+        let table = MySqlTableName::parse(update.table_name())
+            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let columns = self
+            .list_columns(&table)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        operands
+            .iter()
+            .map(|operand| {
+                let written = operand.written_column();
+                let column = columns
+                    .iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(written))
+                    .ok_or(MySqlQueryError::Engine(LimboError::SchemaUpdated))?;
+                let kind = if column.decimal_size().is_some() {
+                    BoundOperandKind::ExactNumber
+                } else if is_integer_type(column.type_name())
+                    && column.type_name() != "BIGINT UNSIGNED"
+                {
+                    BoundOperandKind::WholeNumber
+                } else {
+                    return Err(MySqlQueryError::Unsupported(format!(
+                        "a ? in arithmetic written into a {} column, where what MySQL does with the value bound there has not been measured",
+                        column.type_name()
+                    )));
+                };
+                Ok((operand.ordinal(), kind))
+            })
+            .collect()
     }
 
     /// Prepares an `INSERT ... SELECT` into a table that counts its own ids.
@@ -3087,11 +3153,19 @@ impl MySqlConnection {
         if let PreparedExecutionPlan::OrdinaryWrite {
             insert_target,
             word_parameters,
+            bound_operands,
             ..
         } = plan
         {
             self.refuse_untyped_wide_integer_write_parameters(insert_target.as_ref(), values)?;
             refuse_a_word_parameter_bound_otherwise(word_parameters, values)?;
+            hold_bound_operands(bound_operands, values)?;
+            whole_number_parameters.extend(
+                bound_operands
+                    .iter()
+                    .filter(|(_, kind)| *kind == BoundOperandKind::WholeNumber)
+                    .map(|(ordinal, _)| *ordinal),
+            );
         }
         let timestamp_parameters = match plan {
             PreparedExecutionPlan::OrdinaryWrite {
@@ -11122,6 +11196,45 @@ pub(crate) struct BoundTemporalParameter {
 
 /// The whole number a bound word names, which is what MySQL reads it as
 /// against a column holding whole numbers.
+/// Holds each value an `UPDATE` does arithmetic with to what MySQL reads alike;
+/// see [`BoundOperandKind`].
+fn hold_bound_operands(
+    operands: &[(usize, BoundOperandKind)],
+    values: &[MySqlPreparedValue],
+) -> Result<()> {
+    for (ordinal, kind) in operands {
+        let value = values.get(*ordinal).ok_or_else(|| {
+            LimboError::InternalError(
+                "an arithmetic placeholder is outside the prepared parameters".to_string(),
+            )
+        })?;
+        let fits = match (kind, value) {
+            (_, MySqlPreparedValue::Null | MySqlPreparedValue::Integer(_)) => true,
+            (BoundOperandKind::WholeNumber, MySqlPreparedValue::Text(written)) => {
+                bound_whole_number(written).is_some()
+            }
+            (BoundOperandKind::ExactNumber, MySqlPreparedValue::Text(written)) => {
+                turso_mysql_parser::read_written_number(written).is_some()
+            }
+            _ => false,
+        };
+        if !fits {
+            return Err(LimboError::InvalidArgument(format!(
+                "a value bound in arithmetic written into a {} column has to be a whole number{}",
+                match kind {
+                    BoundOperandKind::WholeNumber => "whole-number",
+                    BoundOperandKind::ExactNumber => "DECIMAL",
+                },
+                match kind {
+                    BoundOperandKind::WholeNumber => ", or a word naming one",
+                    BoundOperandKind::ExactNumber => " or a word naming a number",
+                }
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn bound_whole_number(written: &str) -> Option<i64> {
     match turso_mysql_parser::read_written_number(written)? {
         turso_mysql_parser::WrittenNumber::Whole(value) => Some(value),

@@ -225,3 +225,164 @@ fn a_word_that_is_no_whole_number_is_refused_against_a_count() {
         );
     }
 }
+
+/// The first column of every row a text statement answers.
+fn first_column(adapter: &mut Adapter, sql: &str) -> Vec<String> {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must answer rows");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+        .collect()
+}
+
+fn one_value(adapter: &mut Adapter, sql: &str) -> String {
+    first_column(adapter, sql).remove(0)
+}
+
+fn changed(adapter: &mut Adapter, sql: &str, values: &[Bound<'_>]) -> u64 {
+    match prepared(adapter, sql, values) {
+        Ok(PreparedStatementExecutionResult::Ok(result)) => result.affected_rows,
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+/// GORM's `UpdateColumn("balance", gorm.Expr("balance - ?", 10))` into a
+/// `DECIMAL(10,2)`. Measured on MySQL 8.4.11: a bound whole number and a bound
+/// word naming a number are taken exactly, the answer rounded half away from
+/// zero into the column — 90.50 less `'0.005'` is 90.495, which stores as
+/// 90.50 and changes nothing. A bound double makes the arithmetic a double's
+/// (1.97 plus 0.145 stores 2.11 there, and 2.12 when done exactly), a word
+/// naming no number fails with 1292, and NULL with 1048.
+#[test]
+fn gorm_takes_a_bound_amount_from_a_decimal() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    run(&mut adapter, "UPDATE users SET is_active = 0 WHERE id = 2");
+    let take = "UPDATE `users` SET `balance`=balance - ? WHERE is_active = ?";
+    let balance = "SELECT balance FROM users WHERE id = 1";
+    for (amount, rows, stored) in [
+        (Bound::Whole(10), 1, "90.50"),
+        (Bound::Word("0.005"), 0, "90.50"),
+        (Bound::Word("-1"), 1, "91.50"),
+        (Bound::Word("+1.5"), 1, "90.00"),
+    ] {
+        assert_eq!(
+            changed(&mut adapter, take, &[amount, Bound::Whole(1)]),
+            rows
+        );
+        assert_eq!(one_value(&mut adapter, balance), stored);
+    }
+    for amount in [Bound::Real(0.015), Bound::Word("abc"), Bound::Word(" 2 ")] {
+        assert_eq!(
+            prepared(&mut adapter, take, &[amount, Bound::Whole(1)]),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+    assert_eq!(
+        prepared(&mut adapter, take, &[Bound::Null, Bound::Whole(1)]),
+        Err(FrontendErrorKind::NotNullViolation)
+    );
+    assert_eq!(one_value(&mut adapter, balance), "90.00");
+}
+
+/// GORM's `UpdateColumn("views", gorm.Expr("views + ?", 3))` into a
+/// `BIGINT`. Measured on MySQL 8.4.11: a bound whole number, or a word naming
+/// one, is added exactly; a bound double or a word naming a fraction is added
+/// as a double and the answer rounded into the column, 8 plus 1.5 storing 10,
+/// which the engine refuses to store; a word naming no number fails with 1292.
+#[test]
+fn gorm_adds_a_bound_count_to_a_whole_number() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    let add = "UPDATE `posts` SET `views`=views + ? WHERE views > ?";
+    assert_eq!(
+        changed(&mut adapter, add, &[Bound::Whole(3), Bound::Whole(4)]),
+        2
+    );
+    assert_eq!(
+        changed(&mut adapter, add, &[Bound::Word("2"), Bound::Whole(4)]),
+        2
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT views FROM posts ORDER BY id"),
+        ["10", "12", "1"]
+    );
+    for amount in [Bound::Real(1.5), Bound::Word("2.5"), Bound::Word("x")] {
+        assert_eq!(
+            prepared(&mut adapter, add, &[amount, Bound::Whole(4)]),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+}
+
+/// Each `?` in a `SET` holds its own place among the statement's parameters,
+/// so the rule for the one an arithmetic reads falls on that one alone.
+#[test]
+fn a_bound_value_before_the_arithmetic_keeps_its_own_place() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    let update = "UPDATE users SET name = ?, balance = balance - ? WHERE is_active = ?";
+    assert_eq!(
+        changed(
+            &mut adapter,
+            update,
+            &[Bound::Word("abc"), Bound::Whole(1), Bound::Whole(1)]
+        ),
+        2
+    );
+    assert_eq!(
+        prepared(
+            &mut adapter,
+            update,
+            &[Bound::Whole(7), Bound::Real(1.5), Bound::Whole(1)]
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT name FROM users ORDER BY id"),
+        ["abc", "abc"]
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT balance FROM users ORDER BY id"),
+        ["99.50", "-1.00"]
+    );
+}
+
+/// A row an `UPDATE` changes takes the moment in its `ON UPDATE
+/// CURRENT_TIMESTAMP` column whichever value changed it, the second of two
+/// bound ones included; one it leaves as it was keeps its moment.
+#[test]
+fn the_second_bound_value_in_a_set_stamps_the_row() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE stamped (id INT PRIMARY KEY, a INT, b INT, updated_at DATETIME NULL ON UPDATE CURRENT_TIMESTAMP)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO stamped (id, a, b) VALUES (1, 1, 1)",
+    );
+    let update = "UPDATE stamped SET a = ?, b = ? WHERE id = ?";
+    let stamped = "SELECT updated_at IS NOT NULL FROM stamped";
+    assert_eq!(
+        changed(
+            &mut adapter,
+            update,
+            &[Bound::Whole(1), Bound::Whole(1), Bound::Whole(1)]
+        ),
+        0
+    );
+    assert_eq!(one_value(&mut adapter, stamped), "0");
+    assert_eq!(
+        changed(
+            &mut adapter,
+            update,
+            &[Bound::Whole(1), Bound::Whole(2), Bound::Whole(1)]
+        ),
+        1
+    );
+    assert_eq!(one_value(&mut adapter, stamped), "1");
+}
