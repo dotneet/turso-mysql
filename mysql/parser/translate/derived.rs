@@ -164,6 +164,18 @@ pub(super) fn derived_columns(
     ))
 }
 
+/// What a derived table the statement only counts the rows of projects: as
+/// far as anything reads it, its table's own columns, as a body projecting
+/// `*` does.
+pub(super) fn only_counted(inner: &MySqlSelectSource) -> MySqlDerivedColumns {
+    MySqlDerivedColumns {
+        inner_reference: inner.reference.clone(),
+        materialized: false,
+        names: Vec::new(),
+        answers: Vec::new(),
+    }
+}
+
 /// Reports whether an answer is one MySQL has been measured storing in the
 /// table it writes an aggregating body out into.
 fn is_stored_in_a_derived_table(answer: &StaticSelectMetadata) -> bool {

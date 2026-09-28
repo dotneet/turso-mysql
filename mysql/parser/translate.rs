@@ -866,7 +866,10 @@ fn render_select_body(
         return unsupported("SELECT without projections");
     }
 
+    render_context.counts_the_rows_of_the_derived_table =
+        outer_projection && only_counts_the_rows_of_a_derived_table(select);
     let (from, source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
+    render_context.counts_the_rows_of_the_derived_table = false;
     // Some `information_schema` tables answer only a few of the columns MySQL
     // gives them, and a wildcard over one of those — which asks for all of
     // them — would answer a row of a different width than MySQL answers.
@@ -975,6 +978,47 @@ fn render_select_body(
         outer_projected_group_concats,
     );
     Ok((normalized, source_tables))
+}
+
+/// Reports whether a statement answers the count of its one derived table's
+/// rows and nothing else — `SELECT COUNT(*) FROM (...) subquery_for_count`,
+/// which is how Rails counts a relation carrying a limit.
+fn only_counts_the_rows_of_a_derived_table(select: &sqlparser::ast::Select) -> bool {
+    let [SelectItem::UnnamedExpr(Expr::Function(count))
+    | SelectItem::ExprWithAlias {
+        expr: Expr::Function(count),
+        ..
+    }] = select.projection.as_slice()
+    else {
+        return false;
+    };
+    let sqlparser::ast::FunctionArguments::List(arguments) = &count.args else {
+        return false;
+    };
+    let counts_every_row = matches!(
+        arguments.args.as_slice(),
+        [sqlparser::ast::FunctionArg::Unnamed(
+            sqlparser::ast::FunctionArgExpr::Wildcard
+        )]
+    ) || matches!(arguments.args.as_slice(), [argument] if static_select_metadata::counts_every_row(argument));
+    let groups_nothing = matches!(
+        &select.group_by,
+        sqlparser::ast::GroupByExpr::Expressions(keys, _) if keys.is_empty()
+    );
+    static_select_metadata::is_count_call(count)
+        && arguments.duplicate_treatment.is_none()
+        && counts_every_row
+        && select.distinct.is_none()
+        && select.selection.is_none()
+        && select.having.is_none()
+        && groups_nothing
+        && matches!(
+            select.from.as_slice(),
+            [sqlparser::ast::TableWithJoins {
+                relation: TableFactor::Derived { .. },
+                joins,
+            }] if joins.is_empty()
+        )
 }
 
 /// Writes a value worked out in full under the name MySQL gives it: its
@@ -1473,6 +1517,9 @@ fn render_derived_table(
     let Some(render_context) = render_context else {
         return unsupported("derived table outside a SELECT");
     };
+    if std::mem::take(&mut render_context.counts_the_rows_of_the_derived_table) {
+        return render_counted_derived_table(subquery, alias, render_context);
+    }
     let body = match unwrap_query_wrappers(subquery.body.as_ref())? {
         SetExpr::SetOperation { .. } => render_derived_catalog_union(subquery, render_context)?,
         _ => render_subquery(subquery, render_context)?.0,
@@ -1491,6 +1538,84 @@ fn render_derived_table(
             subquery: false,
             projected_columns,
             derived: Some(derived),
+            catalog: source.catalog,
+            hinted_indexes: Vec::new(),
+        },
+    ))
+}
+
+/// Renders a derived table the statement only counts the rows of, whose body
+/// may cut its rows with a `LIMIT` and project what it likes.
+///
+/// Rails counts a relation carrying a limit as
+/// `SELECT COUNT(*) FROM (SELECT 1 AS one FROM posts LIMIT 3 OFFSET 0)
+/// subquery_for_count`. Measured on MySQL 8.4.11, that answers how many rows
+/// the limit leaves — 3 of 3, and 1 past an offset of 2 — in the shape a
+/// plain `COUNT(*)` answers. No column of the body is read, so what it
+/// projects has no shape to report, and which rows a limit without an order
+/// keeps does not change how many it keeps. An `ORDER BY`, which could still
+/// name what MySQL refuses, and a bound row count are refused.
+fn render_counted_derived_table(
+    subquery: &sqlparser::ast::Query,
+    alias: &sqlparser::ast::TableAlias,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(String, MySqlSelectSource), ParseError> {
+    if subquery.with.is_some()
+        || subquery.order_by.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+        || !subquery.pipe_operators.is_empty()
+    {
+        return unsupported("counted derived table clause");
+    }
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        return unsupported("counted derived table body");
+    };
+    let comparisons_before = render_context.checked_comparisons.len();
+    let (mut body, _) = render_subquery_select(select, render_context)?;
+    // The body's table is read under the derived table's name, so a
+    // comparison naming the body's table names the one table the statement
+    // reads.
+    let inner = render_context
+        .subquery_tables
+        .last()
+        .map(|source| source.reference.clone());
+    for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
+        if comparison.qualifier.as_deref().is_some_and(|qualifier| {
+            inner
+                .as_deref()
+                .is_some_and(|inner| inner.eq_ignore_ascii_case(qualifier))
+        }) {
+            comparison.qualifier = None;
+        }
+    }
+    if let Some(limit) = &subquery.limit_clause {
+        let mut bound_row_counts = Vec::new();
+        body.push_str(&render_select_limit(
+            limit,
+            render_context,
+            &mut bound_row_counts,
+        )?);
+        if !bound_row_counts.is_empty() {
+            return unsupported("bound row count in a counted derived table");
+        }
+    }
+    let Some(source) = render_context.subquery_tables.pop() else {
+        return unsupported("derived table requires one table");
+    };
+    Ok((
+        format!("({body}) AS {}", render_ident(&alias.name)),
+        MySqlSelectSource {
+            reference: alias.name.value.clone(),
+            derived: Some(derived::only_counted(&source)),
+            table: source.table,
+            outer: false,
+            branch: 0,
+            subquery: false,
+            projected_columns: Vec::new(),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
         },
@@ -4494,6 +4619,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the next projection rendered is the statement's own result
     /// rather than a subquery's or a `UNION` branch's.
     renders_the_outer_projection: bool,
+    /// Whether the derived table about to be rendered is one the statement
+    /// only counts the rows of, which nothing reads a column of.
+    counts_the_rows_of_the_derived_table: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
     /// Whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column was
@@ -4581,6 +4709,7 @@ impl<'a> SelectRenderContext<'a> {
             rewritten_on_update,
             subquery_tables: Vec::new(),
             renders_the_outer_projection: false,
+            counts_the_rows_of_the_derived_table: false,
             orders_a_bare_column: false,
             checks_type_sensitive_expression: false,
             renders_a_condition_without_column_types: false,

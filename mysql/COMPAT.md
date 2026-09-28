@@ -526,6 +526,15 @@ in an `UPDATE` or a `DELETE`, each of which reads its own table. A name the body
 that is also another of the table's columns is refused where the statement needs the columns'
 types, since it would stand for two.
 
+A statement that only counts the rows of its one derived table — `SELECT COUNT(*) FROM
+(SELECT 1 AS one FROM posts LIMIT 3 OFFSET 0) subquery_for_count`, which is how Rails counts a
+relation carrying a limit — reads no column of the body, so the body may project anything,
+written values included, and may cut its rows with a `LIMIT` of written numbers. Measured on
+8.4.11, it answers how many rows the limit leaves, 3 of 3 and 1 past an offset of 2, in the shape
+a plain `COUNT(*)` answers, and which rows a limit without an order keeps does not change how
+many it keeps. An `ORDER BY` in such a body and a bound row count are refused, and a statement
+reading anything more of the derived table is held to the rules above.
+
 A shift by months keeps the day inside the month it lands in. MySQL takes the last day of the
 target month where that month has no such day, and the engine's own month arithmetic overflows
 into the next one instead: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28` where

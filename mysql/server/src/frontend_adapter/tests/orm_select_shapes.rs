@@ -383,3 +383,50 @@ fn a_comparison_over_the_clock_a_count_or_numbers_is_a_result_column() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// Rails' `relation.limit(n).offset(m).count`. Measured on MySQL 8.4.11: the
+/// count of the rows the limit leaves, in the shape a plain `COUNT(*)`
+/// answers — 3 of 3 posts under `LIMIT 3 OFFSET 0`, and 1 under `LIMIT 2
+/// OFFSET 2`.
+#[test]
+fn rails_counts_the_rows_a_limit_leaves_in_a_derived_table() {
+    let (_directory, mut adapter) = adapter();
+    for (sql, count) in [
+        (
+            "SELECT COUNT(*) FROM (SELECT 1 AS one FROM `posts` LIMIT 3 OFFSET 0) subquery_for_count",
+            "3",
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT 1 AS one FROM `posts` LIMIT 2 OFFSET 2) subquery_for_count",
+            "1",
+        ),
+        (
+            "SELECT COUNT(*) FROM (SELECT 1 AS one FROM `posts` WHERE `posts`.`user_id` = 1 LIMIT 5) subquery_for_count",
+            "2",
+        ),
+    ] {
+        let counted = result_set(&mut adapter, sql);
+        assert_eq!(text_rows(&counted), [[Some(count.to_owned())]], "{sql}");
+        assert_eq!(
+            shapes(&counted),
+            [(
+                "COUNT(*)",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                0,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            )],
+            "{sql}"
+        );
+    }
+    // Something reads the body's columns, or an order could name what MySQL
+    // refuses: each is held to what a derived table is held to.
+    for sql in [
+        "SELECT COUNT(one) FROM (SELECT 1 AS one FROM posts LIMIT 1) AS s",
+        "SELECT COUNT(*), 1 FROM (SELECT 1 AS one FROM posts LIMIT 1) AS s",
+        "SELECT COUNT(*) FROM (SELECT 1 AS one FROM posts ORDER BY id LIMIT 1) AS s",
+        "SELECT COUNT(*) FROM (SELECT 1 AS one FROM posts LIMIT 1) AS s WHERE one = 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
