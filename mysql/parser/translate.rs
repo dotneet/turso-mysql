@@ -1939,15 +1939,39 @@ fn render_subquery_select(
     select: &sqlparser::ast::Select,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, Option<(String, String)>), ParseError> {
+    let may_join = std::mem::take(&mut render_context.an_exists_may_join);
     let comparisons_before = render_context.checked_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
+    if sources.len() > 1 && may_join {
+        // An unqualified name a subquery compares is the column of whichever
+        // of its tables has one, so those tables travel with it.
+        let references = sources
+            .iter()
+            .map(|source| source.reference.clone())
+            .collect::<Vec<_>>();
+        let references = references.iter().map(String::as_str).collect::<Vec<_>>();
+        for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
+            comparison.name_the_inner_sources(&references);
+        }
+        for mut source in sources {
+            source.subquery = true;
+            if !render_context.subquery_tables.iter().any(|held| {
+                held.reference == source.reference
+                    && held.table == source.table
+                    && held.projected_columns.is_empty()
+            }) {
+                render_context.subquery_tables.push(source);
+            }
+        }
+        return Ok((rendered, None));
+    }
     let [source] = sources.as_slice() else {
         return unsupported("SELECT subquery requires one table");
     };
     // An unqualified name a subquery compares is the subquery's column when it
     // has one, so the subquery it was written inside travels with it.
     for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
-        comparison.name_the_inner_source(&source.reference);
+        comparison.name_the_inner_sources(&[&source.reference]);
     }
     let projected = match select.projection.as_slice() {
         [SelectItem::UnnamedExpr(Expr::Identifier(column))] => {
@@ -2168,7 +2192,7 @@ fn render_having_predicate(
                     .checked_comparisons
                     .push(CheckedSelectComparison {
                         qualifier: None,
-                        inner_source: None,
+                        inner_sources: Vec::new(),
                         column_name: "COUNT".to_owned(),
                         operator,
                         rhs,
@@ -2207,7 +2231,7 @@ fn render_having_predicate(
                     .checked_comparisons
                     .push(CheckedSelectComparison {
                         qualifier: None,
-                        inner_source: None,
+                        inner_sources: Vec::new(),
                         column_name: column.value.clone(),
                         operator,
                         rhs,
@@ -5673,6 +5697,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// its shape is reported there, where the server checks the column's
     /// kind.
     takes_a_joined_aggregate: bool,
+    /// Whether the subquery about to be rendered stands in a `WHERE`'s
+    /// `EXISTS`, the one subquery that may join tables.
+    an_exists_may_join: bool,
     /// Whether the statement writes the rows it reads — `INSERT ... SELECT`
     /// — where a cut `GROUP_CONCAT` fails the statement rather than warning.
     writes_its_rows: bool,
@@ -5755,6 +5782,7 @@ impl<'a> SelectRenderContext<'a> {
             group_concat_calls: 0,
             renders_a_projection_item: false,
             takes_a_joined_aggregate: false,
+            an_exists_may_join: false,
             writes_its_rows: false,
             counts_group_concat_in_having: false,
             group_concat_counts: Vec::new(),
@@ -9410,11 +9438,17 @@ fn render_select_predicate(
             list,
             negated,
         } => render_checked_in_list(expr, list, *negated, render_context),
+        // Laravel's `whereHas` through a pivot table joins the pivot inside
+        // the `EXISTS`, which answers whether a row is there, so no column of
+        // it is read and its tables may be joined.
         Expr::Exists { subquery, negated } => {
-            let (rendered, _) = render_subquery(subquery, render_context)?;
+            render_context.an_exists_may_join = true;
+            let rendered = render_subquery(subquery, render_context);
+            render_context.an_exists_may_join = false;
             Ok(format!(
-                "({}EXISTS ({rendered}))",
-                if *negated { "NOT " } else { "" }
+                "({}EXISTS ({}))",
+                if *negated { "NOT " } else { "" },
+                rendered?.0
             ))
         }
         Expr::Between {
@@ -9649,7 +9683,7 @@ fn render_checked_in_list(
             .checked_comparisons
             .push(CheckedSelectComparison {
                 qualifier: qualifier.map(|q| q.value.clone()),
-                inner_source: None,
+                inner_sources: Vec::new(),
                 column_name: column_name.clone(),
                 operator,
                 rhs,
@@ -9968,7 +10002,7 @@ fn render_checked_select_comparison(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|q| q.value.clone()),
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name,
             operator,
             rhs,
@@ -10153,7 +10187,7 @@ fn render_comparison_over_a_fallback(
     };
     let held = |operator, rhs| CheckedSelectComparison {
         qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
-        inner_source: None,
+        inner_sources: Vec::new(),
         column_name: column.value.clone(),
         operator,
         rhs,
@@ -10214,7 +10248,7 @@ fn render_comparison_over_arithmetic(
             .checked_comparisons
             .push(CheckedSelectComparison {
                 qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
-                inner_source: None,
+                inner_sources: Vec::new(),
                 column_name: column.value.clone(),
                 operator,
                 rhs: CheckedSelectComparisonRhs::Operand(
@@ -10228,7 +10262,7 @@ fn render_comparison_over_arithmetic(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: None,
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: String::new(),
             operator,
             rhs: value,
@@ -10299,7 +10333,7 @@ fn render_column_pair_comparison(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: column.value.clone(),
             operator,
             rhs: CheckedSelectComparisonRhs::Column {
@@ -10368,7 +10402,7 @@ fn render_column_against_a_call(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: column.value.clone(),
             operator,
             rhs: CheckedSelectComparisonRhs::Call(answers),
@@ -10612,7 +10646,7 @@ fn render_comparison_against_an_average(
         })?;
     let whole_number = |qualifier, column_name: &str| CheckedSelectComparison {
         qualifier,
-        inner_source: None,
+        inner_sources: Vec::new(),
         column_name: column_name.to_owned(),
         operator: CheckedSelectComparisonOperator::Equal,
         rhs: CheckedSelectComparisonRhs::SignedInteger(1),
@@ -10773,7 +10807,7 @@ fn render_comparison_over_a_call(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: None,
-            inner_source: None,
+            inner_sources: Vec::new(),
             // The call reads a column, and naming it is what an error message
             // needs; what the value is held to is the answer beside it.
             column_name: String::new(),
@@ -10826,7 +10860,7 @@ fn render_comparison_of_two_calls(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: None,
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: String::new(),
             operator,
             rhs: CheckedSelectComparisonRhs::Call(other_answers),
@@ -10933,7 +10967,7 @@ fn render_checked_like(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|q| q.value.clone()),
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: column.value.clone(),
             operator: if negated {
                 CheckedSelectComparisonOperator::NotLike
@@ -11052,7 +11086,7 @@ fn render_checked_regexp(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: qualifier.map(|qualifier| qualifier.value.clone()),
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: column.value.clone(),
             operator: CheckedSelectComparisonOperator::Like,
             rhs: CheckedSelectComparisonRhs::Text(written.clone()),

@@ -25,6 +25,14 @@ const UNSIGNED_IDS: &[&str] = &[
     "CREATE TABLE post_tag (post_id BIGINT UNSIGNED NOT NULL, tag_id INT UNSIGNED NOT NULL, PRIMARY KEY (post_id, tag_id)) DEFAULT CHARSET=utf8mb4",
 ];
 
+/// Laravel's own tables, whose every id is a `BIGINT UNSIGNED`.
+const LARAVEL: &[&str] = &[
+    UNSIGNED_IDS[0],
+    UNSIGNED_IDS[1],
+    "CREATE TABLE tags (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL UNIQUE) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    "CREATE TABLE post_tag (post_id BIGINT UNSIGNED NOT NULL, tag_id BIGINT UNSIGNED NOT NULL, PRIMARY KEY (post_id, tag_id)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+];
+
 const ROWS: &[&str] = &[
     "INSERT INTO users (email, name, balance, is_active) VALUES ('alice@example.com', 'Alice', 100.50, 1), ('bob@example.com', 'Bob', 20.00, 1), ('carol@example.com', 'Carol', 5.25, 0)",
     "INSERT INTO posts (user_id, title, views) VALUES (1, 'Hello', 10), (1, 'Second', 5), (2, 'Bob post', 1), (2, 'Draft', 0)",
@@ -714,5 +722,56 @@ fn a_subquery_in_the_projection_takes_not_null_off_the_tables_it_names() {
     assert!(is_refused(
         &mut adapter,
         "SELECT id, (SELECT COUNT(*) FROM posts WHERE posts.user_id = email) AS c FROM users"
+    ));
+}
+
+/// Laravel's `User::whereHas('posts.tags', fn ($q) => $q->where('name',
+/// $tag))` asks through the pivot table, joined inside the innermost
+/// `EXISTS`, with the tag's name bound. Measured on MySQL 8.4.11: the bare
+/// `name` there is `tags.name`, the one of the joined tables that has it,
+/// compared without regard to case; `whereDoesntHave` is the `NOT EXISTS`;
+/// and a bare name two joined tables both have answers 1052.
+#[test]
+fn laravel_asks_through_a_pivot_table_joined_inside_an_exists() {
+    let (_directory, mut adapter) = adapter_over(LARAVEL);
+    let where_has = "select `name` from `users` where exists (select * from `posts` where `users`.`id` = `posts`.`user_id` and exists (select * from `tags` inner join `post_tag` on `tags`.`id` = `post_tag`.`tag_id` where `posts`.`id` = `post_tag`.`post_id` and `name` = ?))";
+    for (tag, users) in [
+        ("python", rows(&[&[Some("Alice")]])),
+        ("PYTHON", rows(&[&[Some("Alice")]])),
+        ("news", rows(&[&[Some("Alice")], &[Some("Bob")]])),
+        ("rust", Rows::new()),
+    ] {
+        let mut answered = bound_rows(&mut adapter, where_has, &[Bound::Word(tag)]);
+        answered.sort();
+        assert_eq!(answered, users, "{tag}");
+    }
+    let prepared = adapter.execute_stmt_prepare(where_has).unwrap();
+    assert_eq!(
+        prepared
+            .columns
+            .iter()
+            .map(|column| (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags
+            ))
+            .collect::<Vec<_>>(),
+        [("name", MYSQL_TYPE_VAR_STRING, 400, WORDS)]
+    );
+    adapter.execute_stmt_close(prepared.statement_id);
+    assert_eq!(
+        bound_rows(
+            &mut adapter,
+            &where_has
+                .replace("where exists", "where not exists")
+                .replace("= ?))", "= ?)) order by `name`"),
+            &[Bound::Word("python")]
+        ),
+        rows(&[&[Some("Bob")], &[Some("Carol")]])
+    );
+    assert!(is_refused(
+        &mut adapter,
+        "select `name` from `users` where exists (select * from `tags` inner join `post_tag` on `tags`.`id` = `post_tag`.`tag_id` join posts on posts.id = post_tag.post_id where id = 1)"
     ));
 }

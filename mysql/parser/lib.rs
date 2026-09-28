@@ -1257,10 +1257,11 @@ impl CheckedSubqueryComparison {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedSelectComparison {
     qualifier: Option<String>,
-    /// The subquery this comparison was written inside, when it was written
-    /// inside one. An unqualified name looks there before it looks at the
-    /// statement's own table, which is how MySQL reads one.
-    inner_source: Option<String>,
+    /// The tables of the subquery this comparison was written inside, when it
+    /// was written inside one: one, or those it joins. An unqualified name
+    /// looks there before it looks at the statement's own table, which is how
+    /// MySQL reads one.
+    inner_sources: Vec<String>,
     column_name: String,
     operator: CheckedSelectComparisonOperator,
     rhs: CheckedSelectComparisonRhs,
@@ -1272,9 +1273,12 @@ pub struct CheckedSelectComparison {
 
 impl CheckedSelectComparison {
     /// Records the subquery this comparison was written inside.
-    pub(crate) fn name_the_inner_source(&mut self, reference: &str) {
-        if self.inner_source.is_none() {
-            self.inner_source = Some(reference.to_owned());
+    pub(crate) fn name_the_inner_sources(&mut self, references: &[&str]) {
+        if self.inner_sources.is_empty() {
+            self.inner_sources = references
+                .iter()
+                .map(|reference| (*reference).to_owned())
+                .collect();
         }
     }
 
@@ -1285,7 +1289,16 @@ impl CheckedSelectComparison {
     /// does not — `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name`
     /// where `b` carries no `name`.
     pub fn inner_source(&self) -> Option<&str> {
-        self.inner_source.as_deref()
+        self.inner_sources.first().map(String::as_str)
+    }
+
+    /// Returns every table of the subquery this comparison was written
+    /// inside: the one it reads, or each it joins. A name one of them has is
+    /// that table's column — measured on MySQL 8.4.11, Laravel's `whereHas`
+    /// through a pivot, `EXISTS (SELECT * FROM tags INNER JOIN post_tag ON
+    /// ... WHERE name = ?)`, reads `tags.name`.
+    pub fn inner_sources(&self) -> &[String] {
+        &self.inner_sources
     }
 
     /// Returns the qualifier (table name or alias) used on the column, if any.

@@ -1149,7 +1149,7 @@ fn comparison_tables(
     column_tables(
         source_tables,
         comparison.qualifier(),
-        comparison.inner_source(),
+        comparison.inner_sources(),
     )
 }
 
@@ -1158,7 +1158,7 @@ fn comparison_tables(
 fn column_tables(
     source_tables: &[MySqlSelectSource],
     qualifier: Option<&str>,
-    inner_source: Option<&str>,
+    inner_sources: &[String],
 ) -> Result<Vec<MySqlTableName>> {
     let named = |reference: &str| {
         source_tables
@@ -1173,10 +1173,10 @@ fn column_tables(
             )
         });
     }
-    let mut candidates = Vec::new();
-    if let Some(inner) = inner_source.and_then(named) {
-        candidates.push(inner);
-    }
+    let mut candidates = inner_sources
+        .iter()
+        .filter_map(|inner| named(inner))
+        .collect::<Vec<_>>();
     let readable = source_tables
         .iter()
         .filter(|source| !source.subquery() && source.branch() == 0)
@@ -7672,7 +7672,7 @@ impl MySqlConnection {
                     column_tables(
                         source_tables,
                         comparison.qualifier(),
-                        comparison.inner_source(),
+                        comparison.inner_sources(),
                     )?,
                     comparison.column_name(),
                 )?;
@@ -7680,7 +7680,7 @@ impl MySqlConnection {
                     column_tables(
                         source_tables,
                         qualifier.as_deref(),
-                        comparison.inner_source(),
+                        comparison.inner_sources(),
                     )?,
                     name,
                 )?;
@@ -8007,7 +8007,7 @@ impl MySqlConnection {
                     .any(|source| source.reference().eq_ignore_ascii_case(qualifier))
             });
             let mut tables =
-                column_tables(read, qualifier, comparison.inner_source()).unwrap_or_default();
+                column_tables(read, qualifier, comparison.inner_sources()).unwrap_or_default();
             if !names_a_read_table {
                 tables.extend(written.clone());
             }

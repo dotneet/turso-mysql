@@ -222,7 +222,7 @@ pub(super) fn read_the_sequence(
     }
     let reference = source.reference.clone();
     for comparison in comparisons {
-        if comparison.inner_source.is_some() || comparison.answers.is_some() {
+        if !comparison.inner_sources.is_empty() || comparison.answers.is_some() {
             continue;
         }
         if comparison

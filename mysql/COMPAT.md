@@ -1626,8 +1626,19 @@ Measured on 8.4.11, `EXISTS (SELECT 1 FROM b WHERE tag = 'z')` reads `b.tag`
 and `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name`, `b` carrying
 no `name` — and the value is held to the type of whichever column it found.
 
+An `EXISTS` may join tables inside it, which is how Laravel's `whereHas` asks
+through a pivot table: `EXISTS (SELECT * FROM tags INNER JOIN post_tag ON tags.id
+= post_tag.tag_id WHERE posts.id = post_tag.post_id AND name = ?)`, nested in the
+`EXISTS` over `posts`. Measured on MySQL 8.4.11, a bare name there is the column
+of whichever joined table has it — `tags.name` — held to that column's type and
+compared under its collation, a bound `'PYTHON'` finding `python`; one two joined
+tables both have answers 1052, which the engine refuses too; and `NOT EXISTS` is
+`whereDoesntHave`. Only an `EXISTS` in a `SELECT`'s `WHERE` joins: an `IN`, a
+scalar subquery and a subquery in an `UPDATE` or `DELETE` still read one table.
+
 Refused: a subquery projecting more than one column or reading more than one
-table, one carrying its own `ORDER BY` or `LIMIT`, and a subquery anywhere but a `WHERE`.
+table outside an `EXISTS`, one carrying its own `ORDER BY` or `LIMIT`, and a
+subquery anywhere but a `WHERE`.
 
 An `UPDATE` may name the rows it changes through a join —
 `UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0` — and the join is written the

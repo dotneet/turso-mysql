@@ -854,7 +854,7 @@ fn record_json_comparison(
         .checked_comparisons
         .push(CheckedSelectComparison {
             qualifier: None,
-            inner_source: None,
+            inner_sources: Vec::new(),
             column_name: String::new(),
             operator,
             rhs,

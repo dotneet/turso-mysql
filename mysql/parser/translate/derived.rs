@@ -213,7 +213,7 @@ pub(super) fn resolve_comparisons_through_derived_columns(
         .filter(|source| !source.subquery && source.branch == 0)
         .collect::<Vec<_>>();
     for comparison in comparisons {
-        if comparison.inner_source.is_some() || comparison.answers.is_some() {
+        if !comparison.inner_sources.is_empty() || comparison.answers.is_some() {
             continue;
         }
         let source = match &comparison.qualifier {
