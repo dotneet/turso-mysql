@@ -4673,7 +4673,12 @@ table that counts its ids answered 1213 that way. Measured on
 of a key another open transaction just wrote answers 1062 once that one
 commits, leaving the transaction open; both hold here, except that the second
 insert waits for the first transaction's commit where MySQL's does not wait at
-all, the write lock being one over the whole database. So under `READ
+all, the write lock being one over the whole database. A table that counts
+its ids hands them out one session at a time, and a session whose insert
+comes while another's is taking its id waits its turn for as long as it waits
+for a lock, as MySQL's inserts wait at a table's AUTO-INC lock; it used to
+answer 1205 at once, which failed one of Prisma's two `create`s now and then.
+So under `READ
 COMMITTED`, whose snapshot is new at every statement, a write is no longer
 given up at all. A `SAVEPOINT` is not a first read either. Measured on 8.4.11,
 a transaction that begins with one still sees a row another session commits

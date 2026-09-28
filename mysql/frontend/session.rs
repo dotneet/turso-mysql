@@ -5270,8 +5270,10 @@ impl MySqlConnection {
                 "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
             )
         })?;
-        let mut query = capability.allocator.peek_high_water(table.key)?;
-        let high_water = capability.io.block(|| query.step())?;
+        let high_water = self.when_the_counter_is_free(|| {
+            let mut query = capability.allocator.peek_high_water(table.key)?;
+            capability.io.block(|| query.step())
+        })?;
         Ok((high_water > 0).then_some(high_water))
     }
 
@@ -5411,13 +5413,12 @@ impl MySqlConnection {
                 "ALTER TABLE AUTO_INCREMENT past the column's type".to_string(),
             ));
         }
-        let mut lease = capability
-            .allocator
-            .lease_high_water(table.key)
-            .map_err(MySqlQueryError::Engine)?;
-        let current = capability
-            .io
-            .block(|| lease.read())
+        let (mut lease, current) = self
+            .when_the_counter_is_free(|| {
+                let mut lease = capability.allocator.lease_high_water(table.key)?;
+                let current = capability.io.block(|| lease.read())?;
+                Ok((lease, current))
+            })
             .map_err(MySqlQueryError::Engine)?;
         if handed_out < current {
             lease.release().map_err(MySqlQueryError::Engine)?;
@@ -9484,13 +9485,11 @@ impl MySqlConnection {
         // Measured, MySQL cuts the last batch short at the column's highest
         // number and still writes the rows that fit, which this does not
         // repeat.
-        let mut peek = capability
-            .allocator
-            .peek_high_water(table.key)
-            .map_err(MySqlQueryError::Engine)?;
-        let high_water = capability
-            .io
-            .block(|| peek.step())
+        let high_water = self
+            .when_the_counter_is_free(|| {
+                let mut peek = capability.allocator.peek_high_water(table.key)?;
+                capability.io.block(|| peek.step())
+            })
             .map_err(MySqlQueryError::Engine)?;
         if high_water
             .checked_add(spent)
@@ -9502,13 +9501,11 @@ impl MySqlConnection {
             ));
         }
         self.check_write_deadline(deadline)?;
-        let mut reservation = capability
-            .allocator
-            .reserve(table.key, spent)
-            .map_err(MySqlQueryError::Engine)?;
-        let range = capability
-            .io
-            .block(|| reservation.step())
+        let range = self
+            .when_the_counter_is_free(|| {
+                let mut reservation = capability.allocator.reserve(table.key, spent)?;
+                capability.io.block(|| reservation.step())
+            })
             .map_err(MySqlQueryError::Engine)?;
         if range.last() > ceiling {
             return Err(MySqlQueryError::Engine(LimboError::Constraint(
@@ -9833,14 +9830,11 @@ impl MySqlConnection {
             )
         })?;
         self.check_write_deadline(deadline)?;
-        let mut operation = capability
-            .allocator
-            .advance_past(table.key, high_water)
-            .map_err(MySqlQueryError::Engine)?;
-        capability
-            .io
-            .block(|| operation.step())
-            .map_err(MySqlQueryError::Engine)?;
+        self.when_the_counter_is_free(|| {
+            let mut operation = capability.allocator.advance_past(table.key, high_water)?;
+            capability.io.block(|| operation.step())
+        })
+        .map_err(MySqlQueryError::Engine)?;
         self.check_write_deadline(deadline)
     }
 
@@ -10165,8 +10159,11 @@ impl MySqlConnection {
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let mut peek = capability.allocator.peek_high_water(table.key)?;
-        if highest_named > capability.io.block(|| peek.step())? {
+        let high_water = self.when_the_counter_is_free(|| {
+            let mut peek = capability.allocator.peek_high_water(table.key)?;
+            capability.io.block(|| peek.step())
+        })?;
+        if highest_named > high_water {
             return Err(LimboError::ParseError(
                 "a counted upsert naming an id past the counter beside a row asking for one is unsupported"
                     .to_string(),
@@ -10331,8 +10328,11 @@ impl MySqlConnection {
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let mut peek = capability.allocator.peek_high_water(table.key)?;
-        if highest_explicit <= capability.io.block(|| peek.step())? {
+        let high_water = self.when_the_counter_is_free(|| {
+            let mut peek = capability.allocator.peek_high_water(table.key)?;
+            capability.io.block(|| peek.step())
+        })?;
+        if highest_explicit <= high_water {
             return Ok(None);
         }
         if bound
@@ -10366,8 +10366,11 @@ impl MySqlConnection {
         }
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
-        let mut lease = capability.allocator.lease_high_water(table.key)?;
-        let mut current = capability.io.block(|| lease.read())?;
+        let (mut lease, mut current) = self.when_the_counter_is_free(|| {
+            let mut lease = capability.allocator.lease_high_water(table.key)?;
+            let current = capability.io.block(|| lease.read())?;
+            Ok((lease, current))
+        })?;
         if highest_explicit <= current {
             lease.release()?;
             return Ok(None);
@@ -10708,8 +10711,10 @@ impl MySqlConnection {
             .max()
             .unwrap_or(0);
         if highest_explicit > 0 {
-            let mut high_water = capability.allocator.peek_high_water(table.key)?;
-            let high_water = capability.io.block(|| high_water.step())?;
+            let high_water = self.when_the_counter_is_free(|| {
+                let mut peek = capability.allocator.peek_high_water(table.key)?;
+                capability.io.block(|| peek.step())
+            })?;
             if highest_explicit > high_water {
                 return Err(LimboError::ParseError(
                     "AUTO_INCREMENT INSERT with a new explicit high-water mark is not supported"
@@ -10718,10 +10723,12 @@ impl MySqlConnection {
             }
         }
         let high_water_before = if has_generated {
-            let mut reservation = capability
-                .allocator
-                .reserve_insert_values(table.key, row_values.clone())?;
-            let reserved = capability.io.block(|| reservation.step())?;
+            let reserved = self.when_the_counter_is_free(|| {
+                let mut reservation = capability
+                    .allocator
+                    .reserve_insert_values(table.key, row_values.clone())?;
+                capability.io.block(|| reservation.step())
+            })?;
             let generated_ceiling = if table.definition.allocator_column_type
                 == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
             {
@@ -10746,6 +10753,28 @@ impl MySqlConnection {
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
         self.row_ids_after(bound, table, values, row_values, high_water_before)
+    }
+
+    /// Runs one step of a table's `AUTO_INCREMENT` counter, starting it again
+    /// while another session's step holds the counter.
+    ///
+    /// The counter lets one step in at a time and answers any other at once
+    /// with `Busy`, and a step takes a moment, so a session waits for it as
+    /// long as it waits for any other lock, the way MySQL's inserts wait their
+    /// turn at a table's AUTO-INC lock. Answering 1205 at once failed one of
+    /// Prisma's two concurrent `tag.create` calls in the framework harness.
+    fn when_the_counter_is_free<T>(&self, mut step: impl FnMut() -> Result<T>) -> Result<T> {
+        let deadline = std::time::Instant::now().checked_add(self.inner.get_busy_timeout());
+        loop {
+            match step() {
+                Err(LimboError::Busy)
+                    if deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                answer => return answer,
+            }
+        }
     }
 
     /// The ids a `VALUES` insert's rows take when the counter stands at

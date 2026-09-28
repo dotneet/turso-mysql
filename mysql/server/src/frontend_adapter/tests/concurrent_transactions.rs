@@ -307,3 +307,36 @@ fn counted(adapter: &mut Adapter, statement_id: u32) -> i64 {
     };
     count
 }
+
+/// Prisma's `Promise.all([tag.create(...), tag.create(...)])` over two pooled
+/// connections, each in a transaction of its own, many times over. Each
+/// insert takes its id from the table's counter, which lets one session in at
+/// a time; the other waits its turn, as MySQL's inserts wait at a table's
+/// AUTO-INC lock, rather than answering 1205 at once.
+#[test]
+fn two_sessions_inserting_counted_rows_at_once_both_write_every_row() {
+    const ROUNDS: usize = 200;
+    let TwoSessions {
+        _directory,
+        one,
+        two,
+    } = two_sessions();
+    let inserter = |mut adapter: Adapter, prefix: &'static str| {
+        std::thread::spawn(move || {
+            let insert = prepare(&mut adapter, INSERT_TAG);
+            for round in 0..ROUNDS {
+                run(&mut adapter, "BEGIN");
+                let name = format!("{prefix}{round}");
+                execute(&mut adapter, insert, &[Bound::Null, Bound::Word(&name)])
+                    .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                run(&mut adapter, "COMMIT");
+            }
+            adapter
+        })
+    };
+    let first = inserter(one, "a");
+    let second = inserter(two, "b");
+    let mut one = first.join().unwrap();
+    second.join().unwrap();
+    assert_eq!(names(&mut one).len(), 2 * ROUNDS);
+}
