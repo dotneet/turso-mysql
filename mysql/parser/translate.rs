@@ -1865,6 +1865,14 @@ fn render_having_predicate(
             };
             let (rendered_right, rhs) =
                 render_checked_select_comparison_rhs(right, render_context)?;
+            // Measured on MySQL 8.4.11: a count against a word compares the
+            // two as doubles, so a word naming a whole number is that number
+            // — Rails writes `HAVING (COUNT(*) > '1')` — and says nothing.
+            let (rendered_right, rhs) = if static_select_metadata::is_count_call(function) {
+                whole_number_a_written_word_names(rendered_right, rhs)
+            } else {
+                (rendered_right, rhs)
+            };
             if !matches!(rhs, CheckedSelectComparisonRhs::SignedInteger(_)) {
                 return unsupported("HAVING comparison requires an exact signed integer");
             }

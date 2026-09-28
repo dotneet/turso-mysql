@@ -1759,7 +1759,12 @@ types against, so the aggregate's own argument column is recorded instead —
 `HAVING SUM(score) > 45` holds `score` to the same rule `WHERE score > 45`
 would, which is what makes the integer literal safe. `COUNT` records nothing,
 because it answers an integer whatever it counts. `AND`, `OR`, `NOT` and
-parentheses cross; the right side has to be an exact signed integer.
+parentheses cross; the right side has to be an exact signed integer. A count
+also takes a word naming a whole number, which Rails writes for a bound one —
+`HAVING (COUNT(*) > '1')`: measured on 8.4.11, MySQL compares the two as
+doubles, so `'1'` and `'02'` are the numbers they name and raise nothing,
+where `'1abc'` warns 1292; a word with a point, a space or anything else
+beside its digits is refused, and so is a word against any other aggregate.
 
 A `HAVING` with no `GROUP BY` is taken, over the one implicit group of every
 row. Measured on MySQL 8.4.11 over rows (1,'a',10), (2,'a',30), (3,'b',20):

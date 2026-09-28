@@ -236,3 +236,36 @@ fn a_qualified_aggregate_that_could_name_another_table_is_refused() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// Rails' `group(:user_id).having("COUNT(*) > ?", 1).count` writes the bound
+/// number as a word. Measured on MySQL 8.4.11: a count against a word
+/// compares the two as doubles, so `'1'` is 1 and says nothing, while
+/// `'1abc'` warns 1292 and `'1.5'` is not a whole number.
+#[test]
+fn rails_compares_a_count_with_a_word_naming_a_whole_number() {
+    let (_directory, mut adapter) = adapter();
+    let grouped = result_set(
+        &mut adapter,
+        "SELECT COUNT(*) AS `count_all`, `posts`.`user_id` AS `posts_user_id` FROM `posts` GROUP BY `posts`.`user_id` HAVING (COUNT(*) > '1')",
+    );
+    assert_eq!(
+        text_rows(&grouped),
+        [[Some("2".to_owned()), Some("1".to_owned())]]
+    );
+    assert_eq!(grouped.warnings, 0);
+    assert_eq!(
+        text_rows(&result_set(
+            &mut adapter,
+            "SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*) = '02'"
+        )),
+        [[Some("1".to_owned())]]
+    );
+    for sql in [
+        "SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*) > '1abc'",
+        "SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*) > '1.5'",
+        "SELECT user_id FROM posts GROUP BY user_id HAVING COUNT(*) > ' 1'",
+        "SELECT user_id FROM posts GROUP BY user_id HAVING MAX(id) > '1'",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

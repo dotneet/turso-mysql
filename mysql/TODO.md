@@ -527,6 +527,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A word against a column holding numbers that is not a whole number spelled out — `age = '1.5'`, `' 30'`, `'3e1'`, `''`, `'30abc'` — or any word against a `DOUBLE`, or one past an `i64` | refused; measured, MySQL reads `'1.5'` against an `INT` as a double, the others without a warning or with warning 1292, and this reads only the words it can spell out as the one number MySQL reads. `id = '1'`, `IN ('1', '2')`, `BETWEEN`, a `DECIMAL` against `'10.5'`, a word bound against a whole-number column and `YEAR(col) = '2026'` are taken |
 | A word bound against a call — `YEAR(created_at) = ?` | refused; a bound value against a call is refused whatever it binds |
 | A `HAVING` counted against a number written with a fraction — `HAVING COUNT(*) > 1.5` | refused; a count is a whole number |
+| A `HAVING` comparing a word with an aggregate other than a count, or a count with a word that is not only a whole number's digits — `HAVING SUM(n) > '1'`, `HAVING COUNT(*) > '1abc'` | refused; measured, MySQL compares them as doubles and warns 1292 for a word it cuts. A count against a word naming a whole number is taken |
 | A run of digits too long for an `i64` in a comparison against an integer or floating column — `n > 9223372036854775808` | refused; an exact `DECIMAL` column accepts up to 65 written digits after its type has been checked |
 | `ENUM` | works |
 | `ORDER BY` on a `SET` | orders by the numeric bit value of its members, as measured on MySQL 8.4.11 |
