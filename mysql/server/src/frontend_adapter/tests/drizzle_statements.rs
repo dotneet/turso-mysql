@@ -495,3 +495,50 @@ fn drizzle_kit_reads_indexes_with_qualified_columns() {
     };
     assert_eq!(result.rows.len(), 1);
 }
+
+/// The app's first schema with five tags, `news` on two posts, `alpha`,
+/// `rust` and `sql` on one each and `Zed` on none.
+fn tagged_blog() -> (tempfile::TempDir, Adapter) {
+    let (directory, mut adapter) = adapter();
+    for sql in FIRST_MIGRATION {
+        run(&mut adapter, sql);
+    }
+    for sql in [
+        "INSERT INTO users (id, email, name) VALUES (1, 'alice@example.com', 'Alice'), (2, 'bob@example.com', 'Bob')",
+        "INSERT INTO posts (id, user_id, title, views) VALUES (1, 1, 'Hello', 3), (2, 1, 'Second', 5), (3, 2, 'Bob writes', 3)",
+        "INSERT INTO tags (id, name) VALUES (1, 'news'), (2, 'rust'), (3, 'sql'), (4, 'Zed'), (5, 'alpha')",
+        "INSERT INTO post_tags VALUES (1, 1), (1, 2), (3, 3), (3, 1), (2, 5)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    (directory, adapter)
+}
+
+/// `db.select({ name: tags.name, n: count(postTags.postId) }).from(tags)
+/// .leftJoin(postTags, ...).groupBy(tags.id).orderBy(desc(count(...)),
+/// asc(tags.name))` orders by a column its key decides. Measured on MySQL
+/// 8.4.11: that is taken as the projection takes it, words ordered under
+/// `utf8mb4_0900_ai_ci`, and one the keys do not decide is 1055.
+#[test]
+fn drizzles_grouped_count_orders_by_a_column_its_key_decides() {
+    let (_directory, mut adapter) = tagged_blog();
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "select `tags`.`name`, count(`post_tags`.`post_id`) from `tags` left join `post_tags` on `post_tags`.`tag_id` = `tags`.`id` group by `tags`.`id` order by count(`post_tags`.`post_id`) desc, `tags`.`name` asc"
+        ),
+        [["news", "2"], ["alpha", "1"], ["rust", "1"], ["sql", "1"], ["Zed", "0"]]
+            .map(|row| row.map(|value| Some(value.to_owned())))
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "select count(*) AS n from tags left join post_tags on post_tags.tag_id = tags.id group by tags.id order by tags.name desc"
+        ),
+        [["1"], ["1"], ["1"], ["2"], ["1"]].map(|row| row.map(|value| Some(value.to_owned())))
+    );
+    refused(
+        &mut adapter,
+        "select tags.id, count(*) AS n from tags left join post_tags on post_tags.tag_id = tags.id group by tags.id order by post_tags.post_id",
+    );
+}

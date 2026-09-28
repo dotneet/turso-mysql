@@ -584,10 +584,13 @@ pub(super) fn hold_the_grouped_having(
 /// projection is held.
 ///
 /// An ordinal and a projection's alias name something the projection was
-/// already held to.
+/// already held to. A column the keys decide may be ordered by as it may be
+/// projected — Drizzle's `GROUP BY tags.id ORDER BY count(...) DESC,
+/// tags.name` — and joins the columns the frontend holds to the keys.
 pub(super) fn hold_the_grouped_order_by(
     order_by: &sqlparser::ast::OrderBy,
     select: &sqlparser::ast::Select,
+    claim: &mut Option<MySqlColumnsTheKeysDecide>,
 ) -> Result<(), ParseError> {
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         return Ok(());
@@ -610,7 +613,28 @@ pub(super) fn hold_the_grouped_order_by(
         {
             continue;
         }
-        return unsupported("GROUP BY leaves an ordered column out of the grouping");
+        let Some(columns) = columns_beside_the_keys(ordered, group_by) else {
+            return unsupported("GROUP BY leaves an ordered column out of the grouping");
+        };
+        if claim.is_none() {
+            let Some(joins) = joined_tables(&select.from) else {
+                return unsupported("GROUP BY keys deciding a column over this FROM");
+            };
+            *claim = Some(MySqlColumnsTheKeysDecide {
+                keys: group_by
+                    .iter()
+                    .filter_map(grouped_column)
+                    .map(MySqlNamedColumn::written)
+                    .collect(),
+                columns: Vec::new(),
+                joins,
+            });
+        }
+        claim
+            .as_mut()
+            .expect("the claim was made above")
+            .columns
+            .extend(columns);
     }
     Ok(())
 }

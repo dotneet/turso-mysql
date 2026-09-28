@@ -3330,6 +3330,23 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
             .collect::<Vec<_>>(),
         [(None, "team")]
     );
+    // So is a column the statement is ordered by, which MySQL takes when the
+    // keys decide it and answers 1055 for otherwise.
+    let translated = parse_select(
+        "SELECT team FROM users GROUP BY team ORDER BY COUNT(*) DESC, score",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated
+            .columns_the_keys_decide()
+            .expect("score is not a key")
+            .columns()
+            .iter()
+            .map(|column| (column.table(), column.column()))
+            .collect::<Vec<_>>(),
+        [(None, "score")]
+    );
     let translated = parse_select(
         "SELECT u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id AND u.active = 1 GROUP BY p.id",
         SessionSqlMode::default(),
@@ -3370,8 +3387,7 @@ fn group_by_takes_whole_columns_and_holds_only_full_group_by() {
         "SELECT UPPER(team), COUNT(*) FROM users GROUP BY UPPER(team)",
         // A key inside a larger expression is not the key: 1055.
         "SELECT UPPER(DATE(joined)) FROM users GROUP BY DATE(joined)",
-        // 1055 for an ordered column, 1054 for a HAVING column.
-        "SELECT team FROM users GROUP BY team ORDER BY score",
+        // 1054 for a HAVING column.
         "SELECT id FROM users GROUP BY id HAVING score > 1",
         "SELECT DATE(joined) FROM users GROUP BY DATE(joined) HAVING DATE(joined) > '2026-01-01'",
         // A rollup over an expression, a rollup read again for each level's

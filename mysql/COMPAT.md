@@ -1962,11 +1962,14 @@ JOIN posts p ... GROUP BY p.id` does not decide `u.name`, and `ON p.user_id =
 p.id AND u.id = p.user_id` decides nothing under `GROUP BY p.user_id`, the rows
 it leaves unmatched differing within a group. A table's keys decide its own
 columns on either side, a `LEFT JOIN`'s missing row answering NULL for all of
-them. Everything else MySQL answers 1055 for is refused here. Some forms MySQL
-takes are refused too, not having been worked out: a match in the `WHERE`, a
+them. A decided column may be ordered by as it may be projected — Drizzle's
+`GROUP BY tags.id ORDER BY count(post_tags.post_id) DESC, tags.name`, measured
+on 8.4.11 and matched — and ordering by a column the keys do not decide is 1055
+there and refused here. Everything else MySQL answers 1055 for is refused here.
+Some forms MySQL takes are refused too, not having been worked out: a match in the `WHERE`, a
 comma join, `USING`, a `RIGHT JOIN`, a match between columns that are not both
 whole numbers, a derived table or a view among the tables, a decided column in
-the `ORDER BY` or the `HAVING`, and the same grouping in a subquery, a `UNION`,
+the `HAVING`, and the same grouping in a subquery, a `UNION`,
 a view, `INSERT ... SELECT` or `CREATE TABLE ... AS SELECT`. A call over
 words the client wrote itself is not taken as a key — `GROUP BY UPPER(title)` —
 because MySQL groups words under the column's collation, where `a` and `A` are

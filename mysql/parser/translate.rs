@@ -703,7 +703,11 @@ pub(crate) fn translate_select_query(
     };
     if let Some(order_by) = &query.order_by {
         if let SetExpr::Select(select) = query.body.as_ref() {
-            grouping::hold_the_grouped_order_by(order_by, select)?;
+            grouping::hold_the_grouped_order_by(
+                order_by,
+                select,
+                &mut render_context.columns_the_keys_decide,
+            )?;
         }
         normalized.push_str(" ORDER BY ");
         normalized.push_str(&render_select_order_by(
