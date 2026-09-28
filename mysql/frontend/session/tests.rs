@@ -2863,8 +2863,12 @@ fn secondary_index_on_primary_key_columns_is_visible_and_droppable() -> Result<(
     Ok(())
 }
 
+/// A table another table's foreign key names is made again under a name of
+/// its own and given the table's name once the old one is gone, so the
+/// child's key goes on naming it rather than following it to a temporary
+/// name.
 #[test]
-fn rewriting_a_referenced_table_cannot_change_its_foreign_key_target() -> Result<()> {
+fn rewriting_a_referenced_table_keeps_its_foreign_key_target() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open_database(io, "mysql-referenced-rewrite.db", OpenFlags::Create)?;
     let connection = MySqlConnection::new(db.connect()?, binary_context())?;
@@ -2875,21 +2879,28 @@ fn rewriting_a_referenced_table_cannot_change_its_foreign_key_target() -> Result
          CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent (id))",
     )?;
 
-    assert!(matches!(
-        connection.execute_schema_ddl("ALTER TABLE parent ADD COLUMN first_column INT FIRST"),
-        Err(MySqlQueryError::Unsupported(_))
-    ));
+    connection
+        .execute_schema_ddl("ALTER TABLE parent ADD COLUMN first_column INT FIRST")
+        .unwrap();
     let schema = connection.inner().current_schema();
     let child = schema.get_btree_table("child").unwrap();
     assert_eq!(child.foreign_keys[0].parent_table, "parent");
-    assert!(schema
-        .get_btree_table("parent")
-        .unwrap()
-        .columns()
-        .iter()
-        .all(|column| column.name.as_deref() != Some("first_column")));
+    assert_eq!(
+        schema
+            .get_btree_table("parent")
+            .unwrap()
+            .columns()
+            .iter()
+            .map(|column| column.name.clone().unwrap())
+            .collect::<Vec<_>>(),
+        ["first_column", "id"]
+    );
+    assert!(schema.get_btree_table("parent_turso_written").is_none());
     drop(schema);
     connection.execute("INSERT INTO child (id, parent_id) VALUES (1, 1)")?;
+    assert!(connection
+        .execute("INSERT INTO child (id, parent_id) VALUES (2, 2)")
+        .is_err());
     connection.close()?;
     Ok(())
 }

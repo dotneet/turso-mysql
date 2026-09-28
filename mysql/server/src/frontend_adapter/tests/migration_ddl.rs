@@ -1151,3 +1151,148 @@ fn drop_table_refuses_a_table_another_tables_key_names() {
     run(&mut adapter, "DROP TABLE sr");
     assert!(!table_names(&mut adapter).contains(&"sr".to_owned()));
 }
+
+fn column_order(adapter: &mut Adapter, table: &str) -> Vec<String> {
+    rows(adapter, &format!("SHOW COLUMNS FROM `{table}`"))
+        .into_iter()
+        .map(|row| row[0].clone().unwrap())
+        .collect()
+}
+
+/// Laravel writes every `->after()` of one migration into one `ALTER TABLE`.
+/// Measured on MySQL 8.4.11: the clauses go in the order written, each placed
+/// in the table the ones before it left, a clause naming no place puts its
+/// column last at its turn, and `AFTER` a column only a later clause adds is
+/// 1054, leaving the table as it was.
+#[test]
+fn several_columns_placed_in_one_alter_stand_where_each_asked() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, "CREATE TABLE m1 (id INT, x INT, y INT)");
+    run(&mut adapter, "INSERT INTO m1 VALUES (1, 2, 3)");
+    run(
+        &mut adapter,
+        "ALTER TABLE m1 ADD a INT AFTER x, ADD b INT AFTER a",
+    );
+    assert_eq!(column_order(&mut adapter, "m1"), ["id", "x", "a", "b", "y"]);
+    assert_eq!(
+        refused_with(
+            &mut adapter,
+            "ALTER TABLE m1 ADD d INT AFTER c, ADD c INT AFTER id"
+        ),
+        FrontendErrorKind::UnknownColumn
+    );
+    assert_eq!(column_order(&mut adapter, "m1"), ["id", "x", "a", "b", "y"]);
+    run(
+        &mut adapter,
+        "ALTER TABLE m1 ADD e INT, ADD f INT FIRST, ADD g INT AFTER e",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE m1 ADD h INT AFTER y, ADD i INT AFTER y",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE m1 ADD j INT AFTER id, ADD COLUMN k INT, ADD l INT FIRST, ADD m INT FIRST",
+    );
+    assert_eq!(
+        column_order(&mut adapter, "m1"),
+        ["m", "l", "f", "id", "j", "x", "a", "b", "y", "i", "h", "e", "g", "k"]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, x, y, a FROM m1"),
+        [some_and_null(&["1", "2", "3"], 1)]
+    );
+    assert_eq!(
+        refused_with(&mut adapter, "ALTER TABLE m1 ADD n INT FIRST, ADD n INT"),
+        FrontendErrorKind::DuplicateColumn
+    );
+}
+
+/// `values` followed by `nulls` NULLs.
+fn some_and_null(values: &[&str], nulls: usize) -> Vec<Option<String>> {
+    let mut row = some(values);
+    row.extend(std::iter::repeat_n(None, nulls));
+    row
+}
+
+/// A column placed in a table other tables' foreign keys name — Laravel adds
+/// `->after()` columns to `users` and `posts`, which `posts` and `post_tag`
+/// name. MySQL writes the table again and every key naming it holds as it
+/// did: measured on 8.4.11, the rows keep their values and take the new
+/// column's default, a child row naming no parent is still 1452, a delete
+/// still cascades, and the counter goes on from where it stood.
+#[test]
+fn a_column_placed_in_a_table_other_tables_name_keeps_their_keys() {
+    let (directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE users (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL UNIQUE, password VARCHAR(255) NOT NULL)",
+        "CREATE TABLE posts (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, user_id BIGINT UNSIGNED NOT NULL, title VARCHAR(255) NOT NULL, views INT NOT NULL DEFAULT 0, CONSTRAINT posts_user_id_foreign FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE)",
+        "CREATE TABLE tags (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50))",
+        "CREATE TABLE post_tag (post_id BIGINT UNSIGNED NOT NULL, tag_id BIGINT UNSIGNED NOT NULL, PRIMARY KEY (post_id, tag_id), FOREIGN KEY (post_id) REFERENCES posts (id) ON DELETE CASCADE, FOREIGN KEY (tag_id) REFERENCES tags (id))",
+        "INSERT INTO users (name, email, password) VALUES ('a', 'a@x', 'p'), ('b', 'b@x', 'p')",
+        "INSERT INTO posts (user_id, title) VALUES (1, 't1'), (2, 't2')",
+        "INSERT INTO tags (name) VALUES ('x')",
+        "INSERT INTO post_tag VALUES (1, 1), (2, 1)",
+        "alter table `users` add `balance` decimal(10, 2) not null default '0' after `password`, add `is_active` tinyint(1) not null default '1' after `balance`, add `profile` json null after `is_active`",
+        "alter table `posts` add `slug` varchar(255) null after `title`",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let mut adapter = reopened(&directory, adapter);
+    assert_eq!(
+        printed_table(&mut adapter, "users"),
+        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  `email` varchar(255) NOT NULL,\n  `password` varchar(255) NOT NULL,\n  `balance` decimal(10,2) NOT NULL DEFAULT '0.00',\n  `is_active` tinyint(1) NOT NULL DEFAULT '1',\n  `profile` json DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `email` (`email`)\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        column_order(&mut adapter, "posts"),
+        ["id", "user_id", "title", "slug", "views"]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, balance, is_active, profile FROM users"
+        ),
+        [
+            vec![
+                Some("1".to_owned()),
+                Some("0.00".to_owned()),
+                Some("1".to_owned()),
+                None
+            ],
+            vec![
+                Some("2".to_owned()),
+                Some("0.00".to_owned()),
+                Some("1".to_owned()),
+                None
+            ],
+        ]
+    );
+    assert_eq!(
+        refused_with(
+            &mut adapter,
+            "INSERT INTO posts (user_id, title) VALUES (99, 'orphan')"
+        ),
+        FrontendErrorKind::ForeignKeyViolation
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO users (name, email, password) VALUES ('c', 'c@x', 'p')",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT MAX(id) FROM users"),
+        [some(&["3"])]
+    );
+    assert_eq!(
+        refused_with(
+            &mut adapter,
+            "INSERT INTO users (name, email, password) VALUES ('d', 'a@x', 'p')"
+        ),
+        FrontendErrorKind::ConstraintViolation
+    );
+    run(&mut adapter, "DELETE FROM users WHERE id = 1");
+    assert_eq!(rows(&mut adapter, "SELECT id FROM posts"), [some(&["2"])]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT post_id FROM post_tag"),
+        [some(&["2"])]
+    );
+}

@@ -283,7 +283,9 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | The index MySQL creates beside a `FOREIGN KEY` | created when no existing key has the child columns as a left prefix; it appears in `SHOW CREATE TABLE` |
 | `ALTER TABLE ... ADD FOREIGN KEY` without a `CONSTRAINT` name | works; measured, MySQL names it `t_ibfk_N` counting the keys the table already carries, and so does this — two unnamed keys added one after the other read back as `t_ibfk_1` and `t_ibfk_2` |
 | The index MySQL creates beside a `FOREIGN KEY` an `ALTER TABLE` adds | created or reused by the same rule as `CREATE TABLE` |
-| Column-position changes on a child table carrying a foreign key | accepted with its foreign key and supporting indexes retained through the rewrite and reopen; position changes on a referenced parent table remain refused |
+| Column-position changes on a table in a foreign key | accepted on a child and on a referenced parent, each key and supporting index retained through the rewrite and reopen |
+| A placed `ADD COLUMN` beside any operation but another `ADD COLUMN` in one `ALTER TABLE` | refused; several `ADD COLUMN`s, placed or not, are taken |
+| A column placed, moved, or a `CHECK` added or dropped, in a database holding a view or a trigger written through this server | refused; the table is written again under another name, and the engine refuses to rename a table while such a view or trigger exists |
 | `FLOAT(M,D)` and `DOUBLE(M,D)` | refused; MySQL keeps the size and rounds a stored value to it — measured, 1.239 into a `double(10,2)` reads back 1.24 — which is a rounding rule this does not have |
 | `FLOAT(p)` naming a precision | refused; MySQL reads `p` up to 24 as a `float` and above it as a `double`, which has not been measured |
 | Warning 1681 for an integer display width or a floating-point size | not raised; MySQL raises one per column and this raises none, so a client counting warnings after a `CREATE TABLE` sees zero |
@@ -560,8 +562,7 @@ Behaviour that works but does not match MySQL lives in
   table through the MySQL frontend fails with a migration error
 - Legacy tables with a foreign key but no child index must be rebuilt or
   re-imported; opening them through the MySQL frontend fails with a migration
-  error. Column-position changes on a referenced parent table are refused until
-  its foreign key targets can be preserved through a rewrite
+  error
 - `TIMESTAMP` converts explicit `INSERT ... VALUES` input and direct column
   output for fixed-offset sessions. Wider non-UTC queries and writes are
   refused as listed above

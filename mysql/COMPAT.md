@@ -3101,9 +3101,27 @@ anyway, so the statement runs as the ordinary one it means; `AFTER` naming a
 column the table has not got answers 1054, which is what MySQL answers. A table
 carrying a trigger is refused, a trigger not being the table's own row.
 Moving a column in a foreign-key child table retains its constraint and
-supporting indexes through the rewrite and a reopen. Moving a column in a
-referenced parent table is refused, because rewriting it would retarget the
-child's reference to the temporary table.
+supporting indexes through the rewrite and a reopen. A table another table's
+foreign key names is written again the other way round, since the engine
+points a child's key at a renamed table's new name: the new table is made
+under a name of its own, the rows are copied into it, the old one is dropped,
+and the new one takes the name the child's key still names. Laravel adds its
+`->after()` columns to `users` and `posts`, which `posts` and `post_tag` name;
+measured on 8.4.11 and matched, the rows keep their values and take the new
+column's default, a child row naming no parent is still refused, a delete
+still cascades, and the counter goes on from where it stood, across a reopen.
+
+Laravel writes every `->after()` of one migration into one `ALTER TABLE` —
+`add balance ... after password, add is_active ... after balance, add profile
+... after is_active`. Measured on 8.4.11 and matched: the clauses go in the
+order written, each placed in the table the ones before it left, so `ADD a
+AFTER x, ADD b AFTER a` leaves `x, a, b` and `ADD h AFTER y, ADD i AFTER y`
+leaves `y, i, h`; a clause naming no place puts its column last at its turn;
+and `AFTER` a column only a later clause adds is 1054, leaving the table as it
+was. Such a statement is taken when every clause adds a column; one mixing a
+placed `ADD` with any other operation is refused. A rewrite of any table is
+refused in a database holding a view or a trigger written through this
+server, the engine refusing to rename a table there.
 
 A table's stored definition is held to being exactly what the reader that
 canonicalises one would write, which is how a tampered schema row is caught, and

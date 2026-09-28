@@ -199,6 +199,14 @@ struct StoredIndexStatement {
     implicit: bool,
 }
 
+/// What a table's rewrite runs once its rows are in the new table.
+struct AfterTheCopy {
+    drop_the_old_table: String,
+    /// Where the new table was made under a name of its own, the statement
+    /// giving it the table's name.
+    rename_the_new_one: Option<String>,
+}
+
 #[derive(Clone)]
 pub(crate) struct AutoIncrementExecutionCapability {
     allocator: DurableRangeAllocator,
@@ -4382,8 +4390,14 @@ impl MySqlConnection {
     /// Foreign key checks are off while this runs. Every row is carried across,
     /// so nothing a key names goes missing; what the checks would catch is the
     /// moment between the drop and the copy, which is not a state any statement
-    /// can see. A table referenced by a foreign key cannot use this path:
-    /// renaming it would retarget the child constraint to the temporary name.
+    /// can see.
+    ///
+    /// A table another table's foreign key names is made the other way round:
+    /// the engine points a child's key at a renamed table's new name, so the
+    /// table cannot be set aside under a name of its own. The new one is made
+    /// under a name of its own instead, the rows are copied into it, the old
+    /// one is dropped, and the new one takes the name, which the child's key
+    /// still names.
     fn write_the_table_again_with(
         &self,
         table: &str,
@@ -4393,15 +4407,10 @@ impl MySqlConnection {
         // it, where MySQL leaves one where it stood.
         self.reject_insert_target_triggers(table)
             .map_err(MySqlQueryError::Engine)?;
-        if self
+        let referenced = self
             .inner
             .current_schema()
-            .any_resolved_fks_referencing(table)
-        {
-            return Err(MySqlQueryError::Unsupported(
-                "moving a column of a table referenced by a foreign key".to_string(),
-            ));
-        }
+            .any_resolved_fks_referencing(table);
         let counter = self
             .counter_of_a_stored_table(table)
             .map_err(MySqlQueryError::Engine)?;
@@ -4410,6 +4419,47 @@ impl MySqlConnection {
             .map_err(MySqlQueryError::Engine)?;
         let quoted = mysql_quoted(table);
         let set_aside = format!("{table}_turso_rewritten");
+        let (before, copied_into, copied_from, after_copy) = if referenced {
+            let made_new = format!("{table}_turso_written");
+            let written_prefix = format!("CREATE TABLE {quoted} (");
+            let Some(columns_onwards) = rewrite.create_sql.strip_prefix(&written_prefix) else {
+                return Err(MySqlQueryError::Unsupported(
+                    "writing again a table whose statement does not begin with its name"
+                        .to_string(),
+                ));
+            };
+            (
+                vec![format!(
+                    "CREATE TABLE {} ({columns_onwards}",
+                    mysql_quoted(&made_new)
+                )],
+                made_new.clone(),
+                table.to_owned(),
+                AfterTheCopy {
+                    drop_the_old_table: format!("DROP TABLE {}", sqlite_quoted(table)),
+                    rename_the_new_one: Some(format!(
+                        "ALTER TABLE {} RENAME TO {quoted}",
+                        mysql_quoted(&made_new)
+                    )),
+                },
+            )
+        } else {
+            (
+                vec![
+                    format!(
+                        "ALTER TABLE {quoted} RENAME TO {}",
+                        mysql_quoted(&set_aside)
+                    ),
+                    rewrite.create_sql.clone(),
+                ],
+                table.to_owned(),
+                set_aside.clone(),
+                AfterTheCopy {
+                    drop_the_old_table: format!("DROP TABLE {}", sqlite_quoted(&set_aside)),
+                    rename_the_new_one: None,
+                },
+            )
+        };
         // The rows go across through the engine rather than through the
         // frontend's own `INSERT`, which would refuse to write a counted
         // column its numbers. These are the rows the table already has, with
@@ -4428,22 +4478,16 @@ impl MySqlConnection {
             .join(", ");
         let copy = format!(
             "INSERT INTO {} ({written_into}) SELECT {read_from} FROM {}",
-            sqlite_quoted(table),
-            sqlite_quoted(&set_aside)
+            sqlite_quoted(&copied_into),
+            sqlite_quoted(&copied_from)
         );
         let checks = self.inner.foreign_keys_enabled();
         self.set_foreign_key_checks(false);
         let written = self.write_the_table_again_between_commits(
-            &[
-                format!(
-                    "ALTER TABLE {quoted} RENAME TO {}",
-                    mysql_quoted(&set_aside)
-                ),
-                rewrite.create_sql.clone(),
-            ],
+            &before,
             &copy,
-            &format!("DROP TABLE {}", sqlite_quoted(&set_aside)),
-            table,
+            &after_copy,
+            &copied_into,
             &indexes,
         );
         self.set_foreign_key_checks(checks);
@@ -4470,8 +4514,8 @@ impl MySqlConnection {
         &self,
         before: &[String],
         copy: &str,
-        drop_aside: &str,
-        table: &str,
+        after_copy: &AfterTheCopy,
+        copied_into: &str,
         after: &[StoredIndexStatement],
     ) -> std::result::Result<(), MySqlQueryError> {
         // DDL commits what came before it, which is what MySQL does.
@@ -4479,7 +4523,7 @@ impl MySqlConnection {
             self.run_internal("COMMIT")?;
         }
         self.run_internal("BEGIN")?;
-        let applied = self.write_the_table_again_now(before, copy, drop_aside, table, after);
+        let applied = self.write_the_table_again_now(before, copy, after_copy, copied_into, after);
         if applied.is_err() {
             self.run_internal("ROLLBACK")?;
             return applied;
@@ -4499,8 +4543,8 @@ impl MySqlConnection {
         &self,
         before: &[String],
         copy: &str,
-        drop_aside: &str,
-        table: &str,
+        after_copy: &AfterTheCopy,
+        copied_into: &str,
         after: &[StoredIndexStatement],
     ) -> std::result::Result<(), MySqlQueryError> {
         let run = |statement: &String| -> std::result::Result<(), MySqlQueryError> {
@@ -4510,8 +4554,9 @@ impl MySqlConnection {
                 .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
         };
         before.iter().try_for_each(run)?;
-        self.carry_the_rows_across(copy, table)?;
-        self.run_internal(drop_aside)?;
+        self.carry_the_rows_across(copy, copied_into)?;
+        self.run_internal(&after_copy.drop_the_old_table)?;
+        after_copy.rename_the_new_one.iter().try_for_each(run)?;
         after.iter().try_for_each(|index| {
             self.prepare_with_index_origin(&index.sql, index.implicit)
                 .and_then(|mut prepared| prepared.run_ignore_rows())

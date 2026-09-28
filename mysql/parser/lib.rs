@@ -3589,6 +3589,9 @@ pub fn table_with_a_column_placed(
     let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
         return Ok(None);
     };
+    if alter.operations.len() > 1 {
+        return table_with_columns_added_in_place(stored_ddl, &alter.operations, mode);
+    }
     let [operation] = alter.operations.as_slice() else {
         return Ok(None);
     };
@@ -3693,6 +3696,83 @@ pub fn table_with_a_column_placed(
         }
     };
     table.columns.insert(at, column_def);
+    Ok(Some(MySqlColumnPlacement::TableWrittenAgain(
+        MySqlTableRewrite {
+            create_sql: render_table_written_again(&table, mode)?,
+            carried_columns,
+        },
+    )))
+}
+
+/// Reads an `ALTER TABLE` adding several columns, one or more of them with a
+/// place — Laravel writes each `->after()` of one migration this way — and
+/// answers the table it becomes.
+///
+/// Measured on MySQL 8.4.11: the clauses go in the order written, each placed
+/// in the table the ones before it left, so `ADD a AFTER x, ADD b AFTER a`
+/// leaves `x, a, b`, `ADD h AFTER y, ADD i AFTER y` leaves `y, i, h`, and a
+/// clause naming no place puts its column last at its turn. `AFTER` a column
+/// only a later clause adds is 1054.
+///
+/// Answers `None` for a statement doing anything else, or naming no place.
+fn table_with_columns_added_in_place(
+    stored_ddl: &str,
+    operations: &[AlterTableOperation],
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlColumnPlacement>, ParseError> {
+    let additions = operations
+        .iter()
+        .map(|operation| match operation {
+            AlterTableOperation::AddColumn {
+                column_def,
+                column_position,
+                if_not_exists: false,
+                ..
+            } => Some((column_def, column_position.as_ref())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(additions) = additions else {
+        return Ok(None);
+    };
+    if additions.iter().all(|(_, position)| position.is_none()) {
+        return Ok(None);
+    }
+    let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let mut table = stored;
+    let carried_columns = table
+        .columns
+        .iter()
+        .map(|column| (column.name.value.clone(), column.name.value.clone()))
+        .collect::<Vec<_>>();
+    for (column_def, position) in additions {
+        let named = |name: &str| {
+            table
+                .columns
+                .iter()
+                .position(|column| column.name.value.eq_ignore_ascii_case(name))
+        };
+        if named(&column_def.name.value).is_some() {
+            return Ok(Some(MySqlColumnPlacement::DuplicateColumn(
+                column_def.name.value.clone(),
+            )));
+        }
+        let at = match position {
+            None => table.columns.len(),
+            Some(sqlparser::ast::MySQLColumnPosition::First) => 0,
+            Some(sqlparser::ast::MySQLColumnPosition::After(after)) => {
+                let Some(at) = named(&after.value) else {
+                    return Ok(Some(MySqlColumnPlacement::NoSuchColumn(
+                        after.value.clone(),
+                    )));
+                };
+                at + 1
+            }
+        };
+        table.columns.insert(at, column_def.clone());
+    }
     Ok(Some(MySqlColumnPlacement::TableWrittenAgain(
         MySqlTableRewrite {
             create_sql: render_table_written_again(&table, mode)?,
