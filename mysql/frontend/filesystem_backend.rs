@@ -27,7 +27,9 @@ use turso_core::io::FileSyncType;
 use turso_core::storage::auto_increment::{
     AllocatorDatabaseIdentity, AllocatorOpenMode, DurableRangeAllocator,
 };
-use turso_core::{DatabaseFileOwner, IOExt as _};
+use turso_core::DatabaseFileOwner;
+#[cfg(test)]
+use turso_core::IOExt as _;
 
 const MANIFEST_FILE: &str = ".turso-mysql-root.json";
 const REGISTRY_FILE: &str = ".turso-mysql-registry.json";
@@ -1713,11 +1715,9 @@ impl OsDataRoot {
             FileSyncType::Fsync,
         )
         .map_err(|_| RegistryError::Backend)?;
-        let mut operation = allocator.verify().map_err(|_| RegistryError::Backend)?;
         let io = turso_core::PlatformIO::new().map_err(|_| RegistryError::Backend)?;
-        io.block(|| operation.step())
-            .map(|()| true)
-            .map_err(|_| RegistryError::Backend)
+        crate::database_catalog::verify_allocator_waiting_its_turn(&io, &allocator)?;
+        Ok(true)
     }
 
     fn inspect_open_artifact(

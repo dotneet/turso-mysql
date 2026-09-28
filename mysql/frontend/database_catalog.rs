@@ -1023,10 +1023,36 @@ fn reopen_allocator(
         FileSyncType::Fsync,
     )
     .map_err(|_| RegistryError::Backend)?;
-    let mut operation = allocator.verify().map_err(|_| RegistryError::Backend)?;
-    io.block(|| operation.step())
-        .map_err(|_| RegistryError::Backend)?;
+    verify_allocator_waiting_its_turn(io, &allocator)?;
     Ok(allocator)
+}
+
+/// How long opening a database waits for the statements counting ids in it
+/// to let its allocator be checked.
+const ALLOCATOR_VERIFY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Checks an allocator's sidecar against its database, waiting its turn.
+///
+/// Every allocator over one sidecar shares one in-process gate, so while a
+/// statement in another connection hands ids out the check answers busy.
+/// Opening the database is what checks it, and a failure there poisons the
+/// registry, refusing every later connection to every database; so the check
+/// waits for the statement instead, as an insert waits for another's ids.
+pub(crate) fn verify_allocator_waiting_its_turn(
+    io: &dyn IO,
+    allocator: &DurableRangeAllocator,
+) -> Result<(), RegistryError> {
+    let deadline = std::time::Instant::now() + ALLOCATOR_VERIFY_WAIT;
+    loop {
+        let mut operation = allocator.verify().map_err(|_| RegistryError::Backend)?;
+        match io.block(|| operation.step()) {
+            Ok(()) => return Ok(()),
+            Err(turso_core::LimboError::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => return Err(RegistryError::Backend),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1059,6 +1085,30 @@ mod tests {
 
     fn open_connection(database: &Arc<Database>) -> CoreResult<MySqlConnection> {
         MySqlConnection::new(database.connect()?, binary_context())
+    }
+
+    /// Every allocator over one sidecar shares one in-process gate. A
+    /// connection opening the database while a statement in another holds
+    /// that gate — Gitea opens connections while its fixtures insert — waits
+    /// for the statement, where it used to answer busy, which poisoned the
+    /// registry and refused every later connection to every database.
+    #[test]
+    fn opening_a_database_waits_for_a_statement_counting_ids_in_it() {
+        let directory = private_tempdir();
+        let mut catalog = DatabaseCatalog::open(directory.path()).unwrap();
+        catalog.create("reports").unwrap();
+        let (_database, allocator) = catalog.acquire_with_allocator("reports").unwrap();
+        let key = turso_core::storage::auto_increment::AutoIncrementKey::new([7; 16]).unwrap();
+        let mut lease = allocator.lease_high_water(key).unwrap();
+        catalog.io.block(|| lease.read()).unwrap();
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            lease.release().unwrap();
+        });
+        catalog.acquire("reports").unwrap();
+        released.join().unwrap();
+        catalog.acquire("reports").unwrap();
+        assert!(catalog.contains("reports").unwrap());
     }
 
     #[test]
