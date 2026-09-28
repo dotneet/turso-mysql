@@ -3485,6 +3485,12 @@ fn names_one_member(path: &str) -> bool {
     let Some(name) = path.strip_prefix("$.") else {
         return false;
     };
+    // `$."city"`, the way Laravel writes every member, names the one `$.city`
+    // names.
+    let name = name
+        .strip_prefix('"')
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .unwrap_or(name);
     !name.is_empty()
         && !name.starts_with(|character: char| character.is_ascii_digit())
         && name
@@ -3522,6 +3528,23 @@ pub fn names_a_plain_json_path(path: &str) -> bool {
         return false;
     };
     while !rest.is_empty() {
+        // Laravel writes every member quoted, `$."city"`, which names the one
+        // `$.city` names, and the engine reads it so too.
+        if let Some(after) = rest.strip_prefix(".\"") {
+            let Some(end) = after.find('"') else {
+                return false;
+            };
+            let member = &after[..end];
+            if member.is_empty()
+                || !member
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return false;
+            }
+            rest = &after[end + 1..];
+            continue;
+        }
         if let Some(after) = rest.strip_prefix('.') {
             let member = after
                 .split(['.', '['])

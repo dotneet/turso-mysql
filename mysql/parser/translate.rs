@@ -5774,6 +5774,13 @@ fn render_select_expr(
             {
                 return unsupported("SELECT JSON path over DECIMAL requires text conversion");
             }
+            // Only a plain path is one the engine reads as MySQL does, and only
+            // over one is the reading's column known: measured on 8.4.11,
+            // `doc->'$.a.*'` answers `[1]` over `{"a": {"b": 1}}` where the
+            // engine answers nothing, and either answered a column of no type.
+            if static_select_metadata::classify_static_select_expr(expr).is_none() {
+                return unsupported("SELECT JSON reading over a path this does not read");
+            }
             let left = render_select_expr(left, render_context)?;
             let right = render_select_expr(right, render_context)?;
             if matches!(op, BinaryOperator::LongArrow) {

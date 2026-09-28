@@ -4450,6 +4450,18 @@ Measured on 8.4.11 against the engine: MySQL leaves `JSON_SET('{}', '$.x.y',
 cannot reach either disagreement, so the wider paths are refused rather than
 answered differently.
 
+A member may be named in quotes, `$."city"`, which is how Laravel writes every
+JSON path — `select('profile->city as city')` is `json_unquote(json_extract(
+profile, '$."city"'))` and a JSON update `json_set(profile, '$."city"', ?)` —
+wherever the bare `$.city` is taken, in a reading and in the four that change a
+document, as long as the quoted name is letters, digits and underscores.
+Measured on 8.4.11 and matched: it names the member the bare name names, in the
+same column over both protocols. A reading written with `->` or `->>` over any
+other path — `doc->'$.a.*'`, a quoted name holding a space — is refused: the
+engine answered it, but in a column of no type at all, and `doc->'$.a.*'` over
+`{"a": {"b": 1}}` answered nothing where MySQL answers `[1]`, measured. A bound
+value put into a document by `JSON_SET` is refused, as a `?` inside a call is.
+
 JSON numbers follow MySQL 8.4.11's RapidJSON conversion, including its
 rounding at `1000000000000000.1` and `1e-30`. They read back as `1e15` and
 `9.999999999999999e-31`, respectively.

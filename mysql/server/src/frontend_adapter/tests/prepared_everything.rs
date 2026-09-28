@@ -757,3 +757,113 @@ fn laravel_writes_a_row_found_by_its_unsigned_id() {
         [[word("2"), word("3")], [word("3"), word("3")]]
     );
 }
+
+/// Laravel writes every member of a JSON path quoted — `select('profile->city
+/// as city')` is `json_unquote(json_extract(profile, '$."city"'))` and a JSON
+/// update `json_set(profile, '$."city"', ?)` — which names what `$.city`
+/// names. Measured on MySQL 8.4.11, over both protocols: the reading answers
+/// what the bare path answers, in the same column, a `LONG_BLOB` of
+/// 4294967295 unquoted and a `JSON` of 4294967292 not; and the update changes
+/// the member the bare path changes.
+#[test]
+fn laravel_reads_and_changes_a_json_member_named_in_quotes() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "create table `users` (`id` bigint unsigned not null auto_increment primary key, `email` varchar(255) not null, `profile` json null)",
+        "insert into `users` (`email`, `profile`) values ('a', '{\"city\": \"Tokyo\", \"tags\": [\"a\", \"b\"], \"n\": null}'), ('b', null)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let city = "select `email`, json_unquote(json_extract(`profile`, '$.\"city\"')) as `city` from `users` where `profile` is not null";
+    let Ok(CommandExecutionResult::ResultSet(text)) = adapter.execute_query(city) else {
+        panic!("{city} must answer rows");
+    };
+    assert_eq!(text.rows, [[Some(b"a".to_vec()), Some(b"Tokyo".to_vec())]]);
+    assert_eq!(
+        (
+            text.columns[1].column_type,
+            text.columns[1].column_length,
+            text.columns[1].flags,
+            text.columns[1].decimals
+        ),
+        (
+            MYSQL_TYPE_LONG_BLOB,
+            4_294_967_295,
+            MYSQL_BINARY_FLAG,
+            NOT_FIXED_DECIMALS
+        )
+    );
+    let PreparedStatementExecutionResult::ResultSet(binary) = prepared(&mut adapter, city, &[])
+    else {
+        panic!("{city} must answer rows prepared");
+    };
+    assert_eq!(binary.columns, text.columns);
+    assert_eq!(
+        binary.rows[0][1],
+        BinaryResultValue::Blob(b"Tokyo".to_vec())
+    );
+    for (sql, answer, length) in [
+        (
+            "select json_extract(`profile`, '$.\"tags\"[1]') from `users` order by `id`",
+            ["\"b\"", "NULL"],
+            4_294_967_292,
+        ),
+        (
+            "select `profile`->'$.\"n\"' from `users` order by `id`",
+            ["null", "NULL"],
+            4_294_967_292,
+        ),
+        (
+            "select `profile`->>'$.\"city\"' from `users` order by `id`",
+            ["Tokyo", "NULL"],
+            4_294_967_295,
+        ),
+    ] {
+        let Ok(CommandExecutionResult::ResultSet(read)) = adapter.execute_query(sql) else {
+            panic!("{sql} must answer rows");
+        };
+        assert_eq!(
+            read.rows
+                .iter()
+                .map(|row| row[0]
+                    .as_ref()
+                    .map_or("NULL".to_owned(), |value| String::from_utf8(value.clone())
+                        .unwrap()))
+                .collect::<Vec<_>>(),
+            answer,
+            "{sql}"
+        );
+        assert_eq!(read.columns[0].column_length, length, "{sql}");
+    }
+
+    assert_eq!(
+        adapter
+            .execute_query(
+                "update `users` set `profile` = json_set(`profile`, '$.\"city\"', 'Kyoto') where `email` = 'a'"
+            )
+            .map(|result| match result {
+                CommandExecutionResult::Ok(ok) => ok.affected_rows,
+                CommandExecutionResult::ResultSet(_) => panic!("an update answers OK"),
+            }),
+        Ok(1)
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `profile` from `users` where `email` = 'a'"
+        ),
+        [[word(
+            "{\"n\": null, \"city\": \"Kyoto\", \"tags\": [\"a\", \"b\"]}"
+        )]]
+    );
+    // A quoted name holding anything but letters, digits and underscores, and
+    // a wildcard, are not paths the engine and MySQL were measured to agree
+    // on: the arrow over one answered a column of no type.
+    for sql in [
+        "select json_extract(`profile`, '$.\"first name\"') from `users`",
+        "select `profile`->>'$.\"first name\"' as `x` from `users`",
+        "select `profile`->'$.*' as `x` from `users`",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
