@@ -137,7 +137,10 @@ async function main() {
       order: [['id', 'ASC'], [{ model: Post, as: 'posts' }, 'id', 'ASC']],
     });
     expect(users.length === 3, `expected 3 users, got ${users.length}`);
-    const names = users[0].posts[0].tags.map((t) => t.name).sort().join();
+    // Sequelize writes a user's nested posts at once over two pooled
+    // connections, so which post takes the lower id is a race, on MySQL too.
+    const hello = users[0].posts.find((p) => p.title === 'Hello');
+    const names = hello.tags.map((t) => t.name).sort().join();
     expect(names === 'news,rust', `unexpected tags ${names}`);
     const tagged = await Post.findAll({
       include: [
@@ -209,7 +212,10 @@ async function main() {
       offset: 0,
       limit: 1,
     });
-    expect(withTags.rows.length === 1 && withTags.rows[0].tags.length === 2 && withTags.count === 3,
+    // Which of Alice's posts has the lower id is a race (see 'relations'), so
+    // the first post's tags are read without paging to compare against.
+    const first = await Post.findOne({ include: [{ model: Tag, as: 'tags' }], order: [['id', 'ASC']] });
+    expect(withTags.rows.length === 1 && withTags.rows[0].tags.length === first.tags.length && withTags.count === 3,
       `paginated include returned ${withTags.rows.length} rows, ${withTags.rows[0] && withTags.rows[0].tags.length} tags, count ${withTags.count}`);
   });
 
