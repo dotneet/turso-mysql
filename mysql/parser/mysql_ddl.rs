@@ -735,12 +735,14 @@ fn render_mysql_table_constraint(
             render_mysql_foreign_key(clause)?
         )),
         // Measured on MySQL 8.4.11: a key over several columns prints back as
-        // `PRIMARY KEY (`a`,`b`)`, with no space after the comma.
+        // `PRIMARY KEY (`a`,`b`)`, with no space after the comma, and a
+        // `CONSTRAINT` name written before it is dropped, the key always being
+        // named PRIMARY.
         TursoTableConstraint::PrimaryKey {
             columns,
             auto_increment: false,
             conflict_clause: None,
-        } if columns.len() > 1 && constraint.name.is_none() => {
+        } if columns.len() > 1 => {
             let mut names = Vec::with_capacity(columns.len());
             for column in columns {
                 if column.order.is_some() || column.nulls.is_some() {

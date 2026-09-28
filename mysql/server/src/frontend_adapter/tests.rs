@@ -30909,3 +30909,5 @@ mod gui_browsing;
 
 #[cfg(unix)]
 mod drizzle_statements;
+#[cfg(unix)]
+mod sequelize_statements;

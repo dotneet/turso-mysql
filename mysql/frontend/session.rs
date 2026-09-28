@@ -4401,12 +4401,7 @@ impl MySqlConnection {
                     "JSON column cannot be indexed directly".to_string(),
                 ));
             }
-            if self
-                .inner
-                .current_schema()
-                .get_indices(table)
-                .any(|index| mysql_index_name(index).eq_ignore_ascii_case(logical_name))
-            {
+            if the_index_named(&self.inner.current_schema(), table, logical_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "Duplicate key name '{logical_name}'"
                 )));
@@ -4718,11 +4713,12 @@ impl MySqlConnection {
             {
                 return Err(MySqlQueryError::JsonIndex);
             }
-            if self
-                .inner
-                .current_schema()
-                .get_indices(tbl_name.as_str())
-                .any(|index| mysql_index_name(index).eq_ignore_ascii_case(idx_name.name.as_str()))
+            if the_index_named(
+                &self.inner.current_schema(),
+                tbl_name.as_str(),
+                idx_name.name.as_str(),
+            )
+            .is_some()
             {
                 return Err(MySqlQueryError::DuplicateIndex);
             }
@@ -5893,13 +5889,13 @@ impl MySqlConnection {
                         return Err(MySqlAlterTableIndexError::MissingIndex);
                     };
                     names.remove(position);
-                    let stored_name = self
-                        .inner
-                        .current_schema()
-                        .get_indices(checked.table().as_str())
-                        .find(|index| mysql_index_name(index).eq_ignore_ascii_case(name))
-                        .map(|index| index.name.clone())
-                        .ok_or(MySqlAlterTableIndexError::MissingIndex)?;
+                    let stored_name = the_index_named(
+                        &self.inner.current_schema(),
+                        checked.table().as_str(),
+                        name,
+                    )
+                    .map(|index| index.name.clone())
+                    .ok_or(MySqlAlterTableIndexError::MissingIndex)?;
                     (
                         format!("DROP INDEX `{}`", stored_name.replace('`', "``")),
                         Some(stored_name),
@@ -5947,11 +5943,7 @@ impl MySqlConnection {
             .map_err(MySqlAlterTableIndexError::Engine)?;
         let mut new_names = Vec::with_capacity(renames.len());
         for (from, to) in renames {
-            let stored_name = self
-                .inner
-                .current_schema()
-                .get_indices(table.as_str())
-                .find(|index| mysql_index_name(index).eq_ignore_ascii_case(from))
+            let stored_name = the_index_named(&self.inner.current_schema(), table.as_str(), from)
                 .map(|index| index.name.clone())
                 .ok_or(MySqlAlterTableIndexError::MissingIndexToRename)?;
             if !stored
@@ -7104,9 +7096,7 @@ impl MySqlConnection {
                 let holds = if named.eq_ignore_ascii_case("PRIMARY") {
                     !btree.primary_key_columns.is_empty()
                 } else {
-                    schema
-                        .get_indices(table)
-                        .any(|index| mysql_index_name(index).eq_ignore_ascii_case(named))
+                    the_index_named(&schema, table, named).is_some()
                 };
                 if !holds {
                     return Err(MySqlQueryError::Unsupported(format!(
@@ -13705,6 +13695,41 @@ fn run_checked_write_statement(statement: &mut Statement, timeout: Option<Durati
         statement.set_query_timeout_override(Some(Some(timeout)));
     }
     statement.run_with_row_callback(|_| Ok(()))
+}
+
+/// The index MySQL knows by `name` on `table`, other than the primary key.
+///
+/// The engine keeps a key over a column that is not its row number in an
+/// index of its own, which MySQL calls `PRIMARY` and which carries no other
+/// name: a `UNIQUE` over the key's own columns is a second index beside it,
+/// named after its first column like any other.
+pub(crate) fn the_index_named<'a>(
+    schema: &'a turso_core::schema::Schema,
+    table: &str,
+    name: &str,
+) -> Option<&'a Arc<turso_core::schema::Index>> {
+    let primary_key = schema
+        .get_btree_table(table)
+        .map(|btree| btree.primary_key_columns.clone())
+        .unwrap_or_default();
+    schema.get_indices(table).find(|index| {
+        !is_the_primary_keys_own_index(index, &primary_key)
+            && mysql_index_name(index).eq_ignore_ascii_case(name)
+    })
+}
+
+/// Whether `index` is the one the engine made for the table's primary key.
+pub(crate) fn is_the_primary_keys_own_index(
+    index: &turso_core::schema::Index,
+    primary_key: &[(String, turso_parser::ast::SortOrder)],
+) -> bool {
+    index.name.starts_with("sqlite_autoindex_")
+        && index.columns.len() == primary_key.len()
+        && index
+            .columns
+            .iter()
+            .zip(primary_key)
+            .all(|(column, (key, _))| column.name.eq_ignore_ascii_case(key))
 }
 
 /// The name MySQL gives an index.

@@ -197,7 +197,31 @@ A `PRIMARY KEY (a, b)` is kept as a composite key. Measured on 8.4.11, MySQL
 prints every key column as `NOT NULL` even when its declaration did not specify
 nullability; the stored definition, `SHOW COLUMNS` and insertion checks now
 agree. A key column explicitly declared `NULL` or `DEFAULT NULL` remains
-refused, as do composite keys containing an `AUTO_INCREMENT` column.
+refused, as do composite keys containing an `AUTO_INCREMENT` column. A
+`CONSTRAINT name` written before the key — drizzle-kit's
+`CONSTRAINT `post_tags_post_id_tag_id` PRIMARY KEY(`post_id`,`tag_id`)` — is
+dropped, as MySQL drops it: measured, the key is `PRIMARY` in `SHOW CREATE
+TABLE`, `SHOW INDEX` and `information_schema.TABLE_CONSTRAINTS` alike.
+
+A column that is both `UNIQUE` and the primary key keeps two indexes, as MySQL
+does — measured on 8.4.11, Sequelize's `name VARCHAR(255) NOT NULL UNIQUE,
+PRIMARY KEY (name)`, `name ... UNIQUE PRIMARY KEY` and `UNIQUE KEY (name),
+PRIMARY KEY (name)` all print `PRIMARY KEY (`name`)` and `UNIQUE KEY `name`
+(`name`)`, and `SHOW INDEX`, `STATISTICS`, `TABLE_CONSTRAINTS` and
+`KEY_COLUMN_USAGE` list both. The engine would read the two as one key, so the
+column's `UNIQUE` becomes an index of its own beside the key, named after the
+column by the rule an unnamed key is named by and before the keys the table
+writes after its columns (`name UNIQUE, UNIQUE KEY (name)` gives `name` and
+`name_2`). A `UNIQUE` carrying a name or an index option on that column is
+refused.
+
+`SERIAL` is written out as `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE`,
+which MySQL documents it to be and which, measured, is what it makes:
+drizzle-kit's `id serial primary key` prints as a `bigint unsigned NOT NULL
+AUTO_INCREMENT` key with a `UNIQUE KEY `id``. Only an unquoted `SERIAL` in a
+column's type place in a `CREATE TABLE` is read that way. A `SERIAL` column
+with no primary key of its own is refused, as the long spelling is — MySQL takes
+it — and so is `SERIAL DEFAULT VALUE`.
 
 An inline `KEY name (column)` inside `CREATE TABLE` is taken. The engine has no
 inline non-unique index, so one MySQL statement becomes a `CREATE TABLE` and one

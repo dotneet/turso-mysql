@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::session::mysql_index_name;
+use crate::session::{is_the_primary_keys_own_index, mysql_index_name};
 use turso_core::{
     schema::is_system_table, Connection, Database, InternalVirtualTable,
     InternalVirtualTableCursor, LimboError, Result, Value,
@@ -173,25 +173,16 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
 ///
 /// That one is already reported under the name `PRIMARY`, read off the table
 /// rather than off the indexes — which is the only place a rowid-alias primary
-/// key, which has no index at all, can be read from.
+/// key, which has no index at all, can be read from. A `UNIQUE` written over
+/// the key's own columns is an index of its own, as it is in MySQL.
 pub(crate) fn indexes_beside_the_primary_key<'a>(
     schema: &'a turso_core::schema::Schema,
     table: &str,
     btree: &turso_core::schema::BTreeTable,
 ) -> Vec<&'a Arc<turso_core::schema::Index>> {
-    let primary = btree
-        .primary_key_columns
-        .iter()
-        .map(|(column, _)| column.as_str())
-        .collect::<Vec<_>>();
     schema
         .get_indices(table)
-        .filter(|index| {
-            !same_columns(
-                index.columns.iter().map(|column| column.name.as_str()),
-                primary.iter().copied(),
-            )
-        })
+        .filter(|index| !is_the_primary_keys_own_index(index, &btree.primary_key_columns))
         .collect()
 }
 

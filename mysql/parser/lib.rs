@@ -34,6 +34,7 @@ mod raw_bytes_in_words;
 mod replace_view;
 mod safe_updates;
 mod select_projection_origins;
+mod serial_type;
 mod session_queries;
 mod session_settings;
 mod shift_moment;
@@ -175,6 +176,7 @@ pub use safe_updates::{read_safe_update, ComparedValues, SafeUpdateConjunct, Saf
 pub use select_projection_origins::{
     compound_drops_repeated_rows, select_projection_origins, MySqlSelectProjectionOrigin,
 };
+pub use serial_type::write_serial_out;
 pub use session_queries::{
     parse_optional_named_lock_query, parse_optional_select_database,
     parse_optional_system_variable_query, parse_optional_user_variable_query, MySqlNamedLockCall,
@@ -2795,12 +2797,18 @@ pub fn parse_optional_create_table_with_keys(
         return Ok(None);
     };
     reject_json_defaults_and_keys(&table)?;
-    if !table.constraints.iter().any(|constraint| {
-        matches!(
-            constraint,
-            TableConstraint::Index(_) | TableConstraint::Unique(_) | TableConstraint::ForeignKey(_)
-        )
-    }) {
+    let mut remaining = table.clone();
+    let keyed_column = unique_written_on_the_primary_key(&mut remaining)?;
+    if keyed_column.is_none()
+        && !table.constraints.iter().any(|constraint| {
+            matches!(
+                constraint,
+                TableConstraint::Index(_)
+                    | TableConstraint::Unique(_)
+                    | TableConstraint::ForeignKey(_)
+            )
+        })
+    {
         return Ok(None);
     }
     let [ObjectNamePart::Identifier(table_ident)] = table.name.0.as_slice() else {
@@ -2810,8 +2818,16 @@ pub fn parse_optional_create_table_with_keys(
         MySqlTableName::parse(&table_ident.value).map_err(|_| ParseError::Unsupported {
             feature: "CREATE TABLE name",
         })?;
+    // The column's own `UNIQUE` comes before every key the table writes after
+    // its columns, so it takes its name first.
     let mut indexes = Vec::new();
-    let mut remaining = table.clone();
+    if let Some(column) = keyed_column {
+        indexes.push(MySqlInlineIndex {
+            name: column.clone(),
+            columns: vec![column],
+            unique: true,
+        });
+    }
     remaining.constraints.clear();
     for constraint in &table.constraints {
         let (unique, written_name, index_type, index_options, index_columns) = match constraint {
@@ -2878,6 +2894,70 @@ pub fn parse_optional_create_table_with_keys(
         table_sql: Statement::CreateTable(remaining).to_string(),
         indexes,
     }))
+}
+
+/// Takes a `UNIQUE` off the column the primary key is over, and answers that
+/// column.
+///
+/// Measured on MySQL 8.4.11: `name VARCHAR(255) NOT NULL UNIQUE, PRIMARY KEY
+/// (name)` — the table Sequelize keeps its migrations in — and `id SERIAL
+/// PRIMARY KEY` each make two indexes, `PRIMARY` and a unique one named after
+/// the column. The engine would read the two as one key, so the `UNIQUE` is
+/// made an index of its own. A key over several columns is not the column's
+/// key, and a column's `UNIQUE` there stays where it is.
+fn unique_written_on_the_primary_key(
+    table: &mut CreateTable,
+) -> Result<Option<String>, ParseError> {
+    let key_clauses = table
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            TableConstraint::PrimaryKey(key) => Some(key),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let keyed_by_clause = match key_clauses.as_slice() {
+        [key] => match key.columns.as_slice() {
+            [column] => match &column.column.expr {
+                Expr::Identifier(name) => Some(name.value.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(column) = table.columns.iter_mut().find(|column| {
+        let keyed_inline = column
+            .options
+            .iter()
+            .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)));
+        keyed_inline
+            || keyed_by_clause
+                .as_ref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&column.name.value))
+    }) else {
+        return Ok(None);
+    };
+    let mut unique_options = 0;
+    for option in &column.options {
+        if let ColumnOption::Unique(unique) = &option.option {
+            if option.name.is_some() || unique.name.is_some() {
+                return unsupported("named UNIQUE on the PRIMARY KEY column");
+            }
+            reject_unique(unique)?;
+            unique_options += 1;
+        }
+    }
+    match unique_options {
+        0 => Ok(None),
+        1 => {
+            column
+                .options
+                .retain(|option| !matches!(option.option, ColumnOption::Unique(_)));
+            Ok(Some(column.name.value.clone()))
+        }
+        _ => unsupported("UNIQUE written twice on one column"),
+    }
 }
 
 /// Names an inline key the statement left unnamed.
@@ -8590,8 +8670,10 @@ fn render_table_constraint(constraint: &TableConstraint) -> Result<String, Parse
         // refused here so it keeps reaching the checked path that gives it a
         // marker of its own; that path moves the words onto the column.
         TableConstraint::PrimaryKey(key) if key.columns.len() > 1 => {
-            if key.name.is_some()
-                || key.index_name.is_some()
+            // Measured on MySQL 8.4.11: a `CONSTRAINT` name on the key is
+            // dropped, the key always being named PRIMARY — Drizzle names
+            // every composite key it writes.
+            if key.index_name.is_some()
                 || key.index_type.is_some()
                 || !key.index_options.is_empty()
                 || key.characteristics.is_some()

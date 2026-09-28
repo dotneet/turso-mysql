@@ -3134,6 +3134,10 @@ where
             turso_mysql_parser::leave_out_from_dual(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = without_dual.as_deref().unwrap_or(sql);
+        let serial_written_out =
+            turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = serial_written_out.as_deref().unwrap_or(sql);
         match self.prepare_checked_database_statement(sql) {
             Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
                 if turso_mysql_parser::answers_no_rows_and_binds_nothing(
@@ -3352,6 +3356,10 @@ where
             turso_mysql_parser::leave_out_from_dual(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = without_dual.as_deref().unwrap_or(sql);
+        let serial_written_out =
+            turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = serial_written_out.as_deref().unwrap_or(sql);
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,

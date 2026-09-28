@@ -282,6 +282,8 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `PRIMARY KEY (a, b)` naming a column without a `NULL`/`NOT NULL` clause | accepted; each key column is stored and reported as `NOT NULL`, as MySQL does. An explicit `NULL` or `DEFAULT NULL` on a key column remains refused |
 | `PRIMARY KEY (a, b)` with an `AUTO_INCREMENT` column inside it | refused; the counted column stands for one rowid, which has no way to spread over a pair |
 | An `AUTO_INCREMENT` column that is not the table's key, or one with no key at all | refused where MySQL answers 1075 |
+| An `AUTO_INCREMENT` column whose only key is a `UNIQUE` one — `id SERIAL` with no `PRIMARY KEY` | refused; measured, MySQL takes it and prints `UNIQUE KEY `id` (`id`)` with no primary key, and the counted path wants the counter to be the key |
+| `SERIAL DEFAULT VALUE` on an integer column | refused; unmeasured |
 | An `AUTO_INCREMENT` column not written `NOT NULL` | accepted when its table-level primary key names that column; the stored definition adds `NOT NULL`, as MySQL does. Other forms are refused |
 | `PRIMARY KEY` carrying `USING BTREE` or an index name, or a column written `DESC` | refused; measured, MySQL prints all three back, so dropping them would print a different table |
 | `PRIMARY KEY (missing)`, or a table writing two keys | refused where MySQL answers 1072 and 1068 |
