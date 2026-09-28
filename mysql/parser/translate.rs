@@ -2035,6 +2035,31 @@ fn render_having_predicate(
             };
             let (rendered_right, rhs) =
                 render_checked_select_comparison_rhs(right, render_context)?;
+            let operator =
+                checked_select_comparison_operator(op).expect("comparison operator guard");
+            // A count is a whole number whatever it counts, so a bound value
+            // meets it the way it meets any whole number; the frontend holds
+            // what binds there to the kinds MySQL reads alike.
+            if matches!(rhs, CheckedSelectComparisonRhs::Placeholder { .. })
+                && static_select_metadata::is_count_call(function)
+            {
+                render_context
+                    .checked_comparisons
+                    .push(CheckedSelectComparison {
+                        qualifier: None,
+                        inner_source: None,
+                        column_name: "COUNT".to_owned(),
+                        operator,
+                        rhs,
+                        collated: false,
+                        answers: Some(crate::CheckedComparisonAnswer::RowCount),
+                    });
+                return Ok(format!(
+                    "({} {} {rendered_right})",
+                    render_aggregate_call(function, render_context),
+                    checked_select_comparison_sql_operator(op)
+                ));
+            }
             // Measured on MySQL 8.4.11: a count against a word compares the
             // two as doubles, so a word naming a whole number is that number
             // — Rails writes `HAVING (COUNT(*) > '1')` — and says nothing.
@@ -2063,8 +2088,7 @@ fn render_having_predicate(
                         qualifier: None,
                         inner_source: None,
                         column_name: column.value.clone(),
-                        operator: checked_select_comparison_operator(op)
-                            .expect("comparison operator guard"),
+                        operator,
                         rhs,
                         collated: false,
                         answers: None,

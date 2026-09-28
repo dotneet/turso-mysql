@@ -1124,6 +1124,10 @@ pub enum CheckedComparisonAnswer {
     /// A document `JSON_CONTAINS` looks for. A bound value has to bind as
     /// text, which the dialect then reads as a document.
     JsonDocument,
+    /// The rows a `COUNT` in a `HAVING` counted. MySQL reads a value bound
+    /// against it as a whole number — measured, a bound `'abc'` warns
+    /// "Truncated incorrect INTEGER value" — so a bound word has to name one.
+    RowCount,
 }
 
 /// The comparison operators accepted by the strict integer SELECT subset.

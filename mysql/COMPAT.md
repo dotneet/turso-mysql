@@ -1802,7 +1802,16 @@ types against, so the aggregate's own argument column is recorded instead —
 `HAVING SUM(score) > 45` holds `score` to the same rule `WHERE score > 45`
 would, which is what makes the integer literal safe. `COUNT` records nothing,
 because it answers an integer whatever it counts. `AND`, `OR`, `NOT` and
-parentheses cross; the right side has to be an exact signed integer. A count
+parentheses cross; the right side has to be an exact signed integer, or — against
+a `COUNT` — a `?`, which GORM's `Having("COUNT(*) > ?", 1)` sends. Measured on
+8.4.11, MySQL reads a value bound there as a whole number: a bound `LONGLONG`
+and a word naming a whole number compare as that number, a `DOUBLE` as a number
+(`COUNT(*) > 1.5` finds the groups of two, `> 0.5` every group), and NULL finds
+no group. Those are taken. Any other word is refused when the statement runs:
+MySQL converts it by its own rule, `'abc'` reading as 0 with warning 1292
+"Truncated incorrect INTEGER value", where the engine would order a word after
+every number.
+A count
 also takes a word naming a whole number, which Rails writes for a bound one —
 `HAVING (COUNT(*) > '1')`: measured on 8.4.11, MySQL compares the two as
 doubles, so `'1'` and `'02'` are the numbers they name and raise nothing,
@@ -3312,7 +3321,11 @@ it names, which no amount of recognizing written shapes could give. What a
 session may see is decided the same way it always was — a database-wide grant,
 or the grants it holds on the tables the rows would name — and the answer is
 left on the connection for the table to read, because the table is registered
-on the database rather than on one session.
+on the database rather than on one session. A prepared query over it binds its
+values the way a text one writes them — GORM's Migrator lists a database's
+tables with `where TABLE_SCHEMA=?` and a table's indexes from `STATISTICS` with
+the database and table names bound — its values held to the types the table
+declares for its columns.
 
 A wildcard over `TABLES` is refused: it asks for MySQL's twenty-one columns
 and this answers eight, so a row of a different width would come back. So is a

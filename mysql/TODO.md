@@ -534,6 +534,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A word bound against a call — `YEAR(created_at) = ?` | refused; a bound value against a call is refused whatever it binds |
 | A `HAVING` counted against a number written with a fraction — `HAVING COUNT(*) > 1.5` | refused; a count is a whole number |
 | A `HAVING` comparing a word with an aggregate other than a count, or a count with a word that is not only a whole number's digits — `HAVING SUM(n) > '1'`, `HAVING COUNT(*) > '1abc'` | refused; measured, MySQL compares them as doubles and warns 1292 for a word it cuts. A count against a word naming a whole number is taken |
+| A word bound against a `COUNT` in a `HAVING` that names no whole number — `HAVING COUNT(*) > ?` binding `'abc'` or `'1.5'` — or a `?` against any other aggregate | refused; MySQL reads the word as a whole number by its own conversion, `'abc'` as 0 with warning 1292, and a bound value against `SUM` or `MAX` meets the column's type, which was not measured. A bound whole number, a word naming one, a double and NULL against a `COUNT` are taken |
 | A run of digits too long for an `i64` in a comparison against an integer or floating column — `n > 9223372036854775808` | refused; an exact `DECIMAL` column accepts up to 65 written digits after its type has been checked |
 | `ENUM` | works |
 | `ORDER BY` on a `SET` | orders by the numeric bit value of its members, as measured on MySQL 8.4.11 |

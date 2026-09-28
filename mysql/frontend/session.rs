@@ -1102,6 +1102,20 @@ impl CopiedSelect {
 /// statement's when it does not, which is how MySQL reads it — measured on
 /// 8.4.11, `EXISTS (SELECT 1 FROM b WHERE name = 'one')` reads `a.name` where
 /// `b` carries no `name`.
+/// The type an `information_schema` table the statement reads declares for
+/// the column one comparison names. Such a table's columns are named by the
+/// table itself rather than by stored DDL.
+fn catalog_column_type(
+    source_tables: &[MySqlSelectSource],
+    comparison: &CheckedSelectComparison,
+) -> Option<&'static str> {
+    source_tables.iter().find_map(|source| {
+        source
+            .catalog()
+            .and_then(|catalog| catalog.column_type(comparison.column_name()))
+    })
+}
+
 fn comparison_tables(
     source_tables: &[MySqlSelectSource],
     comparison: &CheckedSelectComparison,
@@ -7128,11 +7142,7 @@ impl MySqlConnection {
             // An `information_schema` table's columns are named by the table
             // itself rather than by stored DDL, so the type a comparison has
             // to fit is the one the table declares for the column.
-            if let Some(type_name) = source_tables.iter().find_map(|source| {
-                source
-                    .catalog()
-                    .and_then(|catalog| catalog.column_type(comparison.column_name()))
-            }) {
+            if let Some(type_name) = catalog_column_type(source_tables, comparison) {
                 bound.extend(select_comparison_fits_column(comparison, type_name, 0)?);
                 continue;
             }
@@ -7197,7 +7207,12 @@ impl MySqlConnection {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
                 continue;
             };
-            if comparison.answers().is_some() {
+            // What a bound value meets in an `information_schema` table was
+            // held to the type that table declares, and none of its columns
+            // holds an exact number.
+            if comparison.answers().is_some()
+                || catalog_column_type(source_tables, comparison).is_some()
+            {
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
@@ -7229,7 +7244,12 @@ impl MySqlConnection {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
                 continue;
             };
+            if comparison.answers() == Some(CheckedComparisonAnswer::RowCount) {
+                bound.push(*ordinal);
+                continue;
+            }
             if comparison.answers().is_some()
+                || catalog_column_type(source_tables, comparison).is_some()
                 || matches!(
                     comparison.operator(),
                     CheckedSelectComparisonOperator::Like
@@ -7718,6 +7738,12 @@ impl MySqlConnection {
                             || (whole_number_parameters.contains(ordinal)
                                 && bound_whole_number(written).is_some())
                     }
+                }
+                // Measured on 8.4.11, a bound double meets a count as a
+                // number, `COUNT(*) > 1.5` finding the groups of two, which is
+                // how the engine compares a whole number with a real.
+                MySqlPreparedValue::Real(_) => {
+                    comparison.answers() == Some(CheckedComparisonAnswer::RowCount)
                 }
                 _ => false,
             };
@@ -10951,7 +10977,9 @@ fn checked_comparison_fits_column(
         // answers it in.
         CheckedSelectComparisonRhs::Call(answers) => match answers {
             CheckedComparisonAnswer::Text => is_text_type(type_name),
-            CheckedComparisonAnswer::WholeNumber => is_integer_type(type_name),
+            CheckedComparisonAnswer::WholeNumber | CheckedComparisonAnswer::RowCount => {
+                is_integer_type(type_name)
+            }
             CheckedComparisonAnswer::Day => type_name == "DATE",
             CheckedComparisonAnswer::Moment => matches!(type_name, "DATETIME" | "TIMESTAMP"),
             CheckedComparisonAnswer::JsonText
@@ -11317,6 +11345,13 @@ fn checked_comparison_meets_an_answer(
         (CheckedComparisonAnswer::JsonDocument, CheckedSelectComparisonRhs::Placeholder { .. }) => {
             true
         }
+        // What binds against a count is held to a whole number when the
+        // statement runs.
+        (
+            CheckedComparisonAnswer::RowCount,
+            CheckedSelectComparisonRhs::SignedInteger(_)
+            | CheckedSelectComparisonRhs::Placeholder { .. },
+        ) => true,
         _ => false,
     }
 }
@@ -11406,6 +11441,7 @@ const fn answered_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
         CheckedComparisonAnswer::JsonText => "a word or a number",
         CheckedComparisonAnswer::JsonCount => "a number",
         CheckedComparisonAnswer::JsonDocument => "a JSON document",
+        CheckedComparisonAnswer::RowCount => "a whole number",
     }
 }
 
@@ -11446,7 +11482,9 @@ fn checked_comparison_column_refusal(
 const fn answered_column_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
     match answers {
         CheckedComparisonAnswer::Text => "a text column",
-        CheckedComparisonAnswer::WholeNumber => "a whole-number column",
+        CheckedComparisonAnswer::WholeNumber | CheckedComparisonAnswer::RowCount => {
+            "a whole-number column"
+        }
         CheckedComparisonAnswer::Day => "a DATE column",
         CheckedComparisonAnswer::Moment => "a DATETIME or TIMESTAMP column",
         CheckedComparisonAnswer::JsonText
