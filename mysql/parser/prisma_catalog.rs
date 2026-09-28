@@ -102,11 +102,7 @@ pub fn parse_optional_prisma_information_schema_query(
 ) -> Result<Option<PrismaInformationSchemaQuery>, ParseError> {
     // Every one of them names `information_schema`, which most statements
     // do not, so the rest are passed over without being read.
-    if !sql
-        .as_bytes()
-        .windows(b"information_schema".len())
-        .any(|window| window.eq_ignore_ascii_case(b"information_schema"))
-    {
+    if !mentions_ignoring_case(sql, "information_schema") {
         return Ok(None);
     }
     let tokens = tokenize_information_schema_query(sql, mode)?;

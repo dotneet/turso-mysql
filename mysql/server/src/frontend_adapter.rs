@@ -5622,13 +5622,9 @@ fn prepare_for_client_statement(
 /// `CREATE TRIGGER`, which every one names in so many words. Parsing a statement as schema DDL to find
 /// out costs as much as running a primary-key `SELECT`, so the rest skip it.
 fn may_create_a_view_or_trigger(sql: &str) -> bool {
-    [b"VIEW".as_slice(), b"TRIGGER".as_slice()]
+    ["VIEW", "TRIGGER"]
         .iter()
-        .any(|word| {
-            sql.as_bytes()
-                .windows(word.len())
-                .any(|window| window.eq_ignore_ascii_case(word))
-        })
+        .any(|word| turso_mysql_parser::mentions_ignoring_case(sql, word))
 }
 
 /// Runs one statement from the client, and runs it again on a new snapshot

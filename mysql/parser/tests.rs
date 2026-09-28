@@ -9420,6 +9420,47 @@ fn a_kept_reading_answers_what_reading_afresh_would() {
     assert!(bytes_read().parsed_by_the_engine > first_reading.parsed_by_the_engine);
 }
 
+/// A word is found in any letter case at any place, the first and the last
+/// included, and a text shorter than the word never holds it; what it finds
+/// is what comparing every window of the text found.
+#[test]
+fn a_word_is_found_in_any_case_wherever_it_is_written() {
+    let every_window = |text: &str, word: &str| {
+        text.as_bytes()
+            .windows(word.len())
+            .any(|window| window.eq_ignore_ascii_case(word.as_bytes()))
+    };
+    for (text, word, found) in [
+        ("CREATE VIEW v AS SELECT 1", "VIEW", true),
+        ("create view v as select 1", "VIEW", true),
+        ("view", "VIEW", true),
+        ("SELECT * FROM t WHERE a = 'preview'", "VIEW", true),
+        (
+            "SELECT v FROM information_schema.tables",
+            "INFORMATION_SCHEMA",
+            true,
+        ),
+        (
+            "SELECT 1 FROM Information_Schema",
+            "INFORMATION_SCHEMA",
+            true,
+        ),
+        (
+            "SELECT 1 FROM informationschema",
+            "INFORMATION_SCHEMA",
+            false,
+        ),
+        ("VIE", "VIEW", false),
+        ("", "VIEW", false),
+        ("INSERT INTO t VALUES ('café', 'ビュー')", "TRIGGER", false),
+        ("INSERT INTO t VALUES ('trigger 🙂')", "TRIGGER", true),
+        ("vvvvvview", "VIEW", true),
+    ] {
+        assert_eq!(mentions_ignoring_case(text, word), found, "{text} / {word}");
+        assert_eq!(every_window(text, word), found, "{text} / {word}");
+    }
+}
+
 /// `LOCK IN SHARE MODE` is read as `FOR SHARE`, the lock Laravel's
 /// `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` ask for. Measured on
 /// MySQL 8.4.11: it follows `LIMIT`, may be written in any case and with a
