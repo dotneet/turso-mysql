@@ -4,6 +4,7 @@ mod account_admin;
 mod admin_command;
 mod alter_table_indexes;
 mod analyze_table;
+mod bound_written_values;
 mod catalog_qualifiers;
 mod check_constraints;
 mod checked_primary_key;
@@ -73,6 +74,9 @@ use admin_command::{
 };
 use alter_table_indexes::{
     checked_index_operation, drop_key_spelled_as_drop_index, is_index_operation,
+};
+pub use bound_written_values::{
+    parse_optional_bound_written_values, BoundCast, BoundWrittenColumn, BoundWrittenValues,
 };
 use information_schema::{
     contains_information_schema_object, contains_information_schema_tables,

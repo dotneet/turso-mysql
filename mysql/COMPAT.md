@@ -1099,6 +1099,18 @@ answers a different one. Measured on 8.4.11:
   the range answers another number without a warning (`CAST(18446744073709551615 AS SIGNED)`
   is -1), a fraction is rounded, a word that is no whole number warns, and `CAST(NULL AS
   SIGNED)` is nullable, none of which is repeated here.
+- A prepared `SELECT` reading no table whose every `?` is a column of its own under an alias
+  — alone, `CAST(? AS SIGNED)` or `CAST(? AS DECIMAL(p,s))` — beside written values, the way
+  sqlx reads bound values back (`SELECT CAST(? AS SIGNED) AS i, CAST(? AS DECIMAL(10,2)) AS
+  d, ? AS s, CAST(NULL AS CHAR) AS n, NOW(6) AS t`), is answered with each bound value written
+  in, where its written form reads the same: a whole number or a word spelling one into
+  `SIGNED`, a whole number or a word spelling a number with or without a point into a
+  `DECIMAL`, and a word, a whole number or NULL alone. Measured on 8.4.11 through sqlx 0.8.6,
+  prepared and bound alike: the casts report a nullable binary `LONGLONG` of 21 and
+  `NEWDECIMAL` of `p` plus a point and a sign, a word alone the generic string of 65532, and
+  `'3.255'` into `DECIMAL(10,2)` is 3.26 without a warning, as `3.255` is. A word that is no
+  number, a double, a number past `SIGNED` or too wide for the `DECIMAL`, and an unnamed bound
+  column are refused.
 - `CAST('<day>' AS DATE)` and `CAST('<moment>' AS DATETIME)` answer the day or moment a
   column of that type would store, a `DATE` of 10 or a `DATETIME` of 19, nullable. A word
   naming no day is refused: MySQL answers NULL with warning 1292.

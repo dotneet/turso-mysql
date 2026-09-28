@@ -702,7 +702,7 @@ fn written_cast(cast: &Expr, data_type: &DataType) -> Option<(WrittenValue, Stri
 
 /// The digits and places a `DECIMAL` cast names. Measured: `DECIMAL` alone
 /// is `DECIMAL(10,0)`, and `DECIMAL(p)` is `DECIMAL(p,0)`.
-fn decimal_size(size: &ExactNumberInfo) -> Option<(u32, u32)> {
+pub(crate) fn decimal_size(size: &ExactNumberInfo) -> Option<(u32, u32)> {
     let (precision, scale) = match size {
         ExactNumberInfo::None => (10, 0),
         ExactNumberInfo::Precision(precision) => (u32::try_from(*precision).ok()?, 0),

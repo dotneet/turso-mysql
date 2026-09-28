@@ -640,3 +640,91 @@ fn result_columns_and_rows(
             .collect(),
     )
 }
+
+/// sqlx's types step reads bound values back through casts beside written
+/// ones: `SELECT CAST(? AS SIGNED) AS i, CAST(? AS DECIMAL(10,2)) AS d, ? AS
+/// s, CAST(NULL AS CHAR) AS n, NOW(6) AS t`, binding -7, `'3.25'` and
+/// `'héllo'`. Measured on MySQL 8.4.11 through sqlx 0.8.6, prepared and
+/// bound alike: `i` a `LONGLONG` of 21 and `d` a `NEWDECIMAL` of 12 with 2
+/// decimals, both nullable and binary; `s` the generic string of 65532; `n`
+/// a nullable string of 0; `t` a NOT NULL `DATETIME` of 26 with 6 decimals.
+/// `'3.255'` is read as 3.26, as the written number is.
+#[test]
+fn sqlx_reads_bound_values_back_through_casts() {
+    const TYPES: &str = "SELECT CAST(? AS SIGNED) AS i, CAST(? AS DECIMAL(10,2)) AS d, ? AS s, CAST(NULL AS CHAR) AS n, NOW(6) AS t";
+    const SHAPES: [(u8, u16, u32, u8); 5] = [
+        (MYSQL_TYPE_LONGLONG, 0x80, 21, 0),
+        (MYSQL_TYPE_NEWDECIMAL, 0x80, 12, 2),
+        (MYSQL_TYPE_VAR_STRING, 0, 65532, 31),
+        (MYSQL_TYPE_VAR_STRING, 0, 0, 31),
+        (MYSQL_TYPE_DATETIME, 0x81, 26, 6),
+    ];
+    let (_directory, mut adapter) = adapter();
+    let statement = adapter.execute_stmt_prepare(TYPES).unwrap();
+    assert_eq!(shapes(&statement.columns), SHAPES);
+    assert_eq!(statement.parameters.len(), 3);
+    adapter.execute_stmt_close(statement.statement_id);
+
+    for (decimal, read) in [("3.25", "3.25"), ("3.255", "3.26"), ("-1", "-1.00")] {
+        let result = prepared_rows(
+            &mut adapter,
+            TYPES,
+            &[
+                Bound::Whole(-7),
+                Bound::Word(decimal),
+                Bound::Word("hé'l\\lo"),
+            ],
+        );
+        assert_eq!(shapes(&result.columns), SHAPES);
+        assert_eq!(
+            result
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["i", "d", "s", "n", "t"]
+        );
+        let [row] = result.rows.as_slice() else {
+            panic!("one row");
+        };
+        assert_eq!(
+            row[..4],
+            [
+                BinaryResultValue::Integer(-7),
+                BinaryResultValue::Text(read.to_owned()),
+                BinaryResultValue::Text("hé'l\\lo".to_owned()),
+                BinaryResultValue::Null,
+            ]
+        );
+        assert!(matches!(row[4], BinaryResultValue::DateTimeMicros { .. }));
+    }
+
+    // A word that is no whole number warns in MySQL, one too wide for the
+    // `DECIMAL` is held to the widest with a warning, and an unnamed column
+    // is named after the statement's own spelling of it, none of which this
+    // repeats.
+    for (sql, values) in [
+        (
+            TYPES,
+            [Bound::Word("12abc"), Bound::Word("1"), Bound::Word("x")],
+        ),
+        (
+            TYPES,
+            [
+                Bound::Whole(1),
+                Bound::Word("123456789.5"),
+                Bound::Word("x"),
+            ],
+        ),
+        (
+            "SELECT CAST(? AS SIGNED), CAST(? AS DECIMAL(10,2)) AS d, ? AS s, NOW(6) AS t",
+            [Bound::Whole(1), Bound::Word("1"), Bound::Word("x")],
+        ),
+    ] {
+        assert_eq!(
+            prepared(&mut adapter, sql, &values),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql} {values:?}"
+        );
+    }
+}

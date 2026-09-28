@@ -276,6 +276,12 @@ enum RunAsText {
     /// Flyway's check that a schema holds nothing, for the databases it
     /// names or binds.
     FlywaySchemaEmptiness(turso_mysql_parser::FlywaySchemaEmptinessQuery),
+    /// A `SELECT` of written values beside bound ones, run with each bound
+    /// value written in.
+    BoundWrittenValues {
+        sql: String,
+        values: turso_mysql_parser::BoundWrittenValues,
+    },
 }
 
 #[cfg(unix)]
@@ -1767,6 +1773,23 @@ where
         long_data: StatementLongData,
         parameter_count: usize,
     ) -> Result<Vec<String>, FrontendErrorKind> {
+        self.bound_values(statement_id, parameter_payload, long_data, parameter_count)?
+            .into_iter()
+            .map(|value| match value {
+                StatementParameterValue::String(value) => Ok(value),
+                _ => Err(FrontendErrorKind::Unsupported),
+            })
+            .collect()
+    }
+
+    /// Reads the values bound to a statement run through the text path.
+    fn bound_values(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+        long_data: StatementLongData,
+        parameter_count: usize,
+    ) -> Result<Vec<StatementParameterValue>, FrontendErrorKind> {
         if let Some(error) = long_data.error {
             return Err(pending_long_data_error(error));
         }
@@ -1788,14 +1811,7 @@ where
         )
         .map_err(statement_execute_decode_error)?;
         statement.parameter_types = Some(decoded.types);
-        decoded
-            .values
-            .into_iter()
-            .map(|value| match value {
-                StatementParameterValue::String(value) => Ok(value),
-                _ => Err(FrontendErrorKind::Unsupported),
-            })
-            .collect()
+        Ok(decoded.values)
     }
 
     /// The whole numbers bound to a `SET`. Measured on MySQL 8.4.11, a bound
@@ -3221,6 +3237,15 @@ where
                 self.prepare_text_statement(sql, RunAsText::NoRows(sql.to_owned()), Vec::new())
             }
             Err(error @ (FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)) => {
+                if let Some(values) = turso_mysql_parser::parse_optional_bound_written_values(
+                    sql,
+                    self.session.session_sql_mode(),
+                )
+                .ok()
+                .flatten()
+                {
+                    return self.prepare_bound_written_values(sql, values);
+                }
                 let Some(settings) =
                     turso_mysql_parser::parse_optional_session_settings_with_parameters(
                         sql,
@@ -4681,6 +4706,140 @@ where
         Ok(false)
     }
 
+    /// Prepares a `SELECT` of written values beside bound ones — sqlx's
+    /// `SELECT CAST(? AS SIGNED) AS i, CAST(? AS DECIMAL(10,2)) AS d, ? AS s,
+    /// CAST(NULL AS CHAR) AS n, NOW(6) AS t`. The written columns report what
+    /// the statement reports written out, worked out here with a stand-in for
+    /// each bound value, and the bound ones what MySQL reports for a bound
+    /// value before one is bound.
+    fn prepare_bound_written_values(
+        &mut self,
+        sql: &str,
+        values: turso_mysql_parser::BoundWrittenValues,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let stand_ins = values
+            .columns()
+            .iter()
+            .filter_map(|column| match column {
+                turso_mysql_parser::BoundWrittenColumn::Bound { cast, .. } => Some(match cast {
+                    turso_mysql_parser::BoundCast::Nothing => "NULL".to_owned(),
+                    turso_mysql_parser::BoundCast::Signed
+                    | turso_mysql_parser::BoundCast::Decimal { .. } => "0".to_owned(),
+                }),
+                turso_mysql_parser::BoundWrittenColumn::Written => None,
+            })
+            .collect::<Vec<_>>();
+        let written = self.written_values_result(&values.written_with(sql, &stand_ins), &values)?;
+        let columns = values
+            .columns()
+            .iter()
+            .zip(written.columns)
+            .map(|(column, written)| match column {
+                turso_mysql_parser::BoundWrittenColumn::Written => written,
+                turso_mysql_parser::BoundWrittenColumn::Bound { name, cast, .. } => {
+                    bound_value_column(name, *cast, &StatementParameterValue::Null)
+                }
+            })
+            .collect();
+        let parameter_count = values.parameter_count();
+        let mut prepared = self.prepare_text_statement(
+            sql,
+            RunAsText::BoundWrittenValues {
+                sql: sql.to_owned(),
+                values,
+            },
+            columns,
+        )?;
+        prepared.parameters = (1..=parameter_count)
+            .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
+            .collect();
+        Ok(prepared)
+    }
+
+    /// Runs a [`Self::prepare_bound_written_values`] statement with each bound
+    /// value written in, which answers the value it would answer written.
+    ///
+    /// Only a bound value whose written form MySQL reads the same way is
+    /// written in: a whole number or a word spelling one into `SIGNED`, a
+    /// whole number or a word spelling a number with or without a point into
+    /// a `DECIMAL`, and a word, a whole number or NULL alone. Measured on
+    /// MySQL 8.4.11, `'3.255'` into `DECIMAL(10,2)` is 3.26 without a
+    /// warning, as `3.255` is; a word that is no number warns, a double is
+    /// rounded into `SIGNED`, and a number past `SIGNED` wraps, none of which
+    /// is repeated here.
+    fn execute_bound_written_values(
+        &mut self,
+        sql: &str,
+        values: &turso_mysql_parser::BoundWrittenValues,
+        bound: Vec<StatementParameterValue>,
+    ) -> Result<BinaryResultSet, FrontendErrorKind> {
+        let no_backslash_escapes = self.no_backslash_escapes();
+        let casts = values
+            .columns()
+            .iter()
+            .filter_map(|column| match column {
+                turso_mysql_parser::BoundWrittenColumn::Bound { cast, .. } => Some(*cast),
+                turso_mysql_parser::BoundWrittenColumn::Written => None,
+            })
+            .collect::<Vec<_>>();
+        let written_in = casts
+            .iter()
+            .zip(&bound)
+            .map(|(cast, value)| bound_value_written(*cast, value, no_backslash_escapes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let written = self.written_values_result(&values.written_with(sql, &written_in), values)?;
+        let [row] = <[Vec<Option<Vec<u8>>>; 1]>::try_from(written.rows)
+            .map_err(|_| FrontendErrorKind::Internal)?;
+        let mut columns = Vec::with_capacity(row.len());
+        let mut binary_row = Vec::with_capacity(row.len());
+        for ((column, text), value) in values.columns().iter().zip(written.columns).zip(row) {
+            let definition = match column {
+                turso_mysql_parser::BoundWrittenColumn::Written => text,
+                turso_mysql_parser::BoundWrittenColumn::Bound {
+                    ordinal,
+                    name,
+                    cast,
+                } => bound_value_column(
+                    name,
+                    *cast,
+                    bound.get(*ordinal).ok_or(FrontendErrorKind::Internal)?,
+                ),
+            };
+            binary_row.push(written_value_in_binary(&definition, value)?);
+            columns.push(definition);
+        }
+        Ok(BinaryResultSet {
+            columns,
+            rows: vec![binary_row],
+            warnings: 0,
+            status_flags: self.status_flags(),
+        })
+    }
+
+    /// The one row a `SELECT` of written values answers, as many columns
+    /// wide as the statement recognized.
+    fn written_values_result(
+        &mut self,
+        written: &str,
+        values: &turso_mysql_parser::BoundWrittenValues,
+    ) -> Result<TextResultSet, FrontendErrorKind> {
+        // The written form refuses a value it would answer by a rule of its
+        // own — a number too wide for its `DECIMAL`, which MySQL holds to the
+        // widest one and warns — and the statement the client sent was not
+        // one of bad syntax.
+        let result = match self.execute_query_statement(written) {
+            Err(FrontendErrorKind::Syntax) => return Err(FrontendErrorKind::Unsupported),
+            result => result?,
+        };
+        let CommandExecutionResult::ResultSet(result) = result else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        if result.columns.len() != values.columns().len() || result.rows.len() != 1 {
+            return Err(FrontendErrorKind::Internal);
+        }
+        Ok(result)
+    }
+
     fn execute_prepared_statement_command(
         &mut self,
         statement_id: u32,
@@ -4742,6 +4901,16 @@ where
                         .ok_or(FrontendErrorKind::Internal)?;
                     let read = self.flyway_schema_emptiness_result(&schemas)?;
                     binary_session_read(read).map(PreparedStatementExecutionResult::ResultSet)
+                }
+                RunAsText::BoundWrittenValues { sql, values } => {
+                    let bound = self.bound_values(
+                        statement_id,
+                        parameter_payload,
+                        long_data,
+                        values.parameter_count(),
+                    )?;
+                    self.execute_bound_written_values(&sql, &values, bound)
+                        .map(PreparedStatementExecutionResult::ResultSet)
                 }
                 RunAsText::PrismaCatalog(query) => {
                     let schemas = self.bound_words(
@@ -6439,6 +6608,129 @@ fn binary_session_read(read: TextResultSet) -> Result<BinaryResultSet, FrontendE
         warnings: read.warnings,
         status_flags: read.status_flags,
     })
+}
+
+/// What a bound value's column reports. Measured on MySQL 8.4.11 through
+/// sqlx 0.8.6: `CAST(? AS SIGNED)` a `LONGLONG` of 21 and `CAST(? AS
+/// DECIMAL(10,2))` a `NEWDECIMAL` of 12 with 2 decimals, each nullable with
+/// the binary flag, prepared and bound alike; a `?` alone reports what a
+/// bound `?` column reports, a word's the generic string of 65532.
+fn bound_value_column(
+    name: &str,
+    cast: turso_mysql_parser::BoundCast,
+    value: &StatementParameterValue,
+) -> ColumnDefinitionConfig {
+    match cast {
+        turso_mysql_parser::BoundCast::Signed => {
+            let mut definition = ColumnDefinitionConfig::new(name, MYSQL_TYPE_LONGLONG);
+            definition.character_set = MYSQL_BINARY_COLLATION;
+            definition.column_length = 21;
+            definition.flags = MYSQL_BINARY_FLAG;
+            definition
+        }
+        turso_mysql_parser::BoundCast::Decimal { precision, scale } => {
+            let mut definition = ColumnDefinitionConfig::new(name, MYSQL_TYPE_NEWDECIMAL);
+            definition.character_set = MYSQL_BINARY_COLLATION;
+            definition.column_length = precision + u32::from(scale > 0) + 1;
+            definition.decimals = u8::try_from(scale).expect("a DECIMAL holds at most 30 places");
+            definition.flags = MYSQL_BINARY_FLAG;
+            definition
+        }
+        turso_mysql_parser::BoundCast::Nothing => {
+            let kind = match value {
+                StatementParameterValue::Integer(_) => MySqlMarkerType::Integer,
+                _ => MySqlMarkerType::Untyped,
+            };
+            marker_column_definition(name.to_owned(), kind)
+                .expect("a whole number and a word each report a column")
+        }
+    }
+}
+
+/// The SQL a bound value is written into its statement as, where its written
+/// form is read the way MySQL reads the bound one; see
+/// `execute_bound_written_values`.
+fn bound_value_written(
+    cast: turso_mysql_parser::BoundCast,
+    value: &StatementParameterValue,
+    no_backslash_escapes: bool,
+) -> Result<String, FrontendErrorKind> {
+    let spells_a_number = |word: &str, with_a_point: bool| {
+        let digits = word.strip_prefix('-').unwrap_or(word);
+        let (whole, fraction) = match digits.split_once('.') {
+            Some((whole, fraction)) if with_a_point => (whole, Some(fraction)),
+            Some(_) => return false,
+            None => (digits, None),
+        };
+        !whole.is_empty()
+            && whole.bytes().all(|byte| byte.is_ascii_digit())
+            && fraction.is_none_or(|fraction| {
+                !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    match (cast, value) {
+        (_, StatementParameterValue::Integer(number)) => Ok(number.to_string()),
+        (turso_mysql_parser::BoundCast::Signed, StatementParameterValue::String(word))
+            if spells_a_number(word, false) =>
+        {
+            word.parse::<i64>()
+                .map(|number| number.to_string())
+                .map_err(|_| FrontendErrorKind::Unsupported)
+        }
+        (turso_mysql_parser::BoundCast::Decimal { .. }, StatementParameterValue::String(word))
+            if spells_a_number(word, true) =>
+        {
+            Ok(word.clone())
+        }
+        (turso_mysql_parser::BoundCast::Nothing, StatementParameterValue::Null) => {
+            Ok("NULL".to_owned())
+        }
+        (turso_mysql_parser::BoundCast::Nothing, StatementParameterValue::String(word))
+            if !word.contains('\0') =>
+        {
+            let word = if no_backslash_escapes {
+                word.clone()
+            } else {
+                word.replace('\\', "\\\\")
+            };
+            Ok(format!("'{}'", word.replace('\'', "''")))
+        }
+        _ => Err(FrontendErrorKind::Unsupported),
+    }
+}
+
+/// One value a `SELECT` of written values answered in text, in the form the
+/// binary protocol sends a column of its type in.
+fn written_value_in_binary(
+    column: &ColumnDefinitionConfig,
+    value: Option<Vec<u8>>,
+) -> Result<BinaryResultValue, FrontendErrorKind> {
+    let Some(value) = value else {
+        return Ok(BinaryResultValue::Null);
+    };
+    if matches!(
+        column.column_type,
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING
+    ) && column.character_set == MYSQL_BINARY_COLLATION
+    {
+        return Ok(BinaryResultValue::Blob(value));
+    }
+    let value = String::from_utf8(value).map_err(|_| FrontendErrorKind::Internal)?;
+    let parsed = |parsed: Option<BinaryResultValue>| parsed.ok_or(FrontendErrorKind::Internal);
+    match column.column_type {
+        MYSQL_TYPE_LONGLONG if column.flags & MYSQL_UNSIGNED_FLAG != 0 => {
+            parsed(value.parse().ok().map(BinaryResultValue::UnsignedInteger))
+        }
+        MYSQL_TYPE_LONGLONG => parsed(value.parse().ok().map(BinaryResultValue::Integer)),
+        MYSQL_TYPE_DOUBLE => parsed(value.parse().ok().map(BinaryResultValue::Real)),
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_STRING | MYSQL_TYPE_NEWDECIMAL => {
+            Ok(BinaryResultValue::Text(value))
+        }
+        MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP => binary_result_datetime(&value),
+        MYSQL_TYPE_DATE => binary_result_date(&value),
+        MYSQL_TYPE_TIME => binary_result_time(&value),
+        _ => Err(FrontendErrorKind::Unsupported),
+    }
 }
 
 fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {
