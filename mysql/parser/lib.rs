@@ -827,7 +827,7 @@ impl BoundAutoIncrementInsert {
         if id.is_none() && self.allocator_at.is_none() {
             return unsupported("AUTO_INCREMENT rowwise INSERT row names no id of its own");
         }
-        let mut statement = self.insert.sqlite_statement.clone();
+        let mut statement = statement_with_only_its_row(&self.insert.sqlite_statement, row_number)?;
         let Stmt::Insert { columns, body, .. } = &mut statement else {
             return unsupported("AUTO_INCREMENT INSERT AST changed");
         };
@@ -837,13 +837,6 @@ impl BoundAutoIncrementInsert {
         let turso_parser::ast::OneSelect::Values(rows) = &mut select.body.select else {
             return unsupported("AUTO_INCREMENT INSERT VALUES rows changed");
         };
-        let row = rows
-            .get(row_number)
-            .cloned()
-            .ok_or(ParseError::Unsupported {
-                feature: "AUTO_INCREMENT rowwise INSERT row is missing",
-            })?;
-        *rows = vec![row];
         let defaults = self
             .insert
             .defaults_in_each_row
@@ -1003,6 +996,56 @@ impl BoundAutoIncrementInsert {
         };
         TursoExpr::Literal(literal)
     }
+}
+
+/// A copy of a checked `INSERT ... VALUES` holding only one of its rows.
+///
+/// A counted `INSERT` whose rows name their own ids is written a row at a
+/// time, so copying every row for each one made the statement's cost grow
+/// with the square of its rows: a dump's 5,000-row `INSERT` took 30 s.
+fn statement_with_only_its_row(statement: &Stmt, row_number: usize) -> Result<Stmt, ParseError> {
+    let Stmt::Insert {
+        with,
+        or_conflict,
+        tbl_name,
+        columns,
+        body,
+        returning,
+    } = statement
+    else {
+        return unsupported("AUTO_INCREMENT INSERT AST changed");
+    };
+    let turso_parser::ast::InsertBody::Select(select, upsert) = body else {
+        return unsupported("AUTO_INCREMENT INSERT VALUES body changed");
+    };
+    let turso_parser::ast::OneSelect::Values(rows) = &select.body.select else {
+        return unsupported("AUTO_INCREMENT INSERT VALUES rows changed");
+    };
+    let row = rows
+        .get(row_number)
+        .cloned()
+        .ok_or(ParseError::Unsupported {
+            feature: "AUTO_INCREMENT rowwise INSERT row is missing",
+        })?;
+    Ok(Stmt::Insert {
+        with: with.clone(),
+        or_conflict: *or_conflict,
+        tbl_name: tbl_name.clone(),
+        columns: columns.clone(),
+        body: turso_parser::ast::InsertBody::Select(
+            turso_parser::ast::Select {
+                with: select.with.clone(),
+                body: turso_parser::ast::SelectBody {
+                    select: turso_parser::ast::OneSelect::Values(vec![row]),
+                    compounds: select.body.compounds.clone(),
+                },
+                order_by: select.order_by.clone(),
+                limit: select.limit.clone(),
+            },
+            upsert.clone(),
+        ),
+        returning: returning.clone(),
+    })
 }
 
 /// SQLite SQL produced from one checked MySQL `SELECT` statement.
