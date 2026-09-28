@@ -6601,6 +6601,18 @@ before executing any of them. It closes the connection if the assembled
 response exceeds 512 frames or 1 MiB; earlier statement effects may already
 have happened. A runtime write-queue setting can impose a smaller bound.
 
+`COM_SET_OPTION` (0x1b), which Connector/J sends to run a rewritten batch of
+`UPDATE`s as one query, turns multi-statements on and off for the connection,
+whatever the handshake negotiated; it used to answer 1235, and the batch
+failed. Measured on MySQL 8.4.11 and answered the same: option 0 turns them
+on and 1 off, the answer numbered 1 is the packet that ends a result set — an
+EOF packet `fe`, the warning count and the status flags, or with EOF
+deprecated the same as an OK packet with the 0xFE header — bytes after the two
+of the option are ignored, another option is 1047 `Unknown command` (SQLSTATE
+`08S01`), and fewer than two bytes are 1835 `Malformed communication packet.`
+(`HY000`). The warning count here is always 0, where MySQL's carries the
+previous statement's.
+
 Account administration has a deliberately narrow SQL surface: `CREATE USER
 'name'@'%' IDENTIFIED BY 'password'`, `GRANT SELECT ON db.table TO
 'name'@'%'`, and the matching `REVOKE`. The offline provisioner must explicitly

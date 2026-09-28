@@ -451,6 +451,10 @@ pub enum FrontendErrorKind {
     Unsupported,
     /// A packet before sign-in did not read as the one the client owed.
     BadHandshake,
+    /// A command packet too short to hold what its command needs.
+    MalformedPacket,
+    /// A command asked for something the command does not know.
+    UnknownCommand,
     /// A client answered the greeting without starting TLS.
     InsecureTransport,
     /// Authentication failed without exposing credential details.
@@ -741,6 +745,16 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         // Measured on MySQL 8.4.11, message and all, for a packet that does
         // not read as an SSLRequest or a handshake response.
         FrontendErrorKind::BadHandshake => (1043, *b"08S01", b"Bad handshake".as_slice()),
+        // Measured on MySQL 8.4.11, message and all, for a `COM_SET_OPTION`
+        // without its two option bytes.
+        FrontendErrorKind::MalformedPacket => (
+            1835,
+            *b"HY000",
+            b"Malformed communication packet.".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11, message and all, for a `COM_SET_OPTION`
+        // naming an option other than the two.
+        FrontendErrorKind::UnknownCommand => (1047, *b"08S01", b"Unknown command".as_slice()),
         // Measured on MySQL 8.4.11 under `require_secure_transport=ON`,
         // message and all; this server always requires TLS over TCP.
         FrontendErrorKind::InsecureTransport => (
@@ -2686,6 +2700,8 @@ mod tests {
             ),
             (FrontendErrorKind::LongDataTooLarge, 1105, *b"HY000"),
             (FrontendErrorKind::BadHandshake, 1043, *b"08S01"),
+            (FrontendErrorKind::MalformedPacket, 1835, *b"HY000"),
+            (FrontendErrorKind::UnknownCommand, 1047, *b"08S01"),
             (FrontendErrorKind::InsecureTransport, 3159, *b"HY000"),
             (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),

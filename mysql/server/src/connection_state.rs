@@ -14,9 +14,10 @@ use crate::{
     CredentialVerificationError, FrontendErrorKind, HandshakeNonceSource, InitialHandshakeConfig,
     InitialHandshakeError, InitialHandshakeNonceError, InitialHandshakeSettings,
     OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError, ResponsePacketError,
-    AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-    MAX_CLIENT_AUTH_RESPONSE_LENGTH, MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH,
-    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
+    AUTH_PLUGIN_DATA_LENGTH, CLIENT_MULTI_STATEMENTS, CLIENT_SSL,
+    CLIENT_SSL_REQUEST_PAYLOAD_LENGTH, MAX_CLIENT_AUTH_RESPONSE_LENGTH,
+    MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
+    MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
 };
 
 #[cfg(test)]
@@ -65,6 +66,13 @@ pub const COM_STMT_CLOSE: u8 = 0x19;
 pub const COM_STMT_RESET: u8 = 0x1a;
 /// Classic command identifier for resetting the authenticated connection.
 pub const COM_RESET_CONNECTION: u8 = 0x1f;
+/// Classic command identifier for turning multi-statements on or off.
+pub const COM_SET_OPTION: u8 = 0x1b;
+/// The `COM_SET_OPTION` option that lets one `COM_QUERY` hold several
+/// statements.
+pub const MYSQL_OPTION_MULTI_STATEMENTS_ON: u16 = 0;
+/// The `COM_SET_OPTION` option that holds a `COM_QUERY` to one statement.
+pub const MYSQL_OPTION_MULTI_STATEMENTS_OFF: u16 = 1;
 /// Cursor mode that does not request a server-side cursor.
 pub const CURSOR_TYPE_NO_CURSOR: u8 = 0;
 
@@ -111,6 +119,8 @@ pub enum ClassicCommand<'a> {
     StmtReset { statement_id: u32 },
     /// A request to reset the authenticated connection session.
     ResetConnection,
+    /// A request to turn multi-statements on or off, with the option as sent.
+    SetOption { option: u16 },
     /// A request to select the connection's default database.
     InitDb { database: &'a str },
     /// A connection liveness check.
@@ -471,6 +481,26 @@ impl ClassicConnection {
     /// Returns the negotiated client/server capability intersection.
     pub const fn negotiated_capabilities(&self) -> Option<u32> {
         self.negotiated_capabilities
+    }
+
+    /// Lets a `COM_QUERY` hold several statements or holds it to one, as
+    /// `COM_SET_OPTION` asks, whatever the handshake negotiated.
+    ///
+    /// Measured on MySQL 8.4.11: a connection whose handshake left
+    /// `CLIENT_MULTI_STATEMENTS` out runs two statements after the option is
+    /// turned on, and answers 1064 at the second after it is turned off.
+    pub fn set_multi_statements(&mut self, enabled: bool) -> Result<(), ConnectionStateError> {
+        self.ensure_ready()?;
+        let capabilities = self
+            .negotiated_capabilities
+            .as_mut()
+            .ok_or(ConnectionStateError::ClientResponseRequired)?;
+        if enabled {
+            *capabilities |= CLIENT_MULTI_STATEMENTS;
+        } else {
+            *capabilities &= !CLIENT_MULTI_STATEMENTS;
+        }
+        Ok(())
     }
 
     pub(crate) const fn response_packet_codec(&self) -> PacketCodec {
@@ -1261,6 +1291,20 @@ fn decode_command_packet<'a>(
         COM_RESET_CONNECTION => {
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::ResetConnection
+        }
+        // Measured on MySQL 8.4.11: bytes after the two of the option are
+        // ignored, and fewer than two answer 1835.
+        COM_SET_OPTION => {
+            let Some(option) = body.get(..2) else {
+                return Err(CommandPacketError::InvalidPayloadLength {
+                    command,
+                    expected: 3,
+                    actual: body.len() + 1,
+                });
+            };
+            ClassicCommand::SetOption {
+                option: u16::from_le_bytes([option[0], option[1]]),
+            }
         }
         COM_PING => {
             validate_exact_body_length(body, command, 0)?;

@@ -12,12 +12,13 @@ use crate::{
     CommandPacketError, ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, Packet,
     PacketCodec, PacketSequence, ResponsePacketError, ResultTerminatorPacket,
     StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF,
-    CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS, COMMAND_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION,
-    MAX_RESULT_COLUMNS, MYSQL_TYPE_BIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
-    MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG,
-    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL,
-    MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
-    MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
+    CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS, COMMAND_SEQUENCE_ID, COM_SET_OPTION,
+    DEFAULT_UTF8MB4_COLLATION, MAX_RESULT_COLUMNS, MYSQL_OPTION_MULTI_STATEMENTS_OFF,
+    MYSQL_OPTION_MULTI_STATEMENTS_ON, MYSQL_TYPE_BIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE,
+    MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON,
+    MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_NEWDECIMAL,
+    MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP,
+    MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -407,13 +408,18 @@ impl CommandDispatcher {
             }
             Err(ConnectionStateError::Command(error)) if is_recoverable_command_error(&error) => {
                 let capabilities = negotiated_capabilities(connection)?;
+                // Measured on MySQL 8.4.11: a `COM_SET_OPTION` too short to
+                // hold its option answers 1835.
+                let kind = match error {
+                    CommandPacketError::InvalidPayloadLength {
+                        command: COM_SET_OPTION,
+                        ..
+                    } => FrontendErrorKind::MalformedPacket,
+                    _ => FrontendErrorKind::Syntax,
+                };
                 return close_on_response_error(
                     connection,
-                    encode_frontend_error(
-                        connection.response_packet_codec(),
-                        capabilities,
-                        FrontendErrorKind::Syntax,
-                    ),
+                    encode_frontend_error(connection.response_packet_codec(), capabilities, kind),
                 );
             }
             Err(ConnectionStateError::Command(error)) => {
@@ -441,6 +447,10 @@ impl CommandDispatcher {
                 )
             }
             ClassicCommand::Quit => Ok(Vec::new()),
+            ClassicCommand::SetOption { option } => {
+                let answer = set_option(connection, executor, option);
+                close_on_response_error(connection, answer)
+            }
             ClassicCommand::InitDb { database } => {
                 let capabilities = negotiated_capabilities(connection)?;
                 close_on_response_error(
@@ -589,6 +599,43 @@ impl CommandDispatcher {
             }
         }
     }
+}
+
+/// Turns multi-statements on or off.
+///
+/// Measured on MySQL 8.4.11: the answer is the packet that ends a result set
+/// — an EOF packet, or an OK packet with the 0xFE header when the client
+/// deprecated EOF — carrying the status flags, and an option other than the
+/// two is answered 1047, `Unknown command`.
+fn set_option<E: CommandExecutor + ?Sized>(
+    connection: &mut ClassicConnection,
+    executor: &mut E,
+    option: u16,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    let capabilities = negotiated_capabilities(connection)?;
+    let enabled = match option {
+        MYSQL_OPTION_MULTI_STATEMENTS_ON => true,
+        MYSQL_OPTION_MULTI_STATEMENTS_OFF => false,
+        _ => {
+            return encode_frontend_error(
+                connection.response_packet_codec(),
+                capabilities,
+                FrontendErrorKind::UnknownCommand,
+            )
+        }
+    };
+    connection
+        .set_multi_statements(enabled)
+        .map_err(CommandDispatcherError::Connection)?;
+    let answer = connection
+        .response_packet_codec()
+        .encode_result_terminator(
+            SERVER_RESPONSE_SEQUENCE_ID,
+            capabilities,
+            0,
+            executor.status_flags(),
+        )?;
+    Ok(vec![answer])
 }
 
 /// Numbers every packet of an answer in order, a row split into several
@@ -2036,6 +2083,103 @@ mod tests {
             assert_eq!(executor.query_calls, [expected]);
             assert!(crate::AuthOkPacket::decode(CODEC, &frames[0]).is_ok());
         }
+    }
+
+    /// Connector/J turns multi-statements on with `COM_SET_OPTION` for a
+    /// rewritten batch. Measured on MySQL 8.4.11: the answer is `fe 00 00`
+    /// and the status flags, or with EOF deprecated the same as an OK packet
+    /// `fe 00 00 <status> 00 00`, numbered 1, and the option holds for the
+    /// connection whatever the handshake said.
+    #[test]
+    fn set_option_turns_multi_statements_on_and_off() {
+        for deprecated_eof in [false, true] {
+            let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+                | CLIENT_MULTI_RESULTS
+                | if deprecated_eof {
+                    CLIENT_DEPRECATE_EOF
+                } else {
+                    0
+                };
+            let mut connection = ready_connection(capabilities);
+            let mut executor = TestExecutor {
+                query_results: VecDeque::from([
+                    Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+                    Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+                ]),
+                ..TestExecutor::default()
+            };
+
+            let on = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_SET_OPTION, &[0, 0]),
+            )
+            .unwrap();
+            assert_eq!(on.len(), 1);
+            let on = CODEC.decode(&on[0]).unwrap();
+            assert_eq!(on.sequence_id, 1);
+            if deprecated_eof {
+                assert_eq!(on.payload, [0xfe, 0, 0, 0x02, 0, 0, 0]);
+            } else {
+                assert_eq!(on.payload, [0xfe, 0, 0, 0x02, 0]);
+            }
+            dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_QUERY, b"UPDATE t SET v = 1; UPDATE t SET v = 2"),
+            )
+            .unwrap();
+            assert_eq!(executor.query_calls.len(), 2);
+
+            dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_SET_OPTION, &[1, 0]),
+            )
+            .unwrap();
+            let refused = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_QUERY, b"SELECT 1; SELECT 2"),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::ErrPacket::decode(CODEC, &refused[0], capabilities)
+                    .unwrap()
+                    .error_code,
+                1064
+            );
+            assert_eq!(executor.query_calls.len(), 2);
+        }
+    }
+
+    /// Measured on MySQL 8.4.11: an option other than the two answers 1047,
+    /// and a body too short for the option 1835; the connection stays.
+    #[test]
+    fn set_option_refuses_an_unknown_option_and_a_short_body() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor::default();
+        for (body, error_code) in [(&[2u8, 0][..], 1047), (&[0u8][..], 1835), (&[][..], 1835)] {
+            let frames = dispatch_command_frame(
+                &mut connection,
+                &mut executor,
+                &command(crate::COM_SET_OPTION, body),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::ErrPacket::decode(CODEC, &frames[0], capabilities)
+                    .unwrap()
+                    .error_code,
+                error_code,
+                "{body:?}"
+            );
+            assert_eq!(connection.state(), ConnectionState::Ready);
+        }
+        assert_eq!(
+            connection.negotiated_capabilities().unwrap() & CLIENT_MULTI_STATEMENTS,
+            0
+        );
     }
 
     #[test]
