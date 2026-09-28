@@ -3205,7 +3205,14 @@ A wildcard over `TABLES` is refused: it asks for MySQL's twenty-one columns
 and this answers eight, so a row of a different width would come back. So is a
 call over one of
 these columns, whose shape has not been measured; counting them works, since a
-count does not depend on what a column holds. The sum of the two storage
+count does not depend on what a column holds. `CONCAT` over the words of any
+`information_schema` table is the exception, which is how TypeORM's
+`clearDatabase` writes out the statements dropping each view —
+``concat('DROP VIEW IF EXISTS `', table_schema, '`.`', table_name, '`')`` over
+`VIEWS`: measured on 8.4.11, it answers a nullable `VAR_STRING` as wide as each
+word and column counted four bytes to a character, 612 there, with 31 decimals
+and the binary flag the catalog's words carry. Over a column of another kind —
+`VIEW_DEFINITION`, a `LONGTEXT` answered as a `MEDIUM_BLOB` — it stays refused. The sum of the two storage
 counters — Laravel lists tables with `(data_length + index_length) as size` — is
 answered with the shape measured on 8.4.11, an unsigned `LONGLONG` of length 22
 without the binary flag; every other arithmetic over these columns is refused.

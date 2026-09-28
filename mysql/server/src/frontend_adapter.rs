@@ -7732,8 +7732,25 @@ fn scalar_call_column_definition(
     if function == ScalarFunction::Concatenates {
         let mut width = literal_characters.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
         let mut beside_a_text = false;
+        let mut reads_the_catalog = false;
         for column_name in columns {
             let (table, ordinal) = source_metadata.column_named(column_name)?;
+            // Measured on MySQL 8.4.11: over an `information_schema` table's
+            // words — TypeORM's `concat('DROP VIEW IF EXISTS `', table_schema,
+            // '`.`', table_name, '`')` over `VIEWS` — the answer is as wide as
+            // each word and column counted four bytes to a character, 612
+            // there, and carries the binary flag those words carry. A column
+            // of another kind there has not been measured.
+            if let Some(catalog_column) = table.catalog_columns.get(ordinal) {
+                if catalog_column.column_type != MYSQL_TYPE_VAR_STRING
+                    || catalog_column.flags & MYSQL_BINARY_FLAG == 0
+                {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                reads_the_catalog = true;
+                width = width.saturating_add(catalog_column.column_length);
+                continue;
+            }
             let source = table
                 .columns
                 .get(ordinal)
@@ -7754,7 +7771,12 @@ fn scalar_call_column_definition(
                 width.saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER),
             );
         }
-        return Ok(text_call_definition(name, width, not_null));
+        let mut definition = text_call_definition(name, width, not_null);
+        if reads_the_catalog {
+            let flags = definition.flags | MYSQL_BINARY_FLAG;
+            set_column_flags(&mut definition, flags);
+        }
+        return Ok(definition);
     }
     // Measured: GREATEST and LEAST take the widest shape among their arguments.
     if function == ScalarFunction::Widest {

@@ -430,3 +430,58 @@ fn rails_counts_the_rows_a_limit_leaves_in_a_derived_table() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// TypeORM's `clearDatabase` and `dropDatabase` list the views to drop by
+/// writing each statement out of `information_schema.VIEWS`. Measured on
+/// MySQL 8.4.11: the answer is a `VAR_STRING` as wide as each word and column
+/// counted four bytes to a character — 612 and 580 here — with 31 decimals
+/// and the binary flag the catalog's words carry, and nullable.
+#[test]
+fn typeorm_writes_a_statement_out_of_the_catalog_s_words() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("typeorm_owner"));
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("typeorm").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([144; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("typeorm").unwrap();
+    let drops = "SELECT concat('DROP VIEW IF EXISTS `', table_schema, '`.`', table_name, '`') AS `query` FROM `INFORMATION_SCHEMA`.`VIEWS` WHERE `TABLE_SCHEMA` = 'typeorm'";
+    let creates = "SELECT concat('CREATE VIEW ', table_schema, '.', table_name, ' AS ') AS `query` FROM `INFORMATION_SCHEMA`.`VIEWS` WHERE `TABLE_SCHEMA` = 'typeorm'";
+    let none = result_set(&mut adapter, drops);
+    assert!(none.rows.is_empty());
+    assert_eq!(
+        shapes(&none),
+        [("query", MYSQL_TYPE_VAR_STRING, 612, 31, MYSQL_BINARY_FLAG)]
+    );
+    for sql in [
+        "CREATE TABLE posts (id INT NOT NULL PRIMARY KEY, title VARCHAR(20) NOT NULL)",
+        "CREATE VIEW v_posts AS SELECT id, title FROM posts",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let dropped = result_set(&mut adapter, drops);
+    assert_eq!(
+        text_rows(&dropped),
+        [[Some("DROP VIEW IF EXISTS `typeorm`.`v_posts`".to_owned())]]
+    );
+    assert_eq!(shapes(&dropped), shapes(&none));
+    let created = result_set(&mut adapter, creates);
+    assert_eq!(
+        text_rows(&created),
+        [[Some("CREATE VIEW typeorm.v_posts AS ".to_owned())]]
+    );
+    assert_eq!(
+        shapes(&created),
+        [("query", MYSQL_TYPE_VAR_STRING, 580, 31, MYSQL_BINARY_FLAG)]
+    );
+    // Measured: over `VIEW_DEFINITION`, a `LONGTEXT`, the answer is a
+    // `MEDIUM_BLOB` by a rule not taken here.
+    assert!(adapter
+        .execute_query(
+            "SELECT CONCAT('x', view_definition) FROM information_schema.VIEWS WHERE table_schema = 'typeorm'"
+        )
+        .is_err());
+}
