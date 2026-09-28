@@ -176,10 +176,13 @@ fn check_columns(
     // — measured on 8.4.11, a bare `TEXT PRIMARY KEY` is 1170 — so only the
     // two types that carry one are read here.
     let primary_key_integer_type = match column.data_type {
-        DataType::Int(None) => Some(CheckedPrimaryKeyIntegerType::Int),
-        DataType::Integer(None) => Some(CheckedPrimaryKeyIntegerType::Integer),
-        DataType::BigInt(None) => Some(CheckedPrimaryKeyIntegerType::BigInt),
-        DataType::BigIntUnsigned(None) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
+        // A display width is taken and dropped, as on any other integer
+        // column: xorm writes `BIGINT(20) PRIMARY KEY` for every key it
+        // does not count.
+        DataType::Int(_) => Some(CheckedPrimaryKeyIntegerType::Int),
+        DataType::Integer(_) => Some(CheckedPrimaryKeyIntegerType::Integer),
+        DataType::BigInt(_) => Some(CheckedPrimaryKeyIntegerType::BigInt),
+        DataType::BigIntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
         // A key over bytes is what a table keyed by a UUID holds it in,
         // measured taken by MySQL 8.4.11 as `BINARY(16)` and `VARBINARY(16)`.
         DataType::Varchar(Some(_))
@@ -307,7 +310,7 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
     // alias, so an integer key is always written `INT`. A key over a word has
     // no alias to avoid and is written as it was declared.
     let data_type = match column.data_type {
-        DataType::Int(None) | DataType::Integer(None) => "INT".to_owned(),
+        DataType::Int(_) | DataType::Integer(_) => "INT".to_owned(),
         _ => the_type_a_column_is_written_with(column)?,
     };
     let collation = super::engine_collation_of(column);
@@ -371,10 +374,10 @@ fn render_mysql_source_column(
         .any(|option| matches!(&option.option, ColumnOption::PrimaryKey(_)))
     {
         let data_type = match column.data_type {
-            DataType::Int(None) => "INT".to_owned(),
-            DataType::Integer(None) => "INTEGER".to_owned(),
-            DataType::BigInt(None) => "BIGINT".to_owned(),
-            DataType::BigIntUnsigned(None) => "BIGINT UNSIGNED".to_owned(),
+            DataType::Int(_) => "INT".to_owned(),
+            DataType::Integer(_) => "INTEGER".to_owned(),
+            DataType::BigInt(_) => "BIGINT".to_owned(),
+            DataType::BigIntUnsigned(_) => "BIGINT UNSIGNED".to_owned(),
             _ => the_type_a_column_is_written_with(column)?,
         };
         let mut options = Vec::new();

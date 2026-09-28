@@ -267,3 +267,41 @@ fn xorms_dynamic_row_format_is_kept_and_printed_back() {
         );
     }
 }
+
+/// xorm writes `BIGINT(20) PRIMARY KEY` for every key it does not count —
+/// Gitea's `action_run_index` among them. Measured on MySQL 8.4.11, the
+/// width is dropped as on any other integer column and the key is printed
+/// `bigint NOT NULL`.
+#[test]
+fn xorms_uncounted_key_takes_a_display_width() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `action_run_index` (`group_id` BIGINT(20) PRIMARY KEY NOT NULL, `max_index` BIGINT(20) NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+    );
+    assert_eq!(
+        create_table(&mut adapter, "action_run_index"),
+        "CREATE TABLE `action_run_index` (\n  `group_id` bigint NOT NULL,\n  `max_index` bigint DEFAULT NULL,\n  PRIMARY KEY (`group_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ROW_FORMAT=DYNAMIC"
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO `action_run_index` (`group_id`, `max_index`) VALUES (7, 1)",
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "INSERT INTO `action_run_index` (`group_id`, `max_index`) VALUES (7, 2)"
+        ),
+        Err(FrontendErrorKind::ConstraintViolation)
+    ));
+    // An `INTEGER` key written with a width is still no rowid alias: a row
+    // without one is refused rather than numbered.
+    run(
+        &mut adapter,
+        "CREATE TABLE `keyed` (`id` INTEGER(11) PRIMARY KEY, `n` INT)",
+    );
+    assert!(create_table(&mut adapter, "keyed")
+        .starts_with("CREATE TABLE `keyed` (\n  `id` int NOT NULL,"));
+    assert!(adapter
+        .execute_query("INSERT INTO `keyed` (`n`) VALUES (1)")
+        .is_err());
+}
