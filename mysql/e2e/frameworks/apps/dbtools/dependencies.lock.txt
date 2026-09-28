@@ -1,0 +1,5 @@
+
+The following files have been resolved:
+   com.google.protobuf:protobuf-java:jar:4.31.1:compile -- module com.google.protobuf [auto]
+   com.mysql:mysql-connector-j:jar:9.7.0:compile -- module mysql.connector.j (auto)
+

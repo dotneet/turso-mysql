@@ -231,3 +231,10 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-sqlx:local
     working_dir: /app
     command: ["./run.sh"]
+
+  dbtools:
+    <<: *app
+    build: ./apps/dbtools
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-dbtools:local
+    working_dir: /app
+    command: ["./run.sh"]
