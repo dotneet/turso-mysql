@@ -3276,6 +3276,47 @@ fn render_order_by_expr(
         }
         // `ORDER BY name COLLATE utf8mb4_bin` asks for PAD SPACE byte order.
         Expr::Collate { expr: inner, .. } if matches!(inner.as_ref(), Expr::Identifier(_)) => {}
+        // `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END`
+        // is how Gitea lists an issue's dependencies from its own repository
+        // first, and `CASE WHEN name = ? THEN '' ELSE lower_name END` how it
+        // lists an organisation's owners team first. Each condition is read
+        // as a `WHERE` reads it; the branches are whole numbers or words.
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } if ordering_case_kind(
+            &conditions
+                .iter()
+                .map(|when| &when.result)
+                .chain(std::iter::once(otherwise.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .is_some() =>
+        {
+            let results = conditions
+                .iter()
+                .map(|when| &when.result)
+                .chain(std::iter::once(otherwise.as_ref()))
+                .collect::<Vec<_>>();
+            let kind = ordering_case_kind(&results).expect("the guard read the branches");
+            let mut rendered = String::from("CASE");
+            for when in conditions {
+                let condition = render_select_predicate(&when.condition, render_context)?;
+                let result = render_ordering_branch(&when.result, kind, render_context)?;
+                rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
+            }
+            let otherwise = render_ordering_branch(otherwise, kind, render_context)?;
+            return Ok(match kind {
+                OrderingCaseKind::WholeNumbers => {
+                    format!("{rendered} ELSE {otherwise} END {direction}")
+                }
+                OrderingCaseKind::Words => {
+                    format!("{rendered} ELSE {otherwise} END COLLATE MYSQL_UCA9_AI_CI {direction}")
+                }
+            });
+        }
         // `ORDER BY LOWER(name)` is how a report asks for an order it has
         // worked out rather than one a column holds. Any call this already
         // knows the shape of is ordered by, and the answer is collated the way
@@ -3303,31 +3344,6 @@ fn render_order_by_expr(
                 "{} COLLATE MYSQL_UCA9_AI_CI {direction}",
                 render_select_expr(expr, render_context)?
             ));
-        }
-        // `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END`
-        // is how Gitea lists an issue's dependencies from its own repository
-        // first. Each branch is a written whole number or a column held to
-        // plain whole numbers, so the rows order as the numbers MySQL's
-        // `BIGINT` answer holds; each condition is read as a `WHERE` reads it.
-        Expr::Case {
-            operand: None,
-            conditions,
-            else_result: Some(otherwise),
-            ..
-        } if conditions
-            .iter()
-            .map(|when| &when.result)
-            .chain(std::iter::once(otherwise.as_ref()))
-            .all(|result| names_a_whole_number(result) || named_column(result).is_some()) =>
-        {
-            let mut rendered = String::from("CASE");
-            for when in conditions {
-                let condition = render_select_predicate(&when.condition, render_context)?;
-                let result = render_ordering_branch(&when.result, render_context)?;
-                rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
-            }
-            let otherwise = render_ordering_branch(otherwise, render_context)?;
-            return Ok(format!("{rendered} ELSE {otherwise} END {direction}"));
         }
         _ => return unsupported("SELECT ORDER BY expression"),
     }
@@ -3400,19 +3416,71 @@ fn render_order_by_expr(
     Ok(format!("{ordered}{collation} {direction}"))
 }
 
-/// One branch of an ordering `CASE` over whole numbers: a written one as it
-/// stands, a column held to plain whole numbers.
+/// What the branches of an ordering `CASE` answer.
+#[derive(Clone, Copy)]
+enum OrderingCaseKind {
+    /// Written whole numbers and columns holding them, which MySQL answers as
+    /// a `BIGINT` and orders as numbers.
+    WholeNumbers,
+    /// Written words and columns of words, which MySQL answers under the
+    /// columns' collation — a word written out yields to a column's — and
+    /// orders under it.
+    Words,
+}
+
+/// Reads what an ordering `CASE`'s branches answer, from the values written
+/// in them: a word makes it words, a whole number whole numbers, columns
+/// alone whole numbers. A branch of anything else, or words beside numbers,
+/// answers nothing this orders by.
+fn ordering_case_kind(results: &[&Expr]) -> Option<OrderingCaseKind> {
+    let mut words = false;
+    let mut numbers = false;
+    for result in results {
+        if names_a_whole_number(result) {
+            numbers = true;
+        } else if matches!(result, Expr::Value(value)
+            if matches!(value.value, Value::SingleQuotedString(_)))
+        {
+            words = true;
+        } else if named_column(result).is_none() {
+            return None;
+        }
+    }
+    match (words, numbers) {
+        (true, true) => None,
+        (true, false) => Some(OrderingCaseKind::Words),
+        (false, _) => Some(OrderingCaseKind::WholeNumbers),
+    }
+}
+
+/// One branch of an ordering `CASE`: a written value as it stands, a column
+/// held to what the branches answer — plain whole numbers, or words under
+/// the collation the ordering is written with.
 fn render_ordering_branch(
     result: &Expr,
+    kind: OrderingCaseKind,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     if let Some((qualifier, column)) = named_column(result) {
-        render_context
-            .checked_comparisons
-            .push(held_to_plain_whole_numbers(
-                qualifier.map(|qualifier| qualifier.value.clone()),
-                &column.value,
-            ));
+        let qualifier = qualifier.map(|qualifier| qualifier.value.clone());
+        let held = match kind {
+            OrderingCaseKind::WholeNumbers => held_to_plain_whole_numbers(qualifier, &column.value),
+            OrderingCaseKind::Words => {
+                render_context
+                    .collation_sensitive_call_columns
+                    .push(column.value.clone());
+                CheckedSelectComparison {
+                    qualifier,
+                    inner_sources: Vec::new(),
+                    column_name: column.value.clone(),
+                    operator: CheckedSelectComparisonOperator::Equal,
+                    rhs: CheckedSelectComparisonRhs::Text(String::new()),
+                    collated: true,
+                    answers: None,
+                }
+            }
+        };
+        render_context.checked_comparisons.push(held);
         return render_select_expr(result, render_context);
     }
     render_dml_expr(result)

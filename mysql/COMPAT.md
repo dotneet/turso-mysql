@@ -2230,8 +2230,13 @@ An ordering may be a `CASE` whose every branch is a written whole number or a
 column holding whole numbers, in a join too, each condition read as a `WHERE`
 reads it — Gitea lists an issue's dependencies from its own repository first
 with `ORDER BY CASE WHEN issue.repo_id = ? THEN 0 ELSE issue.repo_id END`. The
-rows order as the numbers MySQL's `BIGINT` answer holds; a branch of words, a
-`DECIMAL` or a `BIGINT UNSIGNED` is refused.
+rows order as the numbers MySQL's `BIGINT` answer holds; a `DECIMAL` or a
+`BIGINT UNSIGNED` branch is refused. Its branches may be words instead, written
+and columns — Gitea lists an organisation's teams owners first with `CASE WHEN
+name = ? THEN '' ELSE lower_name END` — and measured on 8.4.11 MySQL answers
+that under the columns' collation, a word written out yielding to a column's,
+so the rows order under `utf8mb4_0900_ai_ci`: `élan` before `zeta`. A column
+under another collation and words beside numbers are refused.
 
 An ordering may name an aggregate over a column whose name a result column's
 alias shares — xorm writes `max(index) AS index ... GROUP BY context_hash ORDER

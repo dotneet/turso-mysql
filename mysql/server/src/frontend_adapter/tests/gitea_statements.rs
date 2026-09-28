@@ -1043,3 +1043,54 @@ fn an_ordering_case_over_whole_numbers_reads_joined_columns() {
         Err(FrontendErrorKind::Unsupported)
     ));
 }
+
+/// Gitea lists an organisation's teams owners first with `ORDER BY CASE WHEN
+/// name = ? THEN '' ELSE lower_name END`, joining `team_user`. MySQL answers
+/// the `CASE` under the column's collation, a written word yielding to a
+/// column's, and orders under it: measured on 8.4.11, `élan` comes before
+/// `zeta`, which byte order puts the other way.
+#[test]
+fn an_ordering_case_over_words_orders_under_the_columns_collation() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `team` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `lower_name` VARCHAR(255) NULL, `name` VARCHAR(255) NULL, `visibility` INT DEFAULT 0 NOT NULL, `code` VARCHAR(20) COLLATE utf8mb4_bin NULL)",
+        "CREATE TABLE `team_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `uid` BIGINT(20) NULL)",
+        "INSERT INTO `team` (`org_id`, `lower_name`, `name`, `visibility`) VALUES (3, 'zeta', 'Zeta', 0), (3, 'owners', 'Owners', 0), (3, 'élan', 'Élan', 0), (3, 'alpha', 'Alpha', 1), (4, 'other', 'Other', 0)",
+        "INSERT INTO `team_user` (`org_id`, `team_id`, `uid`) VALUES (3, 4, 9), (3, 1, 9)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let listed = prepared_rows(
+        &mut adapter,
+        "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id AND team_user.uid = ? WHERE `team`.org_id=? AND (team_user.uid=? OR `team`.visibility IN (?)) ORDER BY CASE WHEN name=? THEN '' ELSE lower_name END LIMIT 10",
+        &[
+            Bound::Whole(9),
+            Bound::Whole(3),
+            Bound::Whole(9),
+            Bound::Whole(0),
+            Bound::Word("Owners"),
+        ],
+    );
+    assert_eq!(
+        listed
+            .rows
+            .iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>(),
+        [2, 4, 3, 1].map(BinaryResultValue::Integer)
+    );
+    for sql in [
+        // Words beside numbers is a coercion MySQL makes by rules of its own.
+        "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id ORDER BY CASE WHEN name = 'Owners' THEN 0 ELSE lower_name END",
+        // A column under another collation orders by that one.
+        "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id ORDER BY CASE WHEN name = 'Owners' THEN '' ELSE code END",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql} must be refused"
+        );
+    }
+}
