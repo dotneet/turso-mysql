@@ -4809,10 +4809,23 @@ transaction form answers 1568 inside a transaction, while the session form is
 taken there and holds from the next transaction on; and the next-transaction
 level is used up by the next transaction that begins — `START TRANSACTION`, or a
 statement reading a table, which is a transaction of its own — but not by
-`SELECT 1` or by a statement that fails. `READ UNCOMMITTED` and `SERIALIZABLE`
-are refused rather than accepted and ignored: a client told yes to either would
-go on reasoning about a guarantee it does not have. The `GLOBAL` scope is refused
-for the same reason — it changes what other sessions get.
+`SELECT 1` or by a statement that fails. `SERIALIZABLE` is taken and kept the
+way `REPEATABLE READ` is, which already gives it: every write waits for the one
+write lock and is given up with 1213 when another session committed since the
+transaction's snapshot, so the transactions that write run as if one after
+another in the order they commit, and one that only reads sees the database as
+one of them left it. MySQL keeps it with locks instead — each read takes a
+shared lock — and gets to the same place: measured on 8.4.11, two
+`SERIALIZABLE` transactions that each read two rows and then write the one the
+other did not end with the first committed and the second answered 1213, and so
+they do here. Where MySQL makes a writer wait for a reader to finish, this
+lets the writer go and gives up the reader if it writes later.
+MySqlConnector's `BeginTransaction(IsolationLevel.Serializable)` sends the
+level and `start transaction;` without waiting between them, so refusing the
+level left the client reading every later answer one behind. `READ
+UNCOMMITTED` is refused rather than accepted and ignored: a client told yes
+would go on reasoning about rows it cannot see here. The `GLOBAL` scope is
+refused too — it changes what other sessions get.
 
 One thing about `REPEATABLE READ` differs, and it is where a snapshot of the
 whole database runs out. MySQL reads the latest committed row for an `UPDATE`,

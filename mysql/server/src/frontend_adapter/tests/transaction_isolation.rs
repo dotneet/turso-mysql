@@ -366,3 +366,43 @@ fn a_consistent_snapshot_is_taken_at_the_statement() {
     );
     run(&mut one, "COMMIT");
 }
+
+/// MySqlConnector begins `BeginTransaction(IsolationLevel.Serializable)` with
+/// `set session transaction isolation level serializable;` and, without
+/// waiting for its answer, `start transaction;`, so a refused level left the
+/// client reading every later answer one behind.
+///
+/// Two transactions each read both rows and then write the one the other did
+/// not: under `SERIALIZABLE` MySQL makes the second writer a deadlock victim
+/// (1213), each read having locked what the other writes. Here the first
+/// commits and the second, whose snapshot is then stale, is given up with
+/// 1213 — one of them, and never both, is written, as in MySQL.
+#[test]
+fn serializable_refuses_one_of_two_transactions_that_each_write_what_the_other_read() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    for session in [&mut one, &mut two] {
+        run(
+            session,
+            "set session transaction isolation level serializable;",
+        );
+        assert_eq!(level_of(session), "SERIALIZABLE");
+        run(session, "start transaction;");
+        assert_eq!(n_of(session, 1), "0");
+        assert_eq!(n_of(session, 2), "0");
+    }
+    run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
+    run(&mut one, "COMMIT");
+    assert_eq!(
+        two.execute_query("UPDATE c SET n = 1 WHERE id = 2"),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    assert_eq!(
+        (n_of(&mut two, 1), n_of(&mut two, 2)),
+        ("1".to_owned(), "0".to_owned())
+    );
+}

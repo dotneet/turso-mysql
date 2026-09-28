@@ -1453,10 +1453,8 @@ fn accept_session_setting(
                 Some(_) => Err(FrontendErrorKind::Unsupported),
             }
         }
-        // `READ COMMITTED` and `REPEATABLE READ` are the two levels this
-        // server keeps. The other two are refused rather than accepted and
-        // ignored, because a client that asked for `SERIALIZABLE` and was told
-        // yes would be reasoning about a guarantee it does not have.
+        // `READ UNCOMMITTED` is refused rather than accepted and ignored: a
+        // client told yes would be reasoning about rows it cannot see here.
         MySqlSessionSetting::TransactionIsolationLevel {
             level,
             next_transaction_only,
@@ -2536,12 +2534,11 @@ mod tests {
         assert_eq!(session.wait_timeout(), None);
     }
 
-    /// The two levels this server keeps are taken, and each reads back as the
-    /// session's level. The other two are refused rather than accepted and
-    /// ignored — a client told yes to `SERIALIZABLE` would reason about a
-    /// guarantee it does not have.
+    /// The three levels this server keeps are taken, and each reads back as
+    /// the session's level. `READ UNCOMMITTED` is refused rather than accepted
+    /// and ignored.
     #[test]
-    fn takes_the_isolation_levels_it_keeps_and_no_other() {
+    fn takes_the_isolation_levels_it_keeps_and_refuses_read_uncommitted() {
         let mut session = MySqlSessionVariables::default();
         let mut run = |sql: &str, status_flags: u16| {
             session.execute_query(
@@ -2576,6 +2573,18 @@ mod tests {
             ),
             (
                 "SET transaction_isolation = 'REPEATABLE-READ'",
+                "REPEATABLE-READ",
+            ),
+            (
+                "set session transaction isolation level serializable;",
+                "SERIALIZABLE",
+            ),
+            (
+                "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+                "SERIALIZABLE",
+            ),
+            (
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
                 "REPEATABLE-READ",
             ),
         ] {
@@ -2642,9 +2651,8 @@ mod tests {
         ));
 
         for sql in [
-            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
             "SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED",
-            "SET SESSION transaction_isolation = 'SERIALIZABLE'",
+            "SET SESSION transaction_isolation = 'READ-UNCOMMITTED'",
         ] {
             assert!(
                 matches!(

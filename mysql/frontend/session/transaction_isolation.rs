@@ -9,6 +9,11 @@
 //! - `READ COMMITTED` lets the snapshot go at every statement until the
 //!   transaction writes. After that nothing else can commit, so the snapshot
 //!   it holds is already the latest one.
+//! - `SERIALIZABLE` is kept the way `REPEATABLE READ` is, which already gives
+//!   it: every write waits for the one write lock and is refused when another
+//!   session committed since the transaction's snapshot, so the transactions
+//!   that write run as if one after another in the order they commit, and one
+//!   that only reads sees the database as one of them left it.
 //!
 //! What `REPEATABLE READ` cannot give is MySQL's current read. Measured on
 //! MySQL 8.4.11: a transaction that read before another session committed can
@@ -23,14 +28,16 @@ use super::*;
 
 /// A transaction isolation level this server can keep.
 ///
-/// `READ UNCOMMITTED` would need other sessions' unwritten rows, and
-/// `SERIALIZABLE` is refused rather than promised, so neither is here.
+/// `READ UNCOMMITTED` would need other sessions' unwritten rows, so it is not
+/// here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MySqlIsolationLevel {
     ReadCommitted,
     /// MySQL's default level.
     #[default]
     RepeatableRead,
+    /// Run as `REPEATABLE READ` is; see the module's notes.
+    Serializable,
 }
 
 impl MySqlIsolationLevel {
@@ -43,6 +50,8 @@ impl MySqlIsolationLevel {
             Some(Self::ReadCommitted)
         } else if words.eq_ignore_ascii_case("REPEATABLE READ") {
             Some(Self::RepeatableRead)
+        } else if words.eq_ignore_ascii_case("SERIALIZABLE") {
+            Some(Self::Serializable)
         } else {
             None
         }
@@ -53,6 +62,7 @@ impl MySqlIsolationLevel {
         match self {
             Self::ReadCommitted => "READ-COMMITTED",
             Self::RepeatableRead => "REPEATABLE-READ",
+            Self::Serializable => "SERIALIZABLE",
         }
     }
 }
