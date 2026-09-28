@@ -147,6 +147,16 @@ pub fn translate(
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
+    // An assignment rule checks a row just before the row itself is written,
+    // after an UPDATE has deleted the old row and after the row's index
+    // entries or earlier rows are already in, so only a statement journal
+    // can undo the refused statement alone.
+    if prepare_options.assignment_validator.is_some()
+        || connection.dialect().assignment_validator().is_some()
+    {
+        program.set_multi_write(true);
+        program.set_may_abort(true);
+    }
 
     program.epilogue(schema);
 

@@ -6181,6 +6181,97 @@ mod tests {
         assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "STILL QUIET");
     }
 
+    /// Refuses the text 'refused' the way a frontend refuses a value too long
+    /// for its column.
+    struct RefuseOneText;
+
+    impl AssignmentValidator for RefuseOneText {
+        fn check_assignment(
+            &self,
+            table_name: &str,
+            _table_sql: Option<&str>,
+            _operation: AssignmentOperation,
+            values: &[Value],
+        ) -> Result<Option<Vec<Value>>> {
+            match values
+                .iter()
+                .position(|value| matches!(value, Value::Text(text) if text.as_str() == "refused"))
+            {
+                Some(column) => Err(crate::AssignmentError::TooLong {
+                    table: table_name.to_string(),
+                    column: column + 1,
+                    type_name: "VARCHAR".to_string(),
+                }
+                .into()),
+                None => Ok(None),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_value_undoes_only_its_statement_inside_a_transaction() {
+        a_refused_value_undoes_only_its_statement("refused-value-wal.db", false);
+    }
+
+    #[test]
+    fn a_refused_value_undoes_only_its_statement_inside_an_mvcc_transaction() {
+        a_refused_value_undoes_only_its_statement("refused-value-mvcc.db", true);
+    }
+
+    fn a_refused_value_undoes_only_its_statement(file_name: &str, mvcc: bool) {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join(file_name));
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE t(n INTEGER, s TEXT)").unwrap();
+        conn.execute("CREATE INDEX t_s ON t(s)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+            .unwrap();
+
+        // The index entry is written before the row it belongs to is
+        // checked, so even a single-row INSERT has something to undo.
+        for sql in [
+            "INSERT INTO t VALUES (3, 'refused')",
+            "INSERT INTO t VALUES (3, 'c'), (4, 'refused')",
+            "UPDATE t SET s = CASE n WHEN 2 THEN 'refused' ELSE 'changed' END",
+        ] {
+            let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql(sql).unwrap() else {
+                panic!("expected a statement");
+            };
+            let options =
+                PrepareOptions::default().with_assignment_validator(Arc::new(RefuseOneText));
+            let error = conn
+                .prepare_translated_stmt_with_options(stmt, sql, &options)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap_err();
+            assert!(matches!(error, LimboError::Assignment(_)), "{sql}: {error}");
+            assert!(!conn.get_auto_commit(), "{sql} ended the transaction");
+        }
+
+        conn.execute("COMMIT").unwrap();
+        let mut stmt = conn
+            .query("SELECT group_concat(n || s, ',') FROM (SELECT n, s FROM t ORDER BY n)")
+            .unwrap()
+            .unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected a row");
+        };
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "1a,2b");
+        drop(stmt);
+        assert_eq!(
+            query_single_i64(&conn, "SELECT COUNT(*) FROM t INDEXED BY t_s WHERE s > ''"),
+            2
+        );
+        let mut stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected a row");
+        };
+        assert_eq!(stmt.row().unwrap().get::<&str>(0).unwrap(), "ok");
+    }
+
     fn text_value(value: &Value) -> &str {
         match value {
             Value::Text(text) => text.as_str(),

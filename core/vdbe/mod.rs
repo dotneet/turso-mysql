@@ -3051,6 +3051,7 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            let had_statement_savepoint = state.has_stmt_transaction;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -3110,6 +3111,20 @@ impl Program {
                 // FK errors always behave like ABORT: rollback statement,
                 // rollback transaction in autocommit mode.
                 Some(LimboError::ForeignKeyConstraint(_)) => {
+                    if must_rollback_tx_if_needed {
+                        self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
+                // A value a frontend's assignment rule refuses fails its
+                // statement the way an ABORT constraint does: the statement
+                // savepoint was rolled back above, and the transaction ends
+                // only when this statement was its own transaction.
+                Some(LimboError::Assignment(_)) => {
+                    turso_assert!(
+                        !inside_explicit_transaction || had_statement_savepoint,
+                        "a refused assignment inside a transaction had no statement savepoint to undo its writes"
+                    );
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }
