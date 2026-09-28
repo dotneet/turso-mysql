@@ -27,8 +27,12 @@ import (
 )
 
 const (
-	clientSSL             = 0x00000800
-	clientQueryAttributes = 0x08000000
+	clientConnectWithDB        = 0x00000008
+	clientSSL                  = 0x00000800
+	clientSecureConnection     = 0x00008000
+	clientPluginAuth           = 0x00080000
+	clientPluginAuthLenencData = 0x00200000
+	clientQueryAttributes      = 0x08000000
 
 	comQuit             = 0x01
 	comInitDB           = 0x02
@@ -206,6 +210,9 @@ type connState struct {
 	prepared       map[uint32]string
 	serverCaps     uint32
 	clientCaps     uint32
+	// handshake describes the client's HandshakeResponse41, logged when the
+	// server drops the connection without answering it.
+	handshake string
 }
 
 func (st *connState) clientToServer(c, s net.Conn) error {
@@ -214,10 +221,19 @@ func (st *connState) clientToServer(c, s net.Conn) error {
 		if err != nil {
 			return err
 		}
+		st.noteHandshake(p)
 		st.noteCommand(p)
 		if err := writePacket(s, p); err != nil {
 			return err
 		}
+	}
+}
+
+func (st *connState) noteHandshake(p packet) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.authenticating && st.handshake == "" {
+		st.handshake = describeHandshakeResponse(p.payload)
 	}
 }
 
@@ -330,14 +346,58 @@ func greetingCapabilities(payload []byte) uint32 {
 }
 
 // noteUnanswered records a command the server never answered, which is how a
-// dropped connection shows up (for example a packet over the server's limit).
+// dropped connection shows up (for example a packet over the server's limit),
+// and a handshake the server closed without an OK or error packet.
 func (st *connState) noteUnanswered() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if st.authenticating && st.handshake != "" {
+		st.out.write(entry{Conn: st.id, Command: "authenticate", SQL: st.handshake, Message: "connection closed during authentication"})
+		return
+	}
 	if w := st.waiting; w != nil {
 		st.waiting = nil
 		st.out.write(entry{Conn: st.id, Command: w.command, SQL: w.sql, Message: "connection closed before the server answered"})
 	}
+}
+
+// describeHandshakeResponse names the fields of a HandshakeResponse41 that a
+// server may refuse: capability flags, collation, auth plugin and database.
+func describeHandshakeResponse(p []byte) string {
+	if len(p) < 32 {
+		return ""
+	}
+	caps := binary.LittleEndian.Uint32(p[:4])
+	collation := p[8]
+	rest := p[32:]
+	field := func() string {
+		for i, b := range rest {
+			if b == 0 {
+				v := string(rest[:i])
+				rest = rest[i+1:]
+				return v
+			}
+		}
+		v := string(rest)
+		rest = nil
+		return v
+	}
+	user := field()
+	switch {
+	case caps&(clientPluginAuthLenencData|clientSecureConnection) != 0 && len(rest) > 0 && rest[0] < 0xfb:
+		rest = rest[min(len(rest), 1+int(rest[0])):]
+	default:
+		field()
+	}
+	database, plugin := "", ""
+	if caps&clientConnectWithDB != 0 {
+		database = field()
+	}
+	if caps&clientPluginAuth != 0 {
+		plugin = field()
+	}
+	return fmt.Sprintf("<handshake response: capabilities 0x%08x, collation %d, user %q, database %q, plugin %q, %d bytes of attributes>",
+		caps, collation, user, database, plugin, len(rest))
 }
 
 func parseErr(payload []byte) (int, string, string) {
