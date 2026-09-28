@@ -104,8 +104,8 @@ pub(super) fn render_json_null_test(
 ) -> Result<String, ParseError> {
     // SQLAlchemy's `CASE` answers no value for the JSON null as well as for a
     // path that is not there.
-    let rendered = if let Some(reading) = read_unquoted_unless_null(expr) {
-        JsonAnswer::TextUnlessNull(reading).render(render_context)?
+    let rendered = if let Some((reading, read_as)) = read_member_unless_null(expr) {
+        JsonAnswer::MemberUnlessNull(reading, read_as).render(render_context)?
     } else if let Some(reading) = read_json_reading(expr) {
         reading.render(render_context)?
     } else {
@@ -170,10 +170,20 @@ pub(super) fn render_in_list_over_a_json_reading(
     }))
 }
 
-/// A written word, a written whole number or a written document.
+/// A written word, a written number, signed or not, or a written document.
 fn is_a_written_value(expr: &Expr) -> bool {
-    written_document(expr).is_some()
-        || matches!(expr, Expr::Value(value) if matches!(&value.value,
+    let unsigned = match expr {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: number,
+        } if matches!(number.as_ref(), Expr::Value(value) if matches!(value.value, Value::Number(_, false))) =>
+        {
+            return true;
+        }
+        other => other,
+    };
+    written_document(unsigned).is_some()
+        || matches!(unsigned, Expr::Value(value) if matches!(&value.value,
             Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) | Value::Number(_, false)))
 }
 
@@ -190,9 +200,10 @@ pub(super) fn reads_a_json_column(expr: &Expr) -> bool {
 enum JsonAnswer<'e> {
     /// `->>` or `JSON_UNQUOTE(JSON_EXTRACT(...))`: text under `utf8mb4_bin`.
     Text(JsonReading<'e>),
-    /// The same text, but no value where the reading found the JSON null —
-    /// the `CASE` SQLAlchemy writes around it.
-    TextUnlessNull(JsonReading<'e>),
+    /// The `CASE` SQLAlchemy writes around a reading: the text, the whole
+    /// number or the double the member reads as, but no value where the
+    /// reading found the JSON null.
+    MemberUnlessNull(JsonReading<'e>, ScalarFunction),
     /// `JSON_TYPE(...)`: the word naming the kind, under `utf8mb4_bin` too.
     Kind(JsonReading<'e>),
     /// `JSON_LENGTH(...)`: a count.
@@ -205,7 +216,7 @@ impl<'e> JsonAnswer<'e> {
     fn reading(&self) -> &JsonReading<'e> {
         match self {
             Self::Text(reading)
-            | Self::TextUnlessNull(reading)
+            | Self::MemberUnlessNull(reading, _)
             | Self::Kind(reading)
             | Self::Count(reading)
             | Self::Document(reading) => reading,
@@ -216,8 +227,9 @@ impl<'e> JsonAnswer<'e> {
         let reading = self.reading().render(render_context)?;
         Ok(match self {
             Self::Text(_) | Self::Document(_) => reading,
-            Self::TextUnlessNull(_) => format!(
-                "(CASE WHEN {reading} = 'null' THEN NULL ELSE mysql_json_unquote({reading}) END)"
+            Self::MemberUnlessNull(_, read_as) => format!(
+                "(CASE WHEN {reading} = 'null' THEN NULL ELSE {} END)",
+                read_json_member_as(*read_as, &reading)
             ),
             Self::Kind(_) => format!("mysql_json_type({reading})"),
             Self::Count(_) => format!("mysql_json_length({reading})"),
@@ -234,8 +246,13 @@ impl<'e> JsonAnswer<'e> {
         render_context: &mut SelectRenderContext<'_>,
     ) -> Result<String, ParseError> {
         match self {
-            Self::Text(_) | Self::TextUnlessNull(_) | Self::Kind(_) => {
+            Self::Text(_)
+            | Self::MemberUnlessNull(_, ScalarFunction::ReadsJsonText)
+            | Self::Kind(_) => {
                 render_text_comparison(rendered, op, operator, other, render_context)
+            }
+            Self::MemberUnlessNull(..) => {
+                render_number_comparison(rendered, op, operator, other, render_context)
             }
             Self::Count(_) => {
                 render_count_comparison(rendered, op, operator, other, render_context)
@@ -248,8 +265,8 @@ impl<'e> JsonAnswer<'e> {
 }
 
 fn answered_by_json(expr: &Expr) -> Option<JsonAnswer<'_>> {
-    if let Some(reading) = read_unquoted_unless_null(expr) {
-        return Some(JsonAnswer::TextUnlessNull(reading));
+    if let Some((reading, read_as)) = read_member_unless_null(expr) {
+        return Some(JsonAnswer::MemberUnlessNull(reading, read_as));
     }
     if let Some(reading) = read_json_reading(expr) {
         return Some(if reading.unquoted {
@@ -406,16 +423,17 @@ fn extracted_reading<'e>(arguments: &[&'e Expr], unquoted: bool) -> Option<JsonR
     })
 }
 
-/// Reads the `CASE` SQLAlchemy writes to compare a JSON value as text:
-/// `CASE JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE
-/// JSON_UNQUOTE(JSON_EXTRACT(col, 'path')) END`, both readings the same.
+/// Reads the `CASE` SQLAlchemy writes to read a JSON member: `CASE
+/// JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE <reading> END`, the
+/// reading `JSON_UNQUOTE(...)`, `CAST(... AS SIGNED INTEGER)` or `... + 0.0`
+/// over the same path of the same column.
 ///
 /// Measured on MySQL 8.4.11: the `CASE` answers no value where the path finds
 /// the JSON null — the JSON string `"null"` answers the word `null` — and
-/// otherwise the unquoted text, compared the way that text is: `= 'Paris'`
-/// finds Paris and not `paris`, `'Paris '` finds it too, `> 'C'` orders by
-/// bytes, and `= 30` reads both sides as numbers.
-fn read_unquoted_unless_null(expr: &Expr) -> Option<JsonReading<'_>> {
+/// otherwise what its reading answers, compared the way that is: the text
+/// byte for byte with trailing spaces ignored and as a double against a
+/// number, the whole number and the double as numbers.
+fn read_member_unless_null(expr: &Expr) -> Option<(JsonReading<'_>, ScalarFunction)> {
     let Expr::Case {
         operand: Some(operand),
         conditions,
@@ -434,8 +452,9 @@ fn read_unquoted_unless_null(expr: &Expr) -> Option<JsonReading<'_>> {
         return None;
     }
     let tested = read_json_reading(operand).filter(|reading| !reading.unquoted)?;
-    let unquoted = read_json_reading(otherwise).filter(|reading| reading.unquoted)?;
-    tested.reads_what(&unquoted).then_some(tested)
+    let (read_as, read_again) = static_select_metadata::member_reading(otherwise)?;
+    let read_again = read_json_reading(read_again).filter(|reading| !reading.unquoted)?;
+    tested.reads_what(&read_again).then_some((tested, read_as))
 }
 
 /// Reads a JSON column itself or a JSON value read out of one, which is what
@@ -597,6 +616,34 @@ fn render_count_comparison(
         rhs,
         crate::CheckedComparisonAnswer::JsonCount,
     );
+    Ok(format!(
+        "({rendered} {} {rendered_other})",
+        checked_select_comparison_sql_operator(op)
+    ))
+}
+
+/// Renders a comparison of a JSON member read as a whole number or a double
+/// with a written number or NULL, which both compare as numbers. A word and a
+/// bound value are refused: MySQL reads them against a number by rules not
+/// measured here.
+fn render_number_comparison(
+    rendered: &str,
+    op: &BinaryOperator,
+    operator: CheckedSelectComparisonOperator,
+    other: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    let (rendered_other, rhs) = render_checked_select_comparison_rhs(other, render_context)?;
+    let rendered_other = match &rhs {
+        CheckedSelectComparisonRhs::SignedInteger(_) => rendered_other,
+        CheckedSelectComparisonRhs::Decimal(written) => format!("({written})"),
+        CheckedSelectComparisonRhs::Null => {
+            return Ok(render_against_null(rendered, op, operator));
+        }
+        _ => {
+            return unsupported("a JSON member read as a number compared with other than a number")
+        }
+    };
     Ok(format!(
         "({rendered} {} {rendered_other})",
         checked_select_comparison_sql_operator(op)

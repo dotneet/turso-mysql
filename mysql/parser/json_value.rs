@@ -294,6 +294,109 @@ pub fn json_equals(left: &str, right: &str) -> Option<bool> {
     Some(same_value(&left, &right))
 }
 
+/// What a JSON value read as a number answers: nothing for the JSON null,
+/// the number, or a refusal where MySQL answers with a warning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JsonNumberReading<T> {
+    NoValue,
+    Number(T),
+    Refused,
+}
+
+/// Reads a document as `CAST(doc AS SIGNED INTEGER)` does.
+///
+/// Measured on MySQL 8.4.11: a whole number is itself, one past the signed
+/// range wrapping around (`18446744073709551615` is -1), a double is rounded
+/// half to even (`0.5` is 0, `1.5` and `2.5` are 2), `true` is 1 and `false`
+/// 0, and a string is the whole number it spells, spaces before it and a sign
+/// allowed. A double outside the signed range, a string spelling anything
+/// else or a number past the range, an array and an object each answer with
+/// warning 3155 or 3156, and are refused here.
+pub fn json_as_whole_number(document: &str) -> JsonNumberReading<i64> {
+    let Some(value) = read_document(document) else {
+        return JsonNumberReading::Refused;
+    };
+    let number = match value {
+        JsonValue::Null => return JsonNumberReading::NoValue,
+        JsonValue::Signed(number) => number,
+        JsonValue::Unsigned(number) => number as i64,
+        JsonValue::Double(number) => {
+            let rounded = number.round_ties_even();
+            // -2^63 itself answers with warning 3155, measured.
+            if !(rounded > i64::MIN as f64 && rounded < i64::MAX as f64) {
+                return JsonNumberReading::Refused;
+            }
+            rounded as i64
+        }
+        JsonValue::Boolean(truth) => i64::from(truth),
+        JsonValue::Text(text) => {
+            let spelled = text.trim_start_matches(' ');
+            let digits = spelled.strip_prefix(['-', '+']).unwrap_or(spelled);
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return JsonNumberReading::Refused;
+            }
+            match spelled.parse::<i64>() {
+                Ok(number) => number,
+                Err(_) => return JsonNumberReading::Refused,
+            }
+        }
+        JsonValue::Array(_) | JsonValue::Object(_) => return JsonNumberReading::Refused,
+    };
+    JsonNumberReading::Number(number)
+}
+
+/// Reads a document as a double, the way `doc + 0.0` does.
+///
+/// Measured on MySQL 8.4.11: a number is the double nearest it
+/// (`18446744073709551615` is `1.8446744073709552e19`), `true` is 1 and
+/// `false` 0, and a string is the number it spells — `"30.7"`, `"1e3"`,
+/// `".5"` and `"+5"` all read, spaces before it allowed. A string spelling
+/// anything else, spaces after it included, an array and an object each
+/// answer 0 with warning 3156, and are refused here.
+pub fn json_as_double(document: &str) -> JsonNumberReading<f64> {
+    let Some(value) = read_document(document) else {
+        return JsonNumberReading::Refused;
+    };
+    let number = match value {
+        JsonValue::Null => return JsonNumberReading::NoValue,
+        JsonValue::Signed(number) => number as f64,
+        JsonValue::Unsigned(number) => number as f64,
+        JsonValue::Double(number) => number,
+        JsonValue::Boolean(truth) => f64::from(u8::from(truth)),
+        JsonValue::Text(text) => {
+            let spelled = text.trim_start_matches(' ');
+            if !spells_a_number(spelled) {
+                return JsonNumberReading::Refused;
+            }
+            match spelled.parse::<f64>() {
+                Ok(number) if number.is_finite() => number,
+                _ => return JsonNumberReading::Refused,
+            }
+        }
+        JsonValue::Array(_) | JsonValue::Object(_) => return JsonNumberReading::Refused,
+    };
+    JsonNumberReading::Number(number)
+}
+
+/// Whether text is a number written out whole: a sign, digits with a point
+/// among or before them, and an exponent.
+fn spells_a_number(text: &str) -> bool {
+    let unsigned = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (unsigned, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let all_digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
+    let mantissa_reads =
+        !(whole.is_empty() && fraction.is_empty()) && all_digits(whole) && all_digits(fraction);
+    let exponent_reads = exponent.is_none_or(|exponent| {
+        let digits = exponent.strip_prefix(['-', '+']).unwrap_or(exponent);
+        !digits.is_empty() && all_digits(digits)
+    });
+    mantissa_reads && exponent_reads
+}
+
 fn holds(target: &JsonValue, candidate: &JsonValue) -> bool {
     match (target, candidate) {
         (JsonValue::Array(elements), JsonValue::Array(wanted)) => wanted

@@ -4431,10 +4431,22 @@ SQLAlchemy reads a member as text through `CASE JSON_EXTRACT(col, 'path') WHEN
 readings the same, which is what `profile["city"].as_string()` writes. Measured
 on 8.4.11: it reports the column `JSON_UNQUOTE` reports and answers what that
 answers, except no value where the path finds the JSON null — the JSON string
-`"null"` still answers the word. Its other readings — `as_integer()`'s `CAST(...
-AS SIGNED INTEGER)`, `as_float()`'s `JSON_EXTRACT(...)+0.0000000000000000000000`,
-`as_numeric()`'s `CAST(... AS DECIMAL(p, s))` and `as_boolean()`'s `WHEN true
-THEN true ELSE false` — are refused; see TODO.md.
+`"null"` still answers the word. `as_integer()` writes `CAST(JSON_EXTRACT(...)
+AS SIGNED INTEGER)` in the `ELSE` and `as_float()` `JSON_EXTRACT(...)
++0.0000000000000000000000`, in a projection and in a condition alike. Measured
+on 8.4.11: the first reports a LONGLONG of 21 and the second a DOUBLE of 23,
+both with the binary and numeric flags; a whole number is itself — one past
+the signed range wrapping around, `18446744073709551615` reading as -1 and as
+`1.8446744073709552e19` — a double is rounded half to even into a whole
+number (`20.5` is 20, `2.5` 2, `-0.5` 0), `true` and `false` are 1 and 0, and
+a string reads as the number it spells, with spaces before it and a sign
+allowed (`" -12"`, `"+5"`, and `"1e3"` and `".5"` as doubles). MySQL reads
+everything else with warning 3155 or 3156 and a value of its choosing — a
+double past the signed range as a whole number, a string spelling anything
+else, spaces after it included, an array and an object — and the statement is
+refused when it reads one. Either is compared with a written number, as a
+number. `as_numeric()`'s `CAST(... AS DECIMAL(p, s))` and `as_boolean()`'s
+`WHEN true THEN true ELSE false` are refused; see TODO.md.
 
 `JSON_TYPE` names a document's kind, `JSON_LENGTH` counts what it holds at the
 top, `JSON_KEYS` answers an object's keys as a document of their own, and

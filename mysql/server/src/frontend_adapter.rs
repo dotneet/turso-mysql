@@ -8720,11 +8720,15 @@ fn scalar_call_column_definition(
     // answers a LONG_BLOB at the widest length there is, JSON_TYPE a
     // VAR_STRING of 68, and JSON_LENGTH and JSON_VALID a LONGLONG of 21 with
     // the binary collation. All but the last two carry the text collation, and
-    // every one of them the binary flag.
+    // every one of them the binary flag. SQLAlchemy's `CAST(... AS SIGNED
+    // INTEGER)` of a member answers a LONGLONG of 21 too, and its `... + 0.0`
+    // a DOUBLE of 23, both with the numeric flag.
     if matches!(
         function,
         ScalarFunction::ReadsAJsonValue
             | ScalarFunction::ReadsJsonText
+            | ScalarFunction::ReadsJsonAsWholeNumber
+            | ScalarFunction::ReadsJsonAsDouble
             | ScalarFunction::ChecksJson
             | ScalarFunction::NamesAJsonKind
             | ScalarFunction::CountsJsonMembers
@@ -8755,6 +8759,11 @@ fn scalar_call_column_definition(
                 definition.decimals = NOT_FIXED_DECIMALS;
                 definition
             }
+            ScalarFunction::ReadsJsonAsDouble => {
+                let mut definition = column_definition(name, MYSQL_TYPE_DOUBLE);
+                definition.column_length = 23;
+                definition
+            }
             _ => {
                 let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
                 definition.column_length = 21;
@@ -8764,7 +8773,10 @@ fn scalar_call_column_definition(
         };
         let numeric = if matches!(
             function,
-            ScalarFunction::ChecksJson | ScalarFunction::CountsJsonMembers
+            ScalarFunction::ChecksJson
+                | ScalarFunction::CountsJsonMembers
+                | ScalarFunction::ReadsJsonAsWholeNumber
+                | ScalarFunction::ReadsJsonAsDouble
         ) {
             MYSQL_NUM_FLAG
         } else {
@@ -8776,6 +8788,8 @@ fn scalar_call_column_definition(
     let mut definition = match function {
         ScalarFunction::ReadsAJsonValue
         | ScalarFunction::ReadsJsonText
+        | ScalarFunction::ReadsJsonAsWholeNumber
+        | ScalarFunction::ReadsJsonAsDouble
         | ScalarFunction::ChecksJson
         | ScalarFunction::NamesAJsonKind
         | ScalarFunction::CountsJsonMembers

@@ -6353,10 +6353,16 @@ fn render_select_expr(
         Expr::Case {
             operand: Some(operand),
             ..
-        } if static_select_metadata::json_text_unless_null(expr).is_some() => {
+        } if static_select_metadata::json_member_unless_null(expr).is_some() => {
+            let Some(StaticSelectMetadata::ScalarCall { function, .. }) =
+                static_select_metadata::json_member_unless_null(expr)
+            else {
+                unreachable!("the guard read a member of a JSON column");
+            };
             let reading = render_select_expr(operand, render_context)?;
             Ok(format!(
-                "(CASE WHEN {reading} = 'null' THEN NULL ELSE mysql_json_unquote({reading}) END)"
+                "(CASE WHEN {reading} = 'null' THEN NULL ELSE {} END)",
+                read_json_member_as(function, &reading)
             ))
         }
         Expr::Case {
@@ -6760,6 +6766,26 @@ fn render_select_expr(
             Ok("last_insert_id()".to_string())
         }
         _ => unsupported("SELECT expression"),
+    }
+}
+
+/// Renders what SQLAlchemy reads a JSON member as, over the rendered reading
+/// of the member.
+pub(crate) fn read_json_member_as(
+    function: static_select_metadata::ScalarFunction,
+    reading: &str,
+) -> String {
+    match function {
+        static_select_metadata::ScalarFunction::ReadsJsonText => {
+            format!("mysql_json_unquote({reading})")
+        }
+        static_select_metadata::ScalarFunction::ReadsJsonAsWholeNumber => {
+            format!("mysql_json_as_whole_number({reading})")
+        }
+        static_select_metadata::ScalarFunction::ReadsJsonAsDouble => {
+            format!("mysql_json_as_double({reading})")
+        }
+        _ => unreachable!("a JSON member is read as text, a whole number or a double"),
     }
 }
 

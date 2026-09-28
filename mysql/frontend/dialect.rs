@@ -13,7 +13,7 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, table_options_of, SessionSqlMode,
+    render_create_table_mysql_with_mode, table_options_of, JsonNumberReading, SessionSqlMode,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -540,6 +540,12 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_JSON_BOUND_WORD) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_BOUND_WORD.to_string())));
         }
+        if arg_count == 1
+            && (name.eq_ignore_ascii_case(MYSQL_JSON_AS_WHOLE_NUMBER)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_AS_DOUBLE))
+        {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_BOUND) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_COMPARE_BOUND.to_string())));
         }
@@ -965,6 +971,37 @@ impl Dialect for MySqlDialect {
                 return Err(LimboError::ParseError(format!("{name} takes one argument")));
             };
             return cast_as_json(value);
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_AS_WHOLE_NUMBER)
+            || name.eq_ignore_ascii_case(MYSQL_JSON_AS_DOUBLE)
+        {
+            let [document] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            let Value::Text(document) = document else {
+                return Ok(Value::Null);
+            };
+            let read = if name.eq_ignore_ascii_case(MYSQL_JSON_AS_WHOLE_NUMBER) {
+                match turso_mysql_parser::json_as_whole_number(document.as_str()) {
+                    JsonNumberReading::NoValue => Some(Value::Null),
+                    JsonNumberReading::Number(number) => Some(Value::from_i64(number)),
+                    JsonNumberReading::Refused => None,
+                }
+            } else {
+                match turso_mysql_parser::json_as_double(document.as_str()) {
+                    JsonNumberReading::NoValue => Some(Value::Null),
+                    JsonNumberReading::Number(number) => Some(Value::from_f64(number)),
+                    JsonNumberReading::Refused => None,
+                }
+            };
+            // MySQL answers these with warning 3155 or 3156 and a value this
+            // cannot warn about.
+            return read.ok_or_else(|| {
+                LimboError::InvalidArgument(
+                    "a JSON value read as a number that MySQL reads only with a warning"
+                        .to_string(),
+                )
+            });
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_BOUND_WORD) {
             let [value] = args else {
@@ -1807,6 +1844,11 @@ pub(crate) const MYSQL_CAST_AS_JSON: &str = "mysql_cast_as_json";
 /// as a JSON string or the JSON null the way MySQL does, and refuses anything
 /// else.
 pub(crate) const MYSQL_JSON_BOUND_WORD: &str = "mysql_json_bound_word";
+/// Read a JSON value as `CAST(value AS SIGNED INTEGER)` and as `value + 0.0`
+/// do, which SQLAlchemy's `as_integer()` and `as_float()` write. The engine
+/// casts a document's text rather than the value it holds.
+pub(crate) const MYSQL_JSON_AS_WHOLE_NUMBER: &str = "mysql_json_as_whole_number";
+pub(crate) const MYSQL_JSON_AS_DOUBLE: &str = "mysql_json_as_double";
 /// Compares a JSON value read out of a column with a bound value, by what
 /// binds: a word as a JSON string, byte for byte, and a whole number as a
 /// JSON number, the way MySQL compares a written one of each.

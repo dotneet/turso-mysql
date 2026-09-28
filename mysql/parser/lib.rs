@@ -133,10 +133,10 @@ pub use insert_select::{
     MySqlInsertValuesWithoutColumns,
 };
 pub use json_value::{
-    is_a_json_path_this_reads, json_compare_integer, json_compare_string, json_contains,
-    json_equals, json_equals_integer, json_extract, json_keys, json_length, json_merge_patch,
-    json_merge_preserve, json_overlaps, json_quote, json_search, json_type, json_unquote,
-    normalize_json, JsonError,
+    is_a_json_path_this_reads, json_as_double, json_as_whole_number, json_compare_integer,
+    json_compare_string, json_contains, json_equals, json_equals_integer, json_extract, json_keys,
+    json_length, json_merge_patch, json_merge_preserve, json_overlaps, json_quote, json_search,
+    json_type, json_unquote, normalize_json, JsonError, JsonNumberReading,
 };
 pub use like_pattern::MySqlLikePattern;
 pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};

@@ -61,7 +61,9 @@ pub(crate) fn leave_the_one_table_out(query: &mut sqlparser::ast::Query) {
 /// into a subquery, whose own tables a qualifier inside it could name.
 fn leave_the_table_out(expr: &mut Expr, reference: &str) {
     match expr {
-        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => {
             leave_the_table_out(inner, reference);
         }
         Expr::BinaryOp {

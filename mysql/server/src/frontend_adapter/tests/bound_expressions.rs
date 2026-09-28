@@ -1157,6 +1157,138 @@ fn gorm_joins_on_a_bound_word() {
     }
 }
 
+/// SQLAlchemy's `profile["age"].as_integer()` and `.as_float()` read a member
+/// through the same `CASE` around `CAST(... AS SIGNED INTEGER)` and
+/// `... + 0.0000000000000000000000`. Measured on MySQL 8.4.11 over the same
+/// rows: a double rounds half to even, a number past the signed range wraps
+/// around, `false` is 0, a string reads as the number it spells with spaces
+/// before it and a sign allowed, the JSON null answers no value; the columns
+/// are a LONGLONG of 21 and a DOUBLE of 23 with the binary and numeric flags.
+/// A value MySQL reads only with a warning — a word spelling no number, a
+/// double past the signed range, an array — is refused when it is read.
+#[test]
+fn sqlalchemy_reads_a_json_member_as_a_whole_number_or_a_double() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE people (id INT PRIMARY KEY, name VARCHAR(10), profile JSON)",
+    );
+    run(
+        &mut adapter,
+        r#"INSERT INTO people VALUES (1, 'Alice', '{"age": 30}'), (2, 'Bob', '{"age": 20.5}'), (3, 'Carol', NULL), (4, 'Dave', '{"age": null}'), (5, 'Eve', '{"age": "30"}'), (6, 'Fay', 'null'), (7, 'Gil', '{"age": -7}'), (8, 'Hal', '{"age": 18446744073709551615}'), (9, 'Ivy', '{"age": " -12"}'), (10, 'Jay', '{"age": 2.5}'), (11, 'Kim', '{"age": "+5"}'), (12, 'Lou', '{"age": 0.1}'), (13, 'Pat', '{"age": 12345678901234567}'), (14, 'Quy', '{"age": -0.5}'), (15, 'Sam', '{"age": false}')"#,
+    );
+    let whole = "CASE JSON_EXTRACT(people.profile, '$.\"age\"') WHEN 'null' THEN NULL ELSE CAST(JSON_EXTRACT(people.profile, '$.\"age\"') AS SIGNED INTEGER) END";
+    let double = "CASE JSON_EXTRACT(people.profile, '$.\"age\"') WHEN 'null' THEN NULL ELSE JSON_EXTRACT(people.profile, '$.\"age\"')+0.0000000000000000000000 END";
+    let read = |reading: &str| format!("SELECT {reading} AS anon_1 FROM people ORDER BY people.id");
+    assert_eq!(
+        first_column(&mut adapter, &read(whole)),
+        [
+            "30",
+            "20",
+            "NULL",
+            "NULL",
+            "30",
+            "NULL",
+            "-7",
+            "-1",
+            "-12",
+            "2",
+            "5",
+            "0",
+            "12345678901234567",
+            "0",
+            "0"
+        ]
+    );
+    assert_eq!(
+        first_column(&mut adapter, &read(double)),
+        [
+            "30",
+            "20.5",
+            "NULL",
+            "NULL",
+            "30",
+            "NULL",
+            "-7",
+            "1.8446744073709552e19",
+            "-12",
+            "2.5",
+            "5",
+            "0.1",
+            "1.2345678901234568e16",
+            "-0.5",
+            "0"
+        ]
+    );
+    for (reading, column_type, column_length, decimals) in [
+        (whole, MYSQL_TYPE_LONGLONG, 21, 0),
+        (double, MYSQL_TYPE_DOUBLE, 23, NOT_FIXED_DECIMALS),
+    ] {
+        let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(&read(reading))
+        else {
+            panic!("the reading must answer rows");
+        };
+        let column = &result.columns[0];
+        assert_eq!(
+            (
+                column.column_type,
+                column.column_length,
+                column.character_set,
+                column.decimals,
+                column.flags
+            ),
+            (
+                column_type,
+                column_length,
+                MYSQL_BINARY_COLLATION,
+                decimals,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            )
+        );
+    }
+    let found = |reading: &str, comparison: &str| {
+        format!("SELECT people.name FROM people WHERE {reading} {comparison} ORDER BY people.id")
+    };
+    for (reading, comparison, names) in [
+        (whole, "> 20", vec!["Alice", "Eve", "Pat"]),
+        (whole, "= -1", vec!["Hal"]),
+        (whole, "IS NULL", vec!["Carol", "Dave", "Fay"]),
+        (whole, "IN (30, -7, 2)", vec!["Alice", "Eve", "Gil", "Jay"]),
+        (double, "> 20", vec!["Alice", "Bob", "Eve", "Hal", "Pat"]),
+        (
+            double,
+            "<= 20.5",
+            vec!["Bob", "Gil", "Ivy", "Jay", "Kim", "Lou", "Quy", "Sam"],
+        ),
+    ] {
+        assert_eq!(
+            first_column(&mut adapter, &found(reading, comparison)),
+            names,
+            "{comparison}"
+        );
+    }
+    assert!(adapter.execute_query(&found(whole, "= '30'")).is_err());
+    for (id, age) in [
+        (16, r#""abc""#),
+        (17, "1e20"),
+        (18, "[1]"),
+        (19, r#""30 ""#),
+    ] {
+        run(
+            &mut adapter,
+            &format!(r#"INSERT INTO people VALUES ({id}, 'x', '{{"age": {age}}}')"#),
+        );
+        assert!(adapter.execute_query(&read(whole)).is_err(), "{age}");
+        // A double past the signed range is still a double.
+        assert_eq!(
+            adapter.execute_query(&read(double)).is_err(),
+            age != "1e20",
+            "{age}"
+        );
+        run(&mut adapter, &format!("DELETE FROM people WHERE id = {id}"));
+    }
+}
+
 const LARAVEL_JSON_UPDATE: &str = "update `users` set `profile` = json_set(`profile`, '$.\"city\"', ?), `users`.`updated_at` = ? where `email` = ?";
 
 /// Laravel's `update(['profile->city' => 'Kyoto'])` binds the member's new

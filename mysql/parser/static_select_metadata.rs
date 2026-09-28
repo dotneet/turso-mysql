@@ -372,6 +372,11 @@ pub enum ScalarFunction {
     ReadsAJsonValue,
     /// `JSON_UNQUOTE` over that, which answers the text inside the value.
     ReadsJsonText,
+    /// `CAST(JSON_EXTRACT(...) AS SIGNED INTEGER)`, which reads the value as
+    /// a whole number.
+    ReadsJsonAsWholeNumber,
+    /// `JSON_EXTRACT(...) + 0.0...`, which reads the value as a double.
+    ReadsJsonAsDouble,
     /// `JSON_VALID`, which answers one or zero.
     ChecksJson,
     /// `JSON_TYPE`, which names the kind of the document it was given.
@@ -554,7 +559,9 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             classify_integer(digits, sign)
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
-        Expr::Case { .. } if json_text_unless_null(expr).is_some() => json_text_unless_null(expr),
+        Expr::Case { .. } if json_member_unless_null(expr).is_some() => {
+            json_member_unless_null(expr)
+        }
         Expr::Case {
             operand,
             conditions,
@@ -642,14 +649,17 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
     }
 }
 
-/// Classifies the `CASE` SQLAlchemy writes to read a JSON member as text,
-/// `CASE JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE
-/// JSON_UNQUOTE(JSON_EXTRACT(col, 'path')) END`, both readings the same.
+/// Classifies the `CASE` SQLAlchemy writes to read a JSON member —
+/// `CASE JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE <reading> END`
+/// — where the reading reads the same path out of the same column:
+/// `JSON_UNQUOTE(...)` for `as_string()`, `CAST(... AS SIGNED INTEGER)` for
+/// `as_integer()` and `... + 0.0000000000000000000000` for `as_float()`.
 ///
-/// Measured on MySQL 8.4.11: it reports the column `JSON_UNQUOTE` reports,
-/// and answers what that answers except no value where the path finds the
-/// JSON null — the JSON string `"null"` still answers the word.
-pub(crate) fn json_text_unless_null(expr: &Expr) -> Option<StaticSelectMetadata> {
+/// Measured on MySQL 8.4.11: each reports the column its reading reports on
+/// its own — a LONG_BLOB, a LONGLONG of 21 and a DOUBLE of 23 — and answers
+/// what the reading answers except no value where the path finds the JSON
+/// null; the JSON string `"null"` is read like any other string.
+pub(crate) fn json_member_unless_null(expr: &Expr) -> Option<StaticSelectMetadata> {
     let Expr::Case {
         operand: Some(operand),
         conditions,
@@ -669,34 +679,74 @@ pub(crate) fn json_text_unless_null(expr: &Expr) -> Option<StaticSelectMetadata>
     if !tests_for_the_null || !answers_no_value {
         return None;
     }
-    let (Expr::Function(read), Expr::Function(unquoted)) = (operand.as_ref(), otherwise.as_ref())
+    let Expr::Function(read) = operand.as_ref() else {
+        return None;
+    };
+    let Some(StaticSelectMetadata::ScalarCall {
+        function: ScalarFunction::ReadsAJsonValue,
+        columns,
+        ..
+    }) = scalar_call(read)
     else {
         return None;
     };
-    let sqlparser::ast::FunctionArguments::List(arguments) = &unquoted.args else {
-        return None;
-    };
-    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unquoted_read))] =
-        arguments.args.as_slice()
-    else {
-        return None;
-    };
-    let reads_a_json_value = matches!(
-        scalar_call(read)?,
-        StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::ReadsAJsonValue,
-            ..
+    let (function, read_again) = member_reading(otherwise)?;
+    (read_again == operand.as_ref()).then_some(StaticSelectMetadata::ScalarCall {
+        function,
+        columns,
+        literal_characters: 0,
+        not_null: false,
+    })
+}
+
+/// Reads the `ELSE` of SQLAlchemy's `CASE`: what it reads the member as, and
+/// the `JSON_EXTRACT` it reads.
+pub(crate) fn member_reading(expr: &Expr) -> Option<(ScalarFunction, &Expr)> {
+    use sqlparser::ast::{CastKind, DataType};
+
+    match expr {
+        Expr::Function(unquoted) => {
+            let [sqlparser::ast::ObjectNamePart::Identifier(name)] = unquoted.name.0.as_slice()
+            else {
+                return None;
+            };
+            if name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("JSON_UNQUOTE") {
+                return None;
+            }
+            let sqlparser::ast::FunctionArguments::List(arguments) = &unquoted.args else {
+                return None;
+            };
+            let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(read))] =
+                arguments.args.as_slice()
+            else {
+                return None;
+            };
+            Some((ScalarFunction::ReadsJsonText, read))
         }
-    );
-    let text = scalar_call(unquoted)?;
-    let reads_json_text = matches!(
-        text,
-        StaticSelectMetadata::ScalarCall {
-            function: ScalarFunction::ReadsJsonText,
-            ..
+        Expr::Cast {
+            kind: CastKind::Cast,
+            expr: read,
+            data_type: DataType::Signed | DataType::SignedInteger,
+            format: None,
+            array: false,
+        } => Some((ScalarFunction::ReadsJsonAsWholeNumber, read)),
+        Expr::BinaryOp {
+            left: read,
+            op: sqlparser::ast::BinaryOperator::Plus,
+            right,
+        } => {
+            let Expr::Value(value) = right.as_ref() else {
+                return None;
+            };
+            let Value::Number(digits, false) = &value.value else {
+                return None;
+            };
+            let zeros = digits.strip_prefix("0.")?;
+            (!zeros.is_empty() && zeros.bytes().all(|digit| digit == b'0'))
+                .then_some((ScalarFunction::ReadsJsonAsDouble, read))
         }
-    );
-    (reads_a_json_value && reads_json_text && unquoted_read == operand.as_ref()).then_some(text)
+        _ => None,
+    }
 }
 
 /// Classifies `col -> '$.path'` and `col ->> '$.path'`, which are MySQL's own
