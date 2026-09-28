@@ -3860,6 +3860,17 @@ column names `EVENTS` as its table, a moment is described in utf8mb4, 76 bytes
 for its nineteen characters, and the words MySQL's definition works out rather
 than reads carry 31 decimals and name no database.
 
+`information_schema.TRIGGERS` answers MySQL's twenty-two columns, one row for
+each trigger, which DBeaver reads whole: what `SHOW TRIGGERS` shows for it —
+its event, table, body, timing, creation time, `sql_mode`, definer and
+character sets — beside MySQL's constants, `ACTION_ORDER` 1 (one table, event
+and timing carry one trigger here), `ROW`, `OLD` and `NEW`, and NULL for the
+condition and the transition tables. Measured on 8.4.11 over both protocols,
+`CREATED` is a `TIMESTAMP` of 22 with two decimals. MySQL lists a trigger to a
+session holding the `TRIGGER` privilege on its table, which a session here
+holds only through the whole database, so one seeing only the tables it was
+granted sees no trigger.
+
 Flyway's check that a database is empty — `SELECT SUM(found) FROM ((SELECT 1
 as found FROM information_schema.tables WHERE table_schema=?) UNION ALL
 (SELECT 1 ... FROM information_schema.views ... LIMIT 1) UNION ALL ...) as

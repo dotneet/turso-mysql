@@ -51,6 +51,7 @@ use crate::schema_sql::{
 };
 use crate::truncate_table::MySqlTruncateTableError;
 use crate::wal_keeper::WalKeeperHandle;
+pub(crate) use catalog::trigger_metadata;
 use transaction_isolation::TransactionIsolation;
 pub use transaction_isolation::{MySqlIsolationLevel, MySqlTransactionOutcome};
 

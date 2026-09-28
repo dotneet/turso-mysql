@@ -11079,6 +11079,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
         }
         MySqlCatalogTable::Routines => catalog_results::information_schema_routines_columns(),
         MySqlCatalogTable::Events => catalog_results::information_schema_events_columns(),
+        MySqlCatalogTable::Triggers => catalog_results::information_schema_triggers_columns(),
         MySqlCatalogTable::Columns => catalog_results::information_schema_columns_every_column(),
         MySqlCatalogTable::Schemata => catalog_results::information_schema_schemata_columns(),
         MySqlCatalogTable::CheckConstraints => {

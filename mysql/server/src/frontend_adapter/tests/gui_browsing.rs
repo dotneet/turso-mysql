@@ -85,3 +85,130 @@ fn a_view_s_status_is_its_name_and_view() {
         [expected]
     );
 }
+
+/// DBeaver reads a database's triggers whole. It answered 1064, the table
+/// being unknown. Measured: one row for each trigger, holding what `SHOW
+/// TRIGGERS` shows for it beside MySQL's constants — the first trigger of
+/// its table, event and timing, fired for each `ROW`, reading `OLD` and
+/// `NEW` — over both protocols.
+#[test]
+fn dbeaver_reads_the_triggers_of_a_database() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE audit (id INT NOT NULL PRIMARY KEY, what VARCHAR(20))",
+        "CREATE TRIGGER users_ai AFTER INSERT ON users FOR EACH ROW INSERT INTO audit (id, what) VALUES (NEW.id, 'added')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let shown = rows(&mut adapter, "SHOW TRIGGERS");
+    let [shown] = shown.as_slice() else {
+        panic!("one trigger: {shown:?}");
+    };
+    let text = |value: &str| Some(value.to_owned());
+    let expected = vec![
+        text("def"),
+        text("dbtools"),
+        text("users_ai"),
+        text("INSERT"),
+        text("def"),
+        text("dbtools"),
+        text("users"),
+        text("1"),
+        None,
+        text("INSERT INTO audit (id, what) VALUES (NEW.id, 'added')"),
+        text("ROW"),
+        text("AFTER"),
+        None,
+        None,
+        text("OLD"),
+        text("NEW"),
+        shown[5].clone(),
+        shown[6].clone(),
+        text("root@%"),
+        shown[8].clone(),
+        shown[9].clone(),
+        shown[10].clone(),
+    ];
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT * FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='dbtools'"
+        ),
+        [expected]
+    );
+
+    let statement = adapter
+        .execute_stmt_prepare("SELECT * FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=?")
+        .unwrap();
+    assert_eq!(statement.columns.len(), 22);
+    assert_eq!(
+        (
+            statement.columns[16].column_type,
+            statement.columns[16].column_length,
+            statement.columns[16].decimals
+        ),
+        (MYSQL_TYPE_TIMESTAMP, 22, 2)
+    );
+    let mut dbtools = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0, 7];
+    dbtools.extend(b"dbtools");
+    let PreparedStatementExecutionResult::ResultSet(read) = adapter
+        .execute_stmt_execute(statement.statement_id, &dbtools)
+        .unwrap()
+    else {
+        panic!("the triggers must read back");
+    };
+    assert_eq!(read.rows.len(), 1);
+    assert_eq!(read.rows[0][7], BinaryResultValue::Integer(1));
+}
+
+/// MySQL lists a trigger only to a session holding the `TRIGGER` privilege on
+/// its table, which a session here holds only through the whole database: one
+/// granted the table alone sees no trigger.
+#[test]
+fn a_session_granted_tables_alone_sees_no_trigger() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("root"));
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    let mut owner = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([157; 32]),
+        ))
+        .unwrap();
+    owner.authorize_connection().unwrap();
+    owner.execute_init_db("reports").unwrap();
+    for sql in [
+        "CREATE TABLE audit (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TRIGGER records_ai AFTER INSERT ON records FOR EACH ROW INSERT INTO audit (id) VALUES (NEW.id)",
+    ] {
+        owner
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert_eq!(
+        rows(
+            &mut owner,
+            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS"
+        )
+        .len(),
+        1
+    );
+    drop(owner);
+
+    let granted = Arc::new(RecordingAuthorizer::with_decisions_and_table_decisions(
+        [Ok(()), Ok(()), Err(AuthorizationError::Denied)],
+        [Ok(()), Ok(())],
+    ));
+    let mut reader = AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), granted)
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([158; 32]),
+        ))
+        .unwrap();
+    reader.authorize_connection().unwrap();
+    reader.execute_init_db("reports").unwrap();
+    assert!(rows(
+        &mut reader,
+        "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS"
+    )
+    .is_empty());
+}

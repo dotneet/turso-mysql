@@ -1396,7 +1396,9 @@ impl MySqlConnection {
     }
 }
 
-fn trigger_metadata(trigger: &turso_core::schema::Trigger) -> Result<MySqlTriggerMetadata> {
+pub(crate) fn trigger_metadata(
+    trigger: &turso_core::schema::Trigger,
+) -> Result<MySqlTriggerMetadata> {
     let decoded = decode_schema_sql(SchemaSqlKind::Trigger, &trigger.sql)
         .map_err(|error| LimboError::Corrupt(error.to_string()))?
         .ok_or_else(|| LimboError::ParseError("trigger has no MySQL metadata".into()))?;

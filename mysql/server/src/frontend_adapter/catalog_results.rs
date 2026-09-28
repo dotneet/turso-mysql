@@ -873,6 +873,185 @@ pub(super) fn information_schema_check_constraints_columns() -> Vec<ColumnDefini
 /// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
 /// every other table here is pinned to. Three columns are constants in MySQL's
 /// own definition of the table, and those name no table at all.
+/// Every column of `information_schema.TRIGGERS`, in the order MySQL declares
+/// them.
+///
+/// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
+/// every other table here is pinned to: each column read out of the data
+/// dictionary names the dictionary table it came from, and the ones MySQL's
+/// definition writes as constants name no table at all.
+pub(super) fn information_schema_triggers_columns() -> Vec<ColumnDefinitionConfig> {
+    let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let listed = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let chosen = named | MYSQL_ENUM_FLAG;
+    // (name, dictionary table, type, length, flags)
+    [
+        (
+            "TRIGGER_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256u32,
+            named,
+        ),
+        (
+            "TRIGGER_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "TRIGGER_NAME",
+            "triggers",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        (
+            "EVENT_MANIPULATION",
+            "triggers",
+            MYSQL_TYPE_STRING,
+            24,
+            chosen,
+        ),
+        (
+            "EVENT_OBJECT_CATALOG",
+            "catalogs",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "EVENT_OBJECT_SCHEMA",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "EVENT_OBJECT_TABLE",
+            "tables",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            named,
+        ),
+        (
+            "ACTION_ORDER",
+            "triggers",
+            MYSQL_TYPE_LONG,
+            10,
+            listed | MYSQL_UNSIGNED_FLAG,
+        ),
+        (
+            "ACTION_CONDITION",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "ACTION_STATEMENT",
+            "triggers",
+            MYSQL_TYPE_BLOB,
+            u32::MAX,
+            named | MYSQL_BLOB_FLAG,
+        ),
+        (
+            "ACTION_ORIENTATION",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        ("ACTION_TIMING", "triggers", MYSQL_TYPE_STRING, 24, chosen),
+        (
+            "ACTION_REFERENCE_OLD_TABLE",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "ACTION_REFERENCE_NEW_TABLE",
+            "",
+            MYSQL_TYPE_NULL,
+            0,
+            MYSQL_BINARY_FLAG,
+        ),
+        (
+            "ACTION_REFERENCE_OLD_ROW",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "ACTION_REFERENCE_NEW_ROW",
+            "",
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        ("CREATED", "triggers", MYSQL_TYPE_TIMESTAMP, 22, named),
+        (
+            "SQL_MODE",
+            "triggers",
+            MYSQL_TYPE_STRING,
+            2080,
+            named | MYSQL_SET_FLAG,
+        ),
+        ("DEFINER", "triggers", MYSQL_TYPE_VAR_STRING, 1152, named),
+        (
+            "CHARACTER_SET_CLIENT",
+            "character_sets",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        (
+            "COLLATION_CONNECTION",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+        (
+            "DATABASE_COLLATION",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            listed,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, dictionary, column_type, column_length, flags)| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        if !dictionary.is_empty() {
+            "information_schema".clone_into(&mut column.schema);
+            "TRIGGERS".clone_into(&mut column.table);
+            dictionary.clone_into(&mut column.original_table);
+            name.clone_into(&mut column.original_name);
+        }
+        column.character_set = if matches!(
+            column_type,
+            MYSQL_TYPE_LONG | MYSQL_TYPE_NULL | MYSQL_TYPE_TIMESTAMP
+        ) {
+            MYSQL_BINARY_COLLATION
+        } else {
+            u16::from(DEFAULT_UTF8MB4_COLLATION)
+        };
+        column.column_length = column_length;
+        column.flags = flags;
+        column.decimals = match column_type {
+            MYSQL_TYPE_TIMESTAMP => 2,
+            MYSQL_TYPE_VAR_STRING if dictionary.is_empty() => 31,
+            _ => 0,
+        };
+        column
+    })
+    .collect()
+}
+
 /// Every column of `information_schema.EVENTS`, in the order MySQL declares
 /// them.
 ///

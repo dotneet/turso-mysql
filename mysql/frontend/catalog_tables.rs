@@ -46,6 +46,8 @@ pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
 
 /// The name the engine knows `information_schema.ROUTINES` by.
 pub(crate) const INFORMATION_SCHEMA_ROUTINES: &str = "mysql_information_schema_routines";
+/// The name the engine knows `information_schema.TRIGGERS` by.
+pub(crate) const INFORMATION_SCHEMA_TRIGGERS: &str = "mysql_information_schema_triggers";
 /// The name the engine knows `information_schema.EVENTS` by.
 pub(crate) const INFORMATION_SCHEMA_EVENTS: &str = "mysql_information_schema_events";
 
@@ -102,6 +104,11 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
     }
     if !database.has_table(INFORMATION_SCHEMA_EVENTS) {
         database.register_internal_vtab(InformationSchemaEvents)?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_TRIGGERS) {
+        database.register_internal_vtab(InformationSchemaTriggers {
+            database: name.to_owned(),
+        })?;
     }
     if !database.has_table(INFORMATION_SCHEMA_CHECK_CONSTRAINTS) {
         database.register_internal_vtab(InformationSchemaCheckConstraints {
@@ -1540,6 +1547,145 @@ impl InternalVirtualTable for InformationSchemaEvents {
         _order_by: &[turso_ext::OrderByInfo],
     ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
         catalog_best_index(constraints)
+    }
+}
+
+/// `information_schema.TRIGGERS`: every trigger of the database, as `SHOW
+/// TRIGGERS` lists them.
+///
+/// MySQL lists a trigger to a session holding the `TRIGGER` privilege on its
+/// table, which a session here holds only through the whole database; one
+/// seeing only the tables it was granted sees no trigger.
+#[derive(Debug)]
+struct InformationSchemaTriggers {
+    database: String,
+}
+
+impl InternalVirtualTable for InformationSchemaTriggers {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_TRIGGERS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_TRIGGERS} (\
+             TRIGGER_CATALOG TEXT, \
+             TRIGGER_SCHEMA TEXT, \
+             TRIGGER_NAME TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             EVENT_MANIPULATION TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             EVENT_OBJECT_CATALOG TEXT, \
+             EVENT_OBJECT_SCHEMA TEXT, \
+             EVENT_OBJECT_TABLE TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             ACTION_ORDER INTEGER, \
+             ACTION_CONDITION TEXT, \
+             ACTION_STATEMENT TEXT, \
+             ACTION_ORIENTATION TEXT, \
+             ACTION_TIMING TEXT COLLATE MYSQL_UCA9_AI_CI, \
+             ACTION_REFERENCE_OLD_TABLE TEXT, \
+             ACTION_REFERENCE_NEW_TABLE TEXT, \
+             ACTION_REFERENCE_OLD_ROW TEXT, \
+             ACTION_REFERENCE_NEW_ROW TEXT, \
+             CREATED TEXT, \
+             SQL_MODE TEXT, \
+             DEFINER TEXT, \
+             CHARACTER_SET_CLIENT TEXT, \
+             COLLATION_CONNECTION TEXT, \
+             DATABASE_COLLATION TEXT)"
+        )
+    }
+
+    fn open(
+        &self,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        let mut rows = Vec::new();
+        if connection.mysql_sees_every_table() {
+            let schema = connection.current_schema();
+            for trigger in schema.triggers.values().flatten() {
+                if trigger.temporary {
+                    continue;
+                }
+                rows.push(crate::session::trigger_metadata(trigger)?);
+            }
+        }
+        // Measured on MySQL 8.4.11: listed by table, a table's `INSERT`
+        // triggers before its `UPDATE` and `DELETE` ones, `BEFORE` before
+        // `AFTER`, as `SHOW TRIGGERS` lists them.
+        rows.sort_unstable_by(|left, right| {
+            (&left.table, left.event, left.timing).cmp(&(&right.table, right.event, right.timing))
+        });
+        Ok(Arc::new(RwLock::new(InformationSchemaTriggersCursor {
+            database: self.database.clone(),
+            rows,
+            position: -1,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+struct InformationSchemaTriggersCursor {
+    database: String,
+    rows: Vec<crate::MySqlTriggerMetadata>,
+    position: i64,
+}
+
+impl InternalVirtualTableCursor for InformationSchemaTriggersCursor {
+    fn next(&mut self) -> std::result::Result<bool, LimboError> {
+        self.position += 1;
+        Ok((self.position as usize) < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.position
+    }
+
+    fn column(&self, column: usize) -> std::result::Result<Value, LimboError> {
+        let row = &self.rows[self.position as usize];
+        let text = |value: &str| Value::build_text(value.to_owned());
+        Ok(match column {
+            0 | 4 => text("def"),
+            1 | 5 => text(&self.database),
+            2 => text(&row.name),
+            3 => text(row.event.written()),
+            6 => text(&row.table),
+            // One table, event and timing carries one trigger here, so each
+            // is the first of its kind.
+            7 => Value::from_i64(1),
+            8 | 12 | 13 => Value::Null,
+            9 => text(&row.statement),
+            10 => text("ROW"),
+            11 => text(row.timing.written()),
+            14 => text("OLD"),
+            15 => text("NEW"),
+            16 => text(&row.creator.created_at),
+            17 => text(&row.creator.sql_mode),
+            18 => Value::build_text(format!("{}@%", row.creator.username)),
+            19 => text(&row.creator.character_set_client),
+            20 => text(&row.creator.collation_connection),
+            21 => text(&row.creator.database_collation),
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "information_schema.TRIGGERS has no column {column}"
+                )))
+            }
+        })
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> std::result::Result<bool, LimboError> {
+        self.position = -1;
+        self.next()
     }
 }
 

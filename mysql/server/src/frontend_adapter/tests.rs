@@ -9964,7 +9964,7 @@ fn an_information_schema_table_is_read_through_the_select_path() {
     // and any other schema's table.
     for sql in [
         "SELECT UPPER(TABLE_NAME) FROM information_schema.TABLES",
-        "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS",
+        "SELECT PARTITION_NAME FROM information_schema.PARTITIONS",
         "SELECT id FROM other.alpha",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");

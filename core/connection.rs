@@ -2939,6 +2939,12 @@ impl Connection {
         }
     }
 
+    /// Whether a MySQL session may see every table of its database, rather
+    /// than only the ones it was granted.
+    pub fn mysql_sees_every_table(&self) -> bool {
+        self.mysql_visible_tables.read().is_none()
+    }
+
     /// Records the tables a MySQL session may see, or `None` for all of them.
     pub fn set_mysql_visible_tables(&self, visible: Option<Vec<String>>) {
         *self.mysql_visible_tables.write() = visible;
