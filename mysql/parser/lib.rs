@@ -4979,6 +4979,46 @@ pub fn parse_auto_increment_insert_target(
     Ok(Some(insert_name(&table)?.as_str().to_owned()))
 }
 
+/// The columns one `INSERT`'s upsert clause compares between the row already
+/// there and the row offered, with `<=>`, and what each row offers for them.
+///
+/// The engine compares the value offered as it was written where MySQL first
+/// puts it into the column's type, so the frontend holds each pair to a
+/// column whose type and offered values make those two the same.
+pub fn offered_row_comparisons(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Vec<OfferedRowComparison>, ParseError> {
+    match parse_one_statement(sql, mode)? {
+        Statement::Insert(insert) => translate::offered_row_comparisons(&insert),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// One column an upsert compares between the two rows, and the values each
+/// row of the statement offers for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedRowComparison {
+    pub table: String,
+    pub column: String,
+    pub offered: Vec<OfferedValue>,
+}
+
+/// What a row of an `INSERT` offers for a column, as far as comparing it with
+/// the column's stored value goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfferedValue {
+    Null,
+    /// A word in quotes.
+    Word,
+    /// A written whole number, `TRUE` or `FALSE`.
+    WholeNumber,
+    /// A written number with a point.
+    NumberWithAPoint,
+    /// Anything else: a bound value, a call, the column's default.
+    Other,
+}
+
 /// How many times one statement calls `VALUES(col)` in an `ON DUPLICATE KEY
 /// UPDATE`, or 0 for a statement that is no such `INSERT`.
 ///

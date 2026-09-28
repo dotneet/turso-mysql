@@ -32,8 +32,9 @@ use turso_mysql_parser::{
     MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
     MySqlDropViewCommand, MySqlSelectSource, MySqlTableName, MySqlTransactionCommand,
-    MySqlTruncateTableCommand, MySqlViewReplacement, ParseError as MySqlParseError, SessionSqlMode,
-    StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
+    MySqlTruncateTableCommand, MySqlViewReplacement, OfferedValue, ParseError as MySqlParseError,
+    SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml,
+    WrittenZero,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -1822,6 +1823,7 @@ impl MySqlConnection {
             }
             translated => translated?,
         };
+        self.refuse_offered_row_comparisons_answered_otherwise(sql, mode)?;
         if translated
             .parse_ast()
             .is_ok_and(|statement| self.writes_a_value_a_trigger_replaces(&statement))
@@ -1960,6 +1962,64 @@ impl MySqlConnection {
             &column_types.text,
         )?;
         Ok((translated, column_types, table_definition))
+    }
+
+    /// Refuses an upsert comparing a column between the row already there and
+    /// the row offered — Rails' `upsert_all` writes `t.name <=> offered.name` —
+    /// where the engine would answer otherwise than MySQL.
+    ///
+    /// MySQL puts the offered value into the column's type before it compares,
+    /// and the engine compares it as it was written: measured, `'2026-01-01'`
+    /// offered for a `DATETIME` holding that midnight is the same moment in
+    /// MySQL and a different word here. A word offered for a column of words,
+    /// compared under the column's collation in both, a whole number for a
+    /// column of them, and a written number for a `DECIMAL`, which the engine
+    /// puts into the column's form before it compares, answer alike.
+    fn refuse_offered_row_comparisons_answered_otherwise(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+    ) -> std::result::Result<(), MySqlParseError> {
+        const REFUSED: MySqlParseError = MySqlParseError::Unsupported {
+            feature: "an upsert comparing a column of the offered row this does not compare as MySQL does",
+        };
+        let comparisons = match turso_mysql_parser::offered_row_comparisons(sql, mode) {
+            Ok(comparisons) => comparisons,
+            // A statement that does not parse is answered by the path that
+            // runs it.
+            Err(_) => return Ok(()),
+        };
+        for comparison in comparisons {
+            let table = MySqlTableName::parse(&comparison.table).map_err(|_| REFUSED)?;
+            let columns = self.list_columns(&table).map_err(|_| REFUSED)?;
+            let column = columns
+                .iter()
+                .find(|column| column.name().eq_ignore_ascii_case(&comparison.column))
+                .ok_or(REFUSED)?;
+            let type_name = column.type_name();
+            let offered_alike = |taken: &[OfferedValue]| {
+                comparison
+                    .offered
+                    .iter()
+                    .all(|offered| *offered == OfferedValue::Null || taken.contains(offered))
+            };
+            let alike = if matches!(
+                type_name,
+                "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT"
+            ) {
+                offered_alike(&[OfferedValue::Word])
+            } else if is_decimal_type(type_name) {
+                offered_alike(&[OfferedValue::WholeNumber, OfferedValue::NumberWithAPoint])
+            } else if is_integer_type(type_name) && type_name != "BIGINT UNSIGNED" {
+                offered_alike(&[OfferedValue::WholeNumber])
+            } else {
+                false
+            };
+            if !alike {
+                return Err(REFUSED);
+            }
+        }
+        Ok(())
     }
 
     /// Renders an `INSERT ... SELECT` whose `SELECT` has to know its columns'
@@ -7709,6 +7769,8 @@ impl MySqlConnection {
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
+        self.refuse_offered_row_comparisons_answered_otherwise(sql, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) if insert.reads_the_clock() && self.time_zone_offset_seconds() != 0 => {
                 Err(LimboError::ParseError(
@@ -7801,6 +7863,8 @@ impl MySqlConnection {
                 }
             }
         }
+        self.refuse_offered_row_comparisons_answered_otherwise(sql, self.parser_mode())
+            .map_err(mysql_query_parse_error)?;
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;

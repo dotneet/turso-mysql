@@ -2306,6 +2306,23 @@ column before the clause writes it answers the same in both — `b = a, a = a +
 10` leaves 11 and 1 in MySQL too — and the offered row is never written, so
 `VALUES(a)` and `o.a` are read anywhere in the clause.
 
+Rails 8's `upsert_all` touches a row's `updated_at` only when it changes one of the
+columns it names: `updated_at = (CASE WHEN (users.name <=> users_values.name AND
+users.balance <=> users_values.balance) THEN users.updated_at ELSE CURRENT_TIMESTAMP(6)
+END)`, first in the clause, before the columns it compares are written. That shape is taken:
+one condition joining `<=>` comparisons of a column of the row already there with the same
+column of the row offered, the column written kept in one branch and a reading of the clock in
+the other. `<=>` is the engine's `IS`, which compares a column of words under the column's own
+collation as MySQL does — measured on 8.4.11, offering `'BOB'` over `'Bob'` writes the name,
+counts 2 and leaves the timestamp, and offering the same rows twice counts 0 the second time.
+MySQL puts the offered value into the column's type before it compares and the engine compares
+it as it was written, so a comparison is taken only where the two answer alike: a word offered
+for a `VARCHAR` or `TEXT`, a whole number for an integer column, a written number for a
+`DECIMAL`, which the engine puts into the column's form first. Anything else is refused —
+measured, `'2026-01-01'` offered for a `DATETIME` holding that midnight is the same moment in
+MySQL, and a different word here — and so is a bound value, whose kind is not known until it
+is bound, and any other `CASE` in the clause.
+
 A name on the offered row with no upsert to use it names nothing, and Rails 8
 writes one on every `insert_all!` — `INSERT INTO tags (name) VALUES ('x') AS
 tags_values`. Measured on 8.4.11, such an insert writes, numbers its rows and

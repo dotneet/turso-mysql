@@ -2532,6 +2532,44 @@ fn an_upsert_renders_the_row_it_was_offered() {
     }
 }
 
+/// Rails 8's `upsert_all` touches `updated_at` only for a row whose named
+/// columns it changes, comparing each with `<=>` — the engine's `IS` — and
+/// writes the same clause with `VALUES()` for a server older than 8.0.19.
+#[test]
+fn rails_touch_of_an_upserted_row_renders_as_the_engines_case() {
+    let touched = "CASE WHEN ((\"name\" IS \"excluded\".\"name\") AND (\"balance\" IS \"excluded\".\"balance\")) THEN \"updated_at\" ELSE (substr(strftime('%Y-%m-%d %H:%M:%f', 'now'), 1, 23) || '000') END";
+    for sql in [
+        "INSERT INTO `users` (`email`,`name`,`balance`,`updated_at`) VALUES ('a@x', 'A', 1.0, CURRENT_TIMESTAMP(6)) AS `users_values` ON DUPLICATE KEY UPDATE updated_at=(CASE WHEN (`users`.`name`<=>`users_values`.`name` AND `users`.`balance`<=>`users_values`.`balance`) THEN `users`.updated_at ELSE CURRENT_TIMESTAMP(6) END),`name`=`users_values`.`name`,`balance`=`users_values`.`balance`",
+        "INSERT INTO `users` (`email`,`name`,`balance`,`updated_at`) VALUES ('a@x', 'A', 1.0, CURRENT_TIMESTAMP(6)) ON DUPLICATE KEY UPDATE updated_at=(CASE WHEN (`name`<=>VALUES(`name`) AND `balance`<=>VALUES(`balance`)) THEN updated_at ELSE CURRENT_TIMESTAMP(6) END),`name`=VALUES(`name`),`balance`=VALUES(`balance`)",
+    ] {
+        let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
+        assert!(
+            translated.as_sql().contains(&format!("\"updated_at\" = {touched}, ")),
+            "{sql}\n{}",
+            translated.as_sql()
+        );
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for clause in [
+        // Two columns compared with each other.
+        "updated_at = (CASE WHEN (u.name <=> o.balance) THEN u.updated_at ELSE NOW(6) END)",
+        // Anything kept but the column written.
+        "updated_at = (CASE WHEN (u.name <=> o.name) THEN u.created_at ELSE NOW(6) END)",
+        // Anything written but the clock.
+        "updated_at = (CASE WHEN (u.name <=> o.name) THEN u.updated_at ELSE o.updated_at END)",
+        // A comparison other than `<=>`, and more than one condition.
+        "updated_at = (CASE WHEN (u.name = o.name) THEN u.updated_at ELSE NOW(6) END)",
+        "updated_at = (CASE WHEN u.name <=> o.name THEN u.updated_at WHEN u.balance <=> o.balance THEN u.updated_at ELSE NOW(6) END)",
+        // A bare column is 1052 once the offered row carries a name.
+        "updated_at = (CASE WHEN (name <=> o.name) THEN u.updated_at ELSE NOW(6) END)",
+    ] {
+        let sql = format!(
+            "INSERT INTO u (email, name, balance, updated_at) VALUES ('a@x', 'A', 1.0, NOW(6)) AS o ON DUPLICATE KEY UPDATE {clause}"
+        );
+        assert!(parse_dml(&sql, SessionSqlMode::default()).is_err(), "{sql}");
+    }
+}
+
 /// An `UPDATE` may write a value worked out from the row. A call and a `CASE`
 /// are rendered the way a projection renders them, and a value reading a
 /// column the same `SET` has already written is refused, MySQL taking the

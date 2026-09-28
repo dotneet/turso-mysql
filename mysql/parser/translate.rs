@@ -3057,17 +3057,19 @@ fn render_duplicate_key_update(
         let assigned_decimal = decimal_columns
             .iter()
             .any(|(known, _)| known.eq_ignore_ascii_case(&column.value));
-        rendered.push(format!(
-            "{} = {}",
-            render_unqualified_name(name)?,
-            render_duplicate_key_value(
-                &assignment.value,
-                &table,
-                offered,
-                decimal_columns,
-                assigned_decimal,
-            )?
-        ));
+        let value =
+            match render_touch_unless_unchanged(&assignment.value, &column.value, &table, offered)?
+            {
+                Some(touch) => touch,
+                None => render_duplicate_key_value(
+                    &assignment.value,
+                    &table,
+                    offered,
+                    decimal_columns,
+                    assigned_decimal,
+                )?,
+            };
+        rendered.push(format!("{} = {value}", render_unqualified_name(name)?));
     }
     Ok(format!(
         " ON CONFLICT DO UPDATE SET {}",
@@ -3100,7 +3102,290 @@ fn reads_a_column_the_clause_wrote(
             reads_a_column_the_clause_wrote(left, offered, assigned)
                 || reads_a_column_the_clause_wrote(right, offered, assigned)
         }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => operand
+            .iter()
+            .chain(else_result)
+            .map(Box::as_ref)
+            .chain(
+                conditions
+                    .iter()
+                    .flat_map(|arm| [&arm.condition, &arm.result]),
+            )
+            .any(|part| reads_a_column_the_clause_wrote(part, offered, assigned)),
         other => !reads_only_unassigned_columns(other, assigned),
+    }
+}
+
+/// Renders the assignment Rails 8's `upsert_all` writes to touch a row's
+/// timestamp only when the upsert changes it —
+/// `updated_at = (CASE WHEN (t.name <=> offered.name AND t.balance <=>
+/// offered.balance) THEN t.updated_at ELSE CURRENT_TIMESTAMP(6) END)` — or
+/// `None` for any other value.
+///
+/// Only that shape is taken: one condition joining null-safe comparisons of a
+/// column of the row already there with the same column of the row offered,
+/// the column written read back off the row already there when nothing
+/// differs, and a reading of the clock when something does. Two values of one
+/// column compare alike in both: MySQL's `<=>` is the engine's `IS`, and the
+/// engine compares a column of words under the column's own collation, as
+/// MySQL does — measured on 8.4.11, offering `'BOB'` over `'Bob'` writes the
+/// name and leaves the timestamp.
+fn render_touch_unless_unchanged(
+    value: &Expr,
+    column: &str,
+    table: &str,
+    offered: Option<&str>,
+) -> Result<Option<String>, ParseError> {
+    let mut value = value;
+    while let Expr::Nested(inner) = value {
+        value = inner;
+    }
+    let Expr::Case {
+        operand: None,
+        conditions,
+        else_result: Some(changed),
+        ..
+    } = value
+    else {
+        return Ok(None);
+    };
+    let [arm] = conditions.as_slice() else {
+        return unsupported("ON DUPLICATE KEY UPDATE CASE with other than one condition");
+    };
+    if !reads_the_column_already_there(&arm.result, column, table, offered) {
+        return unsupported("ON DUPLICATE KEY UPDATE CASE keeping anything but its own column");
+    }
+    if !is_clock_reading_value(changed) {
+        return unsupported("ON DUPLICATE KEY UPDATE CASE writing anything but the clock");
+    }
+    Ok(Some(format!(
+        "CASE WHEN {} THEN {} ELSE {} END",
+        render_offered_row_unchanged(&arm.condition, table, offered)?,
+        render_ident(&Ident::new(column)),
+        render_inserted_value(changed)?
+    )))
+}
+
+/// Renders a condition joining `a <=> b` comparisons of a column of the row
+/// already there with the same column of the row offered.
+fn render_offered_row_unchanged(
+    condition: &Expr,
+    table: &str,
+    offered: Option<&str>,
+) -> Result<String, ParseError> {
+    match condition {
+        Expr::Nested(inner) => render_offered_row_unchanged(inner, table, offered),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => Ok(format!(
+            "({} AND {})",
+            render_offered_row_unchanged(left, table, offered)?,
+            render_offered_row_unchanged(right, table, offered)?
+        )),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Spaceship,
+            right,
+        } => {
+            let pair = [left.as_ref(), right.as_ref()];
+            let Some(column) = pair
+                .iter()
+                .find_map(|side| column_read_off_the_offered_row(side, offered))
+            else {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE <=> naming no column of the offered row",
+                );
+            };
+            if !pair
+                .iter()
+                .any(|side| reads_the_column_already_there(side, &column, table, offered))
+            {
+                return unsupported(
+                    "ON DUPLICATE KEY UPDATE <=> between different columns of the two rows",
+                );
+            }
+            let column = render_ident(&Ident::new(column));
+            Ok(format!("({column} IS \"excluded\".{column})"))
+        }
+        _ => unsupported("ON DUPLICATE KEY UPDATE CASE condition"),
+    }
+}
+
+/// The columns an `INSERT`'s upsert clause compares with `<=>` between the
+/// row already there and the row offered, with what each row offers for them.
+pub(crate) fn offered_row_comparisons(
+    insert: &Insert,
+) -> Result<Vec<crate::OfferedRowComparison>, ParseError> {
+    let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
+        return Ok(Vec::new());
+    };
+    let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
+        return Ok(Vec::new());
+    };
+    let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
+        return Ok(Vec::new());
+    };
+    let offered =
+        insert
+            .insert_alias
+            .as_ref()
+            .and_then(|alias| match alias.row_alias.0.as_slice() {
+                [ObjectNamePart::Identifier(name)] => Some(name.value.as_str()),
+                _ => None,
+            });
+    let mut compared = Vec::new();
+    for assignment in assignments {
+        collect_compared_columns(&assignment.value, offered, &mut compared);
+    }
+    let rows = match insert.source.as_deref().map(|source| source.body.as_ref()) {
+        Some(SetExpr::Values(values)) => values.rows.as_slice(),
+        _ => &[],
+    };
+    Ok(compared
+        .into_iter()
+        .map(|column| {
+            let at = insert.columns.iter().position(|named| {
+                matches!(named.0.as_slice(), [ObjectNamePart::Identifier(named)]
+                    if named.value.eq_ignore_ascii_case(&column))
+            });
+            let offered = rows
+                .iter()
+                .map(|row| match at.and_then(|at| row.get(at)) {
+                    Some(value) => offered_value(value),
+                    None => crate::OfferedValue::Other,
+                })
+                .collect::<Vec<_>>();
+            crate::OfferedRowComparison {
+                table: table.value.clone(),
+                column,
+                offered: if rows.is_empty() {
+                    vec![crate::OfferedValue::Other]
+                } else {
+                    offered
+                },
+            }
+        })
+        .collect())
+}
+
+fn collect_compared_columns(expr: &Expr, offered: Option<&str>, compared: &mut Vec<String>) {
+    match expr {
+        Expr::Nested(inner) => collect_compared_columns(inner, offered, compared),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Spaceship,
+            right,
+        } => compared.extend(
+            [left, right]
+                .into_iter()
+                .find_map(|side| column_read_off_the_offered_row(side, offered)),
+        ),
+        Expr::BinaryOp { left, right, .. } => {
+            collect_compared_columns(left, offered, compared);
+            collect_compared_columns(right, offered, compared);
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            for part in operand.iter().chain(else_result).map(Box::as_ref).chain(
+                conditions
+                    .iter()
+                    .flat_map(|arm| [&arm.condition, &arm.result]),
+            ) {
+                collect_compared_columns(part, offered, compared);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn offered_value(value: &Expr) -> crate::OfferedValue {
+    let written = match value {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr,
+        } if matches!(expr.as_ref(), Expr::Value(value) if matches!(value.value, Value::Number(..))) => {
+            expr.as_ref()
+        }
+        other => other,
+    };
+    let Expr::Value(written) = written else {
+        return crate::OfferedValue::Other;
+    };
+    match &written.value {
+        Value::Null => crate::OfferedValue::Null,
+        Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) => crate::OfferedValue::Word,
+        Value::Boolean(_) => crate::OfferedValue::WholeNumber,
+        Value::Number(digits, false) if digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            crate::OfferedValue::WholeNumber
+        }
+        Value::Number(digits, false)
+            if digits.split_once('.').is_some_and(|(whole, fraction)| {
+                !(whole.is_empty() && fraction.is_empty())
+                    && whole
+                        .bytes()
+                        .chain(fraction.bytes())
+                        .all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            crate::OfferedValue::NumberWithAPoint
+        }
+        _ => crate::OfferedValue::Other,
+    }
+}
+
+/// The column an expression reads off the row offered — `VALUES(col)` or a
+/// column qualified by the name that row carries.
+fn column_read_off_the_offered_row(expr: &Expr, offered: Option<&str>) -> Option<String> {
+    match expr {
+        Expr::Function(function) if names_the_offered_row(function) => {
+            let FunctionArguments::List(arguments) = &function.args else {
+                return None;
+            };
+            match arguments.args.as_slice() {
+                [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    Expr::Identifier(column),
+                ))] => Some(column.value.clone()),
+                _ => None,
+            }
+        }
+        Expr::CompoundIdentifier(parts)
+            if parts.len() == 2
+                && offered.is_some_and(|offered| parts[0].value.eq_ignore_ascii_case(offered)) =>
+        {
+            Some(parts[1].value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Whether an expression reads `column` off the row already there: the column
+/// qualified by the table, or bare while the offered row carries no name —
+/// once it does, MySQL answers a bare column 1052.
+fn reads_the_column_already_there(
+    expr: &Expr,
+    column: &str,
+    table: &str,
+    offered: Option<&str>,
+) -> bool {
+    match expr {
+        Expr::Identifier(ident) => offered.is_none() && ident.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(parts) => {
+            matches!(parts.as_slice(), [qualifier, ident]
+                if qualifier.value.eq_ignore_ascii_case(table)
+                    && ident.value.eq_ignore_ascii_case(column))
+        }
+        _ => false,
     }
 }
 

@@ -631,3 +631,129 @@ fn the_moment_to_the_microsecond_is_held_to_its_column() {
         vec![some(&["2"])]
     );
 }
+
+/// Rails 8's `upsert_all`, which touches `updated_at` only for a row whose
+/// named columns it changes, and names the offered row `users_values`.
+/// Measured on MySQL 8.4.11 statement by statement, the found-rows session
+/// last.
+#[test]
+fn rails_upsert_all_touches_only_the_rows_it_changes() {
+    let (_directory, mut adapter, mut found_rows) = adapter_and_one_counting_found_rows();
+    run(&mut adapter, RAILS_USERS);
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO `users` (`email`,`name`,`balance`,`is_active`,`created_at`,`updated_at`) VALUES ('alice@example.com', 'Alice', 100.50, TRUE, '2026-01-01 00:00:00.000001', '2026-01-01 00:00:00.000001'), ('bob@example.com', 'Bob', 20, FALSE, '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        ),
+        (2, 1)
+    );
+    let upsert_all = |rows: &str| {
+        format!(
+            "INSERT INTO `users` (`email`,`name`,`balance`,`is_active`,`created_at`,`updated_at`) VALUES {rows} AS `users_values` ON DUPLICATE KEY UPDATE updated_at=(CASE WHEN (`users`.`name`<=>`users_values`.`name` AND `users`.`balance`<=>`users_values`.`balance`) THEN `users`.updated_at ELSE CURRENT_TIMESTAMP(6) END),`name`=`users_values`.`name`,`balance`=`users_values`.`balance`"
+        )
+    };
+    let alice_and_dave = upsert_all(
+        "('alice@example.com', 'Alice Updated', 1.0, TRUE, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)), ('dave@example.com', 'Dave', 2.0, TRUE, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))",
+    );
+    assert_eq!(written(&mut adapter, &alice_and_dave), (3, 3));
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["3"])]
+    );
+    let read = rows(
+        &mut adapter,
+        "SELECT id, name, balance, created_at, updated_at FROM users ORDER BY id",
+    );
+    assert_eq!(read[0][..3], some(&["1", "Alice Updated", "1.00"]));
+    assert_eq!(read[0][3].as_deref(), Some("2026-01-01 00:00:00.000001"));
+    assert_ne!(read[0][4], read[0][3]);
+    assert_eq!(
+        read[1],
+        some(&[
+            "2",
+            "Bob",
+            "20.00",
+            "2026-01-01 00:00:00.000000",
+            "2026-01-01 00:00:00.000000"
+        ])
+    );
+    assert_eq!(read[2][..3], some(&["3", "Dave", "2.00"]));
+    // One moment for the whole statement: the row it touched and the row it
+    // added.
+    assert_eq!(read[2][3], read[0][4]);
+    assert_eq!(read[2][4], read[0][4]);
+    // The same rows again change nothing, and so touch nothing.
+    assert_eq!(written(&mut adapter, &alice_and_dave), (0, 0));
+    // A name differing only in case is written, and under the column's
+    // collation it is the same name, so the row is not touched.
+    assert_eq!(
+        written(
+            &mut adapter,
+            &upsert_all(
+                "('bob@example.com', 'BOB', 20, TRUE, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))"
+            )
+        ),
+        (2, 2)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT name, updated_at FROM users WHERE email = 'bob@example.com'"
+        ),
+        vec![some(&["BOB", "2026-01-01 00:00:00.000000"])]
+    );
+    assert_eq!(written(&mut found_rows, &alice_and_dave), (2, 0));
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM users"),
+        vec![some(&["3"])]
+    );
+}
+
+/// MySQL puts the offered value into the column's type before `<=>` compares
+/// it, and the engine compares it as written, so only the pairs that answer
+/// alike are taken. Measured on 8.4.11: `'2026-01-01'` offered for a
+/// `DATETIME` holding that midnight compares equal, and the row is left as it
+/// stood.
+#[test]
+fn an_upsert_comparison_the_engine_answers_otherwise_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE k (code varchar(10) PRIMARY KEY, d datetime NULL, name varchar(20) NULL, n int NULL, j json NULL, touched datetime(6) NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO k (code, d, name, n, touched) VALUES ('a', '2026-01-01 00:00:00', 'Ann', 5, '2000-01-01 00:00:00')",
+    );
+    let touch = |column: &str, offered: &str| {
+        format!(
+            "INSERT INTO k (code, {column}, touched) VALUES ('a', {offered}, NOW(6)) AS o ON DUPLICATE KEY UPDATE touched = (CASE WHEN (k.{column} <=> o.{column}) THEN k.touched ELSE CURRENT_TIMESTAMP(6) END), {column} = o.{column}"
+        )
+    };
+    for sql in [
+        touch("d", "'2026-01-01'"),
+        touch("j", "'{\"a\":1}'"),
+        // A number offered for words, and a word for a number.
+        touch("name", "5"),
+        touch("n", "'5'"),
+    ] {
+        assert_eq!(
+            adapter.execute_query(&sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+        let statement = sql.replacen("VALUES ('a', ", "VALUES (?, ", 1);
+        assert!(
+            adapter.execute_stmt_prepare(&statement).is_err(),
+            "{statement}"
+        );
+    }
+    // A bound value says nothing of its kind until it is bound.
+    assert!(adapter.execute_stmt_prepare(&touch("name", "?")).is_err());
+    assert_eq!(written(&mut adapter, &touch("name", "'ANN'")), (2, 0));
+    assert_eq!(written(&mut adapter, &touch("n", "5")), (0, 0));
+    assert_eq!(
+        rows(&mut adapter, "SELECT name, n, touched FROM k"),
+        vec![some(&["ANN", "5", "2000-01-01 00:00:00.000000"])]
+    );
+}
