@@ -915,6 +915,12 @@ fn render_select_body(
     );
     let outer_group_concat_counts = std::mem::take(&mut render_context.group_concat_counts);
     let outer_projected_group_concats = std::mem::take(&mut render_context.projected_group_concats);
+    // The projection is rendered before the `FROM`, so what a derived table
+    // counts is read from how its body is written.
+    let outer_derived_counts = std::mem::replace(
+        &mut render_context.derived_counts,
+        counts_derived_tables_work_out(select),
+    );
     let projection = select
         .projection
         .iter()
@@ -937,7 +943,9 @@ fn render_select_body(
             render_context.takes_a_joined_aggregate = false;
             rendered
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>();
+    render_context.derived_counts = outer_derived_counts;
+    let projection = projection?;
     if projection.is_empty() {
         return unsupported("SELECT without projections");
     }
@@ -2279,6 +2287,111 @@ fn render_having_predicate(
     }
 }
 
+/// Reads `COALESCE(t.c, 0)` or `IFNULL(t.c, 0)` over a count a derived table
+/// the statement reads worked out — Prisma's relation count, `COALESCE(
+/// aggr_selection_0_Post._aggr_count_posts, 0)` over a `LEFT JOIN` of a
+/// grouped count — which answers the count's own shape, never NULL.
+///
+/// Measured on MySQL 8.4.11: a `LONGLONG` of 21 with the NOT NULL and binary
+/// flags, naming no table.
+fn defaults_a_count_the_select_reads(
+    expr: &Expr,
+    select: &sqlparser::ast::Select,
+) -> Option<StaticSelectMetadata> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let (table, column) = defaulted_derived_count(function)?;
+    counts_derived_tables_work_out(select)
+        .iter()
+        .any(|(counted_table, counted_column)| {
+            counted_table.eq_ignore_ascii_case(&table.value)
+                && counted_column.eq_ignore_ascii_case(&column.value)
+        })
+        .then(|| StaticSelectMetadata::DefaultedAggregate(Box::new(StaticSelectMetadata::Count)))
+}
+
+/// Each column a derived table of the `SELECT` projects as `COUNT(...) AS
+/// name`, with the name the `SELECT` reads the table under.
+fn counts_derived_tables_work_out(select: &sqlparser::ast::Select) -> Vec<(String, String)> {
+    let mut counts = Vec::new();
+    let relations = select.from.iter().flat_map(|source| {
+        std::iter::once(&source.relation).chain(source.joins.iter().map(|join| &join.relation))
+    });
+    for relation in relations {
+        let TableFactor::Derived {
+            subquery,
+            alias: Some(alias),
+            ..
+        } = relation
+        else {
+            continue;
+        };
+        let SetExpr::Select(body) = subquery.body.as_ref() else {
+            continue;
+        };
+        for item in &body.projection {
+            if let SelectItem::ExprWithAlias {
+                expr: Expr::Function(function),
+                alias: name,
+            } = item
+            {
+                if static_select_metadata::is_count_call(function) {
+                    counts.push((alias.name.value.clone(), name.value.clone()));
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// The table and the column of `COALESCE(t.c, n)` or `IFNULL(t.c, n)`, `n` a
+/// whole number, which falls a column named through its table back onto a
+/// number.
+fn defaulted_derived_count(
+    function: &sqlparser::ast::Function,
+) -> Option<(&sqlparser::ast::Ident, &sqlparser::ast::Ident)> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if name.quote_style.is_some()
+        || !(name.value.eq_ignore_ascii_case("COALESCE")
+            || name.value.eq_ignore_ascii_case("IFNULL"))
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::CompoundIdentifier(parts),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let [table, column] = parts.as_slice() else {
+        return None;
+    };
+    direct_signed_integer(fallback)?;
+    Some((table, column))
+}
+
+fn defaulted_fallback(function: &sqlparser::ast::Function) -> &Expr {
+    let FunctionArguments::List(arguments) = &function.args else {
+        unreachable!("a defaulted count was read with its arguments");
+    };
+    let [_, sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        unreachable!("a defaulted count was read with two arguments");
+    };
+    fallback
+}
+
 /// The kind, the table if one is named, and the column of an aggregate over
 /// one column — `SUM(views)` or `SUM(post.views)`.
 ///
@@ -2364,6 +2477,7 @@ pub(crate) fn select_static_result_metadata(
                 }
                 let answer = crate::written_value::read_written_value(expr)
                     .map(|(shape, _)| StaticSelectMetadata::WrittenValue(shape))
+                    .or_else(|| defaults_a_count_the_select_reads(expr, select))
                     .or_else(|| classify_static_select_expr(expr));
                 match (answer, grouped_by_an_expression) {
                     (None, _) => StaticSelectProjectionMetadata::Other,
@@ -5692,6 +5806,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the derived table about to be rendered is one the statement
     /// only counts the rows of, which nothing reads a column of.
     counts_the_rows_of_the_derived_table: bool,
+    /// Each column of a derived table the `SELECT` being rendered reads that
+    /// answers a `COUNT`, with the name it reads the table under.
+    derived_counts: Vec<(String, String)>,
     /// Whether the statement's own `SELECT` asked with `SQL_CALC_FOUND_ROWS`
     /// for the rows it would answer without its `LIMIT`.
     calculates_found_rows: bool,
@@ -5817,6 +5934,7 @@ impl<'a> SelectRenderContext<'a> {
             subquery_tables: Vec::new(),
             renders_the_outer_projection: false,
             counts_the_rows_of_the_derived_table: false,
+            derived_counts: Vec::new(),
             calculates_found_rows: false,
             group_concat_orders_by_another_kind: false,
             orders_a_bare_column: false,
@@ -7125,6 +7243,27 @@ fn render_select_expr(
         }
         Expr::Function(function) if static_select_metadata::scalar_call(function).is_some() => {
             render_scalar_call(function, render_context)
+        }
+        Expr::Function(function)
+            if defaulted_derived_count(function).is_some_and(|(table, column)| {
+                render_context
+                    .derived_counts
+                    .iter()
+                    .any(|(known_table, known_column)| {
+                        known_table.eq_ignore_ascii_case(&table.value)
+                            && known_column.eq_ignore_ascii_case(&column.value)
+                    })
+            }) =>
+        {
+            let (table, column) =
+                defaulted_derived_count(function).expect("the guard read the call");
+            let fallback = direct_signed_integer(defaulted_fallback(function))
+                .expect("the call falls back on a whole number");
+            Ok(format!(
+                "coalesce({}.{}, {fallback})",
+                render_ident(table),
+                render_ident(column)
+            ))
         }
         Expr::Function(function)
             if static_select_metadata::classify_window_call(function).is_some() =>

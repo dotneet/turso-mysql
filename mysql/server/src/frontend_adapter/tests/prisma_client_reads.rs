@@ -255,6 +255,86 @@ fn a_like_over_a_json_member_tells_case_apart_the_way_mysql_does() {
     );
 }
 
+/// `findMany({ include: { _count: { select: { posts: true } } } })` counts
+/// each user's posts in a grouped derived table and falls the users with none
+/// back onto 0. Measured on MySQL 8.4.11: 2, 1 and 0, the count a `LONGLONG`
+/// of 21 with the NOT NULL and binary flags, naming no table.
+#[test]
+fn a_relation_count_falls_back_onto_zero_the_way_mysql_counts_it() {
+    let (_directory, mut adapter) = adapter();
+    const COUNTS: &str = "SELECT `prisma`.`users`.`id`, `prisma`.`users`.`email`, `prisma`.`users`.`name`, `prisma`.`users`.`balance`, `prisma`.`users`.`is_active`, `prisma`.`users`.`profile`, `prisma`.`users`.`created_at`, `prisma`.`users`.`updated_at`, COALESCE(`aggr_selection_0_Post`.`_aggr_count_posts`, 0) AS `_aggr_count_posts` FROM `prisma`.`users` LEFT JOIN (SELECT `prisma`.`posts`.`user_id`, COUNT(*) AS `_aggr_count_posts` FROM `prisma`.`posts` WHERE 1=1 GROUP BY `prisma`.`posts`.`user_id`) AS `aggr_selection_0_Post` ON (`prisma`.`users`.`id` = `aggr_selection_0_Post`.`user_id`) WHERE 1=1 ORDER BY `prisma`.`users`.`id` ASC";
+
+    let prepared = adapter.execute_stmt_prepare(COUNTS).unwrap();
+    let count = prepared.columns.last().unwrap();
+    assert_eq!(
+        (
+            count.column_type,
+            count.column_length,
+            count.decimals,
+            count.flags,
+            count.table.as_str(),
+            count.original_table.as_str(),
+            count.original_name.as_str(),
+        ),
+        (
+            MYSQL_TYPE_LONGLONG,
+            21,
+            0,
+            // The numeric flag rides on every number this server answers.
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+            "",
+            "",
+            "",
+        )
+    );
+    let Ok(CommandExecutionResult::ResultSet(text)) = adapter.execute_query(COUNTS) else {
+        panic!("the counts must read back as text");
+    };
+    assert_eq!(text.columns, prepared.columns);
+    let counts = text
+        .rows
+        .iter()
+        .map(|row| String::from_utf8(row[8].clone().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(counts, ["2", "1", "0"]);
+
+    let rows = prepared_rows(&mut adapter, COUNTS, &[]).unwrap();
+    let counts = rows.iter().map(|row| row[8].clone()).collect::<Vec<_>>();
+    assert_eq!(
+        counts,
+        [
+            BinaryResultValue::Integer(2),
+            BinaryResultValue::Integer(1),
+            BinaryResultValue::Integer(0)
+        ]
+    );
+
+    // Measured the same for IFNULL and for any whole number to fall back on.
+    const FALLS_BACK: &str = "SELECT users.id, IFNULL(a.c, -1) AS c FROM users LEFT JOIN (SELECT user_id, COUNT(*) AS c FROM posts GROUP BY user_id) AS a ON users.id = a.user_id ORDER BY users.id";
+    let Ok(CommandExecutionResult::ResultSet(text)) = adapter.execute_query(FALLS_BACK) else {
+        panic!("{FALLS_BACK} must read back");
+    };
+    assert_eq!(
+        (text.columns[1].column_type, text.columns[1].column_length),
+        (MYSQL_TYPE_LONGLONG, 21)
+    );
+    let counts = text
+        .rows
+        .iter()
+        .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(counts, ["2", "1", "-1"]);
+
+    // A total a derived table worked out, or a table's own column, falls
+    // back onto a shape of its own that has not been measured.
+    for unmeasured in [
+        "SELECT users.id, COALESCE(v.total, 0) AS total FROM users LEFT JOIN (SELECT user_id, SUM(views) AS total FROM posts GROUP BY user_id) AS v ON users.id = v.user_id",
+        "SELECT users.id, COALESCE(p.views, 0) AS views FROM users LEFT JOIN posts AS p ON users.id = p.user_id",
+    ] {
+        assert!(adapter.execute_query(unmeasured).is_err(), "{unmeasured}");
+    }
+}
+
 /// `findMany({ cursor: { id }, skip: 1, take })` reads from the row the
 /// cursor names through a subquery picking that row by its key. Measured on
 /// MySQL 8.4.11: cursor 2 skipping one answers post 3, a cursor naming no row

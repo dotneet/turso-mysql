@@ -2410,6 +2410,17 @@ SMALLINT's length 6. That is the same widening `IFNULL` over a plain column
 does, so the two forms are one rule. Over no rows at all the answer is the
 fallback rather than NULL, which is the whole reason the call is written.
 
+The count may also have been worked out by a derived table the statement
+reads, and be named through it: Prisma counts a relation with
+`COALESCE(aggr_selection_0_Post._aggr_count_posts, 0)` over a `LEFT JOIN` of
+`(SELECT user_id, COUNT(*) AS _aggr_count_posts FROM posts GROUP BY user_id)`,
+so a user with no posts has none to count. Measured on 8.4.11, `COALESCE` and
+`IFNULL` there answer the count's own shape whatever whole number they fall
+back on — a NOT NULL `LONGLONG` of 21 with the binary flag, naming no table —
+and the users' counts 2, 1 and 0. Any other column a derived table worked out,
+a total among them, and any table's own column named through its table are
+still refused with a fallback.
+
 The fallback still has to be a whole number, which is the rule the plain-column
 form follows. A call inside the call rather than an aggregate, and `NULLIF`,
 which answers the other way round, are refused.

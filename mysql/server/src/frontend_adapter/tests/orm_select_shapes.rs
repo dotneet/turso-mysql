@@ -518,12 +518,29 @@ fn a_count_on_the_outer_side_of_a_left_join_is_nullable() {
         (MYSQL_TYPE_LONGLONG, 21, 0, "aggr_selection_0_Post", "")
     );
     // Prisma writes the count as `COALESCE(..., 0)`, which MySQL answers NOT
-    // NULL; a fallback over a derived table's column is not read here.
-    assert!(adapter
-        .execute_query(
-            "SELECT `users`.`id`, COALESCE(`aggr_selection_0_Post`.`_aggr_count_posts`, 0) AS `_aggr_count_posts` FROM `users` LEFT JOIN (SELECT `posts`.`user_id`, COUNT(*) AS `_aggr_count_posts` FROM `posts` WHERE 1=1 GROUP BY `posts`.`user_id`) AS `aggr_selection_0_Post` ON (`users`.`id` = `aggr_selection_0_Post`.`user_id`) WHERE 1=1 ORDER BY `users`.`id` ASC"
-        )
-        .is_err());
+    // NULL and naming no table.
+    let defaulted = result_set(
+        &mut adapter,
+        "SELECT `users`.`id`, COALESCE(`aggr_selection_0_Post`.`_aggr_count_posts`, 0) AS `_aggr_count_posts` FROM `users` LEFT JOIN (SELECT `posts`.`user_id`, COUNT(*) AS `_aggr_count_posts` FROM `posts` WHERE 1=1 GROUP BY `posts`.`user_id`) AS `aggr_selection_0_Post` ON (`users`.`id` = `aggr_selection_0_Post`.`user_id`) WHERE 1=1 ORDER BY `users`.`id` ASC",
+    );
+    assert_eq!(
+        text_rows(&defaulted),
+        [
+            [Some("1".to_owned()), Some("2".to_owned())],
+            [Some("2".to_owned()), Some("0".to_owned())],
+            [Some("3".to_owned()), Some("1".to_owned())],
+        ]
+    );
+    let count = &defaulted.columns[1];
+    assert_eq!(
+        (
+            count.column_type,
+            count.column_length,
+            count.flags & MYSQL_NOT_NULL_FLAG,
+            count.table.as_str(),
+        ),
+        (MYSQL_TYPE_LONGLONG, 21, MYSQL_NOT_NULL_FLAG, "")
+    );
 }
 
 /// The mysql command-line run's pagination: `SELECT SQL_CALC_FOUND_ROWS id,
