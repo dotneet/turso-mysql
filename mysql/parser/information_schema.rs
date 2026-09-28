@@ -104,7 +104,7 @@ pub enum ConnectorJInformationSchemaQuery {
     },
     Columns {
         schema: String,
-        table_pattern: Option<String>,
+        tables: ConnectorJTables,
         column_pattern: String,
     },
     PrimaryKeys {
@@ -114,6 +114,9 @@ pub enum ConnectorJInformationSchemaQuery {
     IndexInfo {
         schema: String,
         table: String,
+        /// `getIndexInfo(..., unique = true, ...)`, which adds
+        /// `AND NON_UNIQUE = 0`.
+        unique_only: bool,
     },
     ImportedKeys {
         schema: String,
@@ -123,6 +126,32 @@ pub enum ConnectorJInformationSchemaQuery {
         schema: String,
         table: String,
     },
+    /// `getCrossReference`: the exported keys of `table` that one child table
+    /// holds.
+    CrossReference {
+        schema: String,
+        table: String,
+        child_schema: String,
+        child_table: String,
+    },
+    /// `getBestRowIdentifier`: the primary key's columns.
+    BestRowIdentifier {
+        schema: String,
+        table: String,
+    },
+}
+
+/// Which tables a Connector/J `getColumns` reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectorJTables {
+    /// No table was named, so every table of the database.
+    Every,
+    /// `TABLE_NAME LIKE '...'`, which Connector/J 9.6 writes for every name
+    /// and 9.7 for a name holding a wildcard.
+    Matching(String),
+    /// `TABLE_NAME = '...'`, which Connector/J 9.7 writes for a name without
+    /// a wildcard.
+    Named(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,15 +341,29 @@ pub fn parse_optional_connector_j_information_schema_query(
             types: Vec::new(),
         }));
     }
-    if let Some(captures) =
-        connector_j_template_captures(&actual, CONNECTOR_J_GET_COLUMNS_TEMPLATE, mode)?
-    {
-        let [Some(schema), Some(table_pattern), Some(column_pattern)] = captures.as_slice() else {
+    for (template, named) in [
+        (CONNECTOR_J_GET_COLUMNS_TEMPLATE.to_owned(), false),
+        (
+            CONNECTOR_J_GET_COLUMNS_TEMPLATE.replace(
+                "TABLE_NAME LIKE '__TABLE_PATTERN__'",
+                "TABLE_NAME = '__TABLE_PATTERN__'",
+            ),
+            true,
+        ),
+    ] {
+        let Some(captures) = connector_j_template_captures(&actual, &template, mode)? else {
+            continue;
+        };
+        let [Some(schema), Some(table), Some(column_pattern)] = captures.as_slice() else {
             return Ok(None);
         };
         return Ok(Some(ConnectorJInformationSchemaQuery::Columns {
             schema: schema.clone(),
-            table_pattern: Some(table_pattern.clone()),
+            tables: if named {
+                ConnectorJTables::Named(table.clone())
+            } else {
+                ConnectorJTables::Matching(table.clone())
+            },
             column_pattern: column_pattern.clone(),
         }));
     }
@@ -334,15 +377,20 @@ pub fn parse_optional_connector_j_information_schema_query(
         };
         return Ok(Some(ConnectorJInformationSchemaQuery::Columns {
             schema: schema.clone(),
-            table_pattern: None,
+            tables: ConnectorJTables::Every,
             column_pattern: column_pattern.clone(),
         }));
     }
+    let unique_index_info =
+        CONNECTOR_J_GET_INDEX_INFO_TEMPLATE.replace(" ORDER BY", " AND NON_UNIQUE = 0 ORDER BY");
+    let best_row_identifier = connector_j_best_row_identifier_template();
     for (template, kind) in [
         (CONNECTOR_J_GET_PRIMARY_KEYS_TEMPLATE, 0),
         (CONNECTOR_J_GET_INDEX_INFO_TEMPLATE, 1),
-        (CONNECTOR_J_GET_IMPORTED_KEYS_TEMPLATE, 2),
-        (CONNECTOR_J_GET_EXPORTED_KEYS_TEMPLATE, 3),
+        (unique_index_info.as_str(), 2),
+        (CONNECTOR_J_GET_IMPORTED_KEYS_TEMPLATE, 3),
+        (CONNECTOR_J_GET_EXPORTED_KEYS_TEMPLATE, 4),
+        (best_row_identifier.as_str(), 5),
     ] {
         let Some(captures) = connector_j_template_captures(&actual, template, mode)? else {
             continue;
@@ -350,27 +398,55 @@ pub fn parse_optional_connector_j_information_schema_query(
         let [Some(schema), Some(table)] = captures.as_slice() else {
             return Ok(None);
         };
+        let (schema, table) = (schema.clone(), table.clone());
         return Ok(Some(match kind {
-            0 => ConnectorJInformationSchemaQuery::PrimaryKeys {
-                schema: schema.clone(),
-                table: table.clone(),
+            0 => ConnectorJInformationSchemaQuery::PrimaryKeys { schema, table },
+            1 | 2 => ConnectorJInformationSchemaQuery::IndexInfo {
+                schema,
+                table,
+                unique_only: kind == 2,
             },
-            1 => ConnectorJInformationSchemaQuery::IndexInfo {
-                schema: schema.clone(),
-                table: table.clone(),
-            },
-            2 => ConnectorJInformationSchemaQuery::ImportedKeys {
-                schema: schema.clone(),
-                table: table.clone(),
-            },
-            3 => ConnectorJInformationSchemaQuery::ExportedKeys {
-                schema: schema.clone(),
-                table: table.clone(),
-            },
+            3 => ConnectorJInformationSchemaQuery::ImportedKeys { schema, table },
+            4 => ConnectorJInformationSchemaQuery::ExportedKeys { schema, table },
+            5 => ConnectorJInformationSchemaQuery::BestRowIdentifier { schema, table },
             _ => unreachable!("all connector query kinds are enumerated"),
         }));
     }
+    let cross_reference = CONNECTOR_J_GET_EXPORTED_KEYS_TEMPLATE.replace(
+        " ORDER BY FKTABLE_CAT",
+        " AND A.TABLE_SCHEMA = '__CHILD_SCHEMA__' AND A.TABLE_NAME = '__CHILD_TABLE__' ORDER BY FKTABLE_CAT",
+    );
+    if let Some(captures) = connector_j_template_captures(&actual, &cross_reference, mode)? {
+        let [Some(schema), Some(table), Some(child_schema), Some(child_table)] =
+            captures.as_slice()
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(ConnectorJInformationSchemaQuery::CrossReference {
+            schema: schema.clone(),
+            table: table.clone(),
+            child_schema: child_schema.clone(),
+            child_table: child_table.clone(),
+        }));
+    }
     Ok(None)
+}
+
+/// `getBestRowIdentifier` as Connector/J 9.7.0 writes it: the four type
+/// columns of `getColumns`, word for word, over the primary key's columns.
+pub fn connector_j_best_row_identifier_template() -> String {
+    let start = CONNECTOR_J_GET_COLUMNS_TEMPLATE
+        .find("CASE WHEN UPPER(DATA_TYPE) = 'DECIMAL' THEN 3")
+        .expect("getColumns reads DATA_TYPE");
+    let end = CONNECTOR_J_GET_COLUMNS_TEMPLATE
+        .find(" AS DECIMAL_DIGITS")
+        .expect("getColumns reads DECIMAL_DIGITS")
+        + " AS DECIMAL_DIGITS".len();
+    format!(
+        "SELECT 2 AS SCOPE, COLUMN_NAME, {}, 1 AS PSEUDO_COLUMN FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = '__SCHEMA__' AND TABLE_NAME = '__TABLE__' AND COLUMN_KEY = 'PRI'",
+        &CONNECTOR_J_GET_COLUMNS_TEMPLATE[start..end]
+    )
 }
 
 pub fn is_connector_j_information_schema_collation_query(
@@ -639,7 +715,7 @@ mod connector_j_tests {
             .unwrap(),
             Some(ConnectorJInformationSchemaQuery::Columns {
                 schema: "reports".to_owned(),
-                table_pattern: Some("jdbc_records".to_owned()),
+                tables: ConnectorJTables::Matching("jdbc_records".to_owned()),
                 column_pattern: "%".to_owned(),
             })
         );
@@ -653,7 +729,7 @@ mod connector_j_tests {
             .unwrap(),
             Some(ConnectorJInformationSchemaQuery::Columns {
                 schema: "reports".to_owned(),
-                table_pattern: None,
+                tables: ConnectorJTables::Every,
                 column_pattern: "%".to_owned(),
             })
         );
@@ -682,6 +758,7 @@ mod connector_j_tests {
                 ConnectorJInformationSchemaQuery::IndexInfo {
                     schema: "reports".to_owned(),
                     table: "jdbc_records".to_owned(),
+                    unique_only: false,
                 },
             ),
             (

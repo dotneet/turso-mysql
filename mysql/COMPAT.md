@@ -6609,6 +6609,30 @@ parser, frontend and protocol regression coverage.
 The MySQL 8.4.11 comparison was a manual snapshot; CI runs the pinned Turso
 fixtures but does not run a MySQL differential gate.
 
+Connector/J 9.7.0's default `information_schema` metadata path is answered
+too, each read recognized word for word as the driver writes it. 9.7 writes
+`TABLE_NAME = '...'` for a table name without a wildcard where 9.6 wrote
+`LIKE`, and both are taken. `getColumns` and `getBestRowIdentifier` work their
+type columns out by Connector/J's own `CASE` expressions over the rows
+`information_schema.COLUMNS` answers, so every type the catalog describes
+reads back as MySQL's does: measured on 8.4.11 over a table of thirty-eight
+types, every value of every row agrees — a `TINYINT(1)` a `BIT` of size 1, a
+`JSON` a `LONGVARCHAR` of 1073741824, a `LONGTEXT` capped at 2147483647, a
+`DATETIME DEFAULT CURRENT_TIMESTAMP` `IS_GENERATEDCOLUMN = YES` (its extra is
+`DEFAULT_GENERATED`). Hibernate's `ddl-auto=validate` reads every column of the
+database at once, naming no table, and is answered the same way.
+`getIndexInfo` answers a table holding rows with a NULL `CARDINALITY`: MySQL
+answers InnoDB's estimate, 2 over two rows here and 0 just after the table was
+made, which this server does not keep, and NULL is what its own `STATISTICS`
+answers; an empty table answers 0, as MySQL does. `getIndexInfo(..., true,
+...)` adds `AND NON_UNIQUE = 0` and answers the unique indexes. `getExportedKeys`
+and `getCrossReference` join every primary and unique key of the parent to
+each foreign key column, whichever one the key points at — measured, a parent
+with a primary key and one unique key answers two rows for a one-column
+foreign key, `PK_NAME` `PRIMARY` then the unique key's name — and a child in
+another database answers none, a foreign key here naming a parent in its own
+database.
+
 ## Verification snapshot
 
 A MySQL 8.0.46 command-line client E2E is checked in under the privileged
@@ -6625,8 +6649,8 @@ fixture. Both passed verified TLS, prepared inserts, CRUD, rollback, `ALTER
 TABLE ADD COLUMN`, and schema inspection. The JDBC fixture sets
 `useInformationSchema=false`, so `DatabaseMetaData.getColumns` reads `SHOW FULL
 TABLES` and `SHOW FULL COLUMNS` with an explicit selected database. Its default
-`information_schema` metadata query uses expressions and columns this server
-does not yet implement. The Go fixture uses `mysql.NewConfig()` to keep the
+`information_schema` metadata path is answered by recognizing each read the
+driver writes, as described above, rather than by running it. The Go fixture uses `mysql.NewConfig()` to keep the
 driver's default packet size. The gate passed locally on 2026-09-26.
 
 The two fixed drivers also opt into multiple statements (`multiStatements`

@@ -81,7 +81,7 @@ pub use information_schema::{
     parse_optional_connector_j_schemata_listing_query,
     parse_optional_gorm_information_schema_prepared_query,
     parse_optional_laravel_information_schema_query, ConnectorJForeignKey,
-    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery, ConnectorJTables,
     GormInformationSchemaPreparedQuery, LaravelInformationSchemaQuery, LaravelSchema,
 };
 use mysql_ddl::render_mysql_column;

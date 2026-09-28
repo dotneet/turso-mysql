@@ -81,8 +81,8 @@ use turso_mysql_parser::{
     renamed_tables, select_projection_origins, table_comment_change, table_counter_change,
     table_engine_restated, ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch,
     ColumnAggregateKind, ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
-    GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
-    MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
+    ConnectorJTables, GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand,
+    MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
     MySqlInformationSchemaTablesColumn, MySqlJoinedDerivedColumn, MySqlLikePattern,
     MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
     ScalarFunction,
@@ -1910,7 +1910,9 @@ where
             | ConnectorJInformationSchemaQuery::PrimaryKeys { schema, .. }
             | ConnectorJInformationSchemaQuery::IndexInfo { schema, .. }
             | ConnectorJInformationSchemaQuery::ImportedKeys { schema, .. }
-            | ConnectorJInformationSchemaQuery::ExportedKeys { schema, .. } => schema,
+            | ConnectorJInformationSchemaQuery::ExportedKeys { schema, .. }
+            | ConnectorJInformationSchemaQuery::CrossReference { schema, .. }
+            | ConnectorJInformationSchemaQuery::BestRowIdentifier { schema, .. } => schema,
         }
         .clone();
         let visibility = self.authorize_catalog_visibility(&schema)?;
@@ -1920,6 +1922,14 @@ where
         let connection =
             self.gorm_catalog_connection(&schema, selected_database, selected_connection)?;
         let status_flags = self.status_flags();
+        let only_child = match &query {
+            ConnectorJInformationSchemaQuery::CrossReference {
+                child_schema,
+                child_table,
+                ..
+            } => Some((child_schema.clone(), child_table.clone())),
+            _ => None,
+        };
         match query {
             ConnectorJInformationSchemaQuery::Tables {
                 table_pattern,
@@ -1956,45 +1966,74 @@ where
                 catalog_results::connector_j_tables_result(&schema, tables, status_flags)
             }
             ConnectorJInformationSchemaQuery::Columns {
-                table_pattern,
+                tables: wanted,
                 column_pattern,
                 ..
             } => {
                 let Some(connection) = connection else {
-                    return catalog_results::connector_j_columns_result(
-                        &schema,
+                    return catalog_results::connector_j_columns_result(Vec::new(), status_flags);
+                };
+                let mode = self.session.session_sql_mode();
+                let table_pattern = match &wanted {
+                    ConnectorJTables::Every => None,
+                    ConnectorJTables::Matching(pattern) => {
+                        Some(MySqlLikePattern::new(pattern, mode))
+                    }
+                    ConnectorJTables::Named(name) => {
+                        let written = name
+                            .chars()
+                            .flat_map(|character| match character {
+                                '\\' | '%' | '_' => vec!['\\', character],
+                                character => vec![character],
+                            })
+                            .collect::<String>();
+                        Some(MySqlLikePattern::with_escape(&written, Some('\\')))
+                    }
+                };
+                let column_pattern = MySqlLikePattern::new(&column_pattern, mode);
+                let mut tables = connection
+                    .list_tables()
+                    .map_err(|_| FrontendErrorKind::Internal)?;
+                tables.retain(|table| {
+                    table_pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.matches(table.name()))
+                });
+                let rows = connector_j_catalog_columns(
+                    &connection,
+                    &schema,
+                    self.filter_catalog_tables(&schema, visibility, tables)?,
+                )?
+                .into_iter()
+                .filter(|row| {
+                    row.get(3)
+                        .and_then(Value::to_text)
+                        .is_none_or(|name| column_pattern.matches(name))
+                })
+                .collect();
+                catalog_results::connector_j_columns_result(rows, status_flags)
+            }
+            ConnectorJInformationSchemaQuery::BestRowIdentifier { table, .. } => {
+                let table =
+                    MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+                let Some(connection) = connection else {
+                    return catalog_results::connector_j_best_row_identifier_result(
                         Vec::new(),
                         status_flags,
                     );
                 };
                 let tables = connection
                     .list_tables()
-                    .map_err(|_| FrontendErrorKind::Internal)?;
-                let tables = self.filter_catalog_tables(&schema, visibility, tables)?;
-                let table_pattern = table_pattern
-                    .as_deref()
-                    .map(|pattern| MySqlLikePattern::new(pattern, self.session.session_sql_mode()));
-                let column_pattern =
-                    MySqlLikePattern::new(&column_pattern, self.session.session_sql_mode());
-                let mut columns = Vec::new();
-                for table in tables.into_iter().filter(|table| {
-                    table_pattern
-                        .as_ref()
-                        .is_none_or(|pattern| pattern.matches(table.name()))
-                }) {
-                    if table.kind() != MySqlTableKind::BaseTable {
-                        return Err(FrontendErrorKind::Unsupported);
-                    }
-                    let name = MySqlTableName::parse(table.name())
-                        .map_err(|_| FrontendErrorKind::Internal)?;
-                    let listed = list_gorm_catalog_columns(&connection, &name)?
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(_, column)| column_pattern.matches(column.name()))
-                        .collect::<Vec<_>>();
-                    columns.push((table.name().to_owned(), listed));
-                }
-                catalog_results::connector_j_columns_result(&schema, columns, status_flags)
+                    .map_err(|_| FrontendErrorKind::Internal)?
+                    .into_iter()
+                    .filter(|listed| listed.name().eq_ignore_ascii_case(table.as_str()))
+                    .collect();
+                let rows = connector_j_catalog_columns(
+                    &connection,
+                    &schema,
+                    self.filter_catalog_tables(&schema, visibility, tables)?,
+                )?;
+                catalog_results::connector_j_best_row_identifier_result(rows, status_flags)
             }
             ConnectorJInformationSchemaQuery::ImportedKeys { table, .. } => {
                 let table =
@@ -2111,7 +2150,9 @@ where
                     .collect();
                 catalog_results::connector_j_primary_keys_result(rows, status_flags)
             }
-            ConnectorJInformationSchemaQuery::IndexInfo { table, .. } => {
+            ConnectorJInformationSchemaQuery::IndexInfo {
+                table, unique_only, ..
+            } => {
                 let table =
                     MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
                 if !self.gorm_catalog_table_visible(&schema, &table, visibility)? {
@@ -2134,9 +2175,17 @@ where
                     ) => Vec::new(),
                     Err(error) => return Err(show_create_table_error_kind(error)),
                 };
-                if !indexes.is_empty() && !connector_j_table_is_empty(&connection, &table)? {
-                    return Err(FrontendErrorKind::Unsupported);
-                }
+                indexes.retain(|index| !unique_only || index.unique());
+                // MySQL answers InnoDB's estimate of the distinct values, which
+                // this server does not keep: `STATISTICS` answers NULL for it,
+                // as MySQL does for an index it has no estimate of. An empty
+                // table has none to estimate, and MySQL answers 0 for it.
+                let cardinality =
+                    if indexes.is_empty() || connector_j_table_is_empty(&connection, &table)? {
+                        Some(b"0".to_vec())
+                    } else {
+                        None
+                    };
                 indexes.sort_unstable_by(|left, right| {
                     (!left.unique())
                         .cmp(&!right.unique())
@@ -2157,7 +2206,7 @@ where
                             Some(index.sequence_in_index().to_string().into_bytes()),
                             Some(index.column_name().as_bytes().to_vec()),
                             Some(b"A".to_vec()),
-                            Some(b"0".to_vec()),
+                            cardinality.clone(),
                             Some(b"0".to_vec()),
                             None,
                         ]
@@ -2165,7 +2214,8 @@ where
                     .collect();
                 catalog_results::connector_j_index_info_result(rows, status_flags)
             }
-            ConnectorJInformationSchemaQuery::ExportedKeys { table, .. } => {
+            ConnectorJInformationSchemaQuery::ExportedKeys { table, .. }
+            | ConnectorJInformationSchemaQuery::CrossReference { table, .. } => {
                 let parent =
                     MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
                 if !self.gorm_catalog_table_visible(&schema, &parent, visibility)? {
@@ -2186,11 +2236,25 @@ where
                     .list_tables()
                     .map_err(|_| FrontendErrorKind::Internal)?;
                 let tables = self.filter_catalog_tables(&schema, visibility, tables)?;
+                // A foreign key here names a parent in its own database, so a
+                // child in another database holds none of this table's keys.
+                let wanted_child = |name: &str| {
+                    only_child
+                        .as_ref()
+                        .is_none_or(|(child_schema, child_table)| {
+                            *child_schema == schema && child_table.eq_ignore_ascii_case(name)
+                        })
+                };
+                // Connector/J joins every unique key of the parent, whichever
+                // one the foreign key points at, so each column of a key is
+                // answered once for each of them: measured on MySQL 8.4.11, a
+                // parent with a primary key and one unique key answers two
+                // rows for a one-column foreign key.
+                let parent_keys = connector_j_unique_key_names(&connection, &parent)?;
                 let mut rows = Vec::new();
-                for child in tables
-                    .into_iter()
-                    .filter(|table| table.kind() == MySqlTableKind::BaseTable)
-                {
+                for child in tables.into_iter().filter(|table| {
+                    table.kind() == MySqlTableKind::BaseTable && wanted_child(table.name())
+                }) {
                     let child_name = MySqlTableName::parse(child.name())
                         .map_err(|_| FrontendErrorKind::Internal)?;
                     let created = connection
@@ -2205,8 +2269,6 @@ where
                         .into_iter()
                         .filter(|key| key.parent_table.eq_ignore_ascii_case(parent.as_str()))
                     {
-                        let pk_name =
-                            connector_j_parent_key_name(&connection, &parent, &key.parent_columns)?;
                         let update_rule = connector_j_referential_rule(key.on_update.as_deref())?;
                         let delete_rule = connector_j_referential_rule(key.on_delete.as_deref())?;
                         for (position, (child_column, parent_column)) in key
@@ -2215,34 +2277,108 @@ where
                             .zip(&key.parent_columns)
                             .enumerate()
                         {
-                            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
-                                return Err(FrontendErrorKind::Internal);
-                            }
                             let value = |text: &str| Some(text.as_bytes().to_vec());
                             let number = |value: usize| Some(value.to_string().into_bytes());
-                            rows.push(vec![
-                                value(&schema),
-                                None,
-                                value(parent.as_str()),
-                                value(parent_column),
-                                value(&schema),
-                                None,
-                                value(child.name()),
-                                value(child_column),
-                                number(position + 1),
-                                number(update_rule),
-                                number(delete_rule),
-                                value(&key.name),
-                                value(&pk_name),
-                                number(7),
-                            ]);
+                            let key_names = if parent_keys.is_empty() {
+                                vec![None]
+                            } else {
+                                parent_keys.iter().map(|name| value(name)).collect()
+                            };
+                            for key_name in key_names {
+                                if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
+                                    return Err(FrontendErrorKind::Internal);
+                                }
+                                rows.push(vec![
+                                    value(&schema),
+                                    None,
+                                    value(parent.as_str()),
+                                    value(parent_column),
+                                    value(&schema),
+                                    None,
+                                    value(child.name()),
+                                    value(child_column),
+                                    number(position + 1),
+                                    number(update_rule),
+                                    number(delete_rule),
+                                    value(&key.name),
+                                    key_name,
+                                    number(7),
+                                ]);
+                            }
                         }
                     }
                 }
+                // `ORDER BY FKTABLE_CAT, FKTABLE_SCHEM, FKTABLE_NAME, KEY_SEQ`;
+                // the table name sorts by its bytes, as `utf8mb3_bin` does.
+                rows.sort_by(|left, right| {
+                    let key_sequence = |row: &Vec<Option<Vec<u8>>>| {
+                        row[8]
+                            .as_deref()
+                            .and_then(|digits| std::str::from_utf8(digits).ok())
+                            .and_then(|digits| digits.parse::<usize>().ok())
+                    };
+                    left[6]
+                        .cmp(&right[6])
+                        .then(key_sequence(left).cmp(&key_sequence(right)))
+                });
                 catalog_results::connector_j_foreign_keys_result(rows, true, status_flags)
             }
         }
     }
+}
+
+/// The names of a table's primary and unique keys, the primary key first,
+/// each once.
+#[cfg(unix)]
+fn connector_j_unique_key_names(
+    connection: &MySqlConnection,
+    table: &MySqlTableName,
+) -> Result<Vec<String>, FrontendErrorKind> {
+    let indexes = connection
+        .list_indexes(table)
+        .map_err(show_create_table_error_kind)?;
+    let mut names = Vec::<String>::new();
+    for index in indexes.iter().filter(|index| index.unique()) {
+        if !names.iter().any(|name| name == index.key_name()) {
+            names.push(index.key_name().to_owned());
+        }
+    }
+    names.sort_by_key(|name| name != "PRIMARY");
+    Ok(names)
+}
+
+/// Every row `information_schema.COLUMNS` answers for these tables, in table
+/// name order, as Connector/J's `ORDER BY TABLE_SCHEMA, TABLE_NAME,
+/// ORDINAL_POSITION` reads them.
+#[cfg(unix)]
+fn connector_j_catalog_columns(
+    connection: &MySqlConnection,
+    schema: &str,
+    mut tables: Vec<turso_mysql::MySqlTable>,
+) -> Result<Vec<Vec<Value>>, FrontendErrorKind> {
+    tables.sort_by(|left, right| left.name().cmp(right.name()));
+    let mut rows = Vec::new();
+    for table in tables {
+        let name = MySqlTableName::parse(table.name()).map_err(|_| FrontendErrorKind::Internal)?;
+        match connection.list_columns(&name) {
+            Ok(columns) => rows.extend(catalog_results::information_schema_columns_rows(
+                schema,
+                table.name(),
+                columns,
+                "",
+            )?),
+            Err(MySqlColumnMetadataError::TableNotFound) => {}
+            Err(MySqlColumnMetadataError::Engine(_)) => return Err(FrontendErrorKind::Internal),
+            Err(
+                MySqlColumnMetadataError::CorruptDefinition
+                | MySqlColumnMetadataError::UnsupportedDefinition,
+            ) => return Err(FrontendErrorKind::Unsupported),
+        }
+        if rows.len() > MAX_DISPATCH_RESULT_ROWS {
+            return Err(FrontendErrorKind::Internal);
+        }
+    }
+    Ok(rows)
 }
 
 #[cfg(unix)]

@@ -2993,52 +2993,67 @@ fn connector_j_null_column(name: &str) -> ColumnDefinitionConfig {
     )
 }
 
+/// Connector/J's `getColumns`, one row for each row `information_schema.COLUMNS`
+/// answers, in the order its `ORDER BY` asks for.
 pub(super) fn connector_j_columns_result(
-    schema: &str,
-    tables: Vec<(String, Vec<(usize, MySqlColumnMetadata)>)>,
+    catalog_rows: Vec<Vec<Value>>,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-    let mut rows = Vec::new();
-    for (table, columns) in tables {
-        for (ordinal, column) in columns {
-            if rows.len() >= MAX_DISPATCH_RESULT_ROWS {
-                return Err(FrontendErrorKind::Internal);
-            }
-            let (jdbc_type, type_name, size, decimal_digits, octet_length) =
-                connector_j_column_type(&column)?;
-            let nullable = column.nullable();
-            let text = |value: &str| Some(value.as_bytes().to_vec());
-            rows.push(vec![
-                text(schema),
-                None,
-                text(&table),
-                text(column.name()),
-                connector_j_number(jdbc_type),
-                text(&type_name),
-                connector_j_number(size),
-                connector_j_number(65_535),
-                decimal_digits.map(|value| value.to_string().into_bytes()),
-                connector_j_number(10),
-                connector_j_number(usize::from(nullable)),
-                text(column.comment()),
-                show_column_default_value(&column)?,
-                connector_j_number(0),
-                connector_j_number(0),
-                octet_length.map(|value| value.to_string().into_bytes()),
-                connector_j_number(ordinal + 1),
-                text(if nullable { "YES" } else { "NO" }),
-                None,
-                None,
-                None,
-                None,
-                text(if column.extra().eq_ignore_ascii_case("auto_increment") {
-                    "YES"
-                } else {
-                    "NO"
-                }),
-                text("NO"),
-            ]);
-        }
+    if catalog_rows.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let mut rows = Vec::with_capacity(catalog_rows.len());
+    for catalog_row in &catalog_rows {
+        let column = ColumnsTableRow::read(catalog_row)?;
+        let kind = connector_j_column_kind(&column);
+        let text = |value: &str| Some(value.as_bytes().to_vec());
+        let number = |value: Option<i64>| value.map(|value| value.to_string().into_bytes());
+        let nullable = if column.is_nullable.eq_ignore_ascii_case("NO") {
+            0
+        } else if column.is_nullable.eq_ignore_ascii_case("YES") {
+            1
+        } else {
+            2
+        };
+        let extra = column.extra.to_ascii_lowercase();
+        rows.push(vec![
+            text(column.schema),
+            None,
+            text(column.table),
+            text(column.name),
+            number(Some(kind.data_type)),
+            text(&kind.type_name),
+            number(kind.column_size),
+            number(Some(65_535)),
+            number(kind.decimal_digits),
+            number(Some(10)),
+            number(Some(nullable)),
+            text(column.comment),
+            column.default.and_then(text),
+            number(Some(0)),
+            number(Some(0)),
+            number(
+                column
+                    .character_octet_length
+                    .map(|length| length.min(i64::from(i32::MAX))),
+            ),
+            number(Some(column.ordinal_position)),
+            text(column.is_nullable),
+            None,
+            None,
+            None,
+            None,
+            text(if extra.contains("auto_increment") {
+                "YES"
+            } else {
+                "NO"
+            }),
+            text(if extra.contains("generated") {
+                "YES"
+            } else {
+                "NO"
+            }),
+        ]);
     }
     Ok(CommandExecutionResult::ResultSet(TextResultSet {
         columns: connector_j_columns_columns(),
@@ -3048,104 +3063,205 @@ pub(super) fn connector_j_columns_result(
     }))
 }
 
-fn connector_j_number(value: impl ToString) -> Option<Vec<u8>> {
-    Some(value.to_string().into_bytes())
+/// Connector/J's `getBestRowIdentifier`: the columns of the primary key, each
+/// with the type columns `getColumns` gives it.
+pub(super) fn connector_j_best_row_identifier_result(
+    catalog_rows: Vec<Vec<Value>>,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let mut rows = Vec::new();
+    for catalog_row in &catalog_rows {
+        let column = ColumnsTableRow::read(catalog_row)?;
+        if column.key != "PRI" {
+            continue;
+        }
+        let kind = connector_j_column_kind(&column);
+        let number = |value: Option<i64>| value.map(|value| value.to_string().into_bytes());
+        rows.push(vec![
+            number(Some(2)),
+            Some(column.name.as_bytes().to_vec()),
+            number(Some(kind.data_type)),
+            Some(kind.type_name.into_bytes()),
+            number(kind.column_size),
+            number(Some(65_535)),
+            number(kind.decimal_digits),
+            number(Some(1)),
+        ]);
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: connector_j_best_row_identifier_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
 }
 
-type ConnectorJColumnType = (i32, String, u32, Option<u32>, Option<u32>);
-
-fn connector_j_column_type(
-    column: &MySqlColumnMetadata,
-) -> Result<ConnectorJColumnType, FrontendErrorKind> {
-    let rendered = show_column_type_name(column)?;
-    let base = the_type_without_its_own_words(&rendered);
-    let unsigned = rendered.ends_with(b" unsigned");
-    let (jdbc_type, name, size, digits, octets) = match base {
-        b"int" | b"integer" => (4, "INT", 10, None, None),
-        b"bigint" => (-5, "BIGINT", if unsigned { 20 } else { 19 }, None, None),
-        b"smallint" => (5, "SMALLINT", 5, None, None),
-        b"mediumint" => (4, "MEDIUMINT", if unsigned { 8 } else { 7 }, None, None),
-        b"tinyint" if !unsigned && rendered.windows(3).any(|window| window == b"(1)") => {
-            (-7, "BIT", 1, None, None)
-        }
-        b"tinyint" => (-6, "TINYINT", 3, None, None),
-        b"varchar" => {
-            let length = column
-                .character_length()
-                .ok_or(FrontendErrorKind::Unsupported)?;
-            let width = connector_j_character_octet_width(column)?;
-            (12, "VARCHAR", length, None, length.checked_mul(width))
-        }
-        b"char" => {
-            let length = column
-                .character_length()
-                .ok_or(FrontendErrorKind::Unsupported)?;
-            let width = connector_j_character_octet_width(column)?;
-            (1, "CHAR", length, None, length.checked_mul(width))
-        }
-        b"text" => (-1, "TEXT", 65_535, None, Some(65_535)),
-        b"decimal" => {
-            let (precision, scale) = column
-                .decimal_size()
-                .ok_or(FrontendErrorKind::Unsupported)?;
-            (3, "DECIMAL", precision, Some(scale), None)
-        }
-        b"timestamp" | b"datetime" => {
-            let precision = connector_j_temporal_precision(&rendered)?;
-            let size = 19 + if precision > 0 { precision + 1 } else { 0 };
-            (
-                93,
-                if base == b"timestamp" {
-                    "TIMESTAMP"
-                } else {
-                    "DATETIME"
-                },
-                size,
-                None,
-                None,
-            )
-        }
-        b"date" => (91, "DATE", 10, None, None),
-        b"time" => {
-            let precision = connector_j_temporal_precision(&rendered)?;
-            let size = 8 + if precision > 0 { precision + 1 } else { 0 };
-            (92, "TIME", size, None, None)
-        }
-        _ => return Err(FrontendErrorKind::Unsupported),
-    };
-    let name = if unsigned {
-        format!("{name} UNSIGNED")
-    } else {
-        name.to_owned()
-    };
-    Ok((jdbc_type, name, size, digits, octets))
+/// The columns of one row of `information_schema.COLUMNS` that Connector/J
+/// reads, as `information_schema_columns_rows` answers them.
+struct ColumnsTableRow<'a> {
+    schema: &'a str,
+    table: &'a str,
+    name: &'a str,
+    ordinal_position: i64,
+    default: Option<&'a str>,
+    is_nullable: &'a str,
+    data_type: &'a str,
+    character_maximum_length: Option<i64>,
+    character_octet_length: Option<i64>,
+    numeric_precision: Option<i64>,
+    numeric_scale: Option<i64>,
+    datetime_precision: Option<i64>,
+    column_type: &'a str,
+    key: &'a str,
+    extra: &'a str,
+    comment: &'a str,
 }
 
-fn connector_j_character_octet_width(
-    column: &MySqlColumnMetadata,
-) -> Result<u32, FrontendErrorKind> {
-    match column.collation_name() {
-        None => Ok(4),
-        Some(name) if name.starts_with("utf8mb4_") => Ok(4),
-        Some(name) if name.starts_with("utf8mb3_") => Ok(3),
-        Some(name) if name.starts_with("latin1_") || name.starts_with("ascii_") => Ok(1),
-        Some(_) => Err(FrontendErrorKind::Unsupported),
+impl<'a> ColumnsTableRow<'a> {
+    /// A table whose columns this server cannot read has a row holding its
+    /// name alone, and a read of its columns is refused, as `COLUMNS` refuses
+    /// it.
+    fn read(row: &'a [Value]) -> Result<Self, FrontendErrorKind> {
+        if row.len() != 22 {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let text = |index: usize| row[index].to_text().ok_or(FrontendErrorKind::Internal);
+        let optional_text = |index: usize| match &row[index] {
+            Value::Null => Ok(None),
+            value => value.to_text().map(Some).ok_or(FrontendErrorKind::Internal),
+        };
+        let optional_number = |index: usize| match &row[index] {
+            Value::Null => Ok(None),
+            Value::Numeric(Numeric::Integer(number)) => Ok(Some(*number)),
+            _ => Err(FrontendErrorKind::Internal),
+        };
+        Ok(Self {
+            schema: text(1)?,
+            table: text(2)?,
+            name: text(3)?,
+            ordinal_position: optional_number(4)?.ok_or(FrontendErrorKind::Internal)?,
+            default: optional_text(5)?,
+            is_nullable: text(6)?,
+            data_type: text(7)?,
+            character_maximum_length: optional_number(8)?,
+            character_octet_length: optional_number(9)?,
+            numeric_precision: optional_number(10)?,
+            numeric_scale: optional_number(11)?,
+            datetime_precision: optional_number(12)?,
+            column_type: text(15)?,
+            key: text(16)?,
+            extra: text(17)?,
+            comment: text(19)?,
+        })
     }
 }
 
-fn connector_j_temporal_precision(rendered: &[u8]) -> Result<u32, FrontendErrorKind> {
-    let Some(open) = rendered.iter().position(|byte| *byte == b'(') else {
-        return Ok(0);
+/// `DATA_TYPE`, `TYPE_NAME`, `COLUMN_SIZE` and `DECIMAL_DIGITS` as
+/// Connector/J 9.7.0 works them out of a `COLUMNS` row.
+struct ConnectorJColumnKind {
+    data_type: i64,
+    type_name: String,
+    column_size: Option<i64>,
+    decimal_digits: Option<i64>,
+}
+
+/// Each arm follows one branch of the `CASE` Connector/J writes, in the order
+/// it writes them, so a column two branches match takes the first.
+fn connector_j_column_kind(column: &ColumnsTableRow<'_>) -> ConnectorJColumnKind {
+    const GEOMETRIES: [&str; 9] = [
+        "GEOMETRY",
+        "POINT",
+        "LINESTRING",
+        "POLYGON",
+        "MULTIPOINT",
+        "MULTILINESTRING",
+        "MULTIPOLYGON",
+        "GEOMETRYCOLLECTION",
+        "GEOMCOLLECTION",
+    ];
+    let data_type = column.data_type.to_ascii_uppercase();
+    let column_type = column.column_type.to_ascii_uppercase();
+    let column_type_unsigned = column_type.contains("UNSIGNED");
+    let data_type_unsigned = data_type.contains("UNSIGNED");
+    // Connector/J reads a TINYINT(1) that is neither unsigned nor zero-filled
+    // as a single bit.
+    let one_bit = !column_type.contains("ZEROFILL")
+        && !column_type_unsigned
+        && column.column_type.contains("(1)");
+    let geometry = GEOMETRIES.contains(&data_type.as_str());
+    let jdbc_type = match data_type.as_str() {
+        "DECIMAL" | "DECIMAL UNSIGNED" => 3,
+        "TINYINT" | "TINYINT UNSIGNED" if one_bit => -7,
+        "TINYINT" | "TINYINT UNSIGNED" => -6,
+        "BOOLEAN" => 16,
+        "SMALLINT" | "SMALLINT UNSIGNED" => 5,
+        "INT" | "INT UNSIGNED" | "MEDIUMINT" | "MEDIUMINT UNSIGNED" => 4,
+        "FLOAT" | "FLOAT UNSIGNED" => 7,
+        "DOUBLE" | "DOUBLE UNSIGNED" => 8,
+        "NULL" => 0,
+        "TIMESTAMP" | "DATETIME" => 93,
+        "BIGINT" | "BIGINT UNSIGNED" => -5,
+        "DATE" | "YEAR" => 91,
+        "TIME" => 92,
+        "VARCHAR" | "TINYTEXT" => 12,
+        "VARBINARY" | "TINYBLOB" => -3,
+        "BIT" => -7,
+        "JSON" | "MEDIUMTEXT" | "LONGTEXT" | "TEXT" => -1,
+        "ENUM" | "SET" | "CHAR" => 1,
+        "MEDIUMBLOB" | "LONGBLOB" | "BLOB" | "VECTOR" => -4,
+        "BINARY" => -2,
+        _ if geometry => -2,
+        _ => 1111,
     };
-    let close = rendered
-        .iter()
-        .position(|byte| *byte == b')')
-        .ok_or(FrontendErrorKind::Unsupported)?;
-    std::str::from_utf8(&rendered[open + 1..close])
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|precision| *precision <= 6)
-        .ok_or(FrontendErrorKind::Unsupported)
+    let type_name = if data_type == "TINYINT" {
+        if one_bit {
+            "BIT".to_owned()
+        } else if column_type_unsigned && !data_type_unsigned {
+            "TINYINT UNSIGNED".to_owned()
+        } else {
+            data_type.clone()
+        }
+    } else if column_type_unsigned
+        && !data_type_unsigned
+        && !data_type.starts_with("SET")
+        && !data_type.starts_with("ENUM")
+    {
+        format!("{data_type} UNSIGNED")
+    } else if geometry {
+        "GEOMETRY".to_owned()
+    } else {
+        data_type.clone()
+    };
+    let with_fraction = |base: i64| {
+        column
+            .datetime_precision
+            .map(|precision| base + if precision > 0 { precision + 1 } else { 0 })
+    };
+    let column_size = match data_type.as_str() {
+        "YEAR" => Some(4),
+        "DATE" => Some(10),
+        "DATETIME" | "TIMESTAMP" => with_fraction(19),
+        "TIME" => with_fraction(8),
+        "TINYINT" if one_bit => Some(1),
+        "MEDIUMINT" if column_type_unsigned => Some(8),
+        "JSON" => Some(1_073_741_824),
+        _ if geometry => Some(65_535),
+        _ => match column.character_maximum_length {
+            None => column.numeric_precision,
+            Some(length) => Some(length.min(i64::from(i32::MAX))),
+        },
+    };
+    let decimal_digits = match data_type.as_str() {
+        "DECIMAL" => column.numeric_scale,
+        "FLOAT" | "DOUBLE" => Some(column.numeric_scale.unwrap_or(0)),
+        _ => None,
+    };
+    ConnectorJColumnKind {
+        data_type: jdbc_type,
+        type_name,
+        column_size,
+        decimal_digits,
+    }
 }
 
 fn connector_j_columns_columns() -> Vec<ColumnDefinitionConfig> {
@@ -3360,6 +3476,42 @@ fn connector_j_columns_columns() -> Vec<ColumnDefinitionConfig> {
             .clone_into(&mut column.original_name);
             if matches!(name, "COLUMN_NAME" | "REMARKS" | "IS_NULLABLE") {
                 column.schema.clear();
+            }
+            column
+        })
+        .collect()
+}
+
+/// Measured on MySQL 8.4.11 through the same client the other Connector/J
+/// reads here were pinned through: the computed words carry 31 decimals.
+fn connector_j_best_row_identifier_columns() -> Vec<ColumnDefinitionConfig> {
+    let whole = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+    let specs = [
+        ("SCOPE", "", MYSQL_TYPE_LONGLONG, 2, whole, 0),
+        ("COLUMN_NAME", "COLUMNS", MYSQL_TYPE_VAR_STRING, 64, 0, 31),
+        ("DATA_TYPE", "", MYSQL_TYPE_LONGLONG, 5, whole, 0),
+        (
+            "TYPE_NAME",
+            "",
+            MYSQL_TYPE_LONG_BLOB,
+            50_331_645,
+            MYSQL_BINARY_FLAG,
+            31,
+        ),
+        ("COLUMN_SIZE", "", MYSQL_TYPE_VAR_STRING, 21, 0, 31),
+        ("BUFFER_LENGTH", "", MYSQL_TYPE_LONGLONG, 6, whole, 0),
+        ("DECIMAL_DIGITS", "", MYSQL_TYPE_VAR_STRING, 10, 0, 31),
+        ("PSEUDO_COLUMN", "", MYSQL_TYPE_LONGLONG, 2, whole, 0),
+    ];
+    specs
+        .into_iter()
+        .map(|(name, table, kind, length, flags, decimals)| {
+            let mut column =
+                connector_j_information_schema_column(name, table, table, kind, length, flags);
+            column.decimals = decimals;
+            if !table.is_empty() {
+                column.schema.clear();
+                name.clone_into(&mut column.original_name);
             }
             column
         })
