@@ -325,20 +325,56 @@ impl MySqlConnection {
         let Some(auto_increment) = auto_increment else {
             return Ok(None);
         };
+        self.peek_next_auto_increment(auto_increment.key)
+            .map_err(MySqlShowCreateTableError::Engine)
+    }
+
+    /// Every counted table's `information_schema.TABLES.AUTO_INCREMENT`, by
+    /// table name; a table missing from the list answers NULL.
+    ///
+    /// Measured on MySQL 8.4.11, the column answers what `SHOW CREATE TABLE`
+    /// prints as `AUTO_INCREMENT=<n>`, NULL for a table that counts nothing
+    /// and for one that has handed out no number yet. MySQL keeps the figure
+    /// it first read for `information_schema_stats_expiry` seconds; this
+    /// reads it afresh every time, which is MySQL's answer with that setting
+    /// at 0.
+    pub fn next_auto_increment_values(&self) -> Result<Vec<(String, u64)>> {
+        let schema = self.inner.current_schema();
+        let identity = self
+            .inner
+            .schema_catalog_validation_context()
+            .map(|context| *context.database_identity());
+        let mut values = Vec::new();
+        for name in schema.tables.keys() {
+            let Some(sql) = schema.table_sql(name) else {
+                continue;
+            };
+            let Some(table) = counted_table_from_stored_sql(sql, identity)? else {
+                continue;
+            };
+            if let Some(next) = self.peek_next_auto_increment(table.key)? {
+                values.push((name.clone(), next));
+            }
+        }
+        Ok(values)
+    }
+
+    /// One past the highest number a counter has handed out, or `None` when
+    /// it has handed out none, or when a concurrent INSERT holds the
+    /// allocator: a catalog read MySQL always answers answers no number
+    /// rather than failing, the number being a snapshot either way.
+    fn peek_next_auto_increment(&self, key: AutoIncrementKey) -> Result<Option<u64>> {
         let capability = self.auto_increment.as_ref().ok_or_else(|| {
-            MySqlShowCreateTableError::Engine(LimboError::Corrupt(
+            LimboError::Corrupt(
                 "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
-            ))
+            )
         })?;
         for _ in 0..ALLOCATOR_PEEK_ATTEMPTS {
-            let mut query = capability
-                .allocator
-                .peek_high_water(auto_increment.key)
-                .map_err(MySqlShowCreateTableError::Engine)?;
+            let mut query = capability.allocator.peek_high_water(key)?;
             match capability.io.block(|| query.step()) {
                 Ok(high_water) => return Ok((high_water > 0).then_some(high_water + 1)),
                 Err(LimboError::Busy) => std::thread::yield_now(),
-                Err(error) => return Err(MySqlShowCreateTableError::Engine(error)),
+                Err(error) => return Err(error),
             }
         }
         Ok(None)

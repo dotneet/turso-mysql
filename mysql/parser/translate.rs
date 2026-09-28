@@ -104,8 +104,11 @@ impl MySqlCatalogTable {
     /// Answers whether the session works out this table's rows before a
     /// statement that scans it runs, rather than the table reading them out
     /// of the schema itself.
+    ///
+    /// `TABLES` reads its rows out of the schema, but its `AUTO_INCREMENT`
+    /// comes off the counters' allocator, which only the session holds.
     pub const fn rows_come_from_the_session(self) -> bool {
-        matches!(self, Self::Columns | Self::Schemata)
+        matches!(self, Self::Columns | Self::Schemata | Self::Tables)
     }
 
     /// Answers whether this table holds every column MySQL gives it, which is
@@ -129,6 +132,7 @@ impl MySqlCatalogTable {
                 ("ENGINE", "TEXT"),
                 ("DATA_LENGTH", "BIGINT UNSIGNED"),
                 ("INDEX_LENGTH", "BIGINT UNSIGNED"),
+                ("AUTO_INCREMENT", "BIGINT UNSIGNED"),
                 ("TABLE_COLLATION", "TEXT"),
                 ("TABLE_COMMENT", "TEXT"),
             ],

@@ -2462,6 +2462,9 @@ pub enum MySqlInformationSchemaTablesColumn {
     DataLength,
     /// How many bytes the indexes take, NULL for the same reason.
     IndexLength,
+    /// The next number a counted table hands out, NULL for a table that
+    /// counts nothing or has handed out nothing yet.
+    AutoIncrement,
     TableCollation,
     TableComment,
 }
@@ -2476,6 +2479,7 @@ impl MySqlInformationSchemaTablesColumn {
             () if name.eq_ignore_ascii_case("ENGINE") => Self::Engine,
             () if name.eq_ignore_ascii_case("DATA_LENGTH") => Self::DataLength,
             () if name.eq_ignore_ascii_case("INDEX_LENGTH") => Self::IndexLength,
+            () if name.eq_ignore_ascii_case("AUTO_INCREMENT") => Self::AutoIncrement,
             () if name.eq_ignore_ascii_case("TABLE_COLLATION") => Self::TableCollation,
             () if name.eq_ignore_ascii_case("TABLE_COMMENT") => Self::TableComment,
             () => return None,

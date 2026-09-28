@@ -241,6 +241,7 @@ impl InternalVirtualTable for InformationSchemaTables {
              ENGINE TEXT COLLATE MYSQL_UCA9_AI_CI, \
              DATA_LENGTH INTEGER, \
              INDEX_LENGTH INTEGER, \
+             AUTO_INCREMENT INTEGER, \
              TABLE_COLLATION TEXT COLLATE MYSQL_UCA9_AI_CI, \
              TABLE_COMMENT TEXT COLLATE MYSQL_UCA9_AI_CI)"
         )
@@ -295,6 +296,7 @@ impl InternalVirtualTable for InformationSchemaTables {
         Ok(Arc::new(RwLock::new(InformationSchemaTablesCursor {
             database: self.database.clone(),
             rows,
+            counters: connection.mysql_catalog_rows(INFORMATION_SCHEMA_TABLES),
             position: -1,
         })))
     }
@@ -320,6 +322,10 @@ struct InformationSchemaTablesCursor {
     database: String,
     /// Each table's name, kind, collation and comment.
     rows: Vec<(String, &'static str, Option<&'static str>, String)>,
+    /// Each counted table's name and next number, which only the session can
+    /// read off the allocator and leaves on the connection before a statement
+    /// scanning this table runs; a table missing from them answers NULL.
+    counters: Option<Arc<Vec<Vec<Value>>>>,
     position: i64,
 }
 
@@ -522,9 +528,24 @@ impl InternalVirtualTableCursor for InformationSchemaTablesCursor {
             1 => Value::build_text(name.clone()),
             2 => Value::build_text((*kind).to_owned()),
             3 if base_table => Value::build_text("InnoDB"),
-            6 => collation.map_or(Value::Null, Value::build_text),
-            3..=6 => Value::Null,
-            7 => Value::build_text(comment.clone()),
+            6 => {
+                let counters = self.counters.as_ref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "information_schema.TABLES was scanned without the session's counters"
+                            .to_owned(),
+                    )
+                })?;
+                counters
+                    .iter()
+                    .find(|counter| {
+                        matches!(counter.first(), Some(Value::Text(text)) if text.as_str().eq_ignore_ascii_case(name))
+                    })
+                    .and_then(|counter| counter.get(1).cloned())
+                    .unwrap_or(Value::Null)
+            }
+            7 => collation.map_or(Value::Null, Value::build_text),
+            3..=5 => Value::Null,
+            8 => Value::build_text(comment.clone()),
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "information_schema.TABLES has no column {column}"

@@ -1095,7 +1095,21 @@ where
             MySqlCatalogTable::Schemata => {
                 self.information_schema_schemata_rows(selected_database)?
             }
-            _ => unreachable!("only COLUMNS and SCHEMATA take their rows from the session"),
+            MySqlCatalogTable::Tables => self
+                .session
+                .connection_reading_no_table()
+                .map_err(database_error_kind)?
+                .next_auto_increment_values()
+                .map_err(frontend_error_kind)?
+                .into_iter()
+                // A counter past the largest signed number is refused rather
+                // than answered as some other number.
+                .map(|(table, next)| {
+                    let next = i64::try_from(next).map_err(|_| FrontendErrorKind::Unsupported)?;
+                    Ok(vec![Value::build_text(table), Value::from_i64(next)])
+                })
+                .collect::<Result<_, FrontendErrorKind>>()?,
+            _ => unreachable!("only COLUMNS, SCHEMATA and TABLES take rows from the session"),
         };
         self.session
             .connection_reading_no_table()
@@ -3763,9 +3777,22 @@ where
                 .list_tables()
                 .map_err(|_| FrontendErrorKind::Internal)?;
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
+            let counters = if query
+                .columns()
+                .contains(&MySqlInformationSchemaTablesColumn::AutoIncrement)
+            {
+                self.session
+                    .connection_reading_no_table()
+                    .map_err(database_error_kind)?
+                    .next_auto_increment_values()
+                    .map_err(frontend_error_kind)?
+            } else {
+                Vec::new()
+            };
             return information_schema_tables_result_to_execution_result(
                 &selected_database,
                 tables,
+                &counters,
                 query.columns(),
                 self.status_flags(),
             );
@@ -11854,6 +11881,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
             MySqlInformationSchemaTablesColumn::Engine,
             MySqlInformationSchemaTablesColumn::DataLength,
             MySqlInformationSchemaTablesColumn::IndexLength,
+            MySqlInformationSchemaTablesColumn::AutoIncrement,
             MySqlInformationSchemaTablesColumn::TableCollation,
             MySqlInformationSchemaTablesColumn::TableComment,
         ]),

@@ -305,6 +305,7 @@ pub(super) fn show_full_tables_result_to_execution_result(
         information_schema_tables_result_to_execution_result(
             database,
             tables,
+            &[],
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
                 MySqlInformationSchemaTablesColumn::TableName,
@@ -338,6 +339,7 @@ pub(super) fn show_full_tables_result_to_execution_result(
 pub(super) fn information_schema_tables_result_to_execution_result(
     database: &str,
     tables: impl IntoIterator<Item = turso_mysql::MySqlTable>,
+    counters: &[(String, u64)],
     projected: &[MySqlInformationSchemaTablesColumn],
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
@@ -363,6 +365,10 @@ pub(super) fn information_schema_tables_result_to_execution_result(
             base_table.then(|| b"InnoDB".to_vec()),
             None,
             None,
+            counters
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(table.name()))
+                .map(|(_, next)| next.to_string().into_bytes()),
             table
                 .collation()
                 .map(|collation| collation.name().as_bytes().to_vec()),
@@ -442,21 +448,30 @@ pub(super) fn information_schema_tables_columns(
             44,
             MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
         ),
-        // The rest were measured against the pinned MySQL 8.4.11 oracle.
+        // The rest were measured against the pinned MySQL 8.4.11 oracle; the
+        // numbers' flags through `mysql --column-type-info`, which prints each
+        // flag the server sent.
         ("ENGINE", "", MYSQL_TYPE_VAR_STRING, 256, 0),
         (
             "DATA_LENGTH",
             "",
             MYSQL_TYPE_LONGLONG,
             21,
-            MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+            MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
         ),
         (
             "INDEX_LENGTH",
             "",
             MYSQL_TYPE_LONGLONG,
             21,
-            MYSQL_UNSIGNED_FLAG | MYSQL_NUM_FLAG,
+            MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
+        ),
+        (
+            "AUTO_INCREMENT",
+            "",
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG,
         ),
         (
             "TABLE_COLLATION",
@@ -505,8 +520,9 @@ fn information_schema_tables_ordinal(column: MySqlInformationSchemaTablesColumn)
         MySqlInformationSchemaTablesColumn::Engine => 3,
         MySqlInformationSchemaTablesColumn::DataLength => 4,
         MySqlInformationSchemaTablesColumn::IndexLength => 5,
-        MySqlInformationSchemaTablesColumn::TableCollation => 6,
-        MySqlInformationSchemaTablesColumn::TableComment => 7,
+        MySqlInformationSchemaTablesColumn::AutoIncrement => 6,
+        MySqlInformationSchemaTablesColumn::TableCollation => 7,
+        MySqlInformationSchemaTablesColumn::TableComment => 8,
     }
 }
 

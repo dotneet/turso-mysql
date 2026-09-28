@@ -21599,6 +21599,7 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
         information_schema_tables_result_to_execution_result(
             &"x".repeat(MAX_CATALOG_VALUE_LENGTH + 1),
             tables.clone(),
+            &[],
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
                 MySqlInformationSchemaTablesColumn::TableName,
@@ -21612,6 +21613,7 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
         information_schema_tables_result_to_execution_result(
             &"x".repeat(MAX_CATALOG_VALUE_LENGTH - 19),
             tables.clone(),
+            &[],
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
                 MySqlInformationSchemaTablesColumn::TableName,
@@ -21630,6 +21632,7 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
                 .cloned()
                 .cycle()
                 .take(MAX_DISPATCH_RESULT_ROWS + 1),
+            &[],
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
                 MySqlInformationSchemaTablesColumn::TableName,
@@ -30936,3 +30939,6 @@ mod sqlx_statements;
 
 #[cfg(unix)]
 mod efcore_statements;
+
+#[cfg(unix)]
+mod gitea_statements;
