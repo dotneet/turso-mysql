@@ -3500,6 +3500,10 @@ pub(crate) fn translate_update(
             &assigned,
             render_context,
         )?;
+        // Most values are written without counting the `?`s in them, and the
+        // parameters after them — the `WHERE`'s, which a prepared statement
+        // holds to what they are compared with — are numbered past them.
+        render_context.parameter_count = first_parameter + placeholders_in(&rendered_value);
         written.push((
             rendered_name.clone(),
             rendered_value.clone(),
@@ -3556,6 +3560,22 @@ pub(crate) fn translate_update(
         let read = dml_subquery_tables(checked.table_name(), render_context)?;
         Ok((normalized, read, checked))
     }
+}
+
+/// How many `?`s a rendered value holds outside its quoted words.
+fn placeholders_in(value: &str) -> usize {
+    let mut count = 0;
+    let mut quote = None;
+    for character in value.chars() {
+        match quote {
+            Some(delimiter) if character == delimiter => quote = None,
+            Some(_) => {}
+            None if character == '\'' || character == '"' => quote = Some(character),
+            None if character == '?' => count += 1,
+            None => {}
+        }
+    }
+    count
 }
 
 /// Hands back the tables a `UPDATE` or `DELETE` reads through a subquery,

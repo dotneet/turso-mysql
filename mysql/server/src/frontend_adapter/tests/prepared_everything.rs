@@ -289,3 +289,262 @@ fn a_variable_beside_a_column_is_no_unknown_column() {
         Err(FrontendErrorKind::UnknownColumn)
     );
 }
+
+/// One value a statement is executed with, bound the way PDO binds it: a PHP
+/// integer as a `LONGLONG`, everything else as a `VAR_STRING`.
+enum Bound<'a> {
+    Word(&'a str),
+    Number(i64),
+}
+
+fn bound(values: &[Bound<'_>]) -> Vec<u8> {
+    let mut payload = vec![0; values.len().div_ceil(8)];
+    payload.push(1);
+    for value in values {
+        let kind = match value {
+            Bound::Word(_) => MYSQL_TYPE_VAR_STRING,
+            Bound::Number(_) => MYSQL_TYPE_LONGLONG,
+        };
+        payload.extend_from_slice(&[kind, 0]);
+    }
+    for value in values {
+        match value {
+            Bound::Word(word) => {
+                payload.push(u8::try_from(word.len()).unwrap());
+                payload.extend_from_slice(word.as_bytes());
+            }
+            Bound::Number(number) => payload.extend_from_slice(&number.to_le_bytes()),
+        }
+    }
+    payload
+}
+
+fn affected(
+    adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+    sql: &str,
+    values: &[Bound<'_>],
+) -> u64 {
+    match prepared(adapter, sql, &bound(values)) {
+        PreparedStatementExecutionResult::Ok(result) => result.affected_rows,
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+fn words_of(
+    adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+    sql: &str,
+) -> Vec<Vec<Option<String>>> {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must answer rows");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
+fn word(value: &str) -> Option<String> {
+    Some(value.to_owned())
+}
+
+/// Laravel's cache, locks, migrations and Eloquent updates find their row by a
+/// column of words compared with a bound word. Measured on MySQL 8.4.11 over
+/// `utf8mb4_unicode_ci` columns: the word matches without regard to case or
+/// trailing spaces; an `IN` list of bound words does the same; and a `?` in a
+/// `SET` is counted before the ones in the `WHERE`.
+#[test]
+fn laravel_writes_where_a_column_of_words_matches_a_bound_word() {
+    let (_directory, mut adapter) = adapter();
+    adapter.execute_query(LARAVEL_OPENS_WITH).unwrap();
+    for sql in [
+        "create table `cache` (`key` varchar(255) not null, `value` mediumtext not null, `expiration` int not null, primary key (`key`)) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "create table `cache_locks` (`key` varchar(255) not null, `owner` varchar(255) not null, `expiration` int not null, primary key (`key`)) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "create table `migrations` (`id` int unsigned not null auto_increment primary key, `migration` varchar(255) not null, `batch` int not null) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "create table `users` (`id` bigint unsigned not null auto_increment primary key, `email` varchar(255) not null, `balance` decimal(10, 2) not null default '0', `updated_at` timestamp null) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "insert into `cache` values ('laravel-cache-counter', 'i:1;', 100), ('laravel-cache-a', 'x', 1), ('laravel-cache-b', 'y', 1), ('Laravel-Cache-C', 'z', 1)",
+        "insert into `cache_locks` values ('laravel-cache-report', 'first', 5)",
+        "insert into `migrations` (`migration`, `batch`) values ('0001_01_01_000000_create_users_table', 1), ('2026_02_01_000000_add_slug', 2)",
+        "insert into `users` (`email`) values ('alice@example.com'), ('bob@example.com')",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "update `cache` set `value` = ? where `key` = ?",
+            &[Bound::Word("i:3;"), Bound::Word("LARAVEL-CACHE-COUNTER  ")],
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "delete from `cache` where `key` in (?, ?)",
+            &[
+                Bound::Word("laravel-cache-a"),
+                Bound::Word("laravel-cache-c")
+            ],
+        ),
+        2
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `key`, `value` from `cache` order by `key`"
+        ),
+        [
+            [word("laravel-cache-b"), word("y")],
+            [word("laravel-cache-counter"), word("i:3;")],
+        ]
+    );
+
+    // Laravel takes a lock another owner let lapse, or its own again.
+    let take_the_lock = "update `cache_locks` set `owner` = ?, `expiration` = ? where `key` = ? and (`owner` = ? or `expiration` <= ?)";
+    assert_eq!(
+        affected(
+            &mut adapter,
+            take_the_lock,
+            &[
+                Bound::Word("second"),
+                Bound::Number(20),
+                Bound::Word("laravel-cache-report"),
+                Bound::Word("second"),
+                Bound::Number(4),
+            ],
+        ),
+        0
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            take_the_lock,
+            &[
+                Bound::Word("second"),
+                Bound::Number(20),
+                Bound::Word("laravel-cache-report"),
+                Bound::Word("second"),
+                Bound::Number(5),
+            ],
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "delete from `cache_locks` where `key` = ? and `owner` = ?",
+            &[Bound::Word("laravel-cache-report"), Bound::Word("second")],
+        ),
+        1
+    );
+
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "delete from `migrations` where `migration` = ?",
+            &[Bound::Word("2026_02_01_000000_add_slug")],
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "update `users` set `balance` = ?, `users`.`updated_at` = ? where `email` = ?",
+            &[
+                Bound::Word("0"),
+                Bound::Word("2026-09-28 01:45:19"),
+                Bound::Word("Alice@Example.com"),
+            ],
+        ),
+        1
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `email`, `balance`, `updated_at` from `users` order by `id`"
+        ),
+        [
+            [
+                word("alice@example.com"),
+                word("0.00"),
+                word("2026-09-28 01:45:19")
+            ],
+            [word("bob@example.com"), word("0.00"), None],
+        ]
+    );
+}
+
+/// A number bound against a column of words is refused, prepared, in a
+/// `SELECT` as in a write. Measured on MySQL 8.4.11: MySQL compares it with the
+/// number each word begins with — `name = 0` finds `'abc'` and `name = 5`
+/// finds `'5x'` — where the engine would compare it as the word it spells and
+/// find neither.
+#[test]
+fn a_number_bound_against_a_column_of_words_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "create table `w` (`id` int primary key, `name` varchar(20))",
+        "insert into `w` values (1, 'abc'), (2, '5x')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    for sql in [
+        "select `id` from `w` where `name` = ?",
+        "update `w` set `id` = `id` where `name` = ?",
+        "delete from `w` where `name` = ?",
+    ] {
+        let statement = adapter.execute_stmt_prepare(sql).unwrap();
+        assert_eq!(
+            adapter.execute_stmt_execute(statement.statement_id, &bound(&[Bound::Number(0)])),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+        assert!(
+            adapter
+                .execute_stmt_execute(statement.statement_id, &bound(&[Bound::Word("abc")]))
+                .is_ok(),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        words_of(&mut adapter, "select `id` from `w` order by `id`"),
+        [[word("2")]]
+    );
+}
+
+/// An `UPDATE` of a table with an `ON UPDATE CURRENT_TIMESTAMP` column
+/// rewrites it when any assigned column changes. Each `?` of the `SET` is the
+/// one compared with its own column's value: measured on MySQL 8.4.11, `SET a
+/// = ?, b = ?` bound 1 and 5 over a row holding 1 and 1 moves the moment.
+#[test]
+fn every_bound_value_of_a_set_is_compared_with_its_own_column() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "create table `t` (`id` int primary key, `a` int, `b` int, `updated_at` timestamp not null default current_timestamp on update current_timestamp)",
+        "insert into `t` values (1, 1, 1, '2000-01-01 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "update `t` set `a` = ?, `b` = ? where `id` = ?",
+            &[Bound::Number(1), Bound::Number(5), Bound::Number(1)],
+        ),
+        1
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `a`, `b`, `updated_at` > '2000-01-01 00:00:00' from `t`"
+        ),
+        [[word("1"), word("5"), word("1")]]
+    );
+}

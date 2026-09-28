@@ -2212,6 +2212,19 @@ not spelled out here, and `'30abc'`, `'abc'` and `'0x1E'` with warning 1292. A
 word against a `DOUBLE`, a word past what an `i64` holds, and a word under an
 explicit `COLLATE` are refused too.
 
+A `?` compared with a column of words in a prepared `UPDATE` or `DELETE` —
+Laravel's `update cache set value = ? where key = ?` and `delete from
+migrations where migration = ?`, and Eloquent's `update users set ...,
+users.updated_at = ? where email = ?` — binds a word compared under the
+column's collation, as a prepared `SELECT`'s does: the statement is read a
+second time knowing which of its table's columns hold words. Measured on 8.4.11
+over `utf8mb4_unicode_ci`: `key = ?` bound `'LARAVEL-CACHE-COUNTER  '` finds
+`laravel-cache-counter`, `key IN (?, ?)` matches the same way, and a `?` in the
+`SET` is counted before those of the `WHERE`. A number bound there is refused,
+in a prepared `SELECT` too, where it used to be compared as the word it spells:
+MySQL compares a column of words with a number as the number each word begins
+with — `name = 0` finds `'abc'` and `name = 5` finds `'5x'`.
+
 `IFNULL` and `COALESCE` take an aggregate as the thing they default, which is
 how a report asks for a total over rows that may not be there —
 `IFNULL(SUM(n), 0)` — or for the highest of nothing —
@@ -4819,7 +4832,9 @@ column takes the moment as its default too.
 
 A value the statement writes is written twice — once as the assignment and once
 in the condition — so a bound `?` in one is named by its ordinal in the other; a
-prepared `UPDATE` asks for the parameters the statement wrote and no more. A
+prepared `UPDATE` asks for the parameters the statement wrote and no more. Each
+`?` of the `SET` is counted, so `SET a = ?, b = ?` compares the second with `b`
+— it used to compare every one with the first. A
 joined `UPDATE` on such a table is refused: it names the table it changes through
 the columns its `SET` names, so which table's columns are its own is a question
 this has not answered.

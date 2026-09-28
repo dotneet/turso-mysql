@@ -1026,6 +1026,8 @@ enum PreparedExecutionPlan {
         read_tables: Vec<String>,
         /// What an `INSERT`'s `SELECT` compares its bound values with.
         copied_select: Option<CopiedSelect>,
+        /// The parameters compared with a column of words, which bind a word.
+        word_parameters: Vec<usize>,
     },
     AutoIncrementInsert(Box<PreparedAutoIncrementInsert>),
     CountedInsertSelect(Box<PreparedCountedInsertSelect>),
@@ -1386,13 +1388,21 @@ impl From<MySqlQueryError> for LimboError {
     }
 }
 
-type CheckedDmlTranslation = (
-    TranslatedDml,
-    Vec<(String, u8)>,
-    Vec<(String, u32)>,
-    Vec<String>,
-    Option<(String, String)>,
-);
+type CheckedDmlTranslation = (TranslatedDml, DmlColumnTypes, Option<(String, String)>);
+
+/// What the table a DML statement writes says about its columns, which the
+/// statement is read a second time knowing. A reprepare has no connection to
+/// read them again from, so they are kept with the statement.
+#[derive(Default)]
+struct DmlColumnTypes {
+    /// The columns an `UPDATE` rewrites to the moment it runs at.
+    rewritten_on_update: Vec<(String, u8)>,
+    decimal: Vec<(String, u32)>,
+    integer: Vec<String>,
+    /// The columns holding words, which a `?` compared with one is held to
+    /// binding a word against.
+    text: Vec<String>,
+}
 
 impl MySqlConnection {
     pub fn new(inner: Arc<Connection>, schema_context: SchemaSqlSessionContext) -> Result<Self> {
@@ -1848,6 +1858,7 @@ impl MySqlConnection {
                 }
             }
         }
+        let inserts = insert_target.is_some();
         let table = if let Some(update) = translated.checked_update() {
             MySqlTableName::parse(update.table_name()).ok()
         } else {
@@ -1860,7 +1871,7 @@ impl MySqlConnection {
                 })
         };
         let Some(table) = table else {
-            return Ok((translated, Vec::new(), Vec::new(), Vec::new(), None));
+            return Ok((translated, DmlColumnTypes::default(), None));
         };
         let table_definition = self
             .inner
@@ -1868,13 +1879,7 @@ impl MySqlConnection {
             .get_btree_table(table.as_str())
             .map(|stored| (table.as_str().to_owned(), stored.to_sql()));
         let Ok(columns) = self.list_columns(&table) else {
-            return Ok((
-                translated,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                table_definition,
-            ));
+            return Ok((translated, DmlColumnTypes::default(), table_definition));
         };
         let rewritten = if translated.checked_update().is_some() {
             columns
@@ -1903,35 +1908,47 @@ impl MySqlConnection {
             .filter(|column| is_integer_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
+        // An `INSERT` compares nothing of the table it writes.
+        let text_columns = if inserts {
+            Vec::new()
+        } else {
+            columns
+                .iter()
+                .filter(|column| is_text_type(column.type_name()))
+                .map(|column| column.name().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let compares_a_placeholder = translated.checked_comparisons().iter().any(|comparison| {
+            matches!(
+                comparison.rhs(),
+                CheckedSelectComparisonRhs::Placeholder { .. }
+            )
+        });
+        let column_types = DmlColumnTypes {
+            rewritten_on_update: rewritten,
+            decimal: decimal_columns,
+            integer: integer_columns,
+            text: text_columns,
+        };
         // The `SELECT` a copy reads was rendered knowing its own columns'
         // types; the table it writes changes nothing in how it renders.
         if translated.copies_a_select_rendered_knowing_its_types()
-            || (rewritten.is_empty()
-                && decimal_columns.is_empty()
-                && !translated.compares_a_written_number())
+            || (column_types.rewritten_on_update.is_empty()
+                && column_types.decimal.is_empty()
+                && !translated.compares_a_written_number()
+                && (column_types.text.is_empty() || !compares_a_placeholder))
         {
-            return Ok((
-                translated,
-                rewritten,
-                decimal_columns,
-                integer_columns,
-                table_definition,
-            ));
+            return Ok((translated, column_types, table_definition));
         }
-        let translated = turso_mysql_parser::parse_dml_knowing_numeric_columns(
+        let translated = turso_mysql_parser::parse_dml_knowing_column_types(
             sql,
             mode,
-            &rewritten,
-            &decimal_columns,
-            &integer_columns,
+            &column_types.rewritten_on_update,
+            &column_types.decimal,
+            &column_types.integer,
+            &column_types.text,
         )?;
-        Ok((
-            translated,
-            rewritten,
-            decimal_columns,
-            integer_columns,
-            table_definition,
-        ))
+        Ok((translated, column_types, table_definition))
     }
 
     /// Renders an `INSERT ... SELECT` whose `SELECT` has to know its columns'
@@ -2121,9 +2138,7 @@ impl MySqlConnection {
     fn frozen_dml_parser(
         &self,
         mode: SessionSqlMode,
-        rewritten_on_update: Vec<(String, u8)>,
-        decimal_columns: Vec<(String, u32)>,
-        integer_columns: Vec<String>,
+        column_types: DmlColumnTypes,
         table_definition: Option<(String, String)>,
         translated: &TranslatedDml,
     ) -> FrozenDmlParser {
@@ -2142,9 +2157,7 @@ impl MySqlConnection {
         }
         FrozenDmlParser {
             mode,
-            rewritten_on_update,
-            decimal_columns,
-            integer_columns,
+            column_types,
             table_definition,
             read_table_definitions,
             untracked_read_source,
@@ -2159,7 +2172,7 @@ impl MySqlConnection {
     ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
     {
         let mode = self.parser_mode();
-        let (translated, rewritten_on_update, decimal_columns, integer_columns, table_definition) =
+        let (translated, column_types, table_definition) =
             match self.parse_checked_dml_translation(sql, mode) {
                 Ok(read) => read,
                 Err(MySqlParseError::ExpectedDml) => {
@@ -2238,14 +2251,7 @@ impl MySqlConnection {
         if is_update {
             self.reject_prepared_auto_increment_update(translated.checked_update())?;
         }
-        let mut frozen = self.frozen_dml_parser(
-            mode,
-            rewritten_on_update,
-            decimal_columns,
-            integer_columns,
-            table_definition,
-            &translated,
-        );
+        let mut frozen = self.frozen_dml_parser(mode, column_types, table_definition, &translated);
         if shifted_timestamp_insert {
             frozen.shifted_timestamp_insert = Some(statement.clone());
         }
@@ -2272,6 +2278,7 @@ impl MySqlConnection {
                 insert_target,
                 written_table,
                 read_tables: read_table_names(&translated),
+                word_parameters: word_parameters(translated.checked_comparisons()),
             },
         ))
     }
@@ -2968,8 +2975,14 @@ impl MySqlConnection {
             Self::validate_row_count_values(row_count_parameters, values)?;
             Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
         }
-        if let PreparedExecutionPlan::OrdinaryWrite { insert_target, .. } = plan {
+        if let PreparedExecutionPlan::OrdinaryWrite {
+            insert_target,
+            word_parameters,
+            ..
+        } = plan
+        {
             self.refuse_untyped_wide_integer_write_parameters(insert_target.as_ref(), values)?;
+            refuse_a_word_parameter_bound_otherwise(word_parameters, values)?;
         }
         let timestamp_parameters = match plan {
             PreparedExecutionPlan::OrdinaryWrite {
@@ -6381,13 +6394,7 @@ impl MySqlConnection {
     fn prepare_non_schema(&self, sql: &str) -> Result<Statement> {
         let mode = self.parser_mode();
         match self.parse_checked_dml_translation(sql, mode) {
-            Ok((
-                translated,
-                rewritten_on_update,
-                decimal_columns,
-                integer_columns,
-                table_definition,
-            )) => {
+            Ok((translated, column_types, table_definition)) => {
                 self.validate_dml_comparison_columns(&translated)?;
                 self.reject_non_utc_timestamp_dml_source(&translated)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -6397,14 +6404,8 @@ impl MySqlConnection {
                 let shifted = self
                     .shift_timestamp_insert_literals(&mut stmt)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
-                let mut frozen = self.frozen_dml_parser(
-                    mode,
-                    rewritten_on_update,
-                    decimal_columns,
-                    integer_columns,
-                    table_definition,
-                    &translated,
-                );
+                let mut frozen =
+                    self.frozen_dml_parser(mode, column_types, table_definition, &translated);
                 if shifted {
                     frozen.shifted_timestamp_insert = Some(stmt.clone());
                 }
@@ -7516,9 +7517,14 @@ impl MySqlConnection {
             let stored_as_a_moment = bound_temporal
                 .iter()
                 .any(|parameter| parameter.ordinal == *ordinal);
+            // A number meeting a column of words is refused for the reason a
+            // DML statement refuses one; see
+            // `refuse_a_word_parameter_bound_otherwise`.
             let fits = match value {
                 MySqlPreparedValue::Null => true,
-                MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment,
+                MySqlPreparedValue::Integer(_) => {
+                    !patterns && !stored_as_a_moment && !comparison.collated()
+                }
                 MySqlPreparedValue::UnsignedInteger(_) => {
                     !patterns && !stored_as_a_moment && bound_decimal.contains(ordinal)
                 }
@@ -7808,9 +7814,9 @@ impl MySqlConnection {
         counted: Option<&AutoIncrementTable>,
     ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
         let mode = self.parser_mode();
-        let (translated, rewritten_on_update, decimal_columns, integer_columns, table_definition) =
-            self.parse_checked_dml_translation(sql, mode)
-                .map_err(mysql_query_parse_error)?;
+        let (translated, column_types, table_definition) = self
+            .parse_checked_dml_translation(sql, mode)
+            .map_err(mysql_query_parse_error)?;
         // A DML `WHERE` is held to the rule a `SELECT` `WHERE` obeys, so the
         // rows a comparison names cannot depend on the statement asking.
         self.validate_dml_comparison_columns(&translated)
@@ -7858,14 +7864,7 @@ impl MySqlConnection {
             )
             .map_err(MySqlQueryError::Engine)?;
         }
-        let mut frozen = self.frozen_dml_parser(
-            mode,
-            rewritten_on_update,
-            decimal_columns,
-            integer_columns,
-            table_definition,
-            &translated,
-        );
+        let mut frozen = self.frozen_dml_parser(mode, column_types, table_definition, &translated);
         if shifted_timestamp_insert {
             frozen.shifted_timestamp_insert = Some(statement.clone());
         }
@@ -11430,11 +11429,7 @@ struct FrozenAutoIncrementDdlParser {
 
 struct FrozenDmlParser {
     mode: SessionSqlMode,
-    /// The columns an `UPDATE` rewrites, read when the statement was prepared.
-    /// A reprepare has no connection to read them again from.
-    rewritten_on_update: Vec<(String, u8)>,
-    decimal_columns: Vec<(String, u32)>,
-    integer_columns: Vec<String>,
+    column_types: DmlColumnTypes,
     table_definition: Option<(String, String)>,
     read_table_definitions: Vec<(String, String)>,
     untracked_read_source: bool,
@@ -11621,6 +11616,45 @@ fn read_table_names(translated: &TranslatedDml) -> Vec<String> {
         .iter()
         .map(|source| source.table().as_str().to_owned())
         .collect()
+}
+
+/// The parameters a DML statement compares with a column of words — a
+/// comparison the parser collated because it was told the column holds them.
+fn word_parameters(comparisons: &[CheckedSelectComparison]) -> Vec<usize> {
+    comparisons
+        .iter()
+        .filter(|comparison| comparison.collated())
+        .filter_map(|comparison| match comparison.rhs() {
+            CheckedSelectComparisonRhs::Placeholder { ordinal } => Some(*ordinal),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Holds what binds against a column of words to a word or NULL.
+///
+/// Measured on MySQL 8.4.11: a number compared with a column of words is
+/// compared with the number each word begins with — `name = 0` finds `'abc'`
+/// and `name = 5` finds `'5x'` — where the engine compares the number as the
+/// word it spells, finding neither.
+fn refuse_a_word_parameter_bound_otherwise(
+    word_parameters: &[usize],
+    values: &[MySqlPreparedValue],
+) -> Result<()> {
+    for ordinal in word_parameters {
+        let value = values.get(*ordinal).ok_or_else(|| {
+            LimboError::InternalError("a compared parameter is outside the bound values".into())
+        })?;
+        if !matches!(
+            value,
+            MySqlPreparedValue::Text(_) | MySqlPreparedValue::Null
+        ) {
+            return Err(LimboError::InvalidArgument(
+                "a value compared with a column of words has to be bound as a word".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The counted table a stored `CREATE TABLE` describes, or `None` for a table
@@ -12209,12 +12243,13 @@ impl ReprepareParser for FrozenDmlParser {
         if let Some(statement) = &self.typed_copy {
             return Ok((Some(Cmd::Stmt(statement.clone())), sql.len()));
         }
-        let translated = turso_mysql_parser::parse_dml_knowing_numeric_columns(
+        let translated = turso_mysql_parser::parse_dml_knowing_column_types(
             sql,
             self.mode,
-            &self.rewritten_on_update,
-            &self.decimal_columns,
-            &self.integer_columns,
+            &self.column_types.rewritten_on_update,
+            &self.column_types.decimal,
+            &self.column_types.integer,
+            &self.column_types.text,
         )
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
         validate_dml_comparison_columns(context.schema, &translated)?;

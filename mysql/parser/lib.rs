@@ -4471,21 +4471,34 @@ pub fn parse_dml_knowing_decimal_columns(
     rewritten_on_update: &[(String, u8)],
     decimal_columns: &[(String, u32)],
 ) -> Result<TranslatedDml, ParseError> {
-    parse_dml_knowing_numeric_columns(sql, mode, rewritten_on_update, decimal_columns, &[])
+    parse_dml_knowing_column_types(sql, mode, rewritten_on_update, decimal_columns, &[], &[])
 }
 
-pub fn parse_dml_knowing_numeric_columns(
+/// Parses one checked DML statement knowing its table's columns: which an
+/// `UPDATE` rewrites to the moment it runs at, which hold a `DECIMAL` or a
+/// whole number, and which hold words — a `?` compared with one of those is
+/// compared under the column's collation, and binds a word.
+pub fn parse_dml_knowing_column_types(
     sql: &str,
     mode: SessionSqlMode,
     rewritten_on_update: &[(String, u8)],
     decimal_columns: &[(String, u32)],
     integer_columns: &[String],
+    text_columns: &[String],
 ) -> Result<TranslatedDml, ParseError> {
     let statement = parse_one_statement(sql, mode)?;
-    let mut render_context =
-        SelectRenderContext::new(sql, mode, &[], &[], &[], &[], &[], rewritten_on_update)
-            .knowing_decimal_columns(decimal_columns)
-            .knowing_integer_columns(integer_columns);
+    let mut render_context = SelectRenderContext::new(
+        sql,
+        mode,
+        text_columns,
+        &[],
+        &[],
+        &[],
+        &[],
+        rewritten_on_update,
+    )
+    .knowing_decimal_columns(decimal_columns)
+    .knowing_integer_columns(integer_columns);
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let mut row_count_parameters = Vec::new();
