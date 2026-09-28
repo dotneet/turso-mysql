@@ -9,6 +9,7 @@ use super::{
 pub struct MySqlShowTableStatusCommand {
     database: Option<MySqlDatabaseName>,
     pattern: Option<MySqlLikePattern>,
+    name: Option<String>,
 }
 
 impl MySqlShowTableStatusCommand {
@@ -24,6 +25,18 @@ impl MySqlShowTableStatusCommand {
     pub fn pattern(&self) -> Option<&MySqlLikePattern> {
         self.pattern.as_ref()
     }
+
+    /// Reports whether the command asks for the table called `table`.
+    ///
+    /// Measured on MySQL 8.4.11: `WHERE Name = 'users'`, which TablePlus
+    /// sends, compares the name by its bytes — `'USERS'` finds nothing — where
+    /// `LIKE` matches without regard to case.
+    pub fn covers(&self, table: &str) -> bool {
+        self.pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.matches(table))
+            && self.name.as_deref().is_none_or(|name| name == table)
+    }
 }
 
 /// Parses the strict `SHOW TABLE STATUS` command.
@@ -36,8 +49,9 @@ pub fn parse_show_table_status(
     })
 }
 
-/// Accepts a `FROM` or `IN` database, a `LIKE` pattern, and an optional single
-/// semicolon; `WHERE` and comments are unsupported.
+/// Accepts a `FROM` or `IN` database, a `LIKE` pattern or `WHERE Name =
+/// 'table'`, and an optional single semicolon; any other `WHERE` and comments
+/// are unsupported.
 pub fn parse_optional_show_table_status(
     sql: &str,
     mode: SessionSqlMode,
@@ -73,13 +87,41 @@ pub fn parse_optional_show_table_status(
     } else {
         None
     };
+    let name = if pattern.is_none() && consume_admin_word(&tokens, &mut cursor, "WHERE") {
+        let names_the_name = matches!(
+            tokens.get(cursor),
+            Some(AdminToken::Word(column) | AdminToken::QuotedIdentifier(column))
+                if column.eq_ignore_ascii_case("Name")
+        );
+        match (
+            names_the_name,
+            tokens.get(cursor + 1),
+            tokens.get(cursor + 2),
+        ) {
+            (true, Some(AdminToken::Equals), Some(AdminToken::StringLiteral(name))) => {
+                cursor += 3;
+                Some(name.clone())
+            }
+            _ => {
+                return Err(ParseError::Unsupported {
+                    feature: "SHOW TABLE STATUS with a WHERE other than Name = 'table'",
+                })
+            }
+        }
+    } else {
+        None
+    };
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
     }
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlShowTableStatusCommand { database, pattern }))
+    Ok(Some(MySqlShowTableStatusCommand {
+        database,
+        pattern,
+        name,
+    }))
 }
 
 #[cfg(test)]
@@ -125,8 +167,15 @@ mod tests {
         assert!(pattern.matches("beta"));
         assert!(!pattern.matches("alpha"));
 
+        let named = parse("SHOW TABLE STATUS FROM `dbtools` WHERE Name = 'users'").unwrap();
+        assert!(named.covers("users"));
+        assert!(!named.covers("USERS"));
+        assert!(!named.covers("posts"));
+
         for sql in [
-            "SHOW TABLE STATUS WHERE Name = 't'",
+            "SHOW TABLE STATUS WHERE Engine = 'InnoDB'",
+            "SHOW TABLE STATUS WHERE Name LIKE 't'",
+            "SHOW TABLE STATUS LIKE 't' WHERE Name = 't'",
             "SHOW TABLE STATUS LIKE t",
             "SHOW TABLE STATUS LIKE",
             "SHOW TABLE STATUS FROM",

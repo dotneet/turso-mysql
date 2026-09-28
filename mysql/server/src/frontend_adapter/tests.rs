@@ -8551,13 +8551,13 @@ fn show_table_status_answers_what_it_knows_and_nulls_the_rest() {
     assert!(unmatched.rows.is_empty());
     assert_eq!(unmatched.columns.len(), 18);
 
-    // Another database's tables are not this session's to describe, and the
-    // `WHERE` filter is not read.
+    // Another database's tables are not this session's to describe, and a
+    // `WHERE` filter other than `Name = 'table'` is not read.
     assert!(adapter
         .execute_query("SHOW TABLE STATUS FROM archive")
         .is_err());
     assert!(adapter
-        .execute_query("SHOW TABLE STATUS WHERE Name = 't'")
+        .execute_query("SHOW TABLE STATUS WHERE Rows = 1")
         .is_err());
 }
 
@@ -30904,3 +30904,6 @@ mod flyway_startup;
 
 #[cfg(unix)]
 mod hibernate_statements;
+
+#[cfg(unix)]
+mod gui_browsing;

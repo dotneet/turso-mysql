@@ -412,7 +412,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `SET @x = @@group_concat_max_len` past the largest `BIGINT` | refused; a user variable here holds no unsigned number |
 | A `GROUP_CONCAT` column of a statement sorting its groups by anything but the grouped columns, or of `SELECT DISTINCT` over groups | reports the shape it has unsorted; measured, MySQL reads it out of a table it sorts through — a `VAR_STRING` with 0 decimals up to 512, past it a `BLOB` of 16 bytes to each (16384 at 1024) with the blob flag — and every other aggregate column of the statement loses its binary flag there too |
 | A `GROUP_CONCAT` in a `UNION`, `EXCEPT` or `INTERSECT` branch | refused; it used to be answered with a column of type NULL, and measured, MySQL reports a `VAR_STRING` with 0 decimals up to 512 and a `BLOB` of 65536 with the blob flag at 1024. Each branch counts its cuts for itself: `UNION ALL` of two cut calls warns `Row 3` twice |
-| `SHOW TABLE STATUS` with `WHERE` | refused; the `FROM`/`IN` and `LIKE` forms work, and a `WHERE` is a predicate over the eighteen columns rather than a pattern |
+| `SHOW TABLE STATUS` with a `WHERE` other than `Name = 'table'` | refused; the `FROM`/`IN`, `LIKE` and TablePlus's `WHERE Name = 'table'` forms work, and any other `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
 | `SHOW ENGINE INNODB STATUS`, `SHOW STORAGE ENGINES` | refused; the first reports InnoDB internals this server does not have |
 | `SHOW TABLES` with `WHERE` | refused; the `LIKE` form works, and a `WHERE` is a predicate over the one column rather than a pattern |

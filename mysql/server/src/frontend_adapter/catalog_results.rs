@@ -2190,6 +2190,15 @@ pub(super) fn show_table_status_result_to_execution_result(
     let rows = rows
         .into_iter()
         .map(|row| {
+            // Measured on MySQL 8.4.11: a view has a name, a creation time
+            // and the comment `VIEW`, and NULL for everything else. This
+            // server keeps no creation times, a table's included.
+            if row.view {
+                let mut described = vec![None; 18];
+                described[0] = Some(row.name.into_bytes());
+                described[17] = Some(b"VIEW".to_vec());
+                return described;
+            }
             vec![
                 Some(row.name.into_bytes()),
                 Some(b"InnoDB".to_vec()),
@@ -2227,6 +2236,8 @@ pub(super) fn show_table_status_result_to_execution_result(
 /// What one `SHOW TABLE STATUS` row can be answered from.
 pub(super) struct ShowTableStatusRow {
     pub name: String,
+    /// A view, which has none of a table's figures.
+    pub view: bool,
     pub rows: u64,
     pub auto_increment: Option<u64>,
     /// The collation the table was declared with.

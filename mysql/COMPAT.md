@@ -4120,8 +4120,13 @@ answer and the only one this can give. A `LIKE` pattern names the tables to
 report and a `FROM` or `IN` qualifier names the database, which has to be the
 selected one — measured on 8.4.11, the qualifier is spelled either way round and
 means the same thing, and a pattern nothing matches answers no rows rather than
-an error. The `WHERE` filter is a predicate over the eighteen columns rather
-than a pattern, and it is not read.
+an error. `WHERE Name = 'table'`, which TablePlus sends, is read too: measured
+on 8.4.11, it compares the name by its bytes, so `'USERS'` finds no `users`,
+where `LIKE` matches without regard to case. Any other `WHERE` is a predicate
+over the eighteen columns rather than a pattern, and it is not read. A view is
+answered as MySQL answers it, its name and the comment `VIEW` with every other
+column NULL — it used to read as an InnoDB table of no rows; MySQL also gives
+it a creation time, which this server keeps for no table.
 
 `SHOW ENGINES` answers with one row. MySQL 8.4.11 lists eleven, most of them
 unavailable on the server that lists them; naming MyISAM or CSV here would claim

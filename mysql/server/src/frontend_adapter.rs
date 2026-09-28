@@ -3755,13 +3755,22 @@ where
             let tables = self.filter_catalog_tables(&selected_database, visibility, tables)?;
             // Measured on MySQL 8.4.11: the pattern names the tables to
             // report, and one nothing matches answers no rows.
-            let tables = tables.into_iter().filter(|table| {
-                command
-                    .pattern()
-                    .is_none_or(|pattern| pattern.matches(table.name()))
-            });
+            let tables = tables
+                .into_iter()
+                .filter(|table| command.covers(table.name()));
             let mut rows = Vec::new();
             for table in tables {
+                if table.kind() == MySqlTableKind::View {
+                    rows.push(ShowTableStatusRow {
+                        name: table.name().to_owned(),
+                        view: true,
+                        rows: 0,
+                        auto_increment: None,
+                        collation: "",
+                        comment: String::new(),
+                    });
+                    continue;
+                }
                 // The row count is counted rather than estimated. MySQL's is an
                 // InnoDB estimate; a real count is the more useful answer and
                 // the only one this can give.
@@ -3770,6 +3779,7 @@ where
                     .map_err(|_| FrontendErrorKind::Internal)?;
                 rows.push(ShowTableStatusRow {
                     name: table.name().to_owned(),
+                    view: false,
                     rows: counted,
                     auto_increment: None,
                     collation: table.collation().unwrap_or_default().name(),
