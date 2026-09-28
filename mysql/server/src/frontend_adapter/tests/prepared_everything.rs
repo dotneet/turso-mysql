@@ -605,3 +605,41 @@ fn laravel_asks_whether_a_row_exists_by_a_bound_word() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// Laravel's database queue takes its next job with `FOR UPDATE SKIP LOCKED`,
+/// prepared, inside a transaction. Measured on MySQL 8.4.11 with no other
+/// session holding a row, it answers the job as `FOR UPDATE` does.
+#[test]
+fn laravel_takes_its_next_job_skipping_locked_rows() {
+    let (_directory, mut adapter) = adapter();
+    adapter.execute_query(LARAVEL_OPENS_WITH).unwrap();
+    for sql in [
+        "create table `jobs` (`id` bigint unsigned not null auto_increment primary key, `queue` varchar(255) not null, `attempts` tinyint unsigned not null, `reserved_at` int unsigned null, `available_at` int unsigned not null) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "insert into `jobs` (`queue`, `attempts`, `available_at`) values ('default', 0, 1790561610)",
+        "START TRANSACTION",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let PreparedStatementExecutionResult::ResultSet(job) = prepared(
+        &mut adapter,
+        "select * from `jobs` where `queue` = ? and ((`reserved_at` is null and `available_at` <= ?) or (`reserved_at` <= ?)) order by `id` asc limit 1 FOR UPDATE SKIP LOCKED",
+        &bound(&[
+            Bound::Word("default"),
+            Bound::Number(1790561610),
+            Bound::Number(1790561520),
+        ]),
+    ) else {
+        panic!("the queue must answer rows");
+    };
+    assert_eq!(
+        job.rows,
+        [[
+            BinaryResultValue::UnsignedInteger(1),
+            BinaryResultValue::Text("default".to_owned()),
+            BinaryResultValue::Integer(0),
+            BinaryResultValue::Null,
+            BinaryResultValue::Integer(1790561610),
+        ]]
+    );
+    adapter.execute_query("COMMIT").unwrap();
+}

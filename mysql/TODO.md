@@ -364,7 +364,7 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `SET TRANSACTION ISOLATION LEVEL` naming `READ UNCOMMITTED` or `SERIALIZABLE`, or `GLOBAL` | refused; `READ COMMITTED` and `REPEATABLE READ` are kept, and saying yes to another would be a guarantee this does not keep |
 | `SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` | works, and the lock is held. A session kept out by it waits and answers 1205, the way MySQL's does. One lock over the whole database rather than one for each row, so it is stronger than MySQL's — see COMPAT.md |
 | `SET innodb_lock_wait_timeout` | works, one to 1073741824 seconds, and the session starts at MySQL's fifty |
-| `FOR UPDATE NOWAIT`, `SKIP LOCKED`, `OF <table>` | refused; each asks what to do about a lock on some rows, and there is one lock over the whole database |
+| `FOR UPDATE NOWAIT`, `OF <table>` | refused; each asks what to do about a lock on some rows, and there is one lock over the whole database. `SKIP LOCKED` is taken and waits for that lock where MySQL would skip the rows another session holds |
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
 | `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
 | `GET_LOCK`, `RELEASE_LOCK`, `IS_FREE_LOCK`, `RELEASE_ALL_LOCKS` | works, in a `SELECT` of those calls alone with a written name and a whole-number or `NULL` timeout |

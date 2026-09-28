@@ -23540,13 +23540,37 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
     );
     one.execute_query("ROLLBACK").unwrap();
 
-    // The options that say what to do when the lock is already held ask for
-    // something one lock cannot answer, and so does naming which tables to
-    // lock. The older spelling takes none of them at all: MySQL answers 1064.
+    // `SKIP LOCKED` asks for rows no other session holds, and once this one
+    // holds the lock no other session holds any: it takes the same lock, and
+    // waits for it rather than skipping the rows another session holds.
+    one.execute_query("START TRANSACTION").unwrap();
+    let CommandExecutionResult::ResultSet(skipping) = one
+        .execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE SKIP LOCKED")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(skipping.rows, vec![vec![Some(b"150".to_vec())]]);
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 996 WHERE id = 2"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    two.execute_query("START TRANSACTION").unwrap();
+    assert_eq!(
+        two.execute_query("SELECT balance FROM accounts WHERE id = 2 FOR UPDATE SKIP LOCKED"),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    two.execute_query("ROLLBACK").unwrap();
+    one.execute_query("ROLLBACK").unwrap();
+
+    // `NOWAIT` asks to be refused when a row it reads is held, which one lock
+    // over the database cannot say, and naming which tables to lock asks for
+    // something one lock cannot answer. The older spelling takes none of them
+    // at all: MySQL answers 1064.
     for sql in [
         "SELECT balance FROM accounts LOCK IN SHARE MODE NOWAIT",
+        "SELECT balance FROM accounts LOCK IN SHARE MODE SKIP LOCKED",
         "SELECT balance FROM accounts FOR UPDATE NOWAIT",
-        "SELECT balance FROM accounts FOR UPDATE SKIP LOCKED",
         "SELECT balance FROM accounts FOR UPDATE OF accounts",
     ] {
         assert!(one.execute_query(sql).is_err(), "{sql}");

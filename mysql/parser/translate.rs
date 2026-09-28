@@ -678,10 +678,15 @@ pub(crate) fn translate_select_query(
 /// MODE` reaches here spelled as `FOR SHARE` — and both are read the same way
 /// here: the engine holds one write lock over the
 /// whole database rather than a lock for each row, so there is no weaker lock
-/// to take for the sharing one. The options that change what happens when the
-/// lock is already held — `NOWAIT`, `SKIP LOCKED` — and the one that names
-/// which tables to lock are refused, because each asks for something a single
-/// lock cannot answer.
+/// to take for the sharing one.
+///
+/// `SKIP LOCKED` — Laravel's database queue takes its next job with it — asks
+/// for rows no other session holds. Once this session holds the one lock, no
+/// other session holds any row, so the rows it reads are those; it waits for
+/// the lock where MySQL would skip the rows another session holds. `NOWAIT`
+/// asks to be refused when a row read is held, and which rows another session
+/// holds is not known here, so it is refused, as is naming which tables to
+/// lock.
 fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseError> {
     let [lock] = locks else {
         if locks.is_empty() {
@@ -689,7 +694,7 @@ fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseErr
         }
         return unsupported("SELECT locking clause written more than once");
     };
-    if lock.of.is_some() || lock.nonblock.is_some() {
+    if lock.of.is_some() || matches!(lock.nonblock, Some(sqlparser::ast::NonBlock::Nowait)) {
         return unsupported("SELECT locking clause option");
     }
     Ok(matches!(
