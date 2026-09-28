@@ -992,8 +992,11 @@ impl ClassicConnection {
     }
 
     /// Rejects a verified full-authentication response before an executor is
-    /// installed. This keeps the pre-authentication path free of a database
-    /// selector while preserving the existing close-on-rejection transition.
+    /// installed, and closes.
+    ///
+    /// Measured on MySQL 8.4.11: a wrong password is answered 1045, numbered
+    /// after the password packet, rather than by closing without a word. The
+    /// message here stays the fixed one and names no account.
     pub(crate) fn reject_full_authentication(
         &mut self,
     ) -> Result<AuthenticationResponse, ConnectionStateError> {
@@ -1001,8 +1004,7 @@ impl ClassicConnection {
             ConnectionState::AuthenticateFullVerification,
             ConnectionEvent::FullAuthenticationResult,
         )?;
-        self.state = ConnectionState::Closing;
-        Err(ConnectionStateError::AuthenticationRejected)
+        self.authentication_error_response(FrontendErrorKind::Authentication)
     }
 
     fn apply_full_authentication_result_unchecked(

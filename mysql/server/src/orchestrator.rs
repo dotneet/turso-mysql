@@ -326,13 +326,17 @@ where
     /// Supplies one complete client frame and advances the protocol.
     ///
     /// Responses remain in wire order when the caller receives another frame
-    /// before earlier output has drained. A credential or provider failure
-    /// does not synthesize an error packet; already queued protocol output is
-    /// left for the transport to flush or discard with [`Self::transport_closed`].
+    /// before earlier output has drained. A sign-in packet that does not read
+    /// as the one the client owed queues the error MySQL answers with before
+    /// the error is returned, and the caller should flush it before closing.
+    /// A credential or provider failure does not synthesize an error packet;
+    /// already queued protocol output is left for the transport to flush or
+    /// discard with [`Self::transport_closed`].
     pub fn receive_frame(
         &mut self,
         frame: ClassicFrame,
     ) -> Result<OrchestratorEvent, OrchestratorError> {
+        let state = self.connection.state();
         let result = self.receive_frame_inner(&frame);
         match result {
             Ok(event) => {
@@ -344,7 +348,12 @@ where
                 }
                 Ok(event)
             }
-            Err(error) => self.fail(error),
+            Err(error) => {
+                if is_sign_in_state(state) && is_bad_handshake(&error) {
+                    self.queue_sign_in_refusal(frame.response_sequence_id());
+                }
+                self.fail(error)
+            }
         }
     }
 
@@ -563,6 +572,25 @@ where
             .map_err(|error| OrchestratorError::Dispatch(CommandDispatcherError::Response(error)))
     }
 
+    /// Measured on MySQL 8.4.11: a packet that does not read as the handshake
+    /// response or the answer the server asked for is answered 1043, `Bad
+    /// handshake`, numbered after it, and the connection closed. A refusal
+    /// that cannot be queued is dropped: the connection is closing anyway.
+    fn queue_sign_in_refusal(&mut self, sequence_id: u8) {
+        let capabilities = self
+            .connection
+            .negotiated_capabilities()
+            .unwrap_or(crate::CLIENT_PROTOCOL_41);
+        let Ok(frame) = crate::map_frontend_error(crate::FrontendErrorKind::BadHandshake).encode(
+            self.connection.response_packet_codec(),
+            sequence_id,
+            capabilities,
+        ) else {
+            return;
+        };
+        let _ = self.write_queue.enqueue_batch([frame]);
+    }
+
     fn authenticate_initial(&mut self) -> Result<(), OrchestratorError> {
         let verification = {
             let request = self.connection.authentication_verification_request()?;
@@ -727,6 +755,34 @@ where
         self.executor_factory = None;
         self.executor = None;
     }
+}
+
+fn is_sign_in_state(state: ConnectionState) -> bool {
+    matches!(
+        state,
+        ConnectionState::AwaitClientResponse
+            | ConnectionState::TlsNegotiated
+            | ConnectionState::AwaitAuthSwitchResponse
+            | ConnectionState::AuthenticateFull
+    )
+}
+
+/// The errors that mean the client's packet was malformed or out of turn,
+/// as opposed to a failure on this side, which closes without a word.
+fn is_bad_handshake(error: &OrchestratorError) -> bool {
+    matches!(
+        error,
+        OrchestratorError::Connection(
+            ConnectionStateError::ClientHandshakeResponse(_)
+                | ConnectionStateError::PacketCodec(_)
+                | ConnectionStateError::AuthPacket(_)
+                | ConnectionStateError::CapabilityNotAdvertised { .. }
+                | ConnectionStateError::CapabilitiesChangedAfterTls { .. }
+                | ConnectionStateError::UnexpectedSequenceId { .. }
+                | ConnectionStateError::TlsRequestRequired
+                | ConnectionStateError::AuthSwitchResponseTooLong { .. }
+        )
+    )
 }
 
 impl From<PacketCodecError> for OrchestratorError {
@@ -1554,15 +1610,43 @@ mod tests {
         );
         assert_eq!(builds.load(Ordering::SeqCst), 0);
 
-        assert!(matches!(
-            orchestrator.receive_frame(ClassicFrame::from_payload(CODEC, 3, b"wrong\0").unwrap()),
-            Err(OrchestratorError::Connection(
-                ConnectionStateError::AuthenticationRejected
-            ))
-        ));
+        drain(&mut orchestrator);
+        assert_eq!(
+            orchestrator
+                .receive_frame(ClassicFrame::from_payload(CODEC, 3, b"wrong\0").unwrap())
+                .unwrap(),
+            OrchestratorEvent::Closing
+        );
         assert_eq!(orchestrator.state(), ConnectionState::Closing);
         assert_eq!(builds.load(Ordering::SeqCst), 0);
         assert!(orchestrator.executor.is_none());
+        let refusal = drain(&mut orchestrator);
+        assert_eq!(refusal.len(), 1);
+        let refusal =
+            crate::ErrPacket::decode(CODEC, &refusal[0], crate::CLIENT_PROTOCOL_41).unwrap();
+        assert_eq!((refusal.sequence_id, refusal.error_code), (4, 1045));
+    }
+
+    /// Measured on MySQL 8.4.11: a response after TLS that does not read as
+    /// one is answered 1043 `Bad handshake`, numbered after it.
+    #[test]
+    fn a_malformed_response_after_tls_is_answered_bad_handshake() {
+        let mut orchestrator = orchestrator_after_tls(
+            StoredCredential::from_sha256_sha256(true, verifier_material(b"secret")),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
+        );
+        assert!(orchestrator
+            .receive_frame(ClassicFrame::from_payload(CODEC, 2, &[1, 2, 3]).unwrap())
+            .is_err());
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+        let refusal = drain(&mut orchestrator);
+        assert_eq!(refusal.len(), 1);
+        let refusal =
+            crate::ErrPacket::decode(CODEC, &refusal[0], crate::CLIENT_PROTOCOL_41).unwrap();
+        assert_eq!(
+            (refusal.sequence_id, refusal.error_code, refusal.sql_state),
+            (3, 1043, Some(*b"08S01"))
+        );
     }
 
     #[test]

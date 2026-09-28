@@ -323,9 +323,20 @@ fn run_inner(
                     packet.last_sequence_id,
                     packet.payload,
                 );
-                let event = orchestrator
-                    .receive_frame(frame)
-                    .map_err(RuntimeUnixConnectionError::Orchestrator)?;
+                let event = match orchestrator.receive_frame(frame) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        // The orchestrator may have queued the error MySQL
+                        // answers a malformed sign-in packet with; the
+                        // connection is closing whether or not it gets out.
+                        let _ = flush_writes(
+                            stream,
+                            orchestrator,
+                            bounded_write_deadline(authentication_deadline, write_timeout),
+                        );
+                        return Err(RuntimeUnixConnectionError::Orchestrator(error));
+                    }
+                };
                 let write_deadline = if admission_complete {
                     Instant::now()
                         + orchestrator

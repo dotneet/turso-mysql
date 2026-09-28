@@ -1607,12 +1607,56 @@ mod tests {
     /// Signs in naming `collation` in the SSLRequest and the handshake
     /// response, and returns the stream and the server's final answer.
     fn sign_in_over_tls(
-        mut client: TcpStream,
+        client: TcpStream,
         collation: u8,
     ) -> (
         rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
         Vec<u8>,
     ) {
+        sign_in_over_tls_with_password(client, collation, b"secret\0")
+    }
+
+    fn sign_in_over_tls_with_password(
+        client: TcpStream,
+        collation: u8,
+        password: &[u8],
+    ) -> (
+        rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+        Vec<u8>,
+    ) {
+        let codec = packet_codec();
+        let mut client = start_tls(client, collation);
+        let capabilities =
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL | CLIENT_DEPRECATE_EOF;
+        let response = ClientHandshakeResponseConfig::new(
+            capabilities,
+            0,
+            collation,
+            "alice",
+            vec![0; 32],
+            None::<String>,
+            Some(CACHING_SHA2_PASSWORD_PLUGIN.to_owned()),
+            None,
+        )
+        .encode(codec, 2)
+        .expect("client handshake response");
+        client.write_all(&response).expect("authentication start");
+        let auth_more = AuthMoreData::decode(codec, &read_frame(&mut client))
+            .expect("full authentication request");
+        assert_eq!(auth_more.kind, AuthMoreDataKind::FullAuthenticationRequired);
+        client
+            .write_all(&codec.encode(4, password).expect("password frame"))
+            .expect("password write");
+        let answer = read_frame(&mut client);
+        (client, answer)
+    }
+
+    /// Reads the greeting, sends an SSLRequest naming `collation` and
+    /// completes TLS.
+    fn start_tls(
+        mut client: TcpStream,
+        collation: u8,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
         let codec = packet_codec();
         let greeting =
             InitialHandshake::decode(codec, &read_frame(&mut client)).expect("initial handshake");
@@ -1631,28 +1675,75 @@ mod tests {
         while connection.is_handshaking() {
             connection.complete_io(&mut client).expect("TLS handshake");
         }
-        let mut client = rustls::StreamOwned::new(connection, client);
+        rustls::StreamOwned::new(connection, client)
+    }
+
+    /// Measured on MySQL 8.4.11: a wrong password is answered 1045, numbered
+    /// after the password, where this server used to close without a word.
+    #[test]
+    fn a_wrong_password_over_tls_is_answered_access_denied() {
+        let runtime = protocol_runtime(Duration::from_secs(1));
+        let (client, worker) = start_worker(&runtime.listener);
+        let (client, answer) =
+            sign_in_over_tls_with_password(client, DEFAULT_UTF8MB4_COLLATION, b"wrong\0");
+        let refusal = ErrPacket::decode(packet_codec(), &answer, crate::CLIENT_PROTOCOL_41)
+            .expect("access denied");
+        assert_eq!(
+            (refusal.sequence_id, refusal.error_code, refusal.sql_state),
+            (5, 1045, Some(*b"28000"))
+        );
+        assert!(worker.join().is_ok());
+        drop(client);
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// MySqlConnector's sign-in over real TLS: its response drops CLIENT_SSL
+    /// and answers for `mysql_native_password`, and is switched to
+    /// `caching_sha2_password` as MySQL 8.4.11 switches it.
+    #[test]
+    fn mysqlconnector_signs_in_over_tls_through_a_plugin_switch() {
+        let runtime = protocol_runtime(Duration::from_secs(1));
+        let (client, worker) = start_worker(&runtime.listener);
+        let codec = packet_codec();
+        let mut client = start_tls(client, DEFAULT_UTF8MB4_COLLATION);
         let response = ClientHandshakeResponseConfig::new(
-            capabilities,
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF,
             0,
-            collation,
+            DEFAULT_UTF8MB4_COLLATION,
             "alice",
-            vec![0; 32],
+            vec![0x33; 20],
             None::<String>,
-            Some(CACHING_SHA2_PASSWORD_PLUGIN.to_owned()),
+            Some("mysql_native_password".to_owned()),
             None,
         )
         .encode(codec, 2)
         .expect("client handshake response");
         client.write_all(&response).expect("authentication start");
+        let switch = read_frame(&mut client);
+        let switch = codec.decode(&switch).expect("switch request");
+        assert_eq!(switch.sequence_id, 3);
+        assert!(switch.payload.starts_with(b"\xfecaching_sha2_password\0"));
+        client
+            .write_all(&codec.encode(4, &[0; 32]).expect("switch answer"))
+            .expect("switch answer write");
         let auth_more = AuthMoreData::decode(codec, &read_frame(&mut client))
             .expect("full authentication request");
         assert_eq!(auth_more.kind, AuthMoreDataKind::FullAuthenticationRequired);
         client
-            .write_all(&codec.encode(4, b"secret\0").expect("password frame"))
+            .write_all(&codec.encode(6, b"secret\0").expect("password frame"))
             .expect("password write");
-        let answer = read_frame(&mut client);
-        (client, answer)
+        let ok = AuthOkPacket::decode(codec, &read_frame(&mut client)).expect("authentication OK");
+        assert_eq!(ok.sequence_id, 7);
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &[COM_QUIT])
+                    .expect("quit frame"),
+            )
+            .expect("quit write");
+        assert!(worker.join().is_ok());
+        drop(client);
+        assert!(runtime.listener.shutdown().drained());
     }
 
     #[test]
@@ -2059,6 +2150,39 @@ mod tests {
                 RuntimeTcpConnectionError::PlaintextRejected(_)
             ))
         ));
+        // Measured on MySQL 8.4.11 under require_secure_transport=ON: 3159,
+        // numbered after the response.
+        let refusal = ErrPacket::decode(codec, &read_frame(&mut client), crate::CLIENT_PROTOCOL_41)
+            .expect("insecure transport refusal");
+        assert_eq!((refusal.sequence_id, refusal.error_code), (2, 3159));
+        drop(client);
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// Measured on MySQL 8.4.11: a first packet too short to be an SSLRequest
+    /// is answered 1043 `Bad handshake`, numbered after it.
+    #[test]
+    fn a_first_packet_that_is_no_ssl_request_is_answered_bad_handshake() {
+        let runtime = protocol_runtime(Duration::from_secs(1));
+        let (mut client, worker) = start_worker(&runtime.listener);
+        let codec = packet_codec();
+        InitialHandshake::decode(codec, &read_frame(&mut client)).expect("initial handshake");
+        client
+            .write_all(&[3, 0, 0, 1, 1, 2, 3])
+            .expect("short packet write");
+
+        assert!(matches!(
+            worker.join(),
+            Err(RuntimeTcpConnectionWorkerError::Connection(
+                RuntimeTcpConnectionError::PlaintextRejected(_)
+            ))
+        ));
+        let refusal = ErrPacket::decode(codec, &read_frame(&mut client), crate::CLIENT_PROTOCOL_41)
+            .expect("bad handshake refusal");
+        assert_eq!(
+            (refusal.sequence_id, refusal.error_code, refusal.sql_state),
+            (2, 1043, Some(*b"08S01"))
+        );
         drop(client);
         assert!(runtime.listener.shutdown().drained());
     }

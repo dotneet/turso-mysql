@@ -6214,6 +6214,20 @@ response adding `CLIENT_MULTI_STATEMENTS` still gets 1064 for two statements —
 so a changed word is still refused here. An empty plugin name is still
 refused.
 
+A client refused while it signs in is told why, where it used to see the
+connection close. Measured on MySQL 8.4.11 with a raw client, and answered the
+same here, each numbered after the client's packet: a wrong password is 1045,
+SQLSTATE `28000` (MySQL's message names the account and the host, this one's
+is the fixed `access denied`); a first packet that is neither an SSLRequest nor
+a handshake response, a response after TLS that does not read as one, a word
+changed after TLS, or a packet out of turn is 1043, `08S01`, `Bad handshake`;
+and a handshake response sent without TLS is 3159, `HY000`, `Connections using
+insecure transport are prohibited while --require_secure_transport=ON.`, which
+MySQL answers only under that setting and only after checking the password —
+this server requires TLS over TCP and answers before any credential is read.
+A failure on this side, such as the account store being unreadable, still
+closes without an answer.
+
 `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA` is honored instead of refused. Real
 clients set it on every connection. The two length forms agree below 251
 bytes, which is why real responses parsed correctly even while the capability

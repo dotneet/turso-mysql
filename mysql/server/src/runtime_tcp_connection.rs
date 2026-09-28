@@ -521,14 +521,20 @@ impl RuntimeTcpConnection {
 
         let request = match self.transport.as_mut() {
             Some(TcpTransport::Plain(stream)) => {
-                read_ssl_request_packet(stream.as_mut(), self.codec, self.tls_deadline).map_err(
-                    |error| match error {
-                        PreTlsPacketError::DeadlineExceeded => {
-                            RuntimeTcpConnectionError::TlsDeadlineExceeded
-                        }
-                        error => RuntimeTcpConnectionError::PlaintextRejected(error),
-                    },
-                )?
+                match read_ssl_request_packet(stream.as_mut(), self.codec, self.tls_deadline) {
+                    Ok(request) => request,
+                    Err(PreTlsPacketError::DeadlineExceeded) => {
+                        return Err(RuntimeTcpConnectionError::TlsDeadlineExceeded)
+                    }
+                    Err(error) => {
+                        refuse_before_tls(
+                            stream.as_mut(),
+                            &error,
+                            bounded_write_deadline(self.tls_deadline, self.timeouts.write()),
+                        );
+                        return Err(RuntimeTcpConnectionError::PlaintextRejected(error));
+                    }
+                }
             }
             Some(TcpTransport::Tls(_)) | None => {
                 return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
@@ -594,10 +600,19 @@ impl RuntimeTcpConnection {
                 Err(error) => return Err(error),
             };
             self.begin_protocol_work()?;
-            let event = self
-                .orchestrator
-                .receive_frame(frame)
-                .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+            let event = match self.orchestrator.receive_frame(frame) {
+                Ok(event) => event,
+                Err(error) => {
+                    // The orchestrator may have queued the error MySQL answers
+                    // a malformed sign-in packet with; the connection is
+                    // closing whether or not it gets out.
+                    let _ = self.flush_tls_writes(bounded_write_deadline(
+                        authentication_deadline,
+                        self.timeouts.write(),
+                    ));
+                    return Err(RuntimeTcpConnectionError::Orchestrator(error));
+                }
+            };
             self.flush_tls_writes(if admission_complete {
                 Instant::now()
                     + self
@@ -751,6 +766,58 @@ impl Drop for RuntimeTcpConnection {
     fn drop(&mut self) {
         if !self.transport_closed {
             let _ = self.close_transport();
+        }
+    }
+}
+
+/// Answers a first packet that is not an SSLRequest the way MySQL would, as
+/// far as the stream allows, before the connection closes.
+///
+/// Measured on MySQL 8.4.11: a handshake response sent without TLS is
+/// answered 3159 under `require_secure_transport=ON` (after authenticating;
+/// here before, so no credential is ever checked in the clear), and a packet
+/// that reads as neither 1043 `Bad handshake`, both numbered after the
+/// client's first packet. The rest of the client's packet is read first when
+/// it is short enough, so closing does not reset the connection under the
+/// answer.
+fn refuse_before_tls(stream: &mut AcceptedTcpStream, error: &PreTlsPacketError, deadline: Instant) {
+    let (kind, unread) = match error {
+        PreTlsPacketError::PayloadTooLarge { length, .. } => {
+            (crate::FrontendErrorKind::InsecureTransport, *length)
+        }
+        PreTlsPacketError::InvalidPayloadLength { actual, .. } => {
+            (crate::FrontendErrorKind::BadHandshake, *actual)
+        }
+        PreTlsPacketError::UnexpectedSequenceId { .. }
+        | PreTlsPacketError::InvalidSslRequest(_)
+        | PreTlsPacketError::InvalidPacket(_) => (crate::FrontendErrorKind::BadHandshake, 0),
+        PreTlsPacketError::DeadlineExceeded
+        | PreTlsPacketError::TruncatedHeader { .. }
+        | PreTlsPacketError::TruncatedPayload { .. }
+        | PreTlsPacketError::ReadFailed
+        | PreTlsPacketError::CommandTooLarge { .. } => return,
+    };
+    if unread <= MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH {
+        let mut rest = vec![0; unread];
+        if read_exact_with_deadline(stream, &mut rest, deadline, ReadPart::Payload).is_err() {
+            return;
+        }
+    }
+    let Ok(codec) = PacketCodec::new(crate::MAX_RESPONSE_PACKET_PAYLOAD_LENGTH) else {
+        return;
+    };
+    let Ok(frame) = crate::map_frontend_error(kind).encode(
+        codec,
+        CLIENT_HANDSHAKE_SEQUENCE_ID + 1,
+        crate::CLIENT_PROTOCOL_41,
+    ) else {
+        return;
+    };
+    let mut written = 0;
+    while written < frame.len() {
+        match write_with_deadline(stream, &frame[written..], deadline) {
+            Ok(count) => written += count,
+            Err(_) => return,
         }
     }
 }

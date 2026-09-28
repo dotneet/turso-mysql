@@ -449,6 +449,10 @@ pub enum FrontendErrorKind {
     LongDataTooLarge,
     /// The statement or feature is not implemented.
     Unsupported,
+    /// A packet before sign-in did not read as the one the client owed.
+    BadHandshake,
+    /// A client answered the greeting without starting TLS.
+    InsecureTransport,
     /// Authentication failed without exposing credential details.
     Authentication,
     /// The authenticated principal is not allowed to use the requested data.
@@ -734,6 +738,17 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
                 .as_slice(),
         ),
         FrontendErrorKind::Unsupported => (1235, *b"42000", b"feature not supported".as_slice()),
+        // Measured on MySQL 8.4.11, message and all, for a packet that does
+        // not read as an SSLRequest or a handshake response.
+        FrontendErrorKind::BadHandshake => (1043, *b"08S01", b"Bad handshake".as_slice()),
+        // Measured on MySQL 8.4.11 under `require_secure_transport=ON`,
+        // message and all; this server always requires TLS over TCP.
+        FrontendErrorKind::InsecureTransport => (
+            3159,
+            *b"HY000",
+            b"Connections using insecure transport are prohibited while --require_secure_transport=ON."
+                .as_slice(),
+        ),
         FrontendErrorKind::Authentication => (1045, *b"28000", b"access denied".as_slice()),
         FrontendErrorKind::AccessDenied => (1045, *b"28000", b"access denied".as_slice()),
     };
@@ -2670,6 +2685,8 @@ mod tests {
                 *b"HY000",
             ),
             (FrontendErrorKind::LongDataTooLarge, 1105, *b"HY000"),
+            (FrontendErrorKind::BadHandshake, 1043, *b"08S01"),
+            (FrontendErrorKind::InsecureTransport, 3159, *b"HY000"),
             (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),
             (FrontendErrorKind::GroupConcatCut, 1260, *b"HY000"),
