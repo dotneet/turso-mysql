@@ -34,6 +34,7 @@ mod shift_moment;
 mod show_character_sets;
 mod show_engines;
 mod show_full_tables;
+mod show_server_activity;
 mod show_stored_programs;
 mod show_table_status;
 mod show_triggers;
@@ -169,6 +170,9 @@ pub use show_character_sets::{
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
+};
+pub use show_server_activity::{
+    parse_optional_show_processlist, parse_optional_show_status, MySqlShowStatusCommand,
 };
 pub use show_stored_programs::{
     parse_optional_show_stored_programs, MySqlShowStoredProgramsCommand, MySqlStoredProgramKind,

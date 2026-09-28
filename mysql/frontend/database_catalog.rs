@@ -2,6 +2,7 @@
 
 use crate::named_locks::MySqlNamedLocks;
 use std::collections::BTreeMap;
+use crate::session_registry::MySqlSessionRegistry;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -224,6 +225,8 @@ pub struct MySqlDatabaseCatalog {
     inner: Mutex<DatabaseCatalog>,
     /// The named locks every session of this server shares.
     named_locks: Arc<MySqlNamedLocks>,
+    /// The sessions logged in to this server, and when it opened.
+    sessions: Arc<MySqlSessionRegistry>,
 }
 
 impl MySqlDatabaseCatalog {
@@ -234,12 +237,18 @@ impl MySqlDatabaseCatalog {
             wal_keeper: WalKeeper::start(),
             inner: Mutex::new(catalog),
             named_locks: Arc::default(),
+            sessions: Arc::default(),
         }))
     }
 
     /// The named locks every session of this server shares.
     pub fn named_locks(&self) -> &Arc<MySqlNamedLocks> {
         &self.named_locks
+    }
+
+    /// The sessions logged in to this server, and when it opened.
+    pub fn sessions(&self) -> &Arc<MySqlSessionRegistry> {
+        &self.sessions
     }
 
     /// Create and publish an empty logical database, returning its canonical name.

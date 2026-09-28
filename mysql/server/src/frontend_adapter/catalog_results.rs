@@ -3973,3 +3973,195 @@ pub(super) fn histogram_listing_result(
         status_flags,
     })
 }
+
+/// Answers `SHOW STATUS` for the counters this server keeps.
+///
+/// MySQL answers some 330 counters about the whole server. This one keeps
+/// three of them and answers those, and no row for any other name — what
+/// `SHOW VARIABLES` does here too, and what MySQL does for a counter its
+/// build leaves out. Measured on MySQL 8.4.11: each is the server's whether
+/// the session or the global scope is asked, the rows come in name order, and
+/// the columns are `SHOW VARIABLES`' own, read from `session_status` or
+/// `global_status`.
+///
+/// `Uptime` counts from when this server opened its databases, and
+/// `Uptime_since_flush_status` with it, `FLUSH STATUS` being refused here.
+/// `Threads_connected` counts the sessions that have logged in, where MySQL
+/// also counts a connection still in its handshake. A session the runtime
+/// did not accept is not counted, and refuses it.
+pub(super) fn show_status_result(
+    command: &MySqlShowStatusCommand,
+    sessions: &MySqlSessionRegistry,
+    counted: bool,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let uptime = sessions.uptime().as_secs().to_string();
+    let counters = [
+        (
+            "Threads_connected",
+            counted.then(|| sessions.logged_in().to_string()),
+        ),
+        ("Uptime", Some(uptime.clone())),
+        ("Uptime_since_flush_status", Some(uptime)),
+    ];
+    let mut rows = Vec::new();
+    for (name, value) in counters {
+        if !command.selects(name) {
+            continue;
+        }
+        let value = value.ok_or(FrontendErrorKind::Unsupported)?;
+        rows.push(vec![
+            Some(name.as_bytes().to_vec()),
+            Some(value.into_bytes()),
+        ]);
+    }
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: crate::session_variables::name_and_value_columns(match command.scope() {
+            MySqlVariableScope::Session => "session_status",
+            MySqlVariableScope::Global => "global_status",
+        }),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// Answers `SHOW [FULL] PROCESSLIST` with the sessions of the asking account.
+///
+/// Measured on MySQL 8.4.11 for an account without `PROCESS`, which is what
+/// every account here is: it lists every connection of its own account in
+/// the order of their IDs, a waiting one as `Sleep` with an empty state and
+/// no statement, and one running a statement as `Query` — `Execute` for a
+/// prepared one — with the statement. `Time` is the whole seconds since the
+/// connection last started or finished a command. The asking connection's
+/// own row reads `init`; another connection running a statement reads
+/// `executing` here, where MySQL names the step it is at, and a prepared
+/// statement is shown with its `?` where MySQL writes the values bound to
+/// it. Without `FULL` the statement is cut to its first 100 characters.
+pub(super) fn show_processlist_result(
+    sessions: Vec<MySqlSessionSnapshot>,
+    asking: u32,
+    full: bool,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if sessions.len() > MAX_DISPATCH_RESULT_ROWS {
+        return Err(FrontendErrorKind::Internal);
+    }
+    let rows = sessions
+        .into_iter()
+        .map(|session| {
+            let (command, state, info) = match &session.running {
+                None => ("Sleep", Some(String::new()), None),
+                Some(running) => {
+                    let state = if session.id == asking {
+                        "init"
+                    } else {
+                        "executing"
+                    };
+                    let text = if full {
+                        running.text.clone()
+                    } else {
+                        running.text.chars().take(100).collect()
+                    };
+                    (running.command, Some(state.to_owned()), Some(text))
+                }
+            };
+            vec![
+                Some(session.id.to_string().into_bytes()),
+                Some(session.account.into_bytes()),
+                Some(session.host.into_bytes()),
+                session.database.map(String::into_bytes),
+                Some(command.as_bytes().to_vec()),
+                Some(session.seconds.to_string().into_bytes()),
+                state.map(String::into_bytes),
+                info.map(String::into_bytes),
+            ]
+        })
+        .collect();
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: show_processlist_columns(full),
+        rows,
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// Measured on MySQL 8.4.11, none of them naming a table.
+fn show_processlist_columns(full: bool) -> Vec<ColumnDefinitionConfig> {
+    let text = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    let info = if full {
+        (MYSQL_TYPE_LONG_BLOB, 805_306_368)
+    } else {
+        (MYSQL_TYPE_VAR_STRING, 400)
+    };
+    let columns: [(&str, u8, u16, u32, u16, u8); 8] = [
+        (
+            "Id",
+            MYSQL_TYPE_LONGLONG,
+            MYSQL_BINARY_COLLATION,
+            22,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            0,
+        ),
+        (
+            "User",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            128,
+            MYSQL_NOT_NULL_FLAG,
+            NOT_FIXED_DECIMALS,
+        ),
+        (
+            "Host",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            1020,
+            MYSQL_NOT_NULL_FLAG,
+            NOT_FIXED_DECIMALS,
+        ),
+        (
+            "db",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            0,
+            NOT_FIXED_DECIMALS,
+        ),
+        (
+            "Command",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            64,
+            MYSQL_NOT_NULL_FLAG,
+            NOT_FIXED_DECIMALS,
+        ),
+        (
+            "Time",
+            MYSQL_TYPE_LONG,
+            MYSQL_BINARY_COLLATION,
+            8,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            0,
+        ),
+        (
+            "State",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            120,
+            0,
+            NOT_FIXED_DECIMALS,
+        ),
+        ("Info", info.0, text, info.1, 0, NOT_FIXED_DECIMALS),
+    ];
+    columns
+        .into_iter()
+        .map(|(name, kind, character_set, length, flags, decimals)| {
+            let mut column = ColumnDefinitionConfig::new(name, kind);
+            column.character_set = character_set;
+            column.column_length = length;
+            column.flags = flags;
+            column.decimals = decimals;
+            column
+        })
+        .collect()
+}

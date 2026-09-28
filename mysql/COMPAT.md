@@ -5150,6 +5150,32 @@ for the rows a `LIMIT` left out, is refused; MySQL has deprecated it. A
 connection the runtime did not accept knows neither its login nor its ID nor
 its counts, and refuses each of these calls.
 
+`SHOW [FULL] PROCESSLIST` lists the sessions logged in to this server under
+the asking account, which is what MySQL 8.4.11 lists for an account without
+`PROCESS` — every account here is one — measured: every connection of the
+account, a pool's others among them, in the order of their IDs and none of
+another account's. Each row carries the connection ID, the account, the host
+as `SHOW PROCESSLIST` writes it — the client's address and port over TCP,
+`localhost` on the socket — the selected database, `Sleep` with an empty state
+and no statement for a session waiting, or `Query` (`Execute` for a prepared
+statement) with the statement for one running, and `Time`, the whole seconds
+since the session last started or finished a command; the asking session's own
+row reads `init`, and without `FULL` a statement is cut to 100 characters, each
+as measured, in MySQL's columns. Two things differ: another session running a
+statement reads `executing`, where MySQL names the step it is at (`User sleep`,
+`Sending data`), and a prepared statement shows its `?` where MySQL writes the
+values bound to it. A session the runtime did not accept is not listed and
+cannot list them.
+
+`SHOW [GLOBAL | SESSION] STATUS [LIKE 'pattern']` answers the three counters
+this server keeps, and no row for any other name, the way `SHOW VARIABLES`
+does: `Threads_connected`, `Uptime` and `Uptime_since_flush_status`, in name
+order and in `SHOW VARIABLES`' columns read from `session_status` or
+`global_status`, the server's value in either scope, measured. `Uptime` counts
+from when this server opened its databases, and `Uptime_since_flush_status`
+with it, `FLUSH STATUS` being refused. `Threads_connected` counts the sessions
+logged in, where MySQL also counts a connection still in its handshake.
+
 These calls are read only as a whole `SELECT` of such calls and variables:
 beside a `FROM`, inside an expression or prepared, they are refused. Every
 other statement still needs a selected database, which MySQL does not require:

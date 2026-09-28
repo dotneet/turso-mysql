@@ -16,6 +16,7 @@ mod group_concat;
 pub mod named_locks;
 pub mod schema_sql;
 mod session;
+pub mod session_registry;
 pub mod show_create_table;
 mod temporal_zone;
 mod truncate_table;

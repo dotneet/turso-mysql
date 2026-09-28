@@ -1958,10 +1958,15 @@ const fn switch_value(enabled: bool) -> &'static str {
 /// the collation the whole frontend runs on and every other catalog column
 /// already reports.
 fn show_variables_columns(scope: MySqlVariableScope) -> Vec<ColumnDefinitionConfig> {
-    let table = match scope {
+    name_and_value_columns(match scope {
         MySqlVariableScope::Session => "session_variables",
         MySqlVariableScope::Global => "global_variables",
-    };
+    })
+}
+
+/// The two columns `SHOW VARIABLES` and `SHOW STATUS` answer in, read from the
+/// `performance_schema` table named. Measured on MySQL 8.4.11.
+pub(crate) fn name_and_value_columns(table: &str) -> Vec<ColumnDefinitionConfig> {
     [
         (
             "Variable_name",

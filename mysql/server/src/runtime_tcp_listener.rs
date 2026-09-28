@@ -436,8 +436,8 @@ impl AcceptedTcpStream {
 
     /// Returns the address the client connected from, if the socket still
     /// knows it.
-    pub(crate) fn peer_address(&self) -> Option<std::net::IpAddr> {
-        self.stream.peer_addr().ok().map(|address| address.ip())
+    pub(crate) fn peer_address(&self) -> Option<std::net::SocketAddr> {
+        self.stream.peer_addr().ok()
     }
 
     /// Starts protocol work if shutdown has not begun.

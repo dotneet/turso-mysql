@@ -37,6 +37,9 @@ use turso_core::{LimboError, Numeric, Value};
 #[cfg(unix)]
 use turso_mysql::schema_sql::SchemaSqlCreator;
 #[cfg(unix)]
+use turso_mysql::session_registry::{MySqlSessionRegistration, RunningStatement};
+use turso_mysql::session_registry::{MySqlSessionRegistry, MySqlSessionSnapshot};
+#[cfg(unix)]
 use turso_mysql::MySqlTableKind;
 #[cfg(unix)]
 use turso_mysql::{
@@ -85,12 +88,13 @@ use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
     parse_optional_truncate_table, parse_select, MySqlHistogramQuery,
-    MySqlShowCharacterSetsCommand, MySqlShowListingFilter, MySqlShowValueTest,
-    MySqlStoredProgramKind, SessionSqlMode,
+    MySqlShowCharacterSetsCommand, MySqlShowListingFilter, MySqlShowStatusCommand,
+    MySqlShowValueTest, MySqlStoredProgramKind, MySqlVariableScope, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
     parse_optional_histogram_query, parse_optional_named_lock_query,
+    parse_optional_show_processlist, parse_optional_show_status,
     parse_optional_show_stored_programs, write_the_current_database_in, MySqlTransactionCommand,
 };
 
@@ -239,6 +243,9 @@ struct DatabasePreparedStatement {
     /// prepared or executed under, for both the cut and its column, so a
     /// session lowering the limit afterwards leaves the statement uncut.
     group_concat_max_len: u64,
+    /// The text the client prepared, which `SHOW PROCESSLIST` shows while the
+    /// statement runs.
+    text: String,
 }
 
 #[cfg(unix)]
@@ -656,6 +663,13 @@ where
         }
         let mut session_variables = crate::session_variables::MySqlSessionVariables::default();
         session_variables.start_counting_statements();
+        let listed = connection_facts
+            .listed_session()
+            .map(|(id, account, host)| {
+                self.catalog
+                    .sessions()
+                    .register(id, account.to_owned(), host.to_owned(), None)
+            });
         Ok(AuthorizedDatabaseCommandAdapter {
             session: self.catalog.new_session_with_prepared_statement_authority(
                 self.schema_context,
@@ -677,6 +691,7 @@ where
             named_locks,
             error_message: None,
             transaction_awaiting_a_database: None,
+            listed,
         })
     }
 }
@@ -714,6 +729,9 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     /// A `START TRANSACTION` the session sent before it selected a database,
     /// begun on the database it selects next.
     transaction_awaiting_a_database: Option<String>,
+    /// This session's place among the sessions logged in to the server, when
+    /// the runtime told it who and where it is.
+    listed: Option<MySqlSessionRegistration>,
 }
 
 /// What looking for a table a statement names that is not there found.
@@ -765,6 +783,9 @@ where
         self.session
             .select_database(&canonical_name)
             .map_err(database_error_kind)?;
+        if let Some(listed) = &self.listed {
+            listed.database_selected(&canonical_name);
+        }
         self.carry_the_session_onto_its_connection()?;
         self.begin_the_transaction_awaiting_a_database()
     }
@@ -1359,6 +1380,7 @@ where
     fn prepare_gorm_catalog_query(
         &mut self,
         query: GormInformationSchemaPreparedQuery,
+        text: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         let database = self
             .session
@@ -1431,6 +1453,7 @@ where
                 runs_as_text: None,
                 sql: None,
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
+                text: text.to_owned(),
             },
         );
         Ok(PreparedStatementResult {
@@ -2095,6 +2118,9 @@ where
 
     fn command_arrived(&mut self, command: ArrivedCommand) {
         self.session_variables.note_command_arrived(command);
+        if let Some(listed) = &self.listed {
+            listed.command_arrived();
+        }
     }
 
     fn execute_init_db(
@@ -2112,9 +2138,18 @@ where
 
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         self.error_message = None;
+        if let Some(listed) = &self.listed {
+            listed.statement_began(RunningStatement {
+                command: "Query",
+                text: sql.to_owned(),
+            });
+        }
         let result = self.execute_client_query(sql);
         let result = self.answer_what_is_missing(sql, result);
         self.session_variables.note_statement_outcome(sql, &result);
+        if let Some(listed) = &self.listed {
+            listed.statement_ended(self.session.selected_database());
+        }
         result
     }
 
@@ -2206,7 +2241,19 @@ where
         if let Some(connection) = &connection {
             prepare_for_client_statement(connection, &self.session_variables)?;
         }
+        if let (Some(listed), Some(statement)) = (
+            &self.listed,
+            self.prepared_statements.statements.get(&statement_id),
+        ) {
+            listed.statement_began(RunningStatement {
+                command: "Execute",
+                text: statement.text.clone(),
+            });
+        }
         let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
+        if let Some(listed) = &self.listed {
+            listed.statement_ended(self.session.selected_database());
+        }
         match &connection {
             Some(connection) => {
                 finish_client_statement(connection, &mut self.session_variables, result)
@@ -2255,7 +2302,7 @@ where
         )
         .map_err(|_| FrontendErrorKind::Syntax)?
         {
-            return self.prepare_gorm_catalog_query(query);
+            return self.prepare_gorm_catalog_query(query, sql);
         }
         let written = write_the_current_database_in(
             sql,
@@ -2459,6 +2506,35 @@ where
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
             return named_lock_results::named_lock_result(&query, &self.named_locks, status_flags);
+        }
+        if let Some(command) = parse_optional_show_status(sql, self.session.session_sql_mode())
+            .map_err(|error| match error {
+                turso_mysql_parser::ParseError::Unsupported { .. } => {
+                    FrontendErrorKind::Unsupported
+                }
+                _ => FrontendErrorKind::Syntax,
+            })?
+        {
+            return catalog_results::show_status_result(
+                &command,
+                self.catalog.sessions(),
+                self.listed.is_some(),
+                status_flags,
+            );
+        }
+        if let Some(full) = parse_optional_show_processlist(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let (asking, account, _) = self
+                .connection_facts
+                .listed_session()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            return catalog_results::show_processlist_result(
+                self.catalog.sessions().sessions_of(account),
+                asking,
+                full,
+                status_flags,
+            );
         }
         if let Some(query) = parse_optional_histogram_query(sql, self.session.session_sql_mode())
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -3286,6 +3362,7 @@ where
                 runs_as_text: None,
                 sql: Some(sql.to_owned()),
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
+                text: sql.to_owned(),
             },
         );
         result
@@ -3333,6 +3410,7 @@ where
                 runs_as_text: Some(sql.to_owned()),
                 sql: None,
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
+                text: sql.to_owned(),
             },
         );
         Ok(PreparedStatementResult {

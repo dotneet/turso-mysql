@@ -384,8 +384,8 @@ speaks; anything measured here from now on has to pass that flag.
 | An `information_schema` query with no `TABLE_SCHEMA` | answers the selected database alone, where MySQL answers every database the caller can see |
 | A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
-| `SHOW [FULL] PROCESSLIST` | refused; measured, a session without the `PROCESS` privilege sees every connection of its own account — a pool's other connections among them — and this session knows only itself |
-| `SHOW [GLOBAL] STATUS` | refused; MySQL answers 330 counters about the whole server, `Threads_connected` and `Uptime` among them, which a session here has no reading of |
+| `information_schema.PROCESSLIST` | refused; `SHOW [FULL] PROCESSLIST` answers the same rows. Measured, the table's columns are shaped differently from the statement's — `INFO` a `BLOB`, `TIME` NOT NULL without the binary flag — and the asking row reads `executing` |
+| `SHOW STATUS` counters other than `Threads_connected`, `Uptime` and `Uptime_since_flush_status` | no row; this server keeps none of MySQL's other 330, as a name MySQL's build leaves out answers no row. `SHOW STATUS WHERE ...` is refused |
 | `SHOW COLLATION` / `SHOW CHARACTER SET` with a `WHERE` other than `=` and `LIKE` tests joined by `AND` | refused; the listing is filtered here rather than by a query engine |
 | The `NUM` flag on a column worked out rather than read from a table — a written `1.5`, `TRUE`, `NULL`, `COUNT(*)`, `@@group_concat_max_len` | sent, where MySQL does not: measured on the wire on 8.4.11, `1.5` and `COUNT(*)` carry `0x81`, `NULL` `0x80` and `@@group_concat_max_len` `0xa0`. `libmysqlclient` sets the flag itself for every numeric type, so the `mysql` client shows it either way |
 | `SET group_concat_max_len` below 4, or read from a user variable | refused; measured, MySQL takes anything below 4 as 4 with warning 1292 (`Truncated incorrect group_concat_max_len value: '0'`) |

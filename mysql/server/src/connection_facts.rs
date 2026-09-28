@@ -1,6 +1,6 @@
 //! What a connection knows about where it came from.
 
-use std::net::IpAddr;
+use std::net::SocketAddr;
 
 /// What a connection knows about itself, which `CONNECTION_ID()`, `USER()`,
 /// `CURRENT_USER()` and `@@socket` answer.
@@ -13,6 +13,9 @@ use std::net::IpAddr;
 pub(crate) struct MySqlConnectionFacts {
     connection_id: Option<u32>,
     client_host: Option<String>,
+    /// Where the client came from as `SHOW PROCESSLIST` writes it, which is
+    /// the host with its port over TCP.
+    listed_host: Option<String>,
     unix_socket_path: Option<Vec<u8>>,
     account_name: Option<String>,
 }
@@ -27,6 +30,7 @@ impl MySqlConnectionFacts {
         Self {
             connection_id: Some(connection_id),
             client_host: Some("localhost".to_owned()),
+            listed_host: Some("localhost".to_owned()),
             unix_socket_path: Some(path),
             account_name: None,
         }
@@ -39,10 +43,17 @@ impl MySqlConnectionFacts {
     /// `app@172.17.0.9`. An IPv4 address a dual-stack socket reports inside
     /// IPv6 is written as the IPv4 one, as MySQL writes it. A socket that no
     /// longer knows its peer leaves the host unknown.
-    pub(crate) fn over_tcp(connection_id: u32, peer: Option<IpAddr>) -> Self {
+    ///
+    /// Measured on MySQL 8.4.11, `SHOW PROCESSLIST` writes the host with the
+    /// client's port after a colon — `172.17.0.3:40964`.
+    pub(crate) fn over_tcp(connection_id: u32, peer: Option<SocketAddr>) -> Self {
+        let host = peer.map(|peer| peer.ip().to_canonical().to_string());
         Self {
             connection_id: Some(connection_id),
-            client_host: peer.map(|peer| peer.to_canonical().to_string()),
+            listed_host: peer
+                .zip(host.as_ref())
+                .map(|(peer, host)| format!("{host}:{}", peer.port())),
+            client_host: host,
             unix_socket_path: None,
             account_name: None,
         }
@@ -65,6 +76,16 @@ impl MySqlConnectionFacts {
             "{}@{}",
             self.account_name.as_deref()?,
             self.client_host.as_deref()?
+        ))
+    }
+
+    /// The account name, the host as `SHOW PROCESSLIST` writes it and the
+    /// connection ID, when the connection knows all three.
+    pub(crate) fn listed_session(&self) -> Option<(u32, &str, &str)> {
+        Some((
+            self.connection_id?,
+            self.account_name.as_deref()?,
+            self.listed_host.as_deref()?,
         ))
     }
 
