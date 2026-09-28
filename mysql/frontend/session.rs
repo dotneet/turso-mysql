@@ -43,6 +43,7 @@ use turso_parser::ast::{
 
 use crate::alter_table_indexes::MySqlAlterTableIndexError;
 use crate::create_table_as_select::MySqlCreateTableAsSelectError;
+use crate::database_users::{DatabaseUser, MySqlDatabaseDropped};
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 use crate::schema_sql::{
     decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v3, CreatorSchemaSqlFormatter,
@@ -82,6 +83,9 @@ pub struct MySqlConnection {
     /// none, shared with every other connection to it so that an `ALTER
     /// DATABASE` one of them runs reaches the next `CREATE TABLE` of all.
     database_collation: Option<SharedDatabaseCollation>,
+    /// This connection's use of its database, when the connection belongs to
+    /// a catalog, which a `DROP DATABASE` waits for and then refuses.
+    database_user: Option<Arc<DatabaseUser>>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -1509,6 +1513,7 @@ impl MySqlConnection {
             schema_readings: Arc::default(),
             wal_keeper: None,
             database_collation: None,
+            database_user: None,
         })
     }
 
@@ -1611,6 +1616,53 @@ impl MySqlConnection {
     pub(crate) fn with_database_collation(mut self, collation: SharedDatabaseCollation) -> Self {
         self.database_collation = Some(collation);
         self
+    }
+
+    /// Lets a catalog's `DROP DATABASE` know when this connection uses its
+    /// database.
+    pub(crate) fn with_database_user(mut self, user: DatabaseUser) -> Self {
+        self.database_user = Some(Arc::new(user));
+        self
+    }
+
+    /// Marks a statement starting on this connection's database, which a
+    /// `DROP DATABASE` then waits for until [`Self::finish_a_statement`].
+    ///
+    /// Answers the database's name when another session dropped it: nothing
+    /// may run on the files of a database that is gone. A statement that
+    /// starts while a drop waits waits behind it, as MySQL's does.
+    pub fn start_a_statement(&self) -> std::result::Result<(), MySqlDatabaseDropped> {
+        match &self.database_user {
+            Some(user) => user.start_using(),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the statement [`Self::start_a_statement`] started as finished.
+    /// A transaction left open keeps the database in use until it ends:
+    /// measured on MySQL 8.4.11, a drop waits for a transaction that read one
+    /// of its tables.
+    pub fn finish_a_statement(&self) {
+        if let Some(user) = &self.database_user {
+            if self.inner.get_auto_commit() {
+                user.stop_using();
+            }
+        }
+    }
+
+    /// Lets the database go whatever this connection still has open, for a
+    /// session dropping its own database once its transaction has ended.
+    pub(crate) fn stop_using_the_database(&self) {
+        if let Some(user) = &self.database_user {
+            user.stop_using();
+        }
+    }
+
+    /// Whether another session dropped this connection's database.
+    pub fn database_was_dropped(&self) -> bool {
+        self.database_user
+            .as_ref()
+            .is_some_and(|user| user.database_was_dropped())
     }
 
     /// The collation a table made through this connection takes when it names

@@ -14147,7 +14147,9 @@ fn authorized_adapter_reset_clears_prepared_state_across_database_switches() {
         adapter.execute_stmt_execute(archive.statement_id, &[]),
         Err(FrontendErrorKind::UnknownPreparedStatement)
     );
-    catalog.drop_database("reports").unwrap();
+    catalog
+        .drop_database("reports", std::time::Duration::ZERO)
+        .unwrap();
 }
 
 #[cfg(unix)]
@@ -14173,10 +14175,6 @@ fn authorized_prepared_statements_keep_origin_connections_across_database_switch
         .execute_stmt_prepare("SELECT 1 AS archive_value")
         .unwrap();
     assert_eq!((reports.statement_id, archive.statement_id), (1, 2));
-    assert!(matches!(
-        catalog.drop_database("reports"),
-        Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
-    ));
 
     let first_payload = vec![0, 1, MYSQL_TYPE_VAR_STRING, 0];
     let first = adapter
@@ -14209,7 +14207,9 @@ fn authorized_prepared_statements_keep_origin_connections_across_database_switch
         adapter.execute_stmt_execute(reports.statement_id, &cached_type_payload),
         Err(FrontendErrorKind::UnknownPreparedStatement)
     ));
-    catalog.drop_database("reports").unwrap();
+    catalog
+        .drop_database("reports", std::time::Duration::ZERO)
+        .unwrap();
 
     let next = adapter
         .execute_stmt_prepare("SELECT 2 AS next_value")
@@ -17142,15 +17142,16 @@ fn admin_queries_authorize_canonical_names_before_typed_execution() {
             status_flags: 0x0002,
         }))
     );
-    assert_eq!(
+    // Measured on MySQL 8.4.11: a session drops the database it is in.
+    assert!(matches!(
         adapter.execute_query("DROP DATABASE ARCHIVE"),
-        Err(FrontendErrorKind::DatabaseBusy)
-    );
+        Ok(CommandExecutionResult::Ok(_))
+    ));
     assert_eq!(
         adapter.execute_query("DROP DATABASE REPORTS"),
         Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
     );
-    assert_eq!(catalog.list().unwrap(), vec![String::from("archive")]);
+    assert!(catalog.list().unwrap().is_empty());
     assert_eq!(
         authorizer.actions(),
         vec![
@@ -17224,7 +17225,7 @@ fn authorized_admin_catalog_errors_keep_their_typed_categories() {
     );
     assert_eq!(
         adapter.execute_query("DROP DATABASE MISSING"),
-        Err(FrontendErrorKind::UnknownDatabase)
+        Err(FrontendErrorKind::NoDatabaseToDrop)
     );
     assert_eq!(
         adapter.execute_query("USE MISSING"),
@@ -21827,7 +21828,9 @@ fn show_tables_has_bounded_protocol_result() {
 fn show_databases_returns_an_empty_result_without_a_selection() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer);
-    catalog.drop_database("reports").unwrap();
+    catalog
+        .drop_database("reports", std::time::Duration::ZERO)
+        .unwrap();
     let mut adapter = factory
         .build(AuthenticatedPrincipal::from_account_id_for_testing(
             AccountId::from_bytes([19; 32]),
@@ -30838,3 +30841,6 @@ mod orm_upserts;
 
 #[cfg(unix)]
 mod bound_expressions;
+
+#[cfg(unix)]
+mod prisma_statements;

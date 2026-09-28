@@ -11,6 +11,8 @@ mod database_catalog;
 mod database_open;
 #[cfg_attr(not(test), allow(dead_code))]
 mod database_registry;
+#[cfg_attr(not(unix), allow(dead_code))]
+mod database_users;
 mod dialect;
 mod drop_table;
 mod found_rows;
@@ -31,6 +33,7 @@ pub use database_catalog::{
     canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
+pub use database_users::MySqlDatabaseDropped;
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use group_concat::{DEFAULT_GROUP_CONCAT_MAX_LEN, GROUP_CONCAT_CUT_ERROR};

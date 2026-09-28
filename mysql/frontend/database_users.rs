@@ -1,0 +1,326 @@
+//! Who is using one opened database, so that a `DROP DATABASE` waits for
+//! them and nobody uses the database once it is gone.
+//!
+//! Measured on MySQL 8.4.11: a `DROP DATABASE` waits for a session running a
+//! statement on the database or holding a transaction that read one of its
+//! tables, and a statement another session starts while the drop waits waits
+//! behind it. A session that merely has the database selected holds nothing
+//! up; once the database is gone, its statements on it answer 1049.
+
+use std::fmt;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+/// The connections using one opened database, which every connection to it
+/// and the catalog that drops it share.
+#[derive(Default)]
+pub(crate) struct DatabaseUsers {
+    state: Mutex<UsersState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct UsersState {
+    /// How many connections are running a statement on the database or hold
+    /// a transaction open on it.
+    using: usize,
+    /// Set while a `DROP DATABASE` waits for them or removes the database.
+    dropping: bool,
+    dropped: bool,
+}
+
+/// Why a `DROP DATABASE` did not get to remove the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DropWaitError {
+    /// Another `DROP DATABASE` removed it first.
+    AlreadyDropped,
+    /// A connection kept using it for longer than the drop waits.
+    TimedOut,
+}
+
+impl DatabaseUsers {
+    /// Waits until no connection uses the database, then keeps every new
+    /// statement on it waiting while the caller removes it.
+    ///
+    /// A drop that another drop of the same database is already making waits
+    /// for that one to finish first.
+    pub(crate) fn wait_to_drop(&self, wait: Duration) -> Result<DropInProgress<'_>, DropWaitError> {
+        let deadline = Instant::now().checked_add(wait);
+        let mut state = self.lock();
+        while state.dropping {
+            state = self.wait_until(state, deadline)?;
+        }
+        if state.dropped {
+            return Err(DropWaitError::AlreadyDropped);
+        }
+        state.dropping = true;
+        while state.using > 0 {
+            state = match self.wait_until(state, deadline) {
+                Ok(state) => state,
+                Err(error) => {
+                    // The statements waiting behind this drop go ahead as
+                    // though it had never been asked for.
+                    let mut state = self.lock();
+                    state.dropping = false;
+                    drop(state);
+                    self.changed.notify_all();
+                    return Err(error);
+                }
+            };
+        }
+        Ok(DropInProgress {
+            users: self,
+            finished: false,
+        })
+    }
+
+    fn wait_until<'a>(
+        &'a self,
+        state: MutexGuard<'a, UsersState>,
+        deadline: Option<Instant>,
+    ) -> Result<MutexGuard<'a, UsersState>, DropWaitError> {
+        let Some(deadline) = deadline else {
+            return Ok(self
+                .changed
+                .wait(state)
+                .expect("MySQL database users mutex poisoned"));
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(DropWaitError::TimedOut);
+        }
+        Ok(self
+            .changed
+            .wait_timeout(state, left)
+            .expect("MySQL database users mutex poisoned")
+            .0)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, UsersState> {
+        self.state
+            .lock()
+            .expect("MySQL database users mutex poisoned")
+    }
+}
+
+/// A `DROP DATABASE` that has waited for every user and keeps new ones out.
+///
+/// Letting it go without [`DropInProgress::finish`] lets them back in, which
+/// is what a drop that failed has to do.
+pub(crate) struct DropInProgress<'a> {
+    users: &'a DatabaseUsers,
+    finished: bool,
+}
+
+impl DropInProgress<'_> {
+    /// Records that the database is gone, which every statement waiting on it
+    /// and every later one answers 1049 for.
+    pub(crate) fn finish(mut self) {
+        let mut state = self.users.lock();
+        state.dropped = true;
+        state.dropping = false;
+        drop(state);
+        self.finished = true;
+        self.users.changed.notify_all();
+    }
+}
+
+impl Drop for DropInProgress<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut state = self.users.lock();
+        state.dropping = false;
+        drop(state);
+        self.users.changed.notify_all();
+    }
+}
+
+/// A statement asked for a database another session dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlDatabaseDropped {
+    /// The database's name, which MySQL's 1049 names.
+    pub database: String,
+}
+
+impl fmt::Display for MySqlDatabaseDropped {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Unknown database '{}'", self.database)
+    }
+}
+
+impl std::error::Error for MySqlDatabaseDropped {}
+
+/// One connection's use of its database, shared by every clone of the
+/// connection.
+pub(crate) struct DatabaseUser {
+    users: Arc<DatabaseUsers>,
+    database: String,
+    using: Mutex<bool>,
+}
+
+impl DatabaseUser {
+    pub(crate) fn new(users: Arc<DatabaseUsers>, database: String) -> Self {
+        Self {
+            users,
+            database,
+            using: Mutex::new(false),
+        }
+    }
+
+    /// Counts this connection as using its database until
+    /// [`DatabaseUser::stop_using`], waiting first for a drop in progress.
+    pub(crate) fn start_using(&self) -> Result<(), MySqlDatabaseDropped> {
+        let mut using = self.lock_using();
+        if *using {
+            return Ok(());
+        }
+        let mut state = self.users.lock();
+        loop {
+            if state.dropped {
+                return Err(MySqlDatabaseDropped {
+                    database: self.database.clone(),
+                });
+            }
+            if !state.dropping {
+                break;
+            }
+            state = self
+                .users
+                .changed
+                .wait(state)
+                .expect("MySQL database users mutex poisoned");
+        }
+        state.using = state
+            .using
+            .checked_add(1)
+            .expect("MySQL database user count must not overflow");
+        *using = true;
+        Ok(())
+    }
+
+    pub(crate) fn stop_using(&self) {
+        let mut using = self.lock_using();
+        if !*using {
+            return;
+        }
+        let mut state = self.users.lock();
+        state.using = state
+            .using
+            .checked_sub(1)
+            .expect("a counted MySQL database user was counted once");
+        drop(state);
+        *using = false;
+        self.users.changed.notify_all();
+    }
+
+    pub(crate) fn database_was_dropped(&self) -> bool {
+        self.users.lock().dropped
+    }
+
+    fn lock_using(&self) -> MutexGuard<'_, bool> {
+        self.using
+            .lock()
+            .expect("MySQL database user mutex poisoned")
+    }
+}
+
+impl Drop for DatabaseUser {
+    fn drop(&mut self) {
+        self.stop_using();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    fn user(users: &Arc<DatabaseUsers>) -> DatabaseUser {
+        DatabaseUser::new(Arc::clone(users), "reports".to_owned())
+    }
+
+    #[test]
+    fn a_connection_that_uses_nothing_holds_no_drop_up() {
+        let users = Arc::new(DatabaseUsers::default());
+        let idle = user(&users);
+        users.wait_to_drop(Duration::ZERO).unwrap().finish();
+        assert!(idle.database_was_dropped());
+        assert_eq!(
+            idle.start_using(),
+            Err(MySqlDatabaseDropped {
+                database: "reports".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_drop_gives_up_on_a_user_that_stays_and_lets_it_carry_on() {
+        let users = Arc::new(DatabaseUsers::default());
+        let busy = user(&users);
+        busy.start_using().unwrap();
+        assert_eq!(
+            users.wait_to_drop(Duration::from_millis(20)).err(),
+            Some(DropWaitError::TimedOut)
+        );
+        busy.stop_using();
+        busy.start_using().unwrap();
+        assert!(!busy.database_was_dropped());
+    }
+
+    #[test]
+    fn a_drop_waits_for_its_user_and_a_new_statement_waits_for_the_drop() {
+        let users = Arc::new(DatabaseUsers::default());
+        let busy = Arc::new(user(&users));
+        busy.start_using().unwrap();
+        let finisher = {
+            let busy = Arc::clone(&busy);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                busy.stop_using();
+            })
+        };
+        let dropping = users.wait_to_drop(Duration::from_secs(10)).unwrap();
+        finisher.join().unwrap();
+        let latecomer = {
+            let latecomer = user(&users);
+            thread::spawn(move || latecomer.start_using())
+        };
+        thread::sleep(Duration::from_millis(50));
+        dropping.finish();
+        assert!(latecomer.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_failed_drop_lets_the_statements_waiting_behind_it_go_ahead() {
+        let users = Arc::new(DatabaseUsers::default());
+        let dropping = users.wait_to_drop(Duration::ZERO).unwrap();
+        let latecomer = {
+            let latecomer = user(&users);
+            thread::spawn(move || latecomer.start_using())
+        };
+        thread::sleep(Duration::from_millis(50));
+        drop(dropping);
+        assert_eq!(latecomer.join().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn a_second_drop_finds_the_database_already_gone() {
+        let users = Arc::new(DatabaseUsers::default());
+        users.wait_to_drop(Duration::ZERO).unwrap().finish();
+        assert_eq!(
+            users.wait_to_drop(Duration::ZERO).err(),
+            Some(DropWaitError::AlreadyDropped)
+        );
+    }
+
+    #[test]
+    fn a_user_let_go_stops_counting() {
+        let users = Arc::new(DatabaseUsers::default());
+        let busy = user(&users);
+        busy.start_using().unwrap();
+        drop(busy);
+        assert!(users.wait_to_drop(Duration::ZERO).is_ok());
+    }
+}

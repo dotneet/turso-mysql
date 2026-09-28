@@ -3935,6 +3935,30 @@ and as a dump does between tables; selecting another is refused, since the
 transaction cannot follow the session there — which also refuses a
 `--single-transaction` dump of several databases.
 
+`DROP DATABASE` drops a database other sessions still have selected, the way
+Prisma's `migrate reset` drops the database its own pooled connections are in
+and its schema engine drops the shadow database it is connected to. Measured on
+8.4.11 and matched: the drop commits the dropping session's transaction first,
+whichever database it names; it waits for a session running a statement on the
+database or holding a transaction open on it, and a statement another session
+starts on the database while it waits waits behind it; a session that merely
+has the database selected holds nothing up. Afterwards that session keeps the
+name — `DATABASE()` answers it — and a statement on the database answers 1049
+`Unknown database 'name'`, until a database is made under the name again, which
+it then reads. The session that drops its own database is left in none,
+`DATABASE()` answering NULL. A database that is not there answers 1008 `Can't
+drop database 'name'; database doesn't exist`. The files are removed while the
+other sessions still hold them open, which Unix allows without either side
+seeing the other, and nothing runs on them again: every statement first checks
+that its database is still there, under the same lock the drop takes. The wait
+is MySQL's default `lock_wait_timeout` of a year, since no session here can set
+it lower; a drop that runs out answers 1205. Three things differ, each listed in
+TODO.md: a transaction that has read no table yet holds the drop up, where
+MySQL's does not; a statement that reads no table at all — `SELECT 1`, `BEGIN` —
+in a session whose database was dropped answers 1049 rather than running; and a
+statement prepared before the drop answers 1049 even once the database is made
+again, where MySQL prepares it over the new one.
+
 The rest of what `mysqldump` 8.4 sends was read from the oracle's general log
 under `--single-transaction --routines --triggers --events --hex-blob
 --databases`, and each statement is answered. `SHOW EVENTS` — with the selected

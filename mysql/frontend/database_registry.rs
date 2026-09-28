@@ -299,7 +299,6 @@ pub(crate) enum RegistryError {
     RegistryPoisoned,
     DatabaseAlreadyExists(DatabaseName),
     DatabaseNotFound(DatabaseName),
-    DatabaseBusy(DatabaseName),
     DatabaseNotReady(DatabaseName),
     DatabaseMarkerMismatch(DatabaseName),
     InvalidRegistryState,
@@ -683,9 +682,6 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
     pub(crate) fn drop_database(&mut self, requested_name: &str) -> Result<(), RegistryError> {
         self.ensure_active()?;
         let name = DatabaseName::parse(requested_name)?;
-        if self.leases.contains(&name) {
-            return Err(RegistryError::DatabaseBusy(name));
-        }
         let entry = self
             .snapshot
             .entries
@@ -1232,8 +1228,11 @@ mod tests {
         assert_eq!(registry.snapshot.entries[&name].state, DatabaseState::Ready);
     }
 
+    /// The engine holding a database open does not stop it being dropped:
+    /// the catalog waits for the sessions using it before asking, and one
+    /// that merely holds it keeps its open files after they are removed.
     #[test]
-    fn initializer_result_can_retain_lifetime_lease_until_database_drop() {
+    fn a_lifetime_lease_the_engine_holds_does_not_stop_a_drop() {
         let mut registry = DatabaseRegistry::open_or_create(FakeRoot::default()).unwrap();
         let (name, lifetime) = registry
             .create_with_initializer(
@@ -1243,12 +1242,10 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            registry.drop_database(name.as_str()),
-            Err(RegistryError::DatabaseBusy(name.clone()))
-        );
-        drop(lifetime);
         registry.drop_database(name.as_str()).unwrap();
+        assert!(registry.root.files.is_empty());
+        assert!(!registry.contains(name.as_str()).unwrap());
+        drop(lifetime);
     }
 
     #[test]
@@ -1649,18 +1646,25 @@ mod tests {
         assert!(DatabaseRegistry::open_or_create(same_root).is_ok());
     }
 
+    /// A database dropped while a lease holds it is gone for good: the lease
+    /// no longer names a database of the registry, and one made again under
+    /// the same name gets files of its own.
     #[test]
-    fn dropping_a_database_lease_releases_the_busy_state() {
+    fn a_database_dropped_under_a_lease_never_hands_its_files_on() {
         let mut registry = DatabaseRegistry::open_or_create(FakeRoot::default()).unwrap();
-        let name = registry.create("live").unwrap();
+        registry.create("live").unwrap();
         let lease = registry.acquire("live").unwrap();
+        let dropped_key = lease.database_file_key().clone();
 
-        assert_eq!(
-            registry.drop_database("live"),
-            Err(RegistryError::DatabaseBusy(name))
-        );
-        drop(lease);
         registry.drop_database("live").unwrap();
+        registry.create("live").unwrap();
+        let again = registry.acquire("live").unwrap();
+        assert_ne!(again.database_file_key(), &dropped_key);
+        assert_eq!(
+            registry.release(lease),
+            Err(RegistryError::InvalidRegistryState)
+        );
+        registry.release(again).unwrap();
     }
 
     #[test]
@@ -1675,18 +1679,14 @@ mod tests {
     }
 
     #[test]
-    fn core_parts_keep_the_root_lock_and_busy_state_after_registry_drop() {
+    fn core_parts_keep_the_root_lock_after_registry_drop() {
         let root = FakeRoot::default();
         let same_root = root.clone();
         let mut registry = DatabaseRegistry::open_or_create(root).unwrap();
-        let name = registry.create("live").unwrap();
+        registry.create("live").unwrap();
         let lease = registry.acquire("live").unwrap();
         let (_handle, lifetime) = lease.into_core_parts();
 
-        assert_eq!(
-            registry.drop_database("live"),
-            Err(RegistryError::DatabaseBusy(name))
-        );
         drop(registry);
         assert!(matches!(
             DatabaseRegistry::open_or_create(same_root.clone()),
@@ -1698,15 +1698,11 @@ mod tests {
     }
 
     #[test]
-    fn lease_is_bound_to_its_registry_instance_and_blocks_drop() {
+    fn lease_is_bound_to_its_registry_instance() {
         let mut registry = DatabaseRegistry::open_or_create(FakeRoot::default()).unwrap();
         let created = registry.create("orders").unwrap();
         let lease = registry.acquire("ORDERS").unwrap();
         assert_eq!(lease.name(), &created);
-        assert_eq!(
-            registry.drop_database("orders"),
-            Err(RegistryError::DatabaseBusy(created))
-        );
 
         let key = OpaqueFileKey::new("db_0000000000000000000000000000000a".to_owned()).unwrap();
         let marker = MySqlOwnerMarkerV2::for_policy(NamePolicy::LowerCaseTableNames1);

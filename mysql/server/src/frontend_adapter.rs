@@ -1380,15 +1380,27 @@ where
         }
 
         let alters = matches!(command, MySqlAdminCommand::AlterDatabase { .. });
-        let result =
-            self.session
-                .execute_parsed_admin_command(command)
-                .map_err(|error| match error {
-                    MySqlDatabaseError::DatabaseNotFound(_) if alters => {
-                        FrontendErrorKind::NoDatabaseToAlter
-                    }
-                    error => database_error_kind(error),
-                })?;
+        let drops = matches!(command, MySqlAdminCommand::DropDatabase { .. });
+        let result = match self.session.execute_parsed_admin_command(command) {
+            Ok(result) => result,
+            Err(MySqlDatabaseError::DatabaseNotFound(_)) if alters => {
+                return Err(FrontendErrorKind::NoDatabaseToAlter)
+            }
+            // Measured on MySQL 8.4.11, message and all.
+            Err(MySqlDatabaseError::DatabaseNotFound(database)) if drops => {
+                self.error_message = Some(
+                    format!("Can't drop database '{database}'; database doesn't exist")
+                        .into_bytes(),
+                );
+                return Err(FrontendErrorKind::NoDatabaseToDrop);
+            }
+            Err(MySqlDatabaseError::DatabaseBusy(_)) if drops => {
+                self.error_message =
+                    Some(b"Lock wait timeout exceeded; try restarting transaction".to_vec());
+                return Err(FrontendErrorKind::DatabaseBusy);
+            }
+            Err(error) => return Err(database_error_kind(error)),
+        };
         if matches!(result, MySqlAdminCommandResult::Selected { .. }) {
             self.carry_the_session_onto_its_connection()?;
             self.begin_the_transaction_awaiting_a_database()?;
@@ -2225,7 +2237,9 @@ where
                 text: sql.to_owned(),
             });
         }
-        let result = self.execute_client_query(sql);
+        let result = self
+            .follow_a_dropped_database()
+            .and_then(|()| self.execute_client_query(sql));
         let found_rows_before_the_limit = self
             .session
             .connection()
@@ -2269,7 +2283,17 @@ where
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         self.error_message = None;
-        let result = self.prepare_client_statement(sql);
+        let result = self.follow_a_dropped_database().and_then(|()| {
+            let connection = self.session.connection().ok().cloned();
+            if let Some(connection) = &connection {
+                self.start_a_statement_on(connection)?;
+            }
+            let result = self.prepare_client_statement(sql);
+            if let Some(connection) = &connection {
+                connection.finish_a_statement();
+            }
+            result
+        });
         self.answer_what_is_missing(sql, result)
     }
 
@@ -2322,6 +2346,7 @@ where
         parameter_payload: &[u8],
     ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        self.follow_a_dropped_database()?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
         let connection = self
@@ -2330,7 +2355,11 @@ where
             .get(&statement_id)
             .map(|statement| statement.connection.clone());
         if let Some(connection) = &connection {
-            prepare_for_client_statement(connection, &self.session_variables)?;
+            self.start_a_statement_on(connection)?;
+            if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
+                connection.finish_a_statement();
+                return Err(error);
+            }
         }
         if let (Some(listed), Some(statement)) = (
             &self.listed,
@@ -2347,7 +2376,10 @@ where
         }
         match &connection {
             Some(connection) => {
-                finish_client_statement(connection, &mut self.session_variables, result)
+                let result =
+                    finish_client_statement(connection, &mut self.session_variables, result);
+                connection.finish_a_statement();
+                result
             }
             None => result,
         }
@@ -2375,16 +2407,58 @@ where
             .set_database_collation(self.session.selected_database_collation());
         let connection = self.session.connection().ok().cloned();
         if let Some(connection) = &connection {
-            prepare_for_client_statement(connection, &self.session_variables)?;
+            self.start_a_statement_on(connection)?;
+            if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
+                connection.finish_a_statement();
+                return Err(error);
+            }
         }
         let result = self.execute_query_statement(sql);
         let result = match &connection {
             Some(connection) => {
-                finish_client_statement(connection, &mut self.session_variables, result)
+                let result =
+                    finish_client_statement(connection, &mut self.session_variables, result);
+                connection.finish_a_statement();
+                result
             }
             None => result,
         };
         answer_a_result_in_latin1(&self.session_variables, result)
+    }
+
+    /// Counts a statement against the database it runs on, which a `DROP
+    /// DATABASE` waits for, or answers 1049 when another session dropped it.
+    fn start_a_statement_on(
+        &mut self,
+        connection: &MySqlConnection,
+    ) -> Result<(), FrontendErrorKind> {
+        connection.start_a_statement().map_err(|dropped| {
+            self.error_message = Some(dropped.to_string().into_bytes());
+            FrontendErrorKind::UnknownDatabase
+        })
+    }
+
+    /// Selects the session's database again when another session dropped it
+    /// and has made one under the same name since, which is what a MySQL
+    /// session that keeps the name reads from then on. While there is none,
+    /// the session keeps the name and its statements on it answer 1049.
+    fn follow_a_dropped_database(&mut self) -> Result<(), FrontendErrorKind> {
+        let Some(name) = self.session.dropped_database().map(str::to_owned) else {
+            return Ok(());
+        };
+        if self
+            .authorize(DatabaseAction::Connect {
+                database: Some(&name),
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        match self.session.select_database(&name) {
+            Ok(()) => self.carry_the_session_onto_its_connection(),
+            Err(MySqlDatabaseError::DatabaseNotFound(_)) => Ok(()),
+            Err(error) => Err(database_error_kind(error)),
+        }
     }
 
     fn prepare_client_statement(

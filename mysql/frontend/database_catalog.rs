@@ -20,6 +20,7 @@ use turso_mysql_parser::{
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
+use crate::database_users::{DatabaseUser, DatabaseUsers, DropWaitError};
 use crate::schema_sql::SchemaSqlSessionContext;
 use crate::session::SharedDatabaseCollation;
 use crate::wal_keeper::WalKeeper;
@@ -45,7 +46,7 @@ pub enum MySqlDatabaseError {
     DatabaseAlreadyExists(String),
     /// No ready logical database has this name.
     DatabaseNotFound(String),
-    /// The database is selected by a live session and cannot be dropped.
+    /// A `DROP DATABASE` gave up waiting for the sessions using the database.
     DatabaseBusy(String),
     /// The database has not completed creation or removal.
     DatabaseNotReady(String),
@@ -184,7 +185,6 @@ impl From<RegistryError> for MySqlDatabaseError {
             RegistryError::DatabaseNotFound(name) => {
                 Self::DatabaseNotFound(name.as_str().to_owned())
             }
-            RegistryError::DatabaseBusy(name) => Self::DatabaseBusy(name.as_str().to_owned()),
             RegistryError::DatabaseNotReady(name) => {
                 Self::DatabaseNotReady(name.as_str().to_owned())
             }
@@ -293,11 +293,33 @@ impl MySqlDatabaseCatalog {
             .map_err(MySqlDatabaseError::from)
     }
 
-    /// Drop a logical database once no session still selects it.
-    pub fn drop_database(&self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
+    /// Drops a logical database once no session is running a statement on it
+    /// or holding a transaction open on it, waiting at most `wait` for them.
+    ///
+    /// A session that merely has the database selected holds nothing up: its
+    /// next statement on the database answers 1049, and the files are removed
+    /// while it still holds them open, which Unix lets it do without either
+    /// side seeing the other.
+    pub fn drop_database(
+        &self,
+        requested_name: &str,
+        wait: std::time::Duration,
+    ) -> Result<(), MySqlDatabaseError> {
+        let users = self
+            .lock()?
+            .users_of_a_ready_database(requested_name)
+            .map_err(MySqlDatabaseError::from)?;
+        let dropping = users.wait_to_drop(wait).map_err(|error| match error {
+            DropWaitError::AlreadyDropped => {
+                MySqlDatabaseError::DatabaseNotFound(requested_name.to_owned())
+            }
+            DropWaitError::TimedOut => MySqlDatabaseError::DatabaseBusy(requested_name.to_owned()),
+        })?;
         self.lock()?
             .drop_database(requested_name)
-            .map_err(MySqlDatabaseError::from)
+            .map_err(MySqlDatabaseError::from)?;
+        dropping.finish();
+        Ok(())
     }
 
     /// List ready logical databases in canonical order.
@@ -440,10 +462,27 @@ impl MySqlDatabaseSession {
             }
             MySqlAdminCommand::DropDatabase { name } => {
                 let database = name.into_string();
-                if self.selected_database() == Some(database.as_str()) {
-                    return Err(MySqlDatabaseError::DatabaseBusy(database));
+                // Measured on MySQL 8.4.11: `DROP DATABASE` commits the
+                // session's transaction first, whichever database it names.
+                if let Ok(connection) = self.connection() {
+                    connection
+                        .execute_transaction_command("COMMIT")
+                        .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?;
                 }
-                self.catalog.drop_database(&database)?;
+                let drops_its_own = self.selected_database() == Some(database.as_str());
+                if drops_its_own {
+                    if let Some(selected) = &self.selected {
+                        selected.connection.stop_using_the_database();
+                    }
+                }
+                self.catalog
+                    .drop_database(&database, Self::DROP_DATABASE_WAIT)?;
+                // Measured on MySQL 8.4.11: the session that drops the
+                // database it is in is left in none, `DATABASE()` answering
+                // NULL.
+                if drops_its_own {
+                    self.selected = None;
+                }
                 Ok(MySqlAdminCommandResult::Dropped { database })
             }
             MySqlAdminCommand::ShowCreateDatabase {
@@ -468,6 +507,24 @@ impl MySqlDatabaseSession {
         }
     }
 
+    /// How long a `DROP DATABASE` waits for the sessions using the database:
+    /// MySQL's `lock_wait_timeout` starts at a year, and no session here can
+    /// set it lower.
+    const DROP_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(31_536_000);
+
+    /// The selected database's name when another session has dropped it.
+    ///
+    /// Measured on MySQL 8.4.11: a session keeps the name of a database
+    /// another session drops as its own, `DATABASE()` answering it and every
+    /// statement on it answering 1049, and reads the new database once one is
+    /// made under that name — which selecting the name again does here.
+    pub fn dropped_database(&self) -> Option<&str> {
+        self.selected
+            .as_ref()
+            .filter(|selected| selected.connection.database_was_dropped())
+            .map(|selected| selected.name.as_str())
+    }
+
     /// Select a ready database, preserving the prior selection if opening fails.
     pub fn select_database(&mut self, requested_name: &str) -> Result<(), MySqlDatabaseError> {
         let canonical_name = canonicalize_database_name(requested_name)?;
@@ -479,6 +536,9 @@ impl MySqlDatabaseSession {
             let io = Arc::clone(&catalog.io);
             let collation = catalog
                 .shared_collation(&canonical_name)
+                .map_err(MySqlDatabaseError::from)?;
+            let users = catalog
+                .users_of_a_ready_database(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
             let connection = database
                 .connect()
@@ -493,7 +553,8 @@ impl MySqlDatabaseSession {
                 )
                 .map_err(|_| MySqlDatabaseError::ConnectionUnavailable)?
                 .with_wal_keeper(self.catalog.wal_keeper.handle(), Arc::downgrade(&database))
-                .with_database_collation(collation.clone());
+                .with_database_collation(collation.clone())
+                .with_database_user(DatabaseUser::new(users, canonical_name.clone()));
             connection.set_last_insert_id(self.last_insert_id);
             SelectedDatabase {
                 name: canonical_name,
@@ -529,17 +590,24 @@ impl MySqlDatabaseSession {
     }
 
     /// Return the selected connection for checked MySQL statement execution.
+    ///
+    /// A database another session dropped has no connection to run anything
+    /// on: its files are gone, and a statement on it answers 1049.
     pub fn connection(&self) -> Result<&MySqlConnection, MySqlDatabaseError> {
-        self.selected
+        let selected = self
+            .selected
             .as_ref()
-            .map(|selected| &selected.connection)
-            .ok_or(MySqlDatabaseError::NoDatabaseSelected)
+            .ok_or(MySqlDatabaseError::NoDatabaseSelected)?;
+        if selected.connection.database_was_dropped() {
+            return Err(MySqlDatabaseError::DatabaseNotFound(selected.name.clone()));
+        }
+        Ok(&selected.connection)
     }
 
     /// Resets connection state while retaining the selected logical database.
     pub fn reset_connection(&mut self) -> Result<(), MySqlQueryError> {
-        if let Some(selected) = self.selected.as_ref() {
-            selected.connection.reset_connection()?;
+        if let Ok(connection) = self.connection() {
+            connection.reset_connection()?;
         }
         self.last_insert_id = 0;
         Ok(())
@@ -593,6 +661,9 @@ pub(crate) struct DatabaseCatalog {
     /// The collation of each database a session has selected, shared with
     /// that session's connection.
     shared_collations: BTreeMap<DatabaseName, SharedDatabaseCollation>,
+    /// The connections using each database a session has selected or a
+    /// `DROP DATABASE` has named.
+    users: BTreeMap<DatabaseName, Arc<DatabaseUsers>>,
 }
 
 impl DatabaseCatalog {
@@ -605,6 +676,7 @@ impl DatabaseCatalog {
             registry,
             io,
             shared_collations: BTreeMap::new(),
+            users: BTreeMap::new(),
         })
     }
 
@@ -749,11 +821,29 @@ impl DatabaseCatalog {
         Ok(shared)
     }
 
-    /// Drops a ready logical database after all Core references release it.
+    /// The connections using a ready database, which every connection to it
+    /// shares with a `DROP DATABASE` of it.
+    fn users_of_a_ready_database(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<Arc<DatabaseUsers>, RegistryError> {
+        let name = DatabaseName::parse(requested_name)?;
+        if !self.registry.contains(name.as_str())? {
+            return Err(RegistryError::DatabaseNotFound(name));
+        }
+        Ok(Arc::clone(self.users.entry(name).or_default()))
+    }
+
+    /// Drops a ready logical database, whether or not a session still holds
+    /// it open.
+    ///
+    /// The caller has already waited for every connection using it; one that
+    /// merely holds it stops being able to use it once the drop is recorded.
     pub(crate) fn drop_database(&mut self, requested_name: &str) -> Result<(), RegistryError> {
         self.registry.drop_database(requested_name)?;
-        self.shared_collations
-            .remove(&DatabaseName::parse(requested_name)?);
+        let name = DatabaseName::parse(requested_name)?;
+        self.shared_collations.remove(&name);
+        self.users.remove(&name);
         Ok(())
     }
 
@@ -821,6 +911,7 @@ mod tests {
     use crate::schema_sql::{CharacterSet, Collation, SchemaSqlMode};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
     use turso_core::{Result as CoreResult, Value};
 
     fn private_tempdir() -> tempfile::TempDir {
@@ -906,8 +997,11 @@ mod tests {
         Ok(())
     }
 
+    /// The files go while a connection still holds them open, and neither
+    /// the connection nor the database made again under the name sees the
+    /// other: Unix keeps a removed file for whoever has it open.
     #[test]
-    fn core_connection_keeps_drop_busy_until_released() -> CoreResult<()> {
+    fn a_connection_holding_a_dropped_database_keeps_its_files_to_itself() -> CoreResult<()> {
         let directory = private_tempdir();
         let mut catalog = DatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -916,14 +1010,34 @@ mod tests {
             .map_err(|_| turso_core::LimboError::InternalError("create database".into()))?;
         let connection = open_connection(&database)?;
         drop(database);
-        assert!(matches!(
-            catalog.drop_database("busy"),
-            Err(RegistryError::DatabaseBusy(_))
-        ));
-        drop(connection);
+        connection.execute("CREATE TABLE records (id INT)")?;
+        connection.execute("INSERT INTO records (id) VALUES (1)")?;
+        let files_before = fs::read_dir(directory.path()).unwrap().count();
         catalog
             .drop_database("busy")
             .map_err(|_| turso_core::LimboError::InternalError("drop database".into()))?;
+        assert!(fs::read_dir(directory.path()).unwrap().count() < files_before);
+        assert!(!catalog.contains("busy").unwrap());
+
+        let (_, again) = catalog
+            .create("busy")
+            .map_err(|_| turso_core::LimboError::InternalError("create again".into()))?;
+        let fresh = open_connection(&again)?;
+        fresh.execute("CREATE TABLE records (id INT)")?;
+        fresh.execute("INSERT INTO records (id) VALUES (2)")?;
+        connection.execute("INSERT INTO records (id) VALUES (3)")?;
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM records ORDER BY id")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(3)]]
+        );
+        assert_eq!(
+            fresh
+                .prepare_select("SELECT id FROM records")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(2)]]
+        );
         Ok(())
     }
 
@@ -1118,10 +1232,19 @@ mod tests {
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(7), Value::from_text("kept")]]
         );
-        assert!(matches!(
-            catalog.drop_database("reports"),
-            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "reports"
-        ));
+        // Neither session is running a statement or holding a transaction,
+        // so neither holds the drop up; each keeps the name and has nothing
+        // left to run a statement on.
+        catalog
+            .drop_database("reports", Duration::ZERO)
+            .map_err(|_| turso_core::LimboError::InternalError("drop database".into()))?;
+        for session in [&writer, &reader] {
+            assert_eq!(session.selected_database(), Some("reports"));
+            assert!(matches!(
+                session.connection(),
+                Err(MySqlDatabaseError::DatabaseNotFound(name)) if name == "reports"
+            ));
+        }
         Ok(())
     }
 
@@ -1508,12 +1631,9 @@ mod tests {
             .map_err(|_| turso_core::LimboError::InternalError("select second".into()))?;
         assert_eq!(session.selected_database(), Some("second"));
         catalog
-            .drop_database("first")
+            .drop_database("first", Duration::ZERO)
             .map_err(|_| turso_core::LimboError::InternalError("drop first".into()))?;
-        assert!(matches!(
-            catalog.drop_database("second"),
-            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "second"
-        ));
+        assert!(session.connection().is_ok());
         Ok(())
     }
 
@@ -1539,10 +1659,6 @@ mod tests {
             .connection()
             .map_err(|_| turso_core::LimboError::InternalError("selected connection".into()))?
             .execute("CREATE TABLE still_selected (id INT)")?;
-        assert!(matches!(
-            catalog.drop_database("kept"),
-            Err(MySqlDatabaseError::DatabaseBusy(name)) if name == "kept"
-        ));
         Ok(())
     }
 
@@ -1763,8 +1879,12 @@ mod tests {
         assert_eq!(catalog.list().unwrap(), vec!["kept"]);
     }
 
+    /// Measured on MySQL 8.4.11: the session that drops the database it is
+    /// in is left in none; another session in it keeps its name, answers
+    /// 1049 for anything on it, and reads the new database once one is made
+    /// under the name.
     #[test]
-    fn two_sessions_keep_selected_database_busy_for_drop() {
+    fn two_sessions_in_a_database_one_of_them_drops() {
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
         let mut first = catalog.new_session(binary_context());
@@ -1774,15 +1894,88 @@ mod tests {
             .unwrap();
         first.execute_admin_command("USE shared").unwrap();
         second.execute_admin_command("USE SHARED").unwrap();
+        second
+            .connection()
+            .unwrap()
+            .execute("CREATE TABLE before_the_drop (id INT)")
+            .unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             first.execute_admin_command("DROP DATABASE shared"),
-            Err(MySqlAdminCommandError::Database(
-                MySqlDatabaseError::DatabaseBusy(name)
-            )) if name == "shared"
-        ));
-        assert_eq!(first.selected_database(), Some("shared"));
+            Ok(MySqlAdminCommandResult::Dropped {
+                database: "shared".to_owned()
+            })
+        );
+        assert_eq!(first.selected_database(), None);
         assert_eq!(second.selected_database(), Some("shared"));
-        assert_eq!(catalog.list().unwrap(), vec!["shared"]);
+        assert!(matches!(
+            second.connection(),
+            Err(MySqlDatabaseError::DatabaseNotFound(name)) if name == "shared"
+        ));
+        assert!(catalog.list().unwrap().is_empty());
+        assert!(matches!(
+            second.execute_admin_command("USE shared"),
+            Err(MySqlAdminCommandError::Database(MySqlDatabaseError::DatabaseNotFound(name)))
+                if name == "shared"
+        ));
+        assert_eq!(second.selected_database(), Some("shared"));
+        assert_eq!(second.dropped_database(), Some("shared"));
+        assert!(second.connection().is_err());
+
+        first
+            .execute_admin_command("CREATE DATABASE shared")
+            .unwrap();
+        second.select_database("shared").unwrap();
+        assert_eq!(second.dropped_database(), None);
+        assert!(second
+            .connection()
+            .unwrap()
+            .list_tables()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A transaction left open on a database holds a drop of it up until it
+    /// ends, and a drop that waits longer than it was given answers busy and
+    /// leaves the database as it was.
+    #[test]
+    fn a_drop_waits_for_an_open_transaction() {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        catalog.create("held").unwrap();
+        let mut holder = catalog.new_session(binary_context());
+        holder.select_database("held").unwrap();
+        let connection = holder.connection().unwrap().clone();
+        connection
+            .execute("CREATE TABLE rows_held (id INT)")
+            .unwrap();
+        connection.start_a_statement().unwrap();
+        connection.execute_transaction_command("BEGIN").unwrap();
+        connection
+            .execute("INSERT INTO rows_held (id) VALUES (1)")
+            .unwrap();
+        connection.finish_a_statement();
+
+        assert_eq!(
+            catalog.drop_database("held", Duration::from_millis(20)),
+            Err(MySqlDatabaseError::DatabaseBusy("held".to_owned()))
+        );
+        assert!(holder.connection().is_ok());
+
+        let committer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            connection.start_a_statement().unwrap();
+            connection.execute_transaction_command("COMMIT").unwrap();
+            connection.finish_a_statement();
+        });
+        catalog
+            .drop_database("held", Duration::from_secs(60))
+            .unwrap();
+        committer.join().unwrap();
+        assert!(holder.connection().is_err());
+        assert!(matches!(
+            catalog.drop_database("held", Duration::ZERO),
+            Err(MySqlDatabaseError::DatabaseNotFound(name)) if name == "held"
+        ));
     }
 }

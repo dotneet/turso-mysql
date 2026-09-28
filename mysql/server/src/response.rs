@@ -328,6 +328,8 @@ pub enum FrontendErrorKind {
     DuplicateDatabase,
     /// An `ALTER DATABASE` named a database that is not there.
     NoDatabaseToAlter,
+    /// A `DROP DATABASE` named a database that is not there.
+    NoDatabaseToDrop,
     /// A statement named a collation MySQL does not have.
     UnknownCollation,
     /// A statement named a character set MySQL does not have.
@@ -337,7 +339,9 @@ pub enum FrontendErrorKind {
     CollationOfAnotherCharacterSet,
     /// A statement named two different character sets for one thing.
     ConflictingCharacterSets,
-    /// A logical database cannot be changed while another session retains it.
+    /// A session waited longer than it would for a lock another session
+    /// holds, a `DROP DATABASE` waiting for the sessions using the database
+    /// among them.
     DatabaseBusy,
     /// A catalog or storage failure whose details must not reach the client.
     Internal,
@@ -471,6 +475,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::NoDatabaseToAlter => {
             (3503, *b"42Y07", b"Database doesn't exist".as_slice())
         }
+        FrontendErrorKind::NoDatabaseToDrop => (
+            1008,
+            *b"HY000",
+            b"Can't drop database; database doesn't exist".as_slice(),
+        ),
         FrontendErrorKind::UnknownCollation => (1273, *b"HY000", b"Unknown collation".as_slice()),
         FrontendErrorKind::UnknownCharacterSet => {
             (1115, *b"42000", b"Unknown character set".as_slice())
@@ -2626,6 +2635,7 @@ mod tests {
             (FrontendErrorKind::NoDatabaseSelected, 1046, *b"3D000"),
             (FrontendErrorKind::DuplicateDatabase, 1007, *b"HY000"),
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
+            (FrontendErrorKind::NoDatabaseToDrop, 1008, *b"HY000"),
             (FrontendErrorKind::SerializationFailure, 1213, *b"40001"),
             (FrontendErrorKind::IncorrectUserLockName, 3057, *b"42000"),
             (FrontendErrorKind::NotUniqueTable, 1066, *b"42000"),
