@@ -8209,7 +8209,7 @@ fn render_scalar_call(
         // NULL for the whole call; `||` is the operator that agrees.
         return Ok(format!(
             "({})",
-            render_scalar_arguments(function, render_context)?.replace(", ", " || ")
+            rendered_scalar_arguments(function, render_context)?.join(" || ")
         ));
     } else if name.value.eq_ignore_ascii_case("LEFT") {
         return Ok(format!(
@@ -9283,6 +9283,13 @@ fn render_scalar_arguments(
     function: &sqlparser::ast::Function,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    Ok(rendered_scalar_arguments(function, render_context)?.join(", "))
+}
+
+fn rendered_scalar_arguments(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Vec<String>, ParseError> {
     let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
         unreachable!("a checked scalar call was checked to have an argument list");
     };
@@ -9308,8 +9315,7 @@ fn render_scalar_arguments(
                 _ => render_scalar_argument_expr(expr),
             }
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|arguments| arguments.join(", "))
+        .collect()
 }
 
 fn checked_arithmetic_sql_operator(operator: &BinaryOperator) -> &'static str {

@@ -268,6 +268,31 @@ fn concat_ws_skips_a_null_part_and_keeps_an_empty_one() {
     );
 }
 
+/// A written `', '` between two columns is written into the answer as it
+/// reads — the rendering once turned it into the engine's `||` — whether the
+/// answer is read or written into a column.
+#[test]
+fn concat_keeps_a_written_comma_and_space() {
+    let (_directory, mut adapter) = adapter();
+    let sql =
+        "SELECT CONCAT(a, ', ', b), CONCAT(b, ', ', ', ') FROM s WHERE id IN (1, 2, 3) ORDER BY id";
+    assert_eq!(
+        rows(&mut adapter, sql),
+        expected(&[
+            &[Some("www.mysql.com, x"), Some("x, , ")],
+            &[Some(", "), Some(", , ")],
+            &[None, Some("y, , ")],
+        ])
+    );
+    adapter
+        .execute_query("UPDATE s SET b = CONCAT(a, ', ', b) WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        rows(&mut adapter, "SELECT b FROM s WHERE id = 1"),
+        expected(&[&[Some("www.mysql.com, x")]])
+    );
+}
+
 #[test]
 fn substring_answers_nothing_where_mysql_does() {
     let (_directory, mut adapter) = adapter();
