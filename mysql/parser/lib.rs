@@ -176,7 +176,8 @@ pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
 };
 pub use show_server_activity::{
-    parse_optional_show_processlist, parse_optional_show_status, MySqlShowStatusCommand,
+    parse_optional_show_processlist, parse_optional_show_status,
+    parse_optional_status_counter_read, MySqlShowStatusCommand, MySqlStatusCounterRead,
 };
 pub use show_stored_programs::{
     parse_optional_show_stored_programs, MySqlShowStoredProgramsCommand, MySqlStoredProgramKind,

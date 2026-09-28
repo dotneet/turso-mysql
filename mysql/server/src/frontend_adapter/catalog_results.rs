@@ -3982,30 +3982,16 @@ pub(super) fn histogram_listing_result(
 /// build leaves out. Measured on MySQL 8.4.11: each is the server's whether
 /// the session or the global scope is asked, the rows come in name order, and
 /// the columns are `SHOW VARIABLES`' own, read from `session_status` or
-/// `global_status`.
-///
-/// `Uptime` counts from when this server opened its databases, and
-/// `Uptime_since_flush_status` with it, `FLUSH STATUS` being refused here.
-/// `Threads_connected` counts the sessions that have logged in, where MySQL
-/// also counts a connection still in its handshake. A session the runtime
-/// did not accept is not counted, and refuses it.
+/// `global_status`. A session the runtime did not accept has no reading of
+/// `Threads_connected`, and refuses it.
 pub(super) fn show_status_result(
     command: &MySqlShowStatusCommand,
     sessions: &MySqlSessionRegistry,
     counted: bool,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-    let uptime = sessions.uptime().as_secs().to_string();
-    let counters = [
-        (
-            "Threads_connected",
-            counted.then(|| sessions.logged_in().to_string()),
-        ),
-        ("Uptime", Some(uptime.clone())),
-        ("Uptime_since_flush_status", Some(uptime)),
-    ];
     let mut rows = Vec::new();
-    for (name, value) in counters {
+    for (name, value) in kept_status_counters(sessions, counted) {
         if !command.selects(name) {
             continue;
         }
@@ -4024,6 +4010,67 @@ pub(super) fn show_status_result(
         warnings: 0,
         status_flags,
     }))
+}
+
+/// Answers the read of one status counter's value out of
+/// `performance_schema.session_status` or `global_status` — Laravel's
+/// `db:show` counts the connections this way — for a counter this server
+/// keeps, and refuses one it does not rather than answering no row for it.
+///
+/// Measured on MySQL 8.4.11, over both protocols: the counter's name is
+/// matched without regard to case, and the one column is a nullable
+/// `VAR_STRING` of 4096 named after its alias, whose origin is the table's
+/// `VARIABLE_VALUE`.
+pub(super) fn status_counter_read_result(
+    read: &MySqlStatusCounterRead,
+    sessions: &MySqlSessionRegistry,
+    counted: bool,
+    status_flags: u16,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let (_, value) = kept_status_counters(sessions, counted)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(read.counter()))
+        .ok_or(FrontendErrorKind::Unsupported)?;
+    let value = value.ok_or(FrontendErrorKind::Unsupported)?;
+    let table = match read.scope() {
+        MySqlVariableScope::Session => "session_status",
+        MySqlVariableScope::Global => "global_status",
+    };
+    let mut column = ColumnDefinitionConfig::new(read.column_name(), MYSQL_TYPE_VAR_STRING);
+    column.schema = "performance_schema".into();
+    column.table = table.into();
+    column.original_table = table.into();
+    column.original_name = "VARIABLE_VALUE".into();
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = 4096;
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column],
+        rows: vec![vec![Some(value.into_bytes())]],
+        warnings: 0,
+        status_flags,
+    }))
+}
+
+/// The status counters this server keeps, by name, and what each reads.
+///
+/// `Uptime` counts from when this server opened its databases, and
+/// `Uptime_since_flush_status` with it, `FLUSH STATUS` being refused here.
+/// `Threads_connected` counts the sessions that have logged in, where MySQL
+/// also counts a connection still in its handshake. A session the runtime
+/// did not accept is not counted, and has no reading of it.
+fn kept_status_counters(
+    sessions: &MySqlSessionRegistry,
+    counted: bool,
+) -> [(&'static str, Option<String>); 3] {
+    let uptime = sessions.uptime().as_secs().to_string();
+    [
+        (
+            "Threads_connected",
+            counted.then(|| sessions.logged_in().to_string()),
+        ),
+        ("Uptime", Some(uptime.clone())),
+        ("Uptime_since_flush_status", Some(uptime)),
+    ]
 }
 
 /// Answers `SHOW [FULL] PROCESSLIST` with the sessions of the asking account.

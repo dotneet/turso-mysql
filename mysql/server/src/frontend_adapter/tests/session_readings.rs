@@ -491,3 +491,74 @@ fn status_answers_the_counters_this_server_keeps() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// Laravel's `db:show` counts the connections by reading one counter out of
+/// `performance_schema`, prepared. Measured on MySQL 8.4.11 over both
+/// protocols: the counter is named without regard to case, and the one
+/// column is a nullable `VAR_STRING` of 4096 named after its alias, whose
+/// origin is `performance_schema.session_status.VARIABLE_VALUE`. A counter
+/// this server does not keep is refused rather than answered with no row,
+/// which MySQL answers only for a name it has not got.
+#[test]
+fn laravel_counts_the_connections_out_of_performance_schema() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("app"));
+    let (_directory, catalog, _factory) = catalog_factory(authorizer);
+    let _first = listed_session(&catalog, "app", 7, 40000);
+    let _second = listed_session(&catalog, "reader", 8, 40001);
+    let mut asking = listed_session(&catalog, "app", 9, 40002);
+    asking.execute_init_db("reports").unwrap();
+    let laravel = "select variable_value as `Value` from performance_schema.session_status where variable_name = 'threads_connected'";
+    let text = answered(&mut asking, laravel);
+    assert_eq!(text.rows, [[Some(b"3".to_vec())]]);
+    let [column] = text.columns.as_slice() else {
+        panic!("one column");
+    };
+    assert_eq!(
+        (
+            column.name.as_str(),
+            column.original_name.as_str(),
+            column.table.as_str(),
+            column.original_table.as_str(),
+            column.schema.as_str(),
+            column.column_length,
+            column.flags,
+            column.column_type,
+        ),
+        (
+            "Value",
+            "VARIABLE_VALUE",
+            "session_status",
+            "session_status",
+            "performance_schema",
+            4096,
+            0,
+            MYSQL_TYPE_VAR_STRING
+        )
+    );
+    let statement = asking.execute_stmt_prepare(laravel).unwrap();
+    assert_eq!(statement.columns, text.columns);
+    let Ok(PreparedStatementExecutionResult::ResultSet(binary)) =
+        asking.execute_stmt_execute(statement.statement_id, &[])
+    else {
+        panic!("the prepared read must answer a row");
+    };
+    assert_eq!(binary.rows, [[BinaryResultValue::Text("3".to_owned())]]);
+
+    let uptime = answered(
+        &mut asking,
+        "SELECT VARIABLE_VALUE FROM performance_schema.global_status WHERE VARIABLE_NAME = 'Uptime'",
+    );
+    assert_eq!(uptime.columns[0].name, "VARIABLE_VALUE");
+    assert_eq!(uptime.columns[0].table, "global_status");
+    for sql in [
+        "select variable_value from performance_schema.session_status where variable_name = 'Questions'",
+        "select * from performance_schema.session_status where variable_name = 'Uptime'",
+    ] {
+        assert_eq!(query(&mut asking, sql), Err(FrontendErrorKind::Unsupported), "{sql}");
+        assert_eq!(
+            asking.execute_stmt_prepare(sql),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}

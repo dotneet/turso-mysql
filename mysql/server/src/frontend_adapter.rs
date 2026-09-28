@@ -89,13 +89,15 @@ use turso_mysql_parser::{
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
     parse_optional_truncate_table, parse_select, MySqlHistogramQuery,
     MySqlShowCharacterSetsCommand, MySqlShowListingFilter, MySqlShowStatusCommand,
-    MySqlShowValueTest, MySqlStoredProgramKind, MySqlVariableScope, SessionSqlMode,
+    MySqlShowValueTest, MySqlStatusCounterRead, MySqlStoredProgramKind, MySqlVariableScope,
+    SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
     parse_optional_histogram_query, parse_optional_named_lock_query,
     parse_optional_show_processlist, parse_optional_show_status,
-    parse_optional_show_stored_programs, write_the_current_database_in, MySqlTransactionCommand,
+    parse_optional_show_stored_programs, parse_optional_status_counter_read,
+    write_the_current_database_in, MySqlTransactionCommand,
 };
 
 use crate::connection_facts::MySqlConnectionFacts;
@@ -254,8 +256,8 @@ struct DatabasePreparedStatement {
 enum RunAsText {
     /// No rows: a statement with no parameters, `CREATE TABLE` say.
     NoRows(String),
-    /// The one row a read of what the session knows answers — `DATABASE()`,
-    /// `VERSION()` and system variables.
+    /// The one row a read of what the session or the server knows answers —
+    /// `DATABASE()`, `VERSION()`, system variables and a status counter.
     SessionRead(String),
 }
 
@@ -2331,14 +2333,7 @@ where
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
-        if let Some(read) = self.session_variables.read_session(
-            sql,
-            self.bootstrap_settings,
-            &self.connection_facts,
-            self.session.selected_database(),
-            self.session.session_sql_mode(),
-            self.status_flags(),
-        )? {
+        if let Some(read) = self.read_the_session_or_server(sql)? {
             let CommandExecutionResult::ResultSet(read) = read else {
                 return Err(FrontendErrorKind::Internal);
             };
@@ -2379,6 +2374,38 @@ where
             }
             prepared => prepared,
         }
+    }
+
+    /// Answers a statement reading what the session or the server knows —
+    /// `DATABASE()`, system variables, a status counter — which a prepared
+    /// one answers the way a text one does, or nothing for another statement.
+    fn read_the_session_or_server(
+        &self,
+        sql: &str,
+    ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+        let status_flags = self.status_flags();
+        if let Some(read) = self.session_variables.read_session(
+            sql,
+            self.bootstrap_settings,
+            &self.connection_facts,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+            status_flags,
+        )? {
+            return Ok(Some(read));
+        }
+        let Some(read) = parse_optional_status_counter_read(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        else {
+            return Ok(None);
+        };
+        catalog_results::status_counter_read_result(
+            &read,
+            self.catalog.sessions(),
+            self.listed.is_some(),
+            status_flags,
+        )
+        .map(Some)
     }
 
     /// Answers 1146 for a statement refused while it names a table that is
@@ -2581,6 +2608,16 @@ where
         {
             return catalog_results::show_status_result(
                 &command,
+                self.catalog.sessions(),
+                self.listed.is_some(),
+                status_flags,
+            );
+        }
+        if let Some(read) = parse_optional_status_counter_read(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        {
+            return catalog_results::status_counter_read_result(
+                &read,
                 self.catalog.sessions(),
                 self.listed.is_some(),
                 status_flags,

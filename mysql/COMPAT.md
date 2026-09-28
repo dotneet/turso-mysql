@@ -5345,8 +5345,18 @@ from when this server opened its databases, and `Uptime_since_flush_status`
 with it, `FLUSH STATUS` being refused. `Threads_connected` counts the sessions
 logged in, where MySQL also counts a connection still in its handshake.
 
+`SELECT variable_value [AS alias] FROM performance_schema.session_status WHERE
+variable_name = 'name'` — Laravel's `db:show` counts the connections so — and
+the same read of `global_status` answer one of those three counters, over text
+and prepared: measured on 8.4.11, the name is matched without regard to case,
+and the one column is a nullable `VAR_STRING` of 4096 named after the alias,
+whose origin is the table's `VARIABLE_VALUE`. Any other counter, and any other
+read of those tables, is refused rather than answered with no row, which MySQL
+answers only for a name it has not got.
+
 These calls are read only as a whole `SELECT` of such calls and variables:
-beside a `FROM`, inside an expression or prepared, they are refused. Every
+beside a `FROM` or inside an expression they are refused. Prepared, such a
+`SELECT` is answered as it is over text. Every
 other statement still needs a selected database, which MySQL does not require:
 MySQL runs `SELECT 1` and a bare `SET` with no database at all, and this
 frontend answers 1046 because a query has no Core connection until a database
