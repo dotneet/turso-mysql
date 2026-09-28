@@ -3669,7 +3669,10 @@ database, 1046 without — `SHOW FUNCTION STATUS` and `SHOW PROCEDURE STATUS`
 list no row, there being no stored programs here, in the columns MySQL answers
 them in, original tables included; a filter is taken as `LIKE 'pattern'` or
 the `WHERE Db = 'name'` a dump writes, and any other `WHERE` is refused, being
-a predicate MySQL checks against the listing's columns. The query a dump sends
+a predicate MySQL checks against the listing's columns. MySQL answers 1044 to
+`SHOW EVENTS` from an account without the `EVENT` privilege on the database,
+measured; there is no such privilege here, and the account's permission to
+query the database is what is asked. The query a dump sends
 for every table to learn whether it has histograms,
 `SELECT COLUMN_NAME, JSON_EXTRACT(HISTOGRAM, ...) FROM
 information_schema.COLUMN_STATISTICS WHERE SCHEMA_NAME = ... AND TABLE_NAME =
