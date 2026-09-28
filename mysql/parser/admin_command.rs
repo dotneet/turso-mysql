@@ -211,7 +211,7 @@ fn checked_savepoint_identifier(name: &str) -> Result<String, ParseError> {
 /// The accepted grammar is exactly one of `CREATE DATABASE [IF NOT EXISTS]
 /// name [options]`, `ALTER DATABASE [name] options`, `DROP DATABASE [IF
 /// EXISTS] name`, `SHOW CREATE DATABASE [IF NOT EXISTS] name`, `USE name`, or `SHOW
-/// DATABASES`, `SCHEMA` standing for `DATABASE` in each, followed by an
+/// DATABASES [LIKE 'pattern']`, `SCHEMA` standing for `DATABASE` in each, followed by an
 /// optional semicolon. A versioned comment MySQL runs is read as the text it
 /// holds, which is how `mysqldump` writes its `CREATE DATABASE`. Database
 /// options naming a character set, collation or encryption a database here
@@ -324,7 +324,19 @@ pub fn parse_optional_admin_command(
         AdminStatementKind::Use => MySqlAdminCommand::Use {
             name: consume_admin_database_name(&tokens, &mut cursor)?,
         },
-        AdminStatementKind::ListDatabases => MySqlAdminCommand::ListDatabases,
+        AdminStatementKind::ListDatabases => {
+            if consume_admin_word(&tokens, &mut cursor, "LIKE") {
+                let Some(AdminToken::StringLiteral(pattern)) = tokens.get(cursor) else {
+                    return Err(ParseError::ExpectedAdminCommand);
+                };
+                cursor += 1;
+                MySqlAdminCommand::ListDatabasesLike {
+                    pattern: MySqlLikePattern::new(pattern, mode),
+                }
+            } else {
+                MySqlAdminCommand::ListDatabases
+            }
+        }
     };
 
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {

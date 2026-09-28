@@ -14,7 +14,7 @@
 //! left out before the statement is read.
 
 use crate::statement_reads;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{ColumnOption, ObjectName, ObjectNamePart, Statement, TableConstraint};
 use sqlparser::tokenizer::{Location, Span, Token, TokenWithSpan};
 
 use super::{
@@ -88,7 +88,10 @@ pub fn write_the_current_database_in(
 
 /// Leaves the selected database out of a `SELECT`, `INSERT`, `UPDATE` or
 /// `DELETE` wherever it is written before a table it reads or writes, or
-/// before a table and a column.
+/// before a table and a column; and out of a `CREATE TABLE` or `CREATE INDEX`
+/// before the table it makes or indexes and a table a foreign key names —
+/// Flyway writes ``CREATE TABLE `db`.`flyway_schema_history` `` and measured
+/// on MySQL 8.4.11 that makes the table the bare name makes.
 ///
 /// Answers `None` when there is nothing to leave out, and also when leaving it
 /// out would change what the statement answers: a projected expression other
@@ -122,6 +125,21 @@ pub fn leave_out_the_current_database(
     let Ok(statement) = parse_one_statement(sql, mode) else {
         return Ok(None);
     };
+    if let Some(names) = tables_a_definition_names(&statement) {
+        let mut cuts = Vec::new();
+        for name in names {
+            match name.0.as_slice() {
+                [ObjectNamePart::Identifier(_)] => {}
+                [ObjectNamePart::Identifier(qualifier), ObjectNamePart::Identifier(table)]
+                    if qualifier.value.eq_ignore_ascii_case(database) =>
+                {
+                    cuts.push((qualifier.span.start, table.span.start));
+                }
+                _ => return Ok(None),
+            }
+        }
+        return cut_out(sql, cuts);
+    }
     if !matches!(
         statement,
         Statement::Query(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -164,6 +182,37 @@ pub fn leave_out_the_current_database(
         return Ok(None);
     }
     cuts.extend(column_cuts);
+    cut_out(sql, cuts)
+}
+
+/// The tables a `CREATE TABLE` or `CREATE INDEX` names, or `None` for any
+/// other statement.
+fn tables_a_definition_names(statement: &Statement) -> Option<Vec<&ObjectName>> {
+    match statement {
+        Statement::CreateTable(table) => {
+            let mut names = vec![&table.name];
+            for constraint in &table.constraints {
+                if let TableConstraint::ForeignKey(key) = constraint {
+                    names.push(&key.foreign_table);
+                }
+            }
+            for column in &table.columns {
+                for option in &column.options {
+                    if let ColumnOption::ForeignKey(key) = &option.option {
+                        names.push(&key.foreign_table);
+                    }
+                }
+            }
+            Some(names)
+        }
+        Statement::CreateIndex(index) => Some(vec![&index.table_name]),
+        _ => None,
+    }
+}
+
+/// Leaves out each span of the statement, from the start of one to the start
+/// of the next thing kept, or answers `None` when there are none.
+fn cut_out(sql: &str, mut cuts: Vec<(Location, Location)>) -> Result<Option<String>, ParseError> {
     if cuts.is_empty() {
         return Ok(None);
     }

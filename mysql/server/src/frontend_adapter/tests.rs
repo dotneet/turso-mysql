@@ -21738,7 +21738,13 @@ fn show_databases_has_bounded_protocol_result() {
     assert_eq!(column.name, "Database");
     assert_eq!(column.column_type, MYSQL_TYPE_VAR_STRING);
     assert_eq!(column.character_set, u16::from(DEFAULT_UTF8MB4_COLLATION));
-    assert_eq!(column.column_length, 64);
+    // Measured on MySQL 8.4.11: 256 long, read out of `SCHEMATA`.
+    assert_eq!(column.column_length, 256);
+    assert_eq!(column.table, "SCHEMATA");
+    assert_eq!(
+        column.flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
+    );
     let first_row = crate::TextRowPacket::decode(codec, &frames[3], 1).unwrap();
     assert!(matches!(first_row.values[0], TextRowValue::Bytes(value) if value == b"archive"));
     let second_row = crate::TextRowPacket::decode(codec, &frames[4], 1).unwrap();
@@ -30892,3 +30898,6 @@ mod safe_updates;
 
 #[cfg(unix)]
 mod connector_j_metadata;
+
+#[cfg(unix)]
+mod flyway_startup;

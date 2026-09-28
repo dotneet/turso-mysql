@@ -7008,14 +7008,23 @@ impl MySqlConnection {
                             .map(|column| format!("{column:?}"))
                             .collect(),
                     ));
-                } else {
+                } else if source.catalog().is_none() {
+                    // An `information_schema` table's columns are fixed when
+                    // it is registered, so a reprepare — which switching
+                    // `foreign_key_checks` asks for too — reads it as before.
                     untracked_source = true;
                 }
             }
         }
+        let source_is_catalog = translated.source_table().is_some_and(|table| {
+            translated.source_tables().iter().any(|source| {
+                source.catalog().is_some() && source.table().as_str().eq_ignore_ascii_case(table)
+            })
+        });
         FrozenSelectParser {
             mode,
             source_table: translated.source_table().map(str::to_owned),
+            source_is_catalog,
             checked_comparisons: translated.checked_comparisons().to_vec(),
             typed_statement,
             table_definitions,
@@ -13349,6 +13358,10 @@ fn validate_dml_ordered_columns_with_schema(
 struct FrozenSelectParser {
     mode: SessionSqlMode,
     source_table: Option<String>,
+    /// The table the comparisons were held to is an `information_schema`
+    /// table, whose columns are fixed when it is registered and which has no
+    /// stored definition to read them back from.
+    source_is_catalog: bool,
     checked_comparisons: Vec<CheckedSelectComparison>,
     typed_statement: Option<Stmt>,
     table_definitions: Vec<(String, String)>,
@@ -14096,11 +14109,13 @@ impl ReprepareParser for FrozenDmlParser {
 
 impl ReprepareParser for FrozenSelectParser {
     fn parse(&self, sql: &str, context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
-        validate_frozen_select_comparison_columns(
-            context.schema,
-            self.source_table.as_deref(),
-            &self.checked_comparisons,
-        )?;
+        if !self.source_is_catalog {
+            validate_frozen_select_comparison_columns(
+                context.schema,
+                self.source_table.as_deref(),
+                &self.checked_comparisons,
+            )?;
+        }
         if self.untracked_source {
             return Err(LimboError::ParseError(
                 "prepared SELECT source cannot be checked after a schema change; prepare the statement again".to_string(),

@@ -532,6 +532,154 @@ pub fn parse_optional_connector_j_schemata_listing_query(
     Ok(None)
 }
 
+/// One of the two `performance_schema` reads Flyway makes before every
+/// migration, each written the one way Flyway writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PerformanceSchemaRead {
+    /// `SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE
+    /// variable_name = '<name>'`, whose column is named as the query wrote it.
+    GlobalVariable { column: String, name: String },
+    /// `SELECT variable_name FROM performance_schema.user_variables_by_thread
+    /// WHERE variable_value IS NOT NULL`.
+    UserVariablesOfEveryThread { column: String },
+}
+
+/// Recognizes Flyway 11's `performance_schema` probes, or answers `None`.
+pub fn parse_optional_performance_schema_read(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<PerformanceSchemaRead>, ParseError> {
+    const GLOBAL_VARIABLE: &str = "SELECT VARIABLE_VALUE FROM performance_schema.global_variables \
+        WHERE variable_name = '__NAME__'";
+    const USER_VARIABLES: &str = "SELECT variable_name FROM \
+        performance_schema.user_variables_by_thread WHERE variable_value IS NOT NULL";
+    if !mentions_ignoring_case(sql, "performance_schema") {
+        return Ok(None);
+    }
+    let actual = tokenize_information_schema_query(sql, mode)?;
+    let actual = actual
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    // The column is named as the statement wrote it, the second token.
+    let column = match actual.get(1) {
+        Some(Token::Word(word)) if word.quote_style.is_none() => word.value.clone(),
+        _ => return Ok(None),
+    };
+    for (template, global) in [(GLOBAL_VARIABLE, true), (USER_VARIABLES, false)] {
+        let expected = tokenize_information_schema_query(template, mode)?;
+        let expected = expected
+            .iter()
+            .filter(|token| !matches!(token, Token::Whitespace(_)))
+            .collect::<Vec<_>>();
+        if actual.len() != expected.len() {
+            continue;
+        }
+        let mut name = None;
+        let mut same = true;
+        for (actual, expected) in actual.iter().zip(&expected) {
+            match (expected, actual) {
+                (Token::SingleQuotedString(placeholder), Token::SingleQuotedString(value))
+                    if placeholder == "__NAME__" =>
+                {
+                    name = Some(value.clone());
+                }
+                (expected, actual) if same_catalog_token(actual, expected) => {}
+                _ => {
+                    same = false;
+                    break;
+                }
+            }
+        }
+        if !same {
+            continue;
+        }
+        return Ok(Some(match (global, name) {
+            (true, Some(name)) => PerformanceSchemaRead::GlobalVariable { column, name },
+            (false, None) => PerformanceSchemaRead::UserVariablesOfEveryThread { column },
+            _ => return Ok(None),
+        }));
+    }
+    Ok(None)
+}
+
+/// Flyway's check that a schema holds nothing, which it makes before it
+/// creates its history table and before `clean`: one row from each of six
+/// catalog tables, summed.
+///
+/// Each of the six names the database it reads, written or bound; `None`
+/// stands for a `?` a prepared statement binds, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlywaySchemaEmptinessQuery {
+    schemas: Vec<Option<String>>,
+}
+
+impl FlywaySchemaEmptinessQuery {
+    /// The database each of the six reads names, `None` for one bound later.
+    pub fn schemas(&self) -> &[Option<String>] {
+        &self.schemas
+    }
+
+    /// How many `?` the statement binds.
+    pub fn parameter_count(&self) -> usize {
+        self.schemas
+            .iter()
+            .filter(|schema| schema.is_none())
+            .count()
+    }
+}
+
+/// Recognizes Flyway 11's `MySQLSchema` emptiness check, written as Flyway
+/// writes it with its values substituted or bound.
+pub fn parse_optional_flyway_schema_emptiness_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<FlywaySchemaEmptinessQuery>, ParseError> {
+    const QUERY: &str =
+        "SELECT SUM(found) FROM ((SELECT 1 as found FROM information_schema.tables \
+        WHERE table_schema='__S__') UNION ALL (SELECT 1 as found FROM information_schema.views \
+        WHERE table_schema='__S__' LIMIT 1) UNION ALL (SELECT 1 as found FROM \
+        information_schema.table_constraints WHERE table_schema='__S__' LIMIT 1) UNION ALL \
+        (SELECT 1 as found FROM information_schema.triggers WHERE event_object_schema='__S__'  \
+        LIMIT 1) UNION ALL (SELECT 1 as found FROM information_schema.routines WHERE \
+        routine_schema='__S__' LIMIT 1) UNION ALL (SELECT 1 as found FROM \
+        information_schema.events WHERE event_schema='__S__' LIMIT 1)) as all_found";
+    if !names_information_schema(sql) {
+        return Ok(None);
+    }
+    let actual = tokenize_information_schema_query(sql, mode)?;
+    let expected = tokenize_information_schema_query(QUERY, mode)?;
+    let actual = actual
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let expected = expected
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if actual.len() != expected.len() {
+        return Ok(None);
+    }
+    let mut schemas = Vec::new();
+    for (actual, expected) in actual.into_iter().zip(expected) {
+        match (expected, actual) {
+            (Token::SingleQuotedString(placeholder), Token::SingleQuotedString(schema))
+                if placeholder == "__S__" =>
+            {
+                schemas.push(Some(schema.clone()));
+            }
+            (Token::SingleQuotedString(placeholder), Token::Placeholder(marker))
+                if placeholder == "__S__" && marker == "?" =>
+            {
+                schemas.push(None);
+            }
+            (expected, actual) if same_catalog_token(actual, expected) => {}
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(FlywaySchemaEmptinessQuery { schemas }))
+}
+
 /// Whether a statement names `INFORMATION_SCHEMA` anywhere, which every
 /// Connector/J catalog query does.
 fn names_information_schema(sql: &str) -> bool {

@@ -98,6 +98,9 @@ pub enum MySqlSessionCall {
     User,
     /// `CURRENT_USER()` or `CURRENT_USER`: the account the server matched.
     CurrentUser,
+    /// `SUBSTRING_INDEX(USER(), '@', 1)`: the name the client logged in with,
+    /// without its host, which is how Flyway reads who ran a migration.
+    UserName,
     /// `CONNECTION_ID()`.
     ConnectionId,
     /// `ROW_COUNT()`: what the last statement changed.
@@ -307,6 +310,13 @@ fn take_system_variable_read(
 /// without one, which MySQL names the column after as written.
 fn take_session_call(scanner: &mut Scanner) -> Option<MySqlSessionCall> {
     let start = scanner.cursor;
+    if scanner.take_keyword("SUBSTRING_INDEX") {
+        if take_the_rest_of_the_user_name(scanner).is_some() {
+            return Some(MySqlSessionCall::UserName);
+        }
+        scanner.cursor = start;
+        return None;
+    }
     for (name, call) in [
         ("DATABASE", MySqlSessionCall::Database),
         ("SCHEMA", MySqlSessionCall::Database),
@@ -336,6 +346,25 @@ fn take_session_call(scanner: &mut Scanner) -> Option<MySqlSessionCall> {
         return None;
     }
     None
+}
+
+/// Reads the rest of `SUBSTRING_INDEX(USER(), '@', 1)`, the one spelling of
+/// the call this answers.
+fn take_the_rest_of_the_user_name(scanner: &mut Scanner) -> Option<()> {
+    scanner.skip_gaps();
+    scanner.take_byte(b'(').then_some(())?;
+    scanner.skip_gaps();
+    (take_session_call(scanner)? == MySqlSessionCall::User).then_some(())?;
+    scanner.skip_gaps();
+    scanner.take_byte(b',').then_some(())?;
+    scanner.skip_gaps();
+    (scanner.take_nullable_string()?? == "@").then_some(())?;
+    scanner.skip_gaps();
+    scanner.take_byte(b',').then_some(())?;
+    scanner.skip_gaps();
+    (scanner.take_word()? == "1").then_some(())?;
+    scanner.skip_gaps();
+    scanner.take_byte(b')').then_some(())
 }
 
 /// Reads the rest of `CONVERT_TZ('<moment>', from, to) IS NOT NULL`.
@@ -1101,6 +1130,14 @@ mod tests {
                 (Some(MySqlSessionCall::RowCount), "ROW_COUNT()".to_owned()),
                 (Some(MySqlSessionCall::FoundRows), "FOUND_ROWS()".to_owned()),
             ]
+        );
+        // Flyway's reading of who is running a migration.
+        assert_eq!(
+            calls("SELECT SUBSTRING_INDEX(USER(),'@',1)"),
+            [(
+                Some(MySqlSessionCall::UserName),
+                "SUBSTRING_INDEX(USER(),'@',1)".to_owned()
+            )]
         );
         // A bare name is a column, and a call with an argument is not one of
         // these.

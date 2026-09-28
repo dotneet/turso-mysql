@@ -79,10 +79,12 @@ pub use information_schema::{
     is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
     parse_connector_j_foreign_keys, parse_optional_connector_j_information_schema_query,
     parse_optional_connector_j_schemata_listing_query,
+    parse_optional_flyway_schema_emptiness_query,
     parse_optional_gorm_information_schema_prepared_query,
-    parse_optional_laravel_information_schema_query, ConnectorJForeignKey,
-    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery, ConnectorJTables,
-    GormInformationSchemaPreparedQuery, LaravelInformationSchemaQuery, LaravelSchema,
+    parse_optional_laravel_information_schema_query, parse_optional_performance_schema_read,
+    ConnectorJForeignKey, ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
+    ConnectorJTables, FlywaySchemaEmptinessQuery, GormInformationSchemaPreparedQuery,
+    LaravelInformationSchemaQuery, LaravelSchema, PerformanceSchemaRead,
 };
 use mysql_ddl::render_mysql_column;
 pub use prisma_catalog::{
@@ -2338,6 +2340,12 @@ pub enum MySqlAdminCommand {
     Use { name: MySqlDatabaseName },
     /// List the logical databases visible to this session.
     ListDatabases,
+    /// List the visible databases whose names a pattern matches.
+    ///
+    /// Measured on MySQL 8.4.11 with `lower_case_table_names=1`: the pattern
+    /// matches a name by its case, as `SHOW TABLES LIKE` does and unlike every
+    /// other `SHOW ... LIKE` — `LIKE 'TURSO%'` finds no `turso_oracle`.
+    ListDatabasesLike { pattern: MySqlLikePattern },
 }
 
 impl MySqlAdminCommand {
@@ -2349,7 +2357,7 @@ impl MySqlAdminCommand {
             | Self::ShowCreateDatabase { name, .. }
             | Self::Use { name } => Some(name),
             Self::AlterDatabase { name, .. } => name.as_ref(),
-            Self::ListDatabases => None,
+            Self::ListDatabases | Self::ListDatabasesLike { .. } => None,
         }
     }
 }
@@ -2607,6 +2615,14 @@ pub struct MySqlShowVariablesCommand {
 }
 
 impl MySqlShowVariablesCommand {
+    /// `SHOW [GLOBAL | SESSION] VARIABLES` with no pattern: every variable.
+    pub fn every(scope: MySqlVariableScope) -> Self {
+        Self {
+            scope,
+            pattern: None,
+        }
+    }
+
     /// Returns the scope the command was written with.
     pub fn scope(&self) -> MySqlVariableScope {
         self.scope

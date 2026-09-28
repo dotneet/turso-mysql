@@ -273,6 +273,9 @@ enum RunAsText {
     /// A `SET` of session settings whose values are bound, run with the
     /// bound whole numbers written in.
     SessionSettings(turso_mysql_parser::SessionSettingsWithParameters),
+    /// Flyway's check that a schema holds nothing, for the databases it
+    /// names or binds.
+    FlywaySchemaEmptiness(turso_mysql_parser::FlywaySchemaEmptinessQuery),
 }
 
 #[cfg(unix)]
@@ -1422,11 +1425,18 @@ where
                     }
                 }
             }
-            MySqlAdminCommand::ListDatabases => {
+            MySqlAdminCommand::ListDatabases | MySqlAdminCommand::ListDatabasesLike { .. } => {
                 self.authorize(DatabaseAction::List)?;
             }
         }
 
+        // MySQL names the listing after the pattern it was asked for.
+        let listing_heading = match &command {
+            MySqlAdminCommand::ListDatabasesLike { pattern } => {
+                Some(format!("Database ({})", pattern.text()))
+            }
+            _ => None,
+        };
         let alters = matches!(command, MySqlAdminCommand::AlterDatabase { .. });
         let drops = matches!(command, MySqlAdminCommand::DropDatabase { .. });
         let result = match self.session.execute_parsed_admin_command(command) {
@@ -1471,7 +1481,17 @@ where
                 ..CommandOkResult::default()
             }));
         }
-        admin_result_to_execution_result(result)
+        let mut answered = admin_result_to_execution_result(result)?;
+        if let (Some(heading), CommandExecutionResult::ResultSet(listed)) =
+            (listing_heading, &mut answered)
+        {
+            let [column] = listed.columns.as_mut_slice() else {
+                return Err(FrontendErrorKind::Internal);
+            };
+            column.name.clone_from(&heading);
+            column.original_name = heading;
+        }
+        Ok(answered)
     }
     fn prepare_gorm_catalog_query(
         &mut self,
@@ -1893,6 +1913,82 @@ where
             return Err(FrontendErrorKind::Internal);
         };
         catalog_results::laravel_catalog_rows(query, read.rows)
+    }
+
+    /// Answers Flyway's emptiness check: one row for each table and view of
+    /// the database, and one more for each of its views, constraints,
+    /// triggers, routines and events that holds at least one — NULL when all
+    /// six are empty, as the `SUM` of no rows is.
+    ///
+    /// Each of the six names a database, and this answers for the selected
+    /// one alone: the catalog tables list that database's objects, so a
+    /// count over another would say it is empty whether or not it is.
+    fn flyway_schema_emptiness_result(
+        &mut self,
+        schemas: &[String],
+    ) -> Result<TextResultSet, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        let [tables, views, constraints, triggers, routines, events] = schemas else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        if [tables, views, constraints, triggers, routines, events]
+            .iter()
+            .any(|schema| **schema != selected_database)
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        let written = selected_database.replace('\\', "\\\\").replace('\'', "''");
+        let mut count = |sql: String| -> Result<u64, FrontendErrorKind> {
+            let CommandExecutionResult::ResultSet(read) = self.execute_query_statement(&sql)?
+            else {
+                return Err(FrontendErrorKind::Internal);
+            };
+            match read.rows.as_slice() {
+                [row] => match row.as_slice() {
+                    [Some(digits)] => std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|digits| digits.parse::<u64>().ok())
+                        .ok_or(FrontendErrorKind::Internal),
+                    _ => Err(FrontendErrorKind::Internal),
+                },
+                _ => Err(FrontendErrorKind::Internal),
+            }
+        };
+        let mut found = count(format!(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{written}'"
+        ))?;
+        for catalog in ["views", "table_constraints", "routines"] {
+            let column = if catalog == "routines" {
+                "routine_schema"
+            } else {
+                "table_schema"
+            };
+            found += u64::from(
+                count(format!(
+                    "SELECT COUNT(*) FROM information_schema.{catalog} WHERE {column} = '{written}'"
+                ))? > 0,
+            );
+        }
+        // MySQL lists a trigger to a session holding the TRIGGER privilege on
+        // its table, which a session here holds only through the whole
+        // database. Events are refused here, so a database holds none.
+        if self.authorize_catalog_visibility(&selected_database)? == CatalogVisibility::All {
+            let triggers = self
+                .session
+                .connection()
+                .map_err(database_error_kind)?
+                .list_triggers()
+                .map_err(|_| FrontendErrorKind::Internal)?;
+            found += u64::from(!triggers.is_empty());
+        }
+        Ok(catalog_results::flyway_schema_emptiness_text_result(
+            (found > 0).then_some(found),
+            self.status_flags(),
+        ))
     }
 
     fn execute_connector_j_catalog_query(
@@ -2987,6 +3083,23 @@ where
         {
             return self.prepare_gorm_catalog_query(query, sql);
         }
+        if let Some(query) = turso_mysql_parser::parse_optional_flyway_schema_emptiness_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let parameter_count = query.parameter_count();
+            let mut prepared = self.prepare_text_statement(
+                sql,
+                RunAsText::FlywaySchemaEmptiness(query),
+                vec![catalog_results::flyway_schema_emptiness_column()],
+            )?;
+            prepared.parameters = (1..=parameter_count)
+                .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
+                .collect();
+            return Ok(prepared);
+        }
         if let Some(query) = turso_mysql_parser::parse_optional_prisma_information_schema_query(
             sql,
             self.session.session_sql_mode(),
@@ -3390,6 +3503,22 @@ where
             return Ok(CommandExecutionResult::ResultSet(
                 catalog_results::laravel_catalog_text_result(&query, rows, status_flags),
             ));
+        }
+        if let Some(query) = turso_mysql_parser::parse_optional_flyway_schema_emptiness_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let schemas = query
+                .schemas()
+                .iter()
+                .cloned()
+                .collect::<Option<Vec<_>>>()
+                .ok_or(FrontendErrorKind::Syntax)?;
+            return self
+                .flyway_schema_emptiness_result(&schemas)
+                .map(CommandExecutionResult::ResultSet);
         }
         // The one written shape this recognized before the engine could scan
         // the table still answers it, because it takes a `WHERE TABLE_SCHEMA =
@@ -4305,6 +4434,24 @@ where
                             self.status_flags(),
                         ),
                     ))
+                }
+                RunAsText::FlywaySchemaEmptiness(query) => {
+                    let mut bound = self
+                        .bound_words(
+                            statement_id,
+                            parameter_payload,
+                            long_data,
+                            query.parameter_count(),
+                        )?
+                        .into_iter();
+                    let schemas = query
+                        .schemas()
+                        .iter()
+                        .map(|schema| schema.clone().or_else(|| bound.next()))
+                        .collect::<Option<Vec<_>>>()
+                        .ok_or(FrontendErrorKind::Internal)?;
+                    let read = self.flyway_schema_emptiness_result(&schemas)?;
+                    binary_session_read(read).map(PreparedStatementExecutionResult::ResultSet)
                 }
                 RunAsText::PrismaCatalog(query) => {
                     let schemas = self.bound_words(
@@ -10921,6 +11068,7 @@ fn catalog_table_columns(catalog: MySqlCatalogTable) -> Vec<ColumnDefinitionConf
             catalog_results::information_schema_referential_constraints_columns()
         }
         MySqlCatalogTable::Routines => catalog_results::information_schema_routines_columns(),
+        MySqlCatalogTable::Events => catalog_results::information_schema_events_columns(),
         MySqlCatalogTable::Columns => catalog_results::information_schema_columns_every_column(),
         MySqlCatalogTable::Schemata => catalog_results::information_schema_schemata_columns(),
         MySqlCatalogTable::CheckConstraints => {
@@ -11337,9 +11485,11 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
         MySqlColumnKey::Unique => {
             flags |= MYSQL_UNIQUE_KEY_FLAG | MYSQL_PART_KEY_FLAG;
         }
-        // The column is part of a key without being unique on its own.
+        // Measured on MySQL 8.4.11: the first column of a key that lets a
+        // value repeat — an index, or a unique key over columns that may be
+        // NULL — carries the multiple-key flag beside the part-key one.
         MySqlColumnKey::Multiple => {
-            flags |= MYSQL_PART_KEY_FLAG;
+            flags |= MYSQL_MULTIPLE_KEY_FLAG | MYSQL_PART_KEY_FLAG;
         }
         MySqlColumnKey::None => {}
     }
@@ -11351,6 +11501,19 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     }
     if column.extra().eq_ignore_ascii_case("AUTO_INCREMENT") {
         flags |= MYSQL_AUTO_INCREMENT_FLAG;
+    }
+    // Measured on MySQL 8.4.11: a TIMESTAMP the server fills in itself —
+    // `DEFAULT CURRENT_TIMESTAMP` or `ON UPDATE CURRENT_TIMESTAMP` — carries
+    // the timestamp flag, and one it sets on update the on-update flag too. A
+    // DATETIME carries neither, nor does a TIMESTAMP defaulting to `(now())`.
+    if column.type_name().eq_ignore_ascii_case("TIMESTAMP") {
+        let set_on_update = column.extra().contains("on update CURRENT_TIMESTAMP");
+        if set_on_update || matches!(column.default_value(), Some(MySqlColumnDefault::Moment)) {
+            flags |= MYSQL_TIMESTAMP_FLAG;
+        }
+        if set_on_update {
+            flags |= MYSQL_ON_UPDATE_NOW_FLAG;
+        }
     }
     // Measured on MySQL 8.4.11: both TEXT and BLOB carry the blob flag, and a
     // BLOB carries the binary one on top of it.
@@ -11461,14 +11624,16 @@ const MYSQL_TYPE_YEAR: u8 = 0x0d;
 const MYSQL_TYPE_TIMESTAMP: u8 = 0x07;
 const MYSQL_TYPE_NEWDECIMAL: u8 = 0xf6;
 pub(crate) const MYSQL_NOT_NULL_FLAG: u16 = 1;
-#[cfg(unix)]
-const MYSQL_PRI_KEY_FLAG: u16 = 2;
+pub(crate) const MYSQL_PRI_KEY_FLAG: u16 = 2;
 #[cfg(unix)]
 const MYSQL_UNIQUE_KEY_FLAG: u16 = 4;
 #[cfg(unix)]
 const MYSQL_MULTIPLE_KEY_FLAG: u16 = 8;
 #[cfg(unix)]
-const MYSQL_PART_KEY_FLAG: u16 = 16_384;
+const MYSQL_TIMESTAMP_FLAG: u16 = 1024;
+#[cfg(unix)]
+const MYSQL_ON_UPDATE_NOW_FLAG: u16 = 8192;
+pub(crate) const MYSQL_PART_KEY_FLAG: u16 = 16_384;
 const MYSQL_BLOB_FLAG: u16 = 16;
 pub(crate) const MYSQL_UNSIGNED_FLAG: u16 = 32;
 const MYSQL_ZEROFILL_FLAG: u16 = 64;

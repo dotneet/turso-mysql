@@ -8460,6 +8460,13 @@ fn optionally_parses_only_the_network_admin_surface() {
         parse_optional_admin_command("SHOW DATABASES", mode),
         Ok(Some(MySqlAdminCommand::ListDatabases))
     );
+    // Flyway asks whether it runs on RDS this way.
+    assert_eq!(
+        parse_optional_admin_command("SHOW DATABASES LIKE 'RDSAdmin';", mode),
+        Ok(Some(MySqlAdminCommand::ListDatabasesLike {
+            pattern: MySqlLikePattern::new("RDSAdmin", mode),
+        }))
+    );
 
     for sql in [
         "SELECT 1 + 1",
@@ -8814,7 +8821,7 @@ fn optional_admin_parser_rejects_invalid_recognized_statements() {
         "CREATE DATABASE",
         "DROP DATABASE",
         "USE",
-        "SHOW DATABASES LIKE 'tenant%'",
+        "SHOW DATABASES LIKE tenant",
         "SHOW DATABASES WHERE 1",
         "SHOW DATABASES; SELECT 1",
         "SHOW DATABASES -- hidden",

@@ -16,7 +16,8 @@ use crate::{
     dispatcher::{ArrivedCommand, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS},
     frontend_adapter::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
-        MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
+        MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_PART_KEY_FLAG, MYSQL_PRI_KEY_FLAG,
+        MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
     },
     handshake::{is_supported_utf8mb4_collation, SERVER_VERSION, SERVER_VERSION_COMMENT},
     statement_execute::{
@@ -655,6 +656,17 @@ impl MySqlSessionVariables {
                 status_flags,
             )));
         }
+        if let Some(read) =
+            turso_mysql_parser::parse_optional_performance_schema_read(sql, session_sql_mode)
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(self.performance_schema_read(
+                &read,
+                settings,
+                facts,
+                status_flags,
+            )));
+        }
         if let Some(query) = parse_optional_system_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Unsupported)?
         {
@@ -1062,6 +1074,65 @@ impl MySqlSessionVariables {
         })
     }
 
+    /// Answers one of Flyway's `performance_schema` reads.
+    ///
+    /// `@@performance_schema` reads 0 here, and measured on MySQL 8.4.11
+    /// started with it off, `global_variables` still lists every variable
+    /// the server has while `user_variables_by_thread` answers no row even
+    /// after a session has set one. So a variable reads what `SHOW GLOBAL
+    /// VARIABLES` shows for it — nothing for a name this server has not got,
+    /// as MySQL answers nothing for `pxc_strict_mode` — and the user variables
+    /// read none.
+    fn performance_schema_read(
+        &self,
+        read: &turso_mysql_parser::PerformanceSchemaRead,
+        settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
+        status_flags: u16,
+    ) -> CommandExecutionResult {
+        let (column, rows) = match read {
+            turso_mysql_parser::PerformanceSchemaRead::GlobalVariable { column, name } => {
+                let every = MySqlShowVariablesCommand::every(MySqlVariableScope::Global);
+                let CommandExecutionResult::ResultSet(shown) = self.show_variables(
+                    &every,
+                    settings,
+                    facts,
+                    SessionSqlMode::default(),
+                    status_flags,
+                ) else {
+                    unreachable!("SHOW VARIABLES always answers rows");
+                };
+                let rows = shown
+                    .rows
+                    .into_iter()
+                    .filter(|row| {
+                        row.first()
+                            .and_then(Option::as_deref)
+                            .is_some_and(|shown| shown.eq_ignore_ascii_case(name.as_bytes()))
+                    })
+                    .map(|mut row| vec![row.pop().flatten()])
+                    .collect();
+                let mut value = name_and_value_columns("global_variables").remove(1);
+                value.name.clone_from(column);
+                "VARIABLE_VALUE".clone_into(&mut value.original_name);
+                (value, rows)
+            }
+            turso_mysql_parser::PerformanceSchemaRead::UserVariablesOfEveryThread { column } => {
+                let mut name = name_and_value_columns("user_variables_by_thread").remove(0);
+                name.name.clone_from(column);
+                "VARIABLE_NAME".clone_into(&mut name.original_name);
+                name.flags |= MYSQL_PRI_KEY_FLAG | MYSQL_PART_KEY_FLAG;
+                (name, Vec::new())
+            }
+        };
+        CommandExecutionResult::ResultSet(TextResultSet {
+            columns: vec![column],
+            rows,
+            warnings: 0,
+            status_flags,
+        })
+    }
+
     /// Answers `SHOW VARIABLES` for the variables this server actually has.
     ///
     /// MySQL 8.4.11 returns 647 rows for an unfiltered `SHOW VARIABLES`. This
@@ -1142,7 +1213,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 38] = [
+const SHOWN_VARIABLES: [&str; 39] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -1155,6 +1226,7 @@ const SHOWN_VARIABLES: [&str; 38] = [
     "collation_database",
     "collation_server",
     "default_storage_engine",
+    "enforce_gtid_consistency",
     "foreign_key_checks",
     "group_concat_max_len",
     "init_connect",
@@ -1490,9 +1562,13 @@ fn system_variable_result(
             row.push(value);
             continue;
         }
-        // Measured on MySQL 8.4.11: `@@SESSION.socket` is 1238, the socket
-        // being the server's rather than a session's.
-        if read.names_the_session() && read.name().eq_ignore_ascii_case("socket") {
+        // Measured on MySQL 8.4.11: `@@SESSION.socket` and
+        // `@@SESSION.enforce_gtid_consistency` are 1238, each being the
+        // server's rather than a session's.
+        if read.names_the_session()
+            && (read.name().eq_ignore_ascii_case("socket")
+                || read.name().eq_ignore_ascii_case("enforce_gtid_consistency"))
+        {
             return Err(FrontendErrorKind::Unsupported);
         }
         // A server listening on no socket reads as an empty path, as `SHOW
@@ -1551,8 +1627,9 @@ struct SessionReadings<'a> {
 /// Answers one call reading what the session knows about itself, with the
 /// column MySQL reports it in.
 ///
-/// Measured on MySQL 8.4.11: the user calls answer a nullable `VAR_STRING` of
-/// 1152 and `DATABASE()` one of 256, each with 31 decimals and NULL for no
+/// Measured on MySQL 8.4.11: the user calls, and the user's name cut from
+/// `USER()` with `SUBSTRING_INDEX`, answer a nullable `VAR_STRING` of 1152
+/// and `DATABASE()` one of 256, each with 31 decimals and NULL for no
 /// database; `CONNECTION_ID()` a NOT NULL unsigned `LONGLONG` of 21; and
 /// `ROW_COUNT()` and `FOUND_ROWS()` a NOT NULL signed `LONGLONG` of 21. A
 /// call whose answer this session does not know is refused.
@@ -1568,6 +1645,11 @@ fn session_call_column(
         MySqlSessionCall::Database => (256, selected_database.map(str::to_owned)),
         MySqlSessionCall::User => (1152, Some(known(facts.user())?)),
         MySqlSessionCall::CurrentUser => (1152, Some(known(facts.current_user())?)),
+        MySqlSessionCall::UserName => {
+            let user = known(facts.user())?;
+            let name = user.split_once('@').map_or(user.as_str(), |(name, _)| name);
+            (1152, Some(name.to_owned()))
+        }
         MySqlSessionCall::ConnectionId => {
             let id = known(facts.connection_id().map(|id| id.to_string()))?;
             return Ok((counted_call_column(read, true), Some(id.into_bytes())));
@@ -1930,6 +2012,12 @@ fn worded_system_variable(
     }
     if name.eq_ignore_ascii_case("terminology_use_previous") {
         return Some("NONE".to_owned());
+    }
+    // It says whether statements a GTID-based replica could not replay are
+    // refused. This server keeps no GTIDs and refuses nothing for their sake,
+    // which is what `OFF` says; Flyway reads it before every migration.
+    if name.eq_ignore_ascii_case("enforce_gtid_consistency") {
+        return Some("OFF".to_owned());
     }
     // Nothing runs when a connection opens.
     if name.eq_ignore_ascii_case("init_connect") {
@@ -3643,6 +3731,7 @@ mod tests {
                 ("collation_database", "utf8mb4_0900_ai_ci"),
                 ("collation_server", "utf8mb4_0900_ai_ci"),
                 ("default_storage_engine", "InnoDB"),
+                ("enforce_gtid_consistency", "OFF"),
                 ("foreign_key_checks", "ON"),
                 ("group_concat_max_len", "1024"),
                 ("init_connect", ""),

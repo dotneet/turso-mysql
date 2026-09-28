@@ -46,6 +46,8 @@ pub(crate) const INFORMATION_SCHEMA_REFERENTIAL_CONSTRAINTS: &str =
 
 /// The name the engine knows `information_schema.ROUTINES` by.
 pub(crate) const INFORMATION_SCHEMA_ROUTINES: &str = "mysql_information_schema_routines";
+/// The name the engine knows `information_schema.EVENTS` by.
+pub(crate) const INFORMATION_SCHEMA_EVENTS: &str = "mysql_information_schema_events";
 
 /// The name the engine knows `information_schema.CHECK_CONSTRAINTS` by.
 pub(crate) const INFORMATION_SCHEMA_CHECK_CONSTRAINTS: &str =
@@ -97,6 +99,9 @@ pub(crate) fn register_catalog_tables(database: &Database, name: &str) -> Result
     }
     if !database.has_table(INFORMATION_SCHEMA_ROUTINES) {
         database.register_internal_vtab(InformationSchemaRoutines)?;
+    }
+    if !database.has_table(INFORMATION_SCHEMA_EVENTS) {
+        database.register_internal_vtab(InformationSchemaEvents)?;
     }
     if !database.has_table(INFORMATION_SCHEMA_CHECK_CONSTRAINTS) {
         database.register_internal_vtab(InformationSchemaCheckConstraints {
@@ -1478,6 +1483,67 @@ impl InternalVirtualTable for InformationSchemaRoutines {
     }
 }
 
+/// `information_schema.EVENTS`, which is always empty: events are refused
+/// here, so no database holds one. Its columns are MySQL's own, so a wildcard
+/// answers the width MySQL does.
+#[derive(Debug)]
+struct InformationSchemaEvents;
+
+impl InternalVirtualTable for InformationSchemaEvents {
+    fn name(&self) -> String {
+        INFORMATION_SCHEMA_EVENTS.to_owned()
+    }
+
+    fn sql(&self) -> String {
+        let columns = [
+            "EVENT_CATALOG TEXT",
+            "EVENT_SCHEMA TEXT",
+            "EVENT_NAME TEXT",
+            "DEFINER TEXT",
+            "TIME_ZONE TEXT",
+            "EVENT_BODY TEXT",
+            "EVENT_DEFINITION TEXT",
+            "EVENT_TYPE TEXT",
+            "EXECUTE_AT TEXT",
+            "INTERVAL_VALUE TEXT",
+            "INTERVAL_FIELD TEXT",
+            "SQL_MODE TEXT",
+            "STARTS TEXT",
+            "ENDS TEXT",
+            "STATUS TEXT",
+            "ON_COMPLETION TEXT",
+            "CREATED TEXT",
+            "LAST_ALTERED TEXT",
+            "LAST_EXECUTED TEXT",
+            "EVENT_COMMENT TEXT",
+            "ORIGINATOR INTEGER",
+            "CHARACTER_SET_CLIENT TEXT",
+            "COLLATION_CONNECTION TEXT",
+            "DATABASE_COLLATION TEXT",
+        ];
+        format!(
+            "CREATE TABLE {INFORMATION_SCHEMA_EVENTS} ({})",
+            columns.join(", ")
+        )
+    }
+
+    fn open(
+        &self,
+        _connection: Arc<Connection>,
+    ) -> Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(NoRoutinesCursor)))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[turso_ext::ConstraintInfo],
+        _order_by: &[turso_ext::OrderByInfo],
+    ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
+        catalog_best_index(constraints)
+    }
+}
+
+/// The cursor of a catalog table that never holds a row.
 struct NoRoutinesCursor;
 
 impl InternalVirtualTableCursor for NoRoutinesCursor {

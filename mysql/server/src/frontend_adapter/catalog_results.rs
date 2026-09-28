@@ -238,10 +238,16 @@ pub(super) fn gorm_columns_result(
     ))
 }
 
+/// Measured on MySQL 8.4.11: a `VAR_STRING` of 256 read out of `SCHEMATA`,
+/// with the not-null, binary and no-default flags.
 pub(super) fn database_list_column() -> ColumnDefinitionConfig {
     let mut column = ColumnDefinitionConfig::new("Database", MYSQL_TYPE_VAR_STRING);
+    "Database".clone_into(&mut column.original_name);
+    "SCHEMATA".clone_into(&mut column.table);
+    "schemata".clone_into(&mut column.original_table);
     column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-    column.column_length = 64;
+    column.column_length = 256;
+    column.flags = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
     column
 }
 
@@ -867,6 +873,161 @@ pub(super) fn information_schema_check_constraints_columns() -> Vec<ColumnDefini
 /// Measured on MySQL 8.4.11 through `SELECT *` with an `ORDER BY`, the reading
 /// every other table here is pinned to. Three columns are constants in MySQL's
 /// own definition of the table, and those name no table at all.
+/// Every column of `information_schema.EVENTS`, in the order MySQL declares
+/// them.
+///
+/// Measured on MySQL 8.4.11 over both protocols through `SELECT *` with an
+/// `ORDER BY`: every column names `EVENTS` as its table, the ones MySQL's
+/// definition works out rather than reads name no database, and the words
+/// worked out carry 31 decimals. A moment is described in utf8mb4, four
+/// bytes to each of its nineteen characters.
+pub(super) fn information_schema_events_columns() -> Vec<ColumnDefinitionConfig> {
+    let named =
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    let listed = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    let unique = listed | MYSQL_UNIQUE_KEY_FLAG;
+    let stored = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    // (name, read from the dictionary, type, length, flags)
+    [
+        (
+            "EVENT_CATALOG",
+            true,
+            MYSQL_TYPE_VAR_STRING,
+            256u32,
+            named | MYSQL_UNIQUE_KEY_FLAG,
+        ),
+        ("EVENT_SCHEMA", true, MYSQL_TYPE_VAR_STRING, 256, named),
+        ("EVENT_NAME", true, MYSQL_TYPE_VAR_STRING, 256, listed),
+        (
+            "DEFINER",
+            true,
+            MYSQL_TYPE_VAR_STRING,
+            1152,
+            named | MYSQL_MULTIPLE_KEY_FLAG,
+        ),
+        ("TIME_ZONE", true, MYSQL_TYPE_VAR_STRING, 256, stored),
+        (
+            "EVENT_BODY",
+            false,
+            MYSQL_TYPE_VAR_STRING,
+            12,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "EVENT_DEFINITION",
+            true,
+            MYSQL_TYPE_BLOB,
+            u32::MAX,
+            stored | MYSQL_BLOB_FLAG,
+        ),
+        (
+            "EVENT_TYPE",
+            false,
+            MYSQL_TYPE_VAR_STRING,
+            36,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        (
+            "EXECUTE_AT",
+            false,
+            MYSQL_TYPE_DATETIME,
+            76,
+            MYSQL_BINARY_FLAG,
+        ),
+        ("INTERVAL_VALUE", false, MYSQL_TYPE_VAR_STRING, 1024, 0),
+        (
+            "INTERVAL_FIELD",
+            true,
+            MYSQL_TYPE_STRING,
+            72,
+            MYSQL_BINARY_FLAG | MYSQL_ENUM_FLAG,
+        ),
+        (
+            "SQL_MODE",
+            true,
+            MYSQL_TYPE_STRING,
+            2080,
+            stored | MYSQL_SET_FLAG,
+        ),
+        ("STARTS", false, MYSQL_TYPE_DATETIME, 76, MYSQL_BINARY_FLAG),
+        ("ENDS", false, MYSQL_TYPE_DATETIME, 76, MYSQL_BINARY_FLAG),
+        (
+            "STATUS",
+            false,
+            MYSQL_TYPE_VAR_STRING,
+            84,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "ON_COMPLETION",
+            false,
+            MYSQL_TYPE_VAR_STRING,
+            48,
+            MYSQL_NOT_NULL_FLAG,
+        ),
+        ("CREATED", true, MYSQL_TYPE_TIMESTAMP, 76, stored),
+        ("LAST_ALTERED", true, MYSQL_TYPE_TIMESTAMP, 76, stored),
+        (
+            "LAST_EXECUTED",
+            false,
+            MYSQL_TYPE_DATETIME,
+            76,
+            MYSQL_BINARY_FLAG,
+        ),
+        ("EVENT_COMMENT", true, MYSQL_TYPE_VAR_STRING, 8192, stored),
+        (
+            "ORIGINATOR",
+            true,
+            MYSQL_TYPE_LONG,
+            10,
+            MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        (
+            "CHARACTER_SET_CLIENT",
+            true,
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            unique,
+        ),
+        (
+            "COLLATION_CONNECTION",
+            true,
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            unique,
+        ),
+        (
+            "DATABASE_COLLATION",
+            true,
+            MYSQL_TYPE_VAR_STRING,
+            256,
+            unique,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, dictionary, column_type, column_length, flags)| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        if dictionary {
+            "information_schema".clone_into(&mut column.schema);
+        }
+        "EVENTS".clone_into(&mut column.table);
+        "EVENTS".clone_into(&mut column.original_table);
+        name.clone_into(&mut column.original_name);
+        column.character_set = if column_type == MYSQL_TYPE_LONG {
+            MYSQL_BINARY_COLLATION
+        } else {
+            u16::from(DEFAULT_UTF8MB4_COLLATION)
+        };
+        column.column_length = column_length;
+        column.flags = flags;
+        if !dictionary && column_type == MYSQL_TYPE_VAR_STRING {
+            column.decimals = 31;
+        }
+        column
+    })
+    .collect()
+}
+
 pub(super) fn information_schema_routines_columns() -> Vec<ColumnDefinitionConfig> {
     let named = MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
     let listed = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
@@ -3480,6 +3641,29 @@ fn connector_j_columns_columns() -> Vec<ColumnDefinitionConfig> {
             column
         })
         .collect()
+}
+
+/// Flyway's emptiness check answers one row, its sum.
+pub(super) fn flyway_schema_emptiness_text_result(
+    found: Option<u64>,
+    status_flags: u16,
+) -> TextResultSet {
+    TextResultSet {
+        columns: vec![flyway_schema_emptiness_column()],
+        rows: vec![vec![found.map(|found| found.to_string().into_bytes())]],
+        warnings: 0,
+        status_flags,
+    }
+}
+
+/// Measured on MySQL 8.4.11 over both protocols: the `SUM` of whole numbers is
+/// a nullable `NEWDECIMAL` of 42 with no decimals and the binary flag.
+pub(super) fn flyway_schema_emptiness_column() -> ColumnDefinitionConfig {
+    let mut column = ColumnDefinitionConfig::new("SUM(found)", MYSQL_TYPE_NEWDECIMAL);
+    column.character_set = MYSQL_BINARY_COLLATION;
+    column.column_length = 42;
+    column.flags = MYSQL_BINARY_FLAG;
+    column
 }
 
 /// Measured on MySQL 8.4.11 through the same client the other Connector/J

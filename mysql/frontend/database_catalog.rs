@@ -526,6 +526,16 @@ impl MySqlDatabaseSession {
             MySqlAdminCommand::ListDatabases => Ok(MySqlAdminCommandResult::Listed {
                 databases: self.catalog.list()?,
             }),
+            MySqlAdminCommand::ListDatabasesLike { pattern } => {
+                Ok(MySqlAdminCommandResult::Listed {
+                    databases: self
+                        .catalog
+                        .list()?
+                        .into_iter()
+                        .filter(|database| pattern.matches_keeping_case(database))
+                        .collect(),
+                })
+            }
         }
     }
 

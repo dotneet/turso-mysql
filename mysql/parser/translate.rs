@@ -60,10 +60,11 @@ pub enum MySqlCatalogTable {
     Columns,
     Schemata,
     CheckConstraints,
+    Events,
 }
 
 impl MySqlCatalogTable {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Tables,
         Self::Views,
         Self::Statistics,
@@ -74,6 +75,7 @@ impl MySqlCatalogTable {
         Self::Columns,
         Self::Schemata,
         Self::CheckConstraints,
+        Self::Events,
     ];
 
     /// The name the engine knows this table by, which has no qualifier.
@@ -89,6 +91,7 @@ impl MySqlCatalogTable {
             Self::Columns => "mysql_information_schema_columns",
             Self::Schemata => "mysql_information_schema_schemata",
             Self::CheckConstraints => "mysql_information_schema_check_constraints",
+            Self::Events => "mysql_information_schema_events",
         }
     }
 
@@ -254,6 +257,32 @@ impl MySqlCatalogTable {
                 ("CONSTRAINT_NAME", "TEXT"),
                 ("CHECK_CLAUSE", "TEXT"),
             ],
+            Self::Events => &[
+                ("EVENT_CATALOG", "TEXT"),
+                ("EVENT_SCHEMA", "TEXT"),
+                ("EVENT_NAME", "TEXT"),
+                ("DEFINER", "TEXT"),
+                ("TIME_ZONE", "TEXT"),
+                ("EVENT_BODY", "TEXT"),
+                ("EVENT_DEFINITION", "TEXT"),
+                ("EVENT_TYPE", "TEXT"),
+                ("EXECUTE_AT", "DATETIME"),
+                ("INTERVAL_VALUE", "TEXT"),
+                ("INTERVAL_FIELD", "TEXT"),
+                ("SQL_MODE", "TEXT"),
+                ("STARTS", "DATETIME"),
+                ("ENDS", "DATETIME"),
+                ("STATUS", "TEXT"),
+                ("ON_COMPLETION", "TEXT"),
+                ("CREATED", "DATETIME"),
+                ("LAST_ALTERED", "DATETIME"),
+                ("LAST_EXECUTED", "DATETIME"),
+                ("EVENT_COMMENT", "TEXT"),
+                ("ORIGINATOR", "INT UNSIGNED"),
+                ("CHARACTER_SET_CLIENT", "TEXT"),
+                ("COLLATION_CONNECTION", "TEXT"),
+                ("DATABASE_COLLATION", "TEXT"),
+            ],
             Self::Schemata => &[
                 ("CATALOG_NAME", "TEXT"),
                 ("SCHEMA_NAME", "TEXT"),
@@ -305,6 +334,7 @@ impl MySqlCatalogTable {
             Self::Columns => "COLUMNS",
             Self::Schemata => "SCHEMATA",
             Self::CheckConstraints => "CHECK_CONSTRAINTS",
+            Self::Events => "EVENTS",
         }
     }
 }
