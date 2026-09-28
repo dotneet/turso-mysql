@@ -9,14 +9,14 @@ use std::{error::Error, fmt};
 
 use crate::{
     is_supported_utf8mb4_collation, map_frontend_error, AuthMoreData, AuthMoreDataKind,
-    AuthOkPacketConfig, AuthPacketError, ClientAuthResponse, ClientHandshakeResponse,
-    ClientHandshakeResponseError, ClientSslRequest, ClientSslRequestError,
+    AuthOkPacketConfig, AuthPacketError, AuthSwitchRequestConfig, ClientAuthResponse,
+    ClientHandshakeResponse, ClientHandshakeResponseError, ClientSslRequest, ClientSslRequestError,
     CredentialVerificationError, FrontendErrorKind, HandshakeNonceSource, InitialHandshakeConfig,
     InitialHandshakeError, InitialHandshakeNonceError, InitialHandshakeSettings,
     OsHandshakeNonceSource, Packet, PacketCodec, PacketCodecError, ResponsePacketError,
     AUTH_PLUGIN_DATA_LENGTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-    MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
-    MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
+    MAX_CLIENT_AUTH_RESPONSE_LENGTH, MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH,
+    MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
 };
 
 #[cfg(test)]
@@ -156,6 +156,11 @@ pub enum ConnectionState {
     TlsUpgradeRequired,
     /// TLS completed; authentication may now be started.
     TlsNegotiated,
+    /// The client answered for another plugin, and the server must ask it to
+    /// switch to `caching_sha2_password`.
+    SendAuthSwitchRequest,
+    /// The switch request was sent and the client's answer is expected.
+    AwaitAuthSwitchResponse,
     /// The server is waiting for an external verified-authentication event.
     AuthenticateCachingSha2Password,
     /// The cached verifier accepted the response and the server must send OK.
@@ -185,6 +190,10 @@ pub enum ConnectionEvent {
     TlsNegotiated,
     /// Start the authentication phase after TLS negotiation.
     BeginAuthentication,
+    /// Ask the client to switch to `caching_sha2_password`.
+    SendAuthSwitchRequest,
+    /// Receive the client's answer to the switch request.
+    ReceiveAuthSwitchResponse,
     /// Apply an external decision to the initial authentication response.
     InitialAuthenticationResult,
     /// Receive a full authentication response from the client.
@@ -578,11 +587,6 @@ impl ClassicConnection {
         response.to_config().validate()?;
         let client_capabilities = response.capability_flags;
         self.validate_client_capabilities(client_capabilities)?;
-        if response.auth_plugin_name.as_deref() != Some(CACHING_SHA2_PASSWORD_PLUGIN) {
-            return Err(ConnectionStateError::UnsupportedAuthenticationPlugin {
-                plugin: response.auth_plugin_name,
-            });
-        }
 
         let initial_response = self.state == ConnectionState::AwaitClientResponse;
         if initial_response {
@@ -596,10 +600,11 @@ impl ClassicConnection {
             let Some(ssl_request) = self.ssl_request.as_ref() else {
                 return Err(ConnectionStateError::SslRequestRequired);
             };
-            if client_capabilities & CLIENT_SSL == 0 {
-                return Err(ConnectionStateError::TlsResponseMissingSslCapability);
-            }
-            if client_capabilities != ssl_request.capability_flags {
+            // Measured on MySQL 8.4.11, the response after TLS may leave
+            // CLIENT_SSL out, as MySqlConnector's does: the server goes by
+            // the TLS it has negotiated, not by the bit. This state is reached
+            // only once TLS is up.
+            if client_capabilities & !CLIENT_SSL != ssl_request.capability_flags & !CLIENT_SSL {
                 return Err(ConnectionStateError::CapabilitiesChangedAfterTls {
                     ssl_request: ssl_request.capability_flags,
                     response: client_capabilities,
@@ -607,14 +612,14 @@ impl ClassicConnection {
             }
         }
         self.set_response_packet_limit(response.max_packet_size)?;
+        self.initial_database.clone_from(&response.database);
+        self.client_response = Some(response);
         if initial_response {
-            self.state = ConnectionState::AuthenticateCachingSha2Password;
             self.negotiated_capabilities =
                 Some(client_capabilities & self.initial_handshake.capability_flags);
             self.auth_server_sequence_id = Some(response_sequence_id.wrapping_add(1));
+            self.state = self.first_authentication_state()?;
         }
-        self.initial_database.clone_from(&response.database);
-        self.client_response = Some(response);
         Ok(())
     }
 
@@ -646,6 +651,79 @@ impl ClassicConnection {
             .as_ref()
             .ok_or(ConnectionStateError::ClientResponseRequired)?;
         self.auth_server_sequence_id = Some(response.sequence_id.wrapping_add(1));
+        self.state = self.first_authentication_state()?;
+        Ok(())
+    }
+
+    /// Measured on MySQL 8.4.11: a client answering for any plugin but the
+    /// account's — MySqlConnector always answers `mysql_native_password`, and
+    /// an unknown name is treated the same — is sent an AuthSwitchRequest for
+    /// `caching_sha2_password` carrying the handshake's own scramble, and its
+    /// answer is then checked as the handshake's would have been.
+    fn first_authentication_state(&self) -> Result<ConnectionState, ConnectionStateError> {
+        let response = self
+            .client_response
+            .as_ref()
+            .ok_or(ConnectionStateError::ClientResponseRequired)?;
+        if response.auth_plugin_name.as_deref() == Some(CACHING_SHA2_PASSWORD_PLUGIN) {
+            Ok(ConnectionState::AuthenticateCachingSha2Password)
+        } else {
+            Ok(ConnectionState::SendAuthSwitchRequest)
+        }
+    }
+
+    /// Asks the client to answer again for `caching_sha2_password`.
+    pub fn send_auth_switch_request(&mut self) -> Result<Vec<u8>, ConnectionStateError> {
+        self.require_state(
+            ConnectionState::SendAuthSwitchRequest,
+            ConnectionEvent::SendAuthSwitchRequest,
+        )?;
+        if self.transport_security != TransportSecurity::Secure {
+            return Err(ConnectionStateError::SecureTransportRequired);
+        }
+        let sequence_id = self.auth_server_sequence_id()?;
+        let mut scramble = self.initial_handshake.auth_plugin_data.to_vec();
+        scramble.push(0);
+        let frame = AuthSwitchRequestConfig::new(CACHING_SHA2_PASSWORD_PLUGIN, scramble)
+            .encode(self.response_packet_codec, sequence_id)?;
+        self.auth_client_sequence_id = Some(sequence_id.wrapping_add(1));
+        self.state = ConnectionState::AwaitAuthSwitchResponse;
+        Ok(frame)
+    }
+
+    /// Takes the client's answer to the switch request in place of the
+    /// handshake's scramble and moves to caching-SHA-2 authentication.
+    pub fn receive_auth_switch_response_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(), ConnectionStateError> {
+        self.require_state(
+            ConnectionState::AwaitAuthSwitchResponse,
+            ConnectionEvent::ReceiveAuthSwitchResponse,
+        )?;
+        let packet = self.packet_codec.decode(frame)?;
+        let expected_sequence_id = self
+            .auth_client_sequence_id
+            .ok_or(ConnectionStateError::ClientResponseRequired)?;
+        self.validate_sequence(
+            packet.sequence_id,
+            expected_sequence_id,
+            ConnectionEvent::ReceiveAuthSwitchResponse,
+        )?;
+        if packet.payload.len() > MAX_CLIENT_AUTH_RESPONSE_LENGTH {
+            return Err(ConnectionStateError::AuthSwitchResponseTooLong {
+                length: packet.payload.len(),
+                limit: MAX_CLIENT_AUTH_RESPONSE_LENGTH,
+            });
+        }
+        let response = self
+            .client_response
+            .as_mut()
+            .ok_or(ConnectionStateError::ClientResponseRequired)?;
+        response.auth_response = packet.payload.to_vec();
+        response.auth_plugin_name = Some(CACHING_SHA2_PASSWORD_PLUGIN.to_owned());
+        self.auth_server_sequence_id = Some(packet.sequence_id.wrapping_add(1));
+        self.auth_client_sequence_id = None;
         self.state = ConnectionState::AuthenticateCachingSha2Password;
         Ok(())
     }
@@ -1394,8 +1472,9 @@ pub enum ConnectionStateError {
     },
     /// A full client response requested TLS without a preceding SSLRequest.
     TlsRequestRequired,
-    /// A post-TLS client response omitted the TLS capability.
-    TlsResponseMissingSslCapability,
+    /// The client's answer to an AuthSwitchRequest is longer than any
+    /// scramble.
+    AuthSwitchResponseTooLong { length: usize, limit: usize },
     /// The full response changed capabilities from the preceding SSLRequest.
     CapabilitiesChangedAfterTls { ssl_request: u32, response: u32 },
     /// Authentication was requested before the full post-TLS client response.
@@ -1585,9 +1664,10 @@ impl fmt::Display for ConnectionStateError {
             Self::TlsRequestRequired => {
                 f.write_str("CLIENT_SSL requires a preceding SSLRequest packet")
             }
-            Self::TlsResponseMissingSslCapability => {
-                f.write_str("post-TLS client response must retain CLIENT_SSL")
-            }
+            Self::AuthSwitchResponseTooLong { length, limit } => write!(
+                f,
+                "authentication switch response is {length} bytes, longer than {limit}"
+            ),
             Self::CapabilitiesChangedAfterTls {
                 ssl_request,
                 response,

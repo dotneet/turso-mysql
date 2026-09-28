@@ -6195,6 +6195,25 @@ silence: `CLIENT_COMPRESS` and `CLIENT_ZSTD_COMPRESSION_ALGORITHM`. Both
 compress every packet after the handshake, so ignoring one would leave the
 client framing a stream this server cannot read.
 
+A client answering for another authentication plugin is asked to switch
+rather than shut out. MySqlConnector, under every .NET app on EF Core, Dapper
+or plain ADO.NET, answers the greeting for `mysql_native_password` whatever
+the greeting names, and its response after TLS leaves `CLIENT_SSL` out of a
+capability word that is otherwise its SSLRequest's (0x011b8202 after
+0x011b8a02). This server closed such a connection without a word. Measured on
+MySQL 8.4.11, the server goes by the TLS it negotiated rather than by the bit,
+and it answers any plugin name but `caching_sha2_password` — the native one,
+an unknown one, an empty one — with an AuthSwitchRequest for
+`caching_sha2_password` carrying the handshake's own scramble, numbered after
+the response; the client's answer is then checked as the handshake's would
+have been, with the fast-auth byte or the request for the password next.
+This server does the same, only once the transport is secure, as before. A
+response after TLS may drop `CLIENT_SSL` and nothing else: MySQL also takes a
+word that changes other bits, but then acts on the SSLRequest's word — a
+response adding `CLIENT_MULTI_STATEMENTS` still gets 1064 for two statements —
+so a changed word is still refused here. An empty plugin name is still
+refused.
+
 `CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA` is honored instead of refused. Real
 clients set it on every connection. The two length forms agree below 251
 bytes, which is why real responses parsed correctly even while the capability

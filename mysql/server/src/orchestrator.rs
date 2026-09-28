@@ -300,6 +300,8 @@ where
             ConnectionState::SendInitialHandshake
             | ConnectionState::AwaitClientResponse
             | ConnectionState::TlsNegotiated
+            | ConnectionState::SendAuthSwitchRequest
+            | ConnectionState::AwaitAuthSwitchResponse
             | ConnectionState::AuthenticateCachingSha2Password
             | ConnectionState::AuthenticateFast
             | ConnectionState::AuthenticateFull
@@ -466,6 +468,18 @@ where
                 if self.connection.state() == ConnectionState::TlsNegotiated {
                     self.connection.begin_authentication()?;
                 }
+                if self.connection.state() == ConnectionState::SendAuthSwitchRequest {
+                    let request = self.connection.send_auth_switch_request()?;
+                    self.write_queue
+                        .enqueue_batch([request])
+                        .map_err(OrchestratorError::WriteQueue)?;
+                    return Ok(self.event());
+                }
+                self.authenticate_initial()?;
+            }
+            ConnectionState::AwaitAuthSwitchResponse => {
+                self.connection
+                    .receive_auth_switch_response_frame(&frame.sign_in_packet())?;
                 self.authenticate_initial()?;
             }
             ConnectionState::AuthenticateFull => {
@@ -1984,6 +1998,264 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert_eq!(CODEC.decode(&frames[1]).unwrap().sequence_id, 3);
         assert_eq!(CODEC.decode(&frames[2]).unwrap().sequence_id, 4);
+    }
+
+    /// MySqlConnector's handshake, as the framework harness logged it: the
+    /// SSLRequest announces 0x011b8a02 and the response after TLS 0x011b8202,
+    /// the same word without CLIENT_SSL, answering for
+    /// `mysql_native_password`. Measured on MySQL 8.4.11, the server takes the
+    /// word and sends an AuthSwitchRequest for `caching_sha2_password` with
+    /// the handshake's scramble, numbered 3; the client's answer is 4, and the
+    /// fast-auth byte and OK follow as 5 and 6.
+    const MYSQLCONNECTOR_SSL_REQUEST_CAPABILITIES: u32 = 0x011b_8a02;
+    const MYSQLCONNECTOR_RESPONSE_CAPABILITIES: u32 = 0x011b_8202;
+
+    #[test]
+    fn mysqlconnector_is_switched_to_caching_sha2_after_tls_without_client_ssl() {
+        let password = b"secret";
+        let mut orchestrator = orchestrator_after_tls(
+            StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            MYSQLCONNECTOR_SSL_REQUEST_CAPABILITIES,
+        );
+        assert_eq!(
+            orchestrator
+                .receive_frame(mysql_native_password_response(
+                    MYSQLCONNECTOR_RESPONSE_CAPABILITIES
+                ))
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        let switch = drain(&mut orchestrator);
+        assert_eq!(switch.len(), 1);
+        let switch = CODEC.decode(&switch[0]).unwrap();
+        assert_eq!(switch.sequence_id, 3);
+        let mut expected = b"\xfecaching_sha2_password\0".to_vec();
+        expected.extend_from_slice(&SCRAMBLE);
+        expected.push(0);
+        assert_eq!(switch.payload, expected);
+
+        assert_eq!(
+            orchestrator
+                .receive_frame(
+                    ClassicFrame::from_payload(CODEC, 4, &fast_response(password)).unwrap()
+                )
+                .unwrap(),
+            OrchestratorEvent::Ready
+        );
+        let frames = drain(&mut orchestrator);
+        assert_eq!(frames.len(), 2);
+        let fast = CODEC.decode(&frames[0]).unwrap();
+        assert_eq!((fast.sequence_id, fast.payload), (5, &[0x01, 0x03][..]));
+        let ok = CODEC.decode(&frames[1]).unwrap();
+        assert_eq!((ok.sequence_id, ok.payload[0]), (6, 0x00));
+        assert_eq!(
+            orchestrator.connection.negotiated_capabilities().unwrap() & CLIENT_SSL,
+            CLIENT_SSL
+        );
+    }
+
+    #[test]
+    fn a_switched_client_without_a_cached_verifier_gives_its_password_after_tls() {
+        let password = b"secret";
+        let mut orchestrator = orchestrator_after_tls(
+            StoredCredential::from_full_verifier(true, verifier_material(password)),
+            MYSQLCONNECTOR_SSL_REQUEST_CAPABILITIES,
+        );
+        orchestrator
+            .receive_frame(mysql_native_password_response(
+                MYSQLCONNECTOR_RESPONSE_CAPABILITIES,
+            ))
+            .unwrap();
+        drain(&mut orchestrator);
+        assert_eq!(
+            orchestrator
+                .receive_frame(
+                    ClassicFrame::from_payload(CODEC, 4, &fast_response(password)).unwrap()
+                )
+                .unwrap(),
+            OrchestratorEvent::AwaitingClientFrame
+        );
+        let full = drain(&mut orchestrator);
+        let full = CODEC.decode(&full[0]).unwrap();
+        assert_eq!((full.sequence_id, full.payload), (5, &[0x01, 0x04][..]));
+        assert_eq!(
+            orchestrator
+                .receive_frame(ClassicFrame::from_payload(CODEC, 6, b"secret\0").unwrap())
+                .unwrap(),
+            OrchestratorEvent::Ready
+        );
+        let ok = drain(&mut orchestrator);
+        let ok = CODEC.decode(&ok[0]).unwrap();
+        assert_eq!((ok.sequence_id, ok.payload[0]), (7, 0x00));
+    }
+
+    #[test]
+    fn a_response_after_tls_may_drop_only_client_ssl_from_the_ssl_request() {
+        let mut orchestrator = orchestrator_after_tls(
+            StoredCredential::from_sha256_sha256(true, verifier_material(b"secret")),
+            MYSQLCONNECTOR_SSL_REQUEST_CAPABILITIES,
+        );
+        let changed = MYSQLCONNECTOR_RESPONSE_CAPABILITIES & !crate::CLIENT_MULTI_STATEMENTS;
+        assert!(matches!(
+            orchestrator.receive_frame(mysql_native_password_response(changed)),
+            Err(OrchestratorError::Connection(
+                ConnectionStateError::CapabilitiesChangedAfterTls { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_switch_answer_numbered_out_of_turn_is_refused() {
+        let mut orchestrator = orchestrator_after_tls(
+            StoredCredential::from_sha256_sha256(true, verifier_material(b"secret")),
+            MYSQLCONNECTOR_SSL_REQUEST_CAPABILITIES,
+        );
+        orchestrator
+            .receive_frame(mysql_native_password_response(
+                MYSQLCONNECTOR_RESPONSE_CAPABILITIES,
+            ))
+            .unwrap();
+        assert!(matches!(
+            orchestrator.receive_frame(
+                ClassicFrame::from_payload(CODEC, 3, &fast_response(b"secret")).unwrap()
+            ),
+            Err(OrchestratorError::Connection(
+                ConnectionStateError::UnexpectedSequenceId {
+                    expected: 4,
+                    actual: 3,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+    }
+
+    /// Over a transport secure from the start there is no SSLRequest, so the
+    /// response is 1 and the switch 2, as measured on MySQL 8.4.11 over a
+    /// plain connection.
+    #[test]
+    fn a_client_on_a_secure_socket_is_switched_right_after_its_response() {
+        let password = b"secret";
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider
+            .insert(
+                "root",
+                StoredCredential::from_sha256_sha256(true, verifier_material(password)),
+            )
+            .unwrap();
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Secure,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            TestExecutorFactory,
+            queue,
+        );
+        orchestrator.start().unwrap();
+        drain(&mut orchestrator);
+        let response = ClientHandshakeResponseConfig::new(
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+            0,
+            crate::DEFAULT_UTF8MB4_COLLATION,
+            "root",
+            [0x33; 20],
+            None::<String>,
+            Some("mysql_native_password"),
+            None,
+        )
+        .encode(CODEC, 1)
+        .unwrap();
+        orchestrator
+            .receive_frame(ClassicFrame::new(CODEC, response).unwrap())
+            .unwrap();
+        let switch = drain(&mut orchestrator);
+        assert_eq!(CODEC.decode(&switch[0]).unwrap().sequence_id, 2);
+        assert_eq!(
+            orchestrator
+                .receive_frame(
+                    ClassicFrame::from_payload(CODEC, 3, &fast_response(password)).unwrap()
+                )
+                .unwrap(),
+            OrchestratorEvent::Ready
+        );
+        let frames = drain(&mut orchestrator);
+        assert_eq!(CODEC.decode(&frames[1]).unwrap().sequence_id, 5);
+    }
+
+    fn orchestrator_after_tls(
+        credential: StoredCredential,
+        ssl_request_capabilities: u32,
+    ) -> ClassicConnectionOrchestrator<crate::InMemoryCredentialProvider, TestExecutorFactory> {
+        let mut provider = crate::InMemoryCredentialProvider::new();
+        provider.insert("root", credential).unwrap();
+        let connection = ClassicConnection::with_test_nonce(
+            settings(),
+            CODEC,
+            TransportSecurity::Plaintext,
+            SCRAMBLE,
+        )
+        .unwrap();
+        let queue = PacketWriteQueue::new(CODEC, 256, 8).unwrap();
+        let mut orchestrator = ClassicConnectionOrchestrator::from_parts(
+            connection,
+            CachingSha2Verifier::new(provider),
+            TestExecutorFactory,
+            queue,
+        );
+        orchestrator.start().unwrap();
+        drain(&mut orchestrator);
+        let ssl = crate::ClientSslRequestConfig::new(
+            ssl_request_capabilities,
+            0x00ff_ffff,
+            crate::DEFAULT_UTF8MB4_COLLATION,
+        )
+        .encode(CODEC, 1)
+        .unwrap();
+        assert_eq!(
+            orchestrator
+                .receive_frame(ClassicFrame::new(CODEC, ssl).unwrap())
+                .unwrap(),
+            OrchestratorEvent::TlsUpgradeRequired
+        );
+        orchestrator.tls_negotiated().unwrap();
+        orchestrator
+    }
+
+    fn mysql_native_password_response(capabilities: u32) -> ClassicFrame {
+        let response = ClientHandshakeResponseConfig::new(
+            capabilities,
+            0x00ff_ffff,
+            crate::DEFAULT_UTF8MB4_COLLATION,
+            "root",
+            [0x33; 20],
+            None::<String>,
+            Some("mysql_native_password"),
+            Some(vec![(
+                "_client_name".to_owned(),
+                "MySqlConnector".to_owned(),
+            )]),
+        )
+        .encode(CODEC, 2)
+        .unwrap();
+        ClassicFrame::new(CODEC, response).unwrap()
+    }
+
+    fn drain<P: crate::CredentialProvider, F: AuthenticatedExecutorFactory>(
+        orchestrator: &mut ClassicConnectionOrchestrator<P, F>,
+    ) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        while let Some(front) = orchestrator.front_write() {
+            frames.push(front.to_vec());
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        frames
     }
 
     #[test]
