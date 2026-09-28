@@ -583,6 +583,12 @@ impl<'a> Reader<'a> {
         self.read_exact(length, "length-encoded parameter")
     }
 
+    /// Reads a length the way MySQL does, whatever width it is written in.
+    ///
+    /// sqlx 0.8 writes the length of a `JSON` parameter in the nine-byte form
+    /// whatever it is — `fe 29 00 00 00 00 00 00 00` for 41 bytes — and MySQL
+    /// 8.4.11 takes it, reading the width the marker names without asking
+    /// whether a narrower one would have held it.
     fn read_lenenc_integer(&mut self, index: usize) -> Result<u64, StatementExecuteDecodeError> {
         let marker = self.read_u8("length-encoded parameter length")?;
         match marker {
@@ -592,45 +598,17 @@ impl<'a> Reader<'a> {
             }
             0xfc => {
                 let bytes = self.read_exact(2, "length-encoded parameter length")?;
-                let value = u64::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-                if value < 0xfb {
-                    return Err(
-                        StatementExecuteDecodeError::NonCanonicalLengthEncodedInteger {
-                            index,
-                            value,
-                        },
-                    );
-                }
-                Ok(value)
+                Ok(u64::from(u16::from_le_bytes([bytes[0], bytes[1]])))
             }
             0xfd => {
                 let bytes = self.read_exact(3, "length-encoded parameter length")?;
-                let value =
-                    u64::from(bytes[0]) | (u64::from(bytes[1]) << 8) | (u64::from(bytes[2]) << 16);
-                if value <= 0xffff {
-                    return Err(
-                        StatementExecuteDecodeError::NonCanonicalLengthEncodedInteger {
-                            index,
-                            value,
-                        },
-                    );
-                }
-                Ok(value)
+                Ok(u64::from(bytes[0]) | (u64::from(bytes[1]) << 8) | (u64::from(bytes[2]) << 16))
             }
             0xfe => {
                 let bytes = self.read_exact(8, "length-encoded parameter length")?;
-                let value = u64::from_le_bytes([
+                Ok(u64::from_le_bytes([
                     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-                ]);
-                if value <= 0xff_ffff {
-                    return Err(
-                        StatementExecuteDecodeError::NonCanonicalLengthEncodedInteger {
-                            index,
-                            value,
-                        },
-                    );
-                }
-                Ok(value)
+                ]))
             }
         }
     }
@@ -687,8 +665,6 @@ pub enum StatementExecuteDecodeError {
     InvalidUtf8 { index: usize },
     /// A length-encoded parameter length used an invalid marker.
     InvalidLengthEncodedInteger { index: usize, marker: u8 },
-    /// A length-encoded parameter length used a wider-than-needed representation.
-    NonCanonicalLengthEncodedInteger { index: usize, value: u64 },
     /// A length-encoded parameter length cannot fit in `usize`.
     LengthTooLarge { index: usize, length: u64 },
     /// Bytes remain after the last parameter value.
@@ -755,12 +731,6 @@ impl fmt::Display for StatementExecuteDecodeError {
                 f,
                 "parameter {index} has invalid length-encoded integer marker 0x{marker:02x}"
             ),
-            Self::NonCanonicalLengthEncodedInteger { index, value } => {
-                write!(
-                    f,
-                    "parameter {index} encodes length {value} non-canonically"
-                )
-            }
             Self::LengthTooLarge { index, length } => {
                 write!(f, "parameter {index} length {length} does not fit in usize")
             }
@@ -1213,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_noncanonical_and_truncated_length_encodings() {
+    fn rejects_invalid_and_truncated_length_encodings() {
         assert_eq!(
             decode(&[0, 1, MYSQL_TYPE_BLOB, 0, 0xfb], 1),
             Err(StatementExecuteDecodeError::InvalidLengthEncodedInteger {
@@ -1222,21 +1192,64 @@ mod tests {
             })
         );
         assert_eq!(
-            decode(&[0, 1, MYSQL_TYPE_BLOB, 0, 0xfc, 250, 0], 1),
-            Err(
-                StatementExecuteDecodeError::NonCanonicalLengthEncodedInteger {
-                    index: 0,
-                    value: 250,
-                }
-            )
-        );
-        assert_eq!(
             decode(&[0, 1, MYSQL_TYPE_BLOB, 0, 3, 1], 1),
             Err(StatementExecuteDecodeError::Truncated {
                 field: "length-encoded parameter",
                 needed: 3,
                 remaining: 1,
             })
+        );
+    }
+
+    /// sqlx 0.8's execute of `INSERT INTO users (email, name, balance,
+    /// is_active, profile, avatar) VALUES (?, ?, ?, ?, ?, ?)` as the framework
+    /// harness captured it: a `DECIMAL` as a word, an unsigned `TINY`, a
+    /// `JSON` document whose length is written in nine bytes, and bytes whose
+    /// length is written in three.
+    #[test]
+    fn reads_a_length_written_wider_than_it_needs() {
+        let document = br#"{"city":"Tokyo","n":1.5,"tags":["a","b"]}"#;
+        let avatar: Vec<u8> = (0..=255).collect();
+        let mut payload = vec![0, 1];
+        payload.extend_from_slice(&[
+            MYSQL_TYPE_VAR_STRING,
+            0,
+            MYSQL_TYPE_VAR_STRING,
+            0,
+            MYSQL_TYPE_NEWDECIMAL,
+            0,
+            MYSQL_TYPE_TINY,
+            0x80,
+            MYSQL_TYPE_STRING,
+            0,
+            MYSQL_TYPE_BLOB,
+            0,
+        ]);
+        payload.push(17);
+        payload.extend_from_slice(b"alice@example.com");
+        payload.push(5);
+        payload.extend_from_slice(b"Alice");
+        payload.push(6);
+        payload.extend_from_slice(b"100.50");
+        payload.push(1);
+        payload.push(0xfe);
+        payload.extend_from_slice(&(document.len() as u64).to_le_bytes());
+        payload.extend_from_slice(document);
+        payload.push(0xfc);
+        payload.extend_from_slice(&(avatar.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&avatar);
+
+        let decoded = decode(&payload, 6).unwrap();
+        assert_eq!(
+            decoded.values[4],
+            StatementParameterValue::String(String::from_utf8(document.to_vec()).unwrap())
+        );
+        assert_eq!(decoded.values[5], StatementParameterValue::Bytes(avatar));
+        assert_eq!(
+            decode(&[0, 1, MYSQL_TYPE_BLOB, 0, 0xfc, 2, 0, b'h', b'i'], 1)
+                .unwrap()
+                .values,
+            [StatementParameterValue::Bytes(b"hi".to_vec())]
         );
     }
 
