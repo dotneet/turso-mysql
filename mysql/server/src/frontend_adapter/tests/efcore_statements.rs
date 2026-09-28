@@ -503,6 +503,77 @@ fn sql_query_reads_the_statement_through_a_derived_table() {
     }
 }
 
+/// `OrderByDescending(u => u.Balance).Select(u => u.Name).Skip(1).Take(1)`
+/// pages in a derived table and sorts again outside it. A body with an
+/// `ORDER BY` and a `LIMIT` was refused.
+///
+/// Measured on MySQL 8.4.11, the same whatever the table holds (none, three
+/// or five hundred rows): MySQL writes such a body out into a table of its
+/// own, so each column names its database, the derived table, and the table
+/// the body read by that table's own name — not the alias the body gave it —
+/// and keeps its NOT NULL and its no-default flag but none of its keys. A
+/// body grouping its rows is written out the same way.
+#[test]
+fn a_derived_table_pages_its_rows_before_the_statement_sorts_them() {
+    let (_directory, mut adapter) = adapter();
+    let second = result_set(
+        &mut adapter,
+        "SELECT `u0`.`Name`\nFROM (\n    SELECT `u`.`Name`, `u`.`Balance`\n    FROM `Users` AS `u`\n    ORDER BY `u`.`Balance` DESC\n    LIMIT 1 OFFSET 1\n) AS `u0`\nORDER BY `u0`.`Balance` DESC\nLIMIT 2",
+    );
+    assert_eq!(second.rows, [[Some(b"Bob".to_vec())]]);
+    let name = &second.columns[0];
+    assert_eq!(
+        (
+            name.schema.as_str(),
+            name.table.as_str(),
+            name.original_table.as_str(),
+            name.column_type,
+            name.column_length,
+            name.flags
+        ),
+        (
+            "reports",
+            "u0",
+            "users",
+            MYSQL_TYPE_VAR_STRING,
+            400,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
+        )
+    );
+
+    let top = result_set(
+        &mut adapter,
+        "SELECT `u0`.`Id`, `u0`.`Name`, `u0`.`Balance` FROM (SELECT `u`.`Id`, `u`.`Name`, `u`.`Balance` FROM `Users` AS `u` ORDER BY `u`.`Balance` DESC LIMIT 2) AS `u0` ORDER BY `u0`.`Balance`",
+    );
+    assert_eq!(
+        top.rows
+            .iter()
+            .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["Bob", "Alice"]
+    );
+    assert_eq!(top.columns[0].flags, MYSQL_NOT_NULL_FLAG);
+    assert_eq!(top.columns[0].original_table, "users");
+    assert_eq!(
+        (top.columns[2].column_type, top.columns[2].flags),
+        (MYSQL_TYPE_NEWDECIMAL, MYSQL_NOT_NULL_FLAG)
+    );
+
+    // A body grouping its rows under an alias names the table the same way.
+    let grouped = result_set(
+        &mut adapter,
+        "SELECT s.UserId, s.c FROM (SELECT p.UserId, COUNT(*) AS c FROM Posts AS p GROUP BY p.UserId) AS s ORDER BY s.UserId",
+    );
+    assert_eq!(grouped.columns[0].original_table, "posts");
+    assert_eq!(grouped.columns[0].schema, "reports");
+
+    assert!(adapter
+        .execute_query(
+            "SELECT s.Name FROM (SELECT u.Name FROM Users AS u ORDER BY u.Name LIMIT ?) AS s"
+        )
+        .is_err());
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

@@ -88,11 +88,6 @@ impl MySqlDerivedColumns {
         self.materialized
     }
 
-    /// Records that MySQL writes the body out into a table of its own.
-    pub(super) fn write_out(&mut self) {
-        self.materialized = true;
-    }
-
     /// Returns the name each projected column goes by, in order, or nothing
     /// for a body projecting its whole table.
     pub fn names(&self) -> &[String] {
@@ -155,8 +150,11 @@ pub(super) fn derived_columns(
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         return unsupported("derived table body grouping");
     };
-    let materialized =
+    let aggregates =
         projects_an_aggregate(select) || !group_by.is_empty() || select.having.is_some();
+    // Measured on MySQL 8.4.11: a body cut with a `LIMIT` is written out into
+    // a table of its own too, whatever that table holds.
+    let materialized = aggregates || query.limit_clause.is_some();
     let inner_reference = inner.reference.clone();
     if let [SelectItem::Wildcard(options)] = select.projection.as_slice() {
         if wildcard_options_are_empty(options) && !materialized {
@@ -198,7 +196,7 @@ pub(super) fn derived_columns(
             answers.push(None);
             continue;
         }
-        if !materialized {
+        if !aggregates {
             return unsupported("derived table working out a column without aggregating");
         }
         let answer = static_select_metadata::classify_static_select_expr(expr)

@@ -11644,12 +11644,11 @@ fn read_through_a_derived_table(
     if let Some(name) = derived.names().get(ordinal) {
         definition.original_name.clone_from(name);
     }
-    joined
-        .map_or(
-            derived.inner_reference(),
-            MySqlJoinedDerivedColumn::reference,
-        )
-        .clone_into(&mut definition.original_table);
+    // A body written out into a table of its own names the table it read by
+    // that table's own name, not the alias it read it under: measured,
+    // `(SELECT p.UserId, COUNT(*) AS c FROM Posts AS p GROUP BY p.UserId) AS
+    // s` and `(SELECT u.Name FROM Users AS u ORDER BY u.Id LIMIT 5) AS s`
+    // report `Posts` and `Users`.
     if derived.materialized() {
         definition.flags &= !(MYSQL_PRI_KEY_FLAG
             | MYSQL_UNIQUE_KEY_FLAG
@@ -11658,6 +11657,12 @@ fn read_through_a_derived_table(
             | MYSQL_AUTO_INCREMENT_FLAG);
         return;
     }
+    joined
+        .map_or(
+            derived.inner_reference(),
+            MySqlJoinedDerivedColumn::reference,
+        )
+        .clone_into(&mut definition.original_table);
     match definition.column_type {
         MYSQL_TYPE_DATE | MYSQL_TYPE_DATETIME | MYSQL_TYPE_TIMESTAMP | MYSQL_TYPE_TIME => {
             definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
