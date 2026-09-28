@@ -841,9 +841,9 @@ where
     ///
     /// MySQL has no connection per database, so a transaction begun with none
     /// selected is already open. The engine's transaction belongs to one
-    /// database's connection, so it is begun here instead; the engine takes
-    /// its read view at the first read either way, as COMPAT.md records for
-    /// `WITH CONSISTENT SNAPSHOT`.
+    /// database's connection, so it is begun here instead, and one begun
+    /// `WITH CONSISTENT SNAPSHOT` takes its read view here, at the selection,
+    /// where MySQL's took it at the statement, as COMPAT.md records.
     fn begin_the_transaction_awaiting_a_database(&mut self) -> Result<(), FrontendErrorKind> {
         let Some(begin) = self.transaction_awaiting_a_database.take() else {
             return Ok(());

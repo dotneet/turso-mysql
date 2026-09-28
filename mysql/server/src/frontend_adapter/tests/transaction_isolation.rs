@@ -226,6 +226,47 @@ fn a_level_for_the_next_transaction_alone_is_used_up_by_the_transaction_that_tak
     run(&mut one, "COMMIT");
 }
 
+/// `START TRANSACTION WITH CONSISTENT SNAPSHOT` sent with no database
+/// selected, as `mysqldump --single-transaction` sends it, is begun on the
+/// database selected next and takes its read view at that selection: a row
+/// another session commits afterwards is not seen, though nothing was read
+/// yet. MySQL takes the view at the statement itself, which here has no
+/// database to take it on; COMPAT.md records the difference.
+#[test]
+fn a_consistent_snapshot_begun_with_no_database_is_taken_at_the_selection() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, _factory) = catalog_factory(Arc::clone(&authorizer));
+    catalog.create("ledger").unwrap();
+    let session = |id: u8| {
+        let mut session = AuthorizedDatabaseAdapterFactory::new(
+            Arc::clone(&catalog),
+            binary_context(),
+            Arc::clone(&authorizer),
+        )
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([id; 32]),
+        ))
+        .unwrap();
+        session.authorize_connection().unwrap();
+        session
+    };
+    let mut writer = session(73);
+    writer.execute_init_db("ledger").unwrap();
+    run(
+        &mut writer,
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, n INT)",
+    );
+    run(&mut writer, "INSERT INTO c (id, n) VALUES (1, 0), (2, 0)");
+
+    let mut dump = session(74);
+    run(&mut dump, "START TRANSACTION WITH CONSISTENT SNAPSHOT");
+    dump.execute_init_db("ledger").unwrap();
+    run(&mut writer, "UPDATE c SET n = 7 WHERE id = 2");
+    assert_eq!(n_of(&mut dump, 2), "0");
+    run(&mut dump, "COMMIT");
+    assert_eq!(n_of(&mut dump, 2), "7");
+}
+
 #[test]
 fn a_consistent_snapshot_is_taken_at_the_statement() {
     let TwoSessions {
