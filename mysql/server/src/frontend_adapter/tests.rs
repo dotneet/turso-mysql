@@ -30881,3 +30881,6 @@ mod mysqldump_bytes;
 
 #[cfg(unix)]
 mod read_only_sessions;
+
+#[cfg(unix)]
+mod safe_updates;

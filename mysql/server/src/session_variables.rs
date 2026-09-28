@@ -196,6 +196,9 @@ pub(crate) struct MySqlSessionVariables {
     /// Whether the session's transactions are read-only, as `SET SESSION
     /// TRANSACTION READ ONLY` makes them.
     transaction_read_only: bool,
+    /// Whether an `UPDATE` or a `DELETE` needs a `LIMIT` or a `WHERE` that can
+    /// use an index.
+    sql_safe_updates: bool,
     /// The modes this session named beyond the ones the server always runs.
     sql_mode_choices: SqlModeChoices,
     /// The idle time the session asked for in place of the server's own.
@@ -297,6 +300,7 @@ impl Default for MySqlSessionVariables {
             transaction_isolation: MySqlIsolationLevel::default(),
             next_transaction_isolation: None,
             transaction_read_only: false,
+            sql_safe_updates: false,
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
             net_read_timeout_seconds: MYSQL_NET_READ_TIMEOUT_SECONDS,
@@ -435,6 +439,12 @@ impl MySqlSessionVariables {
     /// read-only.
     pub(crate) const fn transaction_read_only(&self) -> bool {
         self.transaction_read_only
+    }
+
+    /// Whether an `UPDATE` or a `DELETE` needs a `LIMIT` or a `WHERE` that
+    /// can use an index.
+    pub(crate) const fn sql_safe_updates(&self) -> bool {
+        self.sql_safe_updates
     }
 
     /// Forgets a level set for the next transaction alone, once one began.
@@ -861,10 +871,12 @@ impl MySqlSessionVariables {
             | MySqlSessionSetting::UserVariable(_) => {
                 unreachable!("a setting read from a variable is worked out before it is applied")
             }
+            MySqlSessionSetting::SqlSafeUpdates(enabled) => {
+                self.sql_safe_updates = enabled;
+            }
             MySqlSessionSetting::InformationSchemaStatsExpiry(_)
             | MySqlSessionSetting::TerminologyUsePrevious(_)
             | MySqlSessionSetting::SqlAutoIsNull(_)
-            | MySqlSessionSetting::SqlSafeUpdates(_)
             | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
             MySqlSessionSetting::SessionMaxAllowedPacket => {
                 unreachable!("the session's max_allowed_packet is refused before it is applied")
@@ -1274,15 +1286,9 @@ fn accept_session_setting(
                 Ok(())
             }
         }
-        // An UPDATE or DELETE with no key in its WHERE runs here, which is what
-        // 0 says; 1 asks for a refusal this server does not make.
-        MySqlSessionSetting::SqlSafeUpdates(enabled) => {
-            if *enabled {
-                Err(FrontendErrorKind::Unsupported)
-            } else {
-                Ok(())
-            }
-        }
+        // MySQL Workbench opens with `SET SQL_SAFE_UPDATES=1`, and the refusal
+        // it asks for is kept: see `refuse_an_update_without_a_key`.
+        MySqlSessionSetting::SqlSafeUpdates(_) => Ok(()),
         MySqlSessionSetting::TimeZone(zone) => {
             if parse_time_zone_offset(zone).is_some() {
                 Ok(())
@@ -1800,11 +1806,16 @@ fn counted_system_variable(
     if name.eq_ignore_ascii_case("group_concat_max_len") {
         return Some((session_variables.group_concat_max_len.to_string(), 21, true));
     }
-    // Neither rule is one this server has, and a session is refused both.
-    if name.eq_ignore_ascii_case("sql_auto_is_null")
-        || name.eq_ignore_ascii_case("sql_safe_updates")
-    {
+    // The rule is not one this server has, and a session is refused it.
+    if name.eq_ignore_ascii_case("sql_auto_is_null") {
         return Some(("0".to_owned(), 1, false));
+    }
+    if name.eq_ignore_ascii_case("sql_safe_updates") {
+        return Some((
+            u8::from(session_variables.sql_safe_updates).to_string(),
+            1,
+            false,
+        ));
     }
     // MySQL keeps an idle connection a client called interactive for
     // `interactive_timeout` instead. This server keeps every connection for the
@@ -2372,7 +2383,7 @@ mod tests {
         for sql in [
             "SET foreign_key_checks = 0, wait_timeout = 0",
             "SET @@SESSION.sql_mode = CONCAT(@@sql_mode, ',NO_AUTO_VALUE_ON_ZERO'), sql_auto_is_null = 1",
-            "SET wait_timeout = 100, sql_safe_updates = 1",
+            "SET wait_timeout = 100, sql_auto_is_null = 1",
             "SET SESSION wait_timeout = 100, GLOBAL foreign_key_checks = 0",
         ] {
             assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");

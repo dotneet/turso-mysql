@@ -455,6 +455,9 @@ pub enum FrontendErrorKind {
     MalformedPacket,
     /// A command asked for something the command does not know.
     UnknownCommand,
+    /// An `UPDATE` or a `DELETE` had neither a `LIMIT` nor a `WHERE` that can
+    /// use an index, while `sql_safe_updates` was on.
+    UpdateWithoutKey,
     /// A client answered the greeting without starting TLS.
     InsecureTransport,
     /// Authentication failed without exposing credential details.
@@ -755,6 +758,13 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         // Measured on MySQL 8.4.11, message and all, for a `COM_SET_OPTION`
         // naming an option other than the two.
         FrontendErrorKind::UnknownCommand => (1047, *b"08S01", b"Unknown command".as_slice()),
+        // Measured on MySQL 8.4.11, message and all, trailing space included.
+        FrontendErrorKind::UpdateWithoutKey => (
+            1175,
+            *b"HY000",
+            b"You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column. "
+                .as_slice(),
+        ),
         // Measured on MySQL 8.4.11 under `require_secure_transport=ON`,
         // message and all; this server always requires TLS over TCP.
         FrontendErrorKind::InsecureTransport => (
@@ -2702,6 +2712,7 @@ mod tests {
             (FrontendErrorKind::BadHandshake, 1043, *b"08S01"),
             (FrontendErrorKind::MalformedPacket, 1835, *b"HY000"),
             (FrontendErrorKind::UnknownCommand, 1047, *b"08S01"),
+            (FrontendErrorKind::UpdateWithoutKey, 1175, *b"HY000"),
             (FrontendErrorKind::InsecureTransport, 3159, *b"HY000"),
             (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),

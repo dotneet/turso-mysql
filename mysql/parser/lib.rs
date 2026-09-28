@@ -31,6 +31,7 @@ mod number_format;
 mod prisma_catalog;
 mod raw_bytes_in_words;
 mod replace_view;
+mod safe_updates;
 mod select_projection_origins;
 mod session_queries;
 mod session_settings;
@@ -165,6 +166,7 @@ pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use nothing_to_run::{nothing_to_run, NothingToRun};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
+pub use safe_updates::{read_safe_update, ComparedValues, SafeUpdateConjunct, SafeUpdateReading};
 pub use select_projection_origins::{
     compound_drops_repeated_rows, select_projection_origins, MySqlSelectProjectionOrigin,
 };

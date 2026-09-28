@@ -363,6 +363,12 @@ impl CommandExecutor for MySqlCommandAdapter {
             Some(sql),
             connection.parser_mode(),
         )?;
+        refuse_an_update_without_a_key(
+            Some(&connection),
+            &self.session_variables,
+            Some(sql),
+            connection.parser_mode(),
+        )?;
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = run_client_statement(&connection, || self.execute_query_statement(sql));
         let result = finish_client_statement(&connection, &mut self.session_variables, result);
@@ -461,6 +467,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self.connection.clone();
         refuse_a_write_while_read_only(
+            Some(&connection),
+            &self.session_variables,
+            None,
+            connection.parser_mode(),
+        )?;
+        refuse_an_update_without_a_key(
             Some(&connection),
             &self.session_variables,
             None,
@@ -2505,13 +2517,21 @@ where
             .statements
             .get(&statement_id)
             .map(|statement| statement.connection.clone());
+        let text = self
+            .prepared_statements
+            .statements
+            .get(&statement_id)
+            .map(|statement| statement.text.as_str());
         refuse_a_write_while_read_only(
             connection.as_ref(),
             &self.session_variables,
-            self.prepared_statements
-                .statements
-                .get(&statement_id)
-                .map(|statement| statement.text.as_str()),
+            text,
+            self.session.session_sql_mode(),
+        )?;
+        refuse_an_update_without_a_key(
+            connection.as_ref(),
+            &self.session_variables,
+            text,
             self.session.session_sql_mode(),
         )?;
         if let Some(connection) = &connection {
@@ -2572,6 +2592,12 @@ where
             .set_database_collation(self.session.selected_database_collation());
         let connection = self.session.connection_reading_no_table().ok().cloned();
         refuse_a_write_while_read_only(
+            connection.as_ref(),
+            &self.session_variables,
+            Some(sql),
+            self.session.session_sql_mode(),
+        )?;
+        refuse_an_update_without_a_key(
             connection.as_ref(),
             &self.session_variables,
             Some(sql),
@@ -6039,6 +6065,84 @@ fn refuse_a_write_while_read_only(
         return Err(FrontendErrorKind::ReadOnlyTransaction);
     }
     Ok(())
+}
+
+/// Answers 1175, before it runs, for an `UPDATE` or a `DELETE` with neither
+/// a `LIMIT` nor a `WHERE` that can use an index, while the session has
+/// `sql_safe_updates` on.
+///
+/// MySQL decides by whether its range optimizer finds an index to use, so
+/// this lets a statement through only where that is sure — a comparison of
+/// the first column of an index with written values of a kind the index
+/// serves — answers 1175 only where it is sure no index can serve, when
+/// nothing the `WHERE` compares is indexed at all, and answers 1235 for the
+/// rest, rather than run what MySQL would refuse. `sql` is `None` where the
+/// statement's text is not at hand.
+fn refuse_an_update_without_a_key(
+    connection: Option<&MySqlConnection>,
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+    sql: Option<&str>,
+    mode: turso_mysql_parser::SessionSqlMode,
+) -> Result<(), FrontendErrorKind> {
+    use turso_mysql_parser::{SafeUpdateConjunct, SafeUpdateReading};
+    if !session_variables.sql_safe_updates() {
+        return Ok(());
+    }
+    let Some(sql) = sql else {
+        return Err(FrontendErrorKind::Unsupported);
+    };
+    let (table, conjuncts) = match turso_mysql_parser::read_safe_update(sql, mode) {
+        None | Some(SafeUpdateReading::Limited) => return Ok(()),
+        Some(SafeUpdateReading::Unread) => return Err(FrontendErrorKind::Unsupported),
+        Some(SafeUpdateReading::OneTable { table, conjuncts }) => (table, conjuncts),
+    };
+    let connection = connection.ok_or(FrontendErrorKind::Unsupported)?;
+    let table = MySqlTableName::parse(&table).map_err(|_| FrontendErrorKind::Unsupported)?;
+    let indexes = connection
+        .list_indexes(&table)
+        .map_err(|_| FrontendErrorKind::Unsupported)?;
+    let columns = connection
+        .list_columns(&table)
+        .map_err(|_| FrontendErrorKind::Unsupported)?;
+    let indexed = |column: &str, first_only: bool| {
+        indexes.iter().any(|entry| {
+            entry.column_name().eq_ignore_ascii_case(column)
+                && (!first_only || entry.sequence_in_index() == 1)
+        })
+    };
+    let served = |column: &str, values: turso_mysql_parser::ComparedValues| {
+        let Some(declared) = columns
+            .iter()
+            .find(|declared| declared.name().eq_ignore_ascii_case(column))
+        else {
+            return false;
+        };
+        match declared.type_name().trim_end_matches(" UNSIGNED") {
+            "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "DECIMAL" => true,
+            "CHAR" | "VARCHAR" => !values.numbers && !values.bound,
+            _ => false,
+        }
+    };
+    let mut sure_no_index_serves = true;
+    for conjunct in &conjuncts {
+        match conjunct {
+            SafeUpdateConjunct::ColumnAgainstValues { column, values } => {
+                if indexed(column, true) && served(column, *values) {
+                    return Ok(());
+                }
+                sure_no_index_serves &= !indexed(column, false);
+            }
+            SafeUpdateConjunct::OtherUse { columns } => {
+                sure_no_index_serves &= !columns.iter().any(|column| indexed(column, false));
+            }
+            SafeUpdateConjunct::Unread => sure_no_index_serves = false,
+        }
+    }
+    if sure_no_index_serves {
+        Err(FrontendErrorKind::UpdateWithoutKey)
+    } else {
+        Err(FrontendErrorKind::Unsupported)
+    }
 }
 
 /// Whether a statement could be a `CREATE VIEW`, an `ALTER VIEW` or a

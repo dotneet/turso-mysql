@@ -3169,9 +3169,29 @@ word or as `@@GLOBAL.`, is refused.
 `SET wait_timeout` takes one second through a year, the range measured on
 8.4.11, and the connection keeps that idle time in place of the server's own
 until the session sets `DEFAULT` or resets. MySQL clamps a value past either
-end with a warning where this refuses it. `SET sql_auto_is_null = 0` and `SET
-sql_safe_updates = 0` are taken, being what this server does; 1 asks for a
-rule it does not have and is refused.
+end with a warning where this refuses it. `SET sql_auto_is_null = 0` is taken,
+being what this server does; 1 asks for a rule it does not have and is refused.
+
+`SET sql_safe_updates = 1`, which MySQL Workbench opens every session with, is
+taken and kept. Measured on MySQL 8.4.11, over a table with a primary key
+`id`, an index on `k` and an unindexed `v`: an `UPDATE` or a `DELETE` with a
+`LIMIT`, or with a `WHERE` whose top-level `AND` holds a comparison an index
+serves — `id = 1`, `id > 0` over every row, `id <> 1`, `id IS NULL`,
+`id IN (1, 2)`, `id BETWEEN 1 AND 2`, `id = '1'`, `k > 0`,
+`id = 1 OR id = 2`, `v = 9 AND id = 1`, and a prepared `id = ?` — runs, while
+one with no `WHERE`, `v = 1`, `1 = 1`, `id = id`, `id + 0 = 1`,
+`id = 1 OR v = 2` or a prepared `v = ?` answers 1175, `You are using safe
+update mode and you tried to update a table without a WHERE that uses a KEY
+column. `. MySQL decides by whether its range optimizer finds an index to use,
+so this runs a statement only where that is sure — the first column of an
+index compared with `=`, `<>`, `<`, `>`, `<=`, `>=`, `IN`, `BETWEEN` or
+`IS NULL` against written values of a kind the index serves (a number or a
+quoted word for a whole-number or `DECIMAL` column, a quoted word for a `CHAR`
+or `VARCHAR` one, a `?` for the first) — and answers 1175 only where no column
+the `WHERE` names is indexed at all. Anything between is answered 1235 rather
+than run: `id = id`, `id + 0 = 1` and `id = 1 OR v = 2` among them, where
+MySQL answers 1175, and a comparison of a date column with a word, which
+MySQL runs. A statement over several tables is 1235 too.
 
 `SET time_zone` takes `UTC`, `SYSTEM` and fixed offsets from `-13:59` through
 `+14:00`, the limits measured on MySQL 8.4.11. A `TIMESTAMP` value written by
@@ -5522,7 +5542,7 @@ this enforces, with `ANSI_QUOTES` and `NO_BACKSLASH_ESCAPES` added when the sess
 with them, and `STRICT_ALL_TABLES` and `NO_AUTO_VALUE_ON_ZERO` when the session named them.
 MySQL writes the modes in an order of its own rather than the order they were set in, measured,
 and so does this. `@@wait_timeout` reads the idle time the session asked for, and
-`@@global.wait_timeout` the server's own. `@@sql_auto_is_null` and `@@sql_safe_updates` read 0,
+`@@global.wait_timeout` the server's own. `@@sql_auto_is_null` reads 0 and `@@sql_safe_updates` what the session set,
 and `@@default_storage_engine` reads `InnoDB`.
 
 Their shapes are measured on 8.4.11: a word answers the same `VAR_STRING` of length 87380 with
