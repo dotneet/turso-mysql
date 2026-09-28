@@ -574,9 +574,10 @@ fn settings_made_before_use_reach_the_database_it_selects() {
 
 /// A view in a dump is written by the client it was created with, which is
 /// latin1 wherever the client was left at its default. latin1 and utf8mb4
-/// read ASCII alike, so ASCII is what is taken while latin1 is named.
+/// read ASCII alike, so ASCII is what is taken and answered while latin1 is
+/// named.
 #[test]
-fn latin1_takes_ascii_statements_and_answers_no_result() {
+fn latin1_takes_ascii_statements_and_answers_ascii_results() {
     let (_directory, mut adapter) = restoring_session();
     ok(&mut adapter, "CREATE DATABASE probe");
     ok(&mut adapter, "USE probe");
@@ -603,6 +604,10 @@ fn latin1_takes_ascii_statements_and_answers_no_result() {
     assert_eq!(
         adapter.execute_query("SELECT name FROM names ORDER BY id"),
         Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT name FROM names WHERE id = 2"),
+        [row(&[Some("Zoe")])]
     );
     ok(
         &mut adapter,

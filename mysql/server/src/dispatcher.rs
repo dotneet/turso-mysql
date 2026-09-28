@@ -683,14 +683,29 @@ fn set_result_charset(
         follow_the_connection_collation(&mut rows.columns, connection_collation);
         return Ok(());
     }
-    for column in &mut rows.columns {
+    describe_text_in_one_byte_characters(&mut rows.columns, 63)
+}
+
+/// Describes each text column of a result in a character set of one byte a
+/// character, binary or latin1, in place of utf8mb4's four.
+///
+/// MySQL reports a text column's length in the result's character set: the
+/// column's characters times that set's widest character, or for a `TEXT`
+/// its bytes, which is the same thing here since utf8mb4's narrowest
+/// character is one byte. A length at the four-byte limit stays there, MySQL
+/// having cut it there rather than overflowing.
+pub(crate) fn describe_text_in_one_byte_characters(
+    columns: &mut [ColumnDefinitionConfig],
+    character_set: u16,
+) -> Result<(), FrontendErrorKind> {
+    for column in columns {
         match column.character_set {
             0 | 63 => {}
             45 | 46 | 224 | 255 if column.column_length == u32::MAX => {
-                column.character_set = 63;
+                column.character_set = character_set;
             }
             45 | 46 | 224 | 255 if column.column_length % 4 == 0 => {
-                column.character_set = 63;
+                column.character_set = character_set;
                 column.column_length /= 4;
             }
             _ => return Err(FrontendErrorKind::Unsupported),

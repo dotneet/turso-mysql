@@ -2718,8 +2718,17 @@ ASCII's, as utf8mb4's are, so while the session names latin1 for what it sends
 or for its connection a statement written in ASCII is taken and one with any
 other byte is refused, since latin1 reads that byte as another character; the
 view text a dump writes is ASCII. While it names latin1 for its results, a
-statement answering rows is refused rather than sent in utf8mb4, and a prepared
-statement is refused while any of the three names latin1. Each reads back as
+result whose text columns hold only ASCII, and whose columns are named in
+ASCII, is sent as it is, being the same bytes in latin1; one holding any other
+character is refused rather than sent in utf8mb4. Measured on 8.4.11 over a
+latin1 connection, MySQL describes each text column of such a result as
+latin1_swedish_ci (8) with its length counted in latin1's one-byte characters
+— `select @@version_comment limit 1`, which the `mysql` client sends as it
+starts, is 21845 where utf8mb4 makes it 87380, `VERSION()` 6 where utf8mb4
+makes it 24, a `VARCHAR(20)` 20 and a `TEXT` 65535 — and leaves a number's
+binary character set alone, and this describes them the same. A binary string
+is sent as it is by MySQL too, whatever it holds. A prepared statement is
+refused while any of the three names latin1. Each reads back as
 named, and `SET NAMES utf8mb4` or the dump's own restoring `SET` ends it. A
 view made in that window is kept with no record of the latin1: MySQL's
 `information_schema.VIEWS` reports `latin1` and `latin1_swedish_ci` for it,
@@ -5308,8 +5317,9 @@ does the same for utf8mb4's collations, as described under `SET NAMES`, and
 for `latin1_swedish_ci`, and answers 1231 for those four, with a message that
 does not name the character set. latin1 is kept as `SET NAMES latin1` would
 leave it, with the refusals that come with naming latin1: a statement outside
-ASCII and every result set are refused until the session names utf8mb4, which
-the `SET NAMES utf8mb4` a driver sends does. Any other character set —
+ASCII and a result set holding anything outside ASCII are refused until the
+session names utf8mb4, which the `SET NAMES utf8mb4` a driver sends does. Any
+other character set —
 utf8mb3, binary, another latin1 collation — is answered 1235, `This server
 does not take the character set the client asked for; connect with utf8mb4`,
 in place of the final OK once the credentials are checked. Before, the server

@@ -332,7 +332,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = self.execute_query_statement(sql);
         let result = finish_client_statement(&connection, &mut self.session_variables, result);
-        refuse_a_result_in_latin1(&self.session_variables, result)
+        answer_a_result_in_latin1(&self.session_variables, result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -2300,7 +2300,7 @@ where
             }
             None => result,
         };
-        refuse_a_result_in_latin1(&self.session_variables, result)
+        answer_a_result_in_latin1(&self.session_variables, result)
     }
 
     fn prepare_client_statement(
@@ -5074,18 +5074,58 @@ fn refuse_what_latin1_reads_differently(
     Ok(())
 }
 
-/// Refuses a result the session asked for in latin1, which this server does
-/// not convert its utf8mb4 text to.
-fn refuse_a_result_in_latin1(
+/// Sends a result the session asked for in latin1 when its text is ASCII,
+/// which latin1 and utf8mb4 write with the same bytes, and refuses it
+/// otherwise, since this server does not convert its utf8mb4 text.
+///
+/// Measured on MySQL 8.4.11 over a latin1 connection: every text column, and
+/// every name a column is described with, is sent in latin1; a text column
+/// reports latin1_swedish_ci (8) and its length in latin1's one-byte
+/// characters — `@@version_comment` 21845 where utf8mb4 reports 87380,
+/// `VERSION()` 6 where it reports 24; and a number keeps its binary
+/// character set. A binary string is sent as it is, and so is not read here.
+fn answer_a_result_in_latin1(
     session_variables: &crate::session_variables::MySqlSessionVariables,
     result: Result<CommandExecutionResult, FrontendErrorKind>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-    if session_variables.wants_latin1_results()
-        && matches!(result, Ok(CommandExecutionResult::ResultSet(_)))
-    {
+    if !session_variables.wants_latin1_results() {
+        return result;
+    }
+    let Ok(CommandExecutionResult::ResultSet(mut rows)) = result else {
+        return result;
+    };
+    if !rows.columns.iter().all(is_described_in_ascii) {
         return Err(FrontendErrorKind::Unsupported);
     }
-    result
+    for (index, column) in rows.columns.iter().enumerate() {
+        let sent_as_it_is =
+            column.character_set == MYSQL_BINARY_COLLATION && column.column_type != MYSQL_TYPE_JSON;
+        if !sent_as_it_is
+            && !rows
+                .rows
+                .iter()
+                .all(|row| row[index].as_deref().is_none_or(<[u8]>::is_ascii))
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+    }
+    crate::dispatcher::describe_text_in_one_byte_characters(
+        &mut rows.columns,
+        LATIN1_SWEDISH_CI_COLLATION,
+    )?;
+    Ok(CommandExecutionResult::ResultSet(rows))
+}
+
+fn is_described_in_ascii(column: &ColumnDefinitionConfig) -> bool {
+    [
+        &column.schema,
+        &column.table,
+        &column.original_table,
+        &column.name,
+        &column.original_name,
+    ]
+    .iter()
+    .all(|name| name.is_ascii())
 }
 
 /// Refuses a prepared statement while the session names latin1 for anything:
@@ -9904,6 +9944,7 @@ const MYSQL_SET_FLAG: u16 = 2048;
 const MYSQL_AUTO_INCREMENT_FLAG: u16 = 512;
 pub(crate) const MYSQL_NO_DEFAULT_VALUE_FLAG: u16 = 4096;
 pub(crate) const MYSQL_BINARY_COLLATION: u16 = 63;
+const LATIN1_SWEDISH_CI_COLLATION: u16 = 8;
 
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
 /// character count by when it reports a column's length.

@@ -246,23 +246,89 @@ fn max_allowed_packet_reads_back_64_mib_and_the_session_cannot_set_it() {
 
 /// The `mysql` client on a shell without a UTF-8 locale names latin1 in its
 /// handshake. The session then reads its statements and sends its results in
-/// latin1, as after `SET NAMES latin1`, so a result is refused rather than
-/// sent in utf8mb4, and the `SET NAMES utf8mb4` every driver sends makes the
-/// session whole.
+/// latin1, as after `SET NAMES latin1`. A result written in ASCII is the same
+/// bytes in latin1 and is sent, described as MySQL 8.4.11 describes it over
+/// such a connection, measured: each text column reports latin1_swedish_ci (8)
+/// and a quarter of the length utf8mb4 gives it — `@@version_comment` 21845,
+/// `VERSION()` 6 — and a number is described as it is under utf8mb4. A result
+/// holding any other character, or a column named with one, is refused rather
+/// than sent in utf8mb4, and the `SET NAMES utf8mb4` every driver sends makes
+/// the session whole.
 #[test]
-fn a_latin1_handshake_refuses_results_until_set_names_utf8mb4() {
+fn a_latin1_handshake_answers_results_written_in_ascii() {
     let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE names (id INT NOT NULL PRIMARY KEY, name VARCHAR(20) NOT NULL, notes TEXT)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO names VALUES (1, 'Émile', 'plain'), (2, 'Zoe', NULL)",
+    );
+    const READINGS: &str = "SELECT id, name, notes FROM names WHERE id = 2";
+    let utf8mb4 = described(&mut adapter, READINGS);
     adapter.take_client_collation(8).unwrap();
+    // What the client sends as it starts, and what the harness's step asks.
     assert_eq!(
-        adapter.execute_query("SELECT 1"),
+        described(&mut adapter, "select @@version_comment limit 1").0,
+        [(8, 21845)]
+    );
+    assert_eq!(
+        described(&mut adapter, "SELECT @@character_set_client"),
+        (vec![(8, 21845)], vec![vec![Some(b"latin1".to_vec())]])
+    );
+    assert_eq!(described(&mut adapter, "SELECT VERSION()").0, [(8, 6)]);
+    let latin1 = described(&mut adapter, READINGS);
+    assert_eq!(
+        latin1.0,
+        [
+            utf8mb4.0[0],
+            (8, utf8mb4.0[1].1 / 4),
+            (8, utf8mb4.0[2].1 / 4)
+        ]
+    );
+    assert_eq!(latin1.0[1..], [(8, 20), (8, 65535)]);
+    assert_eq!(latin1.1, utf8mb4.1);
+    assert_eq!(
+        adapter.execute_query("SELECT name FROM names ORDER BY id"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    run(&mut adapter, "SET character_set_client = utf8mb4");
+    assert_eq!(
+        adapter.execute_query("SELECT id AS número FROM names WHERE id = 2"),
         Err(FrontendErrorKind::Unsupported)
     );
     run(&mut adapter, "SET NAMES utf8mb4");
+    assert_eq!(
+        rows(&mut adapter, "SELECT name FROM names ORDER BY id"),
+        [[Some("Émile".to_owned())], [Some("Zoe".to_owned())]]
+    );
     assert_eq!(rows(&mut adapter, "SELECT 1"), [[Some("1".to_owned())]]);
     assert_eq!(
         adapter.take_client_collation(33),
         Err(FrontendErrorKind::UnsupportedClientCharacterSet)
     );
+}
+
+type Description = Vec<(u16, u32)>;
+type Values = Vec<Vec<Option<Vec<u8>>>>;
+
+/// Each column's character set and length, and the rows.
+fn described(
+    adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+    sql: &str,
+) -> (Description, Values) {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must return a result set");
+    };
+    (
+        result
+            .columns
+            .iter()
+            .map(|column| (column.character_set, column.column_length))
+            .collect(),
+        result.rows,
+    )
 }
 
 /// What `mysqldump` 8.4 sends before anything else. Measured on MySQL 8.4.11:
