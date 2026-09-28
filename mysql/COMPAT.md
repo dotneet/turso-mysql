@@ -3418,6 +3418,29 @@ joined columns follows `group_concat_max_len` — 73728 under 2048 — by a rule
 worked out past that, so under any limit but MySQL's own 1024 the two reads are
 refused.
 
+Prisma's schema engine reads the catalog before `migrate deploy`, `db pull`,
+`migrate diff` and `db push` with six statements the statement path does not
+take: they compare and order names with `BINARY`, and join two catalog tables on
+it. Those six, exactly as prisma-engines 7.1 (Prisma 6.19) writes them in
+`sql-schema-describer`, prepared with the database bound, are recognized and
+answered from plain reads of the same tables — the tables with a column,
+their `CREATE_OPTIONS` (empty, as for every table this server takes) and
+comments; every `CHECK` with its clause and its type lower-cased; every column
+with an empty comment answered as NULL; every foreign key's columns joined to
+its actions; every index's columns — each comparison and order Prisma writes
+with `BINARY` made on the names' bytes, so the foreign-key read, which compares
+the database's name that way too, finds nothing for a name written in another
+case, as MySQL's does. Every column is described as MySQL
+8.4.11 described it to `mysql_async` over the binary protocol: the name read
+through `BINARY` a `VAR_STRING` of 192 in the binary character set, numbers
+`LONGLONG` or `LONG` with MySQL's widths and flags, and each word a
+`VAR_STRING`, `STRING` or `BLOB` of MySQL's width. Its two other reads, of
+`VIEWS` and `ROUTINES`, are answered by the statement path as any other.
+Measured, MySQL orders the columns read by their place in their table alone,
+leaving columns of different tables at the same place in an order of its own;
+this answers them in the order the catalog lists the tables, which Prisma, and
+any reader keeping each table's columns in order, cannot tell apart.
+
 `information_schema.STATISTICS` is the second such table, and the first this
 frontend has ever answered. It reports one row per column of every index of
 every table the session may see: the primary key first under the name

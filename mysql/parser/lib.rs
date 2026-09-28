@@ -28,6 +28,7 @@ mod named_tables;
 mod network_address;
 mod nothing_to_run;
 mod number_format;
+mod prisma_catalog;
 mod replace_view;
 mod select_projection_origins;
 mod session_queries;
@@ -79,6 +80,9 @@ pub use information_schema::{
     GormInformationSchemaPreparedQuery, LaravelInformationSchemaQuery, LaravelSchema,
 };
 use mysql_ddl::render_mysql_column;
+pub use prisma_catalog::{
+    parse_optional_prisma_information_schema_query, PrismaInformationSchemaQuery,
+};
 use static_select_metadata::classify_static_select_expr;
 use translate::{
     columns_given_their_default, delete_source_table, direct_signed_integer,

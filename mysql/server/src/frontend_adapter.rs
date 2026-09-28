@@ -7,6 +7,8 @@
 #[cfg(unix)]
 mod catalog_results;
 mod named_lock_results;
+#[cfg(unix)]
+mod prisma_catalog;
 
 use turso_mysql::named_locks::{MySqlNamedLockSession, MySqlNamedLocks};
 #[cfg(unix)]
@@ -263,6 +265,9 @@ enum RunAsText {
     /// The rows of one of Laravel's catalog reads, which are worked out from
     /// the catalog the text path reads.
     LaravelCatalog(LaravelInformationSchemaQuery),
+    /// The rows of one of Prisma's catalog reads, worked out the same way for
+    /// the databases it binds.
+    PrismaCatalog(turso_mysql_parser::PrismaInformationSchemaQuery),
 }
 
 #[cfg(unix)]
@@ -1672,6 +1677,46 @@ where
         Ok(result)
     }
 
+    /// Reads the words bound to a statement run through the text path, each
+    /// of which has to be one: a number or a date there is refused.
+    fn bound_words(
+        &mut self,
+        statement_id: u32,
+        parameter_payload: &[u8],
+        long_data: StatementLongData,
+        parameter_count: usize,
+    ) -> Result<Vec<String>, FrontendErrorKind> {
+        if let Some(error) = long_data.error {
+            return Err(pending_long_data_error(error));
+        }
+        let long_data = long_data
+            .values
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>();
+        let statement = self
+            .prepared_statements
+            .statements
+            .get_mut(&statement_id)
+            .ok_or(FrontendErrorKind::UnknownPreparedStatement)?;
+        let decoded = decode_statement_execute_parameters_with_long_data(
+            parameter_payload,
+            parameter_count,
+            statement.parameter_types.as_deref(),
+            &long_data,
+        )
+        .map_err(statement_execute_decode_error)?;
+        statement.parameter_types = Some(decoded.types);
+        decoded
+            .values
+            .into_iter()
+            .map(|value| match value {
+                StatementParameterValue::String(value) => Ok(value),
+                _ => Err(FrontendErrorKind::Unsupported),
+            })
+            .collect()
+    }
+
     fn gorm_catalog_table_visible(
         &self,
         schema: &str,
@@ -2497,6 +2542,22 @@ where
         .map_err(|_| FrontendErrorKind::Syntax)?
         {
             return self.prepare_gorm_catalog_query(query, sql);
+        }
+        if let Some(query) = turso_mysql_parser::parse_optional_prisma_information_schema_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            let mut prepared = self.prepare_text_statement(
+                sql,
+                RunAsText::PrismaCatalog(query),
+                prisma_catalog::prisma_catalog_columns(query),
+            )?;
+            prepared.parameters = (1..=query.parameter_count())
+                .map(|index| column_definition(format!("?{index}"), MYSQL_TYPE_NULL))
+                .collect();
+            return Ok(prepared);
         }
         let written = write_the_current_database_in(
             sql,
@@ -3713,7 +3774,7 @@ where
             .get(&statement_id)
             .and_then(|statement| statement.runs_as_text.clone())
         {
-            self.pending_long_data.take_statement(statement_id);
+            let long_data = self.pending_long_data.take_statement(statement_id);
             return match statement {
                 RunAsText::NoRows(sql) => match self.execute_query_statement(&sql)? {
                     CommandExecutionResult::Ok(result) => {
@@ -3736,6 +3797,16 @@ where
                             self.status_flags(),
                         ),
                     ))
+                }
+                RunAsText::PrismaCatalog(query) => {
+                    let schemas = self.bound_words(
+                        statement_id,
+                        parameter_payload,
+                        long_data,
+                        query.parameter_count(),
+                    )?;
+                    self.prisma_catalog_result(query, &schemas)
+                        .map(PreparedStatementExecutionResult::ResultSet)
                 }
             };
         }

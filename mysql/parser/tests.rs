@@ -9520,3 +9520,31 @@ fn a_word_opening_a_dollar_quote_is_told_apart_from_a_name_with_a_dollar() {
         }
     ));
 }
+
+/// Prisma's catalog reads are recognized whatever their spacing and with the
+/// comment Prisma writes into two of them; a read that says anything else is
+/// left to the checked `SELECT`, which refuses `BINARY`.
+#[test]
+fn prisma_catalog_reads_are_recognized_and_nothing_near_them() {
+    let mode = SessionSqlMode::default();
+    let read = |sql: &str| parse_optional_prisma_information_schema_query(sql, mode).unwrap();
+    assert_eq!(
+        read("SELECT table_name AS table_name, index_name AS index_name, column_name AS column_name, sub_part AS partial, seq_in_index AS seq_in_index, collation AS column_order, non_unique AS non_unique, index_type AS index_type FROM information_schema.statistics WHERE table_schema = ? ORDER BY BINARY table_name, BINARY index_name, seq_in_index"),
+        Some(PrismaInformationSchemaQuery::Indexes)
+    );
+    assert_eq!(
+        read("SELECT DISTINCT BINARY table_info.table_name AS table_name\nFROM information_schema.tables AS table_info\nJOIN information_schema.columns AS column_info\nON BINARY column_info.table_name = BINARY table_info.table_name\nWHERE table_info.table_schema = ?\nAND column_info.table_schema = ?\n-- Exclude views.\nAND table_info.table_type = 'BASE TABLE'\nORDER BY BINARY table_info.table_name"),
+        Some(PrismaInformationSchemaQuery::MigrationTableNames)
+    );
+    assert_eq!(
+        PrismaInformationSchemaQuery::MigrationTableNames.parameter_count(),
+        2
+    );
+    for other in [
+        "SELECT table_name AS table_name, index_name AS index_name, column_name AS column_name, sub_part AS partial, seq_in_index AS seq_in_index, collation AS column_order, non_unique AS non_unique, index_type AS index_type FROM information_schema.statistics WHERE table_schema = 'prisma' ORDER BY BINARY table_name, BINARY index_name, seq_in_index",
+        "SELECT DISTINCT BINARY table_name FROM information_schema.tables WHERE table_schema = ?",
+        "SELECT 1",
+    ] {
+        assert_eq!(read(other), None, "{other}");
+    }
+}
