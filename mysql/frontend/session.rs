@@ -89,6 +89,9 @@ pub struct MySqlConnection {
     /// MySQL's `lock_wait_timeout`: how long a statement waits for a table or
     /// a database another session is using.
     metadata_lock_wait: Arc<Mutex<Duration>>,
+    /// The transaction command the statement running now ran, if any, which
+    /// decides whether its transaction keeps the database from a drop.
+    transaction_command_ran: Arc<Mutex<TransactionCommandRan>>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -166,6 +169,20 @@ impl SchemaReadings {
 /// it again: measured, 6.7 GB after one UPDATE of a million rows, and over a
 /// second added to the next start.
 struct CloseOnLastDrop(Arc<Connection>);
+
+/// A transaction command a statement ran, which [`MySqlConnection::finish_a_statement`]
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TransactionCommandRan {
+    #[default]
+    None,
+    /// `BEGIN`, `START TRANSACTION`, `COMMIT` or `ROLLBACK`, and their
+    /// chaining forms: whatever transaction is open after it has read nothing
+    /// yet, even when `WITH CONSISTENT SNAPSHOT` took its snapshot.
+    BeganATransaction,
+    /// `SAVEPOINT`, `ROLLBACK TO` or `RELEASE`, which read nothing.
+    Savepoint,
+}
 
 /// Gives a connection back the lock wait it had once a statement that waited
 /// longer is done, however it ends.
@@ -1531,6 +1548,7 @@ impl MySqlConnection {
             database_collation: None,
             database_user: None,
             metadata_lock_wait: Arc::new(Mutex::new(DEFAULT_METADATA_LOCK_WAIT)),
+            transaction_command_ran: Arc::default(),
         })
     }
 
@@ -1649,6 +1667,7 @@ impl MySqlConnection {
     /// may run on the files of a database that is gone. A statement that
     /// starts while a drop waits waits behind it, as MySQL's does.
     pub fn start_a_statement(&self) -> std::result::Result<(), MySqlStatementNotStarted> {
+        *self.transaction_command_ran.lock().unwrap() = TransactionCommandRan::None;
         match &self.database_user {
             Some(user) => user.start_using(self.metadata_lock_wait()),
             None => Ok(()),
@@ -1656,14 +1675,30 @@ impl MySqlConnection {
     }
 
     /// Marks the statement [`Self::start_a_statement`] started as finished.
-    /// A transaction left open keeps the database in use until it ends:
-    /// measured on MySQL 8.4.11, a drop waits for a transaction that read one
-    /// of its tables.
+    ///
+    /// A transaction left open that has read keeps the database in use until
+    /// it ends. Measured on MySQL 8.4.11: a drop waits for a transaction that
+    /// read one of the database's tables, or listed them with `SHOW TABLES`,
+    /// and not for one that has only begun — `WITH CONSISTENT SNAPSHOT`
+    /// among them — taken a savepoint or run `SELECT 1`. The engine takes a
+    /// transaction's snapshot at its first read, so a snapshot left by a
+    /// statement other than a transaction command is such a read.
     pub fn finish_a_statement(&self) {
-        if let Some(user) = &self.database_user {
-            if self.inner.get_auto_commit() {
-                user.stop_using();
+        let Some(user) = &self.database_user else {
+            return;
+        };
+        if self.inner.get_auto_commit() {
+            user.stop_using();
+            return;
+        }
+        let ran = std::mem::take(&mut *self.transaction_command_ran.lock().unwrap());
+        match ran {
+            TransactionCommandRan::BeganATransaction => user.stop_using(),
+            TransactionCommandRan::Savepoint => user.stop_using_unless_the_transaction_keeps_it(),
+            TransactionCommandRan::None if self.inner.has_read_snapshot() => {
+                user.keep_for_the_transaction();
             }
+            TransactionCommandRan::None => user.stop_using_unless_the_transaction_keeps_it(),
         }
     }
 
@@ -3728,6 +3763,12 @@ impl MySqlConnection {
     ) -> std::result::Result<MySqlTransactionOutcome, MySqlQueryError> {
         let command =
             parse_transaction_command(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
+        *self.transaction_command_ran.lock().unwrap() = match command {
+            MySqlTransactionCommand::Savepoint(_)
+            | MySqlTransactionCommand::RollbackToSavepoint(_)
+            | MySqlTransactionCommand::ReleaseSavepoint(_) => TransactionCommandRan::Savepoint,
+            _ => TransactionCommandRan::BeganATransaction,
+        };
         // The lock `LOCK TABLES` took is held by the transaction it opened, so
         // ending that transaction would let go of a lock the client believes
         // it still holds. MySQL keeps the two apart; this keeps them together,

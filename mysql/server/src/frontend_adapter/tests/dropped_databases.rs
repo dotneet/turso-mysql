@@ -297,3 +297,52 @@ fn table_definition_changes_wait_as_long_as_lock_wait_timeout() {
     run(&mut writer, "COMMIT");
     run(&mut changer, "ALTER TABLE kept ADD COLUMN w INT");
 }
+
+/// A transaction holds a `DROP DATABASE` up once it has read the database —
+/// a table, or the list of them — and not before: one that has only begun,
+/// begun `WITH CONSISTENT SNAPSHOT`, taken a savepoint or run `SELECT 1` lets
+/// the drop go at once, and its next read of a table answers 1049.
+#[test]
+fn only_a_transaction_that_read_the_database_holds_a_drop_up() {
+    for (opening, holds) in [
+        (&["BEGIN", "SELECT 1"][..], false),
+        (&["START TRANSACTION WITH CONSISTENT SNAPSHOT"][..], false),
+        (&["BEGIN", "SAVEPOINT s"][..], false),
+        (&["SET autocommit = 0", "SELECT 1"][..], false),
+        (&["BEGIN", "SELECT 1", "SHOW TABLES", "SELECT 2"][..], true),
+        (&["BEGIN", "SELECT id FROM kept", "SAVEPOINT s"][..], true),
+        (
+            &[
+                "BEGIN",
+                "SELECT id FROM kept",
+                "SAVEPOINT s",
+                "ROLLBACK TO SAVEPOINT s",
+            ][..],
+            true,
+        ),
+        (
+            &["BEGIN", "SELECT id FROM kept", "BEGIN", "SELECT 1"][..],
+            false,
+        ),
+    ] {
+        let (_directory, catalog, authorizer) = catalog();
+        let mut holder = session(&catalog, &authorizer, "shop");
+        run(&mut holder, "CREATE TABLE kept (id INT PRIMARY KEY)");
+        for statement in opening {
+            assert!(holder.execute_query(statement).is_ok(), "{statement}");
+        }
+        let mut dropper = session(&catalog, &authorizer, "other");
+        run(&mut dropper, "SET lock_wait_timeout = 1");
+        let dropped = dropper.execute_query("DROP DATABASE shop");
+        if holds {
+            assert_eq!(dropped, Err(FrontendErrorKind::DatabaseBusy), "{opening:?}");
+            continue;
+        }
+        assert!(dropped.is_ok(), "{opening:?}: {dropped:?}");
+        assert_eq!(
+            refusal(&mut holder, "SELECT id FROM kept").0,
+            FrontendErrorKind::UnknownDatabase,
+            "{opening:?}"
+        );
+    }
+}

@@ -4178,7 +4178,7 @@ Prisma's `migrate reset` drops the database its own pooled connections are in
 and its schema engine drops the shadow database it is connected to. Measured on
 8.4.11 and matched: the drop commits the dropping session's transaction first,
 whichever database it names; it waits for a session running a statement on the
-database or holding a transaction open on it, and a statement another session
+database or holding a transaction open that has read it, and a statement another session
 starts on the database while it waits waits behind it; a session that merely
 has the database selected holds nothing up. Afterwards that session keeps the
 name — `DATABASE()` answers it — and a statement on the database answers 1049
@@ -4199,12 +4199,22 @@ waits the session's `lock_wait_timeout`, and a drop that runs out answers 1205;
 a statement another session starts on the database while the drop waits, and
 selecting the database, wait that session's own `lock_wait_timeout` and answer
 1205 once it runs out, selecting leaving the session where it was — measured on
-8.4.11 and matched. Three things differ, each listed in
-TODO.md: a transaction that has read no table yet holds the drop up, where
-MySQL's does not; a statement that reads no table at all — `SELECT 1`, `BEGIN` —
-in a session whose database was dropped answers 1049 rather than running; and a
-statement prepared before the drop answers 1049 even once the database is made
-again, where MySQL prepares it over the new one.
+8.4.11 and matched. A transaction has read the database once it read one of
+its tables or listed them with `SHOW TABLES`, and keeps it until it ends. One
+that has only begun, taken a savepoint or run `SELECT 1` lets the drop go at
+once, and its next read of a table answers 1049; so does one that read and was
+then ended by a `BEGIN`, while a read before a `SAVEPOINT` still holds the drop
+after `ROLLBACK TO` it — each measured on 8.4.11 with two sessions and matched.
+The engine takes a transaction's snapshot at its first read, so a statement
+that leaves one behind has read; a transaction command's snapshot, which `WITH
+CONSISTENT SNAPSHOT` takes, is not counted. Four things differ, each listed in
+TODO.md: after `WITH CONSISTENT SNAPSHOT`, and after a `SAVEPOINT` taken before
+the first read and rolled back to after it, the transaction holds the drop even
+though MySQL's has read no table or has let it go; a statement that reads no
+table at all — `SELECT 1`, `BEGIN` — in a session whose database was dropped
+answers 1049 rather than running; and a statement prepared before the drop
+answers 1049 even once the database is made again, where MySQL prepares it over
+the new one.
 
 `SET [SESSION] lock_wait_timeout = <n>` is taken, from one second to a year,
 and `DEFAULT`; `@@lock_wait_timeout` and `SHOW VARIABLES` read it back, an

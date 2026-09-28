@@ -171,7 +171,17 @@ impl std::error::Error for MySqlDatabaseDropped {}
 pub(crate) struct DatabaseUser {
     users: Arc<DatabaseUsers>,
     database: String,
-    using: Mutex<bool>,
+    using: Mutex<Use>,
+}
+
+/// How long a connection counts as using its database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Use {
+    Not,
+    /// Until the statement running now ends.
+    ForTheStatement,
+    /// Until the transaction ends, because it read the database.
+    ForTheTransaction,
 }
 
 impl DatabaseUser {
@@ -179,7 +189,7 @@ impl DatabaseUser {
         Self {
             users,
             database,
-            using: Mutex::new(false),
+            using: Mutex::new(Use::Not),
         }
     }
 
@@ -192,7 +202,7 @@ impl DatabaseUser {
     /// answers 1205 once it runs out.
     pub(crate) fn start_using(&self, wait: Duration) -> Result<(), MySqlStatementNotStarted> {
         let mut using = self.lock_using();
-        if *using {
+        if *using != Use::Not {
             return Ok(());
         }
         let deadline = Instant::now().checked_add(wait);
@@ -215,13 +225,42 @@ impl DatabaseUser {
             .using
             .checked_add(1)
             .expect("MySQL database user count must not overflow");
-        *using = true;
+        *using = Use::ForTheStatement;
         Ok(())
     }
 
-    pub(crate) fn stop_using(&self) {
+    /// Keeps counting this connection until its transaction ends, which
+    /// [`DatabaseUser::stop_using`] is told of.
+    ///
+    /// Measured on MySQL 8.4.11: a `DROP DATABASE` waits for a transaction
+    /// that read one of the database's tables, and not for one that has only
+    /// begun, taken a savepoint or run `SELECT 1`.
+    pub(crate) fn keep_for_the_transaction(&self) {
         let mut using = self.lock_using();
-        if !*using {
+        assert_ne!(
+            *using,
+            Use::Not,
+            "only a connection running a statement on its database can keep it"
+        );
+        *using = Use::ForTheTransaction;
+    }
+
+    /// Stops counting this connection once its statement ends, unless its
+    /// transaction read the database before.
+    pub(crate) fn stop_using_unless_the_transaction_keeps_it(&self) {
+        let mut using = self.lock_using();
+        if *using == Use::ForTheTransaction {
+            return;
+        }
+        self.stop_counting(&mut using);
+    }
+
+    pub(crate) fn stop_using(&self) {
+        self.stop_counting(&mut self.lock_using());
+    }
+
+    fn stop_counting(&self, using: &mut Use) {
+        if *using == Use::Not {
             return;
         }
         let mut state = self.users.lock();
@@ -230,7 +269,7 @@ impl DatabaseUser {
             .checked_sub(1)
             .expect("a counted MySQL database user was counted once");
         drop(state);
-        *using = false;
+        *using = Use::Not;
         self.users.changed.notify_all();
     }
 
@@ -238,7 +277,7 @@ impl DatabaseUser {
         self.users.lock().dropped
     }
 
-    fn lock_using(&self) -> MutexGuard<'_, bool> {
+    fn lock_using(&self) -> MutexGuard<'_, Use> {
         self.using
             .lock()
             .expect("MySQL database user mutex poisoned")
@@ -355,6 +394,30 @@ mod tests {
             users.wait_to_drop(Duration::ZERO).err(),
             Some(DropWaitError::AlreadyDropped)
         );
+    }
+
+    #[test]
+    fn a_transaction_that_read_keeps_counting_until_it_ends() {
+        let users = Arc::new(DatabaseUsers::default());
+        let reader = user(&users);
+        reader.start_using(A_LONG_WAIT).unwrap();
+        reader.keep_for_the_transaction();
+        reader.stop_using_unless_the_transaction_keeps_it();
+        assert_eq!(
+            users.wait_to_drop(Duration::ZERO).err(),
+            Some(DropWaitError::TimedOut)
+        );
+        reader.stop_using();
+        assert!(users.wait_to_drop(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn a_statement_that_read_nothing_stops_counting_when_it_ends() {
+        let users = Arc::new(DatabaseUsers::default());
+        let idle = user(&users);
+        idle.start_using(A_LONG_WAIT).unwrap();
+        idle.stop_using_unless_the_transaction_keeps_it();
+        assert!(users.wait_to_drop(Duration::ZERO).is_ok());
     }
 
     #[test]

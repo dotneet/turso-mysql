@@ -1992,6 +1992,8 @@ mod tests {
             .unwrap();
         connection.start_a_statement().unwrap();
         connection.execute_transaction_command("BEGIN").unwrap();
+        connection.finish_a_statement();
+        connection.start_a_statement().unwrap();
         connection
             .execute("INSERT INTO rows_held (id) VALUES (1)")
             .unwrap();
