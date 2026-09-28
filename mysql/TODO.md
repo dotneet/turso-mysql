@@ -375,6 +375,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | `SET TRANSACTION ISOLATION LEVEL` naming `READ UNCOMMITTED` or `SERIALIZABLE`, or `GLOBAL` | refused; `READ COMMITTED` and `REPEATABLE READ` are kept, and saying yes to another would be a guarantee this does not keep |
 | `SELECT ... FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` | works, and the lock is held. A session kept out by it waits and answers 1205, the way MySQL's does. One lock over the whole database rather than one for each row, so it is stronger than MySQL's — see COMPAT.md |
 | `SET innodb_lock_wait_timeout` | works, one to 1073741824 seconds, and the session starts at MySQL's fifty |
+| `SET lock_wait_timeout` | works, one second to a year, and the session starts at MySQL's year. It bounds a `DROP DATABASE`'s wait for the sessions using the database, a statement's and a `USE`'s wait behind such a drop, and the wait of `CREATE`, `ALTER`, `DROP`, `TRUNCATE`, `RENAME` and `LOCK TABLES` for the engine's write lock |
 | `FOR UPDATE NOWAIT`, `OF <table>` | refused; each asks what to do about a lock on some rows, and there is one lock over the whole database. `SKIP LOCKED` is taken and waits for that lock where MySQL would skip the rows another session holds |
 | `COMMIT AND RELEASE`, `ROLLBACK AND RELEASE` | refused; MySQL closes the connection after them, which is a protocol behaviour rather than a statement |
 | `COMMIT AND NO CHAIN` | refused; it is the default spelled out, but the token check takes only the forms it knows |
@@ -429,7 +430,8 @@ speaks; anything measured here from now on has to pass that flag.
 | A prepared statement executed after its database was dropped and made again under the same name | answered 1049; measured, MySQL prepares it again over the new database |
 | `BINARY <expr>` outside the six catalog reads of Prisma's schema engine, and `CAST(<expr> AS BINARY)` | refused; measured, `BINARY` binds tighter than a comparison and answers a `VAR_STRING` in the binary character set — 192 wide over an `information_schema` name — compared and ordered by its bytes |
 | Prisma's column read over a database holding a view | refused, as every read of a view's columns out of `information_schema.COLUMNS` is; measured, MySQL answers each column of the view, the `id` of a `BIGINT` key with default `0` |
-| `SET lock_wait_timeout` | refused; a `DROP DATABASE` waits MySQL's default of a year for the sessions using the database |
+| `SET lock_wait_timeout` below one second or past a year | refused; measured, MySQL clamps it to one of the two with warning 1292 |
+| A write, or a read, of a table another session holds with `LOCK TABLES` | the write waits `innodb_lock_wait_timeout` and the read does not wait; measured, MySQL makes both wait `lock_wait_timeout` |
 | `SHOW FIELDS` / `DESCRIBE` of a view | refused as an internal error; measured, MySQL types each column from the view's query — `id + 1` reads `bigint` with default `0` — and `mysqldump` reads it to write a view's placeholder |
 | `information_schema` beyond `TABLES`, `VIEWS`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS`, `CHECK_CONSTRAINTS` and `ROUTINES` | not started; what is left is `COLLATION_CHARACTER_SET_APPLICABILITY` and the server-status tables |
 | `information_schema.CHECK_CONSTRAINTS.CHECK_CLAUSE` for an expression beyond a comparison, `IS [NOT] NULL`, `AND`, `OR`, `+`, `-` and `*` over columns, numbers and words | refused when read; how MySQL writes the rest back has not been measured |

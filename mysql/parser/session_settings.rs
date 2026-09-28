@@ -21,6 +21,10 @@ pub enum MySqlSessionSetting {
     /// already does: it is how long a session waits for a lock another session
     /// holds before giving up.
     LockWaitTimeout(u64),
+    /// `SET lock_wait_timeout = <n>`, in seconds, or `DEFAULT` for MySQL's
+    /// year: how long a statement waits for a table or a database another
+    /// session is using, as a `DROP DATABASE` or an `ALTER TABLE` does.
+    MetadataLockWaitTimeout(Option<u64>),
     /// `SET foreign_key_checks = 0` or `= 1`.
     ///
     /// This one changes how the server behaves too: with it off, a row may
@@ -408,6 +412,14 @@ fn take_one_session_setting(
             return Ok(None);
         };
         MySqlSessionSetting::LockWaitTimeout(value)
+    } else if name.eq_ignore_ascii_case("lock_wait_timeout") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::MetadataLockWaitTimeout(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::MetadataLockWaitTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
     } else if name.eq_ignore_ascii_case("foreign_key_checks") {
         let Some(value) = take_checked_switch(scanner)? else {
             return Ok(None);
@@ -963,6 +975,39 @@ mod tests {
             assert_eq!(
                 parse(sql),
                 Some(MySqlSessionSetting::SqlMode(Vec::new())),
+                "{sql}"
+            );
+        }
+    }
+
+    /// Measured on MySQL 8.4.11: `lock_wait_timeout` takes a whole number of
+    /// seconds or `DEFAULT` under every spelling, and a quoted or fractional
+    /// value answers 1232.
+    #[test]
+    fn reads_the_metadata_lock_wait() {
+        for sql in [
+            "SET lock_wait_timeout = 5",
+            "SET SESSION lock_wait_timeout=5",
+            "SET LOCAL lock_wait_timeout = 5",
+            "SET @@lock_wait_timeout = 5",
+            "set @@session.LOCK_WAIT_TIMEOUT = 5;",
+        ] {
+            assert_eq!(
+                parse(sql),
+                Some(MySqlSessionSetting::MetadataLockWaitTimeout(Some(5))),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse("SET SESSION lock_wait_timeout = DEFAULT"),
+            Some(MySqlSessionSetting::MetadataLockWaitTimeout(None))
+        );
+        for sql in ["SET lock_wait_timeout = '5'", "SET lock_wait_timeout = 1.5"] {
+            assert!(
+                !matches!(
+                    parse_optional_session_settings(sql, SessionSqlMode::default()),
+                    Ok(Some(_))
+                ),
                 "{sql}"
             );
         }

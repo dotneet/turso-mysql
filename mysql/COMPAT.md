@@ -4194,14 +4194,30 @@ session whose database another session dropped is left in none by it, where
 the plain form's 1008 leaves it the name. The files are removed while the
 other sessions still hold them open, which Unix allows without either side
 seeing the other, and nothing runs on them again: every statement first checks
-that its database is still there, under the same lock the drop takes. The wait
-is MySQL's default `lock_wait_timeout` of a year, since no session here can set
-it lower; a drop that runs out answers 1205. Three things differ, each listed in
+that its database is still there, under the same lock the drop takes. The drop
+waits the session's `lock_wait_timeout`, and a drop that runs out answers 1205;
+a statement another session starts on the database while the drop waits, and
+selecting the database, wait that session's own `lock_wait_timeout` and answer
+1205 once it runs out, selecting leaving the session where it was — measured on
+8.4.11 and matched. Three things differ, each listed in
 TODO.md: a transaction that has read no table yet holds the drop up, where
 MySQL's does not; a statement that reads no table at all — `SELECT 1`, `BEGIN` —
 in a session whose database was dropped answers 1049 rather than running; and a
 statement prepared before the drop answers 1049 even once the database is made
 again, where MySQL prepares it over the new one.
+
+`SET [SESSION] lock_wait_timeout = <n>` is taken, from one second to a year,
+and `DEFAULT`; `@@lock_wait_timeout` and `SHOW VARIABLES` read it back, an
+unsigned `LONGLONG` of 21 starting at 31536000, measured on 8.4.11. It bounds
+what MySQL calls a metadata lock wait. Measured on 8.4.11 with
+`lock_wait_timeout = 1` and `innodb_lock_wait_timeout = 30`, beside another
+session's open transaction that wrote a table: `ALTER TABLE`, `DROP TABLE`,
+`TRUNCATE TABLE`, `CREATE INDEX`, `RENAME TABLE` and `LOCK TABLES` of that table
+each answer 1205 after one second. Here each of those waits for the engine's
+one write lock, so it waits `lock_wait_timeout` for it rather than the
+`innodb_lock_wait_timeout` an `INSERT` or an `UPDATE` waits. Every 1205 now
+carries MySQL's message, `Lock wait timeout exceeded; try restarting
+transaction`, where it used to read `database is busy`.
 
 The rest of what `mysqldump` 8.4 sends was read from the oracle's general log
 under `--single-transaction --routines --triggers --events --hex-blob

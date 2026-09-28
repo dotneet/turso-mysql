@@ -494,7 +494,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             *b"HY000",
             b"Conflicting declarations: CHARACTER SET".as_slice(),
         ),
-        FrontendErrorKind::DatabaseBusy => (1205, *b"HY000", b"database is busy".as_slice()),
+        FrontendErrorKind::DatabaseBusy => (
+            1205,
+            *b"HY000",
+            b"Lock wait timeout exceeded; try restarting transaction".as_slice(),
+        ),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::UnknownColumn => (1054, *b"42S22", b"unknown column".as_slice()),

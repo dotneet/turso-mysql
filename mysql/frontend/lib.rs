@@ -33,7 +33,9 @@ pub use database_catalog::{
     canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
-pub use database_users::MySqlDatabaseDropped;
+pub use database_users::{
+    MySqlDatabaseDropped, MySqlStatementNotStarted, DEFAULT_METADATA_LOCK_WAIT,
+};
 pub use dialect::MySqlDialect;
 pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use group_concat::{DEFAULT_GROUP_CONCAT_MAX_LEN, GROUP_CONCAT_CUT_ERROR};

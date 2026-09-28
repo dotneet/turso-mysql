@@ -11,6 +11,10 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+/// How long a statement waits for a database or a table another session is
+/// using before answering 1205: MySQL's `lock_wait_timeout` starts at a year.
+pub const DEFAULT_METADATA_LOCK_WAIT: Duration = Duration::from_secs(31_536_000);
+
 /// The connections using one opened database, which every connection to it
 /// and the catalog that drops it share.
 #[derive(Default)]
@@ -137,6 +141,16 @@ impl Drop for DropInProgress<'_> {
     }
 }
 
+/// Why a statement did not get to start on its database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlStatementNotStarted {
+    /// Another session dropped the database: MySQL's 1049.
+    Dropped(MySqlDatabaseDropped),
+    /// A `DROP DATABASE` kept the database for longer than the statement
+    /// waits: MySQL's 1205.
+    WaitTimedOut,
+}
+
 /// A statement asked for a database another session dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlDatabaseDropped {
@@ -170,27 +184,32 @@ impl DatabaseUser {
     }
 
     /// Counts this connection as using its database until
-    /// [`DatabaseUser::stop_using`], waiting first for a drop in progress.
-    pub(crate) fn start_using(&self) -> Result<(), MySqlDatabaseDropped> {
+    /// [`DatabaseUser::stop_using`], waiting at most `wait` first for a drop
+    /// in progress.
+    ///
+    /// Measured on MySQL 8.4.11: a statement on a database a `DROP DATABASE`
+    /// is waiting to drop waits the session's own `lock_wait_timeout`, and
+    /// answers 1205 once it runs out.
+    pub(crate) fn start_using(&self, wait: Duration) -> Result<(), MySqlStatementNotStarted> {
         let mut using = self.lock_using();
         if *using {
             return Ok(());
         }
+        let deadline = Instant::now().checked_add(wait);
         let mut state = self.users.lock();
         loop {
             if state.dropped {
-                return Err(MySqlDatabaseDropped {
+                return Err(MySqlStatementNotStarted::Dropped(MySqlDatabaseDropped {
                     database: self.database.clone(),
-                });
+                }));
             }
             if !state.dropping {
                 break;
             }
             state = self
                 .users
-                .changed
-                .wait(state)
-                .expect("MySQL database users mutex poisoned");
+                .wait_until(state, deadline)
+                .map_err(|_| MySqlStatementNotStarted::WaitTimedOut)?;
         }
         state.using = state
             .using
@@ -237,6 +256,8 @@ mod tests {
     use super::*;
     use std::thread;
 
+    const A_LONG_WAIT: Duration = Duration::from_secs(10);
+
     fn user(users: &Arc<DatabaseUsers>) -> DatabaseUser {
         DatabaseUser::new(Arc::clone(users), "reports".to_owned())
     }
@@ -248,10 +269,10 @@ mod tests {
         users.wait_to_drop(Duration::ZERO).unwrap().finish();
         assert!(idle.database_was_dropped());
         assert_eq!(
-            idle.start_using(),
-            Err(MySqlDatabaseDropped {
+            idle.start_using(A_LONG_WAIT),
+            Err(MySqlStatementNotStarted::Dropped(MySqlDatabaseDropped {
                 database: "reports".to_owned()
-            })
+            }))
         );
     }
 
@@ -259,13 +280,13 @@ mod tests {
     fn a_drop_gives_up_on_a_user_that_stays_and_lets_it_carry_on() {
         let users = Arc::new(DatabaseUsers::default());
         let busy = user(&users);
-        busy.start_using().unwrap();
+        busy.start_using(A_LONG_WAIT).unwrap();
         assert_eq!(
             users.wait_to_drop(Duration::from_millis(20)).err(),
             Some(DropWaitError::TimedOut)
         );
         busy.stop_using();
-        busy.start_using().unwrap();
+        busy.start_using(A_LONG_WAIT).unwrap();
         assert!(!busy.database_was_dropped());
     }
 
@@ -273,7 +294,7 @@ mod tests {
     fn a_drop_waits_for_its_user_and_a_new_statement_waits_for_the_drop() {
         let users = Arc::new(DatabaseUsers::default());
         let busy = Arc::new(user(&users));
-        busy.start_using().unwrap();
+        busy.start_using(A_LONG_WAIT).unwrap();
         let finisher = {
             let busy = Arc::clone(&busy);
             thread::spawn(move || {
@@ -285,11 +306,32 @@ mod tests {
         finisher.join().unwrap();
         let latecomer = {
             let latecomer = user(&users);
-            thread::spawn(move || latecomer.start_using())
+            thread::spawn(move || latecomer.start_using(A_LONG_WAIT))
         };
         thread::sleep(Duration::from_millis(50));
         dropping.finish();
         assert!(latecomer.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn a_statement_waiting_behind_a_drop_gives_up_after_its_own_wait() {
+        let users = Arc::new(DatabaseUsers::default());
+        let busy = user(&users);
+        busy.start_using(A_LONG_WAIT).unwrap();
+        let dropper = {
+            let users = Arc::clone(&users);
+            thread::spawn(move || users.wait_to_drop(A_LONG_WAIT).map(DropInProgress::finish))
+        };
+        while !users.lock().dropping {
+            thread::yield_now();
+        }
+        let latecomer = user(&users);
+        assert_eq!(
+            latecomer.start_using(Duration::from_millis(20)),
+            Err(MySqlStatementNotStarted::WaitTimedOut)
+        );
+        busy.stop_using();
+        assert_eq!(dropper.join().unwrap(), Ok(()));
     }
 
     #[test]
@@ -298,7 +340,7 @@ mod tests {
         let dropping = users.wait_to_drop(Duration::ZERO).unwrap();
         let latecomer = {
             let latecomer = user(&users);
-            thread::spawn(move || latecomer.start_using())
+            thread::spawn(move || latecomer.start_using(A_LONG_WAIT))
         };
         thread::sleep(Duration::from_millis(50));
         drop(dropping);
@@ -319,7 +361,7 @@ mod tests {
     fn a_user_let_go_stops_counting() {
         let users = Arc::new(DatabaseUsers::default());
         let busy = user(&users);
-        busy.start_using().unwrap();
+        busy.start_using(A_LONG_WAIT).unwrap();
         drop(busy);
         assert!(users.wait_to_drop(Duration::ZERO).is_ok());
     }

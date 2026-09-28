@@ -20,7 +20,7 @@ use turso_mysql_parser::{
 
 use crate::database_open::open_preopened_database_with_wal;
 use crate::database_registry::{DatabaseName, DatabaseRegistry, OsDataRoot, RegistryError};
-use crate::database_users::{DatabaseUser, DatabaseUsers, DropWaitError};
+use crate::database_users::{DatabaseUser, DatabaseUsers, DropWaitError, MySqlStatementNotStarted};
 use crate::schema_sql::SchemaSqlSessionContext;
 use crate::session::SharedDatabaseCollation;
 use crate::wal_keeper::WalKeeper;
@@ -359,6 +359,7 @@ impl MySqlDatabaseCatalog {
             last_insert_id: 0,
             selected: None,
             prepared_statement_authority,
+            metadata_lock_wait: crate::database_users::DEFAULT_METADATA_LOCK_WAIT,
         }
     }
 
@@ -376,6 +377,9 @@ pub struct MySqlDatabaseSession {
     last_insert_id: u64,
     selected: Option<SelectedDatabase>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
+    /// MySQL's `lock_wait_timeout`, which bounds how long a `DROP DATABASE`
+    /// waits for the sessions using the database.
+    metadata_lock_wait: std::time::Duration,
 }
 
 struct SelectedDatabase {
@@ -483,7 +487,7 @@ impl MySqlDatabaseSession {
                 }
                 let result = match self
                     .catalog
-                    .drop_database(&database, Self::DROP_DATABASE_WAIT)
+                    .drop_database(&database, self.metadata_lock_wait)
                 {
                     Ok(()) => MySqlAdminCommandResult::Dropped { database },
                     Err(MySqlDatabaseError::DatabaseNotFound(_)) if only_if_present => {
@@ -522,10 +526,15 @@ impl MySqlDatabaseSession {
         }
     }
 
-    /// How long a `DROP DATABASE` waits for the sessions using the database:
-    /// MySQL's `lock_wait_timeout` starts at a year, and no session here can
-    /// set it lower.
-    const DROP_DATABASE_WAIT: std::time::Duration = std::time::Duration::from_secs(31_536_000);
+    /// Sets MySQL's `lock_wait_timeout` for this session: how long its `DROP
+    /// DATABASE` waits for the sessions using the database, and how long its
+    /// statements wait for another session's drop.
+    pub fn set_metadata_lock_wait(&mut self, wait: std::time::Duration) {
+        self.metadata_lock_wait = wait;
+        if let Some(selected) = &self.selected {
+            selected.connection.set_metadata_lock_wait(wait);
+        }
+    }
 
     /// The selected database's name when another session has dropped it.
     ///
@@ -571,12 +580,29 @@ impl MySqlDatabaseSession {
                 .with_database_collation(collation.clone())
                 .with_database_user(DatabaseUser::new(users, canonical_name.clone()));
             connection.set_last_insert_id(self.last_insert_id);
+            connection.set_metadata_lock_wait(self.metadata_lock_wait);
             SelectedDatabase {
                 name: canonical_name,
                 connection,
                 collation_when_selected: collation.get(),
             }
         };
+        // Measured on MySQL 8.4.11: selecting a database a `DROP DATABASE` is
+        // waiting to drop waits for it, the session's `lock_wait_timeout` at
+        // most, and answers 1205 once that runs out, leaving the session where
+        // it was.
+        selected
+            .connection
+            .start_a_statement()
+            .map_err(|error| match error {
+                MySqlStatementNotStarted::Dropped(_) => {
+                    MySqlDatabaseError::DatabaseNotFound(selected.name.clone())
+                }
+                MySqlStatementNotStarted::WaitTimedOut => {
+                    MySqlDatabaseError::DatabaseBusy(selected.name.clone())
+                }
+            })?;
+        selected.connection.stop_using_the_database();
 
         if let Some(previous) = self.selected.replace(selected) {
             self.last_insert_id = previous.connection.last_insert_id();

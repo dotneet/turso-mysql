@@ -43,7 +43,7 @@ use turso_parser::ast::{
 
 use crate::alter_table_indexes::MySqlAlterTableIndexError;
 use crate::create_table_as_select::MySqlCreateTableAsSelectError;
-use crate::database_users::{DatabaseUser, MySqlDatabaseDropped};
+use crate::database_users::{DatabaseUser, MySqlStatementNotStarted, DEFAULT_METADATA_LOCK_WAIT};
 use crate::drop_table::{MySqlDropTableError, MySqlDropTableResult};
 use crate::schema_sql::{
     decode_schema_sql, decode_schema_sql_any, encode_schema_sql_v3, CreatorSchemaSqlFormatter,
@@ -86,6 +86,9 @@ pub struct MySqlConnection {
     /// This connection's use of its database, when the connection belongs to
     /// a catalog, which a `DROP DATABASE` waits for and then refuses.
     database_user: Option<Arc<DatabaseUser>>,
+    /// MySQL's `lock_wait_timeout`: how long a statement waits for a table or
+    /// a database another session is using.
+    metadata_lock_wait: Arc<Mutex<Duration>>,
     /// Closes the engine connection once the last clone lets go. Declared
     /// last so that everything else a clone shares is gone first.
     _closes_on_last_drop: Arc<CloseOnLastDrop>,
@@ -163,6 +166,19 @@ impl SchemaReadings {
 /// it again: measured, 6.7 GB after one UPDATE of a million rows, and over a
 /// second added to the next start.
 struct CloseOnLastDrop(Arc<Connection>);
+
+/// Gives a connection back the lock wait it had once a statement that waited
+/// longer is done, however it ends.
+struct RestoresLockWait<'a> {
+    connection: &'a Connection,
+    wait: Duration,
+}
+
+impl Drop for RestoresLockWait<'_> {
+    fn drop(&mut self) {
+        self.connection.set_busy_timeout(self.wait);
+    }
+}
 
 impl Drop for CloseOnLastDrop {
     fn drop(&mut self) {
@@ -1514,6 +1530,7 @@ impl MySqlConnection {
             wal_keeper: None,
             database_collation: None,
             database_user: None,
+            metadata_lock_wait: Arc::new(Mutex::new(DEFAULT_METADATA_LOCK_WAIT)),
         })
     }
 
@@ -1631,9 +1648,9 @@ impl MySqlConnection {
     /// Answers the database's name when another session dropped it: nothing
     /// may run on the files of a database that is gone. A statement that
     /// starts while a drop waits waits behind it, as MySQL's does.
-    pub fn start_a_statement(&self) -> std::result::Result<(), MySqlDatabaseDropped> {
+    pub fn start_a_statement(&self) -> std::result::Result<(), MySqlStatementNotStarted> {
         match &self.database_user {
-            Some(user) => user.start_using(),
+            Some(user) => user.start_using(self.metadata_lock_wait()),
             None => Ok(()),
         }
     }
@@ -3569,6 +3586,38 @@ impl MySqlConnection {
         self.inner.set_busy_timeout(wait);
     }
 
+    /// Sets how long a statement waits for a table or a database another
+    /// session is using, which is MySQL's `lock_wait_timeout`.
+    pub fn set_metadata_lock_wait(&self, wait: Duration) {
+        *self.metadata_lock_wait.lock().unwrap() = wait;
+    }
+
+    pub fn metadata_lock_wait(&self) -> Duration {
+        *self.metadata_lock_wait.lock().unwrap()
+    }
+
+    /// Runs a statement that changes a table's definition, or locks tables,
+    /// waiting for the engine's write lock as long as `lock_wait_timeout`
+    /// says rather than `innodb_lock_wait_timeout`.
+    ///
+    /// Measured on MySQL 8.4.11 with `lock_wait_timeout = 1` and
+    /// `innodb_lock_wait_timeout = 30`: `ALTER TABLE`, `DROP TABLE`,
+    /// `TRUNCATE TABLE`, `CREATE INDEX`, `RENAME TABLE` and `LOCK TABLES` on a
+    /// table another open transaction wrote each answer 1205 after one
+    /// second. Such a statement waits only for the table's metadata lock, and
+    /// here the engine's one write lock stands for it.
+    pub fn waiting_for_metadata_locks<T>(&self, run: impl FnOnce() -> T) -> T {
+        let row_lock_wait = self.inner.get_busy_timeout();
+        self.inner.set_busy_timeout(self.metadata_lock_wait());
+        let restores = RestoresLockWait {
+            connection: &self.inner,
+            wait: row_lock_wait,
+        };
+        let result = run();
+        drop(restores);
+        result
+    }
+
     /// Says whether a row this connection writes has to name a parent that is
     /// there.
     ///
@@ -3636,7 +3685,7 @@ impl MySqlConnection {
     /// — a write transaction cannot be opened inside another.
     pub fn lock_tables(&self) -> std::result::Result<(), MySqlQueryError> {
         self.unlock_tables()?;
-        self.run_engine_statement("BEGIN IMMEDIATE")?;
+        self.waiting_for_metadata_locks(|| self.run_engine_statement("BEGIN IMMEDIATE"))?;
         *self.tables_locked.lock().unwrap() = true;
         Ok(())
     }

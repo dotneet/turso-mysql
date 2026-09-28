@@ -46,7 +46,7 @@ use turso_mysql::MySqlTableKind;
 #[cfg(unix)]
 use turso_mysql::{
     canonicalize_database_name, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
-    MySqlPreparedStatementAuthority,
+    MySqlPreparedStatementAuthority, MySqlStatementNotStarted,
 };
 #[cfg(unix)]
 use turso_mysql::{
@@ -1410,11 +1410,6 @@ where
                 );
                 return Err(FrontendErrorKind::NoDatabaseToDrop);
             }
-            Err(MySqlDatabaseError::DatabaseBusy(_)) if drops => {
-                self.error_message =
-                    Some(b"Lock wait timeout exceeded; try restarting transaction".to_vec());
-                return Err(FrontendErrorKind::DatabaseBusy);
-            }
             Err(error) => return Err(database_error_kind(error)),
         };
         if matches!(result, MySqlAdminCommandResult::Selected { .. }) {
@@ -2511,9 +2506,12 @@ where
         &mut self,
         connection: &MySqlConnection,
     ) -> Result<(), FrontendErrorKind> {
-        connection.start_a_statement().map_err(|dropped| {
-            self.error_message = Some(dropped.to_string().into_bytes());
-            FrontendErrorKind::UnknownDatabase
+        connection.start_a_statement().map_err(|error| match error {
+            MySqlStatementNotStarted::Dropped(dropped) => {
+                self.error_message = Some(dropped.to_string().into_bytes());
+                FrontendErrorKind::UnknownDatabase
+            }
+            MySqlStatementNotStarted::WaitTimedOut => FrontendErrorKind::DatabaseBusy,
         })
     }
 
@@ -2828,6 +2826,12 @@ where
             if let Some(wait) = self.session_variables.take_lock_wait_timeout() {
                 if let Ok(connection) = self.session.connection() {
                     connection.set_lock_wait(wait);
+                }
+            }
+            if let Some(wait) = self.session_variables.take_metadata_lock_wait() {
+                self.session.set_metadata_lock_wait(wait);
+                for statement in self.prepared_statements.statements.values() {
+                    statement.connection.set_metadata_lock_wait(wait);
                 }
             }
             if let Some(enabled) = self.session_variables.take_foreign_key_checks() {
@@ -4033,6 +4037,33 @@ struct CheckedQueryOptions<'a> {
 }
 
 fn execute_checked_query(
+    connection: &MySqlConnection,
+    sql: &str,
+    selected_database: Option<&str>,
+    source_tables: &[MySqlSelectSource],
+    options: CheckedQueryOptions<'_>,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    if changes_a_table_definition(sql) {
+        return connection.waiting_for_metadata_locks(|| {
+            execute_checked_statement(connection, sql, selected_database, source_tables, options)
+        });
+    }
+    execute_checked_statement(connection, sql, selected_database, source_tables, options)
+}
+
+/// Whether a statement is one MySQL runs under a table's exclusive metadata
+/// lock, which every `CREATE`, `ALTER`, `DROP`, `TRUNCATE` and `RENAME` is.
+fn changes_a_table_definition(sql: &str) -> bool {
+    let first_word = strip_leading_sql_comments(sql)
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    ["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"]
+        .iter()
+        .any(|word| first_word.eq_ignore_ascii_case(word))
+}
+
+fn execute_checked_statement(
     connection: &MySqlConnection,
     sql: &str,
     selected_database: Option<&str>,

@@ -179,6 +179,12 @@ pub(crate) struct MySqlSessionVariables {
     /// The lock wait this session last asked for, which every connection it
     /// opens afterwards is given.
     lock_wait: Option<Duration>,
+    /// How long a statement waits for a table or a database another session
+    /// is using: MySQL's `lock_wait_timeout`.
+    metadata_lock_wait: Duration,
+    /// A `lock_wait_timeout` this session set and the caller has not applied
+    /// yet.
+    pending_metadata_lock_wait: Option<Duration>,
     /// The zone the client last named, as MySQL reads it back.
     ///
     /// Fixed offsets affect TIMESTAMP values in the current session.
@@ -278,6 +284,8 @@ impl Default for MySqlSessionVariables {
             user_variables: HashMap::new(),
             lock_wait_timeout: None,
             lock_wait: None,
+            metadata_lock_wait: turso_mysql::DEFAULT_METADATA_LOCK_WAIT,
+            pending_metadata_lock_wait: None,
             time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
             transaction_isolation: MySqlIsolationLevel::default(),
             next_transaction_isolation: None,
@@ -455,6 +463,12 @@ impl MySqlSessionVariables {
     /// opens later is given too.
     pub(crate) const fn lock_wait(&self) -> Option<Duration> {
         self.lock_wait
+    }
+
+    /// Takes the `lock_wait_timeout` this session set, if it set one since
+    /// this was last read, for the caller to give its connections.
+    pub(crate) fn take_metadata_lock_wait(&mut self) -> Option<Duration> {
+        self.pending_metadata_lock_wait.take()
     }
 
     /// Whether a statement has to be ASCII to be read as the session meant it:
@@ -733,6 +747,11 @@ impl MySqlSessionVariables {
             MySqlSessionSetting::LockWaitTimeout(seconds) => {
                 self.lock_wait_timeout = Some(Duration::from_secs(seconds));
                 self.lock_wait = Some(Duration::from_secs(seconds));
+            }
+            MySqlSessionSetting::MetadataLockWaitTimeout(seconds) => {
+                self.metadata_lock_wait =
+                    seconds.map_or(turso_mysql::DEFAULT_METADATA_LOCK_WAIT, Duration::from_secs);
+                self.pending_metadata_lock_wait = Some(self.metadata_lock_wait);
             }
             MySqlSessionSetting::WaitTimeout(seconds) => {
                 self.wait_timeout = seconds.map(Duration::from_secs);
@@ -1087,7 +1106,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 37] = [
+const SHOWN_VARIABLES: [&str; 38] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -1105,6 +1124,7 @@ const SHOWN_VARIABLES: [&str; 37] = [
     "init_connect",
     "interactive_timeout",
     "license",
+    "lock_wait_timeout",
     "lower_case_table_names",
     "max_allowed_packet",
     "max_execution_time",
@@ -1296,6 +1316,17 @@ fn accept_session_setting(
         // anything else, which is what this refuses.
         MySqlSessionSetting::LockWaitTimeout(seconds) => {
             if (1..=1_073_741_824).contains(seconds) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        // Measured on MySQL 8.4.11: one second to a year, the default, and
+        // anything else clamped with warning 1292, which this refuses
+        // instead.
+        MySqlSessionSetting::MetadataLockWaitTimeout(None) => Ok(()),
+        MySqlSessionSetting::MetadataLockWaitTimeout(Some(seconds)) => {
+            if (1..=31_536_000).contains(seconds) {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -1702,6 +1733,15 @@ fn counted_system_variable(
             .wait_timeout
             .map_or(settings.wait_timeout_seconds(), |wait| wait.as_secs());
         return Some((seconds.to_string(), 21, true));
+    }
+    // Measured on MySQL 8.4.11: a year until a session sets it, and an
+    // unsigned LONGLONG of 21.
+    if name.eq_ignore_ascii_case("lock_wait_timeout") {
+        return Some((
+            session_variables.metadata_lock_wait.as_secs().to_string(),
+            21,
+            true,
+        ));
     }
     // Measured on MySQL 8.4.11: 0 until a session sets it, and an unsigned
     // LONGLONG of 21.
@@ -3547,6 +3587,7 @@ mod tests {
                 ("init_connect", ""),
                 ("interactive_timeout", "28800"),
                 ("license", "MIT"),
+                ("lock_wait_timeout", "31536000"),
                 ("lower_case_table_names", "1"),
                 ("max_allowed_packet", "67108864"),
                 ("max_execution_time", "0"),
