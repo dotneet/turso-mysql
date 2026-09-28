@@ -1672,14 +1672,18 @@ impl MySqlIntegerType {
     }
 }
 
-/// How a column of bytes — a `BLOB` of any size or a `VARBINARY` — holds
-/// them.
+/// How a column of bytes — a `BLOB` of any size, a `VARBINARY` or a
+/// `BINARY` — holds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteStringColumn {
     /// Any number of bytes up to a most: a `VARBINARY` its declared count, a
     /// `BLOB` its type's — 255 for a `TINYBLOB`, 65535 for a `BLOB`,
     /// 16777215 for a `MEDIUMBLOB` and 4294967295 for a `LONGBLOB`.
     Varying { most_bytes: u64 },
+    /// Exactly its declared count of bytes, which a `BINARY` holds whatever
+    /// it is given: measured on 8.4.11, a shorter value is filled out with
+    /// zero bytes.
+    Padded { width: u32 },
 }
 
 impl ByteStringColumn {
@@ -1692,6 +1696,11 @@ impl ByteStringColumn {
             DataType::MediumBlob => 16_777_215,
             DataType::LongBlob => 4_294_967_295,
             DataType::Varbinary(length) => u64::from(declared_binary_length(*length).ok()?),
+            DataType::Binary(width) => {
+                return Some(Self::Padded {
+                    width: declared_padded_width(*width).ok()?,
+                })
+            }
             _ => return None,
         };
         Some(Self::Varying { most_bytes })
@@ -1701,9 +1710,16 @@ impl ByteStringColumn {
 /// Answers whether the engine type name a column is stored under names a
 /// column of bytes rather than of characters.
 pub fn holds_bytes(engine_type_name: &str) -> bool {
-    ["TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB", "VARBINARY"]
-        .iter()
-        .any(|name| engine_type_name.eq_ignore_ascii_case(name))
+    [
+        "TINYBLOB",
+        "BLOB",
+        "MEDIUMBLOB",
+        "LONGBLOB",
+        "VARBINARY",
+        "BINARY",
+    ]
+    .iter()
+    .any(|name| engine_type_name.eq_ignore_ascii_case(name))
 }
 
 /// Private MySQL numeric metadata rebuilt from durable normalized table DDL.
@@ -7518,6 +7534,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
         DataType::Blob(None) => "BLOB".to_owned(),
         DataType::Varchar(length) => format!("VARCHAR({})", declared_character_length(*length)?),
         DataType::Varbinary(length) => format!("VARBINARY({})", declared_binary_length(*length)?),
+        DataType::Binary(width) => format!("BINARY({})", declared_padded_width(*width)?),
         DataType::Char(length) => format!("CHAR({})", declared_character_length(*length)?),
         // MySQL's DOUBLE and the engine's REAL are both IEEE 754 binary64, so
         // the name carries across without changing what a value means. A
@@ -7750,11 +7767,6 @@ pub fn stored_decimal_size(data_type: &TursoType) -> Result<(u32, u32), ParseErr
 const MAX_VARBINARY_BYTES: u64 = 65_532;
 
 /// Reads the byte count from a declared `VARBINARY`.
-///
-/// `BINARY(n)` is not here on purpose. Measured on MySQL 8.4.11: it pads a
-/// shorter value with NUL bytes to the declared width — `'ab'` in a
-/// `BINARY(16)` reads back sixteen bytes long — and the engine has no padding,
-/// so taking it would store a different value than MySQL stores.
 fn declared_binary_length(length: Option<sqlparser::ast::BinaryLength>) -> Result<u32, ParseError> {
     let Some(sqlparser::ast::BinaryLength::IntegerLength { length }) = length else {
         return unsupported("VARBINARY without a length");
@@ -7765,6 +7777,20 @@ fn declared_binary_length(length: Option<sqlparser::ast::BinaryLength>) -> Resul
     u32::try_from(length).map_err(|_| ParseError::Unsupported {
         feature: "VARBINARY length",
     })
+}
+
+/// MySQL's own limit on a `BINARY`, in bytes; wider is 1074.
+const MOST_PADDED_BYTES: u64 = 255;
+
+/// Reads the byte count a `BINARY` holds. Measured on MySQL 8.4.11, a bare
+/// `BINARY` is `binary(1)`. `BINARY(0)` holds only the empty value, and is
+/// refused.
+fn declared_padded_width(width: Option<u64>) -> Result<u32, ParseError> {
+    match width.unwrap_or(1) {
+        0 => unsupported("BINARY(0)"),
+        width if width > MOST_PADDED_BYTES => unsupported("BINARY wider than 255 bytes"),
+        width => Ok(u32::try_from(width).expect("a BINARY width fits")),
+    }
 }
 
 fn declared_character_length(length: Option<CharacterLength>) -> Result<u32, ParseError> {
@@ -8005,6 +8031,24 @@ fn render_column_option(
             }
             if matches!(data_type, DataType::Bit(_)) {
                 return Ok(Some(format!("DEFAULT {}", bit_default(expr)?)));
+            }
+            // Measured on MySQL 8.4.11: a `BINARY(3)` written `DEFAULT 'y'`
+            // prints `DEFAULT 'y\0\0'`, filled out to its width, which a
+            // default kept as it was written would not print.
+            if let DataType::Binary(width) = data_type {
+                let fills_the_width = match expr {
+                    Expr::Value(value) => match &value.value {
+                        Value::SingleQuotedString(word) => {
+                            u64::try_from(word.len()).ok() == Some(width.unwrap_or(1))
+                        }
+                        Value::Null => true,
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !fills_the_width {
+                    return unsupported("a BINARY default narrower than its column");
+                }
             }
             if let Some(range) = whole_number_range_of(data_type) {
                 let integer = whole_number_default(expr, range)?;

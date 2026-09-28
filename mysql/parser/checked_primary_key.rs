@@ -176,7 +176,12 @@ fn check_columns(
         DataType::Int(None) => Some(CheckedPrimaryKeyIntegerType::Int),
         DataType::Integer(None) => Some(CheckedPrimaryKeyIntegerType::Integer),
         DataType::BigIntUnsigned(None) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
-        DataType::Varchar(Some(_)) | DataType::Char(Some(_)) => None,
+        // A key over bytes is what a table keyed by a UUID holds it in,
+        // measured taken by MySQL 8.4.11 as `BINARY(16)` and `VARBINARY(16)`.
+        DataType::Varchar(Some(_))
+        | DataType::Char(Some(_))
+        | DataType::Varbinary(Some(_))
+        | DataType::Binary(_) => None,
         _ => return unsupported("PRIMARY KEY column type"),
     };
     check_primary_key_options(column)?;

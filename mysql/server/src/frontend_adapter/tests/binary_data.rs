@@ -390,3 +390,145 @@ fn bytes_written_out_meet_a_column_of_bytes_alone() {
     }
     assert!(rows(&mut adapter, "SELECT id FROM w").is_empty());
 }
+
+/// A `BINARY(n)` holds exactly `n` bytes and reports itself the way MySQL
+/// does: a `STRING` as long as its width, in the binary collation, with the
+/// binary flag — a key over one with the key's flags besides. MySQL fills a
+/// shorter value out with zero bytes, `'ab'` in a `BINARY(4)` reading back
+/// `ab\0\0`; that is refused here rather than stored otherwise, and a longer
+/// one answers 1406 as MySQL does.
+#[test]
+fn a_binary_column_holds_exactly_its_width() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE u (id BINARY(16) NOT NULL PRIMARY KEY, bn BINARY(4), b1 BINARY, label VARCHAR(20))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO u VALUES (X'000102030405060708090A0B0C0D0E0F', 'abcd', 'x', 'a'), (0xFF0102030405060708090A0B0C0D0E0F, 1234, X'00', 'b')",
+    );
+    for (sql, refused) in [
+        (
+            "INSERT INTO u (id, bn) VALUES (X'EE0102030405060708090A0B0C0D0E0F', 'ab')",
+            FrontendErrorKind::Unsupported,
+        ),
+        (
+            "INSERT INTO u (id) VALUES (X'00')",
+            FrontendErrorKind::Unsupported,
+        ),
+        (
+            "INSERT INTO u (id, bn) VALUES (X'EE0102030405060708090A0B0C0D0E0F', 'abcde')",
+            FrontendErrorKind::DataTooLong,
+        ),
+    ] {
+        assert_eq!(adapter.execute_query(sql), Err(refused), "{sql}");
+    }
+    let read = result(
+        &mut adapter,
+        "SELECT id, bn, b1, HEX(bn) FROM u ORDER BY id",
+    );
+    assert_eq!(
+        read.columns
+            .iter()
+            .map(|column| (
+                column.column_type,
+                column.column_length,
+                column.flags,
+                column.character_set
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (MYSQL_TYPE_STRING, 16, 0x5083, 63),
+            (MYSQL_TYPE_STRING, 4, 0x80, 63),
+            (MYSQL_TYPE_STRING, 1, 0x80, 63),
+            (
+                MYSQL_TYPE_VAR_STRING,
+                32,
+                0,
+                u16::from(DEFAULT_UTF8MB4_COLLATION)
+            ),
+        ]
+    );
+    assert_eq!(
+        read.rows,
+        vec![
+            vec![
+                Some((0..16).collect()),
+                Some(b"abcd".to_vec()),
+                Some(b"x".to_vec()),
+                Some(b"61626364".to_vec()),
+            ],
+            vec![
+                Some([&[0xFF][..], &(1..16).collect::<Vec<u8>>()].concat()),
+                Some(b"1234".to_vec()),
+                Some(vec![0]),
+                Some(b"31323334".to_vec()),
+            ],
+        ]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT label FROM u WHERE id = X'FF0102030405060708090A0B0C0D0E0F'"
+        ),
+        ["b"]
+    );
+    assert_eq!(
+        adapter.execute_query("INSERT INTO u (id) VALUES (X'000102030405060708090A0B0C0D0E0F')"),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+}
+
+/// Measured on MySQL 8.4.11: a column of bytes prints as it was declared —
+/// a bare `BINARY` as `binary(1)` — its collation is NULL, and its default is
+/// reported in hexadecimal, `DEFAULT 'J'` as `0x4A`, an empty one as nothing,
+/// while `SHOW CREATE TABLE` prints the word. A `BINARY` default narrower than
+/// its column, which MySQL fills out and prints filled out, is refused.
+#[test]
+fn a_column_of_bytes_describes_itself_the_way_mysql_does() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE v (a VARBINARY(8) DEFAULT 'J', b BINARY(2) DEFAULT 'Jk', c VARBINARY(8) DEFAULT 'a''b', e VARBINARY(2) DEFAULT '', f BINARY)",
+    );
+    let text = |row: Vec<Option<Vec<u8>>>| {
+        row.into_iter()
+            .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let described = rows(&mut adapter, "SHOW FULL COLUMNS FROM v")
+        .into_iter()
+        .map(|row| text(row)[..6].to_vec())
+        .collect::<Vec<_>>();
+    let expected = [
+        ["a", "varbinary(8)", "", "YES", "", "0x4A"],
+        ["b", "binary(2)", "", "YES", "", "0x4A6B"],
+        ["c", "varbinary(8)", "", "YES", "", "0x612762"],
+        ["e", "varbinary(2)", "", "YES", "", ""],
+        ["f", "binary(1)", "", "YES", "", ""],
+    ]
+    .map(|row| {
+        row.iter()
+            .enumerate()
+            .map(|(at, value)| (at != 2 && !(at == 5 && row[0] == "f")).then(|| value.to_string()))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(described, expected);
+    assert_eq!(
+        text(rows(&mut adapter, "SHOW CREATE TABLE v").remove(0))[1].as_deref(),
+        Some(concat!(
+            "CREATE TABLE `v` (\n",
+            "  `a` varbinary(8) DEFAULT 'J',\n",
+            "  `b` binary(2) DEFAULT 'Jk',\n",
+            "  `c` varbinary(8) DEFAULT 'a''b',\n",
+            "  `e` varbinary(2) DEFAULT '',\n",
+            "  `f` binary(1) DEFAULT NULL\n",
+            ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        ))
+    );
+    assert_eq!(
+        adapter.execute_query("CREATE TABLE narrow (bn BINARY(3) DEFAULT 'y')"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}

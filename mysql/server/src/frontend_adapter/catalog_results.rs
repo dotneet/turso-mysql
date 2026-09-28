@@ -2666,6 +2666,19 @@ pub(super) fn show_column_default_value(
             turso_mysql::show_create_table::the_moment(column.temporal_precision()).into_bytes(),
         ));
     }
+    // Measured on MySQL 8.4.11: a column of bytes reports its default in
+    // hexadecimal, `DEFAULT 'J'` as `0x4A`, and an empty one as nothing at all.
+    if turso_mysql_parser::holds_bytes(column.type_name()) {
+        if let Some(MySqlColumnDefault::Text(bytes)) = column.default_value() {
+            if !bytes.is_empty() {
+                let hexadecimal = bytes
+                    .bytes()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>();
+                return Ok(Some(format!("0x{hexadecimal}").into_bytes()));
+            }
+        }
+    }
     if column.type_name() == "BIT" {
         if let Some(default @ MySqlColumnDefault::Integer { .. }) = column.default_value() {
             return turso_mysql::show_create_table::bit_literal(default)

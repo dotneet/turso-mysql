@@ -6956,7 +6956,7 @@ impl TableResultMetadata {
             };
         }
         if let Some(length) = source.character_length() {
-            if source.type_name() == "VARBINARY" {
+            if matches!(source.type_name(), "VARBINARY" | "BINARY") {
                 // Measured on MySQL 8.4.11: a `VARBINARY(255)` reports 255. The
                 // declared count is already bytes, so nothing is reserved on
                 // top of it, and the column carries the binary collation and
@@ -9878,6 +9878,16 @@ fn hexadecimal_bytes_definition(
             return Ok(text_call_definition(name, width, not_null));
         }
         "TINYBLOB" => return Ok(text_call_definition(name, 2040, not_null)),
+        "BINARY" => {
+            let width = source
+                .character_length()
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            return Ok(text_call_definition(
+                name,
+                width * 2 * UTF8MB4_MAX_BYTES_PER_CHARACTER,
+                not_null,
+            ));
+        }
         "BLOB" => (MYSQL_TYPE_MEDIUM_BLOB, 2_097_120),
         "MEDIUMBLOB" => (MYSQL_TYPE_LONG_BLOB, 536_870_880),
         "LONGBLOB" => (MYSQL_TYPE_LONG_BLOB, u32::MAX),
@@ -10951,9 +10961,9 @@ fn mysql_table_column_flags(column: &MySqlColumnMetadata) -> u16 {
     if column.type_name() == "JSON" {
         flags |= MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG;
     }
-    // Measured on MySQL 8.4.11: a VARBINARY carries the binary flag, as a BLOB
-    // does, and not the blob one.
-    if column.type_name() == "VARBINARY" {
+    // Measured on MySQL 8.4.11: a VARBINARY and a BINARY carry the binary flag,
+    // as a BLOB does, and not the blob one.
+    if matches!(column.type_name(), "VARBINARY" | "BINARY") {
         flags |= MYSQL_BINARY_FLAG;
     }
     if is_unsigned_integer_type(column.type_name())
@@ -11267,8 +11277,9 @@ fn mysql_type_for_declared_name(name: &str) -> Option<u8> {
     if name.eq_ignore_ascii_case("VARBINARY") {
         return Some(MYSQL_TYPE_VAR_STRING);
     }
-    // Measured on MySQL 8.4.11: a CHAR column reports 254, not 253.
-    if name.eq_ignore_ascii_case("CHAR") {
+    // Measured on MySQL 8.4.11: a CHAR column reports 254, not 253, and so
+    // does a BINARY, whose length is its byte count.
+    if name.eq_ignore_ascii_case("CHAR") || name.eq_ignore_ascii_case("BINARY") {
         return Some(MYSQL_TYPE_STRING);
     }
     // Measured on MySQL 8.4.11: an unsigned DOUBLE or FLOAT reports the same

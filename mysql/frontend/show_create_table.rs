@@ -345,6 +345,7 @@ pub fn type_name(column: &MySqlColumnMetadata) -> Option<String> {
             "VARCHAR" => Some(format!("varchar({length})")),
             "CHAR" => Some(format!("char({length})")),
             "VARBINARY" => Some(format!("varbinary({length})")),
+            "BINARY" => Some(format!("binary({length})")),
             _ => None,
         };
     }

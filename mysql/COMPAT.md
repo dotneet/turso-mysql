@@ -3325,10 +3325,21 @@ literal with an odd count of digits is refused, MySQL answering 1064 for
 `X'ABC'` and reading `0xABC` as `0x0ABC`, which reach this spelled alike. In a
 projection they stay refused.
 
-`BINARY(n)` is refused. Measured on the same server, it pads a shorter value
-with NUL bytes to the declared width — `'ab'` in a `BINARY(16)` reads back
-sixteen bytes long — and the engine has no padding, so taking it would store a
-different value than MySQL stores and answer a different length for it.
+`BINARY(n)` is taken, and holds exactly `n` bytes. Measured on 8.4.11, it
+reports a `STRING` as long as its width in the binary collation with the
+binary flag — a `BINARY(16)` key carrying the key's flags besides — prints as
+`binary(n)`, a bare `BINARY` as `binary(1)`, and takes a key, which is how a
+table keyed by a UUID holds it; `VARBINARY(n)` takes one too. MySQL fills a
+shorter value out with zero bytes — `'ab'` in a `BINARY(4)` reads back
+`ab\0\0`, and `''` four zero bytes — and filled out as the row is written,
+after its index entries are, the row and its index would hold different
+values, so a shorter value is refused rather than stored otherwise; a dump
+and a driver writing a UUID give the column its full width. A longer value
+answers 1406. A default narrower than the column is refused: MySQL prints it
+filled out, `DEFAULT 'y\0\0'`. A column of bytes reports its default in
+hexadecimal in `SHOW COLUMNS` and `information_schema.COLUMNS` —
+`DEFAULT 'J'` as `0x4A`, an empty one as nothing — as MySQL does, where it
+used to report the word.
 
 A `FOREIGN KEY` is refused, and refused at the door rather than taken and left
 to do nothing. The parser can translate one; the frontend is what says no. The

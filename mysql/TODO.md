@@ -457,7 +457,6 @@ speaks; anything measured here from now on has to pass that flag.
 | A name that is no column in a statement over more than one table, in `ORDER BY`, `GROUP BY` or `HAVING`, or in a subquery | answered with this server's own refusal (1235) or a 1054 without the name, where MySQL answers 1054 naming the column and the clause |
 | A table that is not there named by `TABLE t`, in another database, or by a statement this server's reader of the tables a statement names cannot read | answered with this server's own refusal, where MySQL answers 1146 |
 | A result longer than the runtime's write queue — `--max-write-bytes`, or more frames than `--max-write-frames`, which a result near the 4096-row limit reaches | answered 1235 in place of its rows; MySQL writes a result out as it reads it and has no such limit |
-| A dump of a `BINARY` column | refused, as the column is. A `BLOB` or `VARBINARY` one is taken, as `_binary '...'` holding its raw bytes and, under `--hex-blob`, as `0x...` |
 | Raw bytes that are not UTF-8 outside a `_binary '...'` word — in a word without the introducer, in a comment, in a `_binary "..."` — or in a prepared statement's text | refused with 1235; measured, MySQL keeps them in a word with warning 1300 (1366 into a column of words) and passes over them in a comment |
 | `NOW(6)`, `CURRENT_TIMESTAMP(6)` as a value to insert | refused, as any clock call taking an argument is; the framework apps' `data.sql` writes one, so seeding them here leaves out that row and the `post_tag` rows naming it |
 | `COM_STATISTICS`, which the `mysql` client's `status` sends | refused; MySQL answers one line of `Uptime`, `Threads`, `Questions`, `Slow queries`, `Opens`, `Flush tables`, `Open tables` and `Queries per second avg`, and this server counts neither questions, slow queries nor table opens. The client prints the rest of `status` without it |
@@ -571,7 +570,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `JSON` | works |
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
 | A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
-| `BINARY(n)` | refused; MySQL pads a shorter value with NUL bytes to the declared width and the engine has no padding, so taking it would store a different value |
+| A value shorter than its `BINARY(n)` column, or a default narrower than it | refused; measured, MySQL fills it out with zero bytes, and filled out as the row is written the row and its index entries would disagree. `BINARY(0)` is refused as well |
 | `BIT` and `BIT(1)` | works: written 0, 1, `TRUE` or `FALSE`, read back as the one byte MySQL sends over both protocols, compared against a written number, and printed `bit(1)` with a `b'0'` or `b'1'` default |
 | `BIT(n)` wider than one bit | refused; it holds an n-bit number and crosses as ceil(n/8) bytes, which has not been measured |
 | A bit literal or a word written into a `BIT(1)`, or compared against one — `b'1'`, `x'01'`, `''` | refused; measured, MySQL takes `b'1'` and `x'01'` as the bit and `''` as 0, and answers 1406 for any other word |

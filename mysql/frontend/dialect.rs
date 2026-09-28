@@ -2678,14 +2678,30 @@ fn check_byte_string(
             ));
         }
     };
-    let turso_mysql_parser::ByteStringColumn::Varying { most_bytes } = column;
-    if bytes <= most_bytes {
+    let (fits, type_name) = match column {
+        turso_mysql_parser::ByteStringColumn::Varying { most_bytes } => (
+            bytes <= most_bytes,
+            format!("a column of at most {most_bytes} bytes"),
+        ),
+        // MySQL fills a shorter value out with zero bytes. Filled out here,
+        // after the row's index entries are written, the row and its index
+        // would hold different values, so a shorter value is refused.
+        turso_mysql_parser::ByteStringColumn::Padded { width } => {
+            if bytes < u64::from(width) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "a value of {bytes} bytes for a BINARY({width}), which MySQL fills out with zero bytes"
+                )));
+            }
+            (bytes == u64::from(width), format!("BINARY({width})"))
+        }
+    };
+    if fits {
         return Ok(());
     }
     Err(AssignmentError::TooLong {
         table: table_name.to_string(),
         column: column_index + 1,
-        type_name: format!("a column of at most {most_bytes} bytes"),
+        type_name,
     }
     .into())
 }

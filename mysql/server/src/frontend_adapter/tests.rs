@@ -8813,14 +8813,10 @@ fn a_text_column_cuts_the_trailing_space_mysql_cuts() {
 /// 8.4.11: it reports VAR_STRING with length 255 for `VARBINARY(255)` — the
 /// declared count itself, not four bytes for each of them — the binary
 /// collation, and the BINARY flag. `SHOW COLUMNS` prints `varbinary(255)`.
-///
-/// `BINARY(n)` is refused. Measured on the same server, it pads a shorter value
-/// with NUL bytes to the declared width: `'ab'` in a `BINARY(16)` reads back
-/// sixteen bytes long. The engine has no padding, so taking it would store a
-/// different value than MySQL stores.
+/// `BINARY(n)` is answered in `binary_data`.
 #[cfg(unix)]
 #[test]
-fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
+fn varbinary_holds_bytes() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -8883,11 +8879,6 @@ fn varbinary_holds_bytes_and_binary_is_refused_for_its_padding() {
             .execute_query(&format!("INSERT INTO n (id, v) VALUES (1, '{written}')"))
             .is_err());
     }
-
-    // BINARY(n) pads, and the engine does not.
-    assert!(adapter
-        .execute_query("CREATE TABLE f (id INT NOT NULL PRIMARY KEY, v BINARY(16))")
-        .is_err());
 }
 
 /// A foreign key is enforced, which is what makes taking the syntax honest.
