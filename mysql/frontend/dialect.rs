@@ -153,13 +153,18 @@ impl Dialect for MySqlDialect {
         // stores the document `1e15` as the integer 1000000000000000, a `SET`
         // written as the bits `'3'` has to stay text long enough to be told
         // from a member spelled `3`, a `YEAR` written as `'0'` is 2000 where
-        // the number 0 is the zero year, a `VARBINARY` holding `'007'`
-        // would otherwise read back as `7`, and a `BIT` written `'1'`, which
-        // MySQL refuses, would be taken as the number 1.
+        // the number 0 is the zero year, and a `BIT` written `'1'`, which
+        // MySQL refuses, would be taken as the number 1. A column of bytes
+        // stores what it is given as bytes, which keeps `'007'` in a
+        // `VARBINARY` from reading back as `7` too.
         for column in table.columns_mut().iter_mut() {
+            if turso_mysql_parser::holds_bytes(&column.ty_str) {
+                column.store_values_as_bytes();
+                continue;
+            }
             let holds_text = matches!(
                 column.ty_str.to_ascii_uppercase().as_str(),
-                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" | "VARBINARY" | "BIT"
+                "JSON" | "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "YEAR" | "BIT"
             ) || turso_mysql_parser::enum_members(&column.ty_str).is_some()
                 || turso_mysql_parser::set_members(&column.ty_str).is_some();
             if holds_text {
@@ -2366,8 +2371,8 @@ pub(crate) fn check_mysql_assignment(
         if injected_rowid_alias_ordinal == Some(column_index) || matches!(value, Value::Null) {
             continue;
         }
-        if let Some(length) = spec.binary_length(column_index) {
-            reject_overlong_binary(table_name, column_index, length, value)?;
+        if let Some(column) = spec.byte_string(column_index) {
+            check_byte_string(table_name, column_index, column, value)?;
             continue;
         }
         if spec.is_bit(column_index) {
@@ -2645,28 +2650,42 @@ fn text_column_value(
     .into())
 }
 
-/// Refuses a value wider than its `VARBINARY` column.
+/// Checks a value a column of bytes is about to hold.
 ///
-/// The declared count is bytes, not characters, which is the whole of the
-/// difference from a `VARCHAR`.
-fn reject_overlong_binary(
+/// The column's affinity has already made text and whole numbers the bytes
+/// MySQL stores for them — measured on 8.4.11, `12` into a `BLOB` stores the
+/// two bytes `12` — so what is left is a blob, or a number with a fraction,
+/// which MySQL stores in the digits it was written with (`0.10` stores
+/// `0.10`) and which the engine no longer has; that is refused. A value wider
+/// than the column answers 1406, as MySQL answers it, counting bytes.
+fn check_byte_string(
     table_name: &str,
     column_index: usize,
-    length: u32,
+    column: turso_mysql_parser::ByteStringColumn,
     value: &Value,
 ) -> Result<()> {
     let bytes = match value {
-        Value::Blob(blob) => blob.len(),
-        Value::Text(text) => text.as_str().len(),
-        _ => return Ok(()),
+        Value::Blob(blob) => blob.len() as u64,
+        Value::Text(_) => {
+            return Err(LimboError::InternalError(format!(
+                "column {} of {table_name} holds bytes, and its affinity left text in it",
+                column_index + 1
+            )));
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(
+                "a number with a fraction written into a column of bytes".to_string(),
+            ));
+        }
     };
-    if bytes <= length as usize {
+    let turso_mysql_parser::ByteStringColumn::Varying { most_bytes } = column;
+    if bytes <= most_bytes {
         return Ok(());
     }
     Err(AssignmentError::TooLong {
         table: table_name.to_string(),
         column: column_index + 1,
-        type_name: format!("VARBINARY({length})"),
+        type_name: format!("a column of at most {most_bytes} bytes"),
     }
     .into())
 }

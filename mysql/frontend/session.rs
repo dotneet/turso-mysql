@@ -29,7 +29,7 @@ use turso_mysql_parser::{
     CheckedComparisonAnswer, CheckedComparisonNow, CheckedComparisonOperand, CheckedInsertValue,
     CheckedPrimaryKeyCreateTable, CheckedSelectComparison, CheckedSelectComparisonOperator,
     CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
-    MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
+    ColumnLiteral, MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
     MySqlDropViewCommand, MySqlSelectSource, MySqlTableName, MySqlTransactionCommand,
     MySqlTruncateTableCommand, MySqlViewReplacement, OfferedValue, ParseError as MySqlParseError,
@@ -1092,6 +1092,9 @@ enum PreparedExecutionPlan {
         copied_select: Option<CopiedSelect>,
         /// The parameters compared with a column of words, which bind a word.
         word_parameters: Vec<usize>,
+        /// The parameters compared with a column of bytes, which bind a word
+        /// or bytes.
+        byte_parameters: Vec<usize>,
         /// Each `?` an `UPDATE` does arithmetic with, and how MySQL reads
         /// what binds there.
         bound_operands: Vec<(usize, BoundOperandKind)>,
@@ -2068,6 +2071,7 @@ impl MySqlConnection {
             translated => translated?,
         };
         self.refuse_an_upsert_answered_otherwise(sql, mode)?;
+        self.refuse_literals_their_columns_store_otherwise(sql, mode)?;
         if translated
             .parse_ast()
             .is_ok_and(|statement| self.writes_a_value_a_trigger_replaces(&statement))
@@ -2217,6 +2221,60 @@ impl MySqlConnection {
             &column_types.text,
         )?;
         Ok((translated, column_types, table_definition))
+    }
+
+    /// Refuses a literal written into a column that would store it otherwise
+    /// than MySQL stores it.
+    ///
+    /// A number with a fraction reaches the engine as the digits it was
+    /// written with, which a column of bytes keeps as they stand, where MySQL
+    /// keeps its own spelling of the number: measured on 8.4.11, `1e3` into a
+    /// `BLOB` stores `1000`. A string of bytes into any other column is read
+    /// as a number or as text by rules not measured here — `X'41'` into an
+    /// `INT` stores 65 — so it is taken only by a column of bytes.
+    fn refuse_literals_their_columns_store_otherwise(
+        &self,
+        sql: &str,
+        mode: SessionSqlMode,
+    ) -> std::result::Result<(), MySqlParseError> {
+        let Ok(Some(turso_mysql_parser::WrittenLiterals {
+            tables,
+            columns: written,
+        })) = turso_mysql_parser::literals_written_into_columns(sql, mode)
+        else {
+            return Ok(());
+        };
+        for table in tables {
+            let Ok(table) = MySqlTableName::parse(&table) else {
+                continue;
+            };
+            let Ok(columns) = self.list_columns(&table) else {
+                continue;
+            };
+            for (name, literal) in &written {
+                let Some(column) = columns
+                    .iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(name))
+                else {
+                    continue;
+                };
+                let holds_bytes = turso_mysql_parser::holds_bytes(column.type_name());
+                match literal {
+                    ColumnLiteral::NumberWithAFraction if holds_bytes => {
+                        return Err(MySqlParseError::Unsupported {
+                            feature: "a number with a fraction written into a column of bytes",
+                        });
+                    }
+                    ColumnLiteral::Bytes if !holds_bytes => {
+                        return Err(MySqlParseError::Unsupported {
+                            feature: "a string of bytes written into a column of another kind",
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Refuses an upsert the engine would answer otherwise than MySQL.
@@ -2657,6 +2715,9 @@ impl MySqlConnection {
         let word_parameters = self
             .dml_word_parameters(&translated)
             .map_err(MySqlPreparedStatementError::Engine)?;
+        let byte_parameters = self
+            .dml_byte_parameters(&translated)
+            .map_err(MySqlPreparedStatementError::Engine)?;
         let bound_operands = self
             .bound_operand_kinds(&translated)
             .map_err(MySqlPreparedStatementError::Prepare)?;
@@ -2670,6 +2731,7 @@ impl MySqlConnection {
                 written_table,
                 read_tables: read_table_names(&translated),
                 word_parameters,
+                byte_parameters,
                 bound_operands,
             },
         ))
@@ -3402,6 +3464,8 @@ impl MySqlConnection {
                 self.whole_number_comparison_parameters(source_tables, checked_comparisons)?;
             let word_parameters =
                 self.word_comparison_parameters(source_tables, checked_comparisons)?;
+            let byte_parameters =
+                self.byte_comparison_parameters(source_tables, checked_comparisons)?;
             Self::validate_select_comparison_values(
                 checked_comparisons,
                 values,
@@ -3409,6 +3473,7 @@ impl MySqlConnection {
                 &bound_decimal,
                 &whole_number_parameters,
                 &word_parameters,
+                &byte_parameters,
             )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
             Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
@@ -3416,12 +3481,14 @@ impl MySqlConnection {
         if let PreparedExecutionPlan::OrdinaryWrite {
             insert_target,
             word_parameters,
+            byte_parameters,
             bound_operands,
             ..
         } = plan
         {
             self.refuse_untyped_wide_integer_write_parameters(insert_target.as_ref(), values)?;
             refuse_a_word_parameter_bound_otherwise(word_parameters, values)?;
+            refuse_a_byte_parameter_bound_otherwise(byte_parameters, values)?;
             hold_bound_operands(bound_operands, values)?;
             whole_number_parameters.extend(
                 bound_operands
@@ -8183,6 +8250,30 @@ impl MySqlConnection {
         source_tables: &[MySqlSelectSource],
         comparisons: &[CheckedSelectComparison],
     ) -> Result<Vec<usize>> {
+        self.string_comparison_parameters(source_tables, comparisons, is_text_type)
+    }
+
+    /// Finds the parameters that meet a column of bytes, which bind a word or
+    /// bytes and never a number: MySQL compares a binary string with a number
+    /// as two numbers, and the engine never finds a number among bytes.
+    fn byte_comparison_parameters(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+    ) -> Result<Vec<usize>> {
+        self.string_comparison_parameters(
+            source_tables,
+            comparisons,
+            turso_mysql_parser::holds_bytes,
+        )
+    }
+
+    fn string_comparison_parameters(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+        holds_strings: fn(&str) -> bool,
+    ) -> Result<Vec<usize>> {
         let mut words = Vec::new();
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -8196,14 +8287,14 @@ impl MySqlConnection {
                     .catalog()
                     .and_then(|catalog| catalog.column_type(comparison.column_name()))
             }) {
-                if is_text_type(type_name) {
+                if holds_strings(type_name) {
                     words.push(*ordinal);
                 }
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
                 if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
-                    if is_text_type(&type_name) {
+                    if holds_strings(&type_name) {
                         words.push(*ordinal);
                     }
                     break;
@@ -8217,6 +8308,19 @@ impl MySqlConnection {
     /// each by the type of the column it meets: one of a table the statement
     /// reads, or else one of the table it writes.
     fn dml_word_parameters(&self, translated: &TranslatedDml) -> Result<Vec<usize>> {
+        self.dml_string_parameters(translated, is_text_type)
+    }
+
+    /// Finds the parameters a DML statement compares with a column of bytes.
+    fn dml_byte_parameters(&self, translated: &TranslatedDml) -> Result<Vec<usize>> {
+        self.dml_string_parameters(translated, turso_mysql_parser::holds_bytes)
+    }
+
+    fn dml_string_parameters(
+        &self,
+        translated: &TranslatedDml,
+        holds_strings: fn(&str) -> bool,
+    ) -> Result<Vec<usize>> {
         let read = translated.read_tables();
         let joins = read.iter().any(|source| !source.subquery());
         let (inner, written): (Vec<_>, Vec<_>) = translated
@@ -8233,7 +8337,7 @@ impl MySqlConnection {
                                 .any(|source| source.reference().eq_ignore_ascii_case(name))
                         })
             });
-        let mut words = self.word_comparison_parameters(read, &inner)?;
+        let mut words = self.string_comparison_parameters(read, &inner, holds_strings)?;
         if written.is_empty() {
             return Ok(words);
         }
@@ -8252,7 +8356,7 @@ impl MySqlConnection {
                 continue;
             }
             if let Some((type_name, _)) = self.comparison_column_type(&table, comparison)? {
-                if is_text_type(&type_name) {
+                if holds_strings(&type_name) {
                     words.push(*ordinal);
                 }
             }
@@ -8591,6 +8695,7 @@ impl MySqlConnection {
         bound_decimal: &[usize],
         whole_number_parameters: &[usize],
         word_parameters: &[usize],
+        byte_parameters: &[usize],
     ) -> Result<()> {
         for comparison in comparisons {
             let CheckedSelectComparisonRhs::Placeholder { ordinal } = comparison.rhs() else {
@@ -8620,12 +8725,15 @@ impl MySqlConnection {
                 .iter()
                 .any(|parameter| parameter.ordinal == *ordinal);
             let meets_words = comparison.collated() || word_parameters.contains(ordinal);
+            let meets_bytes = byte_parameters.contains(ordinal);
             // A number meeting a column of words is refused for the reason a
             // DML statement refuses one; see
             // `refuse_a_word_parameter_bound_otherwise`.
             let fits = match value {
                 MySqlPreparedValue::Null => true,
-                MySqlPreparedValue::Integer(_) => !patterns && !stored_as_a_moment && !meets_words,
+                MySqlPreparedValue::Integer(_) => {
+                    !patterns && !stored_as_a_moment && !meets_words && !meets_bytes
+                }
                 MySqlPreparedValue::UnsignedInteger(_) => {
                     !patterns && !stored_as_a_moment && bound_decimal.contains(ordinal)
                 }
@@ -8634,6 +8742,7 @@ impl MySqlConnection {
                         true
                     } else {
                         meets_words
+                            || meets_bytes
                             || stored_as_a_moment
                             || bound_decimal.contains(ordinal)
                             || (whole_number_parameters.contains(ordinal)
@@ -8646,7 +8755,7 @@ impl MySqlConnection {
                 MySqlPreparedValue::Real(_) => {
                     comparison.answers() == Some(CheckedComparisonAnswer::RowCount)
                 }
-                _ => false,
+                MySqlPreparedValue::Blob(_) => meets_bytes,
             };
             if !fits {
                 return Err(LimboError::InvalidArgument(format!(
@@ -8712,6 +8821,8 @@ impl MySqlConnection {
 
     pub fn execute(&self, sql: &str) -> Result<()> {
         self.refuse_an_upsert_answered_otherwise(sql, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        self.refuse_literals_their_columns_store_otherwise(sql, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) if insert.reads_the_clock() && self.time_zone_offset_seconds() != 0 => {
@@ -8806,6 +8917,8 @@ impl MySqlConnection {
             }
         }
         self.refuse_an_upsert_answered_otherwise(sql, self.parser_mode())
+            .map_err(mysql_query_parse_error)?;
+        self.refuse_literals_their_columns_store_otherwise(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)?;
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
@@ -12154,11 +12267,14 @@ fn checked_comparison_fits_column(
             }
         },
         CheckedSelectComparisonRhs::Text(_) => {
-            is_text_type(type_name) || comparison_meets_the_stored_form(rhs, type_name, operator)
+            is_text_type(type_name)
+                || meets_bytes(type_name, operator)
+                || comparison_meets_the_stored_form(rhs, type_name, operator)
         }
         CheckedSelectComparisonRhs::Null => {
             is_integer_type(type_name)
                 || is_text_type(type_name)
+                || turso_mysql_parser::holds_bytes(type_name)
                 || stores_a_canonical_form(type_name)
         }
         // A parameter carries no type until it is bound. A column of words
@@ -12176,7 +12292,10 @@ fn checked_comparison_fits_column(
             ) {
                 return is_text_type(type_name);
             }
-            is_integer_type(type_name) || is_decimal_type(type_name) || is_text_type(type_name)
+            is_integer_type(type_name)
+                || is_decimal_type(type_name)
+                || is_text_type(type_name)
+                || meets_bytes(type_name, operator)
         }
         // Two columns are held to each other by `column_pair_refusal`, which
         // needs both of them.
@@ -12218,6 +12337,23 @@ fn checked_comparison_fits_column(
                 )
         }
     }
+}
+
+/// Answers whether a word, written or bound, meets a column of bytes the way
+/// MySQL compares them.
+///
+/// The column's affinity makes the word its bytes before the two are
+/// compared, and bytes compare byte by byte with no padding — which is how
+/// MySQL compares a binary string: measured on 8.4.11, `b = 'ABC'` finds
+/// `ABC` and not `abc`, `vb = 'ab'` does not find `ab  `, and `b > 'ab'`
+/// reads the bytes in order. A `LIKE` is not: the engine matches it without
+/// regard to case, where MySQL matches a binary string's bytes exactly.
+fn meets_bytes(type_name: &str, operator: CheckedSelectComparisonOperator) -> bool {
+    turso_mysql_parser::holds_bytes(type_name)
+        && !matches!(
+            operator,
+            CheckedSelectComparisonOperator::Like | CheckedSelectComparisonOperator::NotLike
+        )
 }
 
 /// Answers whether a comparison against a column that is neither an integer
@@ -13210,6 +13346,29 @@ fn refuse_a_word_parameter_bound_otherwise(
         ) {
             return Err(LimboError::InvalidArgument(
                 "a value compared with a column of words has to be bound as a word".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Holds what binds against a column of bytes to a word, bytes or NULL, for
+/// the reason `byte_comparison_parameters` gives.
+fn refuse_a_byte_parameter_bound_otherwise(
+    byte_parameters: &[usize],
+    values: &[MySqlPreparedValue],
+) -> Result<()> {
+    for ordinal in byte_parameters {
+        let value = values.get(*ordinal).ok_or_else(|| {
+            LimboError::InternalError("a compared parameter is outside the bound values".into())
+        })?;
+        if !matches!(
+            value,
+            MySqlPreparedValue::Text(_) | MySqlPreparedValue::Blob(_) | MySqlPreparedValue::Null
+        ) {
+            return Err(LimboError::InvalidArgument(
+                "a value compared with a column of bytes has to be bound as a word or bytes"
+                    .to_owned(),
             ));
         }
     }

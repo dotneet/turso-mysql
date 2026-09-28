@@ -1165,11 +1165,17 @@ JSON rendering. Measured on 8.4.11, `doc > '[1, 1]'` follows JSON's type
 precedence, which comparing the stored text would not. JSON grouping and
 other ordering forms need a separate audit.
 
-A `BLOB` column is not compared yet, and that one is a gap. Measured: MySQL compares the
-bytes, so `payload = 'ABC'` finds no row holding `abc` and `payload > 'a'` reads them in byte
-order — which is the engine's own comparison, without the collation a text column asks for.
-Taking it needs the renderer to be told a column is binary so it leaves that collation off,
-which is the same channel that tells it a column is text.
+A column of bytes — a `TINYBLOB`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB` or
+`VARBINARY` — is compared by its bytes, as MySQL compares a binary string:
+measured on 8.4.11, `b = 'ABC'` finds `ABC` and not `abc`, `vb = 'ab'` does
+not find `ab  ` (no padding), `b > 'ab'` and `ORDER BY b` read the bytes in
+order with the empty value first, and a unique key holds `a`, `A` and `a `
+apart. The column's engine affinity makes a written or bound word its bytes
+before it is compared, which is the comparison MySQL makes; a bound value
+there has to bind as a word or as bytes. A number against a column of bytes
+is refused — measured, MySQL compares the two as numbers, so `b = 0` finds
+every row whose bytes do not begin with a digit — and so is a `LIKE`, which
+MySQL matches byte for byte with regard to case and the engine without.
 
 A column compared with another column — `WHERE name = email`, `WHERE age > score`,
 `WHERE p.n > r.n` in a comma join, `JOIN r ON p.n > r.n` — is taken in a `SELECT`, an
@@ -3281,6 +3287,26 @@ not four bytes reserved for each of them — the binary collation, and the BINAR
 flag. `SHOW CREATE TABLE` and `SHOW COLUMNS` print `varbinary(255)`, and a value
 longer than the declared count is refused the way an over-long `VARCHAR` is,
 counting bytes.
+
+A column of bytes holds a blob whatever it is given. Its engine affinity —
+one this frontend gives a `BLOB` of any size and a `VARBINARY`, and SQLite
+does not have — turns a word into the bytes it is written in and a whole
+number into the bytes of its digits before the row and its index entries are
+written, which is what MySQL stores: measured on 8.4.11, `12` into a `BLOB`
+stores the two bytes `12` and `-5` the bytes `-5`. A number with a fraction
+is refused: MySQL stores its own spelling of it — `0.10` stores `0.10` and
+`1e3` stores `1000` — which the engine does not work out. A value wider than
+the column answers 1406 counting bytes, 256 of them in a `TINYBLOB` as five
+in a `VARBINARY(4)`, and trailing spaces are kept as any other byte. `HEX`
+over a column of bytes reports what MySQL reports — a `VAR_STRING` of eight
+bytes to each of a `VARBINARY`'s (8 for a `VARBINARY(1)`, 2400 for a
+`VARBINARY(300)`) and 2040 over a `TINYBLOB`, a `MEDIUM_BLOB` of 2097120 over a
+`BLOB` and a `LONG_BLOB` of 536870880 over a `MEDIUMBLOB` and of 4294967295
+over a `LONGBLOB` — and `LENGTH`, `OCTET_LENGTH` and `CHAR_LENGTH` all count
+bytes. `HEX(NULL)` answers NULL over any column, where the engine's own `hex`
+answers an empty word. A `VARBINARY` or a `BLOB` written before this frontend
+stored bytes may hold text, which a written word no longer compares equal to;
+an `UPDATE` of the row stores it as bytes.
 
 `BINARY(n)` is refused. Measured on the same server, it pads a shorter value
 with NUL bytes to the declared width — `'ab'` in a `BINARY(16)` reads back

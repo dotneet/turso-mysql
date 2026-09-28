@@ -960,6 +960,7 @@ impl Value {
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
+            Affinity::Bytes => unreachable!("no declared type name reads as bytes"),
             Affinity::Text => {
                 // Convert everything to text representation
                 // TODO: handle encoding and whatever sqlite3_snprintf does

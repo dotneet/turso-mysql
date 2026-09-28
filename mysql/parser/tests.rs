@@ -1046,7 +1046,7 @@ fn a_scalar_call_renders_as_the_engine_spells_it() {
         (
             "SELECT HEX(v) FROM s",
             concat!(
-                "SELECT CASE WHEN typeof(\"v\") IN ('integer', 'real') ",
+                "SELECT CASE WHEN \"v\" IS NULL THEN NULL WHEN typeof(\"v\") IN ('integer', 'real') ",
                 "THEN printf('%X', CAST(round(\"v\") AS INTEGER)) ELSE hex(\"v\") END ",
                 "AS \"HEX(v)\" FROM \"s\""
             ),

@@ -269,7 +269,9 @@ fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'
         crate::vdbe::affinity::Affinity::Real => Some("REAL"),
         crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
         crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
+        crate::vdbe::affinity::Affinity::Blob
+        | crate::vdbe::affinity::Affinity::None
+        | crate::vdbe::affinity::Affinity::Bytes => None,
     }
 }
 

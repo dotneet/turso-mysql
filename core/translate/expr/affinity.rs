@@ -175,6 +175,12 @@ pub(crate) fn expr_data_type(
 }
 
 fn do_comparison_affinity(lhs: Affinity, rhs: Affinity) -> Affinity {
+    // A string of bytes compares with any other string by its bytes, the way
+    // MySQL compares a binary string, so the other side is made bytes too.
+    if (lhs == Affinity::Bytes || rhs == Affinity::Bytes) && !lhs.is_numeric() && !rhs.is_numeric()
+    {
+        return Affinity::Bytes;
+    }
     if lhs != Affinity::None && rhs != Affinity::None {
         // Both sides have affinity - use numeric if either is numeric
         if lhs.is_numeric() || rhs.is_numeric() {
@@ -306,5 +312,30 @@ mod tests {
             do_comparison_affinity(Affinity::None, Affinity::None,),
             Affinity::Blob
         );
+    }
+
+    #[test]
+    fn bytes_meet_a_word_or_a_literal_as_bytes_and_a_number_as_a_number() {
+        for other in [
+            Affinity::None,
+            Affinity::Text,
+            Affinity::Blob,
+            Affinity::Bytes,
+        ] {
+            assert_eq!(
+                do_comparison_affinity(Affinity::Bytes, other),
+                Affinity::Bytes
+            );
+            assert_eq!(
+                do_comparison_affinity(other, Affinity::Bytes),
+                Affinity::Bytes
+            );
+        }
+        for number in [Affinity::Integer, Affinity::Real, Affinity::Numeric] {
+            assert_eq!(
+                do_comparison_affinity(Affinity::Bytes, number),
+                Affinity::Numeric
+            );
+        }
     }
 }

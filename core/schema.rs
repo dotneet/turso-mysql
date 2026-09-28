@@ -5461,6 +5461,17 @@ impl Column {
         self.info.override_affinity(Affinity::Blob);
     }
 
+    /// Stores this column's values as strings of bytes: text as the bytes it
+    /// is written in and a whole number as its digits, before the row and its
+    /// index entries are written, and compares what it holds by its bytes.
+    ///
+    /// A frontend uses this for a column of bytes rather than characters —
+    /// MySQL's `BLOB` and `VARBINARY`, which compare a written word by its
+    /// bytes and find it among blobs the column holds.
+    pub fn store_values_as_bytes(&mut self) {
+        self.info.override_affinity(Affinity::Bytes);
+    }
+
     pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
         if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
             Affinity::Blob

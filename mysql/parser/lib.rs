@@ -52,6 +52,7 @@ mod truncate_table;
 mod unknown_columns;
 mod view_definition;
 mod written_bytes;
+mod written_literals;
 mod written_number;
 mod written_value;
 
@@ -91,6 +92,7 @@ use translate::{
     select_static_result_metadata, translate_delete, translate_insert, translate_select_query,
     translate_update, RenderedSelect, SelectRenderContext,
 };
+pub use written_literals::{literals_written_into_columns, ColumnLiteral, WrittenLiterals};
 
 pub use account_admin::{
     parse_optional_account_admin_command, AccountAdminPassword, MySqlAccountAdminCommand,
@@ -1663,13 +1665,47 @@ impl MySqlIntegerType {
     }
 }
 
+/// How a column of bytes — a `BLOB` of any size or a `VARBINARY` — holds
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteStringColumn {
+    /// Any number of bytes up to a most: a `VARBINARY` its declared count, a
+    /// `BLOB` its type's — 255 for a `TINYBLOB`, 65535 for a `BLOB`,
+    /// 16777215 for a `MEDIUMBLOB` and 4294967295 for a `LONGBLOB`.
+    Varying { most_bytes: u64 },
+}
+
+impl ByteStringColumn {
+    /// Reads how a column declared with this type holds its bytes, or
+    /// nothing when it holds characters or numbers.
+    pub fn of_declared_type(data_type: &DataType) -> Option<Self> {
+        let most_bytes = match data_type {
+            DataType::TinyBlob => 255,
+            DataType::Blob(None) => 65_535,
+            DataType::MediumBlob => 16_777_215,
+            DataType::LongBlob => 4_294_967_295,
+            DataType::Varbinary(length) => u64::from(declared_binary_length(*length).ok()?),
+            _ => return None,
+        };
+        Some(Self::Varying { most_bytes })
+    }
+}
+
+/// Answers whether the engine type name a column is stored under names a
+/// column of bytes rather than of characters.
+pub fn holds_bytes(engine_type_name: &str) -> bool {
+    ["TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB", "VARBINARY"]
+        .iter()
+        .any(|name| engine_type_name.eq_ignore_ascii_case(name))
+}
+
 /// Private MySQL numeric metadata rebuilt from durable normalized table DDL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlNumericSpec {
     columns: Vec<Option<MySqlIntegerType>>,
     character_lengths: Vec<Option<u32>>,
     fixed_widths: Vec<bool>,
-    binary_lengths: Vec<Option<u32>>,
+    byte_strings: Vec<Option<ByteStringColumn>>,
     datetimes: Vec<bool>,
     timestamps: Vec<bool>,
     dates: Vec<bool>,
@@ -1702,9 +1738,9 @@ impl MySqlNumericSpec {
         self.fixed_widths.get(index).copied().unwrap_or(false)
     }
 
-    /// Returns the declared byte count of a `VARBINARY` column.
-    pub fn binary_length(&self, index: usize) -> Option<u32> {
-        self.binary_lengths.get(index).copied().flatten()
+    /// Returns how a column holding bytes rather than characters holds them.
+    pub fn byte_string(&self, index: usize) -> Option<ByteStringColumn> {
+        self.byte_strings.get(index).copied().flatten()
     }
 
     /// Reports whether a stored column position holds a `DATETIME`.
@@ -5508,13 +5544,10 @@ pub fn parse_mysql_numeric_spec(
             .iter()
             .map(|column| matches!(column.data_type, DataType::Char(_)))
             .collect(),
-        binary_lengths: table
+        byte_strings: table
             .columns
             .iter()
-            .map(|column| match column.data_type {
-                DataType::Varbinary(length) => declared_binary_length(length).ok(),
-                _ => None,
-            })
+            .map(|column| ByteStringColumn::of_declared_type(&column.data_type))
             .collect(),
         datetimes: table
             .columns

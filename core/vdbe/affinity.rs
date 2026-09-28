@@ -82,6 +82,14 @@ pub enum Affinity {
     Integer = 4,
     Real = 5,
     None = 6,
+    /// Not one of SQLite's: what a frontend gives a column holding a string
+    /// of bytes rather than of characters, MySQL's `BLOB`, `VARBINARY` and
+    /// `BINARY`. Text is stored as the bytes it is written in and a whole
+    /// number as the bytes of its decimal digits, so everything such a column
+    /// holds is a blob and compares by its bytes. A real is left as it is,
+    /// for the frontend to refuse: the digits it would be written in are not
+    /// the ones MySQL writes.
+    Bytes = 7,
 }
 
 pub const SQLITE_AFF_NONE: char = '@';
@@ -90,6 +98,8 @@ pub const SQLITE_AFF_TEXT: char = 'B';
 pub const SQLITE_AFF_NUMERIC: char = 'C';
 pub const SQLITE_AFF_INTEGER: char = 'D';
 pub const SQLITE_AFF_REAL: char = 'E';
+/// The character of [`Affinity::Bytes`], which SQLite does not have.
+pub const TURSO_AFF_BYTES: char = 'F';
 
 impl Affinity {
     pub fn from_repr(repr: u32) -> Option<Self> {
@@ -100,6 +110,7 @@ impl Affinity {
             4 => Some(Affinity::Integer),
             5 => Some(Affinity::Real),
             6 => Some(Affinity::None),
+            7 => Some(Affinity::Bytes),
             _ => None,
         }
     }
@@ -119,6 +130,7 @@ impl Affinity {
             Affinity::Real => SQLITE_AFF_REAL,
             Affinity::Numeric => SQLITE_AFF_NUMERIC,
             Affinity::None => SQLITE_AFF_NONE,
+            Affinity::Bytes => TURSO_AFF_BYTES,
         }
     }
 
@@ -129,6 +141,7 @@ impl Affinity {
             SQLITE_AFF_BLOB => Affinity::Blob,
             SQLITE_AFF_REAL => Affinity::Real,
             SQLITE_AFF_NUMERIC => Affinity::Numeric,
+            TURSO_AFF_BYTES => Affinity::Bytes,
             _ => Affinity::Blob,
         }
     }
@@ -145,7 +158,7 @@ impl Affinity {
     pub fn to_type(self) -> crate::schema::Type {
         use crate::schema::Type;
         match self {
-            Affinity::Blob | Affinity::None => Type::Blob,
+            Affinity::Blob | Affinity::None | Affinity::Bytes => Type::Blob,
             Affinity::Text => Type::Text,
             Affinity::Numeric => Type::Numeric,
             Affinity::Integer => Type::Integer,
@@ -161,7 +174,7 @@ impl Affinity {
     /// Returns an empty string for BLOB and NONE affinity (no declared type).
     pub fn short_type_name(&self) -> &'static str {
         match self {
-            Affinity::Blob | Affinity::None => "",
+            Affinity::Blob | Affinity::None | Affinity::Bytes => "",
             Affinity::Text => "TEXT",
             Affinity::Numeric => "NUM",
             Affinity::Integer => "INT",
@@ -255,6 +268,16 @@ impl Affinity {
             }
 
             Affinity::Blob | Affinity::None => None, // Do nothing for blob affinity.
+
+            Affinity::Bytes => match val {
+                ValueRef::Text(text) => Some(Either::Right(Value::Blob(
+                    text.as_str().as_bytes().to_vec(),
+                ))),
+                ValueRef::Numeric(Numeric::Integer(integer)) => {
+                    Some(Either::Right(Value::Blob(integer.to_string().into_bytes())))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -286,6 +309,10 @@ impl Affinity {
                 .map(Either::Left),
             Affinity::Text => self.convert(val),
             Affinity::Blob | Affinity::None => None,
+            // A whole number is not turned into its digits here: MySQL
+            // compares a binary string with a number as two numbers, which no
+            // conversion of one side answers.
+            Affinity::Bytes => is_text.then(|| self.convert(val)).flatten(),
         }
     }
 
@@ -310,6 +337,7 @@ impl Affinity {
         match comparison_aff {
             Affinity::Blob | Affinity::None => true,
             Affinity::Text => matches!(self, Affinity::Text),
+            Affinity::Bytes => matches!(self, Affinity::Bytes),
             Affinity::Numeric | Affinity::Integer | Affinity::Real => self.is_numeric(),
         }
     }
@@ -710,6 +738,33 @@ fn stringify_register(val: ValueRef) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_store_a_word_and_a_whole_number_as_bytes_and_leave_a_real() {
+        let converted = |value: Value| match Affinity::Bytes.convert(&value) {
+            Some(Either::Right(converted)) => Some(converted),
+            Some(Either::Left(converted)) => Some(converted.to_owned().unwrap()),
+            None => None,
+        };
+        assert_eq!(
+            converted(Value::Text("é".into())),
+            Some(Value::Blob(vec![0xC3, 0xA9]))
+        );
+        assert_eq!(
+            converted(Value::from_i64(-12)),
+            Some(Value::Blob(b"-12".to_vec()))
+        );
+        assert_eq!(converted(Value::from_f64(1.5)), None);
+        assert_eq!(converted(Value::Blob(vec![0xFF])), None);
+        assert_eq!(converted(Value::Null), None);
+        assert!(Affinity::Bytes
+            .convert_for_compare(&Value::from_i64(12))
+            .is_none());
+        assert_eq!(
+            Affinity::from_char(Affinity::Bytes.aff_mask()),
+            Affinity::Bytes
+        );
+    }
 
     #[test]
     fn test_apply_numeric_affinity_partial_numbers() {

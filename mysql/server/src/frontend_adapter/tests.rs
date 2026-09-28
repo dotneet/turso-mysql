@@ -30878,3 +30878,6 @@ fn whole_readings(
             / length,
     }
 }
+
+#[cfg(unix)]
+mod binary_data;

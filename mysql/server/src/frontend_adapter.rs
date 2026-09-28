@@ -9040,6 +9040,9 @@ fn scalar_call_column_definition(
     // reports 64 whatever the number's width is, because a number is written
     // in at most sixteen hexadecimal characters.
     if function == ScalarFunction::Hexadecimal {
+        if turso_mysql_parser::holds_bytes(source.type_name()) {
+            return hexadecimal_bytes_definition(name, source, not_null);
+        }
         let width = match source.character_length() {
             Some(length) => length.saturating_mul(8).saturating_mul(4),
             None if is_text_column(source) => return Err(FrontendErrorKind::Unsupported),
@@ -9058,9 +9061,15 @@ fn scalar_call_column_definition(
             | ScalarFunction::QuotesForSql
             | ScalarFunction::EncodesInBase64
     ) && spelled_characters(source).is_some();
+    // Measured on MySQL 8.4.11: `LENGTH`, `OCTET_LENGTH` and `CHAR_LENGTH`
+    // over a column of bytes all count its bytes, which is what the engine
+    // counts in a blob, and answer the LONGLONG of 10 they answer over text.
+    let counts_bytes = function == ScalarFunction::CountsText
+        && turso_mysql_parser::holds_bytes(source.type_name());
     if wants_text != is_text_column(source)
         && function != ScalarFunction::NullsOnMatch
         && !cuts_or_pads_a_spelled_value
+        && !counts_bytes
     {
         return Err(FrontendErrorKind::Unsupported);
     }
@@ -9845,6 +9854,42 @@ fn medium_blob_text_definition(
 /// The most bytes a MEDIUM_BLOB holds.
 #[cfg(unix)]
 const MYSQL_MEDIUM_BLOB_LENGTH: u32 = 16_777_215;
+
+/// What `HEX` over a column of bytes reports: two characters for each byte,
+/// four bytes reserved for each of them, as a `VAR_STRING` — measured on
+/// MySQL 8.4.11, 8 over a `VARBINARY(1)`, 2400 over a `VARBINARY(300)` and
+/// 2040 over a `TINYBLOB` — and as a blob past that: a `MEDIUM_BLOB` of
+/// 2097120 over a `BLOB`, a `LONG_BLOB` of 536870880 over a `MEDIUMBLOB` and
+/// of 4294967295 over a `LONGBLOB`, each with the text collation. A
+/// `VARBINARY` too wide for a `VAR_STRING` has not been measured.
+#[cfg(unix)]
+fn hexadecimal_bytes_definition(
+    name: String,
+    source: &MySqlColumnMetadata,
+    not_null: bool,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    let (column_type, width) = match source.type_name() {
+        "VARBINARY" => {
+            let width = source
+                .character_length()
+                .and_then(|bytes| bytes.checked_mul(2 * UTF8MB4_MAX_BYTES_PER_CHARACTER))
+                .filter(|width| *width <= u32::from(u16::MAX))
+                .ok_or(FrontendErrorKind::Unsupported)?;
+            return Ok(text_call_definition(name, width, not_null));
+        }
+        "TINYBLOB" => return Ok(text_call_definition(name, 2040, not_null)),
+        "BLOB" => (MYSQL_TYPE_MEDIUM_BLOB, 2_097_120),
+        "MEDIUMBLOB" => (MYSQL_TYPE_LONG_BLOB, 536_870_880),
+        "LONGBLOB" => (MYSQL_TYPE_LONG_BLOB, u32::MAX),
+        _ => return Err(FrontendErrorKind::Unsupported),
+    };
+    let mut definition = column_definition(name, column_type);
+    definition.column_length = width;
+    definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    definition.decimals = NOT_FIXED_DECIMALS;
+    set_column_flags(&mut definition, 0);
+    Ok(definition)
+}
 
 /// Builds the `VAR_STRING` a call that answers text of a known width reports.
 #[cfg(unix)]

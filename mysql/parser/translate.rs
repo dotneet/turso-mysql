@@ -8022,10 +8022,11 @@ fn render_scalar_call(
         // Measured on MySQL 8.4.11: HEX writes a number in hexadecimal and
         // text as its bytes, so which it is has to be asked at the row rather
         // than worked out from the column. A fractional number is rounded
-        // first — `HEX(1234.56)` is 4D3.
+        // first — `HEX(1234.56)` is 4D3 — and NULL is NULL, where the
+        // engine's own `hex` answers an empty word for it.
         let value = scalar_argument(function, 0)?;
         return Ok(format!(
-            "CASE WHEN typeof({value}) IN ('integer', 'real') THEN printf('%X', CAST(round({value}) AS INTEGER)) ELSE hex({value}) END"
+            "CASE WHEN {value} IS NULL THEN NULL WHEN typeof({value}) IN ('integer', 'real') THEN printf('%X', CAST(round({value}) AS INTEGER)) ELSE hex({value}) END"
         ));
     } else if name.value.eq_ignore_ascii_case("ABS") {
         if has_decimal_argument {
