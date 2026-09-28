@@ -7360,8 +7360,7 @@ impl MySqlConnection {
                 "session-local clock functions in a non-UTC time zone are unsupported".to_owned(),
             ));
         }
-        let untyped = parse_select(sql, self.parser_mode())
-            .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
+        let untyped = parse_select(sql, self.parser_mode()).map_err(mysql_query_parse_error)?;
         let untyped_sql = untyped.as_sql().to_owned();
         let typed = self.with_column_types(sql, untyped)?;
         if typed.renders_a_condition_without_column_types() {

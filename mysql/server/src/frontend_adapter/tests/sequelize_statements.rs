@@ -540,3 +540,217 @@ fn a_key_column_written_in_capitals_has_one_index() {
     );
     assert_eq!(rows(&mut adapter, "SHOW INDEX FROM CamelCase").len(), 1);
 }
+
+/// The app's blog tables as sequelize-cli's migration makes them, three users,
+/// three posts and three tags, the first post carrying two tags and the third
+/// one, and the second none.
+fn blog() -> (tempfile::TempDir, Adapter) {
+    let (directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `users` (`id` BIGINT auto_increment , `email` VARCHAR(191) NOT NULL UNIQUE, `name` VARCHAR(100) NOT NULL, `balance` DECIMAL(10,2) NOT NULL DEFAULT 0, `is_active` TINYINT(1) NOT NULL DEFAULT true, `profile` JSON, `version` INTEGER NOT NULL DEFAULT 0, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+        "CREATE TABLE IF NOT EXISTS `posts` (`id` BIGINT auto_increment , `user_id` BIGINT NOT NULL, `title` VARCHAR(200) NOT NULL, `body` TEXT, `published_at` DATETIME, `views` INTEGER NOT NULL DEFAULT 0, `created_at` DATETIME NOT NULL, `updated_at` DATETIME NOT NULL, PRIMARY KEY (`id`), FOREIGN KEY (`user_id`) REFERENCES `users` (`id`) ON DELETE CASCADE ON UPDATE CASCADE) ENGINE=InnoDB;",
+        "CREATE TABLE IF NOT EXISTS `tags` (`id` BIGINT auto_increment , `name` VARCHAR(100) NOT NULL UNIQUE, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+        "CREATE TABLE IF NOT EXISTS `post_tags` (`post_id` BIGINT NOT NULL , `tag_id` BIGINT NOT NULL , PRIMARY KEY (`post_id`, `tag_id`), FOREIGN KEY (`post_id`) REFERENCES `posts` (`id`) ON DELETE CASCADE, FOREIGN KEY (`tag_id`) REFERENCES `tags` (`id`) ON DELETE CASCADE) ENGINE=InnoDB;",
+        "INSERT INTO users (id, email, name, balance, is_active, created_at, updated_at) VALUES (1, 'alice@example.com', 'Alice', 10, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'), (2, 'bob@example.com', 'Bob', 5, 1, '2026-01-01 00:00:00', '2026-01-01 00:00:00'), (3, 'carol@example.com', 'Carol', 0, 0, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        "INSERT INTO posts (id, user_id, title, body, views, created_at, updated_at) VALUES (1, 1, 'a', 'x', 3, '2026-01-01 00:00:00', '2026-01-01 00:00:00'), (2, 1, 'b', NULL, 5, '2026-01-01 00:00:00', '2026-01-01 00:00:00'), (3, 2, 'c', 'y', 7, '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        "INSERT INTO tags (id, name) VALUES (1, 'news'), (2, 'rust'), (3, 'sql')",
+        "INSERT INTO post_tags VALUES (1, 1), (1, 2), (3, 3)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    (directory, adapter)
+}
+
+/// A result column's name, the table it is read through, and its flags.
+type Shape = (String, String, u16);
+
+/// Runs a statement in both protocols, holds the two to the same columns and
+/// rows, and answers the text protocol's.
+fn report(adapter: &mut Adapter, sql: &str) -> (Vec<Shape>, Vec<Vec<Option<String>>>) {
+    let text = match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::ResultSet(text)) => text,
+        other => panic!("{sql} must answer rows, answered {other:?}"),
+    };
+    let prepared = adapter
+        .execute_stmt_prepare(sql)
+        .unwrap_or_else(|error| panic!("{sql} must prepare: {error:?}"));
+    assert_eq!(prepared.columns, text.columns, "{sql}");
+    let binary = prepared_result_set(
+        adapter
+            .execute_stmt_execute(prepared.statement_id, &[])
+            .unwrap(),
+    );
+    adapter.execute_stmt_close(prepared.statement_id);
+    assert_eq!(binary.columns, text.columns, "{sql}");
+    assert_eq!(binary.rows.len(), text.rows.len(), "{sql}");
+    let shapes = text
+        .columns
+        .iter()
+        .map(|column| (column.name.clone(), column.table.clone(), column.flags))
+        .collect();
+    let rows = text
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+                .collect()
+        })
+        .collect();
+    (shapes, rows)
+}
+
+fn values(rows: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
+    rows.iter()
+        .map(|row| row.iter().map(|value| value.map(str::to_owned)).collect())
+        .collect()
+}
+
+/// An include through a join table — `User.findAll({ include: [{ model:
+/// Post, include: [Tag] }] })` — reads the join table and the tags it names
+/// joined in parentheses, `LEFT OUTER JOIN (post_tags INNER JOIN tags ON ...)
+/// ON ...`. Measured on MySQL 8.4.11: a post with no tag, or whose one row in
+/// the join table names a tag that is not there, is read once with every
+/// column of both tables missing, and those columns keep their keys but not
+/// `NOT NULL`.
+#[test]
+fn sequelizes_include_through_a_join_table_joins_two_tables_in_parentheses() {
+    let (_directory, mut adapter) = blog();
+    let (shapes, rows) = report(
+        &mut adapter,
+        "SELECT `User`.`id`, `posts`.`id` AS `posts.id`, `posts->tags`.`id` AS `posts.tags.id`, `posts->tags`.`name` AS `posts.tags.name`, `posts->tags->PostTag`.`post_id` AS `posts.tags.PostTag.postId`, `posts->tags->PostTag`.`tag_id` AS `posts.tags.PostTag.tagId` FROM `users` AS `User` LEFT OUTER JOIN `posts` AS `posts` ON `User`.`id` = `posts`.`user_id` LEFT OUTER JOIN ( `post_tags` AS `posts->tags->PostTag` INNER JOIN `tags` AS `posts->tags` ON `posts->tags`.`id` = `posts->tags->PostTag`.`tag_id`) ON `posts`.`id` = `posts->tags->PostTag`.`post_id` ORDER BY `User`.`id` ASC, `posts`.`id` ASC;",
+    );
+    const PART_KEY: u16 = 16384;
+    const NO_DEFAULT: u16 = 4096;
+    const KEY: u16 = 2 | 512 | PART_KEY;
+    assert_eq!(
+        shapes,
+        [
+            ("id", "User", 1 | KEY),
+            ("posts.id", "posts", KEY),
+            ("posts.tags.id", "posts->tags", KEY),
+            ("posts.tags.name", "posts->tags", 4 | NO_DEFAULT | PART_KEY),
+            (
+                "posts.tags.PostTag.postId",
+                "posts->tags->PostTag",
+                2 | NO_DEFAULT | PART_KEY
+            ),
+            (
+                "posts.tags.PostTag.tagId",
+                "posts->tags->PostTag",
+                2 | NO_DEFAULT | PART_KEY
+            ),
+        ]
+        .map(|(name, table, flags)| (name.to_owned(), table.to_owned(), flags))
+    );
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|row| (row[0].clone(), row[1].clone(), row[2].clone()));
+    assert_eq!(rows, sorted, "ordered by user and post");
+    assert_eq!(
+        sorted,
+        values(&[
+            &[
+                Some("1"),
+                Some("1"),
+                Some("1"),
+                Some("news"),
+                Some("1"),
+                Some("1")
+            ],
+            &[
+                Some("1"),
+                Some("1"),
+                Some("2"),
+                Some("rust"),
+                Some("1"),
+                Some("2")
+            ],
+            &[Some("1"), Some("2"), None, None, None, None],
+            &[
+                Some("2"),
+                Some("3"),
+                Some("3"),
+                Some("sql"),
+                Some("3"),
+                Some("3")
+            ],
+            &[Some("3"), None, None, None, None, None],
+        ])
+    );
+
+    // A row of the join table naming no tag keeps its post out of the
+    // parentheses, and a condition on the tag moves with the tag.
+    run(&mut adapter, "SET foreign_key_checks = 0");
+    run(&mut adapter, "INSERT INTO post_tags VALUES (2, 99)");
+    let tagged = "SELECT `Post`.`id`, `tags`.`name` AS `tags.name`, `tags->PostTag`.`tag_id` AS `tags.PostTag.tagId` FROM `posts` AS `Post` LEFT OUTER JOIN ( `post_tags` AS `tags->PostTag` INNER JOIN `tags` AS `tags` ON `tags`.`id` = `tags->PostTag`.`tag_id`) ON `Post`.`id` = `tags->PostTag`.`post_id` ORDER BY `Post`.`id`, `tags`.`id`";
+    assert_eq!(
+        report(&mut adapter, tagged).1,
+        values(&[
+            &[Some("1"), Some("news"), Some("1")],
+            &[Some("1"), Some("rust"), Some("2")],
+            &[Some("2"), None, None],
+            &[Some("3"), Some("sql"), Some("3")],
+        ])
+    );
+    assert_eq!(
+        report(
+            &mut adapter,
+            &tagged.replace(
+                "`tags->PostTag`.`post_id` ORDER",
+                "`tags->PostTag`.`post_id` AND `tags`.`name` <> 'news' ORDER"
+            )
+        )
+        .1,
+        values(&[
+            &[Some("1"), Some("rust"), Some("2")],
+            &[Some("2"), None, None],
+            &[Some("3"), Some("sql"), Some("3")],
+        ])
+    );
+    assert_eq!(
+        report(
+            &mut adapter,
+            "SELECT count(DISTINCT(`Post`.`id`)) AS `count` FROM `posts` AS `Post` LEFT OUTER JOIN ( `post_tags` AS `tags->PostTag` INNER JOIN `tags` AS `tags` ON `tags`.`id` = `tags->PostTag`.`tag_id`) ON `Post`.`id` = `tags->PostTag`.`post_id` LEFT OUTER JOIN `users` AS `user` ON `Post`.`user_id` = `user`.`id`;"
+        )
+        .1,
+        values(&[&[Some("3")]])
+    );
+}
+
+/// `required: true` on both includes makes every join an inner one, and the
+/// condition on the tag stands in the `ON` of the parentheses.
+#[test]
+fn sequelizes_required_include_through_a_join_table_joins_inside_parentheses() {
+    let (_directory, mut adapter) = blog();
+    assert_eq!(
+        report(
+            &mut adapter,
+            "SELECT `Post`.`id`, `user`.`email` AS `user.email`, `tags`.`name` AS `tags.name`, `tags->PostTag`.`post_id` AS `tags.PostTag.postId` FROM `posts` AS `Post` INNER JOIN `users` AS `user` ON `Post`.`user_id` = `user`.`id` AND `user`.`is_active` = true INNER JOIN ( `post_tags` AS `tags->PostTag` INNER JOIN `tags` AS `tags` ON `tags`.`id` = `tags->PostTag`.`tag_id`) ON `Post`.`id` = `tags->PostTag`.`post_id` AND `tags`.`name` = 'rust';"
+        )
+        .1,
+        values(&[&[Some("1"), Some("alice@example.com"), Some("rust"), Some("1")]])
+    );
+}
+
+/// What the engine could not answer the same rows for stays refused: a left
+/// join inside the parentheses, and an inner `ON` that does not match a
+/// column of one table against a column of the other, which would let the
+/// second table's rows through beside a first table left missing.
+#[test]
+fn a_join_in_parentheses_the_engine_cannot_follow_is_refused() {
+    let (_directory, mut adapter) = blog();
+    for sql in [
+        "SELECT p.id FROM posts p LEFT JOIN (post_tags pt LEFT JOIN tags t ON t.id = pt.tag_id) ON p.id = pt.post_id",
+        "SELECT p.id FROM posts p LEFT JOIN (post_tags pt JOIN tags t ON t.name = 'news') ON p.id = pt.post_id",
+        "SELECT p.id FROM posts p LEFT JOIN (post_tags pt JOIN tags t ON t.id = pt.tag_id JOIN users u ON u.id = p.user_id) ON p.id = pt.post_id",
+        "SELECT p.id FROM posts p RIGHT JOIN (post_tags pt JOIN tags t ON t.id = pt.tag_id) ON p.id = pt.post_id",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

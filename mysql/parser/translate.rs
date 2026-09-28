@@ -1641,6 +1641,22 @@ fn render_from_clause_with(
         }
         sources.push(source);
         for join in &from.joins {
+            if let TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } = &join.relation
+            {
+                if alias.is_some() {
+                    return unsupported("SELECT nested join alias");
+                }
+                rendered.push_str(&render_nested_join(
+                    &join.join_operator,
+                    table_with_joins,
+                    &mut sources,
+                    render_context.as_deref_mut(),
+                )?);
+                continue;
+            }
             let (joined, mut source) =
                 render_select_table(&join.relation, render_context.as_deref_mut())?;
             let (keyword, constraint) = checked_join(&join.join_operator)?;
@@ -1678,6 +1694,211 @@ fn render_from_clause_with(
         return Ok((None, Vec::new()));
     }
     Ok((Some(rendered), sources))
+}
+
+/// Renders a join to two tables joined in parentheses —
+/// `A LEFT JOIN (B JOIN C ON p) ON q` — which is how Sequelize joins through
+/// a many-to-many table. The engine has no parenthesized join, so it is
+/// written as joins one after another that answer the same rows.
+///
+/// Inner joins can be taken in any order, so `JOIN (B JOIN C ON p) ON q` is
+/// `JOIN B JOIN C ON p AND q`.
+///
+/// A left join keeps a row of `B` only when some row of `C` matches it, so
+/// `LEFT JOIN (B JOIN C ON p) ON q` is
+/// `LEFT JOIN B ON q AND EXISTS (SELECT 1 FROM C WHERE p) LEFT JOIN C ON p`,
+/// with the parts of `q` naming `C` moved into both places `C` is read. When
+/// the first join leaves `B` missing, the second must find no row of `C`
+/// either; `p` matching a column of `C` against a column of `B` is what makes
+/// sure of that, a missing row's column equalling nothing.
+fn render_nested_join(
+    operator: &sqlparser::ast::JoinOperator,
+    nested: &sqlparser::ast::TableWithJoins,
+    sources: &mut Vec<MySqlSelectSource>,
+    mut render_context: Option<&mut SelectRenderContext<'_>>,
+) -> Result<String, ParseError> {
+    let (keyword, CheckedJoinConstraint::On(outer_on)) = checked_join(operator)? else {
+        return unsupported("SELECT nested join without ON");
+    };
+    if keyword != "JOIN" && keyword != "LEFT JOIN" {
+        return unsupported("SELECT nested join form");
+    }
+    let [inner_join] = nested.joins.as_slice() else {
+        return unsupported("SELECT nested join of other than two tables");
+    };
+    let ("JOIN", CheckedJoinConstraint::On(inner_on)) = checked_join(&inner_join.join_operator)?
+    else {
+        return unsupported("SELECT nested join form");
+    };
+    if !matches!(nested.relation, TableFactor::Table { .. })
+        || !matches!(inner_join.relation, TableFactor::Table { .. })
+    {
+        return unsupported("SELECT nested join of other than tables");
+    }
+    let (first, mut first_source) =
+        render_select_table(&nested.relation, render_context.as_deref_mut())?;
+    let (second, mut second_source) =
+        render_select_table(&inner_join.relation, render_context.as_deref_mut())?;
+    let first_name = first_source.reference.clone();
+    let second_name = second_source.reference.clone();
+    if first_name.eq_ignore_ascii_case(&second_name) {
+        return unsupported("SELECT nested join naming one table twice");
+    }
+    let names_the_second =
+        |expr: &Expr| tables_named(expr).map(|tables| tables_include(&tables, &second_name));
+    let mut outer_parts = Vec::new();
+    let mut parts_naming_the_second = Vec::new();
+    for part in conjuncts(outer_on) {
+        match names_the_second(part) {
+            Some(true) => parts_naming_the_second.push(part),
+            Some(false) => outer_parts.push(part),
+            None => return unsupported("SELECT nested join ON naming a column without its table"),
+        }
+    }
+    let Some(inner_tables) = tables_named(inner_on) else {
+        return unsupported("SELECT nested join ON naming a column without its table");
+    };
+    if inner_tables.iter().any(|table| {
+        !table.eq_ignore_ascii_case(&first_name) && !table.eq_ignore_ascii_case(&second_name)
+    }) {
+        return unsupported("SELECT nested join ON naming a table outside it");
+    }
+    if keyword == "JOIN" {
+        let mut on = render_join_predicate(inner_on, render_context.as_deref_mut())?;
+        for part in conjuncts(outer_on) {
+            on = format!(
+                "({on} AND {})",
+                render_join_predicate(part, render_context.as_deref_mut())?
+            );
+        }
+        sources.push(first_source);
+        sources.push(second_source);
+        return Ok(format!(" JOIN {first} JOIN {second} ON {on}"));
+    }
+    if !conjuncts(inner_on)
+        .into_iter()
+        .any(|part| matches_the_two_tables(part, &first_name, &second_name))
+    {
+        return unsupported(
+            "SELECT nested left join whose inner ON matches no column of each table",
+        );
+    }
+    let mut second_on = render_join_predicate(inner_on, render_context.as_deref_mut())?;
+    for part in parts_naming_the_second {
+        second_on = format!(
+            "({second_on} AND {})",
+            render_join_predicate(part, render_context.as_deref_mut())?
+        );
+    }
+    let mut first_on = format!("EXISTS (SELECT 1 FROM {second} WHERE {second_on})");
+    for part in outer_parts.into_iter().rev() {
+        first_on = format!(
+            "({} AND {first_on})",
+            render_join_predicate(part, render_context.as_deref_mut())?
+        );
+    }
+    first_source.outer = true;
+    second_source.outer = true;
+    sources.push(first_source);
+    sources.push(second_source);
+    Ok(format!(
+        " LEFT JOIN {first} ON {first_on} LEFT JOIN {second} ON {second_on}"
+    ))
+}
+
+/// The parts of a condition joined by `AND`, parentheses around it dropped.
+fn conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Nested(inner) => conjuncts(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = conjuncts(left);
+            parts.extend(conjuncts(right));
+            parts
+        }
+        _ => vec![expr],
+    }
+}
+
+/// Whether a condition is `x.a = y.b` with one side naming each table.
+fn matches_the_two_tables(expr: &Expr, first: &str, second: &str) -> bool {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+    let (Expr::CompoundIdentifier(left), Expr::CompoundIdentifier(right)) =
+        (unwrapped(left), unwrapped(right))
+    else {
+        return false;
+    };
+    let [left_table, _] = left.as_slice() else {
+        return false;
+    };
+    let [right_table, _] = right.as_slice() else {
+        return false;
+    };
+    (left_table.value.eq_ignore_ascii_case(first) && right_table.value.eq_ignore_ascii_case(second))
+        || (left_table.value.eq_ignore_ascii_case(second)
+            && right_table.value.eq_ignore_ascii_case(first))
+}
+
+/// The tables a join condition names its columns through, or `None` when it
+/// names a column without its table or holds anything else this does not
+/// look inside.
+fn tables_named(expr: &Expr) -> Option<Vec<String>> {
+    let mut tables = Vec::new();
+    collect_tables_named(expr, &mut tables)?;
+    Some(tables)
+}
+
+fn collect_tables_named(expr: &Expr, tables: &mut Vec<String>) -> Option<()> {
+    match expr {
+        Expr::CompoundIdentifier(parts) => {
+            let [table, _] = parts.as_slice() else {
+                return None;
+            };
+            tables.push(table.value.clone());
+        }
+        Expr::Value(_) => {}
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => collect_tables_named(inner, tables)?,
+        Expr::BinaryOp { left, right, .. } => {
+            collect_tables_named(left, tables)?;
+            collect_tables_named(right, tables)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_tables_named(expr, tables)?;
+            for item in list {
+                collect_tables_named(item, tables)?;
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_tables_named(expr, tables)?;
+            collect_tables_named(low, tables)?;
+            collect_tables_named(high, tables)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn tables_include(tables: &[String], name: &str) -> bool {
+    tables.iter().any(|table| table.eq_ignore_ascii_case(name))
 }
 
 /// Renders what a join matches its two tables on.

@@ -3868,6 +3868,23 @@ comparison does, so a column, a value or a `?` in parentheses on either side of
 a comparison is read as itself; parentheses around anything larger are kept as
 the expression they hold.
 
+Sequelize joins through a many-to-many table by joining the join table and the
+table it names inside parentheses — `` LEFT OUTER JOIN ( `post_tags` AS
+`tags->PostTag` INNER JOIN `tags` AS `tags` ON ...) ON `Post`.`id` =
+`tags->PostTag`.`post_id` ``, an `INNER JOIN` in front of the parentheses when
+the include is required. The engine has no join in parentheses, so the two are
+written as joins one after the other that answer the same rows: inner joins in
+any order answer the same, and a left join keeps a row of the join table only
+when some tag matches it (`... ON q AND EXISTS (SELECT 1 FROM tags WHERE p)
+LEFT JOIN tags ON p`), a condition naming the tag moving with the tag. Measured
+on MySQL 8.4.11 and matched in both protocols: a post with no tag, or whose row
+in the join table names a tag that is not there, is read once with every column
+of both tables missing, and those columns keep their keys and lose `NOT_NULL`.
+Two tables joined by an inner join are all this reads in the parentheses, and
+the inner `ON` has to match a column of one against a column of the other; the
+rest is refused (see TODO.md). A `SELECT` refused while it is read used to
+answer 1064, as if it were not MySQL at all; it answers 1235 now.
+
 Laravel's `Schema::getIndexes` and `Schema::getForeignKeys` — which `hasIndex`,
 `db:table` and a migration's introspection read — each group a table's rows of
 `STATISTICS`, or of `KEY_COLUMN_USAGE` joined to `REFERENTIAL_CONSTRAINTS`,
