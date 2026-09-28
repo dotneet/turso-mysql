@@ -4510,6 +4510,7 @@ fn parse_select_inner(
     let Statement::Query(mut query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
+    translate::name_the_columns_grouped_by_place(&mut query)?;
     translate::leave_the_one_table_out(&mut query);
     let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
         .tokenize()

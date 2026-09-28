@@ -12,6 +12,7 @@
 
 use super::*;
 
+pub(crate) use grouping::name_the_columns_grouped_by_place;
 pub(crate) use one_table_columns::leave_the_one_table_out;
 
 mod derived;

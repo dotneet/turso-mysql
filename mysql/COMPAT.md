@@ -1794,7 +1794,11 @@ the protocol metadata now preserves.
 `DATE`, `YEAR`, `MONTH`, `DAY`, the other readings of a moment's part,
 `LAST_DAY`, `DAYNAME`, `MONTHNAME` and `DATE_FORMAT` over a column, written out
 or named by the projection's alias for it (`... AS m ... GROUP BY m`) — and is
-held to `ONLY_FULL_GROUP_BY`. That mode is in MySQL 8.4's default `sql_mode` and this
+held to `ONLY_FULL_GROUP_BY`. A key may also be the place of a projected whole
+column, as Django writes `GROUP BY 1`: measured on 8.4.11, it groups by that
+column and answers what naming it answers; a place holding an aggregate answers
+1056 and `0` or one past the last 1054, and those, a place holding a call and one
+beside `WITH ROLLUP` are refused. That mode is in MySQL 8.4's default `sql_mode` and this
 server takes a client's `SET sql_mode` naming it, so the rule is enforced rather
 than assumed. Measured on MySQL 8.4.11:
 

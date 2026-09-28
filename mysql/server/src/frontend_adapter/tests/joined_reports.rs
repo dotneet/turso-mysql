@@ -1,5 +1,6 @@
-//! Reports over a join — a count, a total or a largest for each user — as the
-//! ORMs write them, each replayed as the framework harness saw it on the wire.
+//! Reports — a count, a total or a largest for each user or group — as the
+//! ORMs write them over a join or a grouping, each replayed as the framework
+//! harness saw it on the wire.
 //!
 //! Every expectation here was measured on MySQL 8.4.11 over the same tables
 //! and rows, in the text and the binary protocol.
@@ -381,6 +382,66 @@ fn django_projects_a_column_the_primary_key_it_groups_by_decides() {
             &[Some("sql"), Some("1")],
         ])
     );
+}
+
+/// Django's `values("is_active").annotate(...).order_by("is_active")` over
+/// one table groups by the place of the column in the projection, `GROUP BY
+/// 1`, which MySQL answers as `GROUP BY users.is_active`. A place holding an
+/// aggregate (1056), one past the last or `0` (1054) and one holding a call
+/// are refused.
+///
+/// Measured, MySQL groups this through a temporary table, no index holding
+/// `is_active`, where the count and the total lose the binary flag; this
+/// reports the shapes it reports when an index answers the grouping.
+#[test]
+fn django_groups_by_the_place_of_a_projected_column() {
+    let (_directory, mut adapter) = adapter_over(SIGNED_IDS);
+    let (shapes, answered) = report(
+        &mut adapter,
+        "SELECT `users`.`is_active` AS `is_active`, COUNT(`users`.`id`) AS `n`, SUM(`users`.`balance`) AS `total` FROM `users` GROUP BY 1 ORDER BY 1 ASC",
+    );
+    assert_eq!(
+        shapes,
+        [
+            shape("is_active", MYSQL_TYPE_TINY, 1, 0, WORDS),
+            shape("n", MYSQL_TYPE_LONGLONG, 21, 0, COUNTED),
+            shape("total", MYSQL_TYPE_NEWDECIMAL, 34, 2, AGGREGATED),
+        ]
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("0"), Some("1"), Some("5.25")],
+            &[Some("1"), Some("2"), Some("120.50")],
+        ])
+    );
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT name, is_active, COUNT(*) FROM users GROUP BY 2, 1 ORDER BY 2, 1",
+    );
+    assert_eq!(
+        answered,
+        rows(&[
+            &[Some("Carol"), Some("0"), Some("1")],
+            &[Some("Alice"), Some("1"), Some("1")],
+            &[Some("Bob"), Some("1"), Some("1")],
+        ])
+    );
+    let (_, answered) = report(
+        &mut adapter,
+        "SELECT is_active, COUNT(*) AS c FROM users GROUP BY 1 HAVING is_active > 0",
+    );
+    assert_eq!(answered, rows(&[&[Some("1"), Some("2")]]));
+    for sql in [
+        "SELECT is_active, COUNT(*) FROM users GROUP BY 2",
+        "SELECT is_active, COUNT(*) FROM users GROUP BY 0",
+        "SELECT is_active, COUNT(*) FROM users GROUP BY 3",
+        "SELECT UPPER(name), COUNT(*) FROM users GROUP BY 1",
+        "SELECT is_active, name, COUNT(*) FROM users GROUP BY 1",
+        "SELECT is_active, COUNT(*) FROM users GROUP BY 1 WITH ROLLUP",
+    ] {
+        assert!(is_refused(&mut adapter, sql), "{sql}");
+    }
 }
 
 /// Which columns a grouping's keys decide, measured on MySQL 8.4.11 over the

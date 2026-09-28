@@ -126,6 +126,54 @@ impl MySqlJoinedTable {
     }
 }
 
+/// Writes each `GROUP BY` key that is a place in the projection — Django's
+/// `GROUP BY 1` — as the column standing there.
+///
+/// Measured on MySQL 8.4.11: `GROUP BY 1` groups by the first projected
+/// column, answering the rows and the shapes naming the column answers, and a
+/// `HAVING` may name it. A place holding an aggregate answers 1056, and one
+/// that is no place — `0`, or past the last — 1054, so each is refused, as is
+/// a place holding anything but a whole column, and a place beside `WITH
+/// ROLLUP`, neither measured. Only the statement's own `GROUP BY` is read
+/// here; one in a subquery or a derived table stays refused.
+pub(crate) fn name_the_columns_grouped_by_place(
+    query: &mut sqlparser::ast::Query,
+) -> Result<(), ParseError> {
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Ok(());
+    };
+    let sqlparser::ast::GroupByExpr::Expressions(keys, modifiers) = &mut select.group_by else {
+        return Ok(());
+    };
+    for key in keys.iter_mut() {
+        let Expr::Value(value) = &*key else {
+            continue;
+        };
+        let Value::Number(place, false) = &value.value else {
+            continue;
+        };
+        if !modifiers.is_empty() {
+            return unsupported("GROUP BY a place in the projection WITH ROLLUP");
+        }
+        let column = place
+            .parse::<usize>()
+            .ok()
+            .and_then(|place| place.checked_sub(1))
+            .and_then(|place| select.projection.get(place))
+            .and_then(|item| match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    grouped_column(expr).is_some().then(|| expr.clone())
+                }
+                _ => None,
+            });
+        let Some(column) = column else {
+            return unsupported("GROUP BY a place in the projection holding no column");
+        };
+        *key = column;
+    }
+    Ok(())
+}
+
 /// Renders a `GROUP BY` and holds the projection to `ONLY_FULL_GROUP_BY`.
 ///
 /// A key is a whole column, or one of the calls [`groups_the_way_mysql_does`]
