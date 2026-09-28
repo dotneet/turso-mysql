@@ -287,6 +287,26 @@ fn test_read_snapshot_begun_early_hides_rows_committed_before_the_first_read(tmp
 }
 
 #[turso_macros::test]
+fn test_a_transaction_has_a_read_snapshot_from_its_first_read_until_it_lets_go(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE test (value INTEGER)").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+    assert!(!conn.has_read_snapshot());
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(0,)]);
+    assert!(conn.has_read_snapshot());
+    conn.release_read_snapshot().unwrap();
+    assert!(!conn.has_read_snapshot());
+    conn.execute("INSERT INTO test VALUES (1)").unwrap();
+    assert!(conn.has_read_snapshot());
+    conn.execute("COMMIT").unwrap();
+    assert!(!conn.has_read_snapshot());
+}
+
+#[turso_macros::test]
 fn test_read_snapshot_cannot_move_outside_a_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 

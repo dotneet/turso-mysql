@@ -352,7 +352,7 @@ impl CommandExecutor for MySqlCommandAdapter {
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
-        let result = self.execute_query_statement(sql);
+        let result = run_client_statement(&connection, || self.execute_query_statement(sql));
         let result = finish_client_statement(&connection, &mut self.session_variables, result);
         answer_a_result_in_latin1(&self.session_variables, result)
     }
@@ -383,16 +383,20 @@ impl CommandExecutor for MySqlCommandAdapter {
         let group_concat_max_len = self.session_variables.group_concat_max_len();
         self.connection
             .set_group_concat_max_len(group_concat_max_len);
-        let mut result = prepare_checked_statement(&self.connection, sql)?;
-        if let Err(error) = apply_raw_column_collations(
-            &self.connection,
-            &mut result.columns,
-            self.session_variables.raw_character_set_results(),
-        ) {
-            self.connection
-                .remove_prepared_statement(result.statement_id);
-            return Err(error);
-        }
+        let connection = &self.connection;
+        let raw_character_set_results = self.session_variables.raw_character_set_results();
+        let mut result = connection.prepare_without_starting_the_snapshot(|| {
+            let mut result = prepare_checked_statement(connection, sql)?;
+            if let Err(error) = apply_raw_column_collations(
+                connection,
+                &mut result.columns,
+                raw_character_set_results,
+            ) {
+                connection.remove_prepared_statement(result.statement_id);
+                return Err(error);
+            }
+            Ok(result)
+        })?;
         self.prepared_group_concat_max_lens
             .insert(result.statement_id, group_concat_max_len);
         self.raised_warnings.clear();
@@ -443,7 +447,9 @@ impl CommandExecutor for MySqlCommandAdapter {
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self.connection.clone();
         prepare_for_client_statement(&connection, &self.session_variables)?;
-        let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
+        let result = run_client_statement(&connection, || {
+            self.execute_prepared_statement_command(statement_id, parameter_payload)
+        });
         finish_client_statement(&connection, &mut self.session_variables, result)
     }
 }
@@ -2330,13 +2336,13 @@ where
         self.error_message = None;
         let result = self.follow_a_dropped_database().and_then(|()| {
             let connection = self.session.connection().ok().cloned();
-            if let Some(connection) = &connection {
-                self.start_a_statement_on(connection)?;
-            }
-            let result = self.prepare_client_statement(sql);
-            if let Some(connection) = &connection {
-                connection.finish_a_statement();
-            }
+            let Some(connection) = connection else {
+                return self.prepare_client_statement(sql);
+            };
+            self.start_a_statement_on(&connection)?;
+            let result = connection
+                .prepare_without_starting_the_snapshot(|| self.prepare_client_statement(sql));
+            connection.finish_a_statement();
             result
         });
         self.answer_what_is_missing(sql, result)
@@ -2415,7 +2421,12 @@ where
                 text: statement.text.clone(),
             });
         }
-        let result = self.execute_prepared_statement_command(statement_id, parameter_payload);
+        let result = match &connection {
+            Some(connection) => run_client_statement(connection, || {
+                self.execute_prepared_statement_command(statement_id, parameter_payload)
+            }),
+            None => self.execute_prepared_statement_command(statement_id, parameter_payload),
+        };
         if let Some(listed) = &self.listed {
             listed.statement_ended(self.session.selected_database());
         }
@@ -2458,7 +2469,12 @@ where
                 return Err(error);
             }
         }
-        let result = self.execute_query_statement(sql);
+        let result = match &connection {
+            Some(connection) => {
+                run_client_statement(connection, || self.execute_query_statement(sql))
+            }
+            None => self.execute_query_statement(sql),
+        };
         let result = match &connection {
             Some(connection) => {
                 let result =
@@ -5606,6 +5622,38 @@ fn may_create_a_view_or_trigger(sql: &str) -> bool {
                 .windows(word.len())
                 .any(|window| window.eq_ignore_ascii_case(word))
         })
+}
+
+/// Runs one statement from the client, and runs it again on a new snapshot
+/// when it failed only because the snapshot it took itself went stale.
+///
+/// A statement that begins with no snapshot takes one itself, often with this
+/// server's own catalog read or savepoint before the write, and then waits for
+/// another session's write lock. Once that session commits the snapshot is
+/// stale and the write fails. Measured on MySQL 8.4.11, two sessions each
+/// inserting a different row both write, and an insert waiting on another
+/// session's row answers 1062 only if that row takes its key. Nothing the
+/// failed run read reached the client, and a stale snapshot has never
+/// written, so running the statement again from the start is the same as
+/// running it after the other session committed. Every run again follows
+/// another session's commit.
+fn run_client_statement<T>(
+    connection: &MySqlConnection,
+    mut run: impl FnMut() -> Result<T, FrontendErrorKind>,
+) -> Result<T, FrontendErrorKind> {
+    let takes_its_own_snapshot = connection.statement_takes_its_own_snapshot();
+    let began_in_a_transaction = !connection.is_auto_commit();
+    loop {
+        let result = run();
+        if !takes_its_own_snapshot
+            || !matches!(result, Err(FrontendErrorKind::SerializationFailure))
+        {
+            return result;
+        }
+        connection
+            .start_a_stale_statement_again(began_in_a_transaction)
+            .map_err(frontend_query_error)?;
+    }
 }
 
 /// Settles what one statement from the client left behind.

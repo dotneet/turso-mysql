@@ -3155,6 +3155,12 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Whether the connection's transaction has taken its read snapshot yet,
+    /// by reading or writing, or through [`Self::begin_read_snapshot`].
+    pub fn has_read_snapshot(&self) -> bool {
+        self.get_tx_state() != TransactionState::None
+    }
+
     /// Fixes what an explicit transaction reads now, instead of at its first
     /// read.
     ///

@@ -4206,11 +4206,37 @@ row 2 as it was. A snapshot here cannot mix rows from two moments, so that
 write fails instead. The transaction is rolled back and answered with 1213,
 SQLSTATE 40001 — what MySQL answers for a transaction it has to give up on,
 rolling it back the same way — and a client that retries a transaction on 1213
-or 40001 recovers by running it again. It happens only when another session
-committed between the transaction's first read and its first write. Under
-`READ COMMITTED` the snapshot is new at every statement, so it can happen only
-when another session commits in the middle of a statement this server runs in
-more than one step, such as a checked `INSERT` that reads before it writes.
+or 40001 recovers by running it again. Prisma reports it as P2034 and leaves
+the retry to the application. It happens only when another session committed
+between the transaction's first read, by an earlier statement, and its first
+write.
+
+What is not a read here does not start the snapshot either. Preparing a
+statement reads this server's own catalog and not the tables, and MySQL takes
+no read view for it: measured on 8.4.11, a session that begins, prepares an
+`INSERT` and a `SELECT`, and runs them after another session committed, sees
+that session's row and writes its own. The same holds here — Prisma's
+`Promise.all` of two `create`s runs that way over two pooled connections, and
+was answered 1213 while a prepare took the snapshot. A statement that begins
+with no snapshot — any with autocommit on, the first of a transaction, every
+one under `READ COMMITTED` — takes its own, often by reading the catalog or
+taking a savepoint before it writes, and may then wait for another session's
+write. When that session commits the snapshot is stale, and the statement is
+run again from the start on a new one: nothing it read reached the client and
+a stale snapshot has never written, so that is the same as running it after
+the other session committed. Before, even an insert with autocommit on into a
+table that counts its ids answered 1213 that way. Measured on
+8.4.11, two transactions inserting different rows both commit, and an insert
+of a key another open transaction just wrote answers 1062 once that one
+commits, leaving the transaction open; both hold here, except that the second
+insert waits for the first transaction's commit where MySQL's does not wait at
+all, the write lock being one over the whole database. So under `READ
+COMMITTED`, whose snapshot is new at every statement, a write is no longer
+given up at all. Under `REPEATABLE READ` one thing still counts as a first read
+where MySQL's does not: a `SAVEPOINT`. Measured on 8.4.11, a transaction that
+begins with one still sees a row another session commits after it; here the
+savepoint takes the snapshot, so such a transaction reads and writes as though
+it had read at the savepoint.
 
 A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
 with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and

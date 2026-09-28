@@ -106,6 +106,58 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Runs `prepare`, a `COM_STMT_PREPARE`, so that a transaction that had
+    /// not taken its read snapshot still has not taken it afterwards.
+    ///
+    /// Preparing reads this server's own catalog on the session's connection,
+    /// and inside a transaction the engine takes the snapshot at that first
+    /// read. MySQL takes a transaction's read view at its first read of a
+    /// table, which a prepare is not. Measured on MySQL 8.4.11: a session that
+    /// begins, prepares an `INSERT` while another session holds uncommitted
+    /// rows, and runs it after that session commits, writes its row. Keeping
+    /// the snapshot the prepare took would give that write up with 1213.
+    /// Nothing the prepare read reaches the client as rows, so letting it go
+    /// cannot leave the transaction acting on data it saw at another moment.
+    pub fn prepare_without_starting_the_snapshot<T>(&self, prepare: impl FnOnce() -> T) -> T {
+        let unread = self.transaction_has_not_read();
+        let prepared = prepare();
+        if unread {
+            self.inner
+                .release_read_snapshot()
+                .expect("a transaction that had not read lets go of what its prepare read");
+        }
+        prepared
+    }
+
+    fn transaction_has_not_read(&self) -> bool {
+        !self.inner.get_auto_commit() && !self.inner.has_read_snapshot()
+    }
+
+    /// Whether the statement about to run takes the snapshot it reads from
+    /// itself: the session is in no transaction, or in one that has not read.
+    pub fn statement_takes_its_own_snapshot(&self) -> bool {
+        self.inner.get_auto_commit() || !self.inner.has_read_snapshot()
+    }
+
+    /// Readies the session to run again a statement that took its own
+    /// snapshot and found it stale before it could write.
+    ///
+    /// A transaction the statement began itself, as the first statement with
+    /// autocommit off does, is rolled back whole; it holds nothing else. One
+    /// begun before the statement keeps what it has and lets the snapshot go.
+    pub fn start_a_stale_statement_again(
+        &self,
+        began_in_a_transaction: bool,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if began_in_a_transaction {
+            return self
+                .inner
+                .release_read_snapshot()
+                .map_err(MySqlQueryError::Engine);
+        }
+        self.roll_back_after_serialization_failure()
+    }
+
     /// Reports whether the statement that just ran began a transaction, which
     /// is what uses up a level set for the next transaction alone.
     pub fn began_transaction(&self) -> bool {
