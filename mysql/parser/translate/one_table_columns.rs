@@ -73,6 +73,21 @@ fn leave_the_table_out(expr: &mut Expr, reference: &str) {
             leave_the_table_out(left, reference);
             leave_the_table_out(right, reference);
         }
+        // SQLAlchemy reads a JSON member through a `CASE` around two readings.
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            for part in operand.iter_mut().chain(else_result.iter_mut()) {
+                leave_the_table_out(part, reference);
+            }
+            for when in conditions {
+                leave_the_table_out(&mut when.condition, reference);
+                leave_the_table_out(&mut when.result, reference);
+            }
+        }
         Expr::Function(function) => {
             let reads_a_column =
                 is_an_aggregate_this_reads(function) || is_a_json_reading(function);

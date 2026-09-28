@@ -4411,11 +4411,30 @@ answers one or zero. Measured on 8.4.11: the first reports the JSON type at
 length 4294967292, the second a LONG_BLOB at the widest length there is, both
 with the text collation and the binary flag, and the third a LONGLONG of 21
 with the binary collation. The paths taken are the plain member-and-element
-ones — `$`, `$.a`, `$[0]`, `$.a[1]` — which MySQL and the engine read the same
-way; MySQL's wildcards, `$.*`, `$[*]` and `$**`, are refused rather than read
-a different way, and so is a call naming more than one path. MySQL's operator
-spellings of the first two, `doc -> '$.a'` and `doc ->> '$.a'`, read the same
-and are named after the text they were written with, as MySQL names them.
+ones — `$`, `$.a`, `$[0]`, `$.a[1]`; MySQL's wildcards, `$.*`, `$[*]` and
+`$**`, are refused rather than read a different way, and so is a call naming
+more than one path. MySQL's operator spellings of the first two, `doc -> '$.a'`
+and `doc ->> '$.a'`, read the same and are named after the text they were
+written with, as MySQL names them.
+
+Each reading is read by the dialect, the way a condition reads it, rather
+than by the engine's own `->` and `->>`. Measured on 8.4.11: `[0]` over a
+lone value is the value, so `$.s[0]` over `{"s": "x"}` is `"x"` and `$.o[0]`
+over an object is the object, where the engine answered no value; the JSON
+null unquotes to the word `null` and `true` to `true`, where the engine
+answered no value and 1. Laravel's `select('profile->city as city')` reads a
+member through `json_unquote(json_extract(...))` and answered NULL for a
+member holding the JSON null.
+
+SQLAlchemy reads a member as text through `CASE JSON_EXTRACT(col, 'path') WHEN
+'null' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(col, 'path')) END`, both
+readings the same, which is what `profile["city"].as_string()` writes. Measured
+on 8.4.11: it reports the column `JSON_UNQUOTE` reports and answers what that
+answers, except no value where the path finds the JSON null — the JSON string
+`"null"` still answers the word. Its other readings — `as_integer()`'s `CAST(...
+AS SIGNED INTEGER)`, `as_float()`'s `JSON_EXTRACT(...)+0.0000000000000000000000`,
+`as_numeric()`'s `CAST(... AS DECIMAL(p, s))` and `as_boolean()`'s `WHEN true
+THEN true ELSE false` — are refused; see TODO.md.
 
 `JSON_TYPE` names a document's kind, `JSON_LENGTH` counts what it holds at the
 top, `JSON_KEYS` answers an object's keys as a document of their own, and
@@ -4636,13 +4655,26 @@ same rows:
   number, so `doc->'$.n' > 1` finds `"1"`. Django writes the value of its
   lookup as a document read out of itself — `JSON_EXTRACT(users.profile,
   '$."city"') = JSON_EXTRACT('"Paris"', '$')` — which is read as the word or
-  whole number it holds, the column named through its table; a document of
-  any other kind is refused there.
+  whole number it holds, the column named through its table. A document of
+  any other kind — `null` for `profile__city=None`, an object, an array, a
+  double, `true` — is compared for equality with the reading, and with a
+  whole column for `profile={...}`. Measured on 8.4.11: `null` finds a member
+  holding the JSON null and not one that is missing, `{"a": 1}` equals
+  `{"a": 1.0}` and an object with its keys in another order, `[1, 2]` does
+  not equal `[2, 1]`, `true` does not equal 1, and 18446744073709551615 does
+  not equal 18446744073709551615.0. Only `=` is taken with one; text that is
+  no document is 3141 there and refused here.
+- `reading IN (...)` and `NOT IN` — Django's `profile__city__in`, which lists
+  documents read out of themselves, and SQLAlchemy's `CASE ... END IN ('a',
+  'b')` — compare the reading with each member the way `=` does, measured on
+  8.4.11 even where the members are of different kinds: `doc->>'$.lang' IN
+  ('EN ', 5)` finds `EN` alone. A bound member is refused.
 - SQLAlchemy compares a member as text through `CASE JSON_EXTRACT(col,
   'path') WHEN 'null' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(col, 'path'))
   END`, naming the column through its table. Measured on 8.4.11 that is the
   unquoted text above except that the JSON null answers no value — the JSON
-  string `"null"` still answers the word — and it is compared the same way.
+  string `"null"` still answers the word — and it is compared the same way,
+  `IS NULL` finding both the JSON null and a missing member.
 - `JSON_EXTRACT(...) IS NULL` is true only where the path is not there, a
   member holding the JSON null being found; `JSON_TYPE(...)` names it `NULL`,
   and that word is compared under `utf8mb4_bin` too, so `= 'null'` finds
@@ -4651,6 +4683,11 @@ same rows:
   `JSON_CONTAINS_PATH(col, 'one' | 'all', 'path', ...)` stand on their own
   as a condition, the second also under Laravel's `ifnull(..., 0)`. A
   candidate that is not a document is error 3141 there, and refused here.
+  Django writes the other two forms of the first: `JSON_CONTAINS(
+  JSON_EXTRACT(col, 'path'), candidate)` for `profile__tags__contains`,
+  which answers what the three-argument form answers, and
+  `JSON_CONTAINS('<document>', col)` for `profile__contained_by`, which asks
+  the same question the other way round.
 - `JSON_LENGTH(col[, 'path'])` is compared with a number. A written word is
   refused: MySQL reads `json_length(doc) = '6'` as a number.
 

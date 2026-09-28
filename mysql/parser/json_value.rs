@@ -280,6 +280,20 @@ pub fn json_contains(target: &str, candidate: &str) -> Option<bool> {
     Some(holds(&target, &candidate))
 }
 
+/// Answers whether two documents are equal, the way `=` compares two JSON
+/// values.
+///
+/// Measured on MySQL 8.4.11: `{"a": 1}` equals `{"a": 1.0}`, an object equals
+/// one with its keys written in another order, `[1, 2]` does not equal
+/// `[2, 1]`, `true` does not equal `1`, strings are compared byte for byte
+/// with no padding, and `18446744073709551615` does not equal
+/// `18446744073709551615.0`, the double standing for another number.
+pub fn json_equals(left: &str, right: &str) -> Option<bool> {
+    let left = read_document(left)?;
+    let right = read_document(right)?;
+    Some(same_value(&left, &right))
+}
+
 fn holds(target: &JsonValue, candidate: &JsonValue) -> bool {
     match (target, candidate) {
         (JsonValue::Array(elements), JsonValue::Array(wanted)) => wanted

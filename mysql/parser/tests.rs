@@ -4246,28 +4246,28 @@ fn select_order_by_ordinal_names_the_projected_column() {
     }
 }
 
-/// `JSON_EXTRACT` reads one path out of a document, and the engine's `->` reads
-/// the same one. What differs is how the two write a document out — the engine
-/// puts no space after a comma or a colon — so the answer is written again.
+/// `JSON_EXTRACT` and `JSON_UNQUOTE` over it are read by the dialect: the
+/// engine's `->` reads `$[0]` over a lone value as nothing where MySQL reads
+/// the value, and its `->>` answers the JSON null as no value where MySQL
+/// answers the word `null`.
 #[test]
-fn select_json_extract_renders_the_engine_reading() {
+fn select_json_extract_renders_the_dialect_reading() {
     let mode = SessionSqlMode::default();
     let translated = parse_select("SELECT JSON_EXTRACT(doc, '$.a') FROM j", mode).unwrap();
     assert_eq!(
         translated.as_sql(),
         concat!(
-            "SELECT mysql_json_document(\"doc\" -> '$.a') ",
+            "SELECT mysql_json_extract(\"doc\", '$.a') ",
             "AS \"JSON_EXTRACT(doc, '$.a')\" FROM \"j\""
         )
     );
 
-    // JSON_UNQUOTE over the same reading is what the engine's `->>` answers.
     let unquoted =
         parse_select("SELECT JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s')) FROM j", mode).unwrap();
     assert_eq!(
         unquoted.as_sql(),
         concat!(
-            "SELECT \"doc\" ->> '$.s' ",
+            "SELECT mysql_json_unquote(mysql_json_extract(\"doc\", '$.s')) ",
             "AS \"JSON_UNQUOTE(JSON_EXTRACT(doc, '$.s'))\" FROM \"j\""
         )
     );
@@ -4276,12 +4276,15 @@ fn select_json_extract_renders_the_engine_reading() {
     let arrow = parse_select("SELECT doc -> '$.a' FROM j", mode).unwrap();
     assert_eq!(
         arrow.as_sql(),
-        "SELECT mysql_json_document(\"doc\" -> '$.a') AS \"doc -> '$.a'\" FROM \"j\""
+        "SELECT mysql_json_extract(\"doc\", '$.a') AS \"doc -> '$.a'\" FROM \"j\""
     );
     let long_arrow = parse_select("SELECT doc ->> '$.s' FROM j", mode).unwrap();
     assert_eq!(
         long_arrow.as_sql(),
-        "SELECT \"doc\" ->> '$.s' AS \"doc ->> '$.s'\" FROM \"j\""
+        concat!(
+            "SELECT mysql_json_unquote(mysql_json_extract(\"doc\", '$.s')) ",
+            "AS \"doc ->> '$.s'\" FROM \"j\""
+        )
     );
 
     let valid = parse_select("SELECT JSON_VALID(doc) FROM j", mode).unwrap();

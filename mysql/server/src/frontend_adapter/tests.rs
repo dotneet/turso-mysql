@@ -2954,6 +2954,18 @@ fn a_json_column_can_be_read_a_path_at_a_time() {
         ("doc -> '$.s'", Some("\"x\"")),
         ("doc -> '$.arr'", Some("[1, 2, 3]")),
         ("doc ->> '$.s'", Some("x")),
+        // Measured on 8.4.11: the JSON null unquotes to the word `null`, and
+        // `[0]` over a lone value is the value — where the engine's own `->>`
+        // and `->` answer no value for either.
+        ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.n'))", Some("null")),
+        ("doc ->> '$.n'", Some("null")),
+        ("JSON_EXTRACT(doc, '$.s[0]')", Some("\"x\"")),
+        ("doc -> '$.a[0]'", Some("1")),
+        ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.o[0].k'))", Some("v")),
+        ("JSON_EXTRACT(doc, '$.arr[0][0]')", Some("1")),
+        ("JSON_EXTRACT(doc, '$.o[0]')", Some("{\"k\": \"v\"}")),
+        ("JSON_UNQUOTE(JSON_EXTRACT(doc, '$.b'))", Some("true")),
+        ("doc ->> '$.f'", Some("1.5")),
     ] {
         let CommandExecutionResult::ResultSet(read) = adapter
             .execute_query(&format!("SELECT {expression} FROM j WHERE id = 1"))

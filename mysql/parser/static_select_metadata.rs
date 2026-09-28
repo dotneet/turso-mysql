@@ -554,6 +554,7 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             classify_integer(digits, sign)
         }
         Expr::Nested(inner) => classify_static_select_expr(inner),
+        Expr::Case { .. } if json_text_unless_null(expr).is_some() => json_text_unless_null(expr),
         Expr::Case {
             operand,
             conditions,
@@ -639,6 +640,63 @@ pub(super) fn classify_static_select_expr(expr: &Expr) -> Option<StaticSelectMet
             .or_else(|| scalar_call(function)),
         _ => None,
     }
+}
+
+/// Classifies the `CASE` SQLAlchemy writes to read a JSON member as text,
+/// `CASE JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE
+/// JSON_UNQUOTE(JSON_EXTRACT(col, 'path')) END`, both readings the same.
+///
+/// Measured on MySQL 8.4.11: it reports the column `JSON_UNQUOTE` reports,
+/// and answers what that answers except no value where the path finds the
+/// JSON null — the JSON string `"null"` still answers the word.
+pub(crate) fn json_text_unless_null(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::Case {
+        operand: Some(operand),
+        conditions,
+        else_result: Some(otherwise),
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    let [when] = conditions.as_slice() else {
+        return None;
+    };
+    let tests_for_the_null = matches!(&when.condition, Expr::Value(value)
+        if matches!(&value.value, Value::SingleQuotedString(word) if word == "null"));
+    let answers_no_value =
+        matches!(&when.result, Expr::Value(value) if matches!(value.value, Value::Null));
+    if !tests_for_the_null || !answers_no_value {
+        return None;
+    }
+    let (Expr::Function(read), Expr::Function(unquoted)) = (operand.as_ref(), otherwise.as_ref())
+    else {
+        return None;
+    };
+    let sqlparser::ast::FunctionArguments::List(arguments) = &unquoted.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(unquoted_read))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let reads_a_json_value = matches!(
+        scalar_call(read)?,
+        StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::ReadsAJsonValue,
+            ..
+        }
+    );
+    let text = scalar_call(unquoted)?;
+    let reads_json_text = matches!(
+        text,
+        StaticSelectMetadata::ScalarCall {
+            function: ScalarFunction::ReadsJsonText,
+            ..
+        }
+    );
+    (reads_a_json_value && reads_json_text && unquoted_read == operand.as_ref()).then_some(text)
 }
 
 /// Classifies `col -> '$.path'` and `col ->> '$.path'`, which are MySQL's own

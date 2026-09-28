@@ -755,8 +755,9 @@ fn a_word_bound_after_a_number_against_a_json_value_is_refused() {
 
 /// Django's lookup on a `JSONField` names the column through its table and
 /// writes the value as a document read back out of itself. Measured on MySQL
-/// 8.4.11: a JSON string finds the same string and a JSON whole number finds
-/// the numbers of that value; a document of any other kind is refused here.
+/// 8.4.11: a JSON string finds the same string, a JSON number the numbers of
+/// that value, `null` a member holding the JSON null, and any other document
+/// the values equal to it — an array with its elements in the same order.
 #[test]
 fn django_compares_a_json_value_with_a_written_document() {
     let (_directory, mut adapter) = adapter();
@@ -766,20 +767,36 @@ fn django_compares_a_json_value_with_a_written_document() {
             "SELECT `users`.`name` AS `name` FROM `users` WHERE JSON_EXTRACT(`users`.`profile`, '$.\"{member}\"') = JSON_EXTRACT('{document}', '$') ORDER BY `users`.`id`"
         )
     };
-    assert_eq!(
-        first_column(&mut adapter, &lookup("city", "\"Paris\"")),
-        ["Alice"]
-    );
-    assert_eq!(
-        first_column(&mut adapter, &lookup("age", "30")),
-        ["Alice", "Bob"]
-    );
-    for (member, document) in [("tags", "[\"a\", \"b\"]"), ("ok", "true"), ("age", "1.5")] {
-        assert!(
-            adapter.execute_query(&lookup(member, document)).is_err(),
-            "{document}"
+    for (member, document, found) in [
+        ("city", "\"Paris\"", vec!["Alice"]),
+        ("age", "30", vec!["Alice", "Bob"]),
+        ("age", "30.0", vec!["Alice", "Bob"]),
+        ("age", "1.5", vec![]),
+        ("age", "18446744073709551615", vec![]),
+        ("tags", "[\"a\", \"b\"]", vec!["Alice"]),
+        ("tags", "[\"b\", \"a\"]", vec![]),
+        ("ok", "true", vec!["Alice"]),
+        ("n", "null", vec!["Alice"]),
+    ] {
+        assert_eq!(
+            first_column(&mut adapter, &lookup(member, document)),
+            found,
+            "{member} {document}"
         );
     }
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT `users`.`name` FROM `users` WHERE `users`.`profile` = JSON_EXTRACT('[1, 2.0]', '$')"
+        ),
+        ["Dave"]
+    );
+    // Only `=` is taken with a whole document; MySQL orders one by rules this
+    // has not measured.
+    assert!(adapter
+        .execute_query(&lookup("tags", "[\"a\"]").replace(" = JSON", " > JSON"))
+        .is_err());
+    assert!(adapter.execute_query(&lookup("city", "{\"a\": 1")).is_err());
 }
 
 /// Rails' `increment_counter` counts a column up through a fallback,
@@ -885,6 +902,13 @@ fn sqlalchemy_compares_a_json_member_as_text_unless_it_is_null() {
         ("age", "= 30", vec!["Alice", "Bob"]),
         ("s", "= 30", vec!["Alice"]),
         ("ok", "= 'true'", vec!["Alice"]),
+        ("city", "IS NULL", vec!["Carol", "Dave"]),
+        ("city", "IS NOT NULL", vec!["Alice", "Bob", "Eve"]),
+        (
+            "city",
+            "IN ('Paris', 'null', 'berlin')",
+            vec!["Alice", "Eve"],
+        ),
     ] {
         assert_eq!(
             first_column(&mut adapter, &compared(member, comparison)),
@@ -892,6 +916,74 @@ fn sqlalchemy_compares_a_json_member_as_text_unless_it_is_null() {
             "{member} {comparison}"
         );
     }
+}
+
+/// SQLAlchemy's `select(User.profile["city"].as_string())` reads the member
+/// through the same `CASE`. Measured on MySQL 8.4.11: it answers the text
+/// `JSON_UNQUOTE` answers, in the same LONG_BLOB column, except no value for
+/// the JSON null, and it answers the same over the binary protocol.
+#[test]
+fn sqlalchemy_reads_a_json_member_as_text() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    run(
+        &mut adapter,
+        r#"INSERT INTO users (id, email, name, balance, is_active, profile) VALUES (5, 'e@x', 'Eve', 1, 1, '{"city": "null"}')"#,
+    );
+    let read = |path: &str| {
+        format!(
+            "SELECT CASE JSON_EXTRACT(users.profile, '{path}') WHEN 'null' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(users.profile, '{path}')) END AS anon_1 FROM users ORDER BY users.id"
+        )
+    };
+    for (path, found) in [
+        (r#"$."city""#, ["Paris", "Berlin", "NULL", "NULL", "null"]),
+        (r#"$."n""#, ["NULL", "NULL", "NULL", "NULL", "NULL"]),
+        (r#"$."tags"[0]"#, ["a", "NULL", "NULL", "NULL", "NULL"]),
+        (r#"$."age""#, ["30", "30.0", "NULL", "NULL", "NULL"]),
+    ] {
+        assert_eq!(first_column(&mut adapter, &read(path)), found, "{path}");
+    }
+    let city = read(r#"$."city""#);
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(&city) else {
+        panic!("the reading must answer rows");
+    };
+    let column = &result.columns[0];
+    assert_eq!(
+        (
+            column.name.as_str(),
+            column.column_type,
+            column.column_length,
+            column.character_set,
+            column.decimals,
+            column.flags
+        ),
+        (
+            "anon_1",
+            MYSQL_TYPE_LONG_BLOB,
+            u32::MAX,
+            u16::from(DEFAULT_UTF8MB4_COLLATION),
+            NOT_FIXED_DECIMALS,
+            MYSQL_BINARY_FLAG
+        )
+    );
+    // A statement binding nothing is run with no parameter block at all.
+    let statement = adapter.execute_stmt_prepare(&city).unwrap();
+    let Ok(PreparedStatementExecutionResult::ResultSet(result)) =
+        adapter.execute_stmt_execute(statement.statement_id, &[])
+    else {
+        panic!("the prepared reading must answer rows");
+    };
+    adapter.execute_stmt_close(statement.statement_id);
+    assert_eq!(
+        result.rows,
+        [
+            vec![BinaryResultValue::Blob(b"Paris".to_vec())],
+            vec![BinaryResultValue::Blob(b"Berlin".to_vec())],
+            vec![BinaryResultValue::Null],
+            vec![BinaryResultValue::Null],
+            vec![BinaryResultValue::Blob(b"null".to_vec())],
+        ]
+    );
 }
 
 /// Tags and the join table GORM's many-to-many association reads through,

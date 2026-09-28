@@ -6347,6 +6347,18 @@ fn render_select_expr(
             ))
         }
         Expr::Nested(expr) => Ok(format!("({})", render_select_expr(expr, render_context)?)),
+        // `CASE JSON_EXTRACT(...) WHEN 'null'` asks whether the reading found
+        // the JSON null, which the text the reading answers says: the JSON
+        // string `"null"` is written with its quotes.
+        Expr::Case {
+            operand: Some(operand),
+            ..
+        } if static_select_metadata::json_text_unless_null(expr).is_some() => {
+            let reading = render_select_expr(operand, render_context)?;
+            Ok(format!(
+                "(CASE WHEN {reading} = 'null' THEN NULL ELSE mysql_json_unquote({reading}) END)"
+            ))
+        }
         Expr::Case {
             operand,
             conditions,
@@ -6473,9 +6485,7 @@ fn render_select_expr(
             let inner = render_select_expr(inner, render_context)?;
             Ok(format!("ceil({inner})"))
         }
-        // MySQL's own spelling of a JSON reading. The engine spells it the same
-        // way, and the value read still has to be written the way MySQL writes
-        // a document.
+        // MySQL's own spelling of a JSON reading, read as `JSON_EXTRACT` is.
         Expr::BinaryOp {
             left,
             op: op @ (BinaryOperator::Arrow | BinaryOperator::LongArrow),
@@ -6496,9 +6506,11 @@ fn render_select_expr(
             let left = render_select_expr(left, render_context)?;
             let right = render_select_expr(right, render_context)?;
             if matches!(op, BinaryOperator::LongArrow) {
-                return Ok(format!("{left} ->> {right}"));
+                return Ok(format!(
+                    "mysql_json_unquote(mysql_json_extract({left}, {right}))"
+                ));
             }
-            Ok(format!("mysql_json_document({left} -> {right})"))
+            Ok(format!("mysql_json_extract({left}, {right})"))
         }
         // `created_at + INTERVAL 1 DAY` is the operator spelling of a
         // `DATE_ADD`, and is written out as one.
@@ -7574,17 +7586,18 @@ fn render_scalar_call(
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_EXTRACT") {
-        // The engine's `->` reads the same paths and answers the same JSON
-        // value, and differs in how it writes a document out: no space after a
-        // comma or a colon. Writing it again is what puts MySQL's spacing back.
+        // The engine's `->` reads `$[0]` over something that is not an array
+        // as nothing where MySQL reads the value itself, and writes a document
+        // without MySQL's spacing, so the dialect reads it.
         return Ok(format!(
-            "mysql_json_document({} -> {})",
+            "mysql_json_extract({}, {})",
             scalar_argument(function, 0)?,
             scalar_argument(function, 1)?
         ));
     } else if name.value.eq_ignore_ascii_case("JSON_UNQUOTE") {
-        // The only shape taken is `JSON_UNQUOTE(JSON_EXTRACT(col, path))`,
-        // which is what the engine's `->>` answers on its own.
+        // The only shape taken is `JSON_UNQUOTE(JSON_EXTRACT(col, path))`. The
+        // engine's `->>` answers the JSON null as no value, where MySQL
+        // answers the word `null`.
         let sqlparser::ast::FunctionArguments::List(outer) = &function.args else {
             unreachable!("a checked scalar call was already recognized");
         };
@@ -7595,7 +7608,7 @@ fn render_scalar_call(
             unreachable!("a checked JSON_UNQUOTE was checked to wrap a JSON_EXTRACT");
         };
         return Ok(format!(
-            "{} ->> {}",
+            "mysql_json_unquote(mysql_json_extract({}, {}))",
             scalar_argument(inner, 0)?,
             scalar_argument(inner, 1)?
         ));
@@ -9231,6 +9244,11 @@ fn render_checked_in_list(
 ) -> Result<String, ParseError> {
     if let Expr::Tuple(columns) = expr {
         return render_checked_row_in_list(columns, list, negated, render_context);
+    }
+    if let Some(rendered) =
+        json_condition::render_in_list_over_a_json_reading(expr, list, negated, render_context)?
+    {
+        return Ok(rendered);
     }
     let (qualifier, column) = match expr {
         Expr::Identifier(ident) => (None, ident),

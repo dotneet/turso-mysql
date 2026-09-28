@@ -34,36 +34,29 @@ pub(super) fn render_comparison_over_a_json_reading(
             }
             (answer, reversed, left)
         }
-        (None, None) => return Ok(None),
+        (None, None) => {
+            if let Some(column) = whole_column_beside_a_written_document(left, right) {
+                (JsonAnswer::Document(column), op.clone(), right)
+            } else if let Some(column) = whole_column_beside_a_written_document(right, left) {
+                let Some(reversed) = reverse_checked_comparison_operator(op) else {
+                    return unsupported("JSON comparison operator");
+                };
+                (JsonAnswer::Document(column), reversed, left)
+            } else {
+                return Ok(None);
+            }
+        }
     };
     let operator = checked_select_comparison_operator(&op)
         .expect("the caller checked the comparison operator");
-    let rendered = match answer {
-        JsonAnswer::Text(reading) => {
-            let rendered = reading.render(render_context)?;
-            render_text_comparison(&rendered, &op, operator, other, render_context)?
-        }
-        JsonAnswer::TextUnlessNull(reading) => {
-            let document = reading.render(render_context)?;
-            let rendered = format!(
-                "(CASE WHEN {document} = 'null' THEN NULL ELSE mysql_json_unquote({document}) END)"
-            );
-            render_text_comparison(&rendered, &op, operator, other, render_context)?
-        }
-        JsonAnswer::Kind(reading) => {
-            let rendered = format!("mysql_json_type({})", reading.render(render_context)?);
-            render_text_comparison(&rendered, &op, operator, other, render_context)?
-        }
-        JsonAnswer::Count(reading) => {
-            let rendered = format!("mysql_json_length({})", reading.render(render_context)?);
-            render_count_comparison(&rendered, &op, operator, other, render_context)?
-        }
-        JsonAnswer::Document(reading) => {
-            let rendered = reading.render(render_context)?;
-            render_document_comparison(&rendered, &op, operator, other, render_context)?
-        }
-    };
-    Ok(Some(rendered))
+    let rendered = answer.render(render_context)?;
+    Ok(Some(answer.compare(
+        &rendered,
+        &op,
+        operator,
+        other,
+        render_context,
+    )?))
 }
 
 /// Renders a test of a JSON document standing on its own as a condition, or
@@ -109,14 +102,79 @@ pub(super) fn render_json_null_test(
     negated: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    let Some(reading) = read_json_reading(expr) else {
+    // SQLAlchemy's `CASE` answers no value for the JSON null as well as for a
+    // path that is not there.
+    let rendered = if let Some(reading) = read_unquoted_unless_null(expr) {
+        JsonAnswer::TextUnlessNull(reading).render(render_context)?
+    } else if let Some(reading) = read_json_reading(expr) {
+        reading.render(render_context)?
+    } else {
         return unsupported("IS NULL over a JSON call other than a reading");
     };
-    let rendered = reading.render(render_context)?;
     Ok(format!(
         "({rendered} IS {}NULL)",
         if negated { "NOT " } else { "" }
     ))
+}
+
+/// Renders a JSON reading tested against a list of written values —
+/// Django's `JSON_EXTRACT(profile, '$."city"') IN (JSON_EXTRACT('"Tokyo"',
+/// '$'), ...)` and SQLAlchemy's `CASE ... END IN ('Tokyo', 'Osaka')` — or
+/// nothing when the expression is not a JSON reading.
+///
+/// Measured on MySQL 8.4.11: each member is compared the way `=` compares it
+/// with the reading, so the list is written as those comparisons joined. A
+/// bound member is refused: which kind it compares as is settled when it
+/// binds.
+pub(super) fn render_in_list_over_a_json_reading(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let Some(first) = list.first() else {
+        return Ok(None);
+    };
+    let answer = match answered_by_json(expr) {
+        Some(answer) => answer,
+        None => match whole_column_beside_a_written_document(expr, first) {
+            Some(column) => JsonAnswer::Document(column),
+            None => return Ok(None),
+        },
+    };
+    if matches!(answer, JsonAnswer::Kind(_) | JsonAnswer::Count(_)) {
+        return unsupported("IN over a JSON kind or length");
+    }
+    if answer.reading().binds_its_path() {
+        return unsupported("IN over a JSON reading binding its path");
+    }
+    if list.iter().any(|member| !is_a_written_value(member)) {
+        return unsupported("IN over a JSON reading with a member that is not written out");
+    }
+    let rendered = answer.render(render_context)?;
+    let mut compared = Vec::with_capacity(list.len());
+    for member in list {
+        compared.push(answer.compare(
+            &rendered,
+            &BinaryOperator::Eq,
+            CheckedSelectComparisonOperator::Equal,
+            member,
+            render_context,
+        )?);
+    }
+    let joined = format!("({})", compared.join(" OR "));
+    Ok(Some(if negated {
+        format!("(NOT {joined})")
+    } else {
+        joined
+    }))
+}
+
+/// A written word, a written whole number or a written document.
+fn is_a_written_value(expr: &Expr) -> bool {
+    written_document(expr).is_some()
+        || matches!(expr, Expr::Value(value) if matches!(&value.value,
+            Value::SingleQuotedString(_) | Value::DoubleQuotedString(_) | Value::Number(_, false)))
 }
 
 /// Reports whether an expression reads a JSON column, so a caller that would
@@ -151,6 +209,40 @@ impl<'e> JsonAnswer<'e> {
             | Self::Kind(reading)
             | Self::Count(reading)
             | Self::Document(reading) => reading,
+        }
+    }
+
+    fn render(&self, render_context: &mut SelectRenderContext<'_>) -> Result<String, ParseError> {
+        let reading = self.reading().render(render_context)?;
+        Ok(match self {
+            Self::Text(_) | Self::Document(_) => reading,
+            Self::TextUnlessNull(_) => format!(
+                "(CASE WHEN {reading} = 'null' THEN NULL ELSE mysql_json_unquote({reading}) END)"
+            ),
+            Self::Kind(_) => format!("mysql_json_type({reading})"),
+            Self::Count(_) => format!("mysql_json_length({reading})"),
+        })
+    }
+
+    /// Compares what [`Self::render`] rendered with another value.
+    fn compare(
+        &self,
+        rendered: &str,
+        op: &BinaryOperator,
+        operator: CheckedSelectComparisonOperator,
+        other: &Expr,
+        render_context: &mut SelectRenderContext<'_>,
+    ) -> Result<String, ParseError> {
+        match self {
+            Self::Text(_) | Self::TextUnlessNull(_) | Self::Kind(_) => {
+                render_text_comparison(rendered, op, operator, other, render_context)
+            }
+            Self::Count(_) => {
+                render_count_comparison(rendered, op, operator, other, render_context)
+            }
+            Self::Document(_) => {
+                render_document_comparison(rendered, op, operator, other, render_context)
+            }
         }
     }
 }
@@ -533,7 +625,19 @@ fn render_document_comparison(
     if matches!(other, Expr::Collate { .. }) {
         return unsupported("JSON comparison with explicit collation");
     }
-    let written_document = written_document_value(other)?;
+    let written_document = match written_document_value(other)? {
+        Some(WrittenDocument::Value(value)) => Some(*value),
+        Some(WrittenDocument::Whole(document)) => {
+            if operator != CheckedSelectComparisonOperator::Equal {
+                return unsupported("JSON comparison with a document other than by =");
+            }
+            return Ok(format!(
+                "(mysql_json_equals({rendered}, {}))",
+                render_text(&document)
+            ));
+        }
+        None => None,
+    };
     let other = written_document.as_ref().unwrap_or(other);
     let (rendered_other, rhs) = render_checked_select_comparison_rhs(other, render_context)?;
     let sql_operator = checked_select_comparison_sql_operator(op);
@@ -591,38 +695,78 @@ fn render_document_comparison(
     })
 }
 
+/// What `JSON_EXTRACT('<document>', '$')` stands for beside a JSON value.
+enum WrittenDocument {
+    /// A JSON string or a JSON whole number, which compares the way a
+    /// written word or number does.
+    Value(Box<Expr>),
+    /// Any other document, written the way MySQL stores it, which is only
+    /// compared for equality.
+    Whole(String),
+}
+
 /// Reads `JSON_EXTRACT('<document>', '$')`, which Django writes for the value
-/// of a JSON lookup, as the value the document holds: a JSON string as that
-/// word and a JSON whole number as that number, which compare the way a
-/// written word or number does. Measured on MySQL 8.4.11:
+/// of a JSON lookup. Measured on MySQL 8.4.11:
 /// `JSON_EXTRACT(profile, '$."city"') = JSON_EXTRACT('"Paris"', '$')` finds
-/// the JSON string `"Paris"`, and `... = JSON_EXTRACT('30', '$')` both 30 and
-/// 30.0. Any other document is refused.
-fn written_document_value(other: &Expr) -> Result<Option<Expr>, ParseError> {
-    let Some(arguments) = plain_call(other, "JSON_EXTRACT") else {
+/// the JSON string `"Paris"`, `... = JSON_EXTRACT('30', '$')` both 30 and
+/// 30.0, `... = JSON_EXTRACT('null', '$')` a member holding the JSON null and
+/// not one that is missing, and `profile = JSON_EXTRACT('{"city": "Osaka"}',
+/// '$')` the document equal to that one whatever order its keys were written
+/// in. Text that is no document is error 3141 there, and refused here.
+fn written_document_value(other: &Expr) -> Result<Option<WrittenDocument>, ParseError> {
+    if plain_call(other, "JSON_EXTRACT").is_none() {
         return Ok(None);
-    };
-    let [document, path] = arguments.as_slice() else {
-        return unsupported("JSON_EXTRACT over something other than one document and one path");
-    };
-    let (Some(document), Some("$")) = (written_word(document), written_json_path(path)) else {
+    }
+    let Some(document) = written_document(other) else {
         return unsupported("JSON_EXTRACT over something other than a written document");
+    };
+    let Ok(normalized) = crate::normalize_json(document) else {
+        return unsupported("JSON_EXTRACT over text that is not a document");
     };
     let value = match crate::json_type(document) {
         Some("STRING") => Value::SingleQuotedString(
             crate::json_unquote(document).expect("the document was read as a string"),
         ),
-        Some("INTEGER") => {
-            let digits =
-                crate::normalize_json(document).expect("the document was read as a whole number");
-            if digits.parse::<i64>().is_err() {
-                return unsupported("JSON_EXTRACT of a whole number past a signed one");
-            }
-            Value::Number(digits, false)
-        }
-        _ => return unsupported("JSON_EXTRACT of a document other than a word or a number"),
+        Some("INTEGER") if normalized.parse::<i64>().is_ok() => Value::Number(normalized, false),
+        _ => return Ok(Some(WrittenDocument::Whole(normalized))),
     };
-    Ok(Some(Expr::Value(value.into())))
+    Ok(Some(WrittenDocument::Value(Box::new(Expr::Value(
+        value.into(),
+    )))))
+}
+
+/// Returns the document `JSON_EXTRACT('<document>', '$')` writes out, or
+/// nothing when the expression is not that.
+fn written_document(expr: &Expr) -> Option<&str> {
+    let [document, path] = plain_call(expr, "JSON_EXTRACT")?.try_into().ok()?;
+    let document = written_word(document)?;
+    (written_json_path(path) == Some("$")).then_some(document)
+}
+
+/// Reads a JSON column compared as a whole with a written document —
+/// Django's `profile = JSON_EXTRACT('{"city": "Osaka"}', '$')` — or nothing
+/// when the two are not that.
+fn whole_column_beside_a_written_document<'e>(
+    column: &'e Expr,
+    other: &Expr,
+) -> Option<JsonReading<'e>> {
+    written_document(other)?;
+    let (qualifier, column) = named_column(column)?;
+    Some(JsonReading {
+        qualifier,
+        column,
+        path: None,
+        unquoted: false,
+    })
+}
+
+/// Reads a column named on its own or through its table.
+fn named_column(expr: &Expr) -> Option<(Option<&Ident>, &Ident)> {
+    match expr {
+        Expr::Identifier(column) => Some((None, column)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some((Some(&parts[0]), &parts[1])),
+        _ => None,
+    }
 }
 
 fn written_word(expr: &Expr) -> Option<&str> {
@@ -685,16 +829,46 @@ fn render_contains(
     let Some(arguments) = plain_call(expr, "JSON_CONTAINS") else {
         return Ok(None);
     };
-    let (column, candidate, path) = match arguments.as_slice() {
-        [Expr::Identifier(column), candidate] => (column, *candidate, None),
-        [Expr::Identifier(column), candidate, path] => {
+    if let [target, candidate] = arguments.as_slice() {
+        if let Some(rendered) = render_contained_by(target, candidate, render_context)? {
+            return Ok(Some(rendered));
+        }
+    }
+    let target = match arguments.as_slice() {
+        [target, _] => match named_column(target) {
+            Some((qualifier, column)) => JsonReading {
+                qualifier,
+                column,
+                path: None,
+                unquoted: false,
+            },
+            // Django's `profile__tags__contains` looks inside a member:
+            // `JSON_CONTAINS(JSON_EXTRACT(profile, '$."tags"'), '["a"]')`.
+            // Measured on MySQL 8.4.11, it answers what `JSON_CONTAINS(profile,
+            // '["a"]', '$."tags"')` answers, no value where the member is not
+            // there included.
+            None => match read_json_reading(target) {
+                Some(reading) if !reading.unquoted && !reading.binds_its_path() => reading,
+                _ => return unsupported("JSON_CONTAINS over something other than a column"),
+            },
+        },
+        [target, _, path] => {
+            let Some((qualifier, column)) = named_column(target) else {
+                return unsupported("JSON_CONTAINS over something other than a column");
+            };
             let Some(path) = written_json_path(path) else {
                 return unsupported("JSON_CONTAINS path");
             };
-            (column, *candidate, Some(path))
+            JsonReading {
+                qualifier,
+                column,
+                path: Some(JsonPath::Written(path)),
+                unquoted: false,
+            }
         }
         _ => return unsupported("JSON_CONTAINS over something other than a column"),
     };
+    let candidate = arguments[1];
     let rendered_candidate = match candidate {
         Expr::Value(value) => match &value.value {
             Value::SingleQuotedString(written) | Value::DoubleQuotedString(written) => {
@@ -717,15 +891,42 @@ fn render_contains(
         },
         _ => return unsupported("JSON_CONTAINS looking for something other than a document"),
     };
-    let target = JsonReading {
-        qualifier: None,
+    let target = target.render(render_context)?;
+    Ok(Some(format!(
+        "mysql_json_holds({target}, {rendered_candidate})"
+    )))
+}
+
+/// Renders `JSON_CONTAINS('<document>', col)`, which asks whether a written
+/// document holds the column — Django's `profile__contained_by` — or nothing
+/// when the target is not a written document.
+///
+/// Measured on MySQL 8.4.11: it holds the same rule the other way round, and a
+/// NULL column answers no value.
+fn render_contained_by(
+    target: &Expr,
+    candidate: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let Some(document) = written_word(target) else {
+        return Ok(None);
+    };
+    if crate::normalize_json(document).is_err() {
+        return unsupported("JSON_CONTAINS in text that is not a document");
+    }
+    let Some((qualifier, column)) = named_column(candidate) else {
+        return unsupported("JSON_CONTAINS of something other than a column in a document");
+    };
+    let candidate = JsonReading {
+        qualifier,
         column,
-        path: path.map(JsonPath::Written),
+        path: None,
         unquoted: false,
     }
     .render(render_context)?;
     Ok(Some(format!(
-        "mysql_json_holds({target}, {rendered_candidate})"
+        "mysql_json_contains({}, {candidate})",
+        render_text(document)
     )))
 }
 

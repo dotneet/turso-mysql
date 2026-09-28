@@ -551,6 +551,7 @@ impl Dialect for MySqlDialect {
             && (name.eq_ignore_ascii_case(MYSQL_FORMAT)
                 || name.eq_ignore_ascii_case(MYSQL_TRUNCATE)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS)
+                || name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS_INTEGER)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_INTEGER)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_STRING)
@@ -1056,6 +1057,7 @@ impl Dialect for MySqlDialect {
             );
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS)
+            || name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS)
             || name.eq_ignore_ascii_case(MYSQL_JSON_OVERLAPS)
             || name.eq_ignore_ascii_case(MYSQL_JSON_MERGE_PATCH)
             || name.eq_ignore_ascii_case(MYSQL_JSON_MERGE_PRESERVE)
@@ -1072,6 +1074,9 @@ impl Dialect for MySqlDialect {
             let answer = if name.eq_ignore_ascii_case(MYSQL_JSON_CONTAINS) {
                 turso_mysql_parser::json_contains(left, right)
                     .map(|held| Value::from_i64(i64::from(held)))
+            } else if name.eq_ignore_ascii_case(MYSQL_JSON_EQUALS) {
+                turso_mysql_parser::json_equals(left, right)
+                    .map(|equal| Value::from_i64(i64::from(equal)))
             } else if name.eq_ignore_ascii_case(MYSQL_JSON_OVERLAPS) {
                 turso_mysql_parser::json_overlaps(left, right)
                     .map(|shared| Value::from_i64(i64::from(shared)))
@@ -1755,6 +1760,9 @@ pub(crate) const MYSQL_TRUNCATE: &str = "mysql_truncate";
 /// Answers whether one document holds another. The engine has no containment
 /// of its own, so the whole of it is answered by the dialect.
 pub(crate) const MYSQL_JSON_CONTAINS: &str = "mysql_json_contains";
+/// Answers whether two documents are equal, which the engine would answer by
+/// comparing their text: MySQL counts `1` and `1.0` equal.
+pub(crate) const MYSQL_JSON_EQUALS: &str = "mysql_json_equals";
 /// Compares a stored JSON number with a signed SQL integer without losing
 /// integers beyond the exact range of binary64.
 pub(crate) const MYSQL_JSON_EQUALS_INTEGER: &str = "mysql_json_equals_integer";

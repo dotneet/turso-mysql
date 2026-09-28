@@ -225,6 +225,79 @@ fn containment_paths_and_lengths_find_what_mysql_finds() {
     );
 }
 
+/// Django's `JSONField` lookups on MySQL: `__contains` under a key is
+/// `JSON_CONTAINS(JSON_EXTRACT(col, path), doc)`, `__contained_by` is
+/// `JSON_CONTAINS('<doc>', col)`, `__in` compares the reading with a list of
+/// documents read out of themselves, and `__exact` compares with one — the
+/// JSON null, an object, an array, a double or `true` among them. The list
+/// forms are taken over text readings too, the way SQLAlchemy writes them.
+#[test]
+fn the_json_lookups_django_writes_find_what_mysql_finds() {
+    let (_directory, mut adapter) = adapter();
+    assert_ids(
+        &mut adapter,
+        &[
+            (
+                r#"JSON_CONTAINS(JSON_EXTRACT(doc, '$.tags'), '"y"')"#,
+                &[1, 2],
+            ),
+            (
+                r#"NOT JSON_CONTAINS(JSON_EXTRACT(doc, '$.tags'), '"y"')"#,
+                &[],
+            ),
+            (
+                r#"JSON_CONTAINS(JSON_EXTRACT(doc, '$[2]'), '{"a": 3}')"#,
+                &[4],
+            ),
+            ("JSON_CONTAINS(JSON_EXTRACT(doc, '$.arr'), '[3, 1]')", &[3]),
+            (
+                r#"JSON_CONTAINS('{"a": 1, "lang": "EN", "tags": ["y", "z"], "n": "1", "f": "1.50", "nul": null, "x": 2}', doc)"#,
+                &[2],
+            ),
+            (
+                r#"JSON_CONTAINS('[1, "two", {"a": 3, "b": 4}, 5]', doc)"#,
+                &[4],
+            ),
+            ("doc->>'$.lang' IN ('en', 'EN')", &[1, 2, 3]),
+            ("doc->>'$.lang' NOT IN ('en', 'EN')", &[7]),
+            ("doc->>'$.n' IN (1, 10)", &[1, 2, 3]),
+            ("doc->'$.n' IN (1, 10)", &[1, 3]),
+            ("doc->'$.a' IN ('1', 'en ')", &[1, 3]),
+            ("doc->>'$.a' IN ('1', 1)", &[1, 2]),
+            ("doc->>'$.lang' IN ('EN ', 5)", &[2]),
+            ("doc->>'$.lang' IN ('x', 0)", &[1, 2, 3, 7]),
+            (
+                r#"doc->'$.n' IN (JSON_EXTRACT('1', '$'), JSON_EXTRACT('"1"', '$'))"#,
+                &[1, 2],
+            ),
+            (
+                r#"doc->'$.n' NOT IN (JSON_EXTRACT('1', '$'), JSON_EXTRACT('"1"', '$'))"#,
+                &[3],
+            ),
+            (
+                r#"JSON_EXTRACT(doc, '$.b') = JSON_EXTRACT('{"c": "deep"}', '$')"#,
+                &[1],
+            ),
+            (
+                "JSON_EXTRACT(doc, '$.nul') = JSON_EXTRACT('null', '$')",
+                &[2],
+            ),
+            ("JSON_EXTRACT(doc, '$.a') = JSON_EXTRACT('true', '$')", &[7]),
+            ("JSON_EXTRACT(doc, '$.f') = JSON_EXTRACT('1.5', '$')", &[1]),
+            (
+                "JSON_EXTRACT(doc, '$.arr') = JSON_EXTRACT('[1, 2, 3]', '$')",
+                &[3],
+            ),
+            (
+                "JSON_EXTRACT(doc, '$.arr') = JSON_EXTRACT('[1, 3, 2]', '$')",
+                &[],
+            ),
+            (r#"doc = JSON_EXTRACT('"scalar"', '$')"#, &[6]),
+            (r#"doc = JSON_EXTRACT('[1, "two", {"a": 3.0}]', '$')"#, &[4]),
+        ],
+    );
+}
+
 /// An `UPDATE` or a `DELETE` names its rows by the same conditions.
 #[test]
 fn a_write_names_its_rows_by_a_json_condition() {
@@ -270,7 +343,9 @@ fn what_mysql_reads_some_other_way_is_refused() {
         "doc->>'$ . lang' = 'en'",
         "doc->>'$.lang' = 'en' COLLATE utf8mb4_0900_ai_ci",
         "doc->>'$.lang' LIKE 'e%'",
-        "doc->>'$.lang' IN ('en', 'EN')",
+        // A document is only compared for equality here.
+        "doc->'$.tags' > JSON_EXTRACT('[\"x\"]', '$')",
+        "JSON_CONTAINS('not a document', doc)",
         // MySQL reads this `TRUE` as the JSON `true`, not as the number 1.
         "doc->'$.a' = TRUE",
         "json_length(doc) = '6'",
