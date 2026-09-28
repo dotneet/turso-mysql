@@ -7581,6 +7581,19 @@ struct TableResultMetadata {
 
 #[cfg(unix)]
 impl SourceTableColumns {
+    /// Whether this and `other` are two subqueries' readings of one table,
+    /// whose columns are one and the same.
+    fn is_a_subquery_reading_the_table_of(&self, other: &Self) -> bool {
+        let plain = |table: &Self| {
+            table.subquery
+                && table.derived.is_none()
+                && table.catalog_columns.is_empty()
+                && table.view_columns.is_empty()
+                && table.projected_columns.is_empty()
+        };
+        plain(self) && plain(other) && self.source_table.eq_ignore_ascii_case(&other.source_table)
+    }
+
     /// Turns a result column's ordinal into the table column it names.
     ///
     /// A CTE can project its table's columns in any order, so the ordinal
@@ -7638,7 +7651,7 @@ impl TableResultMetadata {
     /// in a joined projection, so this only sees the aggregate and arithmetic
     /// surfaces, which name a column and no table.
     fn column_named(&self, name: &str) -> Result<(&SourceTableColumns, usize), FrontendErrorKind> {
-        let mut found = None;
+        let mut found: Option<(&SourceTableColumns, usize)> = None;
         for table in &self.tables {
             let position = match table.catalog_columns.is_empty() {
                 true => table
@@ -7653,7 +7666,13 @@ impl TableResultMetadata {
             let Some(ordinal) = position else {
                 continue;
             };
-            if found.is_some() {
+            if let Some((earlier, _)) = found {
+                // Two readings of one table — Entity Framework Core's two
+                // subqueries over `Posts AS p` and `Posts AS p0` — carry the
+                // one column.
+                if earlier.is_a_subquery_reading_the_table_of(table) {
+                    continue;
+                }
                 return Err(FrontendErrorKind::Unsupported);
             }
             // Every reader of a named column answers a call, an aggregate or
@@ -8364,11 +8383,19 @@ impl TableResultMetadata {
         column_name: &str,
         kind: ColumnAggregateKind,
     ) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
-        let mut named = self.tables.iter().filter(|table| {
-            table.branch == 0
-                && !table.subquery
-                && table.table_reference.eq_ignore_ascii_case(table_reference)
-        });
+        let named = |in_a_subquery: bool| {
+            self.tables.iter().filter(move |table| {
+                table.branch == 0
+                    && table.subquery == in_a_subquery
+                    && table.table_reference.eq_ignore_ascii_case(table_reference)
+            })
+        };
+        // A table only a subquery reads is the one a scalar subquery's
+        // aggregate names: `(SELECT SUM(p0.Views) FROM Posts AS p0 ...)`.
+        let mut named = match named(false).next() {
+            Some(_) => named(false),
+            None => named(true),
+        };
         let (Some(table), None) = (named.next(), named.next()) else {
             return Err(FrontendErrorKind::Unsupported);
         };

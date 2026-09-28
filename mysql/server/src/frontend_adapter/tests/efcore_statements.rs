@@ -574,6 +574,70 @@ fn a_derived_table_pages_its_rows_before_the_statement_sorts_them() {
         .is_err());
 }
 
+/// A projection counting and summing each user's posts reads them through
+/// correlated subqueries, the sum fallen back on zero inside and outside
+/// its subquery: `COALESCE((SELECT COALESCE(SUM(p0.Views), 0) FROM Posts AS
+/// p0 WHERE u.Id = p0.UserId), 0)`. It was refused.
+///
+/// Measured on MySQL 8.4.11: the count is a nullable `LONGLONG` of 21 with
+/// the binary flag, the fallen-back sum a NOT NULL `NEWDECIMAL` of 33, and
+/// the user's name, which the subqueries read the table of, loses its NOT
+/// NULL.
+#[test]
+fn a_projection_sums_a_relation_through_a_fallen_back_subquery() {
+    let (_directory, mut adapter) = adapter();
+    let counts = result_set(
+        &mut adapter,
+        "SELECT `u`.`Name`, (\n    SELECT COUNT(*)\n    FROM `Posts` AS `p`\n    WHERE `u`.`Id` = `p`.`UserId`) AS `Posts`, COALESCE((\n    SELECT COALESCE(SUM(`p0`.`Views`), 0)\n    FROM `Posts` AS `p0`\n    WHERE `u`.`Id` = `p0`.`UserId`), 0) AS `Views`\nFROM `Users` AS `u`\nORDER BY `u`.`Id`",
+    );
+    let shapes = counts
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shapes,
+        [
+            (
+                "Name",
+                MYSQL_TYPE_VAR_STRING,
+                400,
+                MYSQL_NO_DEFAULT_VALUE_FLAG
+            ),
+            (
+                "Posts",
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+            (
+                "Views",
+                MYSQL_TYPE_NEWDECIMAL,
+                33,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            ),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `u`.`Name`, (SELECT COUNT(*) FROM `Posts` AS `p` WHERE `u`.`Id` = `p`.`UserId`) AS `Posts`, COALESCE((SELECT COALESCE(SUM(`p0`.`Views`), 0) FROM `Posts` AS `p0` WHERE `u`.`Id` = `p0`.`UserId`), 0) AS `Views` FROM `Users` AS `u` ORDER BY `u`.`Id`"
+        ),
+        [
+            row(&["Alice", "1", "0"]),
+            row(&["Bob", "1", "3"]),
+            row(&["Carol", "0", "0"])
+        ]
+    );
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

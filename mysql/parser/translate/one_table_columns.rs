@@ -33,12 +33,7 @@ pub(crate) fn leave_the_one_table_out(query: &mut sqlparser::ast::Query) {
         return;
     };
     for item in &mut select.projection {
-        if let SelectItem::UnnamedExpr(Expr::Subquery(subquery))
-        | SelectItem::ExprWithAlias {
-            expr: Expr::Subquery(subquery),
-            ..
-        } = item
-        {
+        if let Some(subquery) = result_subquery_mut(item) {
             leave_the_subquery_table_out(subquery);
         }
     }
@@ -77,6 +72,68 @@ fn leave_the_subquery_table_out(subquery: &mut sqlparser::ast::Query) {
         if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
             leave_the_table_out(expr, &reference);
         }
+    }
+}
+
+/// The subquery a projection item answers with: the item itself, or the one
+/// a fallback defaults — Entity Framework Core sums a relation as
+/// `COALESCE((SELECT COALESCE(SUM(p0.Views), 0) FROM Posts AS p0 WHERE
+/// u.Id = p0.UserId), 0)`.
+pub(crate) fn result_subquery(item: &SelectItem) -> Option<&sqlparser::ast::Query> {
+    let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+        return None;
+    };
+    match expr {
+        Expr::Subquery(subquery) => Some(subquery),
+        Expr::Function(function) => match defaulted_subquery(function)? {
+            Expr::Subquery(subquery) => Some(subquery),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn result_subquery_mut(item: &mut SelectItem) -> Option<&mut sqlparser::ast::Query> {
+    let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+        return None;
+    };
+    match expr {
+        Expr::Subquery(subquery) => Some(subquery),
+        Expr::Function(function) => {
+            defaulted_subquery(function)?;
+            let sqlparser::ast::FunctionArguments::List(arguments) = &mut function.args else {
+                return None;
+            };
+            match arguments.args.first_mut()? {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    Expr::Subquery(subquery),
+                )) => Some(subquery),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The first argument of `COALESCE(<subquery>, <value>)` or `IFNULL(...)`.
+fn defaulted_subquery(function: &sqlparser::ast::Function) -> Option<&Expr> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !["COALESCE", "IFNULL"]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call))
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    match arguments.args.as_slice() {
+        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            subquery @ Expr::Subquery(_),
+        )), _] => Some(subquery),
+        _ => None,
     }
 }
 

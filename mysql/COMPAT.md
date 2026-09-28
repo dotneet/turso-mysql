@@ -1552,7 +1552,16 @@ a number where MySQL refuses to, which is the one thing worth refusing a whole
 form over.
 
 Two subqueries over the same table record it once, so a column name inside them
-does not look ambiguous where it is not.
+does not look ambiguous where it is not, and neither do two subqueries reading
+it under two names — Entity Framework Core's `Posts AS p` and `Posts AS p0`.
+
+The aggregate may fall back on a whole number inside the subquery, and the
+subquery on one outside it: Entity Framework Core sums each user's posts as
+`COALESCE((SELECT COALESCE(SUM(p0.Views), 0) FROM Posts AS p0 WHERE u.Id =
+p0.UserId), 0)`. Measured on 8.4.11, that answers the shape of the sum on its
+own, never null: a `NEWDECIMAL` of 33 over an `INT`. Such a fallback aggregates
+the subquery's rows, not the statement's, so the statement's own columns stand
+beside it ungrouped.
 
 A scalar subquery may name the statement's table from inside it, which is how
 Laravel's `withCount`, `withSum` and `withMax` count or total each row's

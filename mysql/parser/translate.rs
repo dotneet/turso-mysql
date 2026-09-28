@@ -1177,12 +1177,7 @@ fn note_what_result_subqueries_read(
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(), ParseError> {
     for item in &select.projection {
-        let (SelectItem::UnnamedExpr(Expr::Subquery(subquery))
-        | SelectItem::ExprWithAlias {
-            expr: Expr::Subquery(subquery),
-            ..
-        }) = item
-        else {
+        let Some(subquery) = one_table_columns::result_subquery(item) else {
             continue;
         };
         let SetExpr::Select(inner) = subquery.body.as_ref() else {
@@ -2549,13 +2544,18 @@ fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
         || static_select_metadata::aggregate_over_branches(function).is_some()
         || matches!(
             static_select_metadata::scalar_call(function),
+            // A fallback over a scalar subquery aggregates the subquery's rows,
+            // not the statement's.
+            Some(StaticSelectMetadata::DefaultedAggregate { aggregate, .. })
+                if !matches!(aggregate.as_ref(), StaticSelectMetadata::ScalarSubquery(_))
+        )
+        || matches!(
+            static_select_metadata::scalar_call(function),
             Some(
-                StaticSelectMetadata::DefaultedAggregate { .. }
-                    | StaticSelectMetadata::ScalarCall {
-                        function: static_select_metadata::ScalarFunction::CollectsBuiltJson,
-                        ..
-                    }
-                    | StaticSelectMetadata::RoundedAggregate { .. }
+                StaticSelectMetadata::ScalarCall {
+                    function: static_select_metadata::ScalarFunction::CollectsBuiltJson,
+                    ..
+                } | StaticSelectMetadata::RoundedAggregate { .. }
             )
         )
 }
@@ -9877,6 +9877,13 @@ fn rendered_scalar_arguments(
                         || static_select_metadata::column_aggregate_argument(inner).is_some() =>
                 {
                     Ok(render_aggregate_call(inner, render_context))
+                }
+                // `COALESCE((SELECT SUM(n) FROM ...), 0)` falls a scalar
+                // subquery back the same way.
+                Expr::Subquery(_)
+                    if static_select_metadata::classify_static_select_expr(expr).is_some() =>
+                {
+                    render_select_expr(expr, render_context)
                 }
                 _ => render_scalar_argument_expr(expr),
             }

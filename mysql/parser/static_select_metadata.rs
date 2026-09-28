@@ -1321,18 +1321,72 @@ pub(super) fn classify_scalar_subquery(
     else {
         return None;
     };
-    let inner = match expr {
-        Expr::Function(function) if is_count_call(function) => StaticSelectMetadata::Count,
-        Expr::Function(function) => {
-            let (kind, column) = column_aggregate_argument(function)?;
-            StaticSelectMetadata::ColumnAggregate {
-                column_name: column.value.clone(),
-                kind,
-            }
-        }
-        _ => return None,
+    Some(StaticSelectMetadata::ScalarSubquery(Box::new(
+        scalar_subquery_aggregate(expr)?,
+    )))
+}
+
+/// The aggregate a scalar subquery answers: a count, an aggregate over a
+/// column named bare or with the table the subquery reads — Entity Framework
+/// Core writes `(SELECT COUNT(*) FROM Posts AS p WHERE u.Id = p.UserId)` and
+/// `SUM(p0.Views)` — or one of those falling back on a whole number,
+/// `COALESCE(SUM(p0.Views), 0)`, which answers the aggregate's shape.
+fn scalar_subquery_aggregate(expr: &Expr) -> Option<StaticSelectMetadata> {
+    let Expr::Function(function) = expr else {
+        return None;
     };
-    Some(StaticSelectMetadata::ScalarSubquery(Box::new(inner)))
+    if is_count_call(function) {
+        return Some(StaticSelectMetadata::Count);
+    }
+    if let Some((kind, column)) = column_aggregate_argument(function) {
+        return Some(StaticSelectMetadata::ColumnAggregate {
+            column_name: column.value.clone(),
+            kind,
+        });
+    }
+    if let Some((kind, table, column)) = qualified_aggregate_argument(function) {
+        if kind == ColumnAggregateKind::Concatenated {
+            return None;
+        }
+        return Some(StaticSelectMetadata::QualifiedAggregate {
+            table: table.value.clone(),
+            column_name: column.value.clone(),
+            kind,
+        });
+    }
+    let [sqlparser::ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !["COALESCE", "IFNULL"]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call))
+        || function.over.is_some()
+        || function.filter.is_some()
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(aggregate)), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    if !matches!(
+        classify_static_select_expr(fallback),
+        Some(StaticSelectMetadata::Integer { .. })
+    ) {
+        return None;
+    }
+    let aggregate = scalar_subquery_aggregate(aggregate)?;
+    if matches!(aggregate, StaticSelectMetadata::DefaultedAggregate { .. }) {
+        return None;
+    }
+    Some(StaticSelectMetadata::DefaultedAggregate {
+        aggregate: Box::new(aggregate),
+        fallback_places: 0,
+    })
 }
 
 /// Classifies the window calls whose MySQL result shape has been measured.
@@ -1973,6 +2027,19 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             return Some(StaticSelectMetadata::DefaultedAggregate {
                 aggregate: Box::new(inner),
                 fallback_places: fallback_places.unwrap_or(0),
+            });
+        }
+        // `COALESCE((SELECT SUM(p.views) FROM posts AS p WHERE ...), 0)` falls a
+        // correlated total back the same way, which is how Entity Framework
+        // Core sums a relation. Measured on MySQL 8.4.11, it answers the
+        // subquery's shape, never null.
+        if let Expr::Subquery(query) = defaulted {
+            if falls_back_on_a_word || fallback_places.is_some() {
+                return None;
+            }
+            return Some(StaticSelectMetadata::DefaultedAggregate {
+                aggregate: Box::new(classify_scalar_subquery(query)?),
+                fallback_places: 0,
             });
         }
         if fallback_places.is_some() {
