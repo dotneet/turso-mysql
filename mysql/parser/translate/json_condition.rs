@@ -27,6 +27,11 @@ pub(super) fn render_comparison_over_a_json_reading(
             let Some(reversed) = reverse_checked_comparison_operator(op) else {
                 return unsupported("JSON comparison operator");
             };
+            // The reading is rendered first, so a `?` it binds would take the
+            // place of the one written before it.
+            if answer.reading().binds_its_path() {
+                return unsupported("a JSON reading binding its path on the right");
+            }
             (answer, reversed, left)
         }
         (None, None) => return Ok(None),
@@ -35,19 +40,19 @@ pub(super) fn render_comparison_over_a_json_reading(
         .expect("the caller checked the comparison operator");
     let rendered = match answer {
         JsonAnswer::Text(reading) => {
-            let rendered = reading.render(render_context);
+            let rendered = reading.render(render_context)?;
             render_text_comparison(&rendered, &op, operator, other, render_context)?
         }
         JsonAnswer::Kind(reading) => {
-            let rendered = format!("mysql_json_type({})", reading.render(render_context));
+            let rendered = format!("mysql_json_type({})", reading.render(render_context)?);
             render_text_comparison(&rendered, &op, operator, other, render_context)?
         }
         JsonAnswer::Count(reading) => {
-            let rendered = format!("mysql_json_length({})", reading.render(render_context));
+            let rendered = format!("mysql_json_length({})", reading.render(render_context)?);
             render_count_comparison(&rendered, &op, operator, other, render_context)?
         }
         JsonAnswer::Document(reading) => {
-            let rendered = reading.render(render_context);
+            let rendered = reading.render(render_context)?;
             render_document_comparison(&rendered, &op, operator, other, render_context)?
         }
     };
@@ -100,7 +105,7 @@ pub(super) fn render_json_null_test(
     let Some(reading) = read_json_reading(expr) else {
         return unsupported("IS NULL over a JSON call other than a reading");
     };
-    let rendered = reading.render(render_context);
+    let rendered = reading.render(render_context)?;
     Ok(format!(
         "({rendered} IS {}NULL)",
         if negated { "NOT " } else { "" }
@@ -128,6 +133,17 @@ enum JsonAnswer<'e> {
     Document(JsonReading<'e>),
 }
 
+impl<'e> JsonAnswer<'e> {
+    fn reading(&self) -> &JsonReading<'e> {
+        match self {
+            Self::Text(reading)
+            | Self::Kind(reading)
+            | Self::Count(reading)
+            | Self::Document(reading) => reading,
+        }
+    }
+}
+
 fn answered_by_json(expr: &Expr) -> Option<JsonAnswer<'_>> {
     if let Some(reading) = read_json_reading(expr) {
         return Some(if reading.unquoted {
@@ -144,8 +160,9 @@ fn answered_by_json(expr: &Expr) -> Option<JsonAnswer<'_>> {
         Some([Expr::Identifier(column), path]) => {
             let path = written_json_path(path)?;
             Some(JsonAnswer::Count(JsonReading {
+                qualifier: None,
                 column,
-                path: Some(path),
+                path: Some(JsonPath::Written(path)),
                 unquoted: false,
             }))
         }
@@ -155,26 +172,57 @@ fn answered_by_json(expr: &Expr) -> Option<JsonAnswer<'_>> {
 
 /// One path read out of a JSON column, or the whole column.
 struct JsonReading<'e> {
+    /// The table a column is named through — `users.profile`, the way Django
+    /// and SQLAlchemy name every column — which names the one table the
+    /// statement reads, or the engine refuses the name.
+    qualifier: Option<&'e Ident>,
     column: &'e Ident,
-    path: Option<&'e str>,
+    path: Option<JsonPath<'e>>,
     unquoted: bool,
 }
 
+/// The path a reading takes: written out, or bound — GORM's
+/// `JSON_EXTRACT(profile, ?)`, which the frontend holds to a path this reads
+/// the way MySQL does when it binds.
+enum JsonPath<'e> {
+    Written(&'e str),
+    Bound,
+}
+
 impl JsonReading<'_> {
-    fn render(&self, render_context: &mut SelectRenderContext<'_>) -> String {
+    fn binds_its_path(&self) -> bool {
+        matches!(self.path, Some(JsonPath::Bound))
+    }
+
+    fn render(&self, render_context: &mut SelectRenderContext<'_>) -> Result<String, ParseError> {
         render_context
             .json_reading_columns
             .push(self.column.value.clone());
-        let column = render_ident(self.column);
-        let found = match self.path {
-            Some(path) => format!("mysql_json_extract({column}, {})", render_text(path)),
+        let column = match self.qualifier {
+            Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(self.column)),
+            None => render_ident(self.column),
+        };
+        let found = match &self.path {
+            Some(JsonPath::Written(path)) => {
+                format!("mysql_json_extract({column}, {})", render_text(path))
+            }
+            Some(JsonPath::Bound) => {
+                let ordinal = render_context.next_parameter_ordinal()?;
+                record_json_comparison(
+                    render_context,
+                    CheckedSelectComparisonOperator::Equal,
+                    CheckedSelectComparisonRhs::Placeholder { ordinal },
+                    crate::CheckedComparisonAnswer::JsonPath,
+                );
+                format!("mysql_json_extract({column}, ?)")
+            }
             None => column,
         };
-        if self.unquoted {
+        Ok(if self.unquoted {
             format!("mysql_json_unquote({found})")
         } else {
             found
-        }
+        })
     }
 }
 
@@ -194,37 +242,52 @@ fn read_json_reading(expr: &Expr) -> Option<JsonReading<'_>> {
                 return None;
             };
             Some(JsonReading {
+                qualifier: None,
                 column,
-                path: Some(written_json_path(right)?),
+                path: Some(JsonPath::Written(written_json_path(right)?)),
                 unquoted: matches!(op, BinaryOperator::LongArrow),
             })
         }
         Expr::Nested(inner) => read_json_reading(inner),
         _ => {
-            if let Some([Expr::Identifier(column), path]) =
-                plain_call(expr, "JSON_EXTRACT").as_deref()
-            {
-                return Some(JsonReading {
-                    column,
-                    path: Some(written_json_path(path)?),
-                    unquoted: false,
-                });
+            if let Some(extracted) = plain_call(expr, "JSON_EXTRACT") {
+                return extracted_reading(&extracted, false);
             }
             let unquoted = plain_call(expr, "JSON_UNQUOTE")?;
             let [extracted] = unquoted.as_slice() else {
                 return None;
             };
-            let extracted = plain_call(extracted, "JSON_EXTRACT")?;
-            let [Expr::Identifier(column), path] = extracted.as_slice() else {
-                return None;
-            };
-            Some(JsonReading {
-                column,
-                path: Some(written_json_path(path)?),
-                unquoted: true,
-            })
+            extracted_reading(&plain_call(extracted, "JSON_EXTRACT")?, true)
         }
     }
+}
+
+/// Reads the arguments of `JSON_EXTRACT(col, path)`, the column named on its
+/// own or through its table and the path written or bound.
+fn extracted_reading<'e>(arguments: &[&'e Expr], unquoted: bool) -> Option<JsonReading<'e>> {
+    let [column, path] = arguments else {
+        return None;
+    };
+    let (qualifier, column) = match column {
+        Expr::Identifier(column) => (None, column),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
+        _ => return None,
+    };
+    let path = if is_a_placeholder(path) {
+        JsonPath::Bound
+    } else {
+        JsonPath::Written(written_json_path(path)?)
+    };
+    Some(JsonReading {
+        qualifier,
+        column,
+        path: Some(path),
+        unquoted,
+    })
+}
+
+fn is_a_placeholder(expr: &Expr) -> bool {
+    matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"))
 }
 
 /// Reads a JSON column itself or a JSON value read out of one, which is what
@@ -233,6 +296,7 @@ fn read_json_reading(expr: &Expr) -> Option<JsonReading<'_>> {
 fn read_document_reading(expr: &Expr) -> Option<JsonReading<'_>> {
     if let Expr::Identifier(column) = expr {
         return Some(JsonReading {
+            qualifier: None,
             column,
             path: None,
             unquoted: false,
@@ -413,8 +477,25 @@ fn render_document_comparison(
     if matches!(other, Expr::Collate { .. }) {
         return unsupported("JSON comparison with explicit collation");
     }
+    let written_document = written_document_value(other)?;
+    let other = written_document.as_ref().unwrap_or(other);
     let (rendered_other, rhs) = render_checked_select_comparison_rhs(other, render_context)?;
     let sql_operator = checked_select_comparison_sql_operator(op);
+    if matches!(rhs, CheckedSelectComparisonRhs::Placeholder { .. }) {
+        let compared = format!("mysql_json_compare_bound({rendered}, {rendered_other})");
+        let condition = match operator {
+            CheckedSelectComparisonOperator::Equal => format!("({compared} = 0)"),
+            CheckedSelectComparisonOperator::NotEqual => format!("({compared} <> 0)"),
+            _ => return unsupported("JSON comparison of a bound value other than = or <>"),
+        };
+        record_json_comparison(
+            render_context,
+            operator,
+            rhs,
+            crate::CheckedComparisonAnswer::JsonValue,
+        );
+        return Ok(condition);
+    }
     let orders = matches!(
         operator,
         CheckedSelectComparisonOperator::LessThan
@@ -452,6 +533,50 @@ fn render_document_comparison(
             )
         }
     })
+}
+
+/// Reads `JSON_EXTRACT('<document>', '$')`, which Django writes for the value
+/// of a JSON lookup, as the value the document holds: a JSON string as that
+/// word and a JSON whole number as that number, which compare the way a
+/// written word or number does. Measured on MySQL 8.4.11:
+/// `JSON_EXTRACT(profile, '$."city"') = JSON_EXTRACT('"Paris"', '$')` finds
+/// the JSON string `"Paris"`, and `... = JSON_EXTRACT('30', '$')` both 30 and
+/// 30.0. Any other document is refused.
+fn written_document_value(other: &Expr) -> Result<Option<Expr>, ParseError> {
+    let Some(arguments) = plain_call(other, "JSON_EXTRACT") else {
+        return Ok(None);
+    };
+    let [document, path] = arguments.as_slice() else {
+        return unsupported("JSON_EXTRACT over something other than one document and one path");
+    };
+    let (Some(document), Some("$")) = (written_word(document), written_json_path(path)) else {
+        return unsupported("JSON_EXTRACT over something other than a written document");
+    };
+    let value = match crate::json_type(document) {
+        Some("STRING") => Value::SingleQuotedString(
+            crate::json_unquote(document).expect("the document was read as a string"),
+        ),
+        Some("INTEGER") => {
+            let digits =
+                crate::normalize_json(document).expect("the document was read as a whole number");
+            if digits.parse::<i64>().is_err() {
+                return unsupported("JSON_EXTRACT of a whole number past a signed one");
+            }
+            Value::Number(digits, false)
+        }
+        _ => return unsupported("JSON_EXTRACT of a document other than a word or a number"),
+    };
+    Ok(Some(Expr::Value(value.into())))
+}
+
+fn written_word(expr: &Expr) -> Option<&str> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    match &value.value {
+        Value::SingleQuotedString(word) | Value::DoubleQuotedString(word) => Some(word),
+        _ => None,
+    }
 }
 
 /// Renders a comparison against a written NULL, which answers no value unless
@@ -537,11 +662,12 @@ fn render_contains(
         _ => return unsupported("JSON_CONTAINS looking for something other than a document"),
     };
     let target = JsonReading {
+        qualifier: None,
         column,
-        path,
+        path: path.map(JsonPath::Written),
         unquoted: false,
     }
-    .render(render_context);
+    .render(render_context)?;
     Ok(Some(format!(
         "mysql_json_holds({target}, {rendered_candidate})"
     )))
@@ -587,11 +713,12 @@ fn render_contains_path(
             return unsupported("JSON_CONTAINS_PATH path");
         };
         let reading = JsonReading {
+            qualifier: None,
             column,
-            path: Some(path),
+            path: Some(JsonPath::Written(path)),
             unquoted: false,
         }
-        .render(render_context);
+        .render(render_context)?;
         found.push(format!("{reading} IS NOT NULL"));
     }
     let joined = found.join(if every { " AND " } else { " OR " });

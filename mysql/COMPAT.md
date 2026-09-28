@@ -4613,7 +4613,11 @@ same rows:
   is compared by JSON's rules, the ones a whole `JSON` column is compared by:
   `doc->'$.a' = '1'` finds the string `"1"` and not the number, a word is
   compared byte for byte with no padding, and a string ranks above every
-  number, so `doc->'$.n' > 1` finds `"1"`.
+  number, so `doc->'$.n' > 1` finds `"1"`. Django writes the value of its
+  lookup as a document read out of itself — `JSON_EXTRACT(users.profile,
+  '$."city"') = JSON_EXTRACT('"Paris"', '$')` — which is read as the word or
+  whole number it holds, the column named through its table; a document of
+  any other kind is refused there.
 - `JSON_EXTRACT(...) IS NULL` is true only where the path is not there, a
   member holding the JSON null being found; `JSON_TYPE(...)` names it `NULL`,
   and that word is compared under `utf8mb4_bin` too, so `= 'null'` finds
@@ -4644,6 +4648,17 @@ equals 1, and `JSON_CONTAINS` refuses every word with 3146. From that point
 the statement refuses a word here, and a number bound to `JSON_CONTAINS` is
 refused outright. A prepared `UPDATE` or `DELETE` has no step holding what
 binds, so a `?` against a JSON reading is refused there.
+
+GORM's `datatypes.JSONQuery` binds the path as well —
+`JSON_EXTRACT(profile, ?) = ?` for `Equals` and `... IS NOT NULL` for
+`HasKey` — and compares the JSON value with a bound one, `=` and `<>` alone.
+Measured on 8.4.11 with go-sql-driver's binary types: a bound word finds the
+JSON string of exactly those bytes and nothing else, not a number, `true` or
+the JSON null; a bound whole number finds a JSON number of that value, 30.0
+included; NULL finds nothing, as does a NULL path; and the word-after-a-number
+rule above holds here too. A path MySQL refuses (3143), one it reads as more
+than one value, a number bound as the path (3144) and a bound double are
+refused when the statement runs.
 
 A `FOREIGN KEY` is taken and **enforced**. The engine has the enforcement and
 these connections now run with it on, which is what makes taking the syntax

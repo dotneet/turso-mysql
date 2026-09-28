@@ -636,3 +636,148 @@ fn a_json_cast_into_another_kind_of_column_is_refused() {
         Err(FrontendErrorKind::Unsupported)
     );
 }
+
+/// Four users whose profiles GORM's `JSONQuery` reads.
+fn users_with_profiles(adapter: &mut Adapter) {
+    run(
+        adapter,
+        r#"INSERT INTO users (id, email, name, balance, is_active, profile) VALUES (1, 'a@x', 'Alice', 1, 1, '{"city": "Paris", "tags": ["a", "b"], "age": 30, "n": null, "ok": true, "s": "30"}'), (2, 'b@x', 'Bob', 1, 1, '{"city": "Berlin", "age": 30.0}'), (3, 'c@x', 'Carol', 1, 1, NULL), (4, 'd@x', 'Dave', 1, 1, '[1, 2]')"#,
+    );
+}
+
+fn ids(adapter: &mut Adapter, sql: &str, values: &[Bound<'_>]) -> Vec<u64> {
+    result_rows(adapter, sql, values)
+        .into_iter()
+        .map(|row| match row[0] {
+            BinaryResultValue::UnsignedInteger(id) => id,
+            ref other => panic!("{sql} answered {other:?} for an id"),
+        })
+        .collect()
+}
+
+const GORM_JSON_EQUALS: &str = "SELECT id FROM `users` WHERE JSON_EXTRACT(`profile`,?) = ?";
+
+/// GORM's `datatypes.JSONQuery("profile").Equals(value, "city")` binds the
+/// path and the value. Measured on MySQL 8.4.11: a bound word finds the JSON
+/// string holding exactly those bytes and nothing else — not a number, not
+/// `true`, not the JSON null, not another case or a trailing space — a bound
+/// whole number finds a JSON number of that value, 30.0 included, and NULL
+/// finds nothing, as does a NULL path; `$[0]` over an array is its first
+/// element. A path MySQL refuses (3143), one read as more than one value, and
+/// a number bound as the path (3144) are refused here, and so is a bound
+/// double, which was not measured past one value.
+#[test]
+fn gorm_compares_a_json_value_read_by_a_bound_path() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    for (path, value, found) in [
+        (Bound::Word("$.city"), Bound::Word("Paris"), vec![1]),
+        (Bound::Word("$.age"), Bound::Whole(30), vec![1, 2]),
+        (Bound::Word("$.age"), Bound::Word("30"), vec![]),
+        (Bound::Word("$.s"), Bound::Word("30"), vec![1]),
+        (Bound::Word("$.s"), Bound::Whole(30), vec![]),
+        (Bound::Word("$.ok"), Bound::Whole(1), vec![]),
+        (Bound::Word("$.ok"), Bound::Word("true"), vec![]),
+        (Bound::Word("$.n"), Bound::Word("null"), vec![]),
+        (Bound::Word("$.city"), Bound::Null, vec![]),
+        (Bound::Word("$.city"), Bound::Word("paris"), vec![]),
+        (Bound::Word("$.city"), Bound::Word("Paris "), vec![]),
+        (Bound::Word("$[0]"), Bound::Whole(1), vec![4]),
+        (Bound::Null, Bound::Word("Paris"), vec![]),
+    ] {
+        assert_eq!(ids(&mut adapter, GORM_JSON_EQUALS, &[path, value]), found);
+    }
+    for (path, value) in [
+        (Bound::Word("$.*"), Bound::Word("Paris")),
+        (Bound::Word("bad path"), Bound::Word("Paris")),
+        (Bound::Whole(1), Bound::Word("Paris")),
+        (Bound::Word("$.age"), Bound::Real(30.0)),
+    ] {
+        assert_eq!(
+            prepared(&mut adapter, GORM_JSON_EQUALS, &[path, value]),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+    let every_column = result_rows(
+        &mut adapter,
+        "SELECT * FROM `users` WHERE JSON_EXTRACT(`profile`,?) = ?",
+        &[Bound::Word("$.city"), Bound::Word("Paris")],
+    );
+    assert_eq!(every_column.len(), 1);
+    assert_eq!(every_column[0][0], BinaryResultValue::UnsignedInteger(1));
+}
+
+/// GORM's `JSONQuery("profile").HasKey("tags")`. Measured on MySQL 8.4.11: a
+/// member holding the JSON null is there, and a path an array does not have
+/// is not.
+#[test]
+fn gorm_asks_whether_a_bound_json_path_is_there() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    let is_there = "SELECT id FROM `users` WHERE JSON_EXTRACT(`profile`,?) IS NOT NULL";
+    assert_eq!(ids(&mut adapter, is_there, &[Bound::Word("$.tags")]), [1]);
+    assert_eq!(ids(&mut adapter, is_there, &[Bound::Word("$.n")]), [1]);
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM `users` WHERE JSON_EXTRACT(`profile`,?) IS NULL ORDER BY id",
+            &[Bound::Word("$.nope")]
+        ),
+        [1, 2, 3, 4]
+    );
+}
+
+/// MySQL settles how it reads what binds against a JSON value by what the
+/// statement bound before. Measured on 8.4.11: once a whole number has bound
+/// there, a word bound later finds nothing — `'Paris'` no longer finds
+/// Paris — so a word after a number is refused until the statement is
+/// prepared again. A NULL bound first settles nothing.
+#[test]
+fn a_word_bound_after_a_number_against_a_json_value_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    let statement = adapter.execute_stmt_prepare(GORM_JSON_EQUALS).unwrap();
+    let mut run_with = |values: &[Bound<'_>]| {
+        adapter.execute_stmt_execute(statement.statement_id, &payload(values))
+    };
+    for values in [
+        [Bound::Word("$.city"), Bound::Null],
+        [Bound::Word("$.city"), Bound::Word("Paris")],
+        [Bound::Word("$.age"), Bound::Whole(30)],
+    ] {
+        assert!(run_with(&values).is_ok());
+    }
+    assert_eq!(
+        run_with(&[Bound::Word("$.city"), Bound::Word("Paris")]),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+/// Django's lookup on a `JSONField` names the column through its table and
+/// writes the value as a document read back out of itself. Measured on MySQL
+/// 8.4.11: a JSON string finds the same string and a JSON whole number finds
+/// the numbers of that value; a document of any other kind is refused here.
+#[test]
+fn django_compares_a_json_value_with_a_written_document() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    let lookup = |member: &str, document: &str| {
+        format!(
+            "SELECT `users`.`name` AS `name` FROM `users` WHERE JSON_EXTRACT(`users`.`profile`, '$.\"{member}\"') = JSON_EXTRACT('{document}', '$') ORDER BY `users`.`id`"
+        )
+    };
+    assert_eq!(
+        first_column(&mut adapter, &lookup("city", "\"Paris\"")),
+        ["Alice"]
+    );
+    assert_eq!(
+        first_column(&mut adapter, &lookup("age", "30")),
+        ["Alice", "Bob"]
+    );
+    for (member, document) in [("tags", "[\"a\", \"b\"]"), ("ok", "true"), ("age", "1.5")] {
+        assert!(
+            adapter.execute_query(&lookup(member, document)).is_err(),
+            "{document}"
+        );
+    }
+}

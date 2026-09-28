@@ -1124,6 +1124,14 @@ pub enum CheckedComparisonAnswer {
     /// A document `JSON_CONTAINS` looks for. A bound value has to bind as
     /// text, which the dialect then reads as a document.
     JsonDocument,
+    /// The path a JSON reading binds — `JSON_EXTRACT(doc, ?)` — which has to
+    /// bind as a path this reads the way MySQL does, or as NULL.
+    JsonPath,
+    /// A JSON value read out of a column compared with a bound value, which
+    /// MySQL compares as a JSON string when a word binds and as a JSON number
+    /// when a whole number does — only while the statement has never bound a
+    /// number there, as for [`Self::JsonText`].
+    JsonValue,
     /// The rows a `COUNT` in a `HAVING` counted. MySQL reads a value bound
     /// against it as a whole number — measured, a bound `'abc'` warns
     /// "Truncated incorrect INTEGER value" — so a bound word has to name one.

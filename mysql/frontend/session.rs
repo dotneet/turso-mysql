@@ -11058,7 +11058,9 @@ fn checked_comparison_fits_column(
             CheckedComparisonAnswer::Moment => matches!(type_name, "DATETIME" | "TIMESTAMP"),
             CheckedComparisonAnswer::JsonText
             | CheckedComparisonAnswer::JsonCount
-            | CheckedComparisonAnswer::JsonDocument => false,
+            | CheckedComparisonAnswer::JsonDocument
+            | CheckedComparisonAnswer::JsonPath
+            | CheckedComparisonAnswer::JsonValue => false,
         },
         CheckedSelectComparisonRhs::Operand(CheckedComparisonOperand::Arithmetic) => matches!(
             type_name,
@@ -11455,9 +11457,12 @@ fn checked_comparison_meets_an_answer(
             | CheckedSelectComparisonRhs::Decimal(_)
             | CheckedSelectComparisonRhs::Placeholder { .. },
         ) => true,
-        (CheckedComparisonAnswer::JsonDocument, CheckedSelectComparisonRhs::Placeholder { .. }) => {
-            true
-        }
+        (
+            CheckedComparisonAnswer::JsonDocument
+            | CheckedComparisonAnswer::JsonPath
+            | CheckedComparisonAnswer::JsonValue,
+            CheckedSelectComparisonRhs::Placeholder { .. },
+        ) => true,
         // What binds against a count is held to a whole number when the
         // statement runs.
         (
@@ -11476,13 +11481,15 @@ fn binds_a_number_to_a_json_reading(
     values: &[MySqlPreparedValue],
 ) -> bool {
     json_reading_parameters(comparisons, values).any(|(answers, value)| {
-        answers != CheckedComparisonAnswer::JsonCount
-            && matches!(
-                value,
-                MySqlPreparedValue::Integer(_)
-                    | MySqlPreparedValue::UnsignedInteger(_)
-                    | MySqlPreparedValue::Real(_)
-            )
+        !matches!(
+            answers,
+            CheckedComparisonAnswer::JsonCount | CheckedComparisonAnswer::JsonPath
+        ) && matches!(
+            value,
+            MySqlPreparedValue::Integer(_)
+                | MySqlPreparedValue::UnsignedInteger(_)
+                | MySqlPreparedValue::Real(_)
+        )
     })
 }
 
@@ -11506,9 +11513,15 @@ fn hold_json_reading_parameters(
             (_, MySqlPreparedValue::Null) => true,
             (CheckedComparisonAnswer::JsonText, MySqlPreparedValue::Integer(_))
             | (CheckedComparisonAnswer::JsonText, MySqlPreparedValue::Real(_))
-            | (CheckedComparisonAnswer::JsonCount, MySqlPreparedValue::Integer(_)) => true,
+            | (CheckedComparisonAnswer::JsonCount, MySqlPreparedValue::Integer(_))
+            | (CheckedComparisonAnswer::JsonValue, MySqlPreparedValue::Integer(_)) => true,
+            (CheckedComparisonAnswer::JsonPath, MySqlPreparedValue::Text(path)) => {
+                turso_mysql_parser::is_a_json_path_this_reads(path)
+            }
             (
-                CheckedComparisonAnswer::JsonText | CheckedComparisonAnswer::JsonDocument,
+                CheckedComparisonAnswer::JsonText
+                | CheckedComparisonAnswer::JsonDocument
+                | CheckedComparisonAnswer::JsonValue,
                 MySqlPreparedValue::Text(_),
             ) => !bound_a_number_before,
             _ => false,
@@ -11554,6 +11567,8 @@ const fn answered_kind_name(answers: CheckedComparisonAnswer) -> &'static str {
         CheckedComparisonAnswer::JsonText => "a word or a number",
         CheckedComparisonAnswer::JsonCount => "a number",
         CheckedComparisonAnswer::JsonDocument => "a JSON document",
+        CheckedComparisonAnswer::JsonPath => "a JSON path read the way MySQL reads it",
+        CheckedComparisonAnswer::JsonValue => "a word or a whole number",
         CheckedComparisonAnswer::RowCount => "a whole number",
     }
 }
@@ -11602,7 +11617,9 @@ const fn answered_column_kind_name(answers: CheckedComparisonAnswer) -> &'static
         CheckedComparisonAnswer::Moment => "a DATETIME or TIMESTAMP column",
         CheckedComparisonAnswer::JsonText
         | CheckedComparisonAnswer::JsonCount
-        | CheckedComparisonAnswer::JsonDocument => "no column",
+        | CheckedComparisonAnswer::JsonDocument
+        | CheckedComparisonAnswer::JsonPath
+        | CheckedComparisonAnswer::JsonValue => "no column",
     }
 }
 
@@ -11938,6 +11955,8 @@ fn is_a_json_answer(answers: Option<CheckedComparisonAnswer>) -> bool {
             CheckedComparisonAnswer::JsonText
                 | CheckedComparisonAnswer::JsonCount
                 | CheckedComparisonAnswer::JsonDocument
+                | CheckedComparisonAnswer::JsonPath
+                | CheckedComparisonAnswer::JsonValue
         )
     )
 }

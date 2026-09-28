@@ -537,6 +537,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_CAST_AS_JSON) {
             return Ok(Some(Func::Dialect(MYSQL_CAST_AS_JSON.to_string())));
         }
+        if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_BOUND) {
+            return Ok(Some(Func::Dialect(MYSQL_JSON_COMPARE_BOUND.to_string())));
+        }
         if arg_count == 2
             && (name.eq_ignore_ascii_case(MYSQL_JSON_EXTRACT)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_TEXT_COMPARE)
@@ -921,6 +924,37 @@ impl Dialect for MySqlDialect {
                     )
                 })?;
             return Ok(found.map_or(Value::Null, Value::build_text));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_BOUND) {
+            let [document, operand] = args else {
+                return Err(LimboError::ParseError(format!(
+                    "{name} takes two arguments"
+                )));
+            };
+            let Value::Text(document) = document else {
+                return Ok(Value::Null);
+            };
+            let order =
+                match operand {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Text(word) => {
+                        turso_mysql_parser::json_compare_string(document.as_str(), word.as_str())
+                    }
+                    Value::Numeric(turso_core::Numeric::Integer(number)) => {
+                        turso_mysql_parser::json_compare_integer(document.as_str(), *number)
+                    }
+                    _ => return Err(LimboError::InvalidArgument(
+                        "a JSON value compared with something other than a word or a whole number"
+                            .to_string(),
+                    )),
+                };
+            return Ok(order.map_or(Value::Null, |order| {
+                Value::from_i64(match order {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                })
+            }));
         }
         if name.eq_ignore_ascii_case(MYSQL_CAST_AS_JSON) {
             let [value] = args else {
@@ -1746,6 +1780,10 @@ pub(crate) const MYSQL_JSON_UNQUOTE: &str = "mysql_json_unquote";
 /// value written whole into a `JSON` column: a word parsed as a document, a
 /// whole number as that JSON number.
 pub(crate) const MYSQL_CAST_AS_JSON: &str = "mysql_cast_as_json";
+/// Compares a JSON value read out of a column with a bound value, by what
+/// binds: a word as a JSON string, byte for byte, and a whole number as a
+/// JSON number, the way MySQL compares a written one of each.
+pub(crate) const MYSQL_JSON_COMPARE_BOUND: &str = "mysql_json_compare_bound";
 /// Compares the text a JSON reading answers with a value, the way MySQL
 /// compares it: against a word under `utf8mb4_bin`, and against a number as
 /// two doubles.
