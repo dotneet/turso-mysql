@@ -17,6 +17,7 @@ mod drop_table;
 mod drop_view;
 mod dump_ddl;
 mod flush_tables;
+mod from_dual;
 mod information_schema;
 mod insert_select;
 mod json_value;
@@ -141,6 +142,7 @@ pub use dump_ddl::{
     parse_optional_mysqldump_drop_view, MySqlDumpDdl,
 };
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
+pub use from_dual::leave_out_from_dual;
 pub use insert_select::{
     direct_insert_select_projection, filtered_insert_select_projection, insert_select_source_sql,
     parse_optional_insert_select, parse_optional_insert_select_without_columns,

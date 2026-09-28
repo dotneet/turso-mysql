@@ -30883,7 +30883,6 @@ fn whole_readings(
             / length,
     }
 }
-
 #[cfg(unix)]
 mod binary_data;
 
@@ -30907,3 +30906,6 @@ mod hibernate_statements;
 
 #[cfg(unix)]
 mod gui_browsing;
+
+#[cfg(unix)]
+mod drizzle_statements;

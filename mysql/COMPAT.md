@@ -2651,6 +2651,13 @@ parentheses included, which is what MySQL does — `1+1` keeps its spelling wher
 the engine would print `1 + 1`. That name comes from the statement rather than
 the AST for exactly that reason.
 
+`FROM DUAL` after written values — Drizzle's `select 1 from dual` — is left
+out before the statement is read, so it answers what the same `SELECT` without
+it answers: measured on 8.4.11, the two agree in rows and metadata, with
+`WHERE`, `ORDER BY` and `LIMIT` too. Only the unquoted word names it, `DUAL`
+being reserved; `` `dual` `` is an ordinary table. `DUAL` beside another table,
+under an alias or inside a subquery is left as written, and refused.
+
 Exact `DECIMAL` arithmetic is taken for a known decimal column or its aggregate
 combined with a written numeric literal through `+`, `-`, `*` or `/`, and for
 `+`, `-` or `*` with a known integer column or aggregate. The literal's digits
