@@ -209,3 +209,229 @@ counted-row fix, 2026-09-28. Every step passes on turso for Django (22/22),
 GORM (21/21), Laravel (26/26), the mysql CLI (23/23), mysqldump (9/9), Prisma
 (22/22), Rails (22/22) and SQLAlchemy (20/20). TypeORM passes 17/18; its
 pagination over a derived table that joins tables is still refused.
+
+# Sixth run (new apps)
+
+Six new apps at `df22b69aa` (branch `compat-integration`), 2026-09-28, run as
+a second copy of the harness (`COMPOSE_PROJECT_NAME=turso-e2e-more`). Every
+step of every new app passes against MySQL 8.4.11. GORM (21/21) and the mysql
+CLI (23/23) were rerun alongside as a check of the harness changes and still
+pass on turso.
+
+| App | Stack | turso | MySQL |
+|---|---|---|---|
+| `sequelize` | Sequelize 6.37.8, sequelize-cli 6.6.5, mysql2 3.24.4 | 2/23 | 23/23 |
+| `drizzle` | drizzle-orm 0.45.3, drizzle-kit 0.31.11, mysql2 3.24.4 | 0/20 | 20/20 |
+| `spring` | Spring Boot 3.5.16, Hibernate 6.6.53, Flyway 11.7.2, Connector/J 9.7.0 | 2/46 | 46/46 |
+| `efcore` | EF Core 9.0.20, Pomelo 9.0.0, MySqlConnector 2.4.0 | 0/21 | 21/21 |
+| `sqlx` | sqlx 0.8.6 and sqlx-cli 0.8.6 | 0/22 | 22/22 |
+| `dbtools` | Connector/J 9.7.0 metadata; DBeaver, Workbench, TablePlus statements | 3/11 | 11/11 |
+
+Drizzle was chosen over Knex (about 83 million npm downloads a month against
+19 million), sqlx over diesel and Ecto (sqlx 0.8.6 alone has 73 million crate
+downloads). The GUI statements in `dbtools` are modeled on those tools'
+general-log output, not captured from the GUIs; its DatabaseMetaData calls are
+real Connector/J calls.
+
+## Steps on turso
+
+Every app is stopped by one statement or handshake near the start, so most
+steps fail only because an earlier step did:
+
+- **efcore 0/21, sqlx 0/22:** no connection is ever established (see 1.1
+  and 1.2).
+- **sequelize 2/23:** `connect` and `sync` pass; everything from `migrate` on
+  fails because the `SequelizeMeta` table cannot be created, so no table
+  exists.
+- **drizzle 0/20:** `connect` fails on `select 1 from dual`, `migrate` on the
+  `__drizzle_migrations` table, `introspect-push`/`introspect-pull` on the
+  STATISTICS query, and the rest because no table exists.
+- **spring 2/46:** `connect` passes in both modes; Flyway cannot start, so no
+  table exists and `ddl-auto=validate` fails, and every later step needs the
+  context. The same happens with client-side and server-side prepared
+  statements.
+- **dbtools 3/11:** `setup` (tables, a view, rows), `dbeaver-data` and
+  `tableplus-connect` pass; the other eight fail on the statements listed
+  in 4.
+
+To see past the first blocker, three apps were also run once with the missing
+table created by hand first (not part of the harness): Sequelize with
+`SequelizeMeta` then passes 15/23, Drizzle with `__drizzle_migrations` 1/20,
+and Spring with the V1 schema and `SPRING_JPA_HIBERNATE_DDL_AUTO=none` 12 of
+23 steps in each mode. What those runs hit is listed under 3.
+
+## 1. Connection refused before any statement (P0)
+
+1. **MySqlConnector (every .NET app on EF Core/Pomelo, Dapper and plain
+   ADO.NET with MySqlConnector):** after TLS its HandshakeResponse41 carries
+   capabilities `0x011b8202`, without `CLIENT_SSL`; turso closes the
+   connection with no error packet ("post-TLS client response must retain
+   CLIENT_SSL", `connection_state.rs`). MySQL accepts it. The proxy logs it as
+   an `authenticate` entry.
+2. **sqlx (every Rust app on sqlx):** its SSLRequest announces
+   `max_packet_size` 1024; turso requires at least 4096
+   (`validate_ssl_max_packet_size`, `MIN_SERVER_RESPONSE_PAYLOAD_LENGTH`) and
+   closes the connection with no error packet, so rustls reports "peer closed
+   connection without sending TLS close_notify". MySQL accepts it. Seen with
+   `E2E_PROXY_DUMP=1`: greeting, SSLRequest `0a8a0b0100040000e0...`, then
+   nothing. (In one earlier development run a single sqlx connection got as
+   far as three statements; this was not reproduced in four later runs.)
+
+Both should answer with an error packet at the least; accepting them is what
+MySQL does.
+
+## 2. Migration tools stopped at their first statement (P0)
+
+- **Sequelize** (`sequelize-cli` / umzug's meta table), 1235:
+  ``CREATE TABLE IF NOT EXISTS `SequelizeMeta` (`name` VARCHAR(255) NOT NULL UNIQUE , PRIMARY KEY (`name`)) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE utf8_unicode_ci``.
+  Two separate refusals, checked with the mysql CLI: a column that is both
+  `UNIQUE` and the `PRIMARY KEY` (`... NOT NULL UNIQUE, PRIMARY KEY (name)`,
+  also `... AUTO_INCREMENT UNIQUE PRIMARY KEY`), and `DEFAULT CHARSET=utf8` /
+  `utf8mb3`.
+- **Drizzle** (`drizzle-kit migrate`), 1235:
+  `create table if not exists __drizzle_migrations ( id serial primary key, hash text not null, created_at bigint )`:
+  the `SERIAL` type (`BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE`), alone
+  or with `primary key`.
+- **Flyway** (Spring Boot's default migrator), before it creates anything:
+  - `SELECT SUM(found) FROM ((SELECT 1 as found FROM information_schema.tables WHERE table_schema='spring') UNION ALL (SELECT 1 as found FROM information_schema.views WHERE table_schema='spring' LIMIT 1) UNION ALL ...)` (1064: parenthesized UNION ALL members with LIMIT, over tables, views, table_constraints, triggers, routines);
+  - `SELECT COUNT(1) FROM information_schema.schemata WHERE schema_name=? LIMIT 1` (1235 at execute, server-side prepared);
+  - `SET foreign_key_checks=?, sql_safe_updates=?` (1235 at prepare);
+  - `SELECT SUBSTRING_INDEX(USER(),'@',1)` (1064 text, 1235 prepared);
+  - `SELECT event_name FROM information_schema.events WHERE event_schema=...` (1064);
+  - probes whose failure Flyway tolerates but that turso answers differently:
+    `SELECT @@GLOBAL.ENFORCE_GTID_CONSISTENCY` (1193),
+    `select VARIABLE_VALUE from performance_schema.global_variables where variable_name = 'pxc_strict_mode'` and
+    `SELECT variable_name FROM performance_schema.user_variables_by_thread WHERE variable_value IS NOT NULL` (1064),
+    `SHOW DATABASES LIKE 'RDSAdmin'` (1064).
+- **Hibernate `ddl-auto=validate`, and every JDBC schema tool:** Connector/J
+  9's `DatabaseMetaData.getColumns` is one information_schema query with long
+  `CASE`/`IF(LOCATE(...))` expressions and
+  `IS_NULLABLE COLLATE utf8mb3_general_ci = 'NO'` /
+  `EXTRA COLLATE utf8mb3_general_ci LIKE '%auto_increment%'`; turso answers
+  1064 (1235 in another shape). See 4 for the other metadata calls.
+
+## 3. Statements behind the blockers (P1)
+
+From the hand-primed runs above, and the drizzle/sequelize steps that did run:
+
+- **Hibernate / Spring Data JPA:**
+  `update posts p1_0 set views=(p1_0.views+1) where p1_0.views<5` (1235: UPDATE
+  with a table alias; every bulk JPQL update) and `delete p1_0 from posts p1_0`
+  (1235: multi-table DELETE syntax, `deleteAllInBatch`).
+- **Connector/J:** `SET SESSION TRANSACTION READ ONLY` / `READ WRITE` (1235),
+  sent for every `@Transactional(readOnly = true)`; Spring ignores the failure,
+  the connection is then not read-only, and an UPDATE inside a read-only
+  transaction runs on turso (against MySQL, Connector/J itself refuses it:
+  "Connection is read-only"). `COM_SET_OPTION` (0x1b, 1235): Connector/J turns
+  multi-statements on for a rewritten batch of UPDATEs
+  (`rewriteBatchedStatements=true`, Hibernate batched updates), so the batch
+  fails.
+- **Sequelize:**
+  - a join nested in parentheses, which every `belongsToMany` include
+    produces (1064):
+    ``... LEFT OUTER JOIN ( `post_tags` AS `tags->PostTag` INNER JOIN `tags` AS `tags` ON `tags`.`id` = `tags->PostTag`.`tag_id`) ON `Post`.`id` = `tags->PostTag`.`post_id` ...``;
+  - ``SAVEPOINT `45b6574b-4115-421c-92d9-43e3c00dad7b-sp-1` `` and
+    `ROLLBACK TO SAVEPOINT` with such a name (1235: backquoted savepoint names
+    with `-`; every nested Sequelize transaction);
+  - an aggregate without GROUP BY next to joined columns (1064):
+    ``SELECT max(`views`) AS `max`, `user`.`id` AS `user.id`, ... FROM `posts` AS `Post` INNER JOIN `users` AS `user` ON `Post`.`user_id` = `user`.`id` AND `user`.`email` = 'alice@example.com'``;
+  - `SHOW INDEX FROM users FROM sequelize` (1064; `queryInterface.showIndex`,
+    also used by `sync({ alter })` and `sync({ force })`);
+  - `SELECT COUNT(*) AS n FROM posts WHERE views >= ? AND title <> ?`
+    prepared (bind parameters): prepare succeeds, execute answers 1235;
+  - **table-name case:** a table created as `SequelizeMeta` is listed as
+    `sequelizemeta` by `information_schema.TABLES` (MySQL on Linux keeps the
+    case), so `undo:all` and any case-sensitive check see the wrong name.
+- **Drizzle:**
+  - `select 1 from dual` (1235);
+  - a named composite primary key in CREATE TABLE (1235):
+    ``CONSTRAINT `post_tags_post_id_tag_id` PRIMARY KEY(`post_id`,`tag_id`)``;
+    the migration's earlier tables stay created, so the migration is left half
+    applied (as it would be on MySQL, where DDL is not transactional either);
+  - a multi-row INSERT with `default` for some columns of some rows (1235):
+    ``insert into `posts` (`id`, `user_id`, ...) values (default, 1, 'Hello', ...), (default, 1, 'Draft', 'Not yet', default, 0), ...``;
+  - `JSON_SET` on a table-qualified column (1235):
+    ``update `users` set `profile` = JSON_SET(`users`.`profile`, '$.city', 'Kyoto') where `users`.`id` = 2``;
+  - `VALUES()` naming a table-qualified column in an upsert (1235):
+    ``on duplicate key update `name` = values(`tags`.`name`)``;
+  - information_schema columns qualified by the table name, used by
+    `drizzle-kit push` and `pull` (1235 at prepare):
+    `select * from INFORMATION_SCHEMA.STATISTICS WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'drizzle' and INFORMATION_SCHEMA.STATISTICS.INDEX_NAME != 'PRIMARY'`;
+  - relational queries (`db.query.users.findMany({ with: ... })`) send
+    `left join lateral (select coalesce(json_arrayagg(json_array(...)), json_array()) as data from (select *, row_number() over (order by ...) from posts ... where user_id = users.id) ...)`;
+    not yet reached on turso past the missing tables.
+- **sqlx** (from the mysql CLI, since sqlx cannot connect): its session setup
+  `SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci`
+  answers 1235 and leaves `@@sql_mode` and `@@time_zone` unchanged; with
+  `PIPES_AS_CONCAT` unset, `SELECT 'a' || 'b'` is 1064 (MySQL: 0 with a
+  warning).
+
+## 4. Schema browsers and JDBC metadata (P1)
+
+Connector/J `DatabaseMetaData` (what DBeaver, IntelliJ, DbVisualizer and
+Hibernate call):
+
+- default (information_schema) mode: `getColumns` (1064, the query in 2),
+  `getCrossReference` (1064,
+  `SELECT DISTINCT A.REFERENCED_TABLE_SCHEMA AS PKTABLE_CAT, ... FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE A ...`),
+  `getIndexInfo` (1235,
+  `SELECT TABLE_SCHEMA AS TABLE_CAT, NULL AS TABLE_SCHEM, TABLE_NAME, NON_UNIQUE, ... FROM INFORMATION_SCHEMA.STATISTICS ...`),
+  `getBestRowIdentifier` (1064, `SELECT 2 AS SCOPE, COLUMN_NAME, CASE ...`),
+  `getTablePrivileges` (1064, `INFORMATION_SCHEMA.TABLE_PRIVILEGES`).
+  `getTables`, `getPrimaryKeys`, `getImportedKeys`, `getExportedKeys`,
+  `getCatalogs`, `getTypeInfo` and `getSQLKeywords` work.
+- `useInformationSchema=false` (SHOW) mode: `SHOW KEYS FROM posts FROM dbtools`
+  and `SHOW INDEX FROM users FROM dbtools` (1064, `getPrimaryKeys`,
+  `getIndexInfo`), `SHOW FUNCTION STATUS WHERE Db = 'dbtools' AND Name LIKE '%'`
+  (1064, `getProcedures`/`getFunctions`),
+  `SELECT host, db, table_name, grantor, user, table_priv FROM mysql.tables_priv ...`
+  (1064), and `SHOW FULL TABLES FROM <another database>` (1235) while
+  `getExportedKeys` scans every database.
+- **Result-set metadata differs** (what a result grid and every JDBC
+  `ResultSetMetaData` user reads) for
+  `SELECT u.id, u.balance, ... FROM users u JOIN posts p ...`:
+  `users.id` BIGINT AUTO_INCREMENT reports scale 66 and no auto-increment flag
+  (MySQL: scale 0, auto-increment); `users.balance` DECIMAL(10,2) reports
+  precision 11, scale 0 (MySQL: 10, 2).
+
+Statements the GUIs send (modeled, see above):
+
+- DBeaver: `SHOW PLUGINS` (1235), `SELECT * FROM information_schema.VIEWS WHERE TABLE_SCHEMA=...`
+  (1235), `information_schema.TRIGGERS`, `.EVENTS` and `.PARTITIONS` (1064).
+- MySQL Workbench: `SET @@SESSION.autocommit = ON` and `SET SQL_SAFE_UPDATES=1`
+  (1235), `SELECT st.* FROM performance_schema.events_statements_current st JOIN performance_schema.threads thr ...`
+  (1064), `EXPLAIN SELECT ...` and `EXPLAIN FORMAT=JSON SELECT ...` (1235).
+- TablePlus: `information_schema.TABLES` with `ENGINE`, `TABLE_ROWS`,
+  `TABLE_COMMENT` (1054 unknown column), and
+  `SHOW TABLE STATUS FROM dbtools WHERE Name = 'users'` (1064).
+
+## Suggested priority
+
+1. The two handshakes (1.1, 1.2): each closes a whole language ecosystem, and
+   each is a validation rule, not missing SQL.
+2. The migration-table DDL (`UNIQUE` + `PRIMARY KEY` on one column, `SERIAL`,
+   `CHARSET=utf8`) and Flyway's startup queries: they stop Sequelize, Drizzle
+   and every Flyway project before a single table exists.
+3. Connector/J `getColumns` and `getIndexInfo` (Hibernate validate, DBeaver,
+   IntelliJ), `SET SESSION TRANSACTION READ ONLY` (silently weakens every
+   read-only Spring transaction), `COM_SET_OPTION`, UPDATE/DELETE with a table
+   alias (Hibernate bulk operations).
+4. The Sequelize shapes (nested join in parentheses, savepoint names with `-`,
+   `SHOW INDEX ... FROM db`, table-name case) and the Drizzle shapes (`DUAL`,
+   named composite PK, `default` in multi-row INSERT, qualified columns in
+   `JSON_SET`, `VALUES()` and information_schema).
+5. Result-set metadata of BIGINT AUTO_INCREMENT and DECIMAL columns, then the
+   GUI-only statements (EXPLAIN, SHOW PLUGINS, information_schema.VIEWS /
+   TRIGGERS / EVENTS / PARTITIONS, SHOW TABLE STATUS ... WHERE,
+   performance_schema).
+
+Also seen in the check run of the mysql CLI app: `COM_STATISTICS` (0x09, the
+CLI's `status`) answers 1235; the step still passes.
+
+## Harness changes in this run
+
+- `COMPOSE_PROJECT_NAME` and `E2E_CARGO_TARGET_VOLUME` let a second copy of
+  the harness run beside the main one.
+- The proxy logs a handshake the server closes without answering, as an
+  `authenticate` entry naming the client's capabilities, collation and plugin,
+  and `E2E_PROXY_DUMP=1` writes every packet in hex to `packets.txt`.

@@ -26,6 +26,20 @@ mysql/e2e/frameworks/run.sh --down            # stop and remove the servers
 `--up` rebuilds the server from the checkout, so after a server change run
 `--up` again before `--dev`.
 
+To run a second copy of the harness at the same time (from another checkout
+or worktree), give it its own names; otherwise the two share containers, the
+network and the server build cache, and the cache then holds a build of the
+other checkout's source:
+
+```bash
+COMPOSE_PROJECT_NAME=turso-e2e-more E2E_CARGO_TARGET_VOLUME=turso-e2e-more-cargo-target \
+  mysql/e2e/frameworks/run.sh sequelize
+```
+
+`E2E_PROXY_DUMP=1` also writes every packet, in hex, to
+`.run/results/<app>/<target>/packets.txt`, which shows why a server closed a
+connection before any statement.
+
 Requirements: Docker with a Linux engine (Docker Desktop is fine), about 10 GB
 of disk for the build cache and images. Nothing is built into the checkout's
 `target/`.
@@ -69,6 +83,12 @@ the error code, SQLSTATE and message) to
 | `sqlalchemy` | SQLAlchemy 2.0, Alembic, PyMySQL | `alembic upgrade`, `alembic check`, inspector, ORM |
 | `rails` | ActiveRecord 8.0, mysql2 | `db:migrate`, `db:schema:dump`, `db:rollback` |
 | `gorm` | GORM, go-sql-driver | `AutoMigrate`, Migrator introspection, associations |
+| `sequelize` | Sequelize 6, mysql2 | `sequelize-cli db:migrate` / `undo` / `undo:all`, `sync({ alter })`, associations, `findAndCountAll`, optimistic locking, nested transactions |
+| `drizzle` | Drizzle ORM, drizzle-kit, mysql2 | `drizzle-kit migrate`, `push` and `pull` introspection, relational queries (LATERAL + JSON_ARRAYAGG), savepoints, a revert migration |
+| `spring` | Spring Boot 3.5, Hibernate 6, Flyway, Connector/J 9 | Flyway migrate / clean, `ddl-auto=validate`, repositories, JPQL and native `@Query`, `@Version`, pessimistic locks, batched statements; the whole flow with `useServerPrepStmts` false (`client-prep/`) and true (`server-prep/`) |
+| `efcore` | EF Core 9, Pomelo, MySqlConnector | `dotnet ef database update` up and down, `dbcontext scaffold`, LINQ, row-version concurrency, savepoints, `EnsureCreated` |
+| `sqlx` | sqlx 0.8 and its CLI (Rust) | `sqlx migrate run` / `info` / `revert`, `database reset`, strictly typed `query()` over prepared statements, multi-statement `raw_sql` |
+| `dbtools` | Connector/J 9 | `DatabaseMetaData` as DBeaver uses it (information_schema and SHOW modes), result-set metadata, and the connect/browse statements of DBeaver, MySQL Workbench and TablePlus (modeled on their general logs, not captured from the GUIs) |
 
 Each app writes one JSON line per step to `steps.jsonl`
 (`{"step", "ok", "error"}`) and keeps going after a failed step. A step or
@@ -95,3 +115,13 @@ Runs remove their containers and network. Kept for speed:
 docker volume rm turso-e2e-cargo-registry turso-e2e-cargo-git turso-e2e-cargo-target turso-e2e-go-cache
 docker image rm $(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^turso-e2e-fw-')
 ```
+
+The Maven (spring, dbtools) and Rust (sqlx) app builds also keep BuildKit
+cache mounts with the ids `turso-e2e-m2`, `turso-e2e-sqlx-registry` and
+`turso-e2e-sqlx-target`; `docker buildx du --filter type=exec.cachemount
+--verbose` lists them, and `docker builder prune --filter
+type=exec.cachemount` removes every cache mount, these included.
+
+A second copy started with `COMPOSE_PROJECT_NAME` and
+`E2E_CARGO_TARGET_VOLUME` keeps its own target volume and images under its own
+prefix; remove those the same way.
