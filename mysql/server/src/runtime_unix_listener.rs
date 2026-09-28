@@ -25,8 +25,9 @@ use crate::unix_socket_fs::{
 };
 use crate::{
     AccountAdministration, AccountStoreAdminAuthority, AccountStoreCheckpointReader,
-    RuntimeAccountAdministration, RuntimeAccountReload, RuntimeAccountStore,
-    RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts, UnixSocketPolicy,
+    ErrPacketConfig, PacketCodec, RuntimeAccountAdministration, RuntimeAccountReload,
+    RuntimeAccountStore, RuntimeAccountStoreError, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
+    UnixSocketPolicy, MAX_PACKET_PAYLOAD_LEN,
 };
 
 /// A blocking local listener that owns its private socket directory lease.
@@ -340,8 +341,10 @@ impl RuntimeUnixListener {
             return Err(RuntimeUnixListenerError::ShuttingDown);
         }
         self.peer_verifier.verify(&stream).map_err(map_peer_error)?;
-        let permits = ConnectionPermits::acquire(&self.control.permits)
-            .map_err(RuntimeUnixListenerError::ConnectionLimit)?;
+        let permits = ConnectionPermits::acquire(&self.control.permits).map_err(|error| {
+            refuse_past_limit(&stream, error);
+            RuntimeUnixListenerError::ConnectionLimit(error)
+        })?;
         stream
             .set_nonblocking(false)
             .map_err(|_| RuntimeUnixListenerError::TransportConfiguration)?;
@@ -408,6 +411,37 @@ fn recover_unpublished_endpoint(
         Ok(true) => original_error,
         Ok(false) | Err(_) => RuntimeUnixListenerError::SocketCleanupRequired,
     }
+}
+
+/// Answers a client refused because a limit is full, then leaves the stream to
+/// be closed by its owner.
+fn refuse_past_limit(stream: &UnixStream, error: ConnectionLimitError) {
+    if !error.is_full() || stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    // One write that cannot wait: a peer that does not read loses the answer
+    // rather than holding up the accept loop.
+    let mut writer = stream;
+    let _ = writer.write(&too_many_connections_packet());
+}
+
+/// The answer MySQL 8.4 gives in place of its greeting to a client past
+/// `max_connections`, read byte for byte on 8.4.11 over TCP, with and without
+/// `require_secure_transport`: error 1040 `Too many connections` as packet 0,
+/// then the connection closes. Nothing has been negotiated yet, so the packet
+/// has the old form without a SQLSTATE, and clients report `HY000`, as `mysql`
+/// did over MySQL's socket too. It names no account and nothing about the
+/// server, so it is as safe to send before TLS as the greeting it replaces.
+pub(crate) fn too_many_connections_packet() -> Vec<u8> {
+    let codec =
+        PacketCodec::new(MAX_PACKET_PAYLOAD_LEN).expect("the wire maximum is a valid limit");
+    ErrPacketConfig {
+        error_code: 1040,
+        sql_state: *b"08004",
+        message: b"Too many connections".to_vec(),
+    }
+    .encode(codec, 0, 0)
+    .expect("the fixed 1040 packet must encode")
 }
 
 impl fmt::Debug for RuntimeUnixListener {
@@ -1395,6 +1429,14 @@ pub enum ConnectionLimitError {
     Unavailable,
 }
 
+impl ConnectionLimitError {
+    /// Whether the client was refused because a limit is full, rather than
+    /// because the limits could not be read.
+    pub(crate) const fn is_full(self) -> bool {
+        matches!(self, Self::ConnectionsExhausted | Self::AdmissionsExhausted)
+    }
+}
+
 impl fmt::Display for ConnectionLimitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2201,6 +2243,46 @@ mod tests {
         let third = listener.accept().unwrap();
         drop(third);
         drop(third_client);
+    }
+
+    /// Measured on MySQL 8.4.11: a client past `max_connections` reads 1040
+    /// as packet 0, in place of the greeting and without a SQLSTATE, then end
+    /// of stream; `mysql` over MySQL's socket reported the same 1040 `HY000`. A client refused because too
+    /// many others are still signing in is answered the same way.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_client_past_a_full_limit_reads_too_many_connections_then_end_of_stream() {
+        for (max_connections, max_admissions, refusal) in [
+            (1, 1, ConnectionLimitError::ConnectionsExhausted),
+            (2, 1, ConnectionLimitError::AdmissionsExhausted),
+        ] {
+            let (listener, _data_root, _account_root, _socket_directory, endpoint) = runtime(
+                limits(max_connections, max_admissions),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+            );
+            let first_client = UnixStream::connect(&endpoint).unwrap();
+            let first = listener.accept().unwrap();
+
+            let mut refused_client = UnixStream::connect(&endpoint).unwrap();
+            refused_client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            assert!(matches!(
+                listener.accept(),
+                Err(RuntimeUnixListenerError::ConnectionLimit(error)) if error == refusal
+            ));
+            let mut answer = Vec::new();
+            refused_client.read_to_end(&mut answer).unwrap();
+            assert_eq!(answer, b"\x17\x00\x00\x00\xff\x10\x04Too many connections");
+
+            drop(first);
+            drop(first_client);
+            let next_client = UnixStream::connect(&endpoint).unwrap();
+            let next = listener.accept().unwrap();
+            drop(next);
+            drop(next_client);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -1756,6 +1756,13 @@ mod tests {
     }
 
     fn server_runtime_with_shutdown(shutdown_timeout: Duration) -> ServerRuntime {
+        server_runtime_with(
+            shutdown_timeout,
+            RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).unwrap(),
+        )
+    }
+
+    fn server_runtime_with(shutdown_timeout: Duration, limits: RuntimeLimits) -> ServerRuntime {
         let data_root = private_directory();
         let account_root = private_directory();
         let mut password = b"secret".to_vec();
@@ -1793,7 +1800,7 @@ mod tests {
             account_root.path().canonicalize().unwrap(),
             CheckpointAuthorityId::new("runtime-checkpoints").unwrap(),
             Duration::from_secs(60),
-            RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).unwrap(),
+            limits,
             RuntimeTimeouts::new(
                 Duration::from_secs(1),
                 Duration::from_secs(1),
@@ -1851,6 +1858,10 @@ mod tests {
     }
 
     fn connect_and_close_after_greeting(server: &RuntimeTcpServer) {
+        drop(connect_after_greeting(server));
+    }
+
+    fn connect_after_greeting(server: &RuntimeTcpServer) -> TcpStream {
         let mut client = TcpStream::connect(server.local_addr()).unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -1862,6 +1873,7 @@ mod tests {
         assert!(payload_length <= crate::MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH);
         let mut payload = vec![0; payload_length];
         client.read_exact(&mut payload).unwrap();
+        client
     }
 
     #[test]
@@ -1947,5 +1959,34 @@ mod tests {
         assert_eq!(report.connection_errors(), 2);
         assert_eq!(report.worker_panics(), 0);
         assert_eq!(report.remaining_workers(), 0);
+    }
+
+    /// Measured on MySQL 8.4.11 with `--max-connections=2` and
+    /// `require_secure_transport`: the client past the limit reads 1040 as
+    /// packet 0, before TLS and in place of the greeting, then end of stream.
+    #[test]
+    fn a_client_past_the_connection_limit_reads_too_many_connections_and_gets_no_worker() {
+        let runtime = server_runtime_with(
+            Duration::from_secs(2),
+            RuntimeLimits::new(1, 1, MIN_WRITE_LIMIT, 16).unwrap(),
+        );
+        let running_server = Arc::clone(&runtime.server);
+        let accept_loop = thread::spawn(move || running_server.run());
+        wait_for_run_start(&runtime.server);
+
+        let admitted = connect_after_greeting(&runtime.server);
+        let mut refused = TcpStream::connect(runtime.server.local_addr()).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut answer = Vec::new();
+        refused.read_to_end(&mut answer).unwrap();
+        assert_eq!(answer, b"\x17\x00\x00\x00\xff\x10\x04Too many connections");
+
+        drop(admitted);
+        let report = runtime.server.shutdown();
+        assert!(accept_loop.join().unwrap().is_ok());
+        assert!(report.drained());
+        assert_eq!(report.workers_started(), 1);
     }
 }

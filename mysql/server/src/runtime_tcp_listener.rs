@@ -18,6 +18,7 @@ use crate::runtime_account_reload_supervisor::{
     RuntimeAccountReloadSupervisor, RuntimeAccountReloadSupervisorJoinError,
 };
 use crate::runtime_tcp_connection::{RuntimeTcpConnection, RuntimeTcpConnectionError};
+use crate::runtime_unix_listener::too_many_connections_packet;
 use crate::{
     AccountAdministration, AccountStoreAdminAuthority, AccountStoreCheckpointReader,
     ConnectionLimitError, RuntimeAccountAdministration, RuntimeAccountReload, RuntimeAccountStore,
@@ -204,8 +205,10 @@ impl RuntimeTcpListener {
         if self.is_shutting_down() {
             return Err(RuntimeTcpListenerError::ShuttingDown);
         }
-        let permits = ConnectionPermits::acquire(&self.control.permits)
-            .map_err(RuntimeTcpListenerError::ConnectionLimit)?;
+        let permits = ConnectionPermits::acquire(&self.control.permits).map_err(|error| {
+            refuse_past_limit(&stream, error);
+            RuntimeTcpListenerError::ConnectionLimit(error)
+        })?;
         stream
             .set_nonblocking(false)
             .map_err(|_| RuntimeTcpListenerError::TransportConfiguration)?;
@@ -330,6 +333,19 @@ impl RuntimeTcpListener {
         self.control.finish_shutdown(report);
         report
     }
+}
+
+/// Answers a client refused because a limit is full, then leaves the stream to
+/// be closed by its owner. The answer goes out before TLS, where MySQL sends
+/// it too; see `too_many_connections_packet`.
+fn refuse_past_limit(stream: &TcpStream, error: ConnectionLimitError) {
+    if !error.is_full() || stream.set_nonblocking(true).is_err() {
+        return;
+    }
+    // One write that cannot wait: a client that does not read loses the answer
+    // rather than holding up the accept loop.
+    let mut writer = stream;
+    let _ = writer.write(&too_many_connections_packet());
 }
 
 /// A cloneable, non-blocking request to stop one TCP listener.
@@ -1465,19 +1481,31 @@ mod tests {
     ) -> ProtocolRuntime {
         protocol_runtime_with(
             RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).expect("test limits"),
-            RuntimeTimeouts::new(
-                Duration::from_secs(1),
-                tls_timeout,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-            )
-            .expect("test timeouts")
-            .with_query_timeout(Duration::from_secs(1))
-            .expect("query timeout"),
+            short_timeouts(tls_timeout),
             maximum,
         )
+    }
+
+    fn protocol_runtime_with_limits(limits: RuntimeLimits) -> ProtocolRuntime {
+        protocol_runtime_with(
+            limits,
+            short_timeouts(Duration::from_secs(1)),
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+        )
+    }
+
+    fn short_timeouts(tls_timeout: Duration) -> RuntimeTimeouts {
+        RuntimeTimeouts::new(
+            Duration::from_secs(1),
+            tls_timeout,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .expect("test timeouts")
+        .with_query_timeout(Duration::from_secs(1))
+        .expect("query timeout")
     }
 
     /// A runtime that can take and send payloads longer than one packet, and
@@ -1885,6 +1913,51 @@ mod tests {
         drop(accepted);
         drop(client);
         assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// Measured on MySQL 8.4.11: a client past `max_connections` reads 1040 as
+    /// packet 0, before TLS and in place of the greeting, in the old form
+    /// without a SQLSTATE, then end of stream. A client refused because too
+    /// many others are still signing in is answered the same way.
+    #[test]
+    fn a_client_past_a_full_limit_reads_too_many_connections_then_end_of_stream() {
+        for (max_connections, max_admissions, refusal) in [
+            (1, 1, ConnectionLimitError::ConnectionsExhausted),
+            (2, 1, ConnectionLimitError::AdmissionsExhausted),
+        ] {
+            let runtime = protocol_runtime_with_limits(
+                RuntimeLimits::new(max_connections, max_admissions, MIN_WRITE_LIMIT, 16)
+                    .expect("test limits"),
+            );
+            let address = runtime.listener.local_addr();
+            let first_client = TcpStream::connect(address).expect("first client");
+            let first = runtime.listener.accept().expect("first client is admitted");
+
+            let mut refused_client = TcpStream::connect(address).expect("refused client");
+            refused_client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("client read timeout");
+            assert!(matches!(
+                runtime.listener.accept(),
+                Err(RuntimeTcpListenerError::ConnectionLimit(error)) if error == refusal
+            ));
+            let mut answer = Vec::new();
+            refused_client
+                .read_to_end(&mut answer)
+                .expect("the refusal, then end of stream");
+            assert_eq!(answer, b"\x17\x00\x00\x00\xff\x10\x04Too many connections");
+
+            drop(first);
+            drop(first_client);
+            let next_client = TcpStream::connect(address).expect("next client");
+            let next = runtime
+                .listener
+                .accept()
+                .expect("the refusal holds no permit once the admitted client leaves");
+            drop(next);
+            drop(next_client);
+            assert!(runtime.listener.shutdown().drained());
+        }
     }
 
     #[test]

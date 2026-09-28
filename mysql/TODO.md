@@ -497,7 +497,6 @@ speaks; anything measured here from now on has to pass that flag.
 | A statement several MiB long, such as one row of a dump's extended `INSERT` | taken, but the checked parsers read its text many times over: about 2 s a MiB in a debug build, linear in the length |
 | Long data for several parameters of a connection's statements, together over 64 MiB | answered 1105 at `COM_STMT_EXECUTE`; MySQL holds each parameter to `max_allowed_packet` on its own |
 | Multi-statement `COM_QUERY` beyond the bounded slice | negotiates `CLIENT_MULTI_STATEMENTS` and returns sequential results with `SERVER_MORE_RESULTS_EXISTS`. More than 32 statements and SQL whose delimiter changes under the session's backslash mode are refused before execution. An assembled response beyond 512 frames or 1 MiB closes the connection after execution, so preceding side effects may remain. A later statement can fail after earlier statements have run, as in MySQL. The runtime's configured write queue can impose a tighter limit |
-| A client that connects past `--max-connections`, or while `--max-admissions` others are still signing in | closed before its greeting without an answer; MySQL answers 1040 `Too many connections` in place of the greeting |
 
 ---
 
