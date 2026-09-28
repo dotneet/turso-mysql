@@ -235,7 +235,7 @@ fn is_unquoted_word(token: &Token, expected: &str) -> bool {
 }
 
 /// The byte offset one line-and-column location stands at.
-fn byte_offset_of(sql: &str, location: Location) -> Result<usize, ParseError> {
+pub(crate) fn byte_offset_of(sql: &str, location: Location) -> Result<usize, ParseError> {
     let (mut line, mut column) = (1, 1);
     for (offset, character) in sql.char_indices() {
         if line == location.line && column == location.column {

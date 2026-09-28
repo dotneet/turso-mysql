@@ -53,6 +53,7 @@ mod translate;
 mod trigger_definition;
 mod truncate_table;
 mod unknown_columns;
+mod updated_table_alias;
 mod view_definition;
 mod written_bytes;
 mod written_literals;
@@ -4905,6 +4906,8 @@ fn translate_dml(
     mut render_context: SelectRenderContext<'_>,
     decimal_columns: &[(String, u32)],
 ) -> Result<TranslatedDml, ParseError> {
+    let unaliased = updated_table_alias::without_the_updated_tables_alias(sql, mode)?;
+    let sql = unaliased.as_deref().unwrap_or(sql);
     let statement = parse_one_statement(sql, mode)?;
     let read_tables;
     let mut inherited_comparisons = Vec::new();

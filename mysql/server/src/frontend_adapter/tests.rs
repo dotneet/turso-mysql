@@ -30901,3 +30901,6 @@ mod connector_j_metadata;
 
 #[cfg(unix)]
 mod flyway_startup;
+
+#[cfg(unix)]
+mod hibernate_statements;
