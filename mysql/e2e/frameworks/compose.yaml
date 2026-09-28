@@ -209,3 +209,10 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-drizzle:local
     working_dir: /app
     command: ["./run.sh"]
+
+  spring:
+    <<: *app
+    build: ./apps/spring
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-spring:local
+    working_dir: /app
+    command: ["./run.sh"]
