@@ -563,6 +563,51 @@ impl MySqlSessionVariables {
                 ..CommandOkResult::default()
             })));
         }
+        if let Some(result) = self.read_session(
+            sql,
+            settings,
+            facts,
+            selected_database,
+            session_sql_mode,
+            status_flags,
+        )? {
+            return Ok(Some(result));
+        }
+        if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(self.user_variable_result(&query, status_flags)));
+        }
+        if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(Some(self.show_variables(
+                &command,
+                settings,
+                facts,
+                session_sql_mode,
+                status_flags,
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Answers a `SELECT` of `DATABASE()`, system variables and the calls
+    /// beside them, which read what the session knows and change nothing, or
+    /// nothing when `sql` is another statement.
+    ///
+    /// Measured on MySQL 8.4.11: each answers the same columns over the binary
+    /// protocol as over the text one, so a prepared one is answered from here
+    /// too.
+    pub(crate) fn read_session(
+        &self,
+        sql: &str,
+        settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
+        selected_database: Option<&str>,
+        session_sql_mode: SessionSqlMode,
+        status_flags: u16,
+    ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
         if let Some(query) = parse_optional_select_database(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -591,22 +636,6 @@ impl MySqlSessionVariables {
                 self,
             )
             .map(Some);
-        }
-        if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
-            .map_err(|_| FrontendErrorKind::Syntax)?
-        {
-            return Ok(Some(self.user_variable_result(&query, status_flags)));
-        }
-        if let Some(command) = parse_optional_show_variables(sql, SessionSqlMode::default())
-            .map_err(|_| FrontendErrorKind::Syntax)?
-        {
-            return Ok(Some(self.show_variables(
-                &command,
-                settings,
-                facts,
-                session_sql_mode,
-                status_flags,
-            )));
         }
         Ok(None)
     }

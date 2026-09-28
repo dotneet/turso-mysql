@@ -165,3 +165,127 @@ fn laravel_drops_every_table_in_one_statement() {
     ));
     assert!(!exists(&mut adapter, "cache"));
 }
+
+const LARAVEL_OPENS_WITH: &str = "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', SESSION sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'";
+
+/// The first statements Laravel and Prisma send on a connection read the
+/// server and the session, prepared. Measured on MySQL 8.4.11: each answers
+/// the same columns over the binary protocol as over the text one —
+/// `VERSION()` a NOT NULL `VAR_STRING` of 24, `DATABASE()` a nullable one of
+/// 256, each word variable a nullable one of 87380 — and a whole-number
+/// variable a `LONGLONG`.
+#[test]
+fn laravel_reads_the_server_and_the_session_prepared() {
+    let (_directory, mut adapter) = adapter();
+    adapter.execute_query(LARAVEL_OPENS_WITH).unwrap();
+    for (sql, shapes) in [
+        (
+            "select version() as version, database() as db",
+            &[("version", 24, MYSQL_NOT_NULL_FLAG), ("db", 256, 0)][..],
+        ),
+        (
+            "select @@character_set_client as client, @@character_set_connection as conn, @@character_set_results as results, @@collation_connection as collation, @@sql_mode as sql_mode",
+            &[
+                ("client", 87380, 0),
+                ("conn", 87380, 0),
+                ("results", 87380, 0),
+                ("collation", 87380, 0),
+                ("sql_mode", 87380, 0),
+            ][..],
+        ),
+        (
+            "SELECT VERSION() AS version, DATABASE() AS db, @@character_set_client AS cs",
+            &[
+                ("version", 24, MYSQL_NOT_NULL_FLAG),
+                ("db", 256, 0),
+                ("cs", 87380, 0),
+            ][..],
+        ),
+        (
+            "SELECT @@version, @@GLOBAL.version",
+            &[("@@version", 87380, 0), ("@@GLOBAL.version", 87380, 0)][..],
+        ),
+    ] {
+        let prepared_columns = adapter.execute_stmt_prepare(sql).unwrap().columns;
+        assert_eq!(
+            prepared_columns
+                .iter()
+                .map(|column| (
+                    column.name.as_str(),
+                    column.column_length,
+                    column.flags,
+                    column.column_type
+                ))
+                .collect::<Vec<_>>(),
+            shapes
+                .iter()
+                .map(|(name, length, flags)| (*name, *length, *flags, MYSQL_TYPE_VAR_STRING))
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+        let Ok(CommandExecutionResult::ResultSet(text)) = adapter.execute_query(sql) else {
+            panic!("{sql} must answer a row as text");
+        };
+        let PreparedStatementExecutionResult::ResultSet(binary) = prepared(&mut adapter, sql, &[])
+        else {
+            panic!("{sql} must answer a row prepared");
+        };
+        assert_eq!(binary.columns, text.columns, "{sql}");
+        assert_eq!(
+            binary.rows,
+            text.rows
+                .iter()
+                .map(|row| row
+                    .iter()
+                    .map(|value| BinaryResultValue::Text(
+                        String::from_utf8(value.clone().unwrap()).unwrap()
+                    ))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+    }
+    let PreparedStatementExecutionResult::ResultSet(settings) = prepared(
+        &mut adapter,
+        "select @@character_set_client as client, @@collation_connection as collation, @@autocommit",
+        &[],
+    ) else {
+        panic!("the settings must answer a row");
+    };
+    assert_eq!(
+        settings.rows,
+        [[
+            BinaryResultValue::Text("utf8mb4".to_owned()),
+            BinaryResultValue::Text("utf8mb4_unicode_ci".to_owned()),
+            BinaryResultValue::Integer(1),
+        ]]
+    );
+    assert_eq!(settings.columns[2].column_type, MYSQL_TYPE_LONGLONG);
+    // A variable the server does not have is 1193 when it is prepared, as it
+    // is when it is run.
+    assert_eq!(
+        adapter.execute_stmt_prepare("select @@no_such_variable as x"),
+        Err(FrontendErrorKind::UnknownSystemVariable)
+    );
+}
+
+/// A variable read beside a table's column is refused rather than answered
+/// 1054: the engine reads the variable as a column it does not have, and
+/// MySQL has no such column to miss.
+#[test]
+fn a_variable_beside_a_column_is_no_unknown_column() {
+    let (_directory, mut adapter) = adapter();
+    let sql = "select @@sql_mode as sql_mode, `id` from `records`";
+    assert_eq!(
+        adapter.execute_query(sql),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_stmt_prepare(sql),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("select `nope` from `records`"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+}

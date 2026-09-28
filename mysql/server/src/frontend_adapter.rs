@@ -232,9 +232,9 @@ struct DatabasePreparedStatement {
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
     catalog_query: Option<GormInformationSchemaPreparedQuery>,
-    /// A statement with no parameters and no rows that the checked prepared
-    /// path does not take, run through the text path when it is executed.
-    runs_as_text: Option<String>,
+    /// A statement the checked prepared path does not take, run through the
+    /// text path when it is executed.
+    runs_as_text: Option<RunAsText>,
     /// The checked statement's own text, which a window or a `UNION` reads its
     /// result columns' origins from each time it is executed.
     sql: Option<String>,
@@ -246,6 +246,17 @@ struct DatabasePreparedStatement {
     /// The text the client prepared, which `SHOW PROCESSLIST` shows while the
     /// statement runs.
     text: String,
+}
+
+/// What a prepared statement run through the text path answers.
+#[cfg(unix)]
+#[derive(Clone)]
+enum RunAsText {
+    /// No rows: a statement with no parameters, `CREATE TABLE` say.
+    NoRows(String),
+    /// The one row a read of what the session knows answers — `DATABASE()`,
+    /// `VERSION()` and system variables.
+    SessionRead(String),
 }
 
 #[cfg(unix)]
@@ -2320,6 +2331,21 @@ where
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
+        if let Some(read) = self.session_variables.read_session(
+            sql,
+            self.bootstrap_settings,
+            &self.connection_facts,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+            self.status_flags(),
+        )? {
+            let CommandExecutionResult::ResultSet(read) = read else {
+                return Err(FrontendErrorKind::Internal);
+            };
+            binary_session_read(read.clone())?;
+            return self
+                .prepare_text_statement(RunAsText::SessionRead(sql.to_owned()), read.columns);
+        }
         if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
             sql,
             self.session.session_sql_mode(),
@@ -2349,7 +2375,7 @@ where
                     self.session.session_sql_mode(),
                 ) =>
             {
-                self.prepare_text_statement(sql)
+                self.prepare_text_statement(RunAsText::NoRows(sql.to_owned()), Vec::new())
             }
             prepared => prepared,
         }
@@ -3406,14 +3432,18 @@ where
         result
     }
 
-    /// Retains a statement with no parameters and no rows that the checked
-    /// prepared path does not take — Laravel prepares every statement,
-    /// `CREATE TABLE` included — to be run through the text path when it is
-    /// executed, which is what executing it means.
+    /// Retains a statement the checked prepared path does not take — Laravel
+    /// prepares every statement, `CREATE TABLE` and `SELECT VERSION()`
+    /// included — to be run through the text path when it is executed, which
+    /// is what executing it means. `columns` are the ones it answers, none for
+    /// a statement answering no rows.
     fn prepare_text_statement(
         &mut self,
-        sql: &str,
+        statement: RunAsText,
+        columns: Vec<ColumnDefinitionConfig>,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        let (RunAsText::NoRows(sql) | RunAsText::SessionRead(sql)) = &statement;
+        let text = sql.clone();
         let database = self
             .session
             .selected_database()
@@ -3445,16 +3475,16 @@ where
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
                 catalog_query: None,
-                runs_as_text: Some(sql.to_owned()),
+                runs_as_text: Some(statement),
                 sql: None,
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
-                text: sql.to_owned(),
+                text,
             },
         );
         Ok(PreparedStatementResult {
             statement_id,
             parameters: Vec::new(),
-            columns: Vec::new(),
+            columns,
             warnings: 0,
             status_flags: self.status_flags(),
         })
@@ -3474,18 +3504,26 @@ where
         {
             return self.execute_gorm_catalog_query(statement_id, parameter_payload);
         }
-        if let Some(sql) = self
+        if let Some(statement) = self
             .prepared_statements
             .statements
             .get(&statement_id)
             .and_then(|statement| statement.runs_as_text.clone())
         {
             self.pending_long_data.take_statement(statement_id);
-            return match self.execute_query_statement(&sql)? {
-                CommandExecutionResult::Ok(result) => {
-                    Ok(PreparedStatementExecutionResult::Ok(result))
-                }
-                CommandExecutionResult::ResultSet(_) => Err(FrontendErrorKind::Internal),
+            return match statement {
+                RunAsText::NoRows(sql) => match self.execute_query_statement(&sql)? {
+                    CommandExecutionResult::Ok(result) => {
+                        Ok(PreparedStatementExecutionResult::Ok(result))
+                    }
+                    CommandExecutionResult::ResultSet(_) => Err(FrontendErrorKind::Internal),
+                },
+                RunAsText::SessionRead(sql) => match self.execute_query_statement(&sql)? {
+                    CommandExecutionResult::ResultSet(read) => {
+                        binary_session_read(read).map(PreparedStatementExecutionResult::ResultSet)
+                    }
+                    CommandExecutionResult::Ok(_) => Err(FrontendErrorKind::Internal),
+                },
             };
         }
         let (database, source_tables, read_only_select) = self
@@ -5025,6 +5063,49 @@ impl ProjectionOrigins {
         }
         Ok(columns)
     }
+}
+
+/// The row a read of what the session knows answers, in the binary protocol's
+/// form: a whole number as one and every word as text, which is how MySQL
+/// sends a `LONGLONG`, a `VAR_STRING` and a `NEWDECIMAL` there.
+#[cfg(unix)]
+fn binary_session_read(read: TextResultSet) -> Result<BinaryResultSet, FrontendErrorKind> {
+    let rows = read
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .zip(&read.columns)
+                .map(|(value, column)| {
+                    let Some(value) = value else {
+                        return Ok(BinaryResultValue::Null);
+                    };
+                    let value =
+                        String::from_utf8(value).map_err(|_| FrontendErrorKind::Internal)?;
+                    match column.column_type {
+                        MYSQL_TYPE_LONGLONG if column.flags & MYSQL_UNSIGNED_FLAG != 0 => value
+                            .parse()
+                            .map(BinaryResultValue::UnsignedInteger)
+                            .map_err(|_| FrontendErrorKind::Internal),
+                        MYSQL_TYPE_LONGLONG => value
+                            .parse()
+                            .map(BinaryResultValue::Integer)
+                            .map_err(|_| FrontendErrorKind::Internal),
+                        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_NEWDECIMAL => {
+                            Ok(BinaryResultValue::Text(value))
+                        }
+                        _ => Err(FrontendErrorKind::Unsupported),
+                    }
+                })
+                .collect()
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(BinaryResultSet {
+        columns: read.columns,
+        rows,
+        warnings: read.warnings,
+        status_flags: read.status_flags,
+    })
 }
 
 fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendErrorKind {
@@ -11174,6 +11255,13 @@ fn format_mysql_scaled_integer(value: i64, scale: u8) -> String {
 fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
     match error {
         LimboError::NotNullConstraint { .. } => FrontendErrorKind::NotNullViolation,
+        // The engine reads a variable MySQL answers from the session —
+        // `@@version` beside a column, which only a statement of variables
+        // alone is answered for here — as a column it does not have. MySQL
+        // takes the statement, so it is refused rather than answered 1054.
+        LimboError::NoSuchColumn { name } if name.starts_with('@') => {
+            FrontendErrorKind::Unsupported
+        }
         LimboError::NoSuchColumn { .. } => FrontendErrorKind::UnknownColumn,
         LimboError::AmbiguousColumn { .. } => FrontendErrorKind::AmbiguousColumn,
         LimboError::Assignment(error)
