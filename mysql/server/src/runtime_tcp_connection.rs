@@ -15,6 +15,7 @@ use std::{
 
 use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
 
+use crate::connection_facts::MySqlConnectionFacts;
 use crate::runtime_tcp_listener::{AcceptedTcpStream, RuntimeTcpListenerError};
 use crate::{
     AuthorizedDatabaseAdapterFactory, CachingSha2Verifier, ClassicConnectionOrchestrator,
@@ -460,6 +461,10 @@ impl RuntimeTcpConnection {
         .with_query_timeout(timeouts.query())
         .with_bootstrap_settings(MAX_ALLOWED_PACKET, timeouts.idle())
         .with_net_write_timeout(timeouts.write());
+        factory = factory.with_connection_facts(MySqlConnectionFacts::over_tcp(
+            stream.connection_id(),
+            stream.peer_address(),
+        ));
         if let Some(administration) = stream.account_administration() {
             factory = factory.with_account_administration(administration);
         }

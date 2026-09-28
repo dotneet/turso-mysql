@@ -99,13 +99,13 @@ use crate::{
     AuthorizationError, DatabaseAction, DatabaseAuthorizer, TableAction,
 };
 use crate::{
-    decode_statement_execute_parameters_with_long_data, BinaryResultSet, BinaryResultValue,
-    ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
-    CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
-    PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
-    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
-    MAX_RESULT_COLUMNS, MAX_ROW_PAYLOAD_LENGTH, MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT,
-    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
+    decode_statement_execute_parameters_with_long_data, ArrivedCommand, BinaryResultSet,
+    BinaryResultValue, ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult,
+    CommandExecutor, CommandOkResult, FrontendErrorKind, InitialDatabaseSelector,
+    PreparedStatementExecutionResult, PreparedStatementResult, StatementExecuteDecodeError,
+    StatementParameterType, StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION,
+    MAX_DISPATCH_RESULT_ROWS, MAX_RESULT_COLUMNS, MAX_ROW_PAYLOAD_LENGTH,
+    MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -645,6 +645,13 @@ where
         command_options: CommandExecutionOptions,
     ) -> Result<Self::Executor, AuthorizationError> {
         let named_locks = self.catalog.named_locks().session();
+        let mut connection_facts = self.connection_facts;
+        // Without a name the user calls are refused; the login itself stands.
+        if let Ok(Some(name)) = self.authorizer.schema_creator_username(&principal) {
+            connection_facts = connection_facts.with_account_name(name);
+        }
+        let mut session_variables = crate::session_variables::MySqlSessionVariables::default();
+        session_variables.start_counting_statements();
         Ok(AuthorizedDatabaseCommandAdapter {
             session: self.catalog.new_session_with_prepared_statement_authority(
                 self.schema_context,
@@ -656,9 +663,9 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             bootstrap_settings: self.bootstrap_settings,
-            connection_facts: self.connection_facts,
+            connection_facts,
             account_administration: self.account_administration,
-            session_variables: crate::session_variables::MySqlSessionVariables::default(),
+            session_variables,
             raised_warnings: Vec::new(),
             command_options,
             prepared_statements: DatabasePreparedStatementRegistry::default(),
@@ -1991,11 +1998,16 @@ where
         self.session_variables.net_write_timeout()
     }
 
+    fn command_arrived(&mut self, command: ArrivedCommand) {
+        self.session_variables.note_command_arrived(command);
+    }
+
     fn execute_init_db(
         &mut self,
         database: &str,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
         self.select_database(database)?;
+        self.session_variables.note_database_selected();
         Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
     }
 
@@ -2006,7 +2018,9 @@ where
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         self.error_message = None;
         let result = self.execute_client_query(sql);
-        self.answer_what_is_missing(sql, result)
+        let result = self.answer_what_is_missing(sql, result);
+        self.session_variables.note_statement_outcome(sql, &result);
+        result
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {

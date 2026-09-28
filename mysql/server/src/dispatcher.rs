@@ -209,6 +209,20 @@ impl CommandExecutionOptions {
     }
 }
 
+/// Which kind of command arrived, as far as what the last command changed and
+/// found is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrivedCommand {
+    /// `COM_QUERY`.
+    Query,
+    /// `COM_INIT_DB`.
+    InitDb,
+    /// `COM_PING`.
+    Ping,
+    /// Any other command, and a packet that did not read as one.
+    Other,
+}
+
 /// Injection point for query and default-database execution.
 pub trait CommandExecutor {
     /// Returns the current MySQL server status flags for connection-level responses.
@@ -251,6 +265,11 @@ pub trait CommandExecutor {
     fn session_net_write_timeout(&self) -> Option<std::time::Duration> {
         None
     }
+
+    /// Hears that a command arrived, before it runs, which is how a session
+    /// keeps what `ROW_COUNT()` and `FOUND_ROWS()` read in step with commands
+    /// it is not otherwise told about.
+    fn command_arrived(&mut self, _command: ArrivedCommand) {}
 
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
@@ -362,6 +381,15 @@ impl CommandDispatcher {
         executor: &mut E,
         command: Result<ClassicCommandPacket<'_>, ConnectionStateError>,
     ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+        executor.command_arrived(match &command {
+            Ok(command) => match command.command {
+                ClassicCommand::Query { .. } => ArrivedCommand::Query,
+                ClassicCommand::InitDb { .. } => ArrivedCommand::InitDb,
+                ClassicCommand::Ping => ArrivedCommand::Ping,
+                _ => ArrivedCommand::Other,
+            },
+            Err(_) => ArrivedCommand::Other,
+        });
         let command = match command {
             Ok(command) => command,
             Err(ConnectionStateError::Command(error)) if is_unsupported_command(&error) => {

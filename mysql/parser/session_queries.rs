@@ -55,7 +55,16 @@ pub fn parse_optional_select_database(
     let call = sql[start..scanner.cursor].to_owned();
 
     scanner.skip_gaps();
-    let alias = scanner.take_alias()?;
+    let alias = if scanner.at_keyword("LIMIT") {
+        None
+    } else {
+        scanner.take_alias()?
+    };
+    scanner.skip_gaps();
+    // A list of calls, or a limit, is for the reader of session calls.
+    if scanner.at_byte(b',') || scanner.at_keyword("LIMIT") {
+        return Ok(None);
+    }
     if !scanner.at_end() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
@@ -78,11 +87,31 @@ impl MySqlSystemVariableQuery {
     }
 }
 
+/// A call answering what the session knows about itself rather than a
+/// variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlSessionCall {
+    /// `DATABASE()` or `SCHEMA()`.
+    Database,
+    /// `USER()`, `SESSION_USER()` or `SYSTEM_USER()`: the name the client
+    /// logged in with and the host it came from.
+    User,
+    /// `CURRENT_USER()` or `CURRENT_USER`: the account the server matched.
+    CurrentUser,
+    /// `CONNECTION_ID()`.
+    ConnectionId,
+    /// `ROW_COUNT()`: what the last statement changed.
+    RowCount,
+    /// `FOUND_ROWS()`: how many rows the last `SELECT` answered.
+    FoundRows,
+}
+
 /// One system variable a `SELECT` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlSystemVariableRead {
     name: String,
     scope: MySqlVariableScope,
+    session_call: Option<MySqlSessionCall>,
     /// Whether `SESSION.` or `LOCAL.` was written before the name.
     session_named: bool,
     called: bool,
@@ -111,6 +140,12 @@ impl MySqlSystemVariableRead {
     /// variable only the server has.
     pub fn names_the_session(&self) -> bool {
         self.session_named
+    }
+
+    /// Returns the call this reads, when it reads what the session knows
+    /// about itself rather than a variable. [`Self::name`] is empty then.
+    pub fn session_call(&self) -> Option<MySqlSessionCall> {
+        self.session_call
     }
 
     /// Returns whether the version was asked for as a call rather than as a
@@ -201,6 +236,7 @@ fn take_system_variable_read(
     let mut session_named = false;
     let mut called = false;
     let mut zone_conversion = None;
+    let mut session_call = None;
     let name = if scanner.take_keyword("CONVERT_TZ") {
         let Some(zones) = take_zone_conversion_probe(scanner) else {
             return Ok(None);
@@ -218,6 +254,9 @@ fn take_system_variable_read(
         }
         called = true;
         "version".to_owned()
+    } else if let Some(call) = take_session_call(scanner) {
+        session_call = Some(call);
+        String::new()
     } else {
         if !scanner.take_byte(b'@') || !scanner.take_byte(b'@') {
             return Ok(None);
@@ -254,11 +293,49 @@ fn take_system_variable_read(
     Ok(Some(MySqlSystemVariableRead {
         name,
         scope,
+        session_call,
         session_named,
         called,
         zone_conversion,
         column_name: alias.unwrap_or(expression),
     }))
+}
+
+/// Reads one call answering what the session knows about itself.
+///
+/// Each takes an empty argument list; `CURRENT_USER` may also be written
+/// without one, which MySQL names the column after as written.
+fn take_session_call(scanner: &mut Scanner) -> Option<MySqlSessionCall> {
+    let start = scanner.cursor;
+    for (name, call) in [
+        ("DATABASE", MySqlSessionCall::Database),
+        ("SCHEMA", MySqlSessionCall::Database),
+        ("USER", MySqlSessionCall::User),
+        ("SESSION_USER", MySqlSessionCall::User),
+        ("SYSTEM_USER", MySqlSessionCall::User),
+        ("CURRENT_USER", MySqlSessionCall::CurrentUser),
+        ("CONNECTION_ID", MySqlSessionCall::ConnectionId),
+        ("ROW_COUNT", MySqlSessionCall::RowCount),
+        ("FOUND_ROWS", MySqlSessionCall::FoundRows),
+    ] {
+        if !scanner.take_keyword(name) {
+            continue;
+        }
+        let after_name = scanner.cursor;
+        scanner.skip_gaps();
+        if scanner.take_byte(b'(') {
+            scanner.skip_gaps();
+            if scanner.take_byte(b')') {
+                return Some(call);
+            }
+        } else if call == MySqlSessionCall::CurrentUser {
+            scanner.cursor = after_name;
+            return Some(call);
+        }
+        scanner.cursor = start;
+        return None;
+    }
+    None
 }
 
 /// Reads the rest of `CONVERT_TZ('<moment>', from, to) IS NOT NULL`.
@@ -961,7 +1038,6 @@ mod tests {
         // zero, which asks for no row.
         for sql in [
             "SELECT 1",
-            "SELECT DATABASE()",
             "SELECT id FROM users",
             "SELECT @@version, 1",
             "SELECT @@version,",
@@ -969,6 +1045,77 @@ mod tests {
             "",
         ] {
             assert_eq!(read(sql), None, "{sql}");
+        }
+    }
+
+    /// What the `mysql` client's `status` and Django's connect read, and the
+    /// other calls answering what the session knows about itself. Measured
+    /// on MySQL 8.4.11: each column is named after the call as written, and
+    /// `CURRENT_USER` may go without its parentheses.
+    #[test]
+    fn reads_the_calls_a_session_answers_about_itself() {
+        let calls = |sql: &str| {
+            parse_optional_system_variable_query(sql, SessionSqlMode::default())
+                .unwrap()
+                .unwrap()
+                .reads()
+                .iter()
+                .map(|read| (read.session_call(), read.column_name().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            calls("select DATABASE(), USER() limit 1"),
+            [
+                (Some(MySqlSessionCall::Database), "DATABASE()".to_owned()),
+                (Some(MySqlSessionCall::User), "USER()".to_owned()),
+            ]
+        );
+        assert_eq!(
+            calls("SELECT VERSION(), @@character_set_client, schema () AS s"),
+            [
+                (None, "VERSION()".to_owned()),
+                (None, "@@character_set_client".to_owned()),
+                (Some(MySqlSessionCall::Database), "s".to_owned()),
+            ]
+        );
+        assert_eq!(
+            calls(
+                "SELECT CURRENT_USER, current_user(), SESSION_USER(), SYSTEM_USER(), \
+                 CONNECTION_ID(), ROW_COUNT(), FOUND_ROWS()"
+            ),
+            [
+                (
+                    Some(MySqlSessionCall::CurrentUser),
+                    "CURRENT_USER".to_owned()
+                ),
+                (
+                    Some(MySqlSessionCall::CurrentUser),
+                    "current_user()".to_owned()
+                ),
+                (Some(MySqlSessionCall::User), "SESSION_USER()".to_owned()),
+                (Some(MySqlSessionCall::User), "SYSTEM_USER()".to_owned()),
+                (
+                    Some(MySqlSessionCall::ConnectionId),
+                    "CONNECTION_ID()".to_owned()
+                ),
+                (Some(MySqlSessionCall::RowCount), "ROW_COUNT()".to_owned()),
+                (Some(MySqlSessionCall::FoundRows), "FOUND_ROWS()".to_owned()),
+            ]
+        );
+        // A bare name is a column, and a call with an argument is not one of
+        // these.
+        for sql in [
+            "SELECT USER",
+            "SELECT USER FROM t",
+            "SELECT DATABASE",
+            "SELECT USER('x')",
+            "SELECT CONNECTION_ID",
+        ] {
+            assert_eq!(
+                parse_optional_system_variable_query(sql, SessionSqlMode::default()).unwrap(),
+                None,
+                "{sql}"
+            );
         }
     }
 
@@ -1020,6 +1167,10 @@ mod tests {
             "SHOW DATABASES",
             "SELECT DATABASE",
             "SELECT SCHEMATA()",
+            // A list, or a limit, is read with the other session calls.
+            "SELECT DATABASE(), 1",
+            "SELECT DATABASE() AS d, USER()",
+            "SELECT DATABASE() LIMIT 1",
             "",
         ] {
             assert_eq!(column_name(sql), None, "{sql}");
@@ -1029,8 +1180,7 @@ mod tests {
     #[test]
     fn refuses_the_shapes_it_cannot_answer() {
         for sql in [
-            // MySQL answers these; this query surface takes one column only.
-            "SELECT DATABASE(), 1",
+            // MySQL answers this; this query surface takes one column only.
             "SELECT DATABASE() FROM t",
             "SELECT DATABASE() AS",
             "SELECT DATABASE(x)",

@@ -5062,8 +5062,40 @@ column, and the column is otherwise named after the call as the client wrote it,
 spacing and case included, which is what MySQL 8.4.11 does. The column is a
 `VAR_STRING` of length 256 with no flags and `decimals` 31, measured.
 
-Forms with a second projection or a `FROM` clause are refused rather than
-answered, because this surface returns one column and reads no table. Every
+`DATABASE()` is also read beside the session's variables and the other calls
+answering what a session knows about itself — `select DATABASE(), USER() limit
+1`, which the `mysql` client's `status` sends, and Django's `SELECT VERSION(),
+@@character_set_client, DATABASE()`, sent on every connection. Measured on
+8.4.11 and matched: `USER()`, `SESSION_USER()` and `SYSTEM_USER()` are the name
+the client logged in with at the host it came from, and `CURRENT_USER()` —
+`CURRENT_USER` without parentheses too — the account the login matched, each a
+nullable `VAR_STRING` of 1152 with 31 decimals. Every account here is one for
+any host, so `CURRENT_USER()` reads `name@%`. This server looks no name up, so
+the host is the client's address, as MySQL writes it under `skip_name_resolve`
+(`app@172.17.0.9` on the oracle), with an IPv4 client a dual-stack socket
+reports inside IPv6 written as the IPv4 address; a client on the Unix socket
+comes from `localhost`. `CONNECTION_ID()` is the ID the handshake sent, a NOT
+NULL unsigned `LONGLONG` of 21.
+
+`ROW_COUNT()` and `FOUND_ROWS()`, each a NOT NULL signed `LONGLONG` of 21, read
+what the last command did, by rules measured one command at a time on 8.4.11: a
+fresh connection reads 0 for both; a statement answering rows makes
+`ROW_COUNT()` -1 and `FOUND_ROWS()` the rows it answered — a `SHOW` too, but
+`SHOW WARNINGS` leaves `FOUND_ROWS()` alone; one answering OK makes
+`ROW_COUNT()` the rows its OK reports and leaves `FOUND_ROWS()` alone; one that
+fails makes `ROW_COUNT()` -1; and `COM_PING` and `COM_INIT_DB` make
+`ROW_COUNT()` 0. Where the effect was not measured, or is one this server does
+not report, the count is not known and a call reading it is refused until a
+statement says what it is again: `FOUND_ROWS()` after an `UPDATE` (MySQL makes
+it the rows the `UPDATE` matched), after `SHOW ERRORS`, and both after a
+prepared-statement command, a `COM_RESET_CONNECTION`, or a `COM_QUERY` refused
+before any statement of it ran. `SQL_CALC_FOUND_ROWS`, which asks `FOUND_ROWS()`
+for the rows a `LIMIT` left out, is refused; MySQL has deprecated it. A
+connection the runtime did not accept knows neither its login nor its ID nor
+its counts, and refuses each of these calls.
+
+These calls are read only as a whole `SELECT` of such calls and variables:
+beside a `FROM`, inside an expression or prepared, they are refused. Every
 other statement still needs a selected database, which MySQL does not require:
 MySQL runs `SELECT 1` and a bare `SET` with no database at all, and this
 frontend answers 1046 because a query has no Core connection until a database

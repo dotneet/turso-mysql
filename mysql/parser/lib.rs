@@ -150,7 +150,7 @@ pub use select_projection_origins::{
 pub use session_queries::{
     parse_optional_named_lock_query, parse_optional_select_database,
     parse_optional_system_variable_query, parse_optional_user_variable_query, MySqlNamedLockCall,
-    MySqlNamedLockFunction, MySqlNamedLockQuery, MySqlSelectDatabaseQuery,
+    MySqlNamedLockFunction, MySqlNamedLockQuery, MySqlSelectDatabaseQuery, MySqlSessionCall,
     MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableQuery,
     MySqlUserVariableRead,
 };

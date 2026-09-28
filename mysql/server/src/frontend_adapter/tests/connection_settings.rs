@@ -396,6 +396,7 @@ fn the_socket_is_the_one_this_server_listens_on() {
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut local = factory
         .with_connection_facts(MySqlConnectionFacts::on_unix_socket(
+            7,
             b"/run/turso/mysql.sock".to_vec(),
         ))
         .build(AuthenticatedPrincipal::from_account_id_for_testing(

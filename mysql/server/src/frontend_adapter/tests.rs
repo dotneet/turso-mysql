@@ -30775,8 +30775,6 @@ mod character_set_listings;
 
 #[cfg(unix)]
 mod check_constraints;
-
-#[cfg(unix)]
 mod database_collation;
 
 #[cfg(unix)]
@@ -30790,3 +30788,6 @@ mod refused_values;
 
 #[cfg(unix)]
 mod missing_tables;
+
+#[cfg(unix)]
+mod session_readings;

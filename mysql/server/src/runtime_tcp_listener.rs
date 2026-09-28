@@ -434,6 +434,12 @@ impl AcceptedTcpStream {
         self.lease.connection_id()
     }
 
+    /// Returns the address the client connected from, if the socket still
+    /// knows it.
+    pub(crate) fn peer_address(&self) -> Option<std::net::IpAddr> {
+        self.stream.peer_addr().ok().map(|address| address.ip())
+    }
+
     /// Starts protocol work if shutdown has not begun.
     pub(crate) fn begin_protocol_work(&self) -> Result<(), RuntimeTcpListenerError> {
         self.lease.begin_protocol_work()

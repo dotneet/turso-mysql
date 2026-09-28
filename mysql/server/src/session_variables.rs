@@ -4,7 +4,7 @@ use std::time::Duration;
 use turso_mysql_parser::{
     parse_optional_select_database, parse_optional_session_settings, parse_optional_show_variables,
     parse_optional_system_variable_query, parse_optional_user_variable_query,
-    MySqlSelectDatabaseQuery, MySqlSessionSetting, MySqlShowVariablesCommand,
+    MySqlSelectDatabaseQuery, MySqlSessionCall, MySqlSessionSetting, MySqlShowVariablesCommand,
     MySqlSystemVariableQuery, MySqlSystemVariableRead, MySqlUserVariableAssignment,
     MySqlUserVariableQuery, MySqlUserVariableValue, MySqlVariableScope, SessionSqlMode,
 };
@@ -13,7 +13,7 @@ use turso_mysql::MySqlIsolationLevel;
 
 use crate::{
     connection_facts::MySqlConnectionFacts,
-    dispatcher::{SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS},
+    dispatcher::{ArrivedCommand, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS},
     frontend_adapter::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
         MYSQL_NO_DEFAULT_VALUE_FLAG, MYSQL_NUM_FLAG, MYSQL_UNSIGNED_FLAG, NOT_FIXED_DECIMALS,
@@ -147,7 +147,7 @@ enum CheckedAssignment {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct MySqlSessionVariables {
     sql_notes: bool,
     /// Whether a row this session writes has to name a parent that is there.
@@ -211,6 +211,24 @@ pub(crate) struct MySqlSessionVariables {
     /// selected it, `None` with no database selected. The caller keeps this
     /// up to date before every statement.
     database_collation: Option<turso_mysql_parser::MySqlTableCollation>,
+    /// What the last command changed and found, which `ROW_COUNT()` and
+    /// `FOUND_ROWS()` read.
+    statement_counts: StatementCounts,
+}
+
+/// What the last command changed and found.
+///
+/// Each count is known only after a command whose effect on it was measured
+/// on MySQL 8.4.11, and a call reading one that is not known is refused. A
+/// fresh session knows neither until it is told it began, so a connection
+/// the runtime did not accept never answers them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StatementCounts {
+    row_count: Option<i64>,
+    found_rows: Option<u64>,
+    /// Whether a `COM_QUERY` arrived and no statement of it reached this
+    /// session yet: one refused before it ran leaves what it did unknown.
+    query_unanswered: bool,
 }
 
 /// The `sql_mode` flags a session may turn on or off.
@@ -271,6 +289,7 @@ impl Default for MySqlSessionVariables {
             group_concat_max_len: turso_mysql::DEFAULT_GROUP_CONCAT_MAX_LEN,
             connection_collation: ConnectionCollation::default(),
             database_collation: None,
+            statement_counts: StatementCounts::default(),
         }
     }
 }
@@ -285,6 +304,89 @@ impl MySqlSessionVariables {
 
     pub(crate) const fn sql_notes(&self) -> bool {
         self.sql_notes
+    }
+
+    /// Starts counting what each command changes and finds, for a session
+    /// that has just logged in. Measured on MySQL 8.4.11, a fresh connection
+    /// reads 0 for both.
+    pub(crate) fn start_counting_statements(&mut self) {
+        self.statement_counts = StatementCounts {
+            row_count: Some(0),
+            found_rows: Some(0),
+            query_unanswered: false,
+        };
+    }
+
+    /// Notes that a command arrived, before it runs.
+    ///
+    /// Measured on MySQL 8.4.11: `COM_PING` sets `ROW_COUNT()` to 0 and leaves
+    /// `FOUND_ROWS()` alone. What a `COM_INIT_DB` does is noted once it has
+    /// run. Every other command's effect was not measured, so both counts
+    /// become unknown.
+    pub(crate) fn note_command_arrived(&mut self, command: ArrivedCommand) {
+        let counts = &mut self.statement_counts;
+        if counts.query_unanswered {
+            counts.row_count = None;
+            counts.found_rows = None;
+            counts.query_unanswered = false;
+        }
+        match command {
+            ArrivedCommand::Query => counts.query_unanswered = true,
+            ArrivedCommand::Ping => counts.row_count = Some(0),
+            ArrivedCommand::InitDb => counts.row_count = None,
+            ArrivedCommand::Other => {
+                counts.row_count = None;
+                counts.found_rows = None;
+            }
+        }
+    }
+
+    /// Notes that a `COM_INIT_DB` selected a database, which leaves
+    /// `ROW_COUNT()` at 0 and `FOUND_ROWS()` alone, measured on MySQL 8.4.11.
+    pub(crate) fn note_database_selected(&mut self) {
+        self.statement_counts.row_count = Some(0);
+    }
+
+    /// Notes what one statement of a `COM_QUERY` did.
+    ///
+    /// Measured on MySQL 8.4.11: a statement answering rows makes
+    /// `ROW_COUNT()` -1 and `FOUND_ROWS()` the number of rows answered —
+    /// `SHOW` statements included, apart from `SHOW WARNINGS`, which leaves
+    /// `FOUND_ROWS()` alone; one answering OK makes `ROW_COUNT()` the rows it
+    /// reports changed and leaves `FOUND_ROWS()` alone, apart from an
+    /// `UPDATE`, which makes it the rows it matched; and one that fails makes
+    /// `ROW_COUNT()` -1 and leaves `FOUND_ROWS()` alone. An `UPDATE` does not
+    /// say here how many rows it matched, and `SHOW ERRORS` was not measured,
+    /// so each leaves `FOUND_ROWS()` unknown.
+    pub(crate) fn note_statement_outcome(
+        &mut self,
+        sql: &str,
+        outcome: &Result<CommandExecutionResult, FrontendErrorKind>,
+    ) {
+        let counts = &mut self.statement_counts;
+        counts.query_unanswered = false;
+        let first_words = leading_words(sql);
+        match outcome {
+            Err(_) => counts.row_count = Some(-1),
+            Ok(CommandExecutionResult::ResultSet(result)) => {
+                counts.row_count = Some(-1);
+                if first_words.eq_ignore_ascii_case("SHOW ERRORS") {
+                    counts.found_rows = None;
+                } else if !first_words.eq_ignore_ascii_case("SHOW WARNINGS") {
+                    counts.found_rows = Some(result.rows.len() as u64);
+                }
+            }
+            Ok(CommandExecutionResult::Ok(ok)) => {
+                counts.row_count = i64::try_from(ok.affected_rows).ok();
+                if first_words
+                    .split(' ')
+                    .next()
+                    .is_some_and(|word| word.eq_ignore_ascii_case("UPDATE"))
+                {
+                    counts.found_rows = None;
+                }
+            }
+        }
     }
 
     /// The collation ID every text column of a result reports.
@@ -472,11 +574,14 @@ impl MySqlSessionVariables {
             // shape.
             return system_variable_result(
                 &query,
-                session_sql_mode,
-                settings,
-                status_flags,
+                SessionReadings {
+                    session_sql_mode,
+                    settings,
+                    status_flags,
+                    facts,
+                    selected_database,
+                },
                 self,
-                facts,
             )
             .map(Some);
         }
@@ -1244,15 +1349,31 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
 /// and is NOT NULL. The lengths are the ones MySQL reports under utf8mb4.
 fn system_variable_result(
     query: &MySqlSystemVariableQuery,
-    session_sql_mode: SessionSqlMode,
-    settings: MySqlBootstrapSettings,
-    status_flags: u16,
+    readings: SessionReadings<'_>,
     session_variables: &MySqlSessionVariables,
-    facts: &MySqlConnectionFacts,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let SessionReadings {
+        session_sql_mode,
+        settings,
+        status_flags,
+        facts,
+        selected_database,
+    } = readings;
     let mut columns = Vec::with_capacity(query.reads().len());
     let mut row = Vec::with_capacity(query.reads().len());
     for read in query.reads() {
+        if let Some(call) = read.session_call() {
+            let (column, value) = session_call_column(
+                read,
+                call,
+                facts,
+                selected_database,
+                session_variables.statement_counts,
+            )?;
+            columns.push(column);
+            row.push(value);
+            continue;
+        }
         // Measured on MySQL 8.4.11: `@@SESSION.socket` is 1238, the socket
         // being the server's rather than a session's.
         if read.names_the_session() && read.name().eq_ignore_ascii_case("socket") {
@@ -1294,6 +1415,106 @@ fn system_variable_result(
         warnings: 0,
         status_flags,
     }))
+}
+
+/// What a `SELECT` of variables and session calls is answered from, beside
+/// the session's own variables.
+#[derive(Clone, Copy)]
+struct SessionReadings<'a> {
+    session_sql_mode: SessionSqlMode,
+    settings: MySqlBootstrapSettings,
+    status_flags: u16,
+    facts: &'a MySqlConnectionFacts,
+    selected_database: Option<&'a str>,
+}
+
+/// Answers one call reading what the session knows about itself, with the
+/// column MySQL reports it in.
+///
+/// Measured on MySQL 8.4.11: the user calls answer a nullable `VAR_STRING` of
+/// 1152 and `DATABASE()` one of 256, each with 31 decimals and NULL for no
+/// database; `CONNECTION_ID()` a NOT NULL unsigned `LONGLONG` of 21; and
+/// `ROW_COUNT()` and `FOUND_ROWS()` a NOT NULL signed `LONGLONG` of 21. A
+/// call whose answer this session does not know is refused.
+fn session_call_column(
+    read: &MySqlSystemVariableRead,
+    call: MySqlSessionCall,
+    facts: &MySqlConnectionFacts,
+    selected_database: Option<&str>,
+    counts: StatementCounts,
+) -> Result<(ColumnDefinitionConfig, Option<Vec<u8>>), FrontendErrorKind> {
+    let known = |value: Option<String>| value.ok_or(FrontendErrorKind::Unsupported);
+    let (words_width, value) = match call {
+        MySqlSessionCall::Database => (256, selected_database.map(str::to_owned)),
+        MySqlSessionCall::User => (1152, Some(known(facts.user())?)),
+        MySqlSessionCall::CurrentUser => (1152, Some(known(facts.current_user())?)),
+        MySqlSessionCall::ConnectionId => {
+            let id = known(facts.connection_id().map(|id| id.to_string()))?;
+            return Ok((counted_call_column(read, true), Some(id.into_bytes())));
+        }
+        MySqlSessionCall::RowCount => {
+            let count = known(counts.row_count.map(|count| count.to_string()))?;
+            return Ok((counted_call_column(read, false), Some(count.into_bytes())));
+        }
+        MySqlSessionCall::FoundRows => {
+            let count = known(counts.found_rows.map(|count| count.to_string()))?;
+            return Ok((counted_call_column(read, false), Some(count.into_bytes())));
+        }
+    };
+    let mut column =
+        ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
+    column.catalog = "def".into();
+    column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column.column_length = words_width;
+    column.decimals = NOT_FIXED_DECIMALS;
+    Ok((column, value.map(String::into_bytes)))
+}
+
+fn counted_call_column(read: &MySqlSystemVariableRead, unsigned: bool) -> ColumnDefinitionConfig {
+    let mut column =
+        ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_LONGLONG);
+    column.catalog = "def".into();
+    column.character_set = MYSQL_BINARY_COLLATION;
+    column.column_length = 21;
+    column.decimals = 0;
+    column.flags = MYSQL_NOT_NULL_FLAG
+        | MYSQL_BINARY_FLAG
+        | MYSQL_NUM_FLAG
+        | if unsigned { MYSQL_UNSIGNED_FLAG } else { 0 };
+    column
+}
+
+/// The first two words of a statement, joined by one space, past any comment
+/// before them.
+fn leading_words(sql: &str) -> String {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("/*") {
+            if after.starts_with('!') {
+                break;
+            }
+            rest = after
+                .split_once("*/")
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else if let Some(after) = rest.strip_prefix("--") {
+            rest = after
+                .split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else if let Some(after) = rest.strip_prefix('#') {
+            rest = after
+                .split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.split_ascii_whitespace()
+        .take(2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Answers one variable a `SELECT` reads, with the column MySQL reports it in.

@@ -216,6 +216,7 @@ where
     .with_bootstrap_settings(MAX_ALLOWED_PACKET, timeouts.idle())
     .with_net_write_timeout(timeouts.write())
     .with_connection_facts(MySqlConnectionFacts::on_unix_socket(
+        stream.connection_id(),
         stream.socket_path().as_os_str().as_bytes().to_vec(),
     ));
     if let Some(administration) = stream.account_administration() {
