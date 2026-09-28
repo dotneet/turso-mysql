@@ -4117,9 +4117,35 @@ fn typed_select_keeps_non_decimal_casts_and_defaulted_aggregates() {
         translated.parse_ast().unwrap();
     }
 
+    // A total over a `DECIMAL` falls back on a zero written to its places.
+    for sql in [
+        "SELECT IFNULL(SUM(money), 0) FROM readings",
+        "SELECT COALESCE(SUM(money), 0.0) FROM readings",
+    ] {
+        let translated = parse_select_knowing_decimal_columns(
+            sql,
+            SessionSqlMode::default(),
+            &[],
+            &["money".to_string()],
+            &[],
+            &[],
+            &[],
+            &[("money".to_string(), 2)],
+        )
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        assert!(
+            translated
+                .sqlite_sql
+                .starts_with("SELECT coalesce(mysql_decimal_sum(\"money\"), '0.00')"),
+            "{sql}: {}",
+            translated.sqlite_sql
+        );
+    }
+
     for sql in [
         "SELECT CAST(money AS SIGNED) FROM readings",
-        "SELECT IFNULL(SUM(money), 0) FROM readings",
+        "SELECT IFNULL(SUM(money), 5) FROM readings",
+        "SELECT COALESCE(SUM(money), 0.000) FROM readings",
     ] {
         assert!(
             parse_select_knowing_decimal_columns(

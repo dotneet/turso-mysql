@@ -6316,8 +6316,19 @@ fn a_defaulted_aggregate_answers_the_aggregates_shape_and_never_null() {
         );
     }
 
+    // Over a DECIMAL the fallback is a zero, written to the sum's places.
+    let CommandExecutionResult::ResultSet(set) = adapter
+        .execute_query("SELECT IFNULL(SUM(amount), 0) FROM ag WHERE id > 100")
+        .unwrap()
+    else {
+        panic!("a total over a DECIMAL must return a result set");
+    };
+    assert_eq!(set.rows, vec![vec![Some(b"0.00".to_vec())]]);
+    assert_eq!(set.columns[0].column_type, MYSQL_TYPE_NEWDECIMAL);
+    assert_eq!(set.columns[0].column_length, 34);
+    assert_eq!(set.columns[0].decimals, 2);
     assert!(adapter
-        .execute_query("SELECT IFNULL(SUM(amount), 0) FROM ag")
+        .execute_query("SELECT IFNULL(SUM(amount), 1) FROM ag")
         .is_err());
 
     // The result column is named after the call as written, or after an alias.

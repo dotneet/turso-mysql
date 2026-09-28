@@ -2554,7 +2554,7 @@ fn names_an_aggregate_call(function: &sqlparser::ast::Function) -> bool {
         || matches!(
             static_select_metadata::scalar_call(function),
             Some(
-                StaticSelectMetadata::DefaultedAggregate(_)
+                StaticSelectMetadata::DefaultedAggregate { .. }
                     | StaticSelectMetadata::ScalarCall {
                         function: static_select_metadata::ScalarFunction::CollectsBuiltJson,
                         ..
@@ -2596,12 +2596,16 @@ fn render_having_predicate(
         )),
         Expr::BinaryOp { left, op, right }
             if is_checked_select_comparison_operator(op)
-                && matches!(left.as_ref(), Expr::Function(function)
-                    if static_select_metadata::is_count_call(function)
-                        || aggregated_column(function).is_some()) =>
+                && compared_having_aggregate(left).is_some() =>
         {
-            let Expr::Function(function) = left.as_ref() else {
-                unreachable!("the guard requires a checked aggregate");
+            let (function, fallback) =
+                compared_having_aggregate(left).expect("the guard requires a checked aggregate");
+            let render_the_aggregate = |render_context: &mut SelectRenderContext<'_>| {
+                let rendered = render_aggregate_call(function, render_context);
+                match fallback {
+                    Some(fallback) => format!("coalesce({rendered}, {fallback})"),
+                    None => rendered,
+                }
             };
             let (rendered_right, rhs) =
                 render_checked_select_comparison_rhs(right, render_context)?;
@@ -2626,7 +2630,7 @@ fn render_having_predicate(
                     });
                 return Ok(format!(
                     "({} {} {rendered_right})",
-                    render_aggregate_call(function, render_context),
+                    render_the_aggregate(render_context),
                     checked_select_comparison_sql_operator(op)
                 ));
             }
@@ -2681,7 +2685,7 @@ fn render_having_predicate(
             }
             Ok(format!(
                 "({} {} {rendered_right})",
-                render_aggregate_call(function, render_context),
+                render_the_aggregate(render_context),
                 checked_select_comparison_sql_operator(op)
             ))
         }
@@ -2696,6 +2700,47 @@ fn render_having_predicate(
         } => render_checked_between(*negated, expr, low, high, render_context),
         _ => unsupported("HAVING predicate"),
     }
+}
+
+/// Reads the aggregate a `HAVING` compares — a count or an aggregate over a
+/// column — and the whole number it falls back on when it is written inside
+/// `COALESCE` or `IFNULL`, as Entity Framework Core writes
+/// `HAVING COALESCE(SUM(p.Views), 0) > 5`. The fallback stands where the
+/// aggregate answers NULL, over no rows, and the comparison is held to the
+/// column the aggregate reads the way the bare aggregate's is.
+fn compared_having_aggregate(expr: &Expr) -> Option<(&sqlparser::ast::Function, Option<i64>)> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let is_checked_aggregate = |function: &sqlparser::ast::Function| {
+        static_select_metadata::is_count_call(function) || aggregated_column(function).is_some()
+    };
+    if is_checked_aggregate(function) {
+        return Some((function, None));
+    }
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !["COALESCE", "IFNULL"]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call))
+        || function.over.is_some()
+        || function.filter.is_some()
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Function(aggregate),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    let fallback = direct_signed_integer(fallback)?;
+    is_checked_aggregate(aggregate).then_some((aggregate, Some(fallback)))
 }
 
 /// Reads `COALESCE(t.c, 0)` or `IFNULL(t.c, 0)` over a count a derived table
@@ -2719,7 +2764,10 @@ fn defaults_a_count_the_select_reads(
             counted_table.eq_ignore_ascii_case(&table.value)
                 && counted_column.eq_ignore_ascii_case(&column.value)
         })
-        .then(|| StaticSelectMetadata::DefaultedAggregate(Box::new(StaticSelectMetadata::Count)))
+        .then(|| StaticSelectMetadata::DefaultedAggregate {
+            aggregate: Box::new(StaticSelectMetadata::Count),
+            fallback_places: 0,
+        })
 }
 
 /// Each column a derived table of the `SELECT` projects as `COUNT(...) AS
@@ -8222,6 +8270,54 @@ fn set_member_order(
         .join(", "))
 }
 
+/// Renders `COALESCE(<aggregate over a DECIMAL>, 0)` — Entity Framework Core
+/// totals a `DECIMAL` as `COALESCE(SUM(balance), 0.0)` — as the aggregate, or
+/// over no rows a zero written to the aggregate's places, which is what MySQL
+/// answers there (`0.00`, measured on 8.4.11). Answers nothing for any other
+/// call, a zero with more places than the aggregate's included, which the
+/// refusal after it meets.
+fn render_a_decimal_aggregate_falling_back_on_zero(
+    function: &sqlparser::ast::Function,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Option<String> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !["COALESCE", "IFNULL"]
+        .iter()
+        .any(|call| name.value.eq_ignore_ascii_case(call))
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        aggregate @ Expr::Function(call),
+    )), sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(fallback))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    static_select_metadata::column_aggregate_argument(call)?;
+    let places = decimal_operand_scale(aggregate, render_context.decimal_columns)?;
+    let falls_back_on_zero = direct_signed_integer(fallback) == Some(0)
+        || static_select_metadata::written_zero_places(fallback)
+            .is_some_and(|written| written <= places);
+    if !falls_back_on_zero {
+        return None;
+    }
+    let zero = if places == 0 {
+        "0".to_owned()
+    } else {
+        format!("0.{}", "0".repeat(places as usize))
+    };
+    Some(format!(
+        "coalesce({}, '{zero}')",
+        render_aggregate_call(call, render_context)
+    ))
+}
+
 /// Renders one column a window partitions or orders by.
 fn render_window_column(
     expr: &Expr,
@@ -8256,6 +8352,11 @@ fn render_scalar_call(
         static_select_metadata::scalar_call(function)
     {
         return render_branches_call(name, function, &branches, render_context);
+    }
+    if let Some(rendered) =
+        render_a_decimal_aggregate_falling_back_on_zero(function, render_context)
+    {
+        return Ok(rendered);
     }
     let decimal_argument_scales = match &function.args {
         FunctionArguments::List(arguments) => arguments

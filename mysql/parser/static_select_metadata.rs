@@ -80,7 +80,15 @@ pub enum StaticSelectMetadata {
     /// `IFNULL(<aggregate>, <whole number>)`, which answers the shape the
     /// aggregate answers — never null, which is why it is written, and widened
     /// to a `BIGINT` when the aggregate answers any whole number.
-    DefaultedAggregate(Box<StaticSelectMetadata>),
+    ///
+    /// Entity Framework Core falls a total back on a zero written with places,
+    /// `COALESCE(SUM(balance), 0.0)`, which answers the aggregate's own shape
+    /// only where the aggregate answers a `DECIMAL` with at least those places;
+    /// `fallback_places` is how many were written, 0 for a whole number.
+    DefaultedAggregate {
+        aggregate: Box<StaticSelectMetadata>,
+        fallback_places: u32,
+    },
     /// A `CASE` or `IF` whose branches are whole numbers or name a column, or
     /// an `IFNULL` or `COALESCE` falling one column back onto another. The
     /// answer is a rule over every branch: the kind they share and the widest
@@ -1931,7 +1939,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
                     Value::SingleQuotedString(_) | Value::DoubleQuotedString(_)
                 )
         );
+        let fallback_places = written_zero_places(fallback);
         if !falls_back_on_a_word
+            && fallback_places.is_none()
             && !matches!(
                 classify_static_select_expr(fallback),
                 Some(StaticSelectMetadata::Integer { .. } | StaticSelectMetadata::Boolean(_))
@@ -1954,7 +1964,13 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             ) {
                 return None;
             }
-            return Some(StaticSelectMetadata::DefaultedAggregate(Box::new(inner)));
+            return Some(StaticSelectMetadata::DefaultedAggregate {
+                aggregate: Box::new(inner),
+                fallback_places: fallback_places.unwrap_or(0),
+            });
+        }
+        if fallback_places.is_some() {
+            return None;
         }
         let Expr::Identifier(column) = defaulted else {
             return None;
@@ -4255,4 +4271,20 @@ fn classify_integer(digits: &str, sign: StaticIntegerSign) -> Option<StaticSelec
         StaticIntegerSign::None | StaticIntegerSign::Positive => magnitude <= i64::MAX as u64,
     };
     in_range.then_some(StaticSelectMetadata::Integer { digit_count, sign })
+}
+
+/// The places of a zero written with a point — `0.0` has one — or nothing for
+/// anything else, a whole zero included.
+pub(crate) fn written_zero_places(expr: &Expr) -> Option<u32> {
+    let Expr::Value(value) = expr else {
+        return None;
+    };
+    let Value::Number(written, false) = &value.value else {
+        return None;
+    };
+    let (whole, places) = written.split_once('.')?;
+    let zeros = |digits: &str| !digits.is_empty() && digits.bytes().all(|digit| digit == b'0');
+    (zeros(whole) && zeros(places))
+        .then(|| u32::try_from(places.len()).ok())
+        .flatten()
 }

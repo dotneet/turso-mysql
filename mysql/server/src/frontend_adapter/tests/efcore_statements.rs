@@ -304,6 +304,84 @@ fn a_moment_written_as_a_timestamp_call_meets_a_moment_column() {
     );
 }
 
+/// A `GroupBy` totalling a `DECIMAL` writes `COALESCE(SUM(u.Balance), 0.0)`,
+/// and a `HAVING` over a total `COALESCE(SUM(p.Views), 0) > 5`. Both answered
+/// 1064.
+///
+/// Measured on MySQL 8.4.11: the fallen-back total answers the sum's own
+/// shape, never null — a `NEWDECIMAL` of 34 with 2 places over a
+/// `DECIMAL(10,2)` — and `0.00` over no rows. A zero with more places than
+/// the sum's (`0.000`: 35 with 3) or beside a sum of whole numbers (`0.0`:
+/// 35 with 1) answers another shape, and stays refused.
+#[test]
+fn a_total_falls_back_on_a_zero_written_with_places() {
+    let (_directory, mut adapter) = adapter();
+    let groups = result_set(
+        &mut adapter,
+        "SELECT `u`.`IsActive` AS `Active`, COUNT(*) AS `Count`, COALESCE(SUM(`u`.`Balance`), 0.0) AS `Total`, AVG(`u`.`Balance`) AS `Average`, MAX(`u`.`CreatedAt`) AS `Latest`\nFROM `Users` AS `u`\nGROUP BY `u`.`IsActive`\nHAVING COUNT(*) > 0\nORDER BY `u`.`IsActive`",
+    );
+    let shapes = groups
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.column_type,
+                column.column_length,
+                column.decimals,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shapes,
+        [
+            ("Active", MYSQL_TYPE_TINY, 1, 0),
+            ("Count", MYSQL_TYPE_LONGLONG, 21, 0),
+            ("Total", MYSQL_TYPE_NEWDECIMAL, 34, 2),
+            ("Average", MYSQL_TYPE_NEWDECIMAL, 16, 6),
+            ("Latest", MYSQL_TYPE_DATETIME, 26, 6),
+        ]
+    );
+    assert_eq!(
+        groups.columns[2].flags,
+        MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+    );
+    let totals = rows(
+        &mut adapter,
+        "SELECT `u`.`IsActive`, COUNT(*), COALESCE(SUM(`u`.`Balance`), 0.0), AVG(`u`.`Balance`) FROM `Users` AS `u` GROUP BY `u`.`IsActive` ORDER BY `u`.`IsActive`",
+    );
+    assert_eq!(
+        totals,
+        [
+            row(&["0", "1", "20.25", "20.250000"]),
+            row(&["1", "2", "105.50", "52.750000"])
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COALESCE(SUM(`u`.`Balance`), 0.0) FROM `Users` AS `u` WHERE `u`.`Id` = 0"
+        ),
+        [row(&["0.00"])]
+    );
+
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `p`.`UserId`\nFROM `Posts` AS `p`\nGROUP BY `p`.`UserId`\nHAVING COALESCE(SUM(`p`.`Views`), 0) > 2"
+        ),
+        [row(&["2"])]
+    );
+
+    for refused in [
+        "SELECT COALESCE(SUM(`u`.`Balance`), 0.000) FROM `Users` AS `u`",
+        "SELECT COALESCE(SUM(`p`.`Views`), 0.0) FROM `Posts` AS `p`",
+        "SELECT `p`.`UserId` FROM `Posts` AS `p` GROUP BY `p`.`UserId` HAVING COALESCE(MAX(`p`.`Title`), 0) > 2",
+    ] {
+        assert!(adapter.execute_query(refused).is_err(), "{refused}");
+    }
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

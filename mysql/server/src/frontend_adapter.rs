@@ -11307,7 +11307,9 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
         | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::FromARollup(inner) => needs_source_columns(inner),
         turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
-        | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner)
+        | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate {
+            aggregate: inner, ..
+        }
         | turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable {
             answer: inner, ..
         } => needs_source_columns(inner),
@@ -11371,13 +11373,28 @@ fn aggregate_column_definition(
         // whole number widens to a BIGINT there: `IFNULL(MAX(s), 0)` over a
         // SMALLINT answers LONGLONG while keeping the SMALLINT's length 6,
         // which is what `IFNULL` over a plain column does too.
-        turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate(inner) => {
+        //
+        // A zero written with places, `COALESCE(SUM(balance), 0.0)`, answers
+        // the aggregate's shape only where the aggregate answers a `DECIMAL`
+        // with at least those places: measured, `0.000` beside a sum of
+        // `DECIMAL(10,2)` answers 3 places, and `0.0` beside a sum of an `INT`
+        // a `DECIMAL` of 35 with 1.
+        turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate {
+            aggregate: inner,
+            fallback_places,
+        } => {
             let mut definition = match inner.as_ref() {
                 turso_mysql_parser::StaticSelectMetadata::Count => {
                     static_column_definition(name, inner).ok_or(FrontendErrorKind::Internal)?
                 }
                 inner => aggregate_column_definition(source_metadata, name, inner)?,
             };
+            if *fallback_places > 0
+                && (definition.column_type != MYSQL_TYPE_NEWDECIMAL
+                    || u32::from(definition.decimals) < *fallback_places)
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
             if matches!(
                 definition.column_type,
                 MYSQL_TYPE_TINY | MYSQL_TYPE_SHORT | MYSQL_TYPE_INT24 | MYSQL_TYPE_LONG

@@ -81,7 +81,7 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::WindowAggregate { .. }
         | StaticSelectMetadata::WindowCount
         | StaticSelectMetadata::ScalarSubquery(_)
-        | StaticSelectMetadata::DefaultedAggregate(_)
+        | StaticSelectMetadata::DefaultedAggregate { .. }
         | StaticSelectMetadata::Arithmetic(_)
         | StaticSelectMetadata::Branches { .. }
         | StaticSelectMetadata::AggregateOverBranches { .. }
