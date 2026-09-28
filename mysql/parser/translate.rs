@@ -33,6 +33,9 @@ pub struct MySqlSelectSource {
     reference: String,
     table: MySqlTableName,
     outer: bool,
+    /// Whether a subquery standing as a result column names this table's
+    /// columns from inside it.
+    read_by_a_result_subquery: bool,
     branch: usize,
     subquery: bool,
     projected_columns: Vec<String>,
@@ -340,6 +343,18 @@ impl MySqlSelectSource {
         self.outer
     }
 
+    /// Reports whether a subquery standing as a result column names this
+    /// table's columns from inside it — `SELECT users.*, (SELECT COUNT(*) FROM
+    /// posts WHERE users.id = posts.user_id)`.
+    ///
+    /// Measured on MySQL 8.4.11: each of the table's columns read as a result
+    /// column then reports no `NOT_NULL` flag, its key flags staying, as on
+    /// the outer side of a `LEFT JOIN`. A call or arithmetic over one keeps
+    /// its own shape, and an `EXISTS` naming the table changes nothing.
+    pub const fn read_by_a_result_subquery(&self) -> bool {
+        self.read_by_a_result_subquery
+    }
+
     /// Returns the columns a `WITH` name projects, in order.
     ///
     /// Empty for an ordinary table, whose columns are the table's own. A CTE
@@ -406,6 +421,9 @@ pub(crate) struct RenderedSelect {
     /// The columns a grouped statement projects beside its keys, which the
     /// frontend holds to what the keys decide.
     pub(crate) columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
+    /// Each name a subquery standing as a result column reads without a
+    /// table, with the table the subquery reads.
+    pub(crate) bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -674,6 +692,7 @@ pub(crate) fn translate_select_query(
         concatenates_groups: render_context.group_concat_calls > 0,
         calculates_found_rows: render_context.calculates_found_rows,
         columns_the_keys_decide: render_context.columns_the_keys_decide,
+        bare_names_in_result_subqueries: render_context.bare_names_in_result_subqueries,
     })
 }
 
@@ -920,8 +939,11 @@ fn render_select_body(
 
     render_context.counts_the_rows_of_the_derived_table =
         outer_projection && only_counts_the_rows_of_a_derived_table(select);
-    let (from, source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
+    let (from, mut source_tables) = render_from_clause_with(&select.from, Some(render_context))?;
     render_context.counts_the_rows_of_the_derived_table = false;
+    if outer_projection {
+        note_what_result_subqueries_read(select, &mut source_tables, render_context)?;
+    }
     // Some `information_schema` tables answer only a few of the columns MySQL
     // gives them, and a wildcard over one of those — which asks for all of
     // them — would answer a row of a different width than MySQL answers.
@@ -1031,6 +1053,82 @@ fn render_select_body(
         outer_projected_group_concats,
     );
     Ok((normalized, source_tables))
+}
+
+/// Notes which of the statement's tables each subquery standing as a result
+/// column names from inside it, and each name it reads without a table.
+///
+/// A qualified name says which table it reads. A bare name is the subquery's
+/// own table's column when that table has one, which only the frontend can
+/// see, so it is handed there to be held to that; a subquery written in a
+/// form this does not read through is refused.
+fn note_what_result_subqueries_read(
+    select: &sqlparser::ast::Select,
+    source_tables: &mut [MySqlSelectSource],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<(), ParseError> {
+    for item in &select.projection {
+        let (SelectItem::UnnamedExpr(Expr::Subquery(subquery))
+        | SelectItem::ExprWithAlias {
+            expr: Expr::Subquery(subquery),
+            ..
+        }) = item
+        else {
+            continue;
+        };
+        let SetExpr::Select(inner) = subquery.body.as_ref() else {
+            return unsupported("SELECT subquery body");
+        };
+        let [sqlparser::ast::TableWithJoins { relation, joins }] = inner.from.as_slice() else {
+            return unsupported("SELECT subquery requires one table");
+        };
+        let Some(reference) = grouping::table_reference(relation).filter(|_| joins.is_empty())
+        else {
+            return unsupported("SELECT subquery requires one table");
+        };
+        let table = render_context
+            .subquery_tables
+            .iter()
+            .find(|source| source.reference.eq_ignore_ascii_case(&reference))
+            .map(|source| source.table.clone())
+            .ok_or(ParseError::Unsupported {
+                feature: "SELECT subquery requires one table",
+            })?;
+        let mut named = Vec::new();
+        let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &inner.group_by else {
+            return unsupported("SELECT subquery GROUP BY");
+        };
+        let read_through = inner.projection.iter().all(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                grouping::columns_named_in(expr, &mut named)
+            }
+            _ => false,
+        }) && inner
+            .selection
+            .iter()
+            .chain(inner.having.iter())
+            .chain(group_by)
+            .all(|expr| grouping::columns_named_in(expr, &mut named));
+        if !read_through {
+            return unsupported("a subquery in the projection written in a form not read here");
+        }
+        for column in named {
+            match column.table() {
+                Some(qualifier) if qualifier.eq_ignore_ascii_case(&reference) => {}
+                Some(qualifier) => {
+                    for source in source_tables.iter_mut() {
+                        if source.reference.eq_ignore_ascii_case(qualifier) {
+                            source.read_by_a_result_subquery = true;
+                        }
+                    }
+                }
+                None => render_context
+                    .bare_names_in_result_subqueries
+                    .push((table.clone(), column.column().to_owned())),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reports whether a projection item is a `MIN`, `MAX` or `SUM` over a
@@ -1598,6 +1696,7 @@ fn render_derived_table(
             outer: false,
             branch: 0,
             subquery: false,
+            read_by_a_result_subquery: false,
             projected_columns,
             derived: Some(derived),
             catalog: source.catalog,
@@ -1678,6 +1777,7 @@ fn render_counted_derived_table(
             outer: false,
             branch: 0,
             subquery: false,
+            read_by_a_result_subquery: false,
             projected_columns: Vec::new(),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
@@ -1763,6 +1863,7 @@ fn render_common_table_expressions(
             outer: false,
             branch: 0,
             subquery: false,
+            read_by_a_result_subquery: false,
             projected_columns,
             derived: Some(derived),
             catalog: source.catalog,
@@ -5594,6 +5695,9 @@ pub(crate) struct SelectRenderContext<'a> {
     names_an_unprojected_group_concat: bool,
     /// The columns the statement's own `GROUP BY` has to decide.
     columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
+    /// Each name a subquery standing as a result column reads without a
+    /// table, with the table the subquery reads.
+    bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
 }
 
 impl<'a> SelectRenderContext<'a> {
@@ -5657,6 +5761,7 @@ impl<'a> SelectRenderContext<'a> {
             last_projected_group_concats: Vec::new(),
             names_an_unprojected_group_concat: false,
             columns_the_keys_decide: None,
+            bare_names_in_result_subqueries: Vec::new(),
         }
     }
 
@@ -6302,6 +6407,7 @@ fn render_select_table(
             outer: false,
             branch: 0,
             subquery: false,
+            read_by_a_result_subquery: false,
             projected_columns: Vec::new(),
             derived: None,
             catalog,

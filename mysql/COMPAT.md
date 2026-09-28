@@ -1423,6 +1423,22 @@ form over.
 Two subqueries over the same table record it once, so a column name inside them
 does not look ambiguous where it is not.
 
+A scalar subquery may name the statement's table from inside it, which is how
+Laravel's `withCount`, `withSum` and `withMax` count or total each row's
+relation: `select users.*, (select count(*) from posts where users.id =
+posts.user_id) as posts_count from users order by id asc`. The aggregate may
+name its column with the subquery's own table, `sum(posts.views)`, which reads
+the bare column. Measured on MySQL 8.4.11, every column read straight from a
+table such a subquery names reports no `NOT_NULL` flag, its key flags staying,
+as on the outer side of a `LEFT JOIN`; a table it does not name keeps its flags,
+and so does one only an `EXISTS` names or a subquery naming nothing outside
+itself. A call or arithmetic over such a column keeps the shape it has
+otherwise. A name inside the subquery written without its table is the
+subquery's own column when its table has one; one its table has not got would
+be the statement's, and is refused. Such a statement ordering by a bare column
+is read knowing its tables' columns, the subquery's included, when every name
+the two tables share is of one kind in both.
+
 `NOW()` and `IFNULL` are NOT NULL; the rest answer NULL where their column does.
 The answer belongs to no table, as MySQL reports it, and the column is named
 after the call as written.

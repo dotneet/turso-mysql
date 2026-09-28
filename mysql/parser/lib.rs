@@ -1016,6 +1016,7 @@ pub struct TranslatedSelect {
     /// without its `LIMIT`.
     calculates_found_rows: bool,
     columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
+    bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
     collation_sensitive_call_columns: Vec<String>,
     json_reading_columns: Vec<String>,
     reads_table: bool,
@@ -1867,6 +1868,13 @@ impl TranslatedSelect {
     /// which it may name only when the keys decide them.
     pub const fn columns_the_keys_decide(&self) -> Option<&MySqlColumnsTheKeysDecide> {
         self.columns_the_keys_decide.as_ref()
+    }
+
+    /// Returns each name a subquery standing as a result column reads without
+    /// a table, with the table the subquery reads, which the name has to be a
+    /// column of.
+    pub fn bare_names_in_result_subqueries(&self) -> &[(MySqlTableName, String)] {
+        &self.bare_names_in_result_subqueries
     }
 
     /// Returns which parameters stand where a row count is written.
@@ -4542,6 +4550,7 @@ fn parse_select_inner(
         concatenates_groups,
         calculates_found_rows,
         columns_the_keys_decide,
+        bare_names_in_result_subqueries,
     } = translate_select_query(
         &query,
         sql,
@@ -4583,6 +4592,7 @@ fn parse_select_inner(
         concatenates_groups,
         calculates_found_rows,
         columns_the_keys_decide,
+        bare_names_in_result_subqueries,
     })
 }
 

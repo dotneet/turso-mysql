@@ -280,7 +280,7 @@ fn joined_tables(from: &[sqlparser::ast::TableWithJoins]) -> Option<Vec<MySqlJoi
 }
 
 /// Returns the name a table in a `FROM` goes by, when it is a plain table.
-fn table_reference(relation: &TableFactor) -> Option<String> {
+pub(super) fn table_reference(relation: &TableFactor) -> Option<String> {
     let TableFactor::Table {
         name,
         alias,
@@ -330,7 +330,7 @@ fn without_parentheses(expr: &Expr) -> &Expr {
 
 /// Adds every column an expression names to `columns`, and reports whether
 /// it is written in a form this reads through.
-fn columns_named_in(expr: &Expr, columns: &mut Vec<MySqlNamedColumn>) -> bool {
+pub(super) fn columns_named_in(expr: &Expr, columns: &mut Vec<MySqlNamedColumn>) -> bool {
     if let Some(column) = grouped_column(expr) {
         columns.push(MySqlNamedColumn::written(column));
         return true;
@@ -356,6 +356,27 @@ fn columns_named_in(expr: &Expr, columns: &mut Vec<MySqlNamedColumn>) -> bool {
             columns_named_in(expr, columns)
                 && columns_named_in(low, columns)
                 && columns_named_in(high, columns)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            columns_named_in(expr, columns) && columns_named_in(pattern, columns)
+        }
+        Expr::Function(function) if function.over.is_none() && function.filter.is_none() => {
+            match &function.args {
+                sqlparser::ast::FunctionArguments::None => true,
+                sqlparser::ast::FunctionArguments::List(arguments) => {
+                    arguments.clauses.is_empty()
+                        && arguments.args.iter().all(|argument| match argument {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(argument),
+                            ) => columns_named_in(argument, columns),
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Wildcard,
+                            ) => true,
+                            _ => false,
+                        })
+                }
+                sqlparser::ast::FunctionArguments::Subquery(_) => false,
+            }
         }
         _ => false,
     }

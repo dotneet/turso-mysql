@@ -6046,6 +6046,9 @@ struct SourceTableColumns {
     /// An outer join can leave this table's row missing, which is what takes
     /// the `NOT NULL` flag off its columns.
     outer: bool,
+    /// A subquery standing as a result column names this table's columns,
+    /// which takes the `NOT NULL` flag off the columns read straight from it.
+    read_by_a_result_subquery: bool,
 }
 
 #[cfg(unix)]
@@ -6496,6 +6499,12 @@ impl TableResultMetadata {
         }
         if let Some(derived) = &table.derived {
             read_through_a_derived_table(&mut definition, derived, ordinal);
+        }
+        if table.read_by_a_result_subquery {
+            // Measured on MySQL 8.4.11: a column read straight from a table
+            // a subquery in the projection names drops NOT_NULL, keeping its
+            // key flags; see `MySqlSelectSource::read_by_a_result_subquery`.
+            definition.flags &= !MYSQL_NOT_NULL_FLAG;
         }
         Ok(definition)
     }
@@ -10168,6 +10177,7 @@ fn table_result_metadata_for_references(
                 catalog_columns: catalog_table_columns(catalog),
                 view_columns: Vec::new(),
                 outer: source.outer(),
+                read_by_a_result_subquery: source.read_by_a_result_subquery(),
                 projected_columns: source.projected_columns().to_vec(),
                 derived: source.derived().cloned(),
             });
@@ -10206,6 +10216,7 @@ fn table_result_metadata_for_references(
             catalog_columns: Vec::new(),
             view_columns,
             outer: source.outer(),
+            read_by_a_result_subquery: source.read_by_a_result_subquery(),
             projected_columns: source.projected_columns().to_vec(),
             derived: source.derived().cloned(),
         });
@@ -10274,6 +10285,7 @@ fn written_view_columns(
                 view_columns: Vec::new(),
                 projected_columns: Vec::new(),
                 outer: source.outer(),
+                read_by_a_result_subquery: false,
                 derived: None,
             })
             .collect(),

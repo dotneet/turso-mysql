@@ -1720,6 +1720,8 @@ impl MySqlConnection {
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.hold_the_projection_to_what_the_keys_decide(&translated)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
+                self.hold_bare_names_in_result_subqueries_to_their_tables(&translated)
+                    .map_err(MySqlPreparedStatementError::Prepare)?;
                 self.validate_select_comparison_columns(
                     translated.source_tables(),
                     translated.checked_comparisons(),
@@ -6532,6 +6534,7 @@ impl MySqlConnection {
         self.reject_binary_scalar_collation(&translated)?;
         self.refuse_select_json_readings_of_other_columns(&translated)?;
         self.hold_the_projection_to_what_the_keys_decide(&translated)?;
+        self.hold_bare_names_in_result_subqueries_to_their_tables(&translated)?;
         Self::reject_raw_select_comparisons(&translated)?;
         self.reject_index_hints_naming_no_key(&translated)?;
         self.validate_select_comparison_columns(
@@ -7104,15 +7107,34 @@ impl MySqlConnection {
             return Ok(translated);
         };
         // A derived table and a CTE say what each of their columns is, so the
-        // statement around them can be read knowing the types; a subquery
-        // reads a table of its own this has no types for.
-        if translated.source_tables().iter().any(|source| {
-            source.subquery()
-                || (!source.projected_columns().is_empty() && source.derived().is_none())
-        }) {
-            return Err(MySqlQueryError::Unsupported(
-                "SELECT expression needs a base table's column types".to_string(),
-            ));
+        // statement around them can be read knowing the types. A subquery
+        // reads a base table of its own, whose columns are read too.
+        let mut subquery_columns = Vec::new();
+        for source in translated.source_tables() {
+            if source.subquery() {
+                if source.catalog().is_some()
+                    || self
+                        .inner
+                        .current_schema()
+                        .get_btree_table(source.table().as_str())
+                        .is_none()
+                {
+                    return Err(MySqlQueryError::Unsupported(
+                        "SELECT expression needs a base table's column types".to_string(),
+                    ));
+                }
+                subquery_columns.extend(self.list_columns(source.table()).map_err(|error| {
+                    MySqlQueryError::Unsupported(format!(
+                        "cannot read the columns a subquery reads: {error}"
+                    ))
+                })?);
+                continue;
+            }
+            if !source.projected_columns().is_empty() && source.derived().is_none() {
+                return Err(MySqlQueryError::Unsupported(
+                    "SELECT expression needs a base table's column types".to_string(),
+                ));
+            }
         }
         if self
             .inner
@@ -7141,7 +7163,26 @@ impl MySqlConnection {
         let Ok(table_own_columns) = self.list_columns(&table) else {
             return Ok(translated);
         };
-        let columns = columns_under_derived_names(&table_own_columns, translated.source_tables())?;
+        let mut columns =
+            columns_under_derived_names(&table_own_columns, translated.source_tables())?;
+        // The reading below goes by names alone, so a subquery's column is
+        // told apart from the statement's own only when a name shared between
+        // them is of one kind in both.
+        for column in subquery_columns {
+            match columns
+                .iter()
+                .find(|named| named.name().eq_ignore_ascii_case(column.name()))
+            {
+                Some(named) if read_alike(named, &column) => {}
+                Some(_) => {
+                    return Err(MySqlQueryError::Unsupported(
+                        "a subquery's column shares its name with a column of another kind"
+                            .to_string(),
+                    ));
+                }
+                None => columns.push(column),
+            }
+        }
         let text_columns = columns
             .iter()
             .filter(|column| is_text_type(column.type_name()))
@@ -7436,6 +7477,37 @@ impl MySqlConnection {
             translated.json_reading_columns(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
+    }
+
+    /// Holds each name a subquery standing as a result column reads without a
+    /// table to being a column of the table the subquery reads.
+    ///
+    /// MySQL reads such a name as the subquery's own column when its table
+    /// has one and as the statement's otherwise, and a subquery naming the
+    /// statement's table changes the shape of that table's result columns —
+    /// see [`turso_mysql_parser::MySqlSelectSource::read_by_a_result_subquery`].
+    /// Which of the two a bare name is has not been worked out for the
+    /// second, so it is refused.
+    fn hold_bare_names_in_result_subqueries_to_their_tables(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        for (table, name) in translated.bare_names_in_result_subqueries() {
+            let columns = self.list_columns(table).map_err(|error| {
+                MySqlQueryError::Unsupported(format!(
+                    "cannot read the columns a subquery reads: {error}"
+                ))
+            })?;
+            if !columns
+                .iter()
+                .any(|column| column.name().eq_ignore_ascii_case(name))
+            {
+                return Err(MySqlQueryError::Unsupported(format!(
+                    "a subquery in the projection reads the statement's column {name} without its table"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Holds a grouped statement's projection to the columns its keys decide,
@@ -11334,6 +11406,31 @@ fn columns_under_derived_names(
         }
     }
     Ok(named)
+}
+
+/// Reports whether two columns land in the same lists a `SELECT` is read
+/// knowing, and so are rendered alike wherever the statement names them.
+fn read_alike(first: &MySqlColumnMetadata, second: &MySqlColumnMetadata) -> bool {
+    let kind = |column: &MySqlColumnMetadata| {
+        let type_name = column.type_name();
+        (
+            is_text_type(type_name),
+            matches!(type_name, "DATETIME" | "TIMESTAMP"),
+            column
+                .decimal_size()
+                .map(|(_, scale)| scale)
+                .or_else(|| (type_name == "BIGINT UNSIGNED").then_some(0)),
+            is_integer_type(type_name),
+            matches!(
+                type_name,
+                "FLOAT" | "FLOAT UNSIGNED" | "DOUBLE" | "DOUBLE UNSIGNED"
+            ),
+            type_name == "JSON",
+            turso_mysql_parser::enum_members(type_name),
+            turso_mysql_parser::set_members(type_name),
+        )
+    };
+    kind(first) == kind(second)
 }
 
 /// One table a grouped statement reads, with the keys that decide its row.

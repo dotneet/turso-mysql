@@ -32,21 +32,19 @@ pub(crate) fn leave_the_one_table_out(query: &mut sqlparser::ast::Query) {
     let SetExpr::Select(select) = query.body.as_mut() else {
         return;
     };
-    let [sqlparser::ast::TableWithJoins { relation, joins }] = select.from.as_slice() else {
-        return;
-    };
-    if !joins.is_empty() {
-        return;
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(Expr::Subquery(subquery))
+        | SelectItem::ExprWithAlias {
+            expr: Expr::Subquery(subquery),
+            ..
+        } = item
+        {
+            leave_the_subquery_table_out(subquery);
+        }
     }
-    let TableFactor::Table { name, alias, .. } = relation else {
+    let Some(reference) = the_one_table(&select.from) else {
         return;
     };
-    let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
-        return;
-    };
-    let reference = alias
-        .as_ref()
-        .map_or_else(|| table.value.clone(), |alias| alias.name.value.clone());
     for item in &mut select.projection {
         if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
             leave_the_table_out(expr, &reference);
@@ -55,6 +53,52 @@ pub(crate) fn leave_the_one_table_out(query: &mut sqlparser::ast::Query) {
     if let Some(selection) = &mut select.selection {
         leave_the_table_out(selection, &reference);
     }
+}
+
+/// Leaves the table's name out of what a subquery in the projection answers,
+/// where the subquery reads one table and the name is that table's —
+/// Laravel's `withSum` writes `(select sum(posts.views) from posts where
+/// users.id = posts.user_id)`.
+///
+/// A bare name inside the subquery is its own table's column before it is
+/// the statement's, so the answer reads the same column; the frontend holds
+/// each bare name there to being a column of that table.
+fn leave_the_subquery_table_out(subquery: &mut sqlparser::ast::Query) {
+    if subquery.with.is_some() {
+        return;
+    }
+    let SetExpr::Select(select) = subquery.body.as_mut() else {
+        return;
+    };
+    let Some(reference) = the_one_table(&select.from) else {
+        return;
+    };
+    for item in &mut select.projection {
+        if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } = item {
+            leave_the_table_out(expr, &reference);
+        }
+    }
+}
+
+/// Returns the name a `FROM` of one table and no join reads it under.
+fn the_one_table(from: &[sqlparser::ast::TableWithJoins]) -> Option<String> {
+    let [sqlparser::ast::TableWithJoins { relation, joins }] = from else {
+        return None;
+    };
+    if !joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, alias, .. } = relation else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
+        return None;
+    };
+    Some(
+        alias
+            .as_ref()
+            .map_or_else(|| table.value.clone(), |alias| alias.name.value.clone()),
+    )
 }
 
 /// Follows an expression down to its aggregates and JSON readings, never

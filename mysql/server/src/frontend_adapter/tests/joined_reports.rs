@@ -507,3 +507,151 @@ fn a_column_stands_beside_the_keys_only_when_they_decide_it() {
         .execute_query("CREATE VIEW named_by_id AS SELECT id, name FROM users GROUP BY id")
         .is_err());
 }
+
+/// Laravel's `User::withCount('posts')` and `withSum('posts', 'views')`,
+/// `withMax('posts', 'views')`: each relation is a subquery standing as a
+/// result column, correlated to the user it counts for, beside `users.*`.
+///
+/// Measured on MySQL 8.4.11: the count is a nullable `LONGLONG` of 21, the
+/// total and the largest the shapes they have over the table alone, and every
+/// `users` column read beside them loses its `NOT_NULL` flag, keeping its key
+/// flags, because the subquery names the table from inside it.
+#[test]
+fn laravel_counts_and_totals_each_users_posts_beside_the_user() {
+    let (_directory, mut adapter) = adapter_over(UNSIGNED_IDS);
+    let user_columns = [
+        shape(
+            "id",
+            MYSQL_TYPE_LONGLONG,
+            20,
+            0,
+            MYSQL_PRI_KEY_FLAG
+                | MYSQL_UNSIGNED_FLAG
+                | MYSQL_AUTO_INCREMENT_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ),
+        shape(
+            "email",
+            MYSQL_TYPE_VAR_STRING,
+            764,
+            0,
+            MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG,
+        ),
+        shape(
+            "name",
+            MYSQL_TYPE_VAR_STRING,
+            400,
+            0,
+            MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ),
+        shape("balance", MYSQL_TYPE_NEWDECIMAL, 12, 2, 0),
+        shape("is_active", MYSQL_TYPE_TINY, 1, 0, 0),
+    ];
+
+    let (shapes, answered) = report(
+        &mut adapter,
+        "select `users`.*, (select count(*) from `posts` where `users`.`id` = `posts`.`user_id`) as `posts_count` from `users` order by `id` asc",
+    );
+    let mut expected = user_columns.to_vec();
+    expected.push(shape("posts_count", MYSQL_TYPE_LONGLONG, 21, 0, AGGREGATED));
+    assert_eq!(shapes, expected);
+    assert_eq!(
+        answered,
+        rows(&[
+            &[
+                Some("1"),
+                Some("alice@example.com"),
+                Some("Alice"),
+                Some("100.50"),
+                Some("1"),
+                Some("2")
+            ],
+            &[
+                Some("2"),
+                Some("bob@example.com"),
+                Some("Bob"),
+                Some("20.00"),
+                Some("1"),
+                Some("2")
+            ],
+            &[
+                Some("3"),
+                Some("carol@example.com"),
+                Some("Carol"),
+                Some("5.25"),
+                Some("0"),
+                Some("0")
+            ],
+        ])
+    );
+
+    let (shapes, answered) = report(
+        &mut adapter,
+        "select `users`.*, (select sum(`posts`.`views`) from `posts` where `users`.`id` = `posts`.`user_id`) as `posts_sum_views`, (select max(`posts`.`views`) from `posts` where `users`.`id` = `posts`.`user_id`) as `posts_max_views` from `users` order by `id` asc",
+    );
+    let mut expected = user_columns.to_vec();
+    expected.push(shape(
+        "posts_sum_views",
+        MYSQL_TYPE_NEWDECIMAL,
+        33,
+        0,
+        AGGREGATED,
+    ));
+    expected.push(shape("posts_max_views", MYSQL_TYPE_LONG, 11, 0, AGGREGATED));
+    assert_eq!(shapes, expected);
+    assert_eq!(
+        answered
+            .iter()
+            .map(|row| row[5..].to_vec())
+            .collect::<Vec<_>>(),
+        rows(&[
+            &[Some("15"), Some("10")],
+            &[Some("1"), Some("1")],
+            &[None, None],
+        ])
+    );
+}
+
+/// Only the tables a subquery in the projection names from inside it lose
+/// their `NOT_NULL` flags, measured on MySQL 8.4.11: `u.id` keeps it beside a
+/// subquery naming `p`, and a subquery naming nothing outside it, or an
+/// `EXISTS`, changes nothing.
+#[test]
+fn a_subquery_in_the_projection_takes_not_null_off_the_tables_it_names() {
+    let (_directory, mut adapter) = adapter_over(UNSIGNED_IDS);
+    let id =
+        MYSQL_PRI_KEY_FLAG | MYSQL_UNSIGNED_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG;
+    let (shapes, _) = report(
+        &mut adapter,
+        "SELECT u.id, p.id, (SELECT COUNT(*) FROM tags t WHERE t.id = p.id) AS c FROM users u JOIN posts p ON p.user_id = u.id",
+    );
+    assert_eq!(
+        shapes[..2],
+        [
+            shape("id", MYSQL_TYPE_LONGLONG, 20, 0, id | MYSQL_NOT_NULL_FLAG),
+            shape("id", MYSQL_TYPE_LONGLONG, 20, 0, id),
+        ]
+    );
+    for sql in [
+        "SELECT users.id, (SELECT COUNT(*) FROM posts) AS a FROM users",
+        "SELECT users.id, EXISTS (SELECT 1 FROM posts WHERE posts.user_id = users.id) AS e FROM users",
+    ] {
+        let (shapes, _) = report(&mut adapter, sql);
+        assert_eq!(
+            shapes[0],
+            shape("id", MYSQL_TYPE_LONGLONG, 20, 0, id | MYSQL_NOT_NULL_FLAG),
+            "{sql}"
+        );
+    }
+    // A bare name is the subquery's own column first; one its table does not
+    // have names the statement's table, which is refused.
+    let (shapes, _) = report(
+        &mut adapter,
+        "SELECT id, (SELECT COUNT(*) FROM posts WHERE user_id = users.id) AS c FROM users",
+    );
+    assert_eq!(shapes[0], shape("id", MYSQL_TYPE_LONGLONG, 20, 0, id));
+    assert!(is_refused(
+        &mut adapter,
+        "SELECT id, (SELECT COUNT(*) FROM posts WHERE posts.user_id = email) AS c FROM users"
+    ));
+}
