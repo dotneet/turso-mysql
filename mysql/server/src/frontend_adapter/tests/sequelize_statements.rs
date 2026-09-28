@@ -348,3 +348,52 @@ fn a_column_names_its_own_character_set() {
         assert!(adapter.execute_query(sql).is_err(), "{sql} must be refused");
     }
 }
+
+/// `sync({ force })` and `queryInterface.showIndex` list a table's indexes
+/// naming the database after the table, which answers what naming it before
+/// the table does; the one written after stands where both are written.
+#[test]
+fn sequelize_lists_indexes_naming_the_database_after_the_table() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `tags` (`id` BIGINT auto_increment , `name` VARCHAR(100) NOT NULL UNIQUE, PRIMARY KEY (`id`)) ENGINE=InnoDB;",
+    );
+    let listed = rows(&mut adapter, "SHOW INDEX FROM `tags`");
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| [row[0].clone(), row[2].clone(), row[4].clone()])
+            .collect::<Vec<_>>(),
+        [["tags", "PRIMARY", "id"], ["tags", "name", "name"]]
+            .map(|row| row.map(|value| Some(value.to_owned())))
+    );
+    for sql in [
+        "SHOW INDEX FROM `tags` FROM `reports`",
+        "SHOW KEYS IN tags IN reports",
+        "SHOW INDEXES FROM reports.tags FROM reports",
+    ] {
+        assert_eq!(rows(&mut adapter, sql), listed, "{sql}");
+    }
+    // Another database is refused, where MySQL reads that database's table.
+    assert!(matches!(
+        adapter.execute_query("SHOW INDEX FROM `tags` FROM `sequelize`"),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}
+
+/// The engine names the columns of the index behind a key as it folds them,
+/// `id` for a column written `Id`; that index is still the key and no other.
+#[test]
+fn a_key_column_written_in_capitals_has_one_index() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE CamelCase (Id INT PRIMARY KEY, Name VARCHAR(10))",
+    );
+    assert_eq!(
+        created(&mut adapter, "camelcase"),
+        "CREATE TABLE `camelcase` (\n  `Id` int NOT NULL,\n  `Name` varchar(10) DEFAULT NULL,\n  PRIMARY KEY (`Id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(rows(&mut adapter, "SHOW INDEX FROM CamelCase").len(), 1);
+}

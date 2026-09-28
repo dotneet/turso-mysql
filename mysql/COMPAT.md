@@ -3037,10 +3037,13 @@ be preserved in DML rendering) and non-ordinal column identifiers. A `LIMIT` wit
 refused as non-deterministic.
 
 `SHOW INDEX FROM table` reports one base table's indexes, and reads the
-`SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes,
-and the selected database written before the table or, as Connector/J writes
-it without information_schema, after it: `SHOW KEYS FROM `posts` FROM `db``,
-which measured on 8.4.11 reads what `db.posts` reads.
+`SHOW INDEXES` and `SHOW KEYS` spellings and the `IN` form MySQL also takes.
+Connector/J, without information_schema, and Sequelize name the database after
+the table — `SHOW KEYS FROM `posts` FROM `db``, `SHOW INDEX FROM users FROM
+sequelize`; measured on 8.4.11, that answers what `db.posts` does, and the
+database written after the table stands in place of one written before it. As
+with the qualifier, the selected database is taken and another refused, where
+MySQL reads that database (or answers 1049).
 The fifteen columns come back in MySQL's order, with the primary key first,
 the other unique indexes next in creation order, and the non-unique ones
 last; an index the engine created for an inline UNIQUE is named after its
@@ -5586,7 +5589,15 @@ reads `MIT`, the licence this repository carries, where MySQL reads `GPL`.
 `@@lower_case_table_names` reads 1 where MySQL on Linux reads 0: a table
 written as `Users` here is found again as `users` and reads back lowercased
 from `SHOW TABLES`, measured against this server, and 1 is what MySQL calls
-that.
+that. A MySQL 8.4.11 initialized with `lower_case_table_names=1` answers the
+same, measured: Sequelize's `SequelizeMeta` is listed as `sequelizemeta` by
+`SHOW TABLES` and `information_schema.TABLES`, whether `TABLE_NAME` is compared
+with `'SequelizeMeta'` or `'sequelizemeta'`, where one under 0 keeps the case
+and finds it under the one spelling alone. Two places it keeps the case as
+written differ here: `SHOW CREATE TABLE CamelCase` names the table
+`CamelCase` in its first column (the `CREATE TABLE` text says `camelcase`),
+and a table read without an alias is reported to a client under the name the
+statement wrote, with the original table lowercased.
 
 `@@socket` names the Unix socket this server listens on. Prisma's driver,
 `mysql_async`, reads it with `@@max_allowed_packet` and `@@wait_timeout` on

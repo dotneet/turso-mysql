@@ -3295,13 +3295,14 @@ pub fn parse_optional_show_index(
         return Err(ParseError::ExpectedAdminCommand);
     }
     let (mut database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor)?;
-    // Connector/J writes the database after the table, `SHOW KEYS FROM
-    // `posts` FROM `db``, which measured on MySQL 8.4.11 reads the same
-    // indexes `db.posts` does.
-    if database.is_none()
-        && ["FROM", "IN"]
-            .iter()
-            .any(|word| consume_admin_word(&tokens, &mut cursor, word))
+    // Measured on MySQL 8.4.11: Connector/J's `SHOW KEYS FROM `posts` FROM
+    // `db`` and Sequelize's `SHOW INDEX FROM users FROM sequelize` answer what
+    // `db.posts` does, and the database written after the table stands in
+    // place of one written before it — `SHOW INDEX FROM mysql.a1 FROM probe`
+    // lists `probe.a1`.
+    if ["FROM", "IN"]
+        .iter()
+        .any(|word| consume_admin_word(&tokens, &mut cursor, word))
     {
         database = Some(consume_admin_database_name(&tokens, &mut cursor)?);
     }

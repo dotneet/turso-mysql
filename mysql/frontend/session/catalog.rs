@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::catalog_tables::{foreign_key_name, indexes_beside_the_primary_key};
+use crate::session::is_the_primary_keys_own_index;
 
 /// What each column of a view kept in the text MySQL prints reads, with the
 /// columns of each table it reads, in the order its `FROM` names them.
@@ -407,13 +408,11 @@ impl MySqlConnection {
         let mut secondary = Vec::new();
         for index in indexes {
             // The engine's own index behind a primary key is already reported.
-            if index.name.starts_with("sqlite_autoindex_")
-                && index
-                    .columns
-                    .iter()
-                    .map(|column| column.name.as_str())
-                    .eq(primary.iter().map(|entry| entry.column_name.as_str()))
-            {
+            // Its columns are named as the engine folds them, so `Id INT
+            // PRIMARY KEY` is behind an index over `id`.
+            if core_table.btree().is_some_and(|btree| {
+                is_the_primary_keys_own_index(index, &btree.primary_key_columns)
+            }) {
                 continue;
             }
             let key_name = mysql_index_name(index);

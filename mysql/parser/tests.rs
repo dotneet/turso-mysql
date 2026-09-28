@@ -7871,7 +7871,6 @@ fn accepts_every_spelling_mysql_takes_for_show_index() {
         "SHOW INDEX FROM",
         "SHOW INDEX reports",
         "SHOW INDEX FROM reports extra",
-        "SHOW INDEX FROM a.reports FROM b",
         "SHOW INDEX FROM reports FROM",
         "SHOW INDEX FROM reports WHERE Key_name = 'PRIMARY'",
     ] {
