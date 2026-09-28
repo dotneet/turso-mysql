@@ -1,10 +1,12 @@
 # Sourced by shell apps. `step NAME COMMAND...` runs one step, prints its
 # output, and appends {"step","ok","error"} to $E2E_OUT/steps.jsonl.
 
+# sed doubles each backslash; awk's gsub would read the replacement's own
+# backslashes as escapes and leave a PHP namespace such as `Illuminate\Console`
+# as an invalid JSON escape.
 json_escape() {
-  awk 'BEGIN { ORS = "" }
-    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "");
-      if (NR > 1) print "\\n"; print }'
+  sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' -e 's/\r//g' |
+    awk 'BEGIN { ORS = "" } { if (NR > 1) print "\\n"; print }'
 }
 
 step() {

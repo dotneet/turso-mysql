@@ -133,3 +133,50 @@ Refused only by turso, by kind:
   `SELECT ... FOR UPDATE SKIP LOCKED` (Laravel's queue), a multi-row INSERT
   with quoted quotes in a replayed dump, and a statement that is only a
   `-- comment` line in a replayed dump.
+
+# Third run
+
+At local main `dba538ffb`, 2026-09-28, after Laravel's prepared statements,
+bound values in expressions, ORM upserts, SELECT shapes and dump replay.
+
+| App | second run | third run |
+|---|---|---|
+| Rails | 16/22 | 22/22 |
+| mysqldump | 5/9 | 9/9 |
+| mysql CLI | 19/23 | 22/23 (`join`) |
+| Laravel | fails at `connect` | 24/27 (relations, aggregate, json) |
+| SQLAlchemy | 2/20 | 18/20 (aggregate, json) |
+| GORM | 9/21 | 17/21 |
+| TypeORM | 6/18 | 14/18 |
+| Django | 17/22 | 17/22 |
+| Prisma | 0/22 | 1/22 (`DROP DATABASE` waits and answers 1205) |
+
+Laravel's count read 23 in the report: its step log wrote PHP namespaces as
+invalid JSON escapes, which the report could not read (fixed in steps.sh).
+
+Refused only by turso, by kind:
+
+- **Grouping by a primary key while selecting its other columns:** Django's and
+  SQLAlchemy's aggregates over a join (`GROUP BY users.id [, users.name]
+  HAVING COUNT(posts.id) >= 1`), the mysql CLI `join` step, Laravel's
+  `group by users.email having post_count >= ?`.
+- **Correlated subqueries in the select list:** Laravel `withCount`
+  (`(select count(*) from posts where users.id = posts.user_id) as posts_count`).
+- **Prisma:** `DROP DATABASE` while its own pooled connections have the database
+  open answers 1205 after waiting (MySQL drops it); its introspection
+  `SELECT DISTINCT BINARY table_info.table_name ... FROM information_schema.tables
+  JOIN information_schema.columns ON BINARY ... = BINARY ...`.
+- **JSON:** Django `JSON_CONTAINS(JSON_EXTRACT(profile, '$.tags'), '"a"')`,
+  SQLAlchemy `CASE JSON_EXTRACT(...) WHEN 'null' THEN NULL ELSE
+  JSON_UNQUOTE(...) END AS anon_1` in a projection, Laravel `json_set(profile,
+  '$.city', ?)`.
+- **Django introspection:** `SELECT column_name, data_type, ... CASE WHEN
+  collation_name = 'utf8mb4_0900_ai_ci' THEN NULL ELSE collation_name END ...,
+  CASE WHEN column_type LIKE '% unsigned' THEN 1 ELSE 0 END ... FROM
+  information_schema.columns WHERE table_name = ...`.
+- **TypeORM:** the pagination `SELECT DISTINCT distinctAlias.Post_id ... FROM
+  (SELECT Post.id AS Post_id, ...)` with joins, `MAX(Post.views)` over a
+  LEFT JOIN, a join `ON (t.tag_id = '1' AND ...)`, a multi-row INSERT with
+  `DEFAULT` in some rows.
+- **GORM:** `COUNT(DISTINCT(user_id))`, `UPDATE posts SET slug = CONCAT('p-', id)`,
+  an upsert mixing an explicit id and `DEFAULT`.
