@@ -1157,6 +1157,9 @@ pub enum CheckedSelectComparisonRhs {
     /// One call answering the moment the statement runs, which needs no
     /// argument and answers a value in the form the column it meets holds.
     Now(CheckedComparisonNow),
+    /// A moment written as `TIMESTAMP('...')`, which meets a `DATETIME` or
+    /// `TIMESTAMP` column as the word it names does and no other column.
+    WrittenMoment(String),
     /// A SQL NULL literal, which retains ordinary SQL three-valued logic.
     Null,
     /// One binary-protocol parameter at the zero-based statement ordinal.
@@ -5683,6 +5686,9 @@ fn is_written_insert_value(expr: &Expr) -> bool {
 fn is_direct_insert_literal(expr: &Expr) -> bool {
     if let Some(bytes) = written_value::written_byte_string(expr) {
         return bytes.is_some();
+    }
+    if written_literals::written_moment(expr).is_some() {
+        return true;
     }
     match expr {
         Expr::Value(value) => match &value.value {

@@ -1,15 +1,16 @@
 //! Which columns a statement writes a literal into whose meaning turns on the
 //! column: a number with a fraction, which a column of bytes stores in
-//! MySQL's spelling of it, and a string of bytes, which only a column of bytes
-//! takes as it stands.
+//! MySQL's spelling of it, a string of bytes, which only a column of bytes
+//! takes as it stands, and a moment written as `TIMESTAMP('...')`, which only
+//! a `DATETIME` or `TIMESTAMP` column stores as the word it names.
 //!
 //! Only the frontend knows each column's type, so this reads the statement's
 //! literals out and leaves the frontend to hold them to their columns.
 
 use crate::{parse_one_statement, ParseError, SessionSqlMode};
 use sqlparser::ast::{
-    AssignmentTarget, Expr, ObjectName, ObjectNamePart, OnInsert, SetExpr, Statement, TableFactor,
-    TableObject, UnaryOperator, Value,
+    AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
+    ObjectNamePart, OnInsert, SetExpr, Statement, TableFactor, TableObject, UnaryOperator, Value,
 };
 
 /// A literal whose meaning turns on the column it is written into.
@@ -20,6 +21,9 @@ pub enum ColumnLiteral {
     /// A string of bytes: `X'..'`, `0x..`, `b'..'`, or a word or hexadecimal
     /// literal after `_binary`.
     Bytes,
+    /// A moment written as `TIMESTAMP('2024-01-02 03:04:05.000000')`, read by
+    /// [`written_moment`].
+    Moment,
 }
 
 /// What a statement writes these literals into.
@@ -129,6 +133,9 @@ fn last_name(name: &ObjectName) -> Option<String> {
 }
 
 fn column_literal(value: &Expr) -> Option<ColumnLiteral> {
+    if written_moment(value).is_some() {
+        return Some(ColumnLiteral::Moment);
+    }
     match value {
         Expr::Nested(inner) => column_literal(inner),
         Expr::UnaryOp {
@@ -149,4 +156,53 @@ fn column_literal(value: &Expr) -> Option<ColumnLiteral> {
         }
         _ => None,
     }
+}
+
+/// The word inside `TIMESTAMP('2024-01-02 03:04:05.000000')`, which is how
+/// MySqlConnector writes every `DateTime` into the text of a statement.
+///
+/// Only a moment written the way MySQL prints one, with no more than six
+/// places of a second, is read: measured on MySQL 8.4.11, such a call stores
+/// into a `DATETIME` or `TIMESTAMP` column, and compares with one, as the word
+/// it names does — `'.5'` into a `DATETIME` rounds to the next second both
+/// ways. Written into any other column the two differ (a `BIGINT` stores
+/// `20240102030406` for the call), and a moment that is no date is 1292, so
+/// those are left for the caller to refuse.
+pub(crate) fn written_moment(value: &Expr) -> Option<&str> {
+    let Expr::Function(function) = value else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !name.value.eq_ignore_ascii_case("TIMESTAMP")
+        || name.quote_style.is_some()
+        || function.over.is_some()
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, FunctionArguments::None)
+    {
+        return None;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(written)))] =
+        arguments.args.as_slice()
+    else {
+        return None;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return None;
+    }
+    let Value::SingleQuotedString(moment) = &written.value else {
+        return None;
+    };
+    let places = moment
+        .split_once('.')
+        .map_or(0, |(_, fraction)| fraction.len());
+    let places = u8::try_from(places).ok().filter(|places| *places <= 6)?;
+    (crate::normalize_datetime_with_precision(moment, places).as_deref() == Some(moment.as_str()))
+        .then_some(moment.as_str())
 }

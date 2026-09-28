@@ -5354,6 +5354,8 @@ fn render_update_assignment_value(
         _ if names_the_columns_default(value, written) => {
             unsupported("UPDATE assignment writing a column default")
         }
+        // The frontend holds the column to a `DATETIME` or `TIMESTAMP`.
+        _ if crate::written_literals::written_moment(value).is_some() => render_dml_expr(value),
         Expr::Identifier(ident) => {
             if contains_decimal_operand(value, render_context.decimal_columns)
                 && !render_context.decimal_columns.iter().any(|(column, _)| column.eq_ignore_ascii_case(written))
@@ -6120,6 +6122,12 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
             expr,
         } => Ok(format!("(+{})", render_dml_expr(expr)?)),
         Expr::Nested(expr) => Ok(format!("({})", render_dml_expr(expr)?)),
+        // The frontend holds the column it is written into to a `DATETIME` or
+        // `TIMESTAMP`, which stores it as the word it names.
+        _ if crate::written_literals::written_moment(expr).is_some() => Ok(format!(
+            "'{}'",
+            crate::written_literals::written_moment(expr).expect("the guard read a moment")
+        )),
         // A reading of the moment is written as the engine call answering the
         // same value in the same form. What lands in the column is then put
         // into the form that column holds, the way a written one is: measured
@@ -12154,6 +12162,14 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
             Ok((
                 now.engine_call().to_owned(),
                 CheckedSelectComparisonRhs::Now(now),
+            ))
+        }
+        _ if crate::written_literals::written_moment(expr).is_some() => {
+            let moment = crate::written_literals::written_moment(expr)
+                .expect("the guard read a written moment");
+            Ok((
+                format!("'{moment}'"),
+                CheckedSelectComparisonRhs::WrittenMoment(moment.to_owned()),
             ))
         }
         // `LAST_INSERT_ID()` answers a whole number, which meets a column of

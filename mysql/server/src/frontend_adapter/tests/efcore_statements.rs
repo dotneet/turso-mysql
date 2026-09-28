@@ -202,3 +202,112 @@ fn save_changes_reads_back_the_row_it_wrote() {
         .execute_query("SELECT `Id` FROM `Tags` WHERE ROW_COUNT() = 'a'")
         .is_err());
 }
+
+/// MySqlConnector writes every `DateTime` as `timestamp('...')`: a post's
+/// `PublishedAt`, and the `UpdatedAt` row version `SaveChanges` holds an
+/// `UPDATE` or a `DELETE` to. Each answered 1235.
+///
+/// Measured on MySQL 8.4.11, the call stores into a `DATETIME` or `TIMESTAMP`
+/// column and compares with one as the word it names; written into a column
+/// of another kind it does not (a `BIGINT` stores 20240102030405, a `DATE`
+/// warns about the moment rounded), and a column of words compares with it as
+/// a moment. Those stay refused.
+#[test]
+fn a_moment_written_as_a_timestamp_call_meets_a_moment_column() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "INSERT INTO `Posts` (`Body`, `PublishedAt`, `Title`, `UserId`, `Views`)\nVALUES ('First post', timestamp('2024-01-02 03:04:05.000000'), 'Hello', 1, 10)"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `PublishedAt` FROM `Posts` WHERE `Title` = 'Hello'"
+        ),
+        [row(&["2024-01-02 03:04:05.000000"])]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Title` FROM `Posts` WHERE `PublishedAt` = timestamp('2024-01-02 03:04:05.000000') ORDER BY `Id`"
+        ),
+        [row(&["Bob writes"]), row(&["Hello"])]
+    );
+
+    let version = updated_at(&mut adapter, 2);
+    // The clock moves on before the row is changed, so the change moves the
+    // row version.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert_eq!(
+        changed(
+            &mut adapter,
+            &format!(
+                "UPDATE `Users` SET `Name` = 'Bob One'\nWHERE `Id` = 2 AND `UpdatedAt` = timestamp('{version}')"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Name` FROM `Users` WHERE ROW_COUNT() = 1 AND `Id` = 2"
+        ),
+        [row(&["Bob One"])]
+    );
+    // The version the second context read is stale now: its UPDATE changes
+    // nothing, and its DELETE neither.
+    assert_ne!(updated_at(&mut adapter, 2), version);
+    assert_eq!(
+        changed(
+            &mut adapter,
+            &format!("UPDATE `Users` SET `Name` = 'Bob Two'\nWHERE `Id` = 2 AND `UpdatedAt` = timestamp('{version}')")
+        ),
+        0
+    );
+    assert_eq!(
+        changed(
+            &mut adapter,
+            &format!(
+                "DELETE FROM `Users`\nWHERE `Id` = 2 AND `UpdatedAt` = timestamp('{version}')"
+            )
+        ),
+        0
+    );
+    let carol = updated_at(&mut adapter, 3);
+    assert_eq!(
+        changed(
+            &mut adapter,
+            &format!("DELETE FROM `Users`\nWHERE `Id` = 3 AND `UpdatedAt` = timestamp('{carol}')")
+        ),
+        1
+    );
+
+    for refused in [
+        "INSERT INTO `Posts` (`Body`, `PublishedAt`, `Title`, `UserId`, `Views`) VALUES (timestamp('2024-01-02 03:04:05.000000'), NULL, 'x', 1, 0)",
+        "INSERT INTO `Posts` (`Body`, `PublishedAt`, `Title`, `UserId`, `Views`) VALUES (NULL, NULL, 'x', 1, timestamp('2024-01-02 03:04:05.000000'))",
+        "UPDATE `Posts` SET `Title` = timestamp('2024-01-02 03:04:05.000000') WHERE `Id` = 1",
+        "SELECT `Id` FROM `Posts` WHERE `Title` = timestamp('2024-01-02 03:04:05.000000')",
+        // No such day: MySQL answers 1292.
+        "INSERT INTO `Posts` (`PublishedAt`, `Title`, `UserId`, `Views`) VALUES (timestamp('2024-02-30 03:04:05.000000'), 'x', 1, 0)",
+        // A moment with more places than the column keeps compares at full
+        // precision in MySQL, and does not meet the stored one.
+        "SELECT `Id` FROM `Posts` WHERE `PublishedAt` = timestamp('2024-01-02 03:04:05.0000001')",
+    ] {
+        assert!(adapter.execute_query(refused).is_err(), "{refused}");
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM `Posts`"),
+        [row(&["3"])]
+    );
+}
+
+fn updated_at(adapter: &mut Adapter, id: u32) -> String {
+    let read = rows(
+        adapter,
+        &format!("SELECT `UpdatedAt` FROM `Users` WHERE `Id` = {id}"),
+    );
+    read[0][0].clone().unwrap()
+}

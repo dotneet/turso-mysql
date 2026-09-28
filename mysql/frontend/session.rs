@@ -2302,6 +2302,13 @@ impl MySqlConnection {
                             feature: "a string of bytes written into a column of another kind",
                         });
                     }
+                    ColumnLiteral::Moment
+                        if !matches!(column.type_name(), "DATETIME" | "TIMESTAMP") =>
+                    {
+                        return Err(MySqlParseError::Unsupported {
+                            feature: "TIMESTAMP('...') written into a column holding no moment",
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -12446,6 +12453,17 @@ fn checked_comparison_fits_column(
                 || meets_bytes(type_name, operator)
                 || comparison_meets_the_stored_form(rhs, type_name, operator)
         }
+        // A written moment meets a moment column as the word it names does,
+        // and no other column: MySQL compares a column of words with it as a
+        // moment, not as a word.
+        CheckedSelectComparisonRhs::WrittenMoment(written) => {
+            matches!(type_name, "DATETIME" | "TIMESTAMP")
+                && comparison_meets_the_stored_form(
+                    &CheckedSelectComparisonRhs::Text(written.clone()),
+                    type_name,
+                    operator,
+                )
+        }
         CheckedSelectComparisonRhs::Null => {
             is_integer_type(type_name)
                 || is_text_type(type_name)
@@ -12771,6 +12789,16 @@ fn select_comparison_fits_column(
         )
     {
         let canonical = match comparison.rhs() {
+            CheckedSelectComparisonRhs::WrittenMoment(written) if type_name != "TIME" => {
+                turso_mysql_parser::normalize_datetime_with_precision(written, temporal_precision)
+                    .as_deref()
+                    == Some(written)
+                    && !matches!(
+                        comparison.operator(),
+                        CheckedSelectComparisonOperator::Like
+                            | CheckedSelectComparisonOperator::NotLike
+                    )
+            }
             CheckedSelectComparisonRhs::Text(written) => {
                 let normalized = if type_name == "TIME" {
                     turso_mysql_parser::normalize_time_with_precision(written, temporal_precision)
@@ -13043,6 +13071,9 @@ fn checked_comparison_column_refusal(
             "a DATETIME or TIMESTAMP column"
         }
         CheckedSelectComparisonRhs::Now(CheckedComparisonNow::TimeOfDay) => "a TIME column",
+        CheckedSelectComparisonRhs::WrittenMoment(_) => {
+            "a DATETIME or TIMESTAMP column holding the moment in its own form"
+        }
         CheckedSelectComparisonRhs::Text(_) => "a text column",
         CheckedSelectComparisonRhs::Bytes => "a column of bytes",
         CheckedSelectComparisonRhs::Null => "a signed integer or text column",

@@ -5973,6 +5973,21 @@ holds, and a written moment reads as itself everywhere. An `UPDATE` and a
 `DELETE` refuse it: neither has a second rendering pass to learn what the column
 holds.
 
+MySqlConnector writes every `DateTime` into the text of a statement as
+`timestamp('2024-01-02 03:04:05.000000')`, so Entity Framework Core inserts a
+post's `PublishedAt` that way and holds each `UPDATE` and `DELETE` to its
+`UpdatedAt` row version with `` `UpdatedAt` = timestamp('...') ``. Such a call
+over a moment written the way MySQL prints one, with up to six places of a
+second, is read as the word it names, where it is written into or compared
+with a `DATETIME` or `TIMESTAMP` column — measured on 8.4.11, it stores and
+compares there as the word does, `.5` into a `DATETIME` rounding to the next
+second both ways. Written into or compared with any other column it is refused:
+there it differs (a `BIGINT` stores `20240102030405`, a `DATE` warns about the
+moment rounded to a second, a column of words is compared with it as a moment).
+So is a day that does not exist, which MySQL answers 1292, and a moment with
+more places than the column keeps, which MySQL compares at the call's own
+precision.
+
 A value bound against one of those columns reads the same way. `WHERE
 created_at > ?` is what an ORM binds for every date filter it runs, and it was
 refused: a bound value carries no type until it binds, and nothing put it into
