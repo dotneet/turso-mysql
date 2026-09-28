@@ -57,6 +57,17 @@ pub(crate) fn custom_type_comparator(
     } = expr
     {
         let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
+        // A FROM-clause subquery's column carries no custom type of its own, so
+        // it orders the way the column it reads does: without this,
+        // `SELECT s.amount FROM (SELECT amount FROM t) s ORDER BY s.amount`
+        // over a `numeric` column sorted by the values' encoding.
+        if let crate::schema::Table::FromClauseSubquery(subquery) = table {
+            let super::plan::Plan::Select(plan) = subquery.plan.as_ref() else {
+                return None;
+            };
+            let read = plan.result_columns.get(*column)?;
+            return custom_type_comparator(&read.expr, &plan.table_references, schema);
+        }
         let col = table.get_column_at(*column)?;
         // Array columns use element-wise comparison
         if col.is_array() {

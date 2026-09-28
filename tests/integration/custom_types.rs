@@ -357,6 +357,38 @@ mod tests {
 
     /// Self-joins on custom type columns must return matching rows.
     ///
+    /// A column read through a FROM-clause subquery orders by its custom
+    /// type's `<` operator, as the column read directly does. It used to sort
+    /// by the value's text, putting 100.50 before 20.25.
+    #[test]
+    fn test_order_by_a_custom_type_column_read_through_a_subquery() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("custom_types_subquery_order.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, amount numeric(10,2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '100.50'), (2, '20.25'), (3, '5.00')")
+            .unwrap();
+
+        for sql in [
+            "SELECT id FROM t ORDER BY amount",
+            "SELECT s.id FROM (SELECT id, amount FROM t) AS s ORDER BY s.amount",
+            "SELECT s.id FROM (SELECT id, amount FROM t ORDER BY id LIMIT 3) AS s ORDER BY s.amount",
+            "WITH s AS (SELECT id, amount AS a FROM t) SELECT id FROM s ORDER BY a",
+        ] {
+            let rows: Vec<(i64,)> = conn.exec_rows(sql);
+            assert_eq!(rows, vec![(3,), (2,), (1,)], "{sql}");
+        }
+        let rows: Vec<(i64,)> = conn
+            .exec_rows("SELECT s.id FROM (SELECT id, amount FROM t) AS s ORDER BY s.amount DESC");
+        assert_eq!(rows, vec![(1,), (2,), (3,)]);
+    }
+
     /// The optimizer builds an ephemeral auto-index for the inner table.
     /// The auto-index stores raw encoded values, so the seek key built from
     /// the outer table must also be encoded.  Previously, the seek-key
