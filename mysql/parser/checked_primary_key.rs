@@ -202,6 +202,7 @@ fn check_columns(
 }
 
 fn check_primary_key_options(column: &ColumnDef) -> Result<(), ParseError> {
+    super::check_column_character_set(column)?;
     let mut nullable_options = 0;
     let mut default_options = 0;
     let mut primary_key_options = 0;
@@ -386,12 +387,16 @@ fn render_mysql_source_column(
             .options
             .iter()
             .find_map(|option| match &option.option {
-                ColumnOption::Collation(name) => {
-                    ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_unicode_ci"]
-                        .into_iter()
-                        .find(|known| super::unqualified_name_is(name, &[known]))
-                        .map(|known| format!(" COLLATE {known}"))
-                }
+                ColumnOption::Collation(name) => [
+                    ("utf8mb4_0900_ai_ci", "utf8mb4_0900_ai_ci"),
+                    ("utf8mb4_bin", "utf8mb4_bin"),
+                    ("utf8mb4_unicode_ci", "utf8mb4_unicode_ci"),
+                    ("utf8mb3_unicode_ci", "utf8mb3_unicode_ci"),
+                    ("utf8_unicode_ci", "utf8mb3_unicode_ci"),
+                ]
+                .into_iter()
+                .find(|(written, _)| super::unqualified_name_is(name, &[written]))
+                .map(|(_, known)| format!(" COLLATE {known}")),
                 _ => None,
             })
             .unwrap_or_default();

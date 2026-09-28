@@ -3287,10 +3287,11 @@ itself; and the 330 status counters describe the whole server.
 
 A column may name a `CHARACTER SET` or a `COLLATE`, which a dumped schema
 spells out on every text column, so refusing them stopped a `mysqldump` from
-being restored. `utf8mb4` is the accepted character set. Text columns take
+being restored. `utf8mb4` is the accepted character set, and `utf8mb3` with
+its `utf8mb3_unicode_ci` alone (see below). Text columns take
 `utf8mb4_0900_ai_ci` by default and may explicitly name `utf8mb4_bin`, which
-uses its own PAD SPACE byte collation, or `utf8mb4_unicode_ci`. Other names are
-refused rather than ignored.
+uses its own PAD SPACE byte collation, `utf8mb4_unicode_ci` or
+`utf8mb3_unicode_ci`. Other names are refused rather than ignored.
 With `character_set_results=utf8mb4`, a selected text column reports the
 connection's collation ID on the wire — 45 until the session names another —
 including a `utf8mb4_bin` column.
@@ -3335,6 +3336,43 @@ CONCAT(name, 'x')` — or comparing such a call with written text, in a `SELECT`
 an `UPDATE` or a `DELETE`: each compares under `utf8mb4_0900_ai_ci`'s weights,
 where MySQL compares a call's answer under the collation of the column it
 read.
+
+`utf8mb3_unicode_ci` is taken too, the one `utf8mb3` collation this server
+has: Sequelize keeps its migrations in a table written `DEFAULT CHARSET=utf8
+COLLATE utf8_unicode_ci`, which MySQL reads as `utf8mb3` and
+`utf8mb3_unicode_ci`. A table takes it as `COLLATE utf8mb3_unicode_ci` or
+`utf8_unicode_ci`, alone or beside `CHARSET=utf8` or `utf8mb3`, and a column as
+`COLLATE utf8mb3_unicode_ci`, alone or beside `CHARACTER SET utf8mb3`. Its
+weights are `utf8mb4_unicode_ci`'s, the character sets agreeing on every
+character `utf8mb3` holds, and the engine keeps it as a collation of its own so
+that the column says which character set it belongs to. Measured on MySQL
+8.4.11 and matched:
+
+- `SHOW CREATE TABLE` ends `DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_unicode_ci`
+  and prints `COLLATE utf8mb3_unicode_ci` on each column that takes it from
+  the table, and `CHARACTER SET utf8mb3 COLLATE utf8mb3_unicode_ci` on one in a
+  `utf8mb4` table (and `CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci` on a
+  `utf8mb4` column in a `utf8mb3` table). `SHOW FULL COLUMNS`,
+  `information_schema.COLUMNS` and `TABLES.TABLE_COLLATION` name the
+  collation; `CHARACTER_SET_NAME` is `utf8mb3` and `CHARACTER_OCTET_LENGTH`
+  three bytes a character — 765 for a `VARCHAR(255)`.
+- A column read back reports what a `utf8mb4` one does, the width counted in
+  the connection's character set: 1020 for a `VARCHAR(255)`.
+- A character past the Basic Multilingual Plane written into the column is
+  1366, in any row and any text type. The same character meeting the column
+  anywhere else — a comparison, `LIKE`, `IN`, `CONCAT` — is 1267 or 1270 in
+  MySQL, and bound it is 3988, so a statement that writes one and names a
+  table holding such a column is refused, as is a bound value spelling one,
+  except the `INSERT ... VALUES` that answers 1366.
+
+`CHARSET=utf8` alone, and a column's `CHARACTER SET utf8mb3` alone, are
+refused: each takes `utf8mb3_general_ci`, a comparison this server does not
+have. So is a collation beside another character set (1253 in MySQL), an
+`ENUM` or `SET` in `utf8mb3` (unmeasured), a database of `utf8mb3`, and a
+`utf8mb3` column read under `character_set_results = NULL`, where MySQL counts
+its width three bytes a character (765) and names collation 192. A column that
+named its table's own collation itself prints the shorter form here, as a
+`utf8mb4` one does. `SHOW COLLATION` and `SHOW CHARACTER SET` do not list it.
 
 A table takes `COLLATE=utf8mb4_unicode_ci` in each of MySQL's spellings —
 `DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`, `COLLATE=...`,

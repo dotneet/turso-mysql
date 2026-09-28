@@ -260,6 +260,11 @@ impl StoredDatabaseCollation {
         match collation {
             MySqlTableCollation::Utf8mb40900AiCi => None,
             MySqlTableCollation::Utf8mb4UnicodeCi => Some(Self::Utf8mb4UnicodeCi),
+            // A database takes `utf8mb4` alone, which the statement naming it
+            // is refused for otherwise.
+            MySqlTableCollation::Utf8mb3UnicodeCi => {
+                unreachable!("a database's collation is one of utf8mb4's")
+            }
         }
     }
 

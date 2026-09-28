@@ -2060,6 +2060,11 @@ pub(super) fn information_schema_columns_rows(
         let data_type = the_type_without_its_own_words(&column_type).to_vec();
         let (character_maximum_length, numeric_precision, numeric_scale, collation_name) =
             information_schema_column_sizes(&column, &column_type);
+        // Measured on MySQL 8.4.11: a `VARCHAR(255)` is 1020 bytes wide in
+        // `utf8mb4` and 765 in `utf8mb3`, and a `TEXT` is 65535 in either.
+        let widest_character = column
+            .collation_name()
+            .map_or(4, turso_mysql_parser::widest_character_of_collation);
         let character_octet_length = match data_type.as_slice() {
             b"char" | b"varchar" | b"enum" | b"set" => character_maximum_length
                 .as_ref()
@@ -2068,7 +2073,7 @@ pub(super) fn information_schema_columns_rows(
                         .ok()
                         .and_then(|digits| digits.parse::<u64>().ok())
                         .ok_or(FrontendErrorKind::Internal)?;
-                    Ok((characters * 4).to_string().into_bytes())
+                    Ok((characters * widest_character).to_string().into_bytes())
                 })
                 .transpose()?,
             _ => character_maximum_length.clone(),
@@ -2079,8 +2084,10 @@ pub(super) fn information_schema_columns_rows(
             }
             _ => Value::Null,
         };
-        let character_set_name = match &collation_name {
-            Some(_) => Value::build_text("utf8mb4"),
+        let character_set_name = match column.collation_name() {
+            Some(collation) => {
+                Value::build_text(turso_mysql_parser::character_set_of_collation(collation))
+            }
             None => Value::Null,
         };
         let key = match column.key() {

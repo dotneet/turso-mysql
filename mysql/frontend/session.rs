@@ -11810,6 +11810,7 @@ fn stored_text_collation_name(column: &turso_parser::ast::ColumnDefinition) -> &
     match named {
         Some(name) if name.eq_ignore_ascii_case("MYSQL_UTF8MB4_BIN") => "utf8mb4_bin",
         Some(name) if name.eq_ignore_ascii_case("MYSQL_UCA400_CI") => "utf8mb4_unicode_ci",
+        Some(name) if name.eq_ignore_ascii_case("MYSQL_UTF8MB3_UCA400_CI") => "utf8mb3_unicode_ci",
         _ => "utf8mb4_0900_ai_ci",
     }
 }
@@ -11854,7 +11855,7 @@ fn names_the_collation_of_words(constraint: &turso_parser::ast::NamedColumnConst
         &constraint.constraint,
         ColumnConstraint::Collate { collation_name }
             if constraint.name.is_none()
-                && ["MYSQL_UCA9_AI_CI", "MYSQL_UTF8MB4_BIN", "MYSQL_UCA400_CI", "NOCASE"].iter().any(|name|
+                && ["MYSQL_UCA9_AI_CI", "MYSQL_UTF8MB4_BIN", "MYSQL_UCA400_CI", "MYSQL_UTF8MB3_UCA400_CI", "NOCASE"].iter().any(|name|
                     collation_name.as_str().eq_ignore_ascii_case(name))
     )
 }
@@ -13311,6 +13312,9 @@ fn call_over_another_collation(
             turso_core::CollationSeq::MySqlUca400 => Some(format!(
                 "text call on utf8mb4_unicode_ci column {name} requires its collation"
             )),
+            turso_core::CollationSeq::MySqlUtf8mb3Uca400 => Some(format!(
+                "text call on utf8mb3_unicode_ci column {name} requires its collation"
+            )),
             _ => None,
         }
     })
@@ -13939,7 +13943,9 @@ fn uses_session_local_clock(sql: &str) -> bool {
 /// Answers `None` for a string `DEFAULT`, whose escaping this does not decide.
 fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option<String> {
     let mut rendered = format!("{} {}", mysql_quoted(name), copied_column_type(column));
-    if let Some(collation @ ("utf8mb4_bin" | "utf8mb4_unicode_ci")) = column.collation_name() {
+    if let Some(collation @ ("utf8mb4_bin" | "utf8mb4_unicode_ci" | "utf8mb3_unicode_ci")) =
+        column.collation_name()
+    {
         rendered.push_str(" COLLATE ");
         rendered.push_str(collation);
     }

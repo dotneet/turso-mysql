@@ -591,10 +591,15 @@ impl Dialect for MySqlDialect {
     }
 
     /// MySQL matches `LIKE` under the collation of the column it reads, and a
-    /// `utf8mb4_unicode_ci` column matches under Unicode 4.0.0's weights.
+    /// `utf8mb4_unicode_ci` or `utf8mb3_unicode_ci` column matches under
+    /// Unicode 4.0.0's weights.
     fn function_for_collation(&self, name: &str, collation: CollationSeq) -> Option<String> {
-        (name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) && collation == CollationSeq::MySqlUca400)
-            .then(|| MYSQL_UCA400_LIKE.to_owned())
+        (name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE)
+            && matches!(
+                collation,
+                CollationSeq::MySqlUca400 | CollationSeq::MySqlUtf8mb3Uca400
+            ))
+        .then(|| MYSQL_UCA400_LIKE.to_owned())
     }
 
     fn exec_scalar_function(
@@ -2371,6 +2376,9 @@ pub(crate) fn check_mysql_assignment(
         if injected_rowid_alias_ordinal == Some(column_index) || matches!(value, Value::Null) {
             continue;
         }
+        if spec.holds_three_byte_characters(column_index) {
+            reject_characters_past_three_bytes(table_name, column_index, value)?;
+        }
         if let Some(column) = spec.byte_string(column_index) {
             check_byte_string(table_name, column_index, column, value)?;
             continue;
@@ -2656,6 +2664,36 @@ fn text_column_value(
         table: table_name.to_string(),
         column: column_index + 1,
         type_name: format!("{}({length})", if fixed_width { "CHAR" } else { "VARCHAR" }),
+    }
+    .into())
+}
+
+/// Refuses a character a `utf8mb3` column cannot hold.
+///
+/// Measured on MySQL 8.4.11: `'a😀'` written to a `utf8mb3_unicode_ci` column
+/// answers 1366, `Incorrect string value: '\xF0\x9F\x98\x80' for column`,
+/// whether the column is a `VARCHAR` or a `TEXT`.
+fn reject_characters_past_three_bytes(
+    table_name: &str,
+    column_index: usize,
+    value: &Value,
+) -> Result<()> {
+    let holds_them = match value {
+        Value::Text(text) => text
+            .as_str()
+            .chars()
+            .all(|character| u32::from(character) <= 0xFFFF),
+        Value::Blob(bytes) => std::str::from_utf8(bytes)
+            .is_ok_and(|text| text.chars().all(|character| u32::from(character) <= 0xFFFF)),
+        _ => true,
+    };
+    if holds_them {
+        return Ok(());
+    }
+    Err(AssignmentError::IncorrectType {
+        table: table_name.to_string(),
+        column: column_index + 1,
+        type_name: "utf8mb3".to_string(),
     }
     .into())
 }

@@ -33,6 +33,10 @@ pub enum MySqlTableCollation {
     /// `utf8mb4_unicode_ci`, the Unicode 4.0.0 collation Laravel and Prisma
     /// ask for.
     Utf8mb4UnicodeCi,
+    /// `utf8mb3_unicode_ci`, the same Unicode 4.0.0 weights over `utf8mb3`,
+    /// which holds no character past the Basic Multilingual Plane. Sequelize
+    /// asks for it as `DEFAULT CHARSET=utf8 COLLATE utf8_unicode_ci`.
+    Utf8mb3UnicodeCi,
 }
 
 impl MySqlTableCollation {
@@ -41,6 +45,12 @@ impl MySqlTableCollation {
             Some(Self::Utf8mb40900AiCi)
         } else if name.eq_ignore_ascii_case("utf8mb4_unicode_ci") {
             Some(Self::Utf8mb4UnicodeCi)
+        } else if name.eq_ignore_ascii_case("utf8mb3_unicode_ci")
+            || name.eq_ignore_ascii_case("utf8_unicode_ci")
+        {
+            // Measured on MySQL 8.4.11: `utf8_unicode_ci` is read as
+            // `utf8mb3_unicode_ci`, and printed back that way.
+            Some(Self::Utf8mb3UnicodeCi)
         } else {
             None
         }
@@ -50,6 +60,15 @@ impl MySqlTableCollation {
         match self {
             Self::Utf8mb40900AiCi => "utf8mb4_0900_ai_ci",
             Self::Utf8mb4UnicodeCi => "utf8mb4_unicode_ci",
+            Self::Utf8mb3UnicodeCi => "utf8mb3_unicode_ci",
+        }
+    }
+
+    /// The character set the collation belongs to.
+    pub const fn character_set(self) -> &'static str {
+        match self {
+            Self::Utf8mb40900AiCi | Self::Utf8mb4UnicodeCi => "utf8mb4",
+            Self::Utf8mb3UnicodeCi => "utf8mb3",
         }
     }
 
@@ -59,7 +78,27 @@ impl MySqlTableCollation {
         match self {
             Self::Utf8mb40900AiCi => "",
             Self::Utf8mb4UnicodeCi => " COLLATE=utf8mb4_unicode_ci",
+            Self::Utf8mb3UnicodeCi => " COLLATE=utf8mb3_unicode_ci",
         }
+    }
+}
+
+/// The character set a collation this server has belongs to: the word its
+/// name starts with, as every MySQL collation's does.
+pub fn character_set_of_collation(collation: &str) -> &'static str {
+    if collation.starts_with("utf8mb3_") {
+        "utf8mb3"
+    } else {
+        "utf8mb4"
+    }
+}
+
+/// How many bytes one character of a collation's character set takes at
+/// most, which is what `CHARACTER_OCTET_LENGTH` counts a column's width in.
+pub fn widest_character_of_collation(collation: &str) -> u64 {
+    match character_set_of_collation(collation) {
+        "utf8mb3" => 3,
+        _ => 4,
     }
 }
 

@@ -60,6 +60,19 @@ pub fn leave_out_from_dual(sql: &str, mode: SessionSqlMode) -> Result<Option<Str
     Ok(Some(format!("{}{}", &sql[..start], &sql[end..])))
 }
 
+/// Whether `sql` is an `INSERT` or `REPLACE` of written rows and nothing
+/// else — no `SELECT` as its source and no `ON DUPLICATE KEY UPDATE`.
+pub fn inserts_written_values_only(sql: &str, mode: SessionSqlMode) -> bool {
+    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+        return false;
+    };
+    insert.on.is_none()
+        && insert
+            .source
+            .as_ref()
+            .is_some_and(|source| matches!(source.body.as_ref(), SetExpr::Values(_)))
+}
+
 fn is_unquoted_word(token: &Token, expected: &str) -> bool {
     matches!(token, Token::Word(word)
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))

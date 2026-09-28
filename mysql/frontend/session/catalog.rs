@@ -108,6 +108,19 @@ impl MySqlConnection {
             .any(|listed| listed.name.eq_ignore_ascii_case(table.as_str())))
     }
 
+    /// Whether a table of the selected database has a column of words in
+    /// `utf8mb3`, which holds no character past the Basic Multilingual Plane.
+    pub fn holds_three_byte_words(&self, table: &MySqlTableName) -> bool {
+        self.inner
+            .current_schema()
+            .get_table(table.as_str())
+            .is_some_and(|table| {
+                table.columns().iter().any(|column| {
+                    column.collation() == turso_core::CollationSeq::MySqlUtf8mb3Uca400
+                })
+            })
+    }
+
     /// Whether a statement on this connection can read a table of this name,
     /// a temporary one among them, which [`Self::names_a_table`] leaves out.
     ///

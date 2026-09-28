@@ -143,7 +143,7 @@ pub use dump_ddl::{
     parse_optional_mysqldump_drop_view, MySqlDumpDdl,
 };
 pub use flush_tables::{parse_flush_tables, parse_optional_flush_tables, MySqlFlushTablesCommand};
-pub use from_dual::leave_out_from_dual;
+pub use from_dual::{inserts_written_values_only, leave_out_from_dual};
 pub use insert_select::{
     direct_insert_select_projection, filtered_insert_select_projection, insert_select_source_sql,
     parse_optional_insert_select, parse_optional_insert_select_without_columns,
@@ -220,10 +220,10 @@ pub use static_select_metadata::{
 };
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
-    alter_table_with_its_collation_on_each_text_column,
+    alter_table_with_its_collation_on_each_text_column, character_set_of_collation,
     create_table_with_its_collation_on_each_text_column, create_table_with_the_database_collation,
     table_collation_of, table_comment_change, table_counter_change, table_engine_restated,
-    table_options_of, MySqlTableCollation, MySqlTableOptions,
+    table_options_of, widest_character_of_collation, MySqlTableCollation, MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
@@ -1754,6 +1754,7 @@ pub struct MySqlNumericSpec {
     jsons: Vec<bool>,
     floats: Vec<bool>,
     unsigned_reals: Vec<bool>,
+    three_byte_texts: Vec<bool>,
 }
 
 impl MySqlNumericSpec {
@@ -1846,6 +1847,12 @@ impl MySqlNumericSpec {
         self.unsigned_reals.get(index).copied().unwrap_or(false)
     }
 
+    /// Reports whether a stored column holds words in `utf8mb3`, which has no
+    /// character past the Basic Multilingual Plane.
+    pub fn holds_three_byte_characters(&self, index: usize) -> bool {
+        self.three_byte_texts.get(index).copied().unwrap_or(false)
+    }
+
     /// Returns the number of columns represented by the durable table DDL.
     pub fn len(&self) -> usize {
         self.columns.len()
@@ -1865,6 +1872,10 @@ impl MySqlNumericSpec {
             && !self.jsons.iter().any(|is_json| *is_json)
             && !self.floats.iter().any(|is_float| *is_float)
             && !self.unsigned_reals.iter().any(|is_unsigned| *is_unsigned)
+            && !self
+                .three_byte_texts
+                .iter()
+                .any(|is_three_byte| *is_three_byte)
     }
 }
 
@@ -5846,7 +5857,48 @@ pub fn parse_mysql_numeric_spec(
                 )
             })
             .collect(),
+        three_byte_texts: {
+            let table_holds_three_byte_characters = check_table_options(&table.table_options)
+                .is_ok_and(|options| options.collation.character_set() == "utf8mb3");
+            table
+                .columns
+                .iter()
+                .map(|column| {
+                    holds_three_byte_characters(column, table_holds_three_byte_characters)
+                })
+                .collect()
+        },
     })
+}
+
+/// Whether a column holds words in `utf8mb3`: it names that character set or
+/// one of its collations, or names neither and its table is `utf8mb3`.
+fn holds_three_byte_characters(column: &ColumnDef, table_holds_them: bool) -> bool {
+    if !a_column_of_words(&column.data_type) {
+        return false;
+    }
+    let named = column
+        .options
+        .iter()
+        .find_map(|option| match &option.option {
+            ColumnOption::Collation(name) => Some(unqualified_name_is(
+                name,
+                &["utf8mb3_unicode_ci", "utf8_unicode_ci"],
+            )),
+            _ => None,
+        })
+        .or_else(|| {
+            column
+                .options
+                .iter()
+                .find_map(|option| match &option.option {
+                    ColumnOption::CharacterSet(name) => {
+                        Some(unqualified_name_is(name, &["utf8mb3", "utf8"]))
+                    }
+                    _ => None,
+                })
+        });
+    named.unwrap_or(table_holds_them)
 }
 
 /// Parses exactly one checked MySQL `CREATE TABLE` statement into Turso's SQLite AST.
@@ -7368,6 +7420,7 @@ pub(crate) fn check_table_options(
     };
     let mut written = Vec::with_capacity(options.len());
     let mut checked = CheckedTableOptions::default();
+    let mut character_set = None;
     for option in options {
         let named = match option {
             SqlOption::KeyValue { key, value }
@@ -7391,9 +7444,14 @@ pub(crate) fn check_table_options(
                 "ENGINE"
             }
             SqlOption::KeyValue { key, value } if names_a_character_set(key) => {
-                if !written_word_is(value, "utf8mb4") {
+                // Measured on MySQL 8.4.11: `utf8` is read as `utf8mb3`.
+                character_set = Some(if written_word_is(value, "utf8mb4") {
+                    "utf8mb4"
+                } else if written_word_is(value, "utf8mb3") || written_word_is(value, "utf8") {
+                    "utf8mb3"
+                } else {
                     return unsupported("CREATE TABLE character set");
-                }
+                });
                 "CHARACTER SET"
             }
             SqlOption::KeyValue { key, value } if names_a_collation(key) => {
@@ -7418,6 +7476,18 @@ pub(crate) fn check_table_options(
             return unsupported("repeated CREATE TABLE option");
         }
         written.push(named);
+    }
+    // A collation names its character set, so naming it alone is enough. A
+    // character set named alone takes its own default collation, which for
+    // `utf8mb3` is `utf8mb3_general_ci`, a comparison this server does not
+    // have; and a collation of another character set is 1253 in MySQL.
+    if let Some(character_set) = character_set {
+        let collation_named = written.contains(&"COLLATE");
+        if character_set != checked.collation.character_set()
+            || (character_set == "utf8mb3" && !collation_named)
+        {
+            return unsupported("CREATE TABLE character set beside another collation");
+        }
     }
     Ok(checked)
 }
@@ -7796,6 +7866,7 @@ fn render_column(column: &ColumnDef) -> Result<String, ParseError> {
     {
         return unsupported("DEFAULT NULL on a NOT NULL column");
     }
+    check_column_character_set(column)?;
     let collation = engine_collation_of(column);
     let options = column
         .options
@@ -7848,8 +7919,60 @@ pub(crate) fn engine_collation_of(column: &ColumnDef) -> &'static str {
         Some(name) if unqualified_name_is(name, &["utf8mb4_unicode_ci"]) => {
             " COLLATE MYSQL_UCA400_CI"
         }
+        Some(name) if unqualified_name_is(name, &["utf8mb3_unicode_ci", "utf8_unicode_ci"]) => {
+            " COLLATE MYSQL_UTF8MB3_UCA400_CI"
+        }
         _ => WORDS_COLLATION,
     }
+}
+
+/// Refuses a column whose character set and collation do not go together, or
+/// that names a character set whose own default collation this server does
+/// not have.
+///
+/// Measured on MySQL 8.4.11: a collation names its character set, so
+/// `COLLATE utf8mb3_unicode_ci` alone makes a `utf8mb3` column; `utf8` is read
+/// as `utf8mb3`; a collation of another character set than the one named is
+/// 1253; and `CHARACTER SET utf8mb3` alone takes `utf8mb3_general_ci`, whose
+/// comparison this server does not have. An `ENUM` or a `SET` in `utf8mb3`
+/// is refused as not measured.
+pub(crate) fn check_column_character_set(column: &ColumnDef) -> Result<(), ParseError> {
+    let mut character_set = None;
+    let mut collation = None;
+    for option in &column.options {
+        match &option.option {
+            ColumnOption::CharacterSet(name) => {
+                character_set = Some(if unqualified_name_is(name, &["utf8mb4"]) {
+                    "utf8mb4"
+                } else {
+                    "utf8mb3"
+                });
+            }
+            ColumnOption::Collation(name) => {
+                collation = Some(
+                    if unqualified_name_is(name, &["utf8mb3_unicode_ci", "utf8_unicode_ci"]) {
+                        "utf8mb3"
+                    } else {
+                        "utf8mb4"
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    let character_set = match (character_set, collation) {
+        (Some(named), Some(collated)) if named != collated => {
+            return unsupported("column COLLATE of another CHARACTER SET")
+        }
+        (Some("utf8mb3"), None) => return unsupported("column CHARACTER SET utf8mb3 alone"),
+        (named, collated) => named.or(collated),
+    };
+    if character_set == Some("utf8mb3")
+        && matches!(column.data_type, DataType::Enum(..) | DataType::Set(_))
+    {
+        return unsupported("ENUM or SET in utf8mb3");
+    }
+    Ok(())
 }
 
 /// Reports whether a column holds words rather than bytes or numbers.
@@ -8254,8 +8377,10 @@ fn render_column_option(
         // declared with the matching engine collation where it is rendered;
         // naming another would be a claim about ordering and case that this
         // cannot keep, so it is refused.
+        // Which collation goes with which character set is checked over the
+        // whole column, in `check_column_character_set`.
         ColumnOption::CharacterSet(name) if option.name.is_none() => {
-            if !unqualified_name_is(name, &["utf8mb4"]) {
+            if !unqualified_name_is(name, &["utf8mb4", "utf8mb3", "utf8"]) {
                 return unsupported("column CHARACTER SET");
             }
             Ok(None)
@@ -8264,7 +8389,13 @@ fn render_column_option(
             if !a_column_of_words(data_type)
                 || !unqualified_name_is(
                     name,
-                    &["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_unicode_ci"],
+                    &[
+                        "utf8mb4_0900_ai_ci",
+                        "utf8mb4_bin",
+                        "utf8mb4_unicode_ci",
+                        "utf8mb3_unicode_ci",
+                        "utf8_unicode_ci",
+                    ],
                 )
             {
                 return unsupported("column COLLATE");

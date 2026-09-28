@@ -2766,6 +2766,17 @@ where
             text,
             self.session.session_sql_mode(),
         )?;
+        // Measured on MySQL 8.4.11: a bound character past the Basic
+        // Multilingual Plane meeting a `utf8mb3` column is 3988, whether it is
+        // written, compared or matched. The bound values are not decoded yet,
+        // so their bytes are looked for the character's four-byte spelling.
+        if let Some(statement) = self.prepared_statements.statements.get(&statement_id) {
+            if spells_a_character_past_three_bytes(parameter_payload)
+                && self.names_a_table_holding_three_byte_words(&statement.text)
+            {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+        }
         if let Some(connection) = &connection {
             self.start_a_statement_on(connection)?;
             if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
@@ -3138,6 +3149,7 @@ where
             turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = serial_written_out.as_deref().unwrap_or(sql);
+        self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         match self.prepare_checked_database_statement(sql) {
             Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
                 if turso_mysql_parser::answers_no_rows_and_binds_nothing(
@@ -3298,6 +3310,51 @@ where
         )
     }
 
+    /// Refuses a statement that writes a character past the Basic
+    /// Multilingual Plane and names a table holding words in `utf8mb3`.
+    ///
+    /// Measured on MySQL 8.4.11: such a character meeting a `utf8mb3` column
+    /// in a comparison, `LIKE`, `IN` or `CONCAT` is 1267 or 1270, an illegal
+    /// mix of collations, where the engine would compare it. Written into the
+    /// column by an `INSERT ... VALUES` it is 1366, which the check on every
+    /// written value answers, so that statement is let through.
+    fn refuse_a_character_past_three_bytes_beside_utf8mb3(
+        &self,
+        sql: &str,
+    ) -> Result<(), FrontendErrorKind> {
+        if !sql.chars().any(|character| u32::from(character) > 0xFFFF)
+            || turso_mysql_parser::inserts_written_values_only(sql, self.session.session_sql_mode())
+        {
+            return Ok(());
+        }
+        if self.names_a_table_holding_three_byte_words(sql) {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Whether `sql` names a table holding words in `utf8mb3`, or a table this
+    /// cannot look at, which might.
+    fn names_a_table_holding_three_byte_words(&self, sql: &str) -> bool {
+        let Ok(connection) = self.session.connection() else {
+            return true;
+        };
+        let Some(named) = turso_mysql_parser::tables_named_by(sql, self.session.session_sql_mode())
+        else {
+            return true;
+        };
+        let selected = self.session.selected_database();
+        named.into_iter().any(|named| {
+            if named.database.is_some_and(|qualifier| {
+                !selected.is_some_and(|selected| qualifier.eq_ignore_ascii_case(selected))
+            }) {
+                return true;
+            }
+            MySqlTableName::parse(&named.table)
+                .map_or(true, |table| connection.holds_three_byte_words(&table))
+        })
+    }
+
     /// The first table `sql` names, in the selected database, that is neither
     /// a table, a view nor a temporary table there.
     fn missing_table_named_by(&self, sql: &str, database: &str) -> MissingTable {
@@ -3360,6 +3417,7 @@ where
             turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = serial_written_out.as_deref().unwrap_or(sql);
+        self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,
@@ -12864,6 +12922,16 @@ fn format_mysql_scaled_integer(value: i64, scale: u8) -> String {
         rendered.push_str(&"0".repeat(usize::from(scale)));
     }
     rendered
+}
+
+/// Whether `bytes` hold the UTF-8 spelling of a character past the Basic
+/// Multilingual Plane: a lead byte from 0xF0 to 0xF4 and three continuation
+/// bytes.
+fn spells_a_character_past_three_bytes(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| {
+        (0xF0..=0xF4).contains(&window[0])
+            && window[1..].iter().all(|byte| (0x80..=0xBF).contains(byte))
+    })
 }
 
 fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {

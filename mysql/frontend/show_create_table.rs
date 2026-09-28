@@ -56,8 +56,9 @@ pub fn render_create_table(
         })
         .unwrap_or_default();
     Some(format!(
-        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET=utf8mb4 COLLATE={}{comment}",
+        "CREATE TABLE {} (\n{body}\n) ENGINE=InnoDB{counter} DEFAULT CHARSET={} COLLATE={}{comment}",
         quoted(table),
+        options.collation.character_set(),
         options.collation.name()
     ))
 }
@@ -195,7 +196,8 @@ fn render_column(
 /// What a column of words says about its collation.
 ///
 /// Measured on MySQL 8.4.11: a column whose collation differs from its table's
-/// prints ` CHARACTER SET utf8mb4 COLLATE <name>`; one that takes a table
+/// prints ` CHARACTER SET <its character set> COLLATE <name>` — `utf8mb3` for
+/// a `utf8mb3_unicode_ci` column in a `utf8mb4` table; one that takes a table
 /// collation other than `utf8mb4_0900_ai_ci` prints ` COLLATE <name>`; and one
 /// that takes `utf8mb4_0900_ai_ci` from its table prints nothing. MySQL also
 /// prints the longer form for a column that named its table's collation
@@ -204,7 +206,10 @@ fn collation_clause(column: Option<&str>, table: MySqlTableCollation) -> String 
     match column {
         None => String::new(),
         Some(column) if column != table.name() => {
-            format!(" CHARACTER SET utf8mb4 COLLATE {column}")
+            format!(
+                " CHARACTER SET {} COLLATE {column}",
+                turso_mysql_parser::character_set_of_collation(column)
+            )
         }
         Some(_) if table == MySqlTableCollation::default() => String::new(),
         Some(column) => format!(" COLLATE {column}"),
