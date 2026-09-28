@@ -2321,8 +2321,16 @@ fn render_in_subquery(
     negated: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
-    let Expr::Identifier(column) = expr else {
-        return unsupported("SELECT IN requires one unqualified column");
+    // The outer column may be named through its table, which the frontend
+    // holds to being the one table the statement reads.
+    let (qualifier, column, rendered_column) = match expr {
+        Expr::Identifier(column) => (None, column, render_ident(column)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (
+            Some(parts[0].value.clone()),
+            &parts[1],
+            format!("{}.{}", render_ident(&parts[0]), render_ident(&parts[1])),
+        ),
+        _ => return unsupported("SELECT IN requires one column"),
     };
     let (rendered, projected) = render_subquery(subquery, render_context)?;
     let Some((inner_table, inner_column_name)) = projected else {
@@ -2331,15 +2339,14 @@ fn render_in_subquery(
     render_context
         .checked_subquery_comparisons
         .push(CheckedSubqueryComparison {
-            qualifier: None,
+            qualifier,
             column_name: column.value.clone(),
             inner_table,
             inner_column_name,
             fixed_columns: Vec::new(),
         });
     Ok(format!(
-        "({} {}IN ({rendered}))",
-        render_ident(column),
+        "({rendered_column} {}IN ({rendered}))",
         if negated { "NOT " } else { "" }
     ))
 }
@@ -2380,7 +2387,27 @@ fn render_subquery_select(
     let may_join = std::mem::take(&mut render_context.an_exists_may_join);
     let comparisons_before = render_context.checked_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
-    if sources.len() > 1 && may_join {
+    // A subquery joining tables answers one column when it projects a column
+    // named through one of them — Gitea's `repository.id IN (SELECT
+    // team_repo.repo_id FROM team_repo INNER JOIN team_user ON ...)` — which
+    // is held to its table's column the way a one-table subquery's is.
+    let joined_projection = match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))]
+            if sources.len() > 1 && parts.len() == 2 =>
+        {
+            let mut named = sources
+                .iter()
+                .filter(|source| source.reference.eq_ignore_ascii_case(&parts[0].value));
+            match (named.next(), named.next()) {
+                (Some(source), None) if source.catalog.is_none() && source.derived.is_none() => {
+                    Some((source.table.as_str().to_owned(), parts[1].value.clone()))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if sources.len() > 1 && (may_join || joined_projection.is_some()) {
         // An unqualified name a subquery compares is the column of whichever
         // of its tables has one, so those tables travel with it.
         let references = sources
@@ -2401,7 +2428,7 @@ fn render_subquery_select(
                 render_context.subquery_tables.push(source);
             }
         }
-        return Ok((rendered, None));
+        return Ok((rendered, joined_projection));
     }
     let [source] = sources.as_slice() else {
         return unsupported("SELECT subquery requires one table");

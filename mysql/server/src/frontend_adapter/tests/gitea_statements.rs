@@ -508,3 +508,68 @@ fn giteas_consistency_checks_compare_a_count_column_with_a_count() {
         );
     }
 }
+
+/// Gitea decides which repositories a user may see with `repository.id IN
+/// (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON ...)`: a
+/// subquery joining tables, projecting one column named through one of them.
+/// That column is held to the outer one's kind the way a one-table
+/// subquery's is. Every answer here was measured on MySQL 8.4.11 over the
+/// same rows.
+#[test]
+fn giteas_access_checks_read_a_column_of_a_joined_subquery() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NULL, `is_private` TINYINT(1) DEFAULT 0 NOT NULL, `lower_name` VARCHAR(255) NULL)",
+        "CREATE TABLE `team_repo` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+        "CREATE TABLE `team_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `uid` BIGINT(20) NULL)",
+        "CREATE TABLE `team_unit` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `team_id` BIGINT(20) NULL, `type` INT NULL, `access_mode` INT NULL)",
+        "INSERT INTO `repository` (`owner_id`, `is_private`) VALUES (1, 0), (2, 1), (3, 1), (2, 0), (4, 1)",
+        "INSERT INTO `team_repo` (`org_id`, `team_id`, `repo_id`) VALUES (3, 10, 3), (3, 11, 5), (3, 10, 5)",
+        "INSERT INTO `team_user` (`org_id`, `team_id`, `uid`) VALUES (3, 10, 7), (3, 11, 8)",
+        "INSERT INTO `team_unit` (`team_id`, `type`, `access_mode`) VALUES (10, 1, 2), (11, 1, 0), (11, 2, 2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT id FROM repository WHERE repository.id IN (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id WHERE team_user.uid=7) OR repository.owner_id=1 ORDER BY id"
+        ),
+        ["1", "3", "5"]
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT id FROM repository WHERE (repository.is_private=1 AND repository.id NOT IN (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id WHERE team_user.uid=8)) ORDER BY id"
+        ),
+        ["2", "3"]
+    );
+    assert!(first_column(
+        &mut adapter,
+        "SELECT id FROM repository WHERE repository.id IN (SELECT `team_repo`.repo_id FROM team_repo INNER JOIN team_user ON `team_user`.team_id = `team_repo`.team_id LEFT JOIN team_unit ON `team_unit`.team_id = `team_repo`.team_id AND `team_unit`.`type` = 1 WHERE `team_user`.uid=8 AND (`team_unit`.`access_mode`>0)) ORDER BY id"
+    )
+    .is_empty());
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT id FROM repository WHERE id IN (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id LEFT JOIN team_unit ON team_unit.team_id = team_repo.team_id AND team_unit.type = 2 WHERE team_user.uid = 8 AND team_unit.access_mode > 0) ORDER BY id"
+        ),
+        ["5"]
+    );
+    for sql in [
+        // A word against a whole number is a coercion MySQL makes and this
+        // does not.
+        "SELECT id FROM repository WHERE lower_name IN (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)",
+        // Which of the joined tables an unqualified name belongs to is not
+        // worked out here.
+        "SELECT id FROM repository WHERE id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql} must be refused"
+        );
+    }
+}

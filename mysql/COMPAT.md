@@ -1754,7 +1754,15 @@ A membership test raises the same coercion question a literal comparison does,
 so it is held to the same rule: MySQL compares the two columns by coercing one
 to the other's type and the engine compares them by affinity, so both have to be
 the same kind — two signed integer columns, or two text ones. `EXISTS` records
-nothing, since it compares nothing.
+nothing, since it compares nothing. The outer column may be named through the
+statement's one table — `repository.id IN (...)` — and the subquery may join
+tables when the column it projects is named through one of them: Gitea decides
+which repositories a user may see with `repository.id IN (SELECT
+team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id =
+team_repo.team_id LEFT JOIN team_unit ON ... WHERE team_user.uid = ?)`, and the
+projected column is held to the outer one's kind as a one-table subquery's is.
+An unqualified projection over a join is refused, which of the tables it
+belongs to not being worked out here.
 
 `IN` over a list of values — `WHERE id IN (1, 2)` — follows the same rule one
 member at a time. Every member is recorded as its own checked comparison, so a
