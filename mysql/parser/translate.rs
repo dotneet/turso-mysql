@@ -1112,7 +1112,20 @@ fn render_select_body(
     // into one answer, so a bare column has no single row to come from. MySQL
     // says so with 1140.
     if group_by.is_empty() && projects_an_aggregate(select) {
-        hold_the_aggregated_projection(select)?;
+        match grouping::columns_written_values_decide(select) {
+            // Sequelize's `Post.max('views', { include: [{ model: User,
+            // where: { email } }] })` projects the user's columns beside the
+            // aggregate, which MySQL takes because the email decides the
+            // user. With no row the one answer is NULL for each of them, so
+            // none is reported NOT NULL.
+            Some(claim) if outer_projection => {
+                render_context.columns_the_keys_decide = Some(claim);
+                for source in &mut source_tables {
+                    source.outer = true;
+                }
+            }
+            _ => hold_the_aggregated_projection(select)?,
+        }
     }
     if let Some(having) = having.as_ref().filter(|_| !row_filter) {
         if group_by.is_empty() {

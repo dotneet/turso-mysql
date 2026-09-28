@@ -2270,6 +2270,9 @@ fn an_aggregated_projection_refuses_an_ungrouped_column() {
         "SELECT id, SUM(score) FROM users GROUP BY id",
         // An ORDER BY is not a projection.
         "SELECT SUM(score) FROM users ORDER BY id",
+        // A written value fixes the column, which the frontend then holds to
+        // what the table's keys decide.
+        "SELECT SUM(score), id FROM users WHERE id = 1",
     ] {
         assert!(
             parse_select(sql, SessionSqlMode::default()).is_ok(),

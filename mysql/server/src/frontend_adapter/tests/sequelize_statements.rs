@@ -802,3 +802,88 @@ fn sequelizes_raw_update_appends_to_a_column_that_may_be_null() {
         );
     }
 }
+
+/// `Post.max('views', { include: [{ model: User, where: { email } }] })`
+/// projects the user's columns beside `max(views)` with no `GROUP BY`.
+/// Measured on MySQL 8.4.11: under `ONLY_FULL_GROUP_BY` that is taken when a
+/// comparison with a written value in the `WHERE` or an inner join's `ON`
+/// decides each column, itself or through a key, and each such column keeps
+/// its keys but not `NOT_NULL`, the one answer being NULL for all of them when
+/// no row matches.
+#[test]
+fn sequelizes_max_over_an_include_projects_the_columns_its_condition_decides() {
+    let (_directory, mut adapter) = blog();
+    let (shapes, rows) = report(
+        &mut adapter,
+        "SELECT max(`views`) AS `max`, `user`.`id` AS `user.id`, `user`.`email` AS `user.email`, `user`.`name` AS `user.name`, `user`.`balance` AS `user.balance`, `user`.`profile` AS `user.profile`, `user`.`created_at` AS `user.createdAt`, `user`.`version` AS `user.version` FROM `posts` AS `Post` INNER JOIN `users` AS `user` ON `Post`.`user_id` = `user`.`id` AND `user`.`email` = 'alice@example.com';",
+    );
+    const PART_KEY: u16 = 16384;
+    const NO_DEFAULT: u16 = 4096;
+    const BINARY: u16 = 128;
+    assert_eq!(
+        shapes,
+        [
+            ("max", "", 32768 | BINARY),
+            ("user.id", "user", 2 | 512 | PART_KEY),
+            ("user.email", "user", 4 | NO_DEFAULT | PART_KEY),
+            ("user.name", "user", NO_DEFAULT),
+            ("user.balance", "user", 0),
+            ("user.profile", "user", 16 | BINARY),
+            ("user.createdAt", "user", BINARY | NO_DEFAULT),
+            ("user.version", "user", 0),
+        ]
+        .map(|(name, table, flags)| (name.to_owned(), table.to_owned(), flags))
+    );
+    assert_eq!(
+        rows,
+        values(&[&[
+            Some("5"),
+            Some("1"),
+            Some("alice@example.com"),
+            Some("Alice"),
+            Some("10.00"),
+            None,
+            Some("2026-01-01 00:00:00"),
+            Some("0"),
+        ]])
+    );
+    for (sql, answer) in [
+        (
+            "SELECT MAX(p.views) AS m, u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id WHERE p.id = 1",
+            [Some("3"), Some("Alice")],
+        ),
+        (
+            "SELECT COUNT(*) AS c, u.name FROM users u WHERE u.email = 'nobody'",
+            [Some("0"), None],
+        ),
+        (
+            "SELECT MAX(views) AS m, title FROM posts WHERE 1 = id",
+            [Some("3"), Some("a")],
+        ),
+        (
+            "SELECT MAX(p.views) AS m, u.name FROM posts p JOIN users u ON u.id = p.user_id WHERE u.name = 'Bob'",
+            [Some("7"), Some("Bob")],
+        ),
+        (
+            "SELECT MAX(p.views) AS m, u.name FROM posts p JOIN users u ON u.id = p.user_id WHERE u.name = 'Nobody'",
+            [None, None],
+        ),
+    ] {
+        assert_eq!(report(&mut adapter, sql).1, values(&[&answer]), "{sql}");
+    }
+    // Each of these is 1140 in MySQL: nothing decides the column.
+    for sql in [
+        "SELECT MAX(p.views) AS m, p.title FROM posts p JOIN users u ON u.id = p.user_id WHERE u.id = 1",
+        "SELECT MAX(p.views) AS m, u.name FROM posts p LEFT JOIN users u ON u.id = p.user_id AND u.email = 'alice@example.com'",
+        "SELECT MAX(views) AS m, title FROM posts WHERE id = 1 OR id = 2",
+        "SELECT MAX(views) AS m, title FROM posts",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

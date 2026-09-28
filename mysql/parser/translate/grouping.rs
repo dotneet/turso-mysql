@@ -240,6 +240,93 @@ pub(super) fn render_select_group_by(
     Ok(rendered.join(", "))
 }
 
+/// Reads a statement that aggregates without a `GROUP BY` and projects whole
+/// columns beside its aggregates, each of which has to be decided by columns
+/// the statement compares with a written value.
+///
+/// Measured on MySQL 8.4.11: all its rows are one group, so a column passes
+/// when `col = value` in the `WHERE` or in an inner join's `ON` fixes it —
+/// `WHERE u.name = 'Bob'` decides `u.name` — or fixes a key that decides it,
+/// as a grouping key would: `JOIN users u ON p.user_id = u.id AND u.email =
+/// 'alice@example.com'` decides `u.name`. The same comparison in a `LEFT
+/// JOIN`'s `ON`, or joined by `OR`, decides nothing and answers 1140.
+pub(super) fn columns_written_values_decide(
+    select: &sqlparser::ast::Select,
+) -> Option<MySqlColumnsTheKeysDecide> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let mut columns = Vec::new();
+    for item in &select.projection {
+        let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
+            return None;
+        };
+        if aggregates_or_literals_only(expr) {
+            continue;
+        }
+        columns.push(MySqlNamedColumn::written(grouped_column(expr)?));
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    let joins = joined_tables(&select.from)?;
+    let [from] = select.from.as_slice() else {
+        return None;
+    };
+    let inner_join_conditions = from
+        .joins
+        .iter()
+        .filter_map(|join| match &join.join_operator {
+            JoinOperator::Join(JoinConstraint::On(on))
+            | JoinOperator::Inner(JoinConstraint::On(on)) => Some(on),
+            _ => None,
+        });
+    let keys = select
+        .selection
+        .iter()
+        .chain(inner_join_conditions)
+        .flat_map(conditions_joined_by_and)
+        .filter_map(column_fixed_to_a_written_value)
+        .map(MySqlNamedColumn::written)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(MySqlColumnsTheKeysDecide {
+        keys,
+        columns,
+        joins,
+    })
+}
+
+/// The column of `col = value` or `value = col`, `value` a written number or
+/// word.
+fn column_fixed_to_a_written_value(condition: &Expr) -> Option<GroupedColumn<'_>> {
+    let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::Eq,
+        right,
+    } = condition
+    else {
+        return None;
+    };
+    let is_written = |expr: &Expr| {
+        matches!(
+            without_parentheses(expr),
+            Expr::Value(value) if matches!(
+                value.value,
+                Value::Number(_, false) | Value::SingleQuotedString(_)
+            )
+        )
+    };
+    match (
+        grouped_column(without_parentheses(left)),
+        grouped_column(without_parentheses(right)),
+    ) {
+        (Some(column), None) if is_written(right) => Some(column),
+        (None, Some(column)) if is_written(left) => Some(column),
+        _ => None,
+    }
+}
+
 /// Returns the columns an expression names outside its aggregates that are
 /// not grouping keys, when it names nothing else a group has more than one
 /// of.
