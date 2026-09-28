@@ -351,7 +351,6 @@ pub struct ClassicConnection {
     state: ConnectionState,
     initial_handshake: InitialHandshakeConfig,
     packet_codec: PacketCodec,
-    response_packet_codec: PacketCodec,
     transport_security: TransportSecurity,
     client_response: Option<ClientHandshakeResponse>,
     initial_database: Option<String>,
@@ -454,7 +453,6 @@ impl ClassicConnection {
             state: ConnectionState::SendInitialHandshake,
             initial_handshake,
             packet_codec,
-            response_packet_codec: packet_codec,
             transport_security,
             client_response: None,
             initial_database: None,
@@ -476,7 +474,7 @@ impl ClassicConnection {
     }
 
     pub(crate) const fn response_packet_codec(&self) -> PacketCodec {
-        self.response_packet_codec
+        self.packet_codec
     }
 
     /// Returns the decoded client response after it has been accepted.
@@ -556,7 +554,6 @@ impl ClassicConnection {
         self.validate_client_capabilities(request.capability_flags)?;
         let negotiated_capabilities =
             request.capability_flags & self.initial_handshake.capability_flags;
-        self.set_response_packet_limit(request.max_packet_size)?;
         self.ssl_request = Some(request);
         self.negotiated_capabilities = Some(negotiated_capabilities);
         self.state = ConnectionState::TlsUpgradeRequired;
@@ -611,7 +608,6 @@ impl ClassicConnection {
                 });
             }
         }
-        self.set_response_packet_limit(response.max_packet_size)?;
         self.initial_database.clone_from(&response.database);
         self.client_response = Some(response);
         if initial_response {
@@ -685,7 +681,7 @@ impl ClassicConnection {
         let mut scramble = self.initial_handshake.auth_plugin_data.to_vec();
         scramble.push(0);
         let frame = AuthSwitchRequestConfig::new(CACHING_SHA2_PASSWORD_PLUGIN, scramble)
-            .encode(self.response_packet_codec, sequence_id)?;
+            .encode(self.packet_codec, sequence_id)?;
         self.auth_client_sequence_id = Some(sequence_id.wrapping_add(1));
         self.state = ConnectionState::AwaitAuthSwitchResponse;
         Ok(frame)
@@ -779,7 +775,7 @@ impl ClassicConnection {
             }
         };
         let sequence_id = self.auth_server_sequence_id()?;
-        let frame = AuthMoreData::encode(self.response_packet_codec, sequence_id, kind)?;
+        let frame = AuthMoreData::encode(self.packet_codec, sequence_id, kind)?;
         self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
         match kind {
             AuthMoreDataKind::FastAuthSuccess => {
@@ -883,8 +879,7 @@ impl ClassicConnection {
 
     fn encode_authentication_ok(&mut self) -> Result<Vec<u8>, ConnectionStateError> {
         let sequence_id = self.auth_server_sequence_id()?;
-        let frame =
-            AuthOkPacketConfig::default().encode(self.response_packet_codec, sequence_id)?;
+        let frame = AuthOkPacketConfig::default().encode(self.packet_codec, sequence_id)?;
         self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
         self.state = ConnectionState::Ready;
         Ok(frame)
@@ -900,11 +895,8 @@ impl ClassicConnection {
             .ok_or(ConnectionStateError::ClientResponseRequired)?;
         self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
         self.state = ConnectionState::Closing;
-        let frame = map_frontend_error(kind).encode(
-            self.response_packet_codec,
-            sequence_id,
-            capabilities,
-        )?;
+        let frame =
+            map_frontend_error(kind).encode(self.packet_codec, sequence_id, capabilities)?;
         Ok(AuthenticationResponse::Err { kind, frame })
     }
 
@@ -1022,8 +1014,7 @@ impl ClassicConnection {
             return Err(ConnectionStateError::AuthenticationRejected);
         }
         let sequence_id = self.auth_server_sequence_id()?;
-        let frame =
-            AuthOkPacketConfig::default().encode(self.response_packet_codec, sequence_id)?;
+        let frame = AuthOkPacketConfig::default().encode(self.packet_codec, sequence_id)?;
         self.auth_server_sequence_id = Some(sequence_id.wrapping_add(1));
         self.state = ConnectionState::Ready;
         Ok(frame)
@@ -1199,20 +1190,6 @@ impl ClassicConnection {
     fn auth_server_sequence_id(&self) -> Result<u8, ConnectionStateError> {
         self.auth_server_sequence_id
             .ok_or(ConnectionStateError::ClientResponseRequired)
-    }
-
-    fn set_response_packet_limit(
-        &mut self,
-        client_max_packet_size: u32,
-    ) -> Result<(), ConnectionStateError> {
-        let requested_limit = if client_max_packet_size == 0 {
-            self.packet_codec.max_payload_len()
-        } else {
-            usize::try_from(client_max_packet_size).unwrap_or(usize::MAX)
-        };
-        let response_limit = self.packet_codec.max_payload_len().min(requested_limit);
-        self.response_packet_codec = PacketCodec::new(response_limit)?;
-        Ok(())
     }
 }
 
@@ -2711,38 +2688,35 @@ mod tests {
         }
     }
 
+    /// sqlx announces 1024 in its SSLRequest and its response. Measured on
+    /// MySQL 8.4.11, 0, 1, 1024 and 4095 are all taken and a longer row is
+    /// sent whole, so the server's own codec stays the only limit.
     #[test]
-    fn rejects_client_limits_and_collations_before_authentication() {
-        let mut connection =
-            ClassicConnection::with_transport_security(server_config(), TransportSecurity::Secure)
+    fn a_client_packet_limit_below_one_response_is_taken_and_ignored() {
+        for max_packet_size in [1, 1024, 4095] {
+            let mut config = server_config();
+            config.capability_flags |= CLIENT_SSL;
+            let mut connection =
+                ClassicConnection::with_transport_security(config, TransportSecurity::Plaintext)
+                    .unwrap();
+            connection.send_initial_handshake().unwrap();
+            let mut ssl = ssl_request(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL);
+            ssl.max_packet_size = max_packet_size;
+            connection.receive_client_ssl_request(ssl).unwrap();
+            connection.tls_upgrade_complete().unwrap();
+            let mut response = client_response_with_sequence(
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL,
+                TLS_CLIENT_HANDSHAKE_SEQUENCE_ID,
+            );
+            response.max_packet_size = max_packet_size;
+            connection
+                .receive_client_handshake_response(response)
                 .unwrap();
-        connection.send_initial_handshake().unwrap();
-
-        let mut too_small = client_response(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES);
-        too_small.max_packet_size = MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1;
-        assert!(matches!(
-            connection.receive_client_handshake_response(too_small),
-            Err(ConnectionStateError::ClientHandshakeResponse(
-                ClientHandshakeResponseError::MaxPacketSizeTooSmall {
-                    max_packet_size,
-                    ..
-                }
-            )) if max_packet_size == MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1
-        ));
-        assert_eq!(connection.state(), ConnectionState::AwaitClientResponse);
-
-        let mut ssl = ssl_request(REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL);
-        ssl.max_packet_size = MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1;
-        assert!(matches!(
-            connection.receive_client_ssl_request(ssl),
-            Err(ConnectionStateError::SslRequest(
-                ClientSslRequestError::MaxPacketSizeTooSmall {
-                    max_packet_size,
-                    ..
-                }
-            )) if max_packet_size == MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1
-        ));
-        assert_eq!(connection.state(), ConnectionState::AwaitClientResponse);
+            assert_eq!(
+                connection.response_packet_codec().max_payload_len(),
+                connection.packet_codec.max_payload_len()
+            );
+        }
     }
 
     #[test]

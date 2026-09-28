@@ -974,7 +974,7 @@ mod tests {
         ClientSslRequestConfig, ClientSslRequestError, PacketCodec, CLIENT_HANDSHAKE_SEQUENCE_ID,
         CLIENT_PLUGIN_AUTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
         DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN,
-        MIN_SERVER_RESPONSE_PAYLOAD_LENGTH, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
 
     struct ScriptedReader {
@@ -1251,23 +1251,26 @@ mod tests {
         );
     }
 
+    /// sqlx 0.8.6's SSLRequest, as the harness proxy dumped it: capabilities
+    /// 0x010b8a0a, a maximum packet size of 1024, utf8mb4_unicode_ci. It used
+    /// to be refused for the 1024, which MySQL 8.4.11 takes.
+    const SQLX_SSL_REQUEST: [u8; 36] = [
+        0x20, 0x00, 0x00, 0x01, 0x0a, 0x8a, 0x0b, 0x01, 0x00, 0x04, 0x00, 0x00, 0xe0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
     #[test]
-    fn a_small_max_packet_size_is_rejected_before_tls_and_any_charset_passes() {
-        let mut too_small = valid_ssl_request_frame(CLIENT_HANDSHAKE_SEQUENCE_ID);
-        too_small[8..12].copy_from_slice(&(MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1).to_le_bytes());
-        let mut too_small_reader = ScriptedReader::new(&too_small, too_small.len());
+    fn sqlx_ssl_request_with_a_small_packet_limit_is_taken_and_any_charset_passes() {
+        let mut sqlx_reader = ScriptedReader::new(&SQLX_SSL_REQUEST, SQLX_SSL_REQUEST.len());
+        let request = read_ssl_request_packet(
+            &mut sqlx_reader,
+            test_codec(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(
-            read_ssl_request_packet(
-                &mut too_small_reader,
-                test_codec(),
-                Instant::now() + Duration::from_secs(5)
-            ),
-            Err(PreTlsPacketError::InvalidSslRequest(
-                ClientSslRequestError::MaxPacketSizeTooSmall {
-                    max_packet_size: MIN_SERVER_RESPONSE_PAYLOAD_LENGTH - 1,
-                    minimum: MIN_SERVER_RESPONSE_PAYLOAD_LENGTH,
-                }
-            ))
+            (request.capability_flags, request.max_packet_size),
+            (0x010b_8a0a, 1024)
         );
 
         let mut unsupported_charset = valid_ssl_request_frame(CLIENT_HANDSHAKE_SEQUENCE_ID);
