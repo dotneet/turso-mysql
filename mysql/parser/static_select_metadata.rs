@@ -89,6 +89,12 @@ pub enum StaticSelectMetadata {
         aggregate: Box<StaticSelectMetadata>,
         fallback_places: u32,
     },
+    /// `CAST(<aggregate> AS SIGNED)` — Entity Framework Core reads a total as
+    /// `CAST(SUM(views) AS SIGNED)` — which answers a `LONGLONG` of 21 with
+    /// the binary flag, nullable as a total over no rows is. Only an
+    /// aggregate answering a whole number is taken, which the cast leaves as
+    /// it is; the server holds the aggregate to that.
+    AggregateAsWholeNumber(Box<StaticSelectMetadata>),
     /// A `CASE` or `IF` whose branches are whole numbers or name a column, or
     /// an `IFNULL` or `COALESCE` falling one column back onto another. The
     /// answer is a rule over every branch: the kind they share and the widest
@@ -3886,6 +3892,21 @@ fn classify_cast(
 
     if format.is_some() || array || !matches!(kind, CastKind::Cast | CastKind::DoubleColon) {
         return None;
+    }
+    if let Expr::Function(function) = expr {
+        if !matches!(data_type, DataType::Signed | DataType::SignedInteger) {
+            return None;
+        }
+        let (kind, column) = column_aggregate_argument(function)?;
+        if !matches!(kind, ColumnAggregateKind::Sum | ColumnAggregateKind::MinMax) {
+            return None;
+        }
+        return Some(StaticSelectMetadata::AggregateAsWholeNumber(Box::new(
+            StaticSelectMetadata::ColumnAggregate {
+                column_name: column.value.clone(),
+                kind,
+            },
+        )));
     }
     let Expr::Identifier(column) = expr else {
         return None;

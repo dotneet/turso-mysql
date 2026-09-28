@@ -11310,6 +11310,7 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
         | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate {
             aggregate: inner, ..
         }
+        | turso_mysql_parser::StaticSelectMetadata::AggregateAsWholeNumber(inner)
         | turso_mysql_parser::StaticSelectMetadata::FromTheGroupingTable {
             answer: inner, ..
         } => needs_source_columns(inner),
@@ -11403,6 +11404,30 @@ fn aggregate_column_definition(
             }
             let flags = definition.flags | MYSQL_NOT_NULL_FLAG;
             set_column_flags(&mut definition, flags);
+            Ok(definition)
+        }
+        // Measured on MySQL 8.4.11: `CAST(SUM(views) AS SIGNED)` answers a
+        // LONGLONG of 21 with the binary flag, nullable, over an aggregate of
+        // whole numbers. Anything else — a total of a DECIMAL with places, of
+        // a DOUBLE, a least of an unsigned column — rounds or wraps, and is
+        // refused.
+        turso_mysql_parser::StaticSelectMetadata::AggregateAsWholeNumber(inner) => {
+            let aggregate = aggregate_column_definition(source_metadata, name.clone(), inner)?;
+            let whole = matches!(
+                aggregate.column_type,
+                MYSQL_TYPE_TINY
+                    | MYSQL_TYPE_SHORT
+                    | MYSQL_TYPE_INT24
+                    | MYSQL_TYPE_LONG
+                    | MYSQL_TYPE_LONGLONG
+            ) || (aggregate.column_type == MYSQL_TYPE_NEWDECIMAL
+                && aggregate.decimals == 0);
+            if !whole || aggregate.flags & MYSQL_UNSIGNED_FLAG != 0 {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
+            definition.column_length = 21;
+            set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
             Ok(definition)
         }
         // Measured on MySQL 8.4.11: a scalar subquery answers the shape its
@@ -11561,6 +11586,7 @@ fn stored_in_a_derived_table(
                 function: ScalarFunction::CastsToDay,
                 ..
             }
+            | StaticSelectMetadata::AggregateAsWholeNumber(_)
     ) {
         return Err(FrontendErrorKind::Unsupported);
     }

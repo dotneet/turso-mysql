@@ -696,6 +696,7 @@ fn is_stored_in_a_derived_table(answer: &StaticSelectMetadata) -> bool {
                 function: ScalarFunction::CastsToDay,
                 ..
             }
+            | StaticSelectMetadata::AggregateAsWholeNumber(_)
     )
 }
 

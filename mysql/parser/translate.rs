@@ -2480,9 +2480,9 @@ fn aggregates_or_literals_only(expr: &Expr) -> bool {
     match expr {
         Expr::Function(function) => names_an_aggregate_call(function),
         Expr::Value(_) => true,
-        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
-            aggregates_or_literals_only(inner)
-        }
+        Expr::Nested(inner)
+        | Expr::UnaryOp { expr: inner, .. }
+        | Expr::Cast { expr: inner, .. } => aggregates_or_literals_only(inner),
         Expr::BinaryOp { left, right, .. } => {
             aggregates_or_literals_only(left) && aggregates_or_literals_only(right)
         }
@@ -2537,6 +2537,7 @@ fn names_an_aggregate(expr: &Expr) -> bool {
         Expr::Function(function) => names_an_aggregate_call(function),
         Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => names_an_aggregate(inner),
         Expr::BinaryOp { left, right, .. } => names_an_aggregate(left) || names_an_aggregate(right),
+        Expr::Cast { expr: inner, .. } => names_an_aggregate(inner),
         _ => false,
     }
 }
@@ -7326,6 +7327,23 @@ fn render_select_expr(
             if static_select_metadata::aggregate_over_branches(function).is_some() =>
         {
             render_aggregate_over_branches(function, render_context)
+        }
+        // The aggregate answers a whole number, which the server holds it
+        // to, so the cast leaves it as it is and the engine's own cast says
+        // the same; rounding it through a double would lose a total past 2^53.
+        Expr::Cast { expr: inner, .. }
+            if matches!(
+                static_select_metadata::classify_static_select_expr(expr),
+                Some(StaticSelectMetadata::AggregateAsWholeNumber(_))
+            ) =>
+        {
+            if contains_decimal_operand(inner, render_context.decimal_columns) {
+                return unsupported("SELECT CAST over DECIMAL requires exact numeric handling");
+            }
+            Ok(format!(
+                "CAST({} AS INTEGER)",
+                render_select_expr(inner, render_context)?
+            ))
         }
         // MySQL writes a column out, reads a whole number out of it, or reads
         // the day or the moment out of it. Each is spelled here as what the

@@ -1042,6 +1042,13 @@ answers 2 for `CAST(1.5 AS SIGNED)` and -2 for `CAST(-1.5 AS SIGNED)` where the 
 cast cuts the fraction off, so the value is rounded before it is cast. `DATE` answers the day
 out of a moment and `DATETIME` the moment a day begins.
 
+`CAST(<aggregate> AS SIGNED)` is read over a `SUM`, `MIN` or `MAX` of whole numbers — Entity
+Framework Core reads a total as `CAST(SUM(ViewCount) AS SIGNED)` — and answers the same
+`LONGLONG` of 21 with the binary flag, nullable, measured on 8.4.11; the aggregate is already
+a whole number there, so the cast leaves it as it is. Through a derived table the answer is
+written out into a table of its own and loses the binary flag, as a total does. An aggregate
+of a `DECIMAL`, a `DOUBLE` or an unsigned column, and an `AVG`, round or wrap and are refused.
+
 The rest are refused, each for a measured reason. `UNSIGNED` wraps a negative into an
 unsigned 64-bit number — `CAST(-3 AS UNSIGNED)` is 18446744073709551613 there — and the
 engine holds an integer as an `i64`. `DECIMAL` casts and writing a `DECIMAL`
@@ -5423,8 +5430,11 @@ the frameworks write over a `JSON` column: Laravel's `where('meta->lang',
 `whereJsonContains`, `whereJsonContainsKey`, `whereJsonLength` and
 `whereNull('meta->x')`, and the `meta->>'$.lang' = 'en'` Rails users write by
 hand. Each reads a column of the one table the statement reads, and the
-column has to be a `JSON` one. What each answers, measured on 8.4.11 over the
-same rows:
+column has to be a `JSON` one. The table may be read through a derived table
+whose body reads it alone, as Entity Framework Core's `SqlQuery` does around
+the app's statement — `SELECT s.Value FROM (SELECT COUNT(*) AS Value FROM
+Users WHERE Profile->>'$.city' = 'Osaka') AS s LIMIT 2`. What each answers,
+measured on 8.4.11 over the same rows:
 
 - `col->>'path'` and `JSON_UNQUOTE(JSON_EXTRACT(col, 'path'))` answer text
   with the `utf8mb4_bin` collation. Against a word it tells `en` from `EN`

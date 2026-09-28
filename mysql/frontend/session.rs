@@ -7995,7 +7995,16 @@ impl MySqlConnection {
                 "a JSON reading in a condition requires one base table".to_string(),
             ));
         };
-        if source.subquery() || !source.projected_columns().is_empty() {
+        // A derived table whose body reads one table reads the JSON column of
+        // that table, which Entity Framework Core's `SqlQuery` does around a
+        // statement of its own: `SELECT s.Value FROM (SELECT COUNT(*) AS Value
+        // FROM Users WHERE Profile->>'$.city' = 'Osaka') AS s LIMIT 2`.
+        let reads_one_table_through_a_derived_table = source
+            .derived()
+            .is_some_and(|derived| derived.joined().is_empty());
+        if source.subquery()
+            || (!source.projected_columns().is_empty() && !reads_one_table_through_a_derived_table)
+        {
             return Err(MySqlQueryError::Unsupported(
                 "a JSON reading in a condition requires one base table".to_string(),
             ));

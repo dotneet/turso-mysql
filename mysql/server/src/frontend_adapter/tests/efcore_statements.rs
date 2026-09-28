@@ -425,6 +425,84 @@ fn like_matches_a_json_document_as_the_text_mysql_prints() {
     );
 }
 
+/// `Database.SqlQuery<T>(...).Single()` reads the app's own statement through
+/// a derived table, `SELECT s.Value FROM (<statement>) AS s LIMIT 2`. A JSON
+/// reading in the statement's `WHERE` was refused there, and so was
+/// `CAST(SUM(ViewCount) AS SIGNED)` anywhere.
+///
+/// Measured on MySQL 8.4.11: through the derived table a count is a
+/// `LONGLONG` of 21, NOT NULL, and a total cast to a whole number a nullable
+/// `LONGLONG` of 21, neither carrying the binary flag; on its own the cast
+/// carries it.
+#[test]
+fn sql_query_reads_the_statement_through_a_derived_table() {
+    let (_directory, mut adapter) = adapter();
+    let shape = |set: &TextResultSet| {
+        let column = &set.columns[0];
+        (
+            column.name.clone(),
+            column.table.clone(),
+            column.column_type,
+            column.column_length,
+            column.flags,
+        )
+    };
+    let osaka = result_set(
+        &mut adapter,
+        "SELECT `s`.`Value`\nFROM (\n    SELECT COUNT(*) AS Value FROM Users WHERE Profile->>'$.city' = 'Osaka'\n) AS `s`\nLIMIT 2",
+    );
+    assert_eq!(
+        shape(&osaka),
+        (
+            "Value".to_owned(),
+            "s".to_owned(),
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+        )
+    );
+    assert_eq!(osaka.rows, [[Some(b"1".to_vec())]]);
+
+    let views = result_set(
+        &mut adapter,
+        "SELECT `s`.`Value`\nFROM (\n    SELECT CAST(SUM(Views) AS SIGNED) AS Value FROM Posts\n) AS `s`\nLIMIT 2",
+    );
+    assert_eq!(
+        shape(&views),
+        (
+            "Value".to_owned(),
+            "s".to_owned(),
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_NUM_FLAG
+        )
+    );
+    assert_eq!(views.rows, [[Some(b"3".to_vec())]]);
+    let plain = result_set(
+        &mut adapter,
+        "SELECT CAST(SUM(Views) AS SIGNED) AS Value FROM Posts WHERE Id = 0",
+    );
+    assert_eq!(
+        shape(&plain),
+        (
+            "Value".to_owned(),
+            String::new(),
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        )
+    );
+    assert_eq!(plain.rows, [[None]]);
+
+    // A total with places rounds, and an average is not a whole number.
+    for refused in [
+        "SELECT CAST(SUM(Balance) AS SIGNED) AS Value FROM Users",
+        "SELECT CAST(AVG(Views) AS SIGNED) AS Value FROM Posts",
+    ] {
+        assert!(adapter.execute_query(refused).is_err(), "{refused}");
+    }
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,
