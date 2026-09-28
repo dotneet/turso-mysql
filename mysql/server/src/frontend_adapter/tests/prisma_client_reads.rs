@@ -401,6 +401,27 @@ fn a_prepared_subquery_is_held_to_the_kind_of_the_column_it_meets() {
     }
 }
 
+/// Prisma's relation filters: `some` through a join table with a `LEFT JOIN`
+/// inside a correlated `EXISTS`, and `none` as a correlated `NOT EXISTS`.
+/// Measured on MySQL 8.4.11: the active user's post tagged `rust`, and the
+/// one user with no posts.
+#[test]
+fn relation_filters_find_the_rows_mysql_finds() {
+    let (_directory, mut adapter) = adapter();
+    const TAGGED: &str = "SELECT `prisma`.`posts`.`id`, `prisma`.`posts`.`user_id`, `prisma`.`posts`.`title`, `prisma`.`posts`.`body`, `prisma`.`posts`.`published_at`, `prisma`.`posts`.`views` FROM `prisma`.`posts` LEFT JOIN `prisma`.`users` AS `j2` ON (`j2`.`id`) = (`prisma`.`posts`.`user_id`) WHERE (EXISTS(SELECT `t0`.`post_id` FROM `prisma`.`post_tag` AS `t0` LEFT JOIN `prisma`.`tags` AS `j1` ON (`j1`.`id`) = (`t0`.`tag_id`) WHERE (`j1`.`name` = ? AND (`j1`.`id` IS NOT NULL) AND (`prisma`.`posts`.`id`) = (`t0`.`post_id`) AND `t0`.`post_id` IS NOT NULL)) AND (`j2`.`is_active` = ? AND (`j2`.`id` IS NOT NULL)))";
+    const NO_POSTS: &str = "SELECT `prisma`.`users`.`id`, `prisma`.`users`.`email`, `prisma`.`users`.`name`, `prisma`.`users`.`balance`, `prisma`.`users`.`is_active`, `prisma`.`users`.`profile`, `prisma`.`users`.`created_at`, `prisma`.`users`.`updated_at` FROM `prisma`.`users` WHERE NOT EXISTS(SELECT `t0`.`user_id` FROM `prisma`.`posts` AS `t0` WHERE (1=1 AND (`prisma`.`users`.`id`) = (`t0`.`user_id`) AND `t0`.`user_id` IS NOT NULL))";
+
+    assert_eq!(
+        ids(
+            &mut adapter,
+            TAGGED,
+            &[Bound::Word("rust"), Bound::Whole(1)]
+        ),
+        [1]
+    );
+    assert_eq!(ids(&mut adapter, NO_POSTS, &[]), [3]);
+}
+
 const NO_ROWS: [i64; 0] = [];
 
 /// The ids of the rows a prepared statement answers, in order.
