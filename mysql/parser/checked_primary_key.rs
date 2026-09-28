@@ -32,6 +32,8 @@ pub enum CheckedPrimaryKeyIntegerType {
     Int,
     /// The MySQL `INTEGER` spelling.
     Integer,
+    /// The MySQL `BIGINT` spelling, which sqlx keeps its migrations under.
+    BigInt,
     /// The MySQL `BIGINT UNSIGNED` spelling.
     BigIntUnsigned,
 }
@@ -42,6 +44,7 @@ impl CheckedPrimaryKeyIntegerType {
         match self {
             Self::Int => "INT",
             Self::Integer => "INTEGER",
+            Self::BigInt => "BIGINT",
             Self::BigIntUnsigned => "BIGINT UNSIGNED",
         }
     }
@@ -175,6 +178,7 @@ fn check_columns(
     let primary_key_integer_type = match column.data_type {
         DataType::Int(None) => Some(CheckedPrimaryKeyIntegerType::Int),
         DataType::Integer(None) => Some(CheckedPrimaryKeyIntegerType::Integer),
+        DataType::BigInt(None) => Some(CheckedPrimaryKeyIntegerType::BigInt),
         DataType::BigIntUnsigned(None) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
         // A key over bytes is what a table keyed by a UUID holds it in,
         // measured taken by MySQL 8.4.11 as `BINARY(16)` and `VARBINARY(16)`.
@@ -369,6 +373,7 @@ fn render_mysql_source_column(
         let data_type = match column.data_type {
             DataType::Int(None) => "INT".to_owned(),
             DataType::Integer(None) => "INTEGER".to_owned(),
+            DataType::BigInt(None) => "BIGINT".to_owned(),
             DataType::BigIntUnsigned(None) => "BIGINT UNSIGNED".to_owned(),
             _ => the_type_a_column_is_written_with(column)?,
         };

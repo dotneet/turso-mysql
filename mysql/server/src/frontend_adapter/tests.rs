@@ -30911,3 +30911,5 @@ mod gui_browsing;
 mod drizzle_statements;
 #[cfg(unix)]
 mod sequelize_statements;
+#[cfg(unix)]
+mod sqlx_statements;
