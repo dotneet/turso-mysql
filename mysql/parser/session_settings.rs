@@ -71,6 +71,14 @@ pub enum MySqlSessionSetting {
     SqlModeExpression(SqlModeValue),
     /// `SET wait_timeout = <n>`, or `DEFAULT` for the server's own.
     WaitTimeout(Option<u64>),
+    /// `SET net_read_timeout = <n>`, in seconds, or `DEFAULT`.
+    NetReadTimeout(Option<u64>),
+    /// `SET net_write_timeout = <n>`, in seconds, or `DEFAULT` for the
+    /// server's own.
+    NetWriteTimeout(Option<u64>),
+    /// `SET terminology_use_previous = <value>`, with the value as written, or
+    /// `DEFAULT`.
+    TerminologyUsePrevious(Option<String>),
     /// `SET max_execution_time = <n>`, in milliseconds, or `DEFAULT` for no
     /// limit.
     ///
@@ -332,6 +340,30 @@ fn take_one_session_setting(
             MySqlSessionSetting::WaitTimeout(None)
         } else if let Some(value) = scanner.take_unsigned() {
             MySqlSessionSetting::WaitTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("net_read_timeout") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::NetReadTimeout(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::NetReadTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("net_write_timeout") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::NetWriteTimeout(None)
+        } else if let Some(value) = scanner.take_unsigned() {
+            MySqlSessionSetting::NetWriteTimeout(Some(value))
+        } else {
+            return Ok(None);
+        }
+    } else if name.eq_ignore_ascii_case("terminology_use_previous") {
+        if scanner.take_keyword("DEFAULT") {
+            MySqlSessionSetting::TerminologyUsePrevious(None)
+        } else if let Some(value) = scanner.take_charset_name(mode) {
+            MySqlSessionSetting::TerminologyUsePrevious(Some(value))
         } else {
             return Ok(None);
         }
@@ -1043,6 +1075,43 @@ mod tests {
         );
     }
 
+    /// What `mysqldump` 8.4 sends before anything else, and what it sends
+    /// before it lists routines or events.
+    #[test]
+    fn reads_the_network_timeouts_and_terminology_a_dump_opens_with() {
+        assert_eq!(
+            parse_all("SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400"),
+            Some(vec![
+                MySqlSessionSetting::NetReadTimeout(Some(86_400)),
+                MySqlSessionSetting::NetWriteTimeout(Some(86_400)),
+            ])
+        );
+        assert_eq!(
+            parse("SET net_write_timeout = DEFAULT"),
+            Some(MySqlSessionSetting::NetWriteTimeout(None))
+        );
+        assert_eq!(
+            parse("SET @@SESSION.net_read_timeout = DEFAULT"),
+            Some(MySqlSessionSetting::NetReadTimeout(None))
+        );
+        assert_eq!(
+            parse("SET @@SESSION.terminology_use_previous = NONE"),
+            Some(MySqlSessionSetting::TerminologyUsePrevious(Some(
+                "NONE".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse("SET terminology_use_previous = 'BEFORE_8_0_26'"),
+            Some(MySqlSessionSetting::TerminologyUsePrevious(Some(
+                "BEFORE_8_0_26".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse("SET terminology_use_previous = DEFAULT"),
+            Some(MySqlSessionSetting::TerminologyUsePrevious(None))
+        );
+    }
+
     /// Every one of MySQL's four levels is read, with or without a scope word.
     /// Which of them this server can honestly accept is the server's question,
     /// not the parser's, so all four come back here.
@@ -1131,7 +1200,7 @@ mod tests {
         for sql in [
             "SELECT 1",
             "SET autocommit = 0",
-            "SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400",
+            "SET SESSION NET_READ_TIMEOUT= 86400, SESSION autocommit = 0",
             "SET sql_mode",
             "",
         ] {

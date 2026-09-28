@@ -593,14 +593,15 @@ impl RuntimeTcpConnection {
                 .orchestrator
                 .receive_frame(frame)
                 .map_err(RuntimeTcpConnectionError::Orchestrator)?;
-            self.flush_tls_writes(bounded_write_deadline(
-                if admission_complete {
-                    Instant::now() + self.timeouts.write()
-                } else {
-                    authentication_deadline
-                },
-                self.timeouts.write(),
-            ))?;
+            self.flush_tls_writes(if admission_complete {
+                Instant::now()
+                    + self
+                        .orchestrator
+                        .session_net_write_timeout()
+                        .unwrap_or_else(|| self.timeouts.write())
+            } else {
+                bounded_write_deadline(authentication_deadline, self.timeouts.write())
+            })?;
 
             match event {
                 OrchestratorEvent::Ready => {

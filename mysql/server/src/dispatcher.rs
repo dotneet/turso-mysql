@@ -245,6 +245,13 @@ pub trait CommandExecutor {
         None
     }
 
+    /// Returns the write deadline this session asked for with
+    /// `SET net_write_timeout`, which the connection keeps in place of the
+    /// runtime's own.
+    fn session_net_write_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
         &mut self,

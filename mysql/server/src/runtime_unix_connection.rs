@@ -9,7 +9,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use std::os::unix::ffi::OsStrExt;
+
 use turso_mysql::schema_sql::{CharacterSet, Collation, SchemaSqlMode, SchemaSqlSessionContext};
+
+use crate::connection_facts::MySqlConnectionFacts;
 
 use crate::{
     AcceptedUnixStream, AuthorizedDatabaseAdapterFactory, CachingSha2Verifier,
@@ -210,7 +214,10 @@ where
     .with_prepared_statement_authority(stream.prepared_statement_authority())
     .with_query_timeout(timeouts.query())
     .with_bootstrap_settings(MAX_ALLOWED_PACKET, timeouts.idle())
-    .with_net_write_timeout(timeouts.write());
+    .with_net_write_timeout(timeouts.write())
+    .with_connection_facts(MySqlConnectionFacts::on_unix_socket(
+        stream.socket_path().as_os_str().as_bytes().to_vec(),
+    ));
     if let Some(administration) = stream.account_administration() {
         factory = factory.with_account_administration(administration);
     }
@@ -319,7 +326,10 @@ fn run_inner(
                     .receive_frame(frame)
                     .map_err(RuntimeUnixConnectionError::Orchestrator)?;
                 let write_deadline = if admission_complete {
-                    Instant::now() + write_timeout
+                    Instant::now()
+                        + orchestrator
+                            .session_net_write_timeout()
+                            .unwrap_or(write_timeout)
                 } else {
                     bounded_write_deadline(authentication_deadline, write_timeout)
                 };

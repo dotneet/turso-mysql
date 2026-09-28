@@ -428,6 +428,14 @@ where
             .and_then(crate::CommandExecutor::session_wait_timeout)
     }
 
+    /// Returns how long the authenticated session asked a response to be
+    /// given to be written, in place of the runtime's own, if it asked.
+    pub fn session_net_write_timeout(&self) -> Option<std::time::Duration> {
+        self.executor
+            .as_ref()
+            .and_then(crate::CommandExecutor::session_net_write_timeout)
+    }
+
     /// Returns the oldest unsent response bytes, if any.
     pub fn front_write(&self) -> Option<&[u8]> {
         self.write_queue.front()

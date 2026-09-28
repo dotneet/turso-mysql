@@ -12,6 +12,7 @@ use turso_mysql_parser::{
 use turso_mysql::MySqlIsolationLevel;
 
 use crate::{
+    connection_facts::MySqlConnectionFacts,
     dispatcher::{SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS},
     frontend_adapter::{
         MySqlBootstrapSettings, MYSQL_BINARY_COLLATION, MYSQL_BINARY_FLAG, MYSQL_NOT_NULL_FLAG,
@@ -131,6 +132,9 @@ const SERVER_SYSTEM_TIME_ZONE: &str = "UTC";
 /// system's — UTC.
 const SERVER_TIME_ZONE_AT_THE_START: &str = "SYSTEM";
 
+/// MySQL's own `net_read_timeout` when a session has not set one.
+const MYSQL_NET_READ_TIMEOUT_SECONDS: u64 = 30;
+
 /// The licence this repository carries. MySQL's own answer is `GPL`.
 const SERVER_LICENSE: &str = "MIT";
 
@@ -187,6 +191,15 @@ pub(crate) struct MySqlSessionVariables {
     sql_mode_choices: SqlModeChoices,
     /// The idle time the session asked for in place of the server's own.
     wait_timeout: Option<Duration>,
+    /// What `@@net_read_timeout` reads back, in seconds.
+    ///
+    /// Nothing here waits by it: the rest of a command the client has begun
+    /// sending is waited for until the idle deadline, as the command's first
+    /// byte is. MySQL uses it only to give up on a client that stops in the
+    /// middle of sending, so keeping it changes no answer.
+    net_read_timeout_seconds: u64,
+    /// The write deadline the session asked for in place of the server's own.
+    net_write_timeout: Option<Duration>,
     /// How long, in milliseconds, a `SELECT` may run before it is stopped;
     /// zero for no limit.
     max_execution_time: u64,
@@ -252,6 +265,8 @@ impl Default for MySqlSessionVariables {
             next_transaction_isolation: None,
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
+            net_read_timeout_seconds: MYSQL_NET_READ_TIMEOUT_SECONDS,
+            net_write_timeout: None,
             max_execution_time: 0,
             group_concat_max_len: turso_mysql::DEFAULT_GROUP_CONCAT_MAX_LEN,
             connection_collation: ConnectionCollation::default(),
@@ -397,6 +412,7 @@ impl MySqlSessionVariables {
         &mut self,
         sql: &str,
         settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
         selected_database: Option<&str>,
         session_sql_mode: SessionSqlMode,
         status_flags: u16,
@@ -416,7 +432,13 @@ impl MySqlSessionVariables {
             let assignments = assignments
                 .into_iter()
                 .map(|setting| {
-                    self.checked_assignment(setting, settings, session_sql_mode, status_flags)
+                    self.checked_assignment(
+                        setting,
+                        settings,
+                        facts,
+                        session_sql_mode,
+                        status_flags,
+                    )
                 })
                 .collect::<Result<Vec<_>, FrontendErrorKind>>()?;
             for assignment in assignments {
@@ -448,9 +470,15 @@ impl MySqlSessionVariables {
             // server has no answer for is one it does not have. Measured on
             // MySQL 8.4.11: that is 1193, not a refusal of the statement's
             // shape.
-            return system_variable_result(&query, session_sql_mode, settings, status_flags, self)
-                .map(Some)
-                .ok_or(FrontendErrorKind::UnknownSystemVariable);
+            return system_variable_result(
+                &query,
+                session_sql_mode,
+                settings,
+                status_flags,
+                self,
+                facts,
+            )
+            .map(Some);
         }
         if let Some(query) = parse_optional_user_variable_query(sql, session_sql_mode)
             .map_err(|_| FrontendErrorKind::Syntax)?
@@ -463,6 +491,7 @@ impl MySqlSessionVariables {
             return Ok(Some(self.show_variables(
                 &command,
                 settings,
+                facts,
                 session_sql_mode,
                 status_flags,
             )));
@@ -476,6 +505,7 @@ impl MySqlSessionVariables {
         &self,
         setting: MySqlSessionSetting,
         settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
         session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> Result<CheckedAssignment, FrontendErrorKind> {
@@ -485,6 +515,7 @@ impl MySqlSessionVariables {
                 value: self.assigned_value(
                     &assignment,
                     settings,
+                    facts,
                     session_sql_mode,
                     status_flags,
                 )?,
@@ -504,10 +535,22 @@ impl MySqlSessionVariables {
         &self,
         assignment: &MySqlUserVariableAssignment,
         settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
         session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> Result<MySqlUserVariableValue, FrontendErrorKind> {
         if let Some(name) = assignment.system_variable() {
+            // Measured on MySQL 8.4.11: a path left unset, `@@init_file`,
+            // gives the variable a NULL that answers as words rather than the
+            // NULL `SET @x = NULL` gives. This keeps only the second kind, so
+            // a server with no socket refuses the assignment.
+            if name.eq_ignore_ascii_case("socket") {
+                return facts
+                    .unix_socket_path()
+                    .and_then(|path| std::str::from_utf8(path).ok())
+                    .map(|path| MySqlUserVariableValue::Text(path.to_owned()))
+                    .ok_or(FrontendErrorKind::Unsupported);
+            }
             if name == "character_set_results" && self.raw_character_set_results {
                 return Ok(MySqlUserVariableValue::Null);
             }
@@ -552,6 +595,12 @@ impl MySqlSessionVariables {
             }
             MySqlSessionSetting::WaitTimeout(seconds) => {
                 self.wait_timeout = seconds.map(Duration::from_secs);
+            }
+            MySqlSessionSetting::NetReadTimeout(seconds) => {
+                self.net_read_timeout_seconds = seconds.unwrap_or(MYSQL_NET_READ_TIMEOUT_SECONDS);
+            }
+            MySqlSessionSetting::NetWriteTimeout(seconds) => {
+                self.net_write_timeout = seconds.map(Duration::from_secs);
             }
             MySqlSessionSetting::MaxExecutionTime(milliseconds) => {
                 self.max_execution_time = milliseconds.unwrap_or(0);
@@ -629,6 +678,7 @@ impl MySqlSessionVariables {
                 unreachable!("a setting read from a variable is worked out before it is applied")
             }
             MySqlSessionSetting::InformationSchemaStatsExpiry(_)
+            | MySqlSessionSetting::TerminologyUsePrevious(_)
             | MySqlSessionSetting::SqlAutoIsNull(_)
             | MySqlSessionSetting::SqlSafeUpdates(_)
             | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
@@ -666,6 +716,11 @@ impl MySqlSessionVariables {
     /// The idle time this session asked for, if it asked for one.
     pub(crate) const fn wait_timeout(&self) -> Option<Duration> {
         self.wait_timeout
+    }
+
+    /// The write deadline this session asked for, if it asked for one.
+    pub(crate) const fn net_write_timeout(&self) -> Option<Duration> {
+        self.net_write_timeout
     }
 
     fn resolve_dump_session_setting(
@@ -826,6 +881,7 @@ impl MySqlSessionVariables {
         &self,
         command: &MySqlShowVariablesCommand,
         settings: MySqlBootstrapSettings,
+        facts: &MySqlConnectionFacts,
         session_sql_mode: SessionSqlMode,
         status_flags: u16,
     ) -> CommandExecutionResult {
@@ -844,6 +900,14 @@ impl MySqlSessionVariables {
             .iter()
             .filter(|name| command.selects(name))
             .filter_map(|name| {
+                // Measured on MySQL 8.4.11: a path left unset shows as an
+                // empty value, the way `init_file` does.
+                if name.eq_ignore_ascii_case("socket") {
+                    return Some(vec![
+                        Some(name.as_bytes().to_vec()),
+                        Some(facts.unix_socket_path().unwrap_or_default().to_vec()),
+                    ]);
+                }
                 shown_variable_value(
                     name,
                     session_sql_mode,
@@ -882,7 +946,7 @@ impl MySqlSessionVariables {
 ///
 /// These are the names `SELECT @@name` answers. MySQL writes them in name
 /// order, measured on 8.4.11.
-const SHOWN_VARIABLES: [&str; 34] = [
+const SHOWN_VARIABLES: [&str; 37] = [
     "auto_increment_increment",
     "auto_increment_offset",
     "autocommit",
@@ -903,13 +967,16 @@ const SHOWN_VARIABLES: [&str; 34] = [
     "lower_case_table_names",
     "max_allowed_packet",
     "max_execution_time",
+    "net_read_timeout",
     "net_write_timeout",
     "performance_schema",
+    "socket",
     "sql_auto_is_null",
     "sql_mode",
     "sql_notes",
     "sql_safe_updates",
     "system_time_zone",
+    "terminology_use_previous",
     "time_zone",
     "transaction_isolation",
     "transaction_read_only",
@@ -981,6 +1048,33 @@ fn accept_session_setting(
         MySqlSessionSetting::GroupConcatMaxLen(_) => Ok(()),
         MySqlSessionSetting::WaitTimeout(Some(seconds)) => {
             if (1..=31_536_000).contains(seconds) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        // Measured on MySQL 8.4.11: both take one second to a year, and
+        // clamp anything else with warning 1292, which this refuses instead.
+        // The write deadline is the caller's to keep, and the read one is
+        // only read back.
+        MySqlSessionSetting::NetReadTimeout(None) | MySqlSessionSetting::NetWriteTimeout(None) => {
+            Ok(())
+        }
+        MySqlSessionSetting::NetReadTimeout(Some(seconds))
+        | MySqlSessionSetting::NetWriteTimeout(Some(seconds)) => {
+            if (1..=31_536_000).contains(seconds) {
+                Ok(())
+            } else {
+                Err(FrontendErrorKind::Unsupported)
+            }
+        }
+        // It chooses between the old and the new words for replication in
+        // what `SHOW` prints, and this server prints neither. `NONE`, the
+        // new words, is what a session starts with and what `mysqldump`
+        // asks for; measured on MySQL 8.4.11, 0 and `DEFAULT` name it too.
+        MySqlSessionSetting::TerminologyUsePrevious(None) => Ok(()),
+        MySqlSessionSetting::TerminologyUsePrevious(Some(value)) => {
+            if value.eq_ignore_ascii_case("NONE") || value == "0" {
                 Ok(())
             } else {
                 Err(FrontendErrorKind::Unsupported)
@@ -1154,10 +1248,21 @@ fn system_variable_result(
     settings: MySqlBootstrapSettings,
     status_flags: u16,
     session_variables: &MySqlSessionVariables,
-) -> Option<CommandExecutionResult> {
+    facts: &MySqlConnectionFacts,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let mut columns = Vec::with_capacity(query.reads().len());
     let mut row = Vec::with_capacity(query.reads().len());
     for read in query.reads() {
+        // Measured on MySQL 8.4.11: `@@SESSION.socket` is 1238, the socket
+        // being the server's rather than a session's.
+        if read.names_the_session() && read.name().eq_ignore_ascii_case("socket") {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        if read.name().eq_ignore_ascii_case("socket") {
+            columns.push(worded_variable_column(read));
+            row.push(facts.unix_socket_path().map(<[u8]>::to_vec));
+            continue;
+        }
         // One name this server cannot answer leaves the whole statement to the
         // caller, which refuses it rather than answering the rest.
         let (column, value) = system_variable_column(
@@ -1166,7 +1271,8 @@ fn system_variable_result(
             settings,
             status_flags,
             session_variables,
-        )?;
+        )
+        .ok_or(FrontendErrorKind::UnknownSystemVariable)?;
         columns.push(column);
         if session_variables.raw_character_set_results
             && read.scope() == MySqlVariableScope::Session
@@ -1182,7 +1288,7 @@ fn system_variable_result(
             row.push(Some(value.into_bytes()));
         }
     }
-    Some(CommandExecutionResult::ResultSet(TextResultSet {
+    Ok(CommandExecutionResult::ResultSet(TextResultSet {
         columns,
         rows: vec![row],
         warnings: 0,
@@ -1228,8 +1334,14 @@ fn system_variable_column(
         return Some((column, value));
     }
     let value = worded_system_variable(read.name(), session_sql_mode, session_variables)?;
-    // A call is NOT NULL and a variable is not, and their reported widths
-    // differ; both measured.
+    Some((worded_variable_column(read), value))
+}
+
+/// The column a variable holding a word, or `VERSION()`, answers in.
+///
+/// A call is NOT NULL and a variable is not, and their reported widths
+/// differ; both measured.
+fn worded_variable_column(read: &MySqlSystemVariableRead) -> ColumnDefinitionConfig {
     let called = read.called();
     let mut column =
         ColumnDefinitionConfig::new(read.column_name().to_owned(), MYSQL_TYPE_VAR_STRING);
@@ -1238,7 +1350,7 @@ fn system_variable_column(
     column.column_length = if called { 24 } else { 87_380 };
     column.decimals = NOT_FIXED_DECIMALS;
     column.flags = if called { MYSQL_NOT_NULL_FLAG } else { 0 };
-    Some((column, value))
+    column
 }
 
 /// Answers whether `CONVERT_TZ` can convert between two zones, which is
@@ -1312,7 +1424,17 @@ fn counted_system_variable(
         return Some((settings.max_allowed_packet().to_string(), 21, true));
     }
     if name.eq_ignore_ascii_case("net_write_timeout") {
-        return Some((settings.net_write_timeout_seconds().to_string(), 21, true));
+        let seconds = session_variables
+            .net_write_timeout
+            .map_or(settings.net_write_timeout_seconds(), |wait| wait.as_secs());
+        return Some((seconds.to_string(), 21, true));
+    }
+    if name.eq_ignore_ascii_case("net_read_timeout") {
+        return Some((
+            session_variables.net_read_timeout_seconds.to_string(),
+            21,
+            true,
+        ));
     }
     if name.eq_ignore_ascii_case("wait_timeout") {
         let seconds = session_variables
@@ -1446,6 +1568,9 @@ fn worded_system_variable(
                 .variable_value()
                 .to_owned(),
         );
+    }
+    if name.eq_ignore_ascii_case("terminology_use_previous") {
+        return Some("NONE".to_owned());
     }
     // Nothing runs when a connection opens.
     if name.eq_ignore_ascii_case("init_connect") {
@@ -1657,6 +1782,7 @@ mod tests {
                 .execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2,
@@ -1724,6 +1850,7 @@ mod tests {
             .execute_query(
                 "SET @x = 1",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -1733,6 +1860,7 @@ mod tests {
         let Ok(Some(CommandExecutionResult::ResultSet(result))) = fresh.execute_query(
             "SELECT @x",
             MySqlBootstrapSettings::default(),
+            &MySqlConnectionFacts::default(),
             None,
             SessionSqlMode::default(),
             2,
@@ -1751,6 +1879,7 @@ mod tests {
         let Ok(Some(CommandExecutionResult::ResultSet(result))) = session.execute_query(
             "\n                SELECT VERSION(),\n                       @@sql_mode,\n                       @@default_storage_engine,\n                       @@sql_auto_is_null,\n                       @@lower_case_table_names,\n                       CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL\n            ",
             MySqlBootstrapSettings::default(),
+            &MySqlConnectionFacts::default(),
             None,
             SessionSqlMode::default(),
             SERVER_STATUS_AUTOCOMMIT,
@@ -1785,6 +1914,7 @@ mod tests {
         let Ok(Some(CommandExecutionResult::ResultSet(named))) = session.execute_query(
             "SELECT CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'Europe/Paris') IS NOT NULL",
             MySqlBootstrapSettings::default(),
+            &MySqlConnectionFacts::default(),
             None,
             SessionSqlMode::default(),
             SERVER_STATUS_AUTOCOMMIT,
@@ -1803,6 +1933,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 SERVER_STATUS_AUTOCOMMIT,
@@ -1850,6 +1981,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 SERVER_STATUS_AUTOCOMMIT,
@@ -1874,6 +2006,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 SERVER_STATUS_AUTOCOMMIT,
@@ -1903,6 +2036,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 status_flags,
@@ -1973,6 +2107,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 status_flags,
@@ -2017,6 +2152,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2080,6 +2216,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2182,7 +2319,14 @@ mod tests {
         for sql in ["SET foreign_key_checks = 0", "SET sql_notes = 0"] {
             assert!(
                 matches!(
-                    session.execute_query(sql, MySqlBootstrapSettings::default(), None, ansi, 0),
+                    session.execute_query(
+                        sql,
+                        MySqlBootstrapSettings::default(),
+                        &MySqlConnectionFacts::default(),
+                        None,
+                        ansi,
+                        0
+                    ),
                     Ok(Some(CommandExecutionResult::Ok(_)))
                 ),
                 "{sql}"
@@ -2191,9 +2335,14 @@ mod tests {
         // The session runs with autocommit off, which is what a status flag
         // of zero says, and with a mode the server was not started in.
         let mut read = |sql: &str| {
-            let Ok(Some(CommandExecutionResult::ResultSet(result))) =
-                session.execute_query(sql, MySqlBootstrapSettings::default(), None, ansi, 0)
-            else {
+            let Ok(Some(CommandExecutionResult::ResultSet(result))) = session.execute_query(
+                sql,
+                MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
+                None,
+                ansi,
+                0,
+            ) else {
                 panic!("expected a variable result for {sql}");
             };
             String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
@@ -2239,6 +2388,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2286,6 +2436,7 @@ mod tests {
                 .execute_query(
                     &sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2
@@ -2299,6 +2450,7 @@ mod tests {
             session.execute_query(
                 "SET time_zone = '+14:01'",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2
@@ -2315,6 +2467,7 @@ mod tests {
                 .execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2,
@@ -2353,6 +2506,7 @@ mod tests {
                 .execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2,
@@ -2388,6 +2542,7 @@ mod tests {
             .execute_query(
                 "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2404,6 +2559,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2452,6 +2608,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2496,6 +2653,7 @@ mod tests {
         let Ok(Some(CommandExecutionResult::ResultSet(result))) = session.execute_query(
             sql,
             MySqlBootstrapSettings::default(),
+            &MySqlConnectionFacts::default(),
             None,
             SessionSqlMode::default(),
             2,
@@ -2521,6 +2679,7 @@ mod tests {
                     session.execute_query(
                         sql,
                         MySqlBootstrapSettings::default(),
+                        &MySqlConnectionFacts::default(),
                         None,
                         SessionSqlMode::default(),
                         2,
@@ -2590,6 +2749,7 @@ mod tests {
                 session.execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2,
@@ -2611,6 +2771,7 @@ mod tests {
             session.execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2707,6 +2868,7 @@ mod tests {
                     session.execute_query(
                         sql,
                         MySqlBootstrapSettings::default(),
+                        &MySqlConnectionFacts::default(),
                         None,
                         SessionSqlMode::default(),
                         2,
@@ -2795,6 +2957,7 @@ mod tests {
             session.execute_query(
                 "SET sql_mode = 'ANSI_QUOTES'",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 ansi,
                 2,
@@ -2806,6 +2969,7 @@ mod tests {
             session.execute_query(
                 "SET sql_mode = ''",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 ansi,
                 2,
@@ -2822,6 +2986,7 @@ mod tests {
             .execute_query(
                 "SELECT @@sql_notes",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 3,
@@ -2841,6 +3006,7 @@ mod tests {
             .execute_query(
                 "SELECT @@SeSsIoN.SQL_NOTES",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2874,6 +3040,7 @@ mod tests {
                 .execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     None,
                     SessionSqlMode::default(),
                     2,
@@ -2908,6 +3075,7 @@ mod tests {
             .execute_query(
                 "SELECT 'unterminated",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2
@@ -2921,6 +3089,7 @@ mod tests {
             .execute_query(
                 sql,
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -2958,6 +3127,7 @@ mod tests {
                 .execute_query(
                     "SELECT DATABASE()",
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     selected,
                     SessionSqlMode::default(),
                     2,
@@ -2997,6 +3167,7 @@ mod tests {
                 .execute_query(
                     sql,
                     MySqlBootstrapSettings::default(),
+                    &MySqlConnectionFacts::default(),
                     Some("app"),
                     SessionSqlMode::default(),
                     2,
@@ -3076,6 +3247,7 @@ mod tests {
             .execute_query(
                 "SHOW VARIABLES",
                 settings,
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -3112,8 +3284,10 @@ mod tests {
                 ("lower_case_table_names", "1"),
                 ("max_allowed_packet", "67108864"),
                 ("max_execution_time", "0"),
+                ("net_read_timeout", "30"),
                 ("net_write_timeout", "60"),
                 ("performance_schema", "OFF"),
+                ("socket", ""),
                 ("sql_auto_is_null", "OFF"),
                 (
                     "sql_mode",
@@ -3123,6 +3297,7 @@ mod tests {
                 ("sql_notes", "ON"),
                 ("sql_safe_updates", "OFF"),
                 ("system_time_zone", "UTC"),
+                ("terminology_use_previous", "NONE"),
                 ("time_zone", "SYSTEM"),
                 ("transaction_isolation", "REPEATABLE-READ"),
                 ("transaction_read_only", "OFF"),
@@ -3159,6 +3334,7 @@ mod tests {
             .execute_query(
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 2,
@@ -3186,6 +3362,7 @@ mod tests {
             .execute_query(
                 "SET SESSION sql_notes=0",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 3,
@@ -3201,6 +3378,7 @@ mod tests {
             .execute_query(
                 "SET sql_notes=2",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 3
@@ -3210,6 +3388,7 @@ mod tests {
             first.execute_query(
                 "SET sql_notes=1; SELECT 1",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 3
@@ -3221,6 +3400,7 @@ mod tests {
             .execute_query(
                 "SET sql_notes=1",
                 MySqlBootstrapSettings::default(),
+                &MySqlConnectionFacts::default(),
                 None,
                 SessionSqlMode::default(),
                 3,

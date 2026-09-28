@@ -4443,7 +4443,8 @@ of them, so refusing them all ends a connection before any work starts. Taken: `
 `@@max_allowed_packet` and `@@wait_timeout`, the five `@@character_set_*` names, the three
 `@@collation_*` names, `@@system_time_zone` and `@@time_zone`, `@@transaction_isolation`,
 `@@auto_increment_increment` and `@@auto_increment_offset`, `@@interactive_timeout`,
-`@@performance_schema`, `@@lower_case_table_names`, `@@init_connect` and `@@license` — one at a
+`@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license`, `@@socket`,
+`@@net_read_timeout`, `@@net_write_timeout` and `@@terminology_use_previous` — one at a
 time or a row of them at once, under any scope and under an alias — `SELECT @@sql_notes AS n` and `SELECT @@global.sql_notes` are read
 now, where the switch once had a reader of its own that took one bare spelling. A driver opens the connection by reading a row of them — the pinned
 `mysql_async` one sends `SELECT @@max_allowed_packet,@@wait_timeout` — so a list is read rather
@@ -4485,6 +4486,35 @@ reads `MIT`, the licence this repository carries, where MySQL reads `GPL`.
 written as `Users` here is found again as `users` and reads back lowercased
 from `SHOW TABLES`, measured against this server, and 1 is what MySQL calls
 that.
+
+`@@socket` names the Unix socket this server listens on. Prisma's driver,
+`mysql_async`, reads it with `@@max_allowed_packet` and `@@wait_timeout` on
+every connection and, when it names a path, opens a second connection there and
+keeps that one. A server listening on TCP here listens on no socket — the two
+listeners are never configured together — so it reads NULL, which is how MySQL
+8.4.11 reads a path left unset (`@@init_file`), measured, in the same
+`VAR_STRING` of 87380 with 31 decimals and no flags a set one answers in; the
+driver takes NULL as no socket and stays on TCP. `SHOW VARIABLES` writes the
+unset path as an empty value, as MySQL does. `@@SESSION.socket` is refused, where
+MySQL answers 1238, and `SET @s = @@socket` with no socket is refused, since
+MySQL gives the variable a NULL of words there that this does not keep apart.
+
+`mysqldump` 8.4 opens every dump with `SET SESSION NET_READ_TIMEOUT= 86400,
+SESSION NET_WRITE_TIMEOUT= 86400`. Both take one second to a year and read back
+as set, as unsigned `LONGLONG`s of 21, measured on 8.4.11; a value outside that
+is refused where MySQL clamps it with warning 1292. `net_write_timeout` is this
+server's own write deadline: a session that sets it has each answer after that
+given that long to be written, in place of the runtime's configured deadline,
+and `DEFAULT` gives the configured one back. `net_read_timeout` is kept and read
+back — 30, MySQL's default, until a session sets it — but nothing here waits by
+it: MySQL uses it only to give up on a client that stops in the middle of
+sending a command, and this server waits for the rest of a command until the
+idle deadline, as it waits for its first byte, so the value changes no answer.
+`mysqldump` also sends `SET @@SESSION.terminology_use_previous = NONE` before it
+lists routines or events. It chooses between the old and the new words for
+replication in what `SHOW` prints, and this server prints neither, so `NONE` —
+what a session starts with, and what 0 and `DEFAULT` also name, measured — is
+taken and reads back, and `BEFORE_8_0_26` is refused.
 
 Django reads `CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL` beside the
 variables when it connects, to learn whether the server has named zones. It answers 1 when

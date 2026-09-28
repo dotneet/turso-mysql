@@ -380,8 +380,6 @@ speaks; anything measured here from now on has to pass that flag.
 |---|---|
 | `information_schema.COLUMNS` `CHARACTER_MAXIMUM_LENGTH`, `NUMERIC_PRECISION`, `NUMERIC_SCALE`, `COLLATION_NAME` | works for supported column declarations; values and wire types were measured against MySQL 8.4.11 and are checked in the JDBC/Go E2E |
 | An `information_schema` query with no `TABLE_SCHEMA` | answers the selected database alone, where MySQL answers every database the caller can see |
-| `SELECT @@net_write_timeout` | reports the configured write deadline in whole seconds; the default is 60. The deadline applies to each bounded server write |
-| `SELECT @@net_read_timeout`, `@@socket` | refused as 1193; this server has no equivalent session setting. The message does not name the variable where MySQL's does |
 | A system variable read inside a larger statement — `SELECT @@autocommit + 1`, `SELECT @@autocommit FROM t` | refused as 1235; MySQL reads the variable and answers the row, and an unknown name there is its own 1193 |
 | `SHOW WARNINGS`, `SHOW ERRORS` | works |
 | `SHOW [FULL] PROCESSLIST` | refused; measured, a session without the `PROCESS` privilege sees every connection of its own account — a pool's other connections among them — and this session knows only itself |
@@ -545,6 +543,9 @@ speaks; anything measured here from now on has to pass that flag.
 Behaviour that works but does not match MySQL lives in
 [COMPAT.md](COMPAT.md), not here. The open ones, each explained there:
 
+- `SET net_read_timeout` is kept and read back but bounds nothing: the rest of
+  a command a client has begun sending is waited for until the idle deadline,
+  where MySQL gives up after `net_read_timeout`
 - Legacy `DECIMAL` tables that stored binary64 values cannot recover their original
   decimal digits. Re-import them into a new exact `DECIMAL` table; opening an old
   table through the MySQL frontend fails with a migration error

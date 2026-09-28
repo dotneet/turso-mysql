@@ -12283,11 +12283,11 @@ fn direct_adapter_serves_connector_j_bootstrap_variables() {
 fn a_variable_this_build_does_not_have_reads_as_unknown() {
     let mut adapter = adapter();
     assert_eq!(
-        adapter.execute_query("SELECT @@socket,@@wait_timeout"),
+        adapter.execute_query("SELECT @@innodb_version,@@wait_timeout"),
         Err(FrontendErrorKind::UnknownSystemVariable)
     );
     assert!(matches!(
-        adapter.execute_query("SELECT '@@socket'"),
+        adapter.execute_query("SELECT '@@innodb_version'"),
         Ok(CommandExecutionResult::ResultSet(_))
     ));
 }
@@ -16965,7 +16965,7 @@ fn an_unknown_system_variable_reads_as_unknown_after_a_database_is_selected() {
     adapter.execute_init_db("reports").unwrap();
 
     assert_eq!(
-        adapter.execute_query("SELECT @@socket,@@wait_timeout"),
+        adapter.execute_query("SELECT @@innodb_version,@@wait_timeout"),
         Err(FrontendErrorKind::UnknownSystemVariable)
     );
 }
@@ -26021,9 +26021,8 @@ fn a_client_reads_the_system_variables_this_server_has() {
         // A variable this server has no honest answer for is turned down as
         // one this build does not have, rather than answered with a value it
         // does not keep.
-        "SELECT @@net_read_timeout",
         "SELECT @@innodb_version",
-        "SELECT @@socket",
+        "SELECT @@hostname",
     ] {
         assert_eq!(
             adapter.execute_query(sql),

@@ -264,3 +264,157 @@ fn a_latin1_handshake_refuses_results_until_set_names_utf8mb4() {
         Err(FrontendErrorKind::UnsupportedClientCharacterSet)
     );
 }
+
+/// What `mysqldump` 8.4 sends before anything else. Measured on MySQL 8.4.11:
+/// both timeouts read back as set, as unsigned LONGLONGs of 21; `DEFAULT`
+/// gives back 30 for reading and the server's own for writing; and a value
+/// outside one second to a year is clamped with warning 1292, which this
+/// refuses instead. The write deadline is the one the connection keeps.
+#[test]
+fn the_network_timeouts_a_dump_asks_for_are_kept() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT @@net_read_timeout, @@net_write_timeout"
+        ),
+        [[Some("30".to_owned()), Some("60".to_owned())]]
+    );
+    assert_eq!(adapter.session_net_write_timeout(), None);
+
+    run(
+        &mut adapter,
+        "SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400",
+    );
+    let Ok(CommandExecutionResult::ResultSet(read)) = adapter
+        .execute_query("SELECT @@net_read_timeout, @@net_write_timeout, @@GLOBAL.net_read_timeout")
+    else {
+        panic!("the timeouts are answered");
+    };
+    assert_eq!(
+        read.rows,
+        [[
+            Some(b"86400".to_vec()),
+            Some(b"86400".to_vec()),
+            Some(b"30".to_vec())
+        ]]
+    );
+    for column in &read.columns {
+        assert_eq!(column.column_type, MYSQL_TYPE_LONGLONG);
+        assert_eq!(column.column_length, 21);
+        assert_eq!(
+            column.flags,
+            MYSQL_UNSIGNED_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        );
+    }
+    assert_eq!(
+        adapter.session_net_write_timeout(),
+        Some(Duration::from_secs(86_400))
+    );
+
+    run(&mut adapter, "SET net_write_timeout = 600");
+    assert_eq!(
+        adapter.session_net_write_timeout(),
+        Some(Duration::from_secs(600))
+    );
+    for refused in [
+        "SET net_read_timeout = 0",
+        "SET net_write_timeout = 31536001",
+    ] {
+        assert_eq!(
+            adapter.execute_query(refused),
+            Err(FrontendErrorKind::Unsupported),
+            "{refused}"
+        );
+    }
+    run(
+        &mut adapter,
+        "SET net_read_timeout = DEFAULT, net_write_timeout = DEFAULT",
+    );
+    assert_eq!(adapter.session_net_write_timeout(), None);
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT @@net_read_timeout, @@net_write_timeout"
+        ),
+        [[Some("30".to_owned()), Some("60".to_owned())]]
+    );
+}
+
+/// `mysqldump` asks for the new words for replication before it lists
+/// routines or events. Measured on MySQL 8.4.11: `NONE`, 0 and `DEFAULT` all
+/// leave it at `NONE`; `BEFORE_8_0_26` asks for the old words, which this
+/// server has no output to print in, and is refused.
+#[test]
+fn a_dump_may_ask_for_the_new_replication_words() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "SET @@SESSION.terminology_use_previous = NONE",
+    );
+    run(&mut adapter, "SET terminology_use_previous = 0");
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@terminology_use_previous"),
+        [[Some("NONE".to_owned())]]
+    );
+    assert_eq!(
+        adapter.execute_query("SET terminology_use_previous = 'BEFORE_8_0_26'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+/// Prisma's driver reads this on every connection and moves to the socket it
+/// names. Measured on MySQL 8.4.11: a `VAR_STRING` of 87380 with 31 decimals
+/// and no flags; a path left unset reads as NULL there — `@@init_file` — and
+/// as an empty value in `SHOW VARIABLES`; and `@@SESSION.socket` is 1238.
+/// A server listening on TCP here listens on no socket at all.
+#[test]
+fn the_socket_is_the_one_this_server_listens_on() {
+    let (_directory, mut adapter) = adapter();
+    let Ok(CommandExecutionResult::ResultSet(read)) =
+        adapter.execute_query("SELECT @@socket, @@max_allowed_packet, @@wait_timeout")
+    else {
+        panic!("the socket is answered");
+    };
+    assert_eq!(read.rows[0][0], None);
+    let socket = &read.columns[0];
+    assert_eq!(socket.name, "@@socket");
+    assert_eq!(socket.column_type, MYSQL_TYPE_VAR_STRING);
+    assert_eq!(socket.column_length, 87_380);
+    assert_eq!(socket.decimals, NOT_FIXED_DECIMALS);
+    assert_eq!(socket.flags, 0);
+    assert_eq!(
+        rows(&mut adapter, "SHOW VARIABLES LIKE 'socket'"),
+        [[Some("socket".to_owned()), Some(String::new())]]
+    );
+    assert_eq!(
+        adapter.execute_query("SELECT @@SESSION.socket"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut local = factory
+        .with_connection_facts(MySqlConnectionFacts::on_unix_socket(
+            b"/run/turso/mysql.sock".to_vec(),
+        ))
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([81; 32]),
+        ))
+        .unwrap();
+    local.authorize_connection().unwrap();
+    assert_eq!(
+        rows(&mut local, "SELECT @@socket, @@GLOBAL.socket AS s"),
+        [[
+            Some("/run/turso/mysql.sock".to_owned()),
+            Some("/run/turso/mysql.sock".to_owned())
+        ]]
+    );
+    assert_eq!(
+        rows(&mut local, "SHOW VARIABLES LIKE 'socket'"),
+        [[
+            Some("socket".to_owned()),
+            Some("/run/turso/mysql.sock".to_owned())
+        ]]
+    );
+}

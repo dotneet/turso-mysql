@@ -13,6 +13,7 @@ mod account_store_fs;
 mod auth;
 mod authorization;
 mod client_handshake;
+mod connection_facts;
 mod connection_state;
 mod dispatcher;
 mod frontend_adapter;

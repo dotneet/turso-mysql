@@ -377,6 +377,7 @@ impl RuntimeUnixListener {
             account_administration: self.account_administration.clone(),
             catalog: Arc::clone(&self.catalog),
             prepared_statement_authority: self.prepared_statement_authority.clone(),
+            socket_path: self.endpoint_path.clone(),
             limits: self.limits,
             timeouts: self.timeouts,
         })
@@ -537,11 +538,17 @@ pub(crate) struct AcceptedUnixStream {
     account_administration: Option<Arc<dyn AccountAdministration>>,
     catalog: Arc<MySqlDatabaseCatalog>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
+    socket_path: std::path::PathBuf,
     limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
 }
 
 impl AcceptedUnixStream {
+    /// Returns the path of the socket this stream was accepted on.
+    pub(crate) fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
+    }
+
     /// Marks authentication complete and switches future reads to the idle timeout.
     pub(crate) fn complete_admission(&mut self) -> Result<(), RuntimeUnixListenerError> {
         self.set_read_timeout(self.timeouts.idle())?;

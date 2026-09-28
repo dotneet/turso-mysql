@@ -83,6 +83,8 @@ impl MySqlSystemVariableQuery {
 pub struct MySqlSystemVariableRead {
     name: String,
     scope: MySqlVariableScope,
+    /// Whether `SESSION.` or `LOCAL.` was written before the name.
+    session_named: bool,
     called: bool,
     zone_conversion: Option<(String, String)>,
     column_name: String,
@@ -102,6 +104,13 @@ impl MySqlSystemVariableRead {
     /// still answers 1.
     pub fn scope(&self) -> MySqlVariableScope {
         self.scope
+    }
+
+    /// Returns whether the read named the session's value in so many words —
+    /// `@@SESSION.name` or `@@LOCAL.name` — which MySQL refuses for a
+    /// variable only the server has.
+    pub fn names_the_session(&self) -> bool {
+        self.session_named
     }
 
     /// Returns whether the version was asked for as a call rather than as a
@@ -189,6 +198,7 @@ fn take_system_variable_read(
 ) -> Result<Option<MySqlSystemVariableRead>, ParseError> {
     let start = scanner.cursor;
     let mut scope = MySqlVariableScope::Session;
+    let mut session_named = false;
     let mut called = false;
     let mut zone_conversion = None;
     let name = if scanner.take_keyword("CONVERT_TZ") {
@@ -222,6 +232,7 @@ fn take_system_variable_read(
                     return Ok(None);
                 }
                 scope = named;
+                session_named = named == MySqlVariableScope::Session;
                 break;
             }
         }
@@ -243,6 +254,7 @@ fn take_system_variable_read(
     Ok(Some(MySqlSystemVariableRead {
         name,
         scope,
+        session_named,
         called,
         zone_conversion,
         column_name: alias.unwrap_or(expression),

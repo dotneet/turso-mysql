@@ -90,6 +90,7 @@ use turso_mysql_parser::{
 #[cfg(unix)]
 use turso_mysql_parser::{parse_optional_named_lock_query, write_the_current_database_in};
 
+use crate::connection_facts::MySqlConnectionFacts;
 use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
 #[cfg(unix)]
 use crate::{
@@ -292,6 +293,10 @@ impl CommandExecutor for MySqlCommandAdapter {
         self.session_variables.wait_timeout()
     }
 
+    fn session_net_write_timeout(&self) -> Option<Duration> {
+        self.session_variables.net_write_timeout()
+    }
+
     fn no_backslash_escapes(&self) -> bool {
         self.connection.parser_mode().no_backslash_escapes
     }
@@ -405,6 +410,7 @@ impl MySqlCommandAdapter {
         if let Some(result) = self.session_variables.execute_query(
             sql,
             self.bootstrap_settings,
+            &MySqlConnectionFacts::default(),
             None,
             self.connection.parser_mode(),
             status_flags,
@@ -549,6 +555,7 @@ pub struct AuthorizedDatabaseAdapterFactory<A> {
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
+    connection_facts: MySqlConnectionFacts,
     account_administration: Option<Arc<dyn AccountAdministration>>,
 }
 
@@ -567,6 +574,7 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
             prepared_statement_authority: MySqlPreparedStatementAuthority::default(),
             query_timeout: None,
             bootstrap_settings: MySqlBootstrapSettings::default(),
+            connection_facts: MySqlConnectionFacts::default(),
             account_administration: None,
         }
     }
@@ -609,6 +617,12 @@ impl<A> AuthorizedDatabaseAdapterFactory<A> {
         self.account_administration = Some(administration);
         self
     }
+
+    /// Supplies what the runtime knows about the connection it accepted.
+    pub(crate) fn with_connection_facts(mut self, facts: MySqlConnectionFacts) -> Self {
+        self.connection_facts = facts;
+        self
+    }
 }
 
 #[cfg(unix)]
@@ -642,6 +656,7 @@ where
             authorizer: self.authorizer,
             query_timeout: self.query_timeout,
             bootstrap_settings: self.bootstrap_settings,
+            connection_facts: self.connection_facts,
             account_administration: self.account_administration,
             session_variables: crate::session_variables::MySqlSessionVariables::default(),
             raised_warnings: Vec::new(),
@@ -670,6 +685,7 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     authorizer: Arc<A>,
     query_timeout: Option<Duration>,
     bootstrap_settings: MySqlBootstrapSettings,
+    connection_facts: MySqlConnectionFacts,
     account_administration: Option<Arc<dyn AccountAdministration>>,
     session_variables: crate::session_variables::MySqlSessionVariables,
     /// What the last statement warned about, which `SHOW WARNINGS` reports.
@@ -1971,6 +1987,10 @@ where
         self.session_variables.wait_timeout()
     }
 
+    fn session_net_write_timeout(&self) -> Option<Duration> {
+        self.session_variables.net_write_timeout()
+    }
+
     fn execute_init_db(
         &mut self,
         database: &str,
@@ -2295,6 +2315,7 @@ where
         if let Some(result) = self.session_variables.execute_query(
             sql,
             self.bootstrap_settings,
+            &self.connection_facts,
             self.session.selected_database(),
             self.session.session_sql_mode(),
             status_flags,
