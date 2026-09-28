@@ -403,7 +403,10 @@ speaks; anything measured here from now on has to pass that flag.
 | `CHECK TABLE` with a list, a qualified name, or the `QUICK` / `FOR UPGRADE` / `EXTENDED` options | refused; one unqualified table at a time is taken |
 | `ANALYZE TABLE` over several tables, or with `NO_WRITE_TO_BINLOG`, `LOCAL` or a histogram clause | refused; one unqualified table at a time is taken |
 | `CREATE USER`, `GRANT`, `REVOKE` beyond the narrow account slice | `CREATE USER 'name'@'%' IDENTIFIED BY 'password'` and table-scoped `GRANT` / `REVOKE SELECT ON db.table TO` / `FROM 'name'@'%'` use a dedicated account-management privilege, the crash-safe journal, external checkpoint CAS, and runtime reload. Other hosts, database/global grants in SQL, multiple privileges, and account alteration/drop remain refused. The offline provisioner may bootstrap an administrator with `--global-manage-accounts true` |
-| Stored procedures, functions, events | refused, and out of scope — see what this frontend is for |
+| Stored procedures, functions, events | refused, and out of scope — see what this frontend is for. Their listings — `SHOW EVENTS`, `SHOW FUNCTION STATUS`, `SHOW PROCEDURE STATUS` — answer no row |
+| `SHOW FUNCTION STATUS` / `SHOW PROCEDURE STATUS` with a `WHERE` other than `Db = 'name'`, `SHOW EVENTS` with a `WHERE` | refused; MySQL checks the predicate against the listing's columns — an unknown one is 1054 — before it finds no row |
+| Switching databases inside a transaction, a `--single-transaction` dump of several databases among them | refused; the transaction belongs to the first database's connection. Selecting the same database again is taken |
+| `SHOW FIELDS` / `DESCRIBE` of a view | refused as an internal error; measured, MySQL types each column from the view's query — `id + 1` reads `bigint` with default `0` — and `mysqldump` reads it to write a view's placeholder |
 | `information_schema` beyond `TABLES`, `VIEWS`, `COLUMNS`, `SCHEMATA`, `STATISTICS`, `KEY_COLUMN_USAGE`, `TABLE_CONSTRAINTS`, `REFERENTIAL_CONSTRAINTS`, `CHECK_CONSTRAINTS` and `ROUTINES` | not started; what is left is `COLLATION_CHARACTER_SET_APPLICABILITY` and the server-status tables |
 | `information_schema.CHECK_CONSTRAINTS.CHECK_CLAUSE` for an expression beyond a comparison, `IS [NOT] NULL`, `AND`, `OR`, `+`, `-` and `*` over columns, numbers and words | refused when read; how MySQL writes the rest back has not been measured |
 | A `CREATE TABLE` giving a `CHECK` a name another table's `CHECK` already has | taken, where MySQL answers 3822, a name being the database's; `ALTER TABLE ... ADD CONSTRAINT` answers 3822 as MySQL does |
@@ -545,6 +548,10 @@ speaks; anything measured here from now on has to pass that flag.
 Behaviour that works but does not match MySQL lives in
 [COMPAT.md](COMPAT.md), not here. The open ones, each explained there:
 
+- A transaction begun before any database is selected — how `mysqldump
+  --single-transaction` opens — takes its read view when a database is
+  selected, not at `START TRANSACTION`, so it sees a row committed between the
+  two
 - `SET net_read_timeout` is kept and read back but bounds nothing: the rest of
   a command a client has begun sending is waited for until the idle deadline,
   where MySQL gives up after `net_read_timeout`

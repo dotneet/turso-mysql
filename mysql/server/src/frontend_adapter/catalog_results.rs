@@ -3719,3 +3719,257 @@ pub(super) fn connector_j_index_info_result(
         status_flags,
     }))
 }
+
+/// Answers `SHOW EVENTS`, `SHOW FUNCTION STATUS` and `SHOW PROCEDURE STATUS`,
+/// which list stored programs. This server keeps none, so each lists no row.
+///
+/// The columns were measured on MySQL 8.4.11, original tables and names
+/// included, which name the data dictionary's own tables.
+pub(super) fn show_stored_programs_result(
+    kind: MySqlStoredProgramKind,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let columns = match kind {
+        MySqlStoredProgramKind::Events => show_events_columns(),
+        MySqlStoredProgramKind::Functions | MySqlStoredProgramKind::Procedures => {
+            show_routine_status_columns()
+        }
+    };
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns,
+        rows: Vec::new(),
+        warnings: 0,
+        status_flags,
+    })
+}
+
+fn show_events_columns() -> Vec<ColumnDefinitionConfig> {
+    let required = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let key = required | MYSQL_PART_KEY_FLAG;
+    let words = |name: &str, length: u32, flags: u16| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = length;
+        column.flags = flags;
+        column
+    };
+    let computed = |mut column: ColumnDefinitionConfig| {
+        column.decimals = NOT_FIXED_DECIMALS;
+        column
+    };
+    let moment = |name: &str| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_DATETIME);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = 76;
+        column.flags = MYSQL_BINARY_FLAG;
+        column
+    };
+    let mut interval_field = ColumnDefinitionConfig::new("Interval field", MYSQL_TYPE_STRING);
+    interval_field.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    interval_field.column_length = 72;
+    interval_field.flags = MYSQL_ENUM_FLAG | MYSQL_BINARY_FLAG;
+    let mut originator = ColumnDefinitionConfig::new("Originator", MYSQL_TYPE_LONG);
+    originator.character_set = MYSQL_BINARY_COLLATION;
+    originator.column_length = 10;
+    originator.flags = required | MYSQL_UNSIGNED_FLAG;
+    // Each column with the data dictionary table it comes from; the ones MySQL
+    // works out rather than reads name none.
+    [
+        (words("Db", 256, key | MYSQL_BINARY_FLAG), "sch"),
+        (words("Name", 256, key), "evt"),
+        (
+            words(
+                "Definer",
+                1152,
+                key | MYSQL_BINARY_FLAG | MYSQL_MULTIPLE_KEY_FLAG,
+            ),
+            "evt",
+        ),
+        (words("Time zone", 256, required | MYSQL_BINARY_FLAG), "evt"),
+        (computed(words("Type", 36, MYSQL_NOT_NULL_FLAG)), ""),
+        (moment("Execute at"), ""),
+        (computed(words("Interval value", 1024, 0)), ""),
+        (interval_field, "evt"),
+        (moment("Starts"), ""),
+        (moment("Ends"), ""),
+        (
+            computed(words("Status", 84, MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG)),
+            "",
+        ),
+        (originator, "evt"),
+        (
+            words("character_set_client", 256, key | MYSQL_UNIQUE_KEY_FLAG),
+            "cs_client",
+        ),
+        (
+            words("collation_connection", 256, key | MYSQL_UNIQUE_KEY_FLAG),
+            "coll_conn",
+        ),
+        (
+            words("Database Collation", 256, key | MYSQL_UNIQUE_KEY_FLAG),
+            "coll_db",
+        ),
+    ]
+    .into_iter()
+    .map(|(mut column, original_table)| {
+        if !original_table.is_empty() {
+            "information_schema".clone_into(&mut column.schema);
+        }
+        "EVENTS".clone_into(&mut column.table);
+        original_table.clone_into(&mut column.original_table);
+        column.original_name = column.name.clone();
+        column
+    })
+    .collect()
+}
+
+fn show_routine_status_columns() -> Vec<ColumnDefinitionConfig> {
+    let required = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    let text = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    // Name, original table, type, character set, length, flags.
+    let fields: [(&str, &str, u8, u16, u32, u16); 12] = [
+        (
+            "Db",
+            "schemata",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Name",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            required,
+        ),
+        (
+            "Type",
+            "routines",
+            MYSQL_TYPE_STRING,
+            text,
+            36,
+            required | MYSQL_ENUM_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Language",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Definer",
+            "routines",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            1152,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Modified",
+            "routines",
+            MYSQL_TYPE_TIMESTAMP,
+            MYSQL_BINARY_COLLATION,
+            19,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Created",
+            "routines",
+            MYSQL_TYPE_TIMESTAMP,
+            MYSQL_BINARY_COLLATION,
+            19,
+            required | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Security_type",
+            "routines",
+            MYSQL_TYPE_STRING,
+            text,
+            28,
+            required | MYSQL_ENUM_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "Comment",
+            "routines",
+            MYSQL_TYPE_BLOB,
+            text,
+            262_140,
+            required | MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG,
+        ),
+        (
+            "character_set_client",
+            "character_sets",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            required,
+        ),
+        (
+            "collation_connection",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            required,
+        ),
+        (
+            "Database Collation",
+            "collations",
+            MYSQL_TYPE_VAR_STRING,
+            text,
+            256,
+            required,
+        ),
+    ];
+    fields
+        .into_iter()
+        .map(
+            |(name, original_table, kind, character_set, length, flags)| {
+                let mut column = ColumnDefinitionConfig::new(name, kind);
+                "ROUTINES".clone_into(&mut column.table);
+                original_table.clone_into(&mut column.original_table);
+                name.clone_into(&mut column.original_name);
+                column.character_set = character_set;
+                column.column_length = length;
+                column.flags = flags;
+                column
+            },
+        )
+        .collect()
+}
+
+/// Answers `mysqldump`'s question whether a table has histograms. MySQL keeps
+/// one only after `ANALYZE TABLE ... UPDATE HISTOGRAM`, which this server
+/// refuses, so no table here has one and the answer is no rows.
+///
+/// Measured on MySQL 8.4.11: `COLUMN_NAME` is the catalog table's own NOT
+/// NULL `VAR_STRING` of 256, and the reading a nullable `JSON` of 4294967292
+/// with 31 decimals, in the connection's collation.
+pub(super) fn histogram_listing_result(
+    query: &MySqlHistogramQuery,
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let mut column_name = ColumnDefinitionConfig::new("COLUMN_NAME", MYSQL_TYPE_VAR_STRING);
+    "information_schema".clone_into(&mut column_name.schema);
+    "COLUMN_STATISTICS".clone_into(&mut column_name.table);
+    "COLUMN_STATISTICS".clone_into(&mut column_name.original_table);
+    "COLUMN_NAME".clone_into(&mut column_name.original_name);
+    column_name.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    column_name.column_length = 256;
+    column_name.flags = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    let mut reading = ColumnDefinitionConfig::new(query.reading_column_name(), MYSQL_TYPE_JSON);
+    reading.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+    reading.column_length = u32::MAX - 3;
+    reading.flags = MYSQL_BINARY_FLAG;
+    reading.decimals = NOT_FIXED_DECIMALS;
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: vec![column_name, reading],
+        rows: Vec::new(),
+        warnings: 0,
+        status_flags,
+    })
+}

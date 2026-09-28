@@ -84,11 +84,15 @@ use turso_mysql_parser::{
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
-    parse_optional_truncate_table, parse_select, MySqlShowCharacterSetsCommand,
-    MySqlShowListingFilter, MySqlShowValueTest, SessionSqlMode,
+    parse_optional_truncate_table, parse_select, MySqlHistogramQuery,
+    MySqlShowCharacterSetsCommand, MySqlShowListingFilter, MySqlShowValueTest,
+    MySqlStoredProgramKind, SessionSqlMode,
 };
 #[cfg(unix)]
-use turso_mysql_parser::{parse_optional_named_lock_query, write_the_current_database_in};
+use turso_mysql_parser::{
+    parse_optional_histogram_query, parse_optional_named_lock_query,
+    parse_optional_show_stored_programs, write_the_current_database_in, MySqlTransactionCommand,
+};
 
 use crate::connection_facts::MySqlConnectionFacts;
 use crate::static_result_metadata::{static_column_definition, static_result_column_metadata};
@@ -672,6 +676,7 @@ where
             pending_long_data: PendingLongData::default(),
             named_locks,
             error_message: None,
+            transaction_awaiting_a_database: None,
         })
     }
 }
@@ -706,6 +711,9 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     /// The words of the error the last statement answered with, where they
     /// name what the fixed message of its kind cannot.
     error_message: Option<Vec<u8>>,
+    /// A `START TRANSACTION` the session sent before it selected a database,
+    /// begun on the database it selects next.
+    transaction_awaiting_a_database: Option<String>,
 }
 
 /// What looking for a table a statement names that is not there found.
@@ -735,20 +743,92 @@ where
     }
 
     fn select_database(&mut self, requested_name: &str) -> Result<(), FrontendErrorKind> {
+        let canonical_name =
+            canonicalize_database_name(requested_name).map_err(database_error_kind)?;
         if self.session.connection().is_ok_and(|connection| {
             !connection.is_auto_commit() || !connection.session_autocommit()
         }) {
+            // Measured on MySQL 8.4.11: selecting the database already
+            // selected leaves a transaction open, which is what `mysqldump
+            // --single-transaction` does between tables. Another database
+            // would take the transaction to a connection it was not begun on.
+            if self.session.selected_database() == Some(canonical_name.as_str()) {
+                return self.authorize(DatabaseAction::Connect {
+                    database: Some(&canonical_name),
+                });
+            }
             return Err(FrontendErrorKind::Unsupported);
         }
-        let canonical_name =
-            canonicalize_database_name(requested_name).map_err(database_error_kind)?;
         self.authorize(DatabaseAction::Connect {
             database: Some(&canonical_name),
         })?;
         self.session
             .select_database(&canonical_name)
             .map_err(database_error_kind)?;
-        self.carry_the_session_onto_its_connection()
+        self.carry_the_session_onto_its_connection()?;
+        self.begin_the_transaction_awaiting_a_database()
+    }
+
+    /// Begins, on the database just selected, the transaction the session
+    /// started before it had one.
+    ///
+    /// MySQL has no connection per database, so a transaction begun with none
+    /// selected is already open. The engine's transaction belongs to one
+    /// database's connection, so it is begun here instead; the engine takes
+    /// its read view at the first read either way, as COMPAT.md records for
+    /// `WITH CONSISTENT SNAPSHOT`.
+    fn begin_the_transaction_awaiting_a_database(&mut self) -> Result<(), FrontendErrorKind> {
+        let Some(begin) = self.transaction_awaiting_a_database.take() else {
+            return Ok(());
+        };
+        self.execute_client_query(&begin).map(|_| ())
+    }
+
+    /// Answers a transaction statement, or `UNLOCK TABLES`, sent before the
+    /// session selected a database.
+    ///
+    /// Measured on MySQL 8.4.11: `START TRANSACTION` with no database selected
+    /// opens a transaction, `UNLOCK TABLES` with nothing locked leaves it
+    /// open, `COM_INIT_DB` leaves it open, and `COMMIT` ends it. This is how
+    /// `mysqldump --single-transaction` opens, before it selects the database
+    /// it dumps.
+    fn answer_without_a_database(
+        &mut self,
+        sql: &str,
+    ) -> Result<Option<CommandExecutionResult>, FrontendErrorKind> {
+        let mode = self.session.session_sql_mode();
+        if let Some(MySqlLockTablesCommand::Unlock) =
+            parse_optional_lock_tables(sql, mode).ok().flatten()
+        {
+            return Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+                status_flags: self.status_flags(),
+                ..CommandOkResult::default()
+            })));
+        }
+        let Some(command) = turso_mysql_parser::parse_optional_transaction_command(sql, mode)
+            .map_err(|_| FrontendErrorKind::Unsupported)?
+        else {
+            return Ok(None);
+        };
+        match command {
+            MySqlTransactionCommand::Begin
+            | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginWithConsistentSnapshot => {
+                self.transaction_awaiting_a_database = Some(sql.to_owned());
+            }
+            MySqlTransactionCommand::Commit | MySqlTransactionCommand::Rollback => {
+                self.transaction_awaiting_a_database = None;
+            }
+            MySqlTransactionCommand::CommitAndChain
+            | MySqlTransactionCommand::RollbackAndChain
+            | MySqlTransactionCommand::Savepoint(_)
+            | MySqlTransactionCommand::RollbackToSavepoint(_)
+            | MySqlTransactionCommand::ReleaseSavepoint(_) => return Ok(None),
+        }
+        Ok(Some(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: self.status_flags(),
+            ..CommandOkResult::default()
+        })))
     }
 
     /// Gives a connection the session has just opened what the session asked
@@ -1230,6 +1310,14 @@ where
                         return Err(FrontendErrorKind::Unsupported);
                     }
                     if !connection.is_auto_commit() || !connection.session_autocommit() {
+                        // Measured on MySQL 8.4.11: `USE` of the database
+                        // already selected leaves the transaction open.
+                        if self.session.selected_database() == Some(canonical_name.as_str()) {
+                            return Ok(CommandExecutionResult::Ok(CommandOkResult {
+                                status_flags: self.status_flags(),
+                                ..CommandOkResult::default()
+                            }));
+                        }
                         return Err(FrontendErrorKind::Unsupported);
                     }
                 }
@@ -1251,6 +1339,7 @@ where
                 })?;
         if matches!(result, MySqlAdminCommandResult::Selected { .. }) {
             self.carry_the_session_onto_its_connection()?;
+            self.begin_the_transaction_awaiting_a_database()?;
         }
         // Measured on MySQL 8.4.11: `CREATE DATABASE IF NOT EXISTS` over a
         // database that is there answers OK with note 1007.
@@ -1972,10 +2061,16 @@ where
     A: DatabaseAuthorizer,
 {
     fn status_flags(&self) -> u16 {
+        let awaiting = if self.transaction_awaiting_a_database.is_some() {
+            SERVER_STATUS_IN_TRANS
+        } else {
+            0
+        };
         self.session
             .connection()
             .map(connection_status_flags)
             .unwrap_or(SERVER_STATUS_AUTOCOMMIT)
+            | awaiting
     }
 
     fn no_backslash_escapes(&self) -> bool {
@@ -2034,6 +2129,7 @@ where
         // MySQL's reset lets go of every named lock the session holds.
         self.named_locks.release_all();
         self.session_variables = crate::session_variables::MySqlSessionVariables::default();
+        self.transaction_awaiting_a_database = None;
         if let Ok(connection) = self.session.connection() {
             connection.set_time_zone_offset_seconds(0);
         }
@@ -2364,6 +2460,14 @@ where
         {
             return named_lock_results::named_lock_result(&query, &self.named_locks, status_flags);
         }
+        if let Some(query) = parse_optional_histogram_query(sql, self.session.session_sql_mode())
+            .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return Ok(catalog_results::histogram_listing_result(
+                &query,
+                status_flags,
+            ));
+        }
         refuse_an_unknown_system_variable(sql)?;
         if is_account_admin_statement(sql) {
             let command =
@@ -2555,6 +2659,11 @@ where
         // This holds one lock over the whole database, so it locks more than
         // was asked for rather than less — which is a lock all the same, and
         // the one thing the statement asks to be true.
+        if self.session.selected_database().is_none() {
+            if let Some(result) = self.answer_without_a_database(sql)? {
+                return Ok(result);
+            }
+        }
         let locking = match parse_optional_lock_tables(sql, self.session.session_sql_mode()) {
             Ok(locking) => locking,
             Err(turso_mysql_parser::ParseError::Unsupported { .. }) => {
@@ -2801,6 +2910,35 @@ where
                     FrontendErrorKind::MissingObject
                 },
             );
+        }
+
+        if let Some(command) = parse_optional_show_stored_programs(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|error| match error {
+            turso_mysql_parser::ParseError::Unsupported { .. } => FrontendErrorKind::Unsupported,
+            _ => FrontendErrorKind::Syntax,
+        })? {
+            // Measured on MySQL 8.4.11: `SHOW EVENTS` lists the selected
+            // database's events and answers 1046 with none selected, and the
+            // routine listings span every database. There are no stored
+            // programs here, so each lists no row.
+            if command.kind() == MySqlStoredProgramKind::Events {
+                let selected_database = self
+                    .session
+                    .selected_database()
+                    .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+                    .to_owned();
+                reject_other_database_qualifier(command.database(), &selected_database)?;
+                self.authorize(DatabaseAction::Query {
+                    database: &selected_database,
+                })?;
+            }
+            return Ok(catalog_results::show_stored_programs_result(
+                command.kind(),
+                self.status_flags(),
+            ));
         }
 
         if let Some(command) = parse_optional_show_triggers(sql, self.session.session_sql_mode())

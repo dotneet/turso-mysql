@@ -1,5 +1,6 @@
 //! Restoring what `mysqldump --databases` writes, the way the `mysql` client
-//! sends it: statement by statement, with the delimiter taken off.
+//! sends it: statement by statement, with the delimiter taken off; and
+//! answering what `mysqldump` sends while it dumps the restored schema again.
 //!
 //! `mysqldump_probe.sql` is a real dump, taken with `mysqldump
 //! --single-transaction --databases probe` from MySQL 8.4.11, of a schema with
@@ -512,4 +513,274 @@ fn latin1_takes_ascii_statements_and_answers_no_result() {
             row(&[Some("Zoë")])
         ]
     );
+}
+
+/// The restored schema, and the catalog it lives in, for a second session.
+fn restored_catalog() -> (tempfile::TempDir, Arc<MySqlDatabaseCatalog>) {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("dump_owner"));
+    let (directory, catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes(ACCOUNT),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    for sql in statements_the_client_sends(DUMP) {
+        run(&mut adapter, &sql);
+    }
+    (directory, catalog)
+}
+
+/// A session of the dump's account, with nothing selected, as `mysqldump`
+/// opens one.
+fn session_on(catalog: &Arc<MySqlDatabaseCatalog>) -> Adapter {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("dump_owner"));
+    let mut adapter =
+        AuthorizedDatabaseAdapterFactory::new(Arc::clone(catalog), binary_context(), authorizer)
+            .build(AuthenticatedPrincipal::from_account_id_for_testing(
+                AccountId::from_bytes(ACCOUNT),
+            ))
+            .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter
+}
+
+fn in_transaction(adapter: &Adapter) -> bool {
+    adapter.status_flags() & SERVER_STATUS_IN_TRANS != 0
+}
+
+/// What `mysqldump --single-transaction --routines --triggers --events
+/// --hex-blob --databases probe` 8.4.11 sent to MySQL, read from the general
+/// log, one table's worth of it. Every statement is answered, and the dump's
+/// reads all come from the one transaction it opened before it selected the
+/// database. Measured on MySQL 8.4.11: `START TRANSACTION` with no database
+/// selected opens a transaction, which `UNLOCK TABLES` and `COM_INIT_DB` leave
+/// open, and `USE` of the database already selected leaves it open too.
+#[test]
+fn a_single_transaction_dump_is_answered_from_one_transaction() {
+    let (_directory, catalog) = restored_catalog();
+    let mut dump = session_on(&catalog);
+    for sql in [
+        "/*!40100 SET @@SQL_MODE='' */",
+        "/*!40103 SET TIME_ZONE='+00:00' */",
+        "/*!80000 SET SESSION information_schema_stats_expiry=0 */",
+        "SET SESSION NET_READ_TIMEOUT= 86400, SESSION NET_WRITE_TIMEOUT= 86400",
+        "SET @@SESSION.terminology_use_previous = NONE",
+        "SHOW VARIABLES LIKE 'gtid_mode'",
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+    ] {
+        dump.execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    assert!(!in_transaction(&dump));
+    run(
+        &mut dump,
+        "START TRANSACTION /*!40100 WITH CONSISTENT SNAPSHOT */",
+    );
+    assert!(in_transaction(&dump));
+    run(&mut dump, "UNLOCK TABLES");
+    assert!(in_transaction(&dump));
+    run(&mut dump, "SHOW VARIABLES LIKE 'ndbinfo\\_version'");
+    dump.execute_init_db("probe").unwrap();
+    assert!(in_transaction(&dump));
+    run(&mut dump, "SAVEPOINT sp");
+    assert_eq!(
+        rows(&mut dump, "SELECT COUNT(*) FROM audit"),
+        [row(&[Some("3")])]
+    );
+
+    // A row another session commits now is not in what the dump reads.
+    let mut writer = session_on(&catalog);
+    writer.execute_init_db("probe").unwrap();
+    run(&mut writer, "INSERT INTO audit (note) VALUES ('later')");
+
+    for sql in [
+        "show table status like 'audit'",
+        "SET SQL_QUOTE_SHOW_CREATE=1",
+        "SET SESSION character_set_results = 'binary'",
+        "show create table `audit`",
+        "SET SESSION character_set_results = 'utf8mb4'",
+        "show fields from `audit`",
+        "SET SESSION character_set_results = 'binary'",
+        "use `probe`",
+        "select @@collation_database",
+        "SHOW TRIGGERS LIKE 'audit'",
+        "SET SESSION character_set_results = 'utf8mb4'",
+        "SET SESSION character_set_results = 'binary'",
+        "SELECT COLUMN_NAME,                       JSON_EXTRACT(HISTOGRAM, '$.\"number-of-buckets-specified\"')                FROM information_schema.COLUMN_STATISTICS                WHERE SCHEMA_NAME = 'probe' AND TABLE_NAME = 'audit'",
+        "SET SESSION character_set_results = 'utf8mb4'",
+        "ROLLBACK TO SAVEPOINT sp",
+        "RELEASE SAVEPOINT sp",
+        "show events",
+        "use `probe`",
+        "select @@collation_database",
+        "SET SESSION character_set_results = 'binary'",
+        "SHOW FUNCTION STATUS WHERE Db = 'probe'",
+        "SHOW PROCEDURE STATUS WHERE Db = 'probe'",
+        "SET SESSION character_set_results = 'utf8mb4'",
+    ] {
+        dump.execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+        assert!(in_transaction(&dump), "{sql}");
+    }
+    dump.execute_init_db("probe").unwrap();
+    assert_eq!(
+        rows(
+            &mut dump,
+            "SELECT /*!40001 SQL_NO_CACHE */ COUNT(*) FROM `audit`"
+        ),
+        [row(&[Some("3")])]
+    );
+    run(&mut dump, "COMMIT");
+    assert!(!in_transaction(&dump));
+    assert_eq!(
+        rows(&mut dump, "SELECT COUNT(*) FROM audit"),
+        [row(&[Some("4")])]
+    );
+}
+
+/// A transaction begun with nothing selected is begun on the database
+/// selected next, by `USE` as by `COM_INIT_DB`, and ended by `COMMIT` or
+/// `ROLLBACK` even when none was selected; moving it to another database is
+/// refused, the transaction being that database's.
+#[test]
+fn a_transaction_begun_before_a_database_is_selected_waits_for_one() {
+    let (_directory, catalog) = restored_catalog();
+    let mut session = session_on(&catalog);
+    run(&mut session, "START TRANSACTION");
+    run(&mut session, "ROLLBACK");
+    assert!(!in_transaction(&session));
+    run(&mut session, "BEGIN");
+    run(&mut session, "COMMIT");
+    assert!(!in_transaction(&session));
+
+    run(&mut session, "START TRANSACTION");
+    run(&mut session, "USE probe");
+    assert!(in_transaction(&session));
+    run(&mut session, "INSERT INTO audit (note) VALUES ('undone')");
+    assert_eq!(
+        session.execute_query("USE other_database"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        session.execute_init_db("other_database"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    run(&mut session, "ROLLBACK");
+    assert_eq!(
+        rows(&mut session, "SELECT COUNT(*) FROM audit"),
+        [row(&[Some("3")])]
+    );
+}
+
+/// There are no stored programs and no histograms here, so each listing a
+/// dump asks for answers no row, in the columns MySQL 8.4.11 answers it in.
+#[test]
+fn a_dump_finds_no_stored_programs_and_no_histograms() {
+    let (_directory, catalog) = restored_catalog();
+    let mut dump = session_on(&catalog);
+    assert_eq!(
+        dump.execute_query("show events"),
+        Err(FrontendErrorKind::NoDatabaseSelected)
+    );
+    dump.execute_init_db("probe").unwrap();
+    let listing = |dump: &mut Adapter, sql: &str| match dump.execute_query(sql) {
+        Ok(CommandExecutionResult::ResultSet(result)) => {
+            assert!(result.rows.is_empty(), "{sql}");
+            result.columns
+        }
+        other => panic!("{sql}: {other:?}"),
+    };
+    let events = listing(&mut dump, "show events");
+    assert_eq!(
+        events
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Db",
+            "Name",
+            "Definer",
+            "Time zone",
+            "Type",
+            "Execute at",
+            "Interval value",
+            "Interval field",
+            "Starts",
+            "Ends",
+            "Status",
+            "Originator",
+            "character_set_client",
+            "collation_connection",
+            "Database Collation",
+        ]
+    );
+    let db = &events[0];
+    assert_eq!(
+        (
+            db.schema.as_str(),
+            db.table.as_str(),
+            db.original_table.as_str(),
+            db.column_length,
+            db.flags
+        ),
+        (
+            "information_schema",
+            "EVENTS",
+            "sch",
+            256,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG
+                | MYSQL_BINARY_FLAG
+        )
+    );
+    assert_eq!(events[11].column_type, MYSQL_TYPE_LONG);
+
+    for sql in [
+        "SHOW FUNCTION STATUS WHERE Db = 'probe'",
+        "SHOW PROCEDURE STATUS WHERE Db = 'probe'",
+        "SHOW PROCEDURE STATUS LIKE 'p%'",
+    ] {
+        let routines = listing(&mut dump, sql);
+        assert_eq!(
+            routines
+                .iter()
+                .map(|column| (column.name.as_str(), column.original_table.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Db", "schemata"),
+                ("Name", "routines"),
+                ("Type", "routines"),
+                ("Language", "routines"),
+                ("Definer", "routines"),
+                ("Modified", "routines"),
+                ("Created", "routines"),
+                ("Security_type", "routines"),
+                ("Comment", "routines"),
+                ("character_set_client", "character_sets"),
+                ("collation_connection", "collations"),
+                ("Database Collation", "collations"),
+            ],
+            "{sql}"
+        );
+        assert_eq!(routines[8].column_type, MYSQL_TYPE_BLOB);
+    }
+    assert_eq!(
+        dump.execute_query("SHOW FUNCTION STATUS WHERE Name = 'f'"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+
+    let histograms = listing(
+        &mut dump,
+        "SELECT COLUMN_NAME,                       JSON_EXTRACT(HISTOGRAM, '$.\"number-of-buckets-specified\"')                FROM information_schema.COLUMN_STATISTICS                WHERE SCHEMA_NAME = 'probe' AND TABLE_NAME = 'posts'",
+    );
+    assert_eq!(histograms[0].name, "COLUMN_NAME");
+    assert_eq!(histograms[0].original_table, "COLUMN_STATISTICS");
+    assert_eq!(
+        histograms[1].name,
+        "JSON_EXTRACT(HISTOGRAM, '$.\"number-of-buckets-specified\"')"
+    );
+    assert_eq!(histograms[1].column_type, MYSQL_TYPE_JSON);
+    assert_eq!(histograms[1].column_length, 4_294_967_292);
 }

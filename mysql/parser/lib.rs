@@ -6,6 +6,7 @@ mod alter_table_indexes;
 mod analyze_table;
 mod check_constraints;
 mod checked_primary_key;
+mod column_statistics;
 mod create_table_as_select;
 mod create_table_like;
 mod current_database;
@@ -33,6 +34,7 @@ mod shift_moment;
 mod show_character_sets;
 mod show_engines;
 mod show_full_tables;
+mod show_stored_programs;
 mod show_table_status;
 mod show_triggers;
 mod static_select_metadata;
@@ -101,6 +103,7 @@ pub use checked_primary_key::{
     parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
     CheckedPrimaryKeyIntegerType,
 };
+pub use column_statistics::{parse_optional_histogram_query, MySqlHistogramQuery};
 pub use create_table_as_select::{
     parse_optional_create_table_as_select, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
@@ -166,6 +169,9 @@ pub use show_character_sets::{
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{
     parse_optional_show_full_tables, parse_show_full_tables, MySqlShowFullTablesCommand,
+};
+pub use show_stored_programs::{
+    parse_optional_show_stored_programs, MySqlShowStoredProgramsCommand, MySqlStoredProgramKind,
 };
 pub use show_table_status::{
     parse_optional_show_table_status, parse_show_table_status, MySqlShowTableStatusCommand,

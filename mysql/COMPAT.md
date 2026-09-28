@@ -3629,6 +3629,44 @@ takes it, so a row committed before the first read stays unseen. Measured on
 8.4.11: under `READ COMMITTED` the phrase is ignored with warning 138, and the
 transaction begins all the same; so it is here.
 
+`mysqldump --single-transaction` sends that statement before it selects the
+database it dumps, which MySQL takes: measured on 8.4.11, `START TRANSACTION`
+with no database selected opens a transaction, `UNLOCK TABLES` with nothing
+locked and `COM_INIT_DB` leave it open, and `COMMIT` or `ROLLBACK` ends it. A
+transaction here belongs to one database's connection, so one begun with
+nothing selected is held — the session reports itself in a transaction — and
+begun on the database `COM_INIT_DB` or `USE` selects next; `COMMIT` and
+`ROLLBACK` end it before then. The one difference is when its read view is
+taken: at that selection rather than at the statement, so a row another session
+commits between the two is seen, where MySQL would not see it. Selecting the
+database already selected inside a transaction leaves it open, as MySQL does
+and as a dump does between tables; selecting another is refused, since the
+transaction cannot follow the session there — which also refuses a
+`--single-transaction` dump of several databases.
+
+The rest of what `mysqldump` 8.4 sends was read from the oracle's general log
+under `--single-transaction --routines --triggers --events --hex-blob
+--databases`, and each statement is answered. `SHOW EVENTS` — with the selected
+database, 1046 without — `SHOW FUNCTION STATUS` and `SHOW PROCEDURE STATUS`
+list no row, there being no stored programs here, in the columns MySQL answers
+them in, original tables included; a filter is taken as `LIKE 'pattern'` or
+the `WHERE Db = 'name'` a dump writes, and any other `WHERE` is refused, being
+a predicate MySQL checks against the listing's columns. The query a dump sends
+for every table to learn whether it has histograms,
+`SELECT COLUMN_NAME, JSON_EXTRACT(HISTOGRAM, ...) FROM
+information_schema.COLUMN_STATISTICS WHERE SCHEMA_NAME = ... AND TABLE_NAME =
+...`, answers no row — MySQL keeps a histogram only after `ANALYZE TABLE ...
+UPDATE HISTOGRAM`, which is refused here — in MySQL's columns, and
+`COLUMN_STATISTICS` read any other way is refused. The two
+`INFORMATION_SCHEMA.FILES` queries for NDB tablespaces, sent only for an
+account with `PROCESS`, stay refused, and a dump carries on past them, as it
+does against MySQL for an account without that privilege. `LOCK TABLES
+mysql.proc READ`, sent under `--routines` without `--single-transaction`, names
+a table MySQL 8 no longer has and answers 1146 there, which a dump ignores;
+here it is taken, `LOCK TABLES` locking the selected database whatever it
+names. `SHOW FIELDS` of a view, which a dump reads to write the view's
+placeholder, is not answered here yet.
+
 `COMMIT AND CHAIN` and `ROLLBACK AND CHAIN` are taken. Each ends the
 transaction and begins another at once. Measured on 8.4.11 over an empty table:
 `START TRANSACTION; INSERT 5; ROLLBACK AND CHAIN; INSERT 6; ROLLBACK` leaves the
