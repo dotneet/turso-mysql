@@ -5324,6 +5324,13 @@ views=views + ? WHERE user_id = ?`, `WHERE id > ?`, `BETWEEN ? AND ?`, a
 detach's `post_id = ? AND tag_id NOT IN (?,?)` and a written `id IN (1, 2)`,
 each of which used to change no row or every row; measured on 8.4.11, each
 finds the rows whose ids compare as numbers.
+A `SELECT` over several tables was read without its columns' types, so it
+compared such a column by kind too: GORM's count of an association through its
+join table — `JOIN post_tags ON post_tags.tag_id = tags.id AND
+post_tags.post_id = ?` — found no row. It is now read knowing which of the
+columns it names are `BIGINT UNSIGNED`, and refused where that name is also a
+column of another kind. One reading a subquery beside such a comparison, which
+is read without its columns' types, is refused.
 
 This internal type is created only for the MySQL frontend. An older MySQL
 table declared as `BIGINT UNSIGNED` used signed integer storage; its original

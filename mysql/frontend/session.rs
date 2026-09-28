@@ -6949,6 +6949,12 @@ impl MySqlConnection {
                 .iter()
                 .any(|source| source.subquery() || !source.projected_columns().is_empty())
         {
+            if self.compares_a_bigint_unsigned_column_by_kind(&translated) {
+                return Err(MySqlQueryError::Unsupported(
+                    "a BIGINT UNSIGNED column compared with a bound value or a list beside a subquery"
+                        .to_string(),
+                ));
+            }
             return Ok(translated);
         }
         // An `information_schema` table has no stored DDL to read a column's
@@ -6980,7 +6986,7 @@ impl MySqlConnection {
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
         }
         let Some(source_table) = translated.source_table() else {
-            return Ok(translated);
+            return self.with_the_unsigned_columns_of_every_table(sql, translated);
         };
         let Ok(table) = MySqlTableName::parse(source_table) else {
             return Ok(translated);
@@ -7119,6 +7125,98 @@ impl MySqlConnection {
             &json_columns,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
+    }
+
+    /// Renders a statement over several tables knowing which of the columns
+    /// it names are `BIGINT UNSIGNED`, when it compares one with a bound
+    /// value or a list, so that comparison goes through the exact-number
+    /// calls a statement over one table already uses. GORM counts and reads
+    /// an association through such a join — `JOIN post_tags ON
+    /// post_tags.tag_id = tags.id AND post_tags.post_id = ?` — and it found
+    /// no row. Nothing else about the tables' columns is read here, and a
+    /// name some table holds as anything but a whole number is refused, the
+    /// calls reading it as a number too.
+    fn with_the_unsigned_columns_of_every_table(
+        &self,
+        sql: &str,
+        translated: turso_mysql_parser::TranslatedSelect,
+    ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
+        if !self.compares_a_bigint_unsigned_column_by_kind(&translated) {
+            return Ok(translated);
+        }
+        let mut columns = Vec::new();
+        for source in translated.source_tables() {
+            if source.subquery() || source.catalog().is_some() {
+                continue;
+            }
+            columns.extend(self.list_columns(source.table()).map_err(|error| {
+                MySqlQueryError::Unsupported(format!(
+                    "cannot read the columns a BIGINT UNSIGNED comparison names: {error}"
+                ))
+            })?);
+        }
+        let unsigned = columns
+            .iter()
+            .filter(|column| column.type_name() == "BIGINT UNSIGNED")
+            .map(|column| (column.name().to_owned(), 0))
+            .collect::<Vec<_>>();
+        if columns.iter().any(|column| {
+            !is_integer_type(column.type_name())
+                && unsigned
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(column.name()))
+        }) {
+            return Err(MySqlQueryError::Unsupported(
+                "a BIGINT UNSIGNED column shares its name with a column of another kind"
+                    .to_string(),
+            ));
+        }
+        turso_mysql_parser::parse_select_knowing_decimal_columns(
+            sql,
+            self.parser_mode(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &unsigned,
+        )
+        .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
+    }
+
+    /// Whether a statement read without its column types compares a
+    /// `BIGINT UNSIGNED` column in a way the engine answers by kind rather
+    /// than by value: against a bound value or a list. The engine keeps such
+    /// a column in a stored form of its own and compares it with a written
+    /// number, and nothing else, through the type's own calls — measured,
+    /// `user_id = ?` found no row and `id > ?` every row.
+    fn compares_a_bigint_unsigned_column_by_kind(
+        &self,
+        translated: &turso_mysql_parser::TranslatedSelect,
+    ) -> bool {
+        translated.checked_comparisons().iter().any(|comparison| {
+            let compared_by_value = matches!(
+                comparison.rhs(),
+                CheckedSelectComparisonRhs::SignedInteger(_)
+                    | CheckedSelectComparisonRhs::Null
+                    | CheckedSelectComparisonRhs::Column { .. }
+            ) && !matches!(
+                comparison.operator(),
+                CheckedSelectComparisonOperator::In | CheckedSelectComparisonOperator::NotIn
+            );
+            if comparison.answers().is_some() || compared_by_value {
+                return false;
+            }
+            translated.source_tables().iter().any(|source| {
+                !source.subquery()
+                    && self.list_columns(source.table()).is_ok_and(|columns| {
+                        columns.iter().any(|column| {
+                            column.type_name() == "BIGINT UNSIGNED"
+                                && column.name().eq_ignore_ascii_case(comparison.column_name())
+                        })
+                    })
+            })
+        })
     }
 
     /// Holds every column a JSON reading in a condition reads to being a

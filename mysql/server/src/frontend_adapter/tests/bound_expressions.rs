@@ -893,3 +893,102 @@ fn sqlalchemy_compares_a_json_member_as_text_unless_it_is_null() {
         );
     }
 }
+
+/// Tags and the join table GORM's many-to-many association reads through,
+/// the first post holding two tags and the second one.
+fn tags_of_posts(adapter: &mut Adapter) {
+    run(
+        adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    run(
+        adapter,
+        "CREATE TABLE `post_tags` (`post_id` bigint unsigned,`tag_id` bigint unsigned,PRIMARY KEY (`post_id`,`tag_id`))",
+    );
+    run(
+        adapter,
+        "INSERT INTO tags (id, name) VALUES (1, 'go'), (2, 'sql'), (3, 'db')",
+    );
+    run(
+        adapter,
+        "INSERT INTO post_tags (post_id, tag_id) VALUES (1, 1), (1, 2), (2, 1)",
+    );
+}
+
+/// GORM counts and reads an association through its join table, and finds
+/// rows through `Joins("User")`, each comparing a `BIGINT UNSIGNED` id with a
+/// bound one. A statement over several tables was read without its columns'
+/// types, so each found no row, or every row for `>`. Measured on MySQL
+/// 8.4.11, each finds the rows whose ids compare as numbers, and so does a
+/// written list.
+#[test]
+fn gorm_reads_an_association_through_a_join_by_a_bound_id() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    tags_of_posts(&mut adapter);
+    let by_post = "FROM `tags` JOIN `post_tags` ON `post_tags`.`tag_id` = `tags`.`id` AND `post_tags`.`post_id` = ?";
+    assert_eq!(
+        result_rows(
+            &mut adapter,
+            &format!("SELECT count(*) {by_post}"),
+            &[Bound::Id(1)]
+        ),
+        [[BinaryResultValue::Integer(2)]]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            &format!("SELECT `tags`.`id`,`tags`.`name` {by_post}"),
+            &[Bound::Id(1)]
+        ),
+        [1, 2]
+    );
+    assert_eq!(
+        result_rows(
+            &mut adapter,
+            "SELECT `tags`.`name` FROM `tags` JOIN `post_tags` ON `post_tags`.`tag_id` = `tags`.`id` WHERE `post_tags`.`post_id` > ?",
+            &[Bound::Id(1)]
+        ),
+        [words(&["go"])]
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT `tags`.`name` FROM `tags` JOIN `post_tags` ON `post_tags`.`tag_id` = `tags`.`id` WHERE `post_tags`.`post_id` IN (1, 2) ORDER BY `post_tags`.`post_id`, `tags`.`id`"
+        ),
+        ["go", "sql", "go"]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT `posts`.`id` FROM `posts` LEFT JOIN `users` `User` ON `posts`.`user_id` = `User`.`id` WHERE `User`.`id` = ? ORDER BY `posts`.`id`",
+            &[Bound::Id(1)]
+        ),
+        [1, 2]
+    );
+}
+
+/// A statement reading a subquery is read without its columns' types, so a
+/// `BIGINT UNSIGNED` column compared with a bound value beside one is
+/// refused rather than compared by kind, which found no row.
+#[test]
+fn an_unsigned_id_bound_beside_a_subquery_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    two_users_with_posts(&mut adapter);
+    assert_eq!(
+        prepared(
+            &mut adapter,
+            "SELECT id FROM posts WHERE views > (SELECT AVG(views) FROM posts) AND user_id = ?",
+            &[Bound::Id(1)]
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM posts WHERE views > (SELECT AVG(views) FROM posts) AND views > ?",
+            &[Bound::Whole(0)]
+        ),
+        [1, 2]
+    );
+}
