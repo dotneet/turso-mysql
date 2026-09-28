@@ -43,6 +43,13 @@ pub(super) fn render_comparison_over_a_json_reading(
             let rendered = reading.render(render_context)?;
             render_text_comparison(&rendered, &op, operator, other, render_context)?
         }
+        JsonAnswer::TextUnlessNull(reading) => {
+            let document = reading.render(render_context)?;
+            let rendered = format!(
+                "(CASE WHEN {document} = 'null' THEN NULL ELSE mysql_json_unquote({document}) END)"
+            );
+            render_text_comparison(&rendered, &op, operator, other, render_context)?
+        }
         JsonAnswer::Kind(reading) => {
             let rendered = format!("mysql_json_type({})", reading.render(render_context)?);
             render_text_comparison(&rendered, &op, operator, other, render_context)?
@@ -125,6 +132,9 @@ pub(super) fn reads_a_json_column(expr: &Expr) -> bool {
 enum JsonAnswer<'e> {
     /// `->>` or `JSON_UNQUOTE(JSON_EXTRACT(...))`: text under `utf8mb4_bin`.
     Text(JsonReading<'e>),
+    /// The same text, but no value where the reading found the JSON null —
+    /// the `CASE` SQLAlchemy writes around it.
+    TextUnlessNull(JsonReading<'e>),
     /// `JSON_TYPE(...)`: the word naming the kind, under `utf8mb4_bin` too.
     Kind(JsonReading<'e>),
     /// `JSON_LENGTH(...)`: a count.
@@ -137,6 +147,7 @@ impl<'e> JsonAnswer<'e> {
     fn reading(&self) -> &JsonReading<'e> {
         match self {
             Self::Text(reading)
+            | Self::TextUnlessNull(reading)
             | Self::Kind(reading)
             | Self::Count(reading)
             | Self::Document(reading) => reading,
@@ -145,6 +156,9 @@ impl<'e> JsonAnswer<'e> {
 }
 
 fn answered_by_json(expr: &Expr) -> Option<JsonAnswer<'_>> {
+    if let Some(reading) = read_unquoted_unless_null(expr) {
+        return Some(JsonAnswer::TextUnlessNull(reading));
+    }
     if let Some(reading) = read_json_reading(expr) {
         return Some(if reading.unquoted {
             JsonAnswer::Text(reading)
@@ -192,6 +206,20 @@ enum JsonPath<'e> {
 impl JsonReading<'_> {
     fn binds_its_path(&self) -> bool {
         matches!(self.path, Some(JsonPath::Bound))
+    }
+
+    /// Whether another reading reads the same written path out of the same
+    /// column, named the same way.
+    fn reads_what(&self, other: &JsonReading<'_>) -> bool {
+        let written = |reading: &JsonReading<'_>| match reading.path {
+            Some(JsonPath::Written(path)) => Some(path.to_owned()),
+            _ => None,
+        };
+        self.qualifier.map(|qualifier| &qualifier.value)
+            == other.qualifier.map(|qualifier| &qualifier.value)
+            && self.column.value == other.column.value
+            && written(self).is_some()
+            && written(self) == written(other)
     }
 
     fn render(&self, render_context: &mut SelectRenderContext<'_>) -> Result<String, ParseError> {
@@ -288,6 +316,38 @@ fn extracted_reading<'e>(arguments: &[&'e Expr], unquoted: bool) -> Option<JsonR
 
 fn is_a_placeholder(expr: &Expr) -> bool {
     matches!(expr, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"))
+}
+
+/// Reads the `CASE` SQLAlchemy writes to compare a JSON value as text:
+/// `CASE JSON_EXTRACT(col, 'path') WHEN 'null' THEN NULL ELSE
+/// JSON_UNQUOTE(JSON_EXTRACT(col, 'path')) END`, both readings the same.
+///
+/// Measured on MySQL 8.4.11: the `CASE` answers no value where the path finds
+/// the JSON null — the JSON string `"null"` answers the word `null` — and
+/// otherwise the unquoted text, compared the way that text is: `= 'Paris'`
+/// finds Paris and not `paris`, `'Paris '` finds it too, `> 'C'` orders by
+/// bytes, and `= 30` reads both sides as numbers.
+fn read_unquoted_unless_null(expr: &Expr) -> Option<JsonReading<'_>> {
+    let Expr::Case {
+        operand: Some(operand),
+        conditions,
+        else_result: Some(otherwise),
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    let [when] = conditions.as_slice() else {
+        return None;
+    };
+    let answers_null =
+        matches!(&when.result, Expr::Value(value) if matches!(value.value, Value::Null));
+    if written_word(&when.condition) != Some("null") || !answers_null {
+        return None;
+    }
+    let tested = read_json_reading(operand).filter(|reading| !reading.unquoted)?;
+    let unquoted = read_json_reading(otherwise).filter(|reading| reading.unquoted)?;
+    tested.reads_what(&unquoted).then_some(tested)
 }
 
 /// Reads a JSON column itself or a JSON value read out of one, which is what

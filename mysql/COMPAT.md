@@ -4628,6 +4628,11 @@ same rows:
   '$."city"') = JSON_EXTRACT('"Paris"', '$')` — which is read as the word or
   whole number it holds, the column named through its table; a document of
   any other kind is refused there.
+- SQLAlchemy compares a member as text through `CASE JSON_EXTRACT(col,
+  'path') WHEN 'null' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(col, 'path'))
+  END`, naming the column through its table. Measured on 8.4.11 that is the
+  unquoted text above except that the JSON null answers no value — the JSON
+  string `"null"` still answers the word — and it is compared the same way.
 - `JSON_EXTRACT(...) IS NULL` is true only where the path is not there, a
   member holding the JSON null being found; `JSON_TYPE(...)` names it `NULL`,
   and that word is compared under `utf8mb4_bin` too, so `= 'null'` finds

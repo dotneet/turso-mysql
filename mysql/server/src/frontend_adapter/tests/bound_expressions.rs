@@ -855,3 +855,41 @@ fn a_fallback_in_a_set_over_another_kind_of_column_is_refused() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// SQLAlchemy compares a JSON member as text through a `CASE` that answers
+/// no value for the JSON null. Measured on MySQL 8.4.11 over the same rows:
+/// the text compares byte for byte with trailing spaces ignored, the JSON
+/// null answers nothing while the JSON string `"null"` answers the word, and
+/// a number reads both sides as numbers.
+#[test]
+fn sqlalchemy_compares_a_json_member_as_text_unless_it_is_null() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    run(
+        &mut adapter,
+        r#"INSERT INTO users (id, email, name, balance, is_active, profile) VALUES (5, 'e@x', 'Eve', 1, 1, '{"city": "null"}')"#,
+    );
+    let compared = |member: &str, comparison: &str| {
+        format!(
+            "SELECT users.name FROM users WHERE CASE JSON_EXTRACT(users.profile, '$.\"{member}\"') WHEN 'null' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(users.profile, '$.\"{member}\"')) END {comparison} ORDER BY users.id"
+        )
+    };
+    for (member, comparison, found) in [
+        ("city", "= 'Paris'", vec!["Alice"]),
+        ("city", "= 'paris'", vec![]),
+        ("city", "= 'Paris '", vec!["Alice"]),
+        ("city", "!= 'Paris'", vec!["Bob", "Eve"]),
+        ("city", "> 'C'", vec!["Alice", "Eve"]),
+        ("city", "= 'null'", vec!["Eve"]),
+        ("n", "= 'null'", vec![]),
+        ("age", "= 30", vec!["Alice", "Bob"]),
+        ("s", "= 30", vec!["Alice"]),
+        ("ok", "= 'true'", vec!["Alice"]),
+    ] {
+        assert_eq!(
+            first_column(&mut adapter, &compared(member, comparison)),
+            found,
+            "{member} {comparison}"
+        );
+    }
+}
