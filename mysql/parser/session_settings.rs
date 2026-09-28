@@ -107,6 +107,14 @@ pub enum MySqlSessionSetting {
         /// plain `transaction_isolation` set the session's level.
         next_transaction_only: bool,
     },
+    /// `SET [SESSION] TRANSACTION READ ONLY` or `READ WRITE`, or the same
+    /// through `transaction_read_only`.
+    TransactionAccessMode {
+        read_only: bool,
+        /// Whether the mode holds for the next transaction alone, by the same
+        /// spellings as for the isolation level.
+        next_transaction_only: bool,
+    },
 }
 
 /// The settings a `SET` may give the value of a user variable, beside
@@ -138,25 +146,13 @@ pub fn parse_optional_session_settings(
     if !scanner.take_keyword("SET") {
         return Ok(None);
     }
-    // `SET TRANSACTION ISOLATION LEVEL <level>` is its own statement, with no
+    // `SET TRANSACTION <characteristic>, ...` is its own statement, with no
     // other assignment beside it. With no scope word it names the next
     // transaction rather than the session.
     let restore = scanner.cursor;
     let scoped = scanner.take_keyword("SESSION") || scanner.take_keyword("LOCAL");
     if scanner.take_keyword("TRANSACTION") {
-        if !scanner.take_keyword("ISOLATION") || !scanner.take_keyword("LEVEL") {
-            return Ok(None);
-        }
-        let Some(level) = scanner.take_isolation_level() else {
-            return Ok(None);
-        };
-        if !scanner.at_end() {
-            return Err(ParseError::TrailingAdminCommandTokens);
-        }
-        return Ok(Some(vec![MySqlSessionSetting::TransactionIsolationLevel {
-            level,
-            next_transaction_only: !scoped,
-        }]));
+        return Ok(take_transaction_characteristics(&mut scanner, !scoped));
     }
     scanner.cursor = restore;
     // Measured on MySQL 8.4.11: a scope word holds for the assignments after
@@ -185,6 +181,55 @@ pub fn parse_optional_session_settings(
         return Err(ParseError::TrailingAdminCommandTokens);
     }
     Ok(Some(settings))
+}
+
+/// Reads what follows `SET [SESSION] TRANSACTION`: an isolation level, an
+/// access mode, or one of each separated by a comma.
+///
+/// Measured on MySQL 8.4.11: `READ ONLY, ISOLATION LEVEL READ COMMITTED` sets
+/// both, while two access modes or two levels answer 1064, which is left to
+/// the statement's own parser here.
+fn take_transaction_characteristics(
+    scanner: &mut Scanner<'_>,
+    next_transaction_only: bool,
+) -> Option<Vec<MySqlSessionSetting>> {
+    let mut settings = Vec::new();
+    loop {
+        let setting = if scanner.take_keyword("ISOLATION") {
+            if !scanner.take_keyword("LEVEL") {
+                return None;
+            }
+            MySqlSessionSetting::TransactionIsolationLevel {
+                level: scanner.take_isolation_level()?,
+                next_transaction_only,
+            }
+        } else if scanner.take_keyword("READ") {
+            let read_only = if scanner.take_keyword("ONLY") {
+                true
+            } else if scanner.take_keyword("WRITE") {
+                false
+            } else {
+                return None;
+            };
+            MySqlSessionSetting::TransactionAccessMode {
+                read_only,
+                next_transaction_only,
+            }
+        } else {
+            return None;
+        };
+        if settings
+            .iter()
+            .any(|taken| std::mem::discriminant(taken) == std::mem::discriminant(&setting))
+        {
+            return None;
+        }
+        settings.push(setting);
+        if !scanner.take_byte(b',') {
+            break;
+        }
+    }
+    scanner.at_end().then_some(settings)
 }
 
 /// The scope an assignment names, by a word before it or by `@@scope.`.
@@ -318,7 +363,15 @@ fn take_one_session_setting(
             }));
         }
     }
-    let setting = if name.eq_ignore_ascii_case("transaction_isolation") {
+    let setting = if name.eq_ignore_ascii_case("transaction_read_only") {
+        let Some(read_only) = take_read_only_value(scanner, mode)? else {
+            return Ok(None);
+        };
+        MySqlSessionSetting::TransactionAccessMode {
+            read_only,
+            next_transaction_only: unscoped_system_variable,
+        }
+    } else if name.eq_ignore_ascii_case("transaction_isolation") {
         let Some(level) = scanner.take_string(mode) else {
             return Ok(None);
         };
@@ -486,6 +539,33 @@ fn take_checked_switch(scanner: &mut Scanner<'_>) -> Result<Option<bool>, ParseE
         None if scanner.take_keyword("OFF") => Ok(Some(false)),
         None => Ok(None),
     }
+}
+
+/// Reads the value of `transaction_read_only`.
+///
+/// Measured on MySQL 8.4.11: `0`, `1`, `ON`, `OFF`, `TRUE`, the quoted
+/// `'ON'` and `'OFF'`, and `DEFAULT`, which is off, are all taken; `2`
+/// answers 1231.
+fn take_read_only_value(
+    scanner: &mut Scanner<'_>,
+    mode: SessionSqlMode,
+) -> Result<Option<bool>, ParseError> {
+    if scanner.take_keyword("DEFAULT") || scanner.take_keyword("FALSE") {
+        return Ok(Some(false));
+    }
+    if scanner.take_keyword("TRUE") {
+        return Ok(Some(true));
+    }
+    if let Some(value) = scanner.take_string(mode) {
+        return if value.eq_ignore_ascii_case("ON") {
+            Ok(Some(true))
+        } else if value.eq_ignore_ascii_case("OFF") {
+            Ok(Some(false))
+        } else {
+            unsupported("transaction_read_only value; expected ON or OFF")
+        };
+    }
+    take_checked_switch(scanner)
 }
 
 /// One `SET @name = value`.
@@ -1232,12 +1312,71 @@ mod tests {
             "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE",
             "SET TRANSACTION ISOLATION LEVEL READ",
-            // The other SET TRANSACTION forms are not read here.
-            "SET TRANSACTION READ ONLY",
             "SET TRANSACTION LEVEL REPEATABLE READ",
         ] {
             assert_eq!(parse(sql), None, "{sql}");
         }
+    }
+
+    /// Connector/J sends `SET SESSION TRANSACTION READ ONLY` for every
+    /// read-only Spring transaction. The spellings were measured on MySQL
+    /// 8.4.11, which of them name the next transaction alone among them.
+    #[test]
+    fn reads_the_transaction_access_mode() {
+        for (sql, read_only, next_transaction_only) in [
+            ("SET SESSION TRANSACTION READ ONLY", true, false),
+            ("set session transaction read write", false, false),
+            ("SET LOCAL TRANSACTION READ ONLY", true, false),
+            ("SET TRANSACTION READ ONLY", true, true),
+            ("SET TRANSACTION READ WRITE", false, true),
+            ("SET transaction_read_only = ON", true, false),
+            ("SET SESSION transaction_read_only = OFF", false, false),
+            ("SET @@session.transaction_read_only = 1", true, false),
+            ("SET @@LOCAL.transaction_read_only = 0", false, false),
+            ("SET transaction_read_only = 'ON'", true, false),
+            ("SET SESSION transaction_read_only = 'off'", false, false),
+            ("SET transaction_read_only = TRUE", true, false),
+            ("SET SESSION transaction_read_only = DEFAULT", false, false),
+            ("SET @@transaction_read_only = 1", true, true),
+        ] {
+            assert_eq!(
+                parse(sql),
+                Some(MySqlSessionSetting::TransactionAccessMode {
+                    read_only,
+                    next_transaction_only,
+                }),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            parse_all("SET SESSION TRANSACTION READ ONLY, ISOLATION LEVEL READ COMMITTED"),
+            Some(vec![
+                MySqlSessionSetting::TransactionAccessMode {
+                    read_only: true,
+                    next_transaction_only: false,
+                },
+                MySqlSessionSetting::TransactionIsolationLevel {
+                    level: "READ COMMITTED".to_owned(),
+                    next_transaction_only: false,
+                },
+            ])
+        );
+        // Measured: 1064 for two modes or two levels in one statement.
+        for sql in [
+            "SET SESSION TRANSACTION READ ONLY, READ WRITE",
+            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED, ISOLATION LEVEL REPEATABLE READ",
+            "SET SESSION TRANSACTION READ",
+        ] {
+            assert_eq!(parse_all(sql), None, "{sql}");
+        }
+        // Measured: 1231 for any other number.
+        assert!(matches!(
+            parse_optional_session_settings(
+                "SET SESSION transaction_read_only = 2",
+                SessionSqlMode::default()
+            ),
+            Err(ParseError::Unsupported { .. })
+        ));
     }
 
     #[test]

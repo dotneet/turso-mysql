@@ -82,16 +82,19 @@ impl MySqlConnection {
     /// Readies the session for one statement from the client.
     ///
     /// `next` is the level a transaction the statement begins will run at,
-    /// and `written_zero` what a 0 written into a counted column means under
-    /// the session's `sql_mode`. Inside a `READ COMMITTED` transaction the
+    /// `session_read_only` whether one begun without saying is read-only, and
+    /// `written_zero` what a 0 written into a counted column means under the
+    /// session's `sql_mode`. Inside a `READ COMMITTED` transaction the
     /// snapshot the last statement read from is let go, so this one reads what
     /// is committed now.
     pub fn prepare_for_client_statement(
         &self,
         next: MySqlIsolationLevel,
+        session_read_only: bool,
         written_zero: WrittenZero,
     ) -> std::result::Result<(), MySqlQueryError> {
         *self.written_zero.lock().unwrap() = written_zero;
+        *self.session_read_only.lock().unwrap() = session_read_only;
         let current = {
             let mut isolation = self.transaction_isolation.lock().unwrap();
             isolation.next = next;

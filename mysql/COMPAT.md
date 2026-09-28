@@ -4092,7 +4092,43 @@ be the kind of quiet lie a lock that is not held would be. The promise ends with
 transaction. A DDL statement is not held to it, because it commits what came
 before and so leaves the read-only transaction before it runs; measured,
 `START TRANSACTION READ ONLY; CREATE TABLE u (...)` is taken there too.
-`READ WRITE` is the default spelled out and changes nothing.
+
+`SET SESSION TRANSACTION READ ONLY`, which Connector/J sends for every
+read-only Spring transaction, is taken with the same promise, and so are
+`READ WRITE`, `SET LOCAL TRANSACTION`, `transaction_read_only` set with or
+without `SESSION` or `@@session.` to `0`, `1`, `ON`, `OFF`, `TRUE`, `'ON'`,
+`'OFF'` or `DEFAULT`, and an access mode beside an isolation level in one
+`SET SESSION TRANSACTION`. It used to be refused, and Spring goes on after
+the refusal, so an `UPDATE` inside a read-only transaction was written here
+where MySQL refuses it. Measured on MySQL 8.4.11, and answered the same here:
+under a read-only session every `INSERT`, `UPDATE`, `DELETE` and `REPLACE`,
+every DDL statement, `CREATE TEMPORARY TABLE`, `CREATE DATABASE`,
+`CREATE USER`, `SELECT ... FOR UPDATE`, `EXPLAIN UPDATE` and a `WITH` over an
+`UPDATE` answer 1792, autocommit on or off; reads, `SET`, `USE`, `DO`,
+`CHECK TABLE`, `FLUSH TABLES`, `SAVEPOINT` and the transaction statements
+run. A transaction begun without saying takes the session's mode, and
+`START TRANSACTION READ WRITE` writes in a read-only session — which is why
+`READ WRITE` is no longer the same as a plain `BEGIN`. A transaction keeps the
+mode it began with when the session changes it — with autocommit off, the
+transaction the first statement reading a table begins — and a chained one
+keeps the mode of the one before. DDL ends the transaction first and so
+answers to the session's mode, not the transaction's: `START TRANSACTION READ
+WRITE; CREATE TABLE ...` answers 1792 in a read-only session, while
+`CREATE TEMPORARY TABLE`, which ends nothing, answers to the transaction's.
+`@@transaction_read_only` reads the session's mode, inside a transaction of
+the other mode too, and `COM_RESET_CONNECTION` makes the session read-write
+again. Prepared statements are held to the same when they are executed.
+
+Where this differs: MySQL lets a read-only session or transaction write to a
+temporary table made before it was read-only, and this refuses that write;
+`ANALYZE TABLE` in a read-only session, which MySQL answers with rows saying it
+could not store the statistics, answers 1792 here; and a statement this server
+does not know what it writes — `CALL`, `LOAD DATA`, `SET PASSWORD`,
+`FLUSH PRIVILEGES` — answers 1792 when either the session or the transaction
+is read-only. `SET TRANSACTION READ ONLY` and `SET @@transaction_read_only`,
+which name the next transaction alone, are refused: measured, MySQL keeps that
+mode through every statement outside a transaction, failed ones included, until
+a transaction ends, a rule this server does not keep.
 
 A standard `mysqldump --databases` restores through the `mysql` client
 statement by statement, and every statement MySQL 8.4.11's writes for a schema

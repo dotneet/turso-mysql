@@ -66,6 +66,10 @@ pub struct MySqlConnection {
     /// a write inside one, so this frontend has to know it is in one to answer
     /// the same rather than accept a transaction whose promise it does not keep.
     read_only_transaction: Arc<Mutex<bool>>,
+    /// Whether the session asked for read-only transactions with `SET SESSION
+    /// TRANSACTION READ ONLY`. A transaction begun without saying which it is
+    /// takes this, and so does a statement outside any transaction.
+    session_read_only: Arc<Mutex<bool>>,
     /// Set while this session holds the lock `LOCK TABLES` took, which is
     /// the write transaction it opened.
     tables_locked: Arc<Mutex<bool>>,
@@ -1566,6 +1570,7 @@ impl MySqlConnection {
             session_autocommit: Arc::new(Mutex::new(true)),
             session_time_zone_offset: Arc::new(Mutex::new(0)),
             read_only_transaction: Arc::new(Mutex::new(false)),
+            session_read_only: Arc::new(Mutex::new(false)),
             tables_locked: Arc::new(Mutex::new(false)),
             transaction_isolation: Arc::new(Mutex::new(TransactionIsolation::default())),
             written_zero: Arc::new(Mutex::new(WrittenZero::AsksForTheNextNumber)),
@@ -3959,6 +3964,7 @@ impl MySqlConnection {
         match command {
             MySqlTransactionCommand::Begin
             | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginReadWrite
             | MySqlTransactionCommand::BeginWithConsistentSnapshot
                 if !self.inner.get_auto_commit() =>
             {
@@ -3979,6 +3985,7 @@ impl MySqlConnection {
             MySqlTransactionCommand::CommitAndChain | MySqlTransactionCommand::RollbackAndChain
                 if self.inner.get_auto_commit() =>
             {
+                *self.read_only_transaction.lock().unwrap() = self.session_read_only();
                 self.begin_transaction_isolation();
                 self.run_transaction_statement(
                     Stmt::Begin {
@@ -3991,13 +3998,24 @@ impl MySqlConnection {
             }
             _ => {}
         }
-        // Every one of these settles what the next transaction is, so the flag
-        // is cleared first and set again only by the READ ONLY form.
-        *self.read_only_transaction.lock().unwrap() =
-            matches!(command, MySqlTransactionCommand::BeginReadOnly);
+        // Measured on MySQL 8.4.11: a transaction begun without saying takes
+        // the session's access mode, `READ ONLY` and `READ WRITE` override
+        // it, and a chained transaction keeps the mode of the one it follows.
+        let read_only = match command {
+            MySqlTransactionCommand::BeginReadOnly => true,
+            MySqlTransactionCommand::BeginReadWrite => false,
+            MySqlTransactionCommand::Begin
+            | MySqlTransactionCommand::BeginWithConsistentSnapshot => self.session_read_only(),
+            MySqlTransactionCommand::CommitAndChain | MySqlTransactionCommand::RollbackAndChain => {
+                *self.read_only_transaction.lock().unwrap()
+            }
+            _ => false,
+        };
+        *self.read_only_transaction.lock().unwrap() = read_only;
         let statement = match command {
             MySqlTransactionCommand::Begin
             | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginReadWrite
             | MySqlTransactionCommand::BeginWithConsistentSnapshot => {
                 self.begin_transaction_isolation();
                 Stmt::Begin {
@@ -4124,6 +4142,21 @@ impl MySqlConnection {
             .map_err(MySqlQueryError::Engine)
     }
 
+    /// Whether a statement runs read-only: inside a transaction, by that
+    /// transaction's access mode, and outside one by the session's, which the
+    /// transaction a statement begins takes.
+    pub fn runs_read_only(&self, session_read_only: bool) -> bool {
+        if self.inner.get_auto_commit() {
+            session_read_only
+        } else {
+            *self.read_only_transaction.lock().unwrap()
+        }
+    }
+
+    fn session_read_only(&self) -> bool {
+        *self.session_read_only.lock().unwrap()
+    }
+
     /// Refuses a write inside a `START TRANSACTION READ ONLY`.
     ///
     /// Measured on MySQL 8.4.11: a write there answers 1792 and the transaction
@@ -4204,6 +4237,10 @@ impl MySqlConnection {
         if self.session_autocommit() {
             return Ok(());
         }
+        // Measured on MySQL 8.4.11: with autocommit off, the transaction the
+        // first statement reading a table begins keeps the session's access
+        // mode even when the session changes it before the transaction ends.
+        *self.read_only_transaction.lock().unwrap() = self.session_read_only();
         self.inner
             .prepare("BEGIN")
             .and_then(|mut statement| statement.run_ignore_rows())

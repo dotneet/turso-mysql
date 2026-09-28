@@ -353,6 +353,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         }
         refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
         let connection = self.connection.clone();
+        refuse_a_write_while_read_only(
+            Some(&connection),
+            &self.session_variables,
+            Some(sql),
+            connection.parser_mode(),
+        )?;
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = run_client_statement(&connection, || self.execute_query_statement(sql));
         let result = finish_client_statement(&connection, &mut self.session_variables, result);
@@ -450,6 +456,12 @@ impl CommandExecutor for MySqlCommandAdapter {
         let _kept_reads = turso_mysql_parser::keep_reads();
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         let connection = self.connection.clone();
+        refuse_a_write_while_read_only(
+            Some(&connection),
+            &self.session_variables,
+            None,
+            connection.parser_mode(),
+        )?;
         prepare_for_client_statement(&connection, &self.session_variables)?;
         let result = run_client_statement(&connection, || {
             self.execute_prepared_statement_command(statement_id, parameter_payload)
@@ -880,6 +892,7 @@ where
         match command {
             MySqlTransactionCommand::Begin
             | MySqlTransactionCommand::BeginReadOnly
+            | MySqlTransactionCommand::BeginReadWrite
             | MySqlTransactionCommand::BeginWithConsistentSnapshot => {
                 self.transaction_awaiting_a_database = Some(sql.to_owned());
             }
@@ -2416,6 +2429,15 @@ where
             .statements
             .get(&statement_id)
             .map(|statement| statement.connection.clone());
+        refuse_a_write_while_read_only(
+            connection.as_ref(),
+            &self.session_variables,
+            self.prepared_statements
+                .statements
+                .get(&statement_id)
+                .map(|statement| statement.text.as_str()),
+            self.session.session_sql_mode(),
+        )?;
         if let Some(connection) = &connection {
             self.start_a_statement_on(connection)?;
             if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
@@ -2473,6 +2495,12 @@ where
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
         let connection = self.session.connection_reading_no_table().ok().cloned();
+        refuse_a_write_while_read_only(
+            connection.as_ref(),
+            &self.session_variables,
+            Some(sql),
+            self.session.session_sql_mode(),
+        )?;
         if let Some(connection) = &connection {
             self.start_a_statement_on(connection)?;
             if let Err(error) = prepare_for_client_statement(connection, &self.session_variables) {
@@ -5861,9 +5889,48 @@ fn prepare_for_client_statement(
     connection
         .prepare_for_client_statement(
             session_variables.isolation_for_next_transaction(),
+            session_variables.transaction_read_only(),
             written_zero,
         )
         .map_err(frontend_query_error)
+}
+
+/// Answers 1792, before anything of it runs, for a statement that writes
+/// where it runs read-only.
+///
+/// A write inside a transaction answers to the transaction's access mode,
+/// and a statement that ends the transaction first, as DDL does, to the
+/// session's. `sql` is `None` where the statement's text is not at hand,
+/// which is read as a statement this does not know.
+fn refuse_a_write_while_read_only(
+    connection: Option<&MySqlConnection>,
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+    sql: Option<&str>,
+    mode: turso_mysql_parser::SessionSqlMode,
+) -> Result<(), FrontendErrorKind> {
+    use turso_mysql_parser::StatementWrites;
+    let session_read_only = session_variables.transaction_read_only();
+    let transaction_read_only = connection.map_or(session_read_only, |connection| {
+        connection.runs_read_only(session_read_only)
+    });
+    // Reading the statement costs as much as its length, so a session that
+    // writes freely is spared it.
+    if !session_read_only && !transaction_read_only {
+        return Ok(());
+    }
+    let writes = sql.map_or(StatementWrites::Unknown, |sql| {
+        turso_mysql_parser::what_a_statement_writes(sql, mode)
+    });
+    let refused = match writes {
+        StatementWrites::Nothing => false,
+        StatementWrites::InTheTransaction => transaction_read_only,
+        StatementWrites::AfterCommitting => session_read_only,
+        StatementWrites::Unknown => session_read_only || transaction_read_only,
+    };
+    if refused {
+        return Err(FrontendErrorKind::ReadOnlyTransaction);
+    }
+    Ok(())
 }
 
 /// Whether a statement could be a `CREATE VIEW`, an `ALTER VIEW` or a

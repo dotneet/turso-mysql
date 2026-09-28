@@ -193,6 +193,9 @@ pub(crate) struct MySqlSessionVariables {
     transaction_isolation: MySqlIsolationLevel,
     /// A level the client set for the next transaction alone.
     next_transaction_isolation: Option<MySqlIsolationLevel>,
+    /// Whether the session's transactions are read-only, as `SET SESSION
+    /// TRANSACTION READ ONLY` makes them.
+    transaction_read_only: bool,
     /// The modes this session named beyond the ones the server always runs.
     sql_mode_choices: SqlModeChoices,
     /// The idle time the session asked for in place of the server's own.
@@ -289,6 +292,7 @@ impl Default for MySqlSessionVariables {
             time_zone: SERVER_TIME_ZONE_AT_THE_START.to_owned(),
             transaction_isolation: MySqlIsolationLevel::default(),
             next_transaction_isolation: None,
+            transaction_read_only: false,
             sql_mode_choices: SqlModeChoices::default(),
             wait_timeout: None,
             net_read_timeout_seconds: MYSQL_NET_READ_TIMEOUT_SECONDS,
@@ -421,6 +425,12 @@ impl MySqlSessionVariables {
     pub(crate) fn isolation_for_next_transaction(&self) -> MySqlIsolationLevel {
         self.next_transaction_isolation
             .unwrap_or(self.transaction_isolation)
+    }
+
+    /// Whether a transaction beginning now, or a statement outside one, is
+    /// read-only.
+    pub(crate) const fn transaction_read_only(&self) -> bool {
+        self.transaction_read_only
     }
 
     /// Forgets a level set for the next transaction alone, once one began.
@@ -830,6 +840,16 @@ impl MySqlSessionVariables {
                 } else {
                     self.transaction_isolation = level;
                 }
+            }
+            MySqlSessionSetting::TransactionAccessMode {
+                read_only,
+                next_transaction_only,
+            } => {
+                assert!(
+                    !next_transaction_only,
+                    "an access mode for the next transaction alone is refused before it is applied"
+                );
+                self.transaction_read_only = read_only;
             }
             MySqlSessionSetting::SqlModeFromUserVariable(_)
             | MySqlSessionSetting::SqlModeExpression(_)
@@ -1364,6 +1384,21 @@ fn accept_session_setting(
             }
             Ok(())
         }
+        // Measured on MySQL 8.4.11, a mode set for the next transaction alone
+        // is not used up by a statement outside a transaction, a failed one
+        // among them, but only by a transaction's end, which is a rule of its
+        // own this server does not keep. The SESSION form is taken anywhere,
+        // a transaction open or not, and holds from the next one on.
+        MySqlSessionSetting::TransactionAccessMode {
+            next_transaction_only,
+            ..
+        } => {
+            if *next_transaction_only {
+                Err(FrontendErrorKind::Unsupported)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1702,10 +1737,14 @@ fn counted_system_variable(
             false,
         ));
     }
-    // A READ ONLY transaction leaves MySQL's session default unchanged. This
-    // server does not accept a change to that default, so it remains off.
+    // Measured on MySQL 8.4.11: this reads the session's mode, even inside a
+    // `START TRANSACTION READ WRITE` or `READ ONLY` that differs from it.
     if name.eq_ignore_ascii_case("transaction_read_only") {
-        return Some(("0".to_owned(), 1, false));
+        return Some((
+            u8::from(session_variables.transaction_read_only).to_string(),
+            1,
+            false,
+        ));
     }
     // This server has no performance schema, which is a thing a client can see
     // for itself and act on rather than a claim about how it behaves.

@@ -8625,7 +8625,7 @@ fn reads_the_chaining_transaction_commands() {
         ),
         (
             "start transaction read write",
-            MySqlTransactionCommand::Begin,
+            MySqlTransactionCommand::BeginReadWrite,
         ),
         ("COMMIT AND CHAIN", MySqlTransactionCommand::CommitAndChain),
         (

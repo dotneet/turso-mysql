@@ -30878,3 +30878,6 @@ mod binary_data;
 
 #[cfg(unix)]
 mod mysqldump_bytes;
+
+#[cfg(unix)]
+mod read_only_sessions;

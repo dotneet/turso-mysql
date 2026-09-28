@@ -43,6 +43,7 @@ mod show_stored_programs;
 mod show_table_status;
 mod show_triggers;
 mod statement_reads;
+mod statement_writes;
 mod static_select_metadata;
 mod str_to_date;
 mod table_collation;
@@ -202,6 +203,7 @@ pub use show_triggers::{
     MySqlShowCreateTriggerCommand, MySqlShowTriggersCommand,
 };
 pub use statement_reads::{bytes_read, keep_reads, BytesRead, KeptReads};
+pub use statement_writes::{what_a_statement_writes, StatementWrites};
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
     ScalarFunction, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
@@ -3512,6 +3514,10 @@ pub enum MySqlTransactionCommand {
     Begin,
     /// `START TRANSACTION READ ONLY`. MySQL answers 1792 to a write inside one.
     BeginReadOnly,
+    /// `START TRANSACTION READ WRITE`, which a session made read-only can
+    /// still write in: measured on MySQL 8.4.11, an `INSERT` inside one is
+    /// taken after `SET SESSION TRANSACTION READ ONLY`.
+    BeginReadWrite,
     /// `START TRANSACTION WITH CONSISTENT SNAPSHOT`, which takes the read
     /// snapshot at the statement rather than at the first read.
     BeginWithConsistentSnapshot,
@@ -3691,14 +3697,13 @@ pub fn parse_optional_transaction_command(
             {
                 return unsupported("transaction options");
             }
-            // `READ WRITE` is the default spelled out, so it changes nothing.
             // `READ ONLY` is a promise MySQL keeps with 1792, and this keeps it
             // too rather than accepting the words and ignoring them.
             match modes.as_slice() {
                 [] => MySqlTransactionCommand::Begin,
                 [sqlparser::ast::TransactionMode::AccessMode(
                     sqlparser::ast::TransactionAccessMode::ReadWrite,
-                )] => MySqlTransactionCommand::Begin,
+                )] => MySqlTransactionCommand::BeginReadWrite,
                 [sqlparser::ast::TransactionMode::AccessMode(
                     sqlparser::ast::TransactionAccessMode::ReadOnly,
                 )] => MySqlTransactionCommand::BeginReadOnly,
