@@ -362,6 +362,11 @@ impl MySqlSessionVariables {
         }
     }
 
+    /// What `ROW_COUNT()` reads, `None` while it is not known.
+    pub(crate) const fn row_count(&self) -> Option<i64> {
+        self.statement_counts.row_count
+    }
+
     /// Notes that a `COM_INIT_DB` selected a database, which leaves
     /// `ROW_COUNT()` at 0 and `FOUND_ROWS()` alone, measured on MySQL 8.4.11.
     pub(crate) fn note_database_selected(&mut self) {

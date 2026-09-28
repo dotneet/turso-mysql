@@ -12,6 +12,9 @@ pub(crate) struct MySqlCallState {
     /// The rows the last `SQL_CALC_FOUND_ROWS` statement would have answered
     /// without its `LIMIT`, until the session reads them.
     pub(crate) found_rows_before_the_limit: Option<u64>,
+    /// What `ROW_COUNT()` reads in the statement running, `None` where the
+    /// session does not know it.
+    pub(crate) row_count: Option<i64>,
 }
 
 pub(crate) fn with_call_state<T>(

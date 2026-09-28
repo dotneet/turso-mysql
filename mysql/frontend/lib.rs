@@ -18,6 +18,7 @@ mod drop_table;
 mod found_rows;
 mod group_concat;
 pub mod named_locks;
+mod row_count;
 pub mod schema_sql;
 mod session;
 pub mod session_registry;

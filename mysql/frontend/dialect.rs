@@ -19,6 +19,7 @@ use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
 use crate::found_rows;
 use crate::group_concat;
+use crate::row_count;
 use crate::schema_sql::{
     decode_persisted_schema_sql, decode_schema_sql_any, reencode_schema_sql,
     validate_schema_sql_catalog, DecodedSchemaSql, SchemaSqlCatalogEntry, SchemaSqlId,
@@ -595,6 +596,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 2 && name.eq_ignore_ascii_case(found_rows::MYSQL_NOTE_FOUND_ROWS) {
             return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
         }
+        if arg_count == 0 && name.eq_ignore_ascii_case(row_count::MYSQL_ROW_COUNT) {
+            return Ok(Some(Func::Dialect(name.to_ascii_lowercase())));
+        }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
@@ -630,6 +634,9 @@ impl Dialect for MySqlDialect {
         }
         if name.eq_ignore_ascii_case(found_rows::MYSQL_NOTE_FOUND_ROWS) {
             return found_rows::note(connection, args);
+        }
+        if name.eq_ignore_ascii_case(row_count::MYSQL_ROW_COUNT) && args.is_empty() {
+            return row_count::read(connection);
         }
         if name.eq_ignore_ascii_case(MYSQL_BIN) || name.eq_ignore_ascii_case(MYSQL_OCT) {
             let [value] = args else {

@@ -122,3 +122,83 @@ fn execute_update_names_its_table_through_an_alias() {
         .execute_query("UPDATE `Users` AS `u` SET `Users`.`Name` = 'x'")
         .is_err());
 }
+
+/// `SaveChanges` writes each row and reads back what the database made for
+/// it in the same batch — `SELECT ... WHERE ROW_COUNT() = 1 AND Id =
+/// LAST_INSERT_ID()` after an `INSERT`, `... AND Id = 2` after an `UPDATE` —
+/// and takes no row as a write that did not happen. Both reads answered 1064.
+#[test]
+fn save_changes_reads_back_the_row_it_wrote() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        changed(&mut adapter, "INSERT INTO `Tags` (`Name`)\nVALUES ('go')"),
+        1
+    );
+    let read_back = result_set(
+        &mut adapter,
+        "SELECT `Id`\nFROM `Tags`\nWHERE ROW_COUNT() = 1 AND `Id` = LAST_INSERT_ID()",
+    );
+    assert_eq!(read_back.columns[0].name, "Id");
+    assert_eq!(read_back.columns[0].column_type, MYSQL_TYPE_LONGLONG);
+    assert_eq!(read_back.rows, [[Some(b"4".to_vec())]]);
+    // The read answered rows, so the count it leaves for the next is -1.
+    assert!(rows(
+        &mut adapter,
+        "SELECT `Id` FROM `Tags` WHERE ROW_COUNT() = 1 AND `Id` = LAST_INSERT_ID()"
+    )
+    .is_empty());
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Id` FROM `Tags` WHERE -1 = ROW_COUNT() AND `Id` = LAST_INSERT_ID()"
+        ),
+        [row(&["4"])]
+    );
+
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "INSERT INTO `Users` (`Email`, `Name`, `Profile`)\nVALUES ('dave@example.com', 'Dave', NULL)"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Id`, `Balance`, `IsActive`\nFROM `Users`\nWHERE ROW_COUNT() = 1 AND `Id` = LAST_INSERT_ID()"
+        ),
+        [row(&["4", "0.00", "1"])]
+    );
+
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `Users` SET `Name` = 'Bob One'\nWHERE `Id` = 2"
+        ),
+        1
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT `Name`\nFROM `Users`\nWHERE ROW_COUNT() = 1 AND `Id` = 2"
+        ),
+        [row(&["Bob One"])]
+    );
+    // A stale row version changes nothing, which EF reads as a conflict.
+    assert_eq!(
+        changed(
+            &mut adapter,
+            "UPDATE `Users` SET `Name` = 'Bob Two'\nWHERE `Id` = 2 AND `Name` = 'Bob'"
+        ),
+        0
+    );
+    assert!(rows(
+        &mut adapter,
+        "SELECT `Name`\nFROM `Users`\nWHERE ROW_COUNT() = 1 AND `Id` = 2"
+    )
+    .is_empty());
+    // A count compared with anything but a whole number stays refused.
+    assert!(adapter
+        .execute_query("SELECT `Id` FROM `Tags` WHERE ROW_COUNT() = 'a'")
+        .is_err());
+}

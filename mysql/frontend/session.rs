@@ -3904,6 +3904,12 @@ impl MySqlConnection {
         crate::found_rows::take(&self.inner)
     }
 
+    /// Sets what `ROW_COUNT()` reads in the statements that run next, `None`
+    /// where the session does not know it.
+    pub fn set_row_count(&self, count: Option<i64>) {
+        crate::row_count::set(&self.inner, count);
+    }
+
     /// Whether the statement that ran noted the rows it answers without its
     /// `LIMIT`, left for `take_found_rows_before_the_limit` to read.
     pub fn noted_found_rows_before_the_limit(&self) -> bool {

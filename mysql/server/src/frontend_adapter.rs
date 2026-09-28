@@ -6953,6 +6953,7 @@ fn prepare_for_client_statement(
     connection: &MySqlConnection,
     session_variables: &crate::session_variables::MySqlSessionVariables,
 ) -> Result<(), FrontendErrorKind> {
+    connection.set_row_count(session_variables.row_count());
     let written_zero = if session_variables.no_auto_value_on_zero() {
         turso_mysql_parser::WrittenZero::Stored
     } else {

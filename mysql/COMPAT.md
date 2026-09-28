@@ -6399,9 +6399,15 @@ fresh connection reads 0 for both; a statement answering rows makes
 `SHOW WARNINGS` leaves `FOUND_ROWS()` alone; one answering OK makes
 `ROW_COUNT()` the rows its OK reports and leaves `FOUND_ROWS()` alone; one that
 fails makes `ROW_COUNT()` -1; and `COM_PING` and `COM_INIT_DB` make
-`ROW_COUNT()` 0. Where the effect was not measured, or is one this server does
-not report, the count is not known and a call reading it is refused until a
-statement says what it is again: `FOUND_ROWS()` after an `UPDATE` (MySQL makes
+`ROW_COUNT()` 0. A `WHERE` may compare `ROW_COUNT()` with a whole number,
+which is how Entity Framework Core reads back each row it writes in the same
+batch — `INSERT ...; SELECT Id FROM Tags WHERE ROW_COUNT() = 1 AND Id =
+LAST_INSERT_ID()` — and `LAST_INSERT_ID()` stands there where a whole number
+meets a column of whole numbers; the statement reads the count the one before
+it left, set on the engine connection before each statement. Where the effect
+was not measured, or is one this server does not report, the count is not
+known and a call reading it is refused until a statement says what it is
+again: `FOUND_ROWS()` after an `UPDATE` (MySQL makes
 it the rows the `UPDATE` matched), after `SHOW ERRORS`, and both after a
 prepared-statement command, a `COM_RESET_CONNECTION`, or a `COM_QUERY` refused
 before any statement of it ran. `SQL_CALC_FOUND_ROWS` on a statement's own

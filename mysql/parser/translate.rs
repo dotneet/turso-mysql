@@ -7816,20 +7816,24 @@ fn render_select_expr(
         {
             render_window_call(function, render_context)
         }
-        Expr::Function(function)
-            if matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(name)] if name.value.eq_ignore_ascii_case("LAST_INSERT_ID"))
-                && !function.uses_odbc_syntax
-                && matches!(&function.parameters, FunctionArguments::None)
-                && matches!(&function.args, FunctionArguments::List(arguments) if arguments.args.is_empty() && arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty())
-                && function.filter.is_none()
-                && function.null_treatment.is_none()
-                && function.over.is_none()
-                && function.within_group.is_empty() =>
-        {
+        Expr::Function(function) if is_a_call_taking_nothing(function, "LAST_INSERT_ID") => {
             Ok("last_insert_id()".to_string())
         }
         _ => unsupported("SELECT expression"),
     }
+}
+
+/// Whether `function` is `name()` written with its parentheses and nothing
+/// in them, as `LAST_INSERT_ID()` and `ROW_COUNT()` are.
+fn is_a_call_taking_nothing(function: &sqlparser::ast::Function, name: &str) -> bool {
+    matches!(function.name.0.as_slice(), [ObjectNamePart::Identifier(written)] if written.value.eq_ignore_ascii_case(name))
+        && !function.uses_odbc_syntax
+        && matches!(&function.parameters, FunctionArguments::None)
+        && matches!(&function.args, FunctionArguments::List(arguments) if arguments.args.is_empty() && arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty())
+        && function.filter.is_none()
+        && function.null_treatment.is_none()
+        && function.over.is_none()
+        && function.within_group.is_empty()
 }
 
 /// Renders what SQLAlchemy reads a JSON member as, over the rendered reading
@@ -10554,6 +10558,9 @@ fn render_checked_select_comparison(
 ) -> Result<String, ParseError> {
     let left = without_parentheses(left);
     let right = without_parentheses(right);
+    if let Some(rendered) = render_comparison_of_the_row_count(left, op, right, render_context)? {
+        return Ok(rendered);
+    }
     if let Some(rendered) =
         json_condition::render_comparison_over_a_json_reading(left, op, right, render_context)?
     {
@@ -10791,6 +10798,46 @@ fn render_checked_select_comparison(
             answers: None,
         });
     Ok(rendered)
+}
+
+/// Renders `ROW_COUNT() = 1`, or nothing when neither side is `ROW_COUNT()`.
+///
+/// Entity Framework Core reads back every row it writes with
+/// `SELECT ... WHERE ROW_COUNT() = 1 AND Id = LAST_INSERT_ID()`, right after
+/// the write in the same batch. `ROW_COUNT()` is a whole number the statement
+/// reads once, the count the one before it left, so it is compared with a
+/// whole number and nothing else. The engine reads it through
+/// `mysql_row_count()`, which the frontend sets before each statement and
+/// which refuses the statement where that count is not known.
+fn render_comparison_of_the_row_count(
+    left: &Expr,
+    op: &BinaryOperator,
+    right: &Expr,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let is_the_row_count = |expr: &Expr| matches!(expr, Expr::Function(function) if is_a_call_taking_nothing(function, "ROW_COUNT"));
+    let (op, other) = if is_the_row_count(left) {
+        (op.clone(), right)
+    } else if is_the_row_count(right) {
+        let Some(reversed) = reverse_checked_comparison_operator(op) else {
+            return unsupported("reversed SELECT comparison operator");
+        };
+        (reversed, left)
+    } else {
+        return Ok(None);
+    };
+    if checked_select_comparison_operator(&op).is_none() {
+        return unsupported("ROW_COUNT() compared by another operator");
+    }
+    let (rendered, CheckedSelectComparisonRhs::SignedInteger(_)) =
+        render_checked_select_comparison_rhs(other, render_context)?
+    else {
+        return unsupported("ROW_COUNT() compared with anything but a whole number");
+    };
+    Ok(Some(format!(
+        "(mysql_row_count() {} {rendered})",
+        checked_select_comparison_sql_operator(&op)
+    )))
 }
 
 /// A column, a value or a `?` in parentheses is the thing itself: MySQL reads
@@ -12109,6 +12156,13 @@ fn render_checked_select_comparison_rhs_allowing_large_integer(
                 CheckedSelectComparisonRhs::Now(now),
             ))
         }
+        // `LAST_INSERT_ID()` answers a whole number, which meets a column of
+        // whole numbers as a written one would: Entity Framework Core finds
+        // the row it inserted by `Id = LAST_INSERT_ID()`.
+        Expr::Function(function) if is_a_call_taking_nothing(function, "LAST_INSERT_ID") => Ok((
+            "last_insert_id()".to_owned(),
+            CheckedSelectComparisonRhs::Call(crate::CheckedComparisonAnswer::WholeNumber),
+        )),
         // A shift of one of those readings is read the same way: what matters
         // to the column it meets is which kind the shift answers, not that it
         // was shifted.
