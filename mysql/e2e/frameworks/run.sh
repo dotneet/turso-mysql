@@ -30,7 +30,7 @@ prefix="${COMPOSE_PROJECT_NAME}"
 # another checkout must not share it (cargo would skip rebuilding changed crates).
 export E2E_CARGO_TARGET_VOLUME="${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}"
 # One database per app, plus the extra ones some apps need.
-export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize drizzle spring spring_ssp efcore sqlx dbtools"
+export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize drizzle spring spring_ssp efcore sqlx dbtools giteatest"
 
 main() {
   case "${1:-}" in
@@ -104,6 +104,7 @@ databases_of() {
     prisma) echo "prisma prisma_shadow" ;;
     mysqldump) echo "dump_src dump_dst" ;;
     spring) echo "spring spring_ssp" ;;
+    gitea) echo "giteatest" ;;
     *) echo "$1" ;;
   esac
 }

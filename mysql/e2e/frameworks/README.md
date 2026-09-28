@@ -89,6 +89,7 @@ the error code, SQLSTATE and message) to
 | `efcore` | EF Core 9, Pomelo, MySqlConnector | `dotnet ef database update` up and down, `dbcontext scaffold`, LINQ, row-version concurrency, savepoints, `EnsureCreated` |
 | `sqlx` | sqlx 0.8 and its CLI (Rust) | `sqlx migrate run` / `info` / `revert`, `database reset`, strictly typed `query()` over prepared statements, multi-statement `raw_sql` |
 | `dbtools` | Connector/J 9 | `DatabaseMetaData` as DBeaver uses it (information_schema and SHOW modes), result-set metadata, and the connect/browse statements of DBeaver, MySQL Workbench and TablePlus (modeled on their general logs, not captured from the GUIs) |
+| `gitea` | Gitea v1.27.3's own integration suite (`tests/integration`, xorm over go-sql-driver) | every top-level test but the ones driving Gitea Actions through a mock runner (they fail against MySQL here too), in `E2E_GITEA_SHARDS` shards (8) so one panicking test ends only its shard; `E2E_GITEA_RUN` narrows it with a `go test -run` pattern. Not in the default run: `run.sh gitea` |
 
 Each app writes one JSON line per step to `steps.jsonl`
 (`{"step", "ok", "error"}`) and keeps going after a failed step. A step or

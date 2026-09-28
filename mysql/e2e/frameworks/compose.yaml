@@ -18,6 +18,9 @@ x-app: &app
     E2E_PASSWORD: ${E2E_PASSWORD:-}
     E2E_USER: e2e
     E2E_PROXY_DUMP: ${E2E_PROXY_DUMP:-0}
+    # A `go test -run` pattern for the gitea app; empty runs its default spread.
+    E2E_GITEA_RUN: ${E2E_GITEA_RUN:-}
+    E2E_GITEA_SHARDS: ${E2E_GITEA_SHARDS:-}
   volumes:
     - .:/e2e/src:ro
     - ${E2E_RUN_DIR:-./.run}/tls/ca.pem:/e2e/tls/ca.pem:ro
@@ -182,6 +185,13 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-rails:local
     working_dir: /app
     command: ["./run.sh"]
+
+  gitea:
+    <<: *app
+    build: ./apps/gitea
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-gitea:local
+    working_dir: /gitea
+    command: ["/app/run.sh"]
 
   sqlalchemy:
     <<: *app
