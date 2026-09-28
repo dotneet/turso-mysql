@@ -3732,9 +3732,23 @@ fn execute_checked_query(
     let sql = strip_leading_sql_comments(sql);
     connection.set_group_concat_max_len(group_concat_max_len);
     connection.forget_group_concat_cuts();
-    if let Some(command) = parse_optional_drop_table(sql, connection.parser_mode())
-        .map_err(|_| FrontendErrorKind::Syntax)?
+    if let Some(command) =
+        parse_optional_drop_table(sql, connection.parser_mode()).map_err(|error| match error {
+            turso_mysql_parser::ParseError::Unsupported { .. } => FrontendErrorKind::Unsupported,
+            _ => FrontendErrorKind::Syntax,
+        })?
     {
+        // A name qualified by another database drops a table of that one,
+        // which this connection does not reach, so only the one the session
+        // is in is taken.
+        let selected = selected_database.and_then(|name| MySqlDatabaseName::parse(name).ok());
+        if command
+            .databases()
+            .iter()
+            .any(|database| Some(database) != selected.as_ref())
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
         let result = connection
             .drop_table(&command)
             .map_err(|error| match error {

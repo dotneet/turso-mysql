@@ -1,7 +1,7 @@
 use super::{
-    consume_admin_table_name, consume_admin_word, is_unquoted_word, skip_admin_comments,
-    tokenize_admin_command, AdminToken, MySqlTableName, ParseError, SessionMySqlDialect,
-    SessionSqlMode,
+    consume_admin_qualified_table_name, consume_admin_word, is_unquoted_word, skip_admin_comments,
+    tokenize_admin_command, AdminToken, MySqlDatabaseName, MySqlTableName, ParseError,
+    SessionMySqlDialect, SessionSqlMode,
 };
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -9,15 +9,23 @@ use sqlparser::tokenizer::{Token, Tokenizer};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlDropTableCommand {
     tables: Vec<MySqlTableName>,
+    databases: Vec<MySqlDatabaseName>,
     if_exists: bool,
 }
 
 impl MySqlDropTableCommand {
-    /// Returns the canonical unqualified table names targeted by the command,
-    /// in the order it named them. Laravel's `migrate:fresh` names every
-    /// table in one statement.
+    /// Returns the canonical table names targeted by the command, without
+    /// the database a name was qualified by, in the order it named them.
+    /// Laravel's `migrate:fresh` names every table in one statement.
     pub fn tables(&self) -> &[MySqlTableName] {
         &self.tables
+    }
+
+    /// Returns the databases the command's qualified names name, each once.
+    /// Laravel's `migrate:fresh` qualifies every table it drops,
+    /// `laravel`.`cache`.
+    pub fn databases(&self) -> &[MySqlDatabaseName] {
+        &self.databases
     }
 
     /// Returns whether the command used `IF EXISTS`.
@@ -26,11 +34,12 @@ impl MySqlDropTableCommand {
     }
 }
 
-/// Parses one strict, unqualified `DROP TABLE` command.
+/// Parses one strict `DROP TABLE` command.
 ///
-/// An optional single semicolon is accepted. Comments, qualified names, and
-/// every clause other than `IF EXISTS` are rejected once the statement starts
-/// with `DROP TABLE`.
+/// An optional single semicolon is accepted. A name may be qualified by its
+/// database, which the caller holds to the one it runs in. Comments and every
+/// clause other than `IF EXISTS` are rejected once the statement starts with
+/// `DROP TABLE`.
 pub fn parse_optional_drop_table(
     sql: &str,
     mode: SessionSqlMode,
@@ -74,8 +83,24 @@ pub fn parse_optional_drop_table(
         false
     };
     let mut tables = Vec::new();
+    let mut databases = Vec::new();
     loop {
-        let table = consume_admin_table_name(&tokens, &mut cursor)?;
+        let (database, table) = consume_admin_qualified_table_name(&tokens, &mut cursor).map_err(
+            |error| match error {
+                // `mysql`, `information_schema` and the other names a database
+                // here may not take are MySQL's own, whose tables are not
+                // dropped through this.
+                ParseError::InvalidDatabaseName { .. } => ParseError::Unsupported {
+                    feature: "DROP TABLE qualified by a system database",
+                },
+                error => error,
+            },
+        )?;
+        if let Some(database) = database {
+            if !databases.contains(&database) {
+                databases.push(database);
+            }
+        }
         if table.as_str().starts_with("sqlite_") || table.as_str().starts_with("__turso_internal_")
         {
             return Err(ParseError::Unsupported {
@@ -99,7 +124,11 @@ pub fn parse_optional_drop_table(
     if cursor != tokens.len() {
         return Err(ParseError::TrailingAdminCommandTokens);
     }
-    Ok(Some(MySqlDropTableCommand { tables, if_exists }))
+    Ok(Some(MySqlDropTableCommand {
+        tables,
+        databases,
+        if_exists,
+    }))
 }
 
 #[cfg(test)]
@@ -142,14 +171,42 @@ mod tests {
         }
     }
 
+    /// Laravel's `migrate:fresh` qualifies every table by its database.
+    #[test]
+    fn drop_table_reads_a_name_qualified_by_its_database() {
+        let command = parse_optional_drop_table(
+            "drop table `laravel`.`cache`, `Laravel`.`jobs`, users, other.t",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            command
+                .tables()
+                .iter()
+                .map(MySqlTableName::as_str)
+                .collect::<Vec<_>>(),
+            ["cache", "jobs", "users", "t"]
+        );
+        assert_eq!(
+            command
+                .databases()
+                .iter()
+                .map(MySqlDatabaseName::as_str)
+                .collect::<Vec<_>>(),
+            ["laravel", "other"]
+        );
+    }
+
     #[test]
     fn drop_table_rejects_clauses_names_and_comments() {
         for sql in [
             "DROP TABLE IF x",
             "DROP TABLE IF NOT EXISTS x",
-            "DROP TABLE db.x",
+            "DROP TABLE db.",
             "DROP TABLE a,",
-            "DROP TABLE a, db.b",
+            "DROP TABLE a.b.c",
+            "DROP TABLE mysql.user",
             "DROP TABLE x CASCADE RESTRICT",
             "DROP TABLE x RESTRICT CASCADE",
             "DROP TABLE x CASCADE, y",

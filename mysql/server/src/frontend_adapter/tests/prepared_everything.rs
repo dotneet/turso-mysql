@@ -166,6 +166,55 @@ fn laravel_drops_every_table_in_one_statement() {
     assert!(!exists(&mut adapter, "cache"));
 }
 
+/// Laravel 12's `migrate:fresh` qualifies every table it drops by its
+/// database, prepared: ``drop table `laravel`.`cache`, `laravel`.`jobs`, ...``.
+/// Measured on MySQL 8.4.11, a qualified name drops the same table an
+/// unqualified one does, a missing one is 1051 and drops none of the others,
+/// and a table named with and without its database is 1066. This server
+/// reports `lower_case_table_names=1`, so a database is named without regard
+/// to case. A table of another database is refused.
+#[test]
+fn laravel_drops_every_table_qualified_by_its_database() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "create table `cache` (`key` varchar(255) not null, primary key (`key`))",
+        "create table `jobs` (`id` bigint unsigned not null auto_increment primary key)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let missing = adapter
+        .execute_stmt_prepare("drop table `reports`.`cache`, `reports`.`missing`")
+        .unwrap();
+    assert_eq!(
+        adapter.execute_stmt_execute(missing.statement_id, &[]),
+        Err(FrontendErrorKind::UnknownTable)
+    );
+    assert!(exists(&mut adapter, "cache"));
+    assert_eq!(
+        adapter.execute_query("drop table `reports`.`cache`, `cache`"),
+        Err(FrontendErrorKind::NotUniqueTable)
+    );
+    assert_eq!(
+        adapter.execute_query("drop table `other`.`cache`"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("drop table `mysql`.`user`"),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert!(exists(&mut adapter, "cache"));
+    assert!(matches!(
+        prepared(
+            &mut adapter,
+            "drop table `REPORTS`.`cache`, `reports`.`jobs`",
+            &[]
+        ),
+        PreparedStatementExecutionResult::Ok(_)
+    ));
+    assert!(!exists(&mut adapter, "cache"));
+    assert!(!exists(&mut adapter, "jobs"));
+}
+
 const LARAVEL_OPENS_WITH: &str = "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_unicode_ci', SESSION sql_mode='ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'";
 
 /// The first statements Laravel and Prisma send on a connection read the
