@@ -4712,13 +4712,19 @@ fn parse_checked_auto_increment_insert(
         }
     }
     let rowwise_conflicts = values.rows.len() > 1 && (insert.on.is_some() || insert.ignore);
+    // A column written to itself — GORM's `ON DUPLICATE KEY UPDATE id = id`,
+    // how it spells doing nothing on a collision — is left as it stood, so it
+    // is not a column the clause changes.
     let upsert_columns = match &insert.on {
         Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) => assignments
             .iter()
             .filter_map(|assignment| match &assignment.target {
-                sqlparser::ast::AssignmentTarget::ColumnName(name) => {
-                    insert_name(name).ok().map(|name| name.as_str().to_owned())
-                }
+                sqlparser::ast::AssignmentTarget::ColumnName(name) => insert_name(name)
+                    .ok()
+                    .map(|name| name.as_str().to_owned())
+                    .filter(|column| {
+                        !writes_the_column_to_itself(&assignment.value, column, &table_name)
+                    }),
                 _ => None,
             })
             .collect(),
@@ -4851,6 +4857,20 @@ fn parse_checked_auto_increment_insert(
         offered_columns,
         reads_the_clock,
     })
+}
+
+/// Whether an upsert assignment writes `column` its own value, naming it bare
+/// or qualified by the table written.
+fn writes_the_column_to_itself(value: &Expr, column: &str, table: &TursoName) -> bool {
+    match value {
+        Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(column),
+        Expr::CompoundIdentifier(parts) => {
+            matches!(parts.as_slice(), [qualifier, ident]
+                if qualifier.value.eq_ignore_ascii_case(table.as_str())
+                    && ident.value.eq_ignore_ascii_case(column))
+        }
+        _ => false,
+    }
 }
 
 /// What one row of an `INSERT` writes into a column.

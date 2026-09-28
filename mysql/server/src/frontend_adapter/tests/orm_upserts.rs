@@ -19,6 +19,28 @@ fn adapter() -> (tempfile::TempDir, Adapter) {
     (directory, adapter)
 }
 
+/// Two sessions on one database, the second one asking for the rows an
+/// update matched rather than the ones it changed, as GORM's driver can.
+fn adapter_and_one_counting_found_rows() -> (tempfile::TempDir, Adapter, Adapter) {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (directory, catalog, factory) = catalog_factory(authorizer.clone());
+    let principal =
+        || AuthenticatedPrincipal::from_account_id_for_testing(AccountId::from_bytes([151; 32]));
+    let mut adapter = factory.build(principal()).unwrap();
+    let mut found_rows =
+        AuthorizedDatabaseAdapterFactory::new(catalog, binary_context(), authorizer)
+            .build_with_options(
+                principal(),
+                CommandExecutionOptions::from_capability_flags(CLIENT_FOUND_ROWS),
+            )
+            .unwrap();
+    for adapter in [&mut adapter, &mut found_rows] {
+        adapter.authorize_connection().unwrap();
+        adapter.execute_init_db("REPORTS").unwrap();
+    }
+    (directory, adapter, found_rows)
+}
+
 fn run(adapter: &mut Adapter, sql: &str) {
     adapter
         .execute_query(sql)
@@ -402,5 +424,107 @@ fn a_default_beside_an_upsert_offers_the_columns_default() {
             "INSERT INTO codes (hits) VALUES (DEFAULT) ON DUPLICATE KEY UPDATE hits = 1"
         ),
         Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+/// GORM spells `clause.OnConflict{DoNothing: true}` on MySQL as writing the
+/// counted id to itself, and prepares every statement. Measured over GORM's
+/// own `BIGINT UNSIGNED` table with go-sql-driver, one statement after the
+/// other on one table, the `CLIENT_FOUND_ROWS` session last.
+#[test]
+fn gorms_do_nothing_upsert_writes_the_counted_id_to_itself() {
+    let (_directory, mut adapter, mut found_rows) = adapter_and_one_counting_found_rows();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))",
+    );
+    let do_nothing = |adapter: &mut Adapter, names: &[&str]| {
+        let rows = vec!["(?)"; names.len()].join(",");
+        let statement = adapter
+            .execute_stmt_prepare(&format!(
+                "INSERT INTO `tags` (`name`) VALUES {rows} ON DUPLICATE KEY UPDATE `id`=`id`"
+            ))
+            .unwrap();
+        assert_eq!(statement.warnings, 0);
+        let written = executed(adapter, statement.statement_id, &words(names));
+        adapter.execute_stmt_close(statement.statement_id);
+        written
+    };
+    assert_eq!(do_nothing(&mut adapter, &["go"]), (1, 1, 0));
+    // A row the clause leaves as it stood counts nothing and reports no id,
+    // and the number it asked for is spent.
+    assert_eq!(do_nothing(&mut adapter, &["go"]), (0, 0, 0));
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["1"])]
+    );
+    assert_eq!(do_nothing(&mut adapter, &["go", "x1"]), (1, 3, 0));
+    let update_all = adapter
+        .execute_stmt_prepare(
+            "INSERT INTO `tags` (`name`) VALUES (?) ON DUPLICATE KEY UPDATE `name`=VALUES(`name`)",
+        )
+        .unwrap();
+    assert_eq!(
+        executed(&mut adapter, update_all.statement_id, &words(&["sql"])),
+        (1, 5, 0)
+    );
+    assert_eq!(
+        executed(&mut adapter, update_all.statement_id, &words(&["sql"])),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        executed(&mut adapter, update_all.statement_id, &words(&["SQL"])),
+        (2, 5, 0)
+    );
+    adapter.execute_stmt_close(update_all.statement_id);
+
+    // Counting the rows it found, a row left as it stood counts 1 and still
+    // reports no id.
+    assert_eq!(do_nothing(&mut found_rows, &["go"]), (1, 0, 0));
+    assert_eq!(do_nothing(&mut found_rows, &["new1"]), (1, 9, 0));
+    assert_eq!(do_nothing(&mut found_rows, &["go", "new2"]), (2, 10, 0));
+    assert_eq!(do_nothing(&mut found_rows, &["go", "sql"]), (2, 0, 0));
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name FROM tags ORDER BY id"),
+        vec![
+            some(&["1", "go"]),
+            some(&["3", "x1"]),
+            some(&["5", "SQL"]),
+            some(&["9", "new1"]),
+            some(&["10", "new2"]),
+        ]
+    );
+    // Writing the id anything else is still refused.
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO `tags` (`name`) VALUES ('go') ON DUPLICATE KEY UPDATE `id`=`id` + 1"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+/// The text form, over a counted table whose id is the engine's own row
+/// number, as a signed `BIGINT` is.
+#[test]
+fn a_counted_id_written_to_itself_leaves_a_signed_table_as_it_stood() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, RAILS_TAGS);
+    let do_nothing = |rows: &str| {
+        format!("INSERT INTO `tags` (`name`) VALUES {rows} ON DUPLICATE KEY UPDATE `id`=`id`")
+    };
+    assert_eq!(written(&mut adapter, &do_nothing("('go')")), (1, 1));
+    assert_eq!(written(&mut adapter, &do_nothing("('go')")), (0, 0));
+    assert_eq!(written(&mut adapter, &do_nothing("('go'), ('x1')")), (1, 3));
+    // Rails' `insert_all` writes its first column to itself, qualified.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO `tags` (`id`, `name`) VALUES (DEFAULT, 'go'), (DEFAULT, 'x2') AS `tags_values` ON DUPLICATE KEY UPDATE `id`=`tags`.`id`"
+        ),
+        (1, 5)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, name FROM tags ORDER BY id"),
+        vec![some(&["1", "go"]), some(&["3", "x1"]), some(&["5", "x2"])]
     );
 }

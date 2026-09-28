@@ -2564,6 +2564,15 @@ is not the engine's own row number — the row number cannot hold its upper rang
 exactly past the engine's signed range: measured, a row numbered
 18446744073709551001 is reported as that number.
 
+The clause may not change the counted column, with one exception: writing it to
+itself, which is how GORM spells doing nothing on a collision — `ON DUPLICATE
+KEY UPDATE id = id`, prepared — and how Rails' `insert_all` does when the id is
+its first column, `id = tags.id`. Measured on 8.4.11 over GORM's `BIGINT
+UNSIGNED` table and a signed one, it is an upsert that leaves the row as it
+stood: 0 rows and no id, `LAST_INSERT_ID()` left where it was, the number the
+row asked for spent, and a session counting found rows counting the row 1 and
+still reporting no id. This reports the same.
+
 `INSERT IGNORE` into a table that counts its own ids is taken over one row.
 The allocator reserves its range before the rows are written, so a row `IGNORE`
 skips has already taken a number — and that is what MySQL does too: measured on
