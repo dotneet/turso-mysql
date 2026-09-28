@@ -2463,13 +2463,25 @@ fn render_subquery_select(
     for comparison in &mut render_context.checked_comparisons[comparisons_before..] {
         comparison.name_the_inner_sources(&[&source.reference]);
     }
-    let projected = match select.projection.as_slice() {
-        [SelectItem::UnnamedExpr(Expr::Identifier(column))] => {
+    // `MIN(c)` and `MAX(c)` answer `c`'s own kind, grouped or not — Gitea
+    // picks each reviewer's latest review with `id IN (SELECT max(id) FROM
+    // review WHERE ... GROUP BY reviewer_id)` — so a membership test holds
+    // them to the column they read.
+    let projected_expr = match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(expr)] => Some(expr),
+        [SelectItem::ExprWithAlias { expr, .. }] if smallest_or_largest_of(expr).is_some() => {
+            Some(expr)
+        }
+        _ => None,
+    };
+    let projected_column = projected_expr.map(|expr| smallest_or_largest_of(expr).unwrap_or(expr));
+    let projected = match projected_column {
+        Some(Expr::Identifier(column)) => {
             Some((source.table.as_str().to_owned(), column.value.clone()))
         }
         // A qualified name is the same column when the qualifier is the table
         // the subquery reads, which is how a correlated one is written.
-        [SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))]
+        Some(Expr::CompoundIdentifier(parts))
             if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case(&source.reference) =>
         {
             Some((source.table.as_str().to_owned(), parts[1].value.clone()))
@@ -2524,6 +2536,40 @@ fn render_subquery_select(
         }
     }
     Ok((rendered, projected))
+}
+
+/// The column a `MIN` or `MAX` reads, when the expression is that call over a
+/// column and nothing more.
+fn smallest_or_largest_of(expr: &Expr) -> Option<&Expr> {
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !name.value.eq_ignore_ascii_case("MIN") && !name.value.eq_ignore_ascii_case("MAX") {
+        return None;
+    }
+    if function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+    {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return None;
+    };
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return None;
+    }
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(column))] =
+        list.args.as_slice()
+    else {
+        return None;
+    };
+    matches!(column, Expr::Identifier(_) | Expr::CompoundIdentifier(_)).then_some(column)
 }
 
 /// Renders a `HAVING`, which sees an aggregate where a `WHERE` sees a column.

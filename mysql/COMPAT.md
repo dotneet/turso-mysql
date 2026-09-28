@@ -1783,7 +1783,10 @@ membership test may stand inside another's subquery — Gitea's branch listing
 asks `repo_id IN (SELECT id FROM repository WHERE repository.owner_id NOT IN
 (SELECT id FROM user WHERE ...))` — its column looked for among the tables of
 the subquery it stands in and then the statement's own, as MySQL reads it. A
-statement that writes still refuses one nested that way.
+statement that writes still refuses one nested that way. The subquery may
+project `MIN(col)` or `MAX(col)` instead of the column, grouped or not — Gitea
+picks each reviewer's latest review with `id IN (SELECT max(id) FROM review
+WHERE ... GROUP BY reviewer_id)` — each answering the column's own kind.
 
 `IN` over a list of values — `WHERE id IN (1, 2)` — follows the same rule one
 member at a time. Every member is recorded as its own checked comparison, so a

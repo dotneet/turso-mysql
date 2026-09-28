@@ -932,3 +932,41 @@ fn giteas_deepest_branch_listing_fits_a_connections_stack() {
         .unwrap();
     assert_eq!(answered, 0);
 }
+
+/// Gitea picks each reviewer's latest review with `id IN (SELECT max(id)
+/// FROM review WHERE ... GROUP BY reviewer_id)`. `MIN` and `MAX` answer the
+/// kind of the column they read, grouped or not, so the membership test holds
+/// them to it. Every answer here was measured on MySQL 8.4.11 over the same
+/// rows.
+#[test]
+fn a_membership_test_reads_the_largest_of_each_group() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `review` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `type` INT NULL, `reviewer_id` BIGINT(20) NULL, `issue_id` BIGINT(20) NULL, `content` TEXT NULL, `dismissed` TINYINT(1) DEFAULT 0 NOT NULL, `created_unix` BIGINT(20) NULL, `updated_unix` BIGINT(20) NULL)",
+        "INSERT INTO `review` (`type`, `reviewer_id`, `issue_id`, `created_unix`, `updated_unix`) VALUES (1, 7, 2, 10, 15), (2, 7, 2, 20, 25), (1, 8, 2, 30, 5), (4, 8, 2, 40, 45), (1, 9, 3, 50, 55), (1, 7, 3, 60, 65)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (sql, found) in [
+        (
+            "SELECT `id` FROM `review` WHERE issue_id=2 AND type IN (1,2) AND `id` IN (SELECT max(id) FROM review WHERE issue_id=2 AND type IN (1,2) GROUP BY reviewer_id) ORDER BY `created_unix` ASC, `id` ASC",
+            &["2", "3"][..],
+        ),
+        (
+            "SELECT `id` FROM `review` WHERE `id` IN (SELECT max(id) as id FROM review WHERE issue_id IN (2,3) AND `type` IN (1,2,4) AND dismissed=0 GROUP BY issue_id, reviewer_id) ORDER BY review.updated_unix ASC",
+            &["2", "4", "5", "6"],
+        ),
+        (
+            "SELECT `id` FROM `review` WHERE `id` NOT IN (SELECT MIN(id) FROM review GROUP BY issue_id) ORDER BY id",
+            &["2", "3", "4", "6"],
+        ),
+    ] {
+        assert_eq!(first_column(&mut adapter, sql), found, "{sql}");
+    }
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT `id` FROM `review` WHERE content IN (SELECT MAX(id) FROM review GROUP BY issue_id)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}
