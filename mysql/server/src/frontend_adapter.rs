@@ -10357,7 +10357,43 @@ fn table_result_metadata_for_references(
             table.column_ordinal(*ordinal)?;
         }
     }
+    for table in &metadata.tables {
+        if let Some(ordinal) = table
+            .derived
+            .as_ref()
+            .and_then(MySqlDerivedColumns::distinct_over_one_column)
+        {
+            hold_a_distinct_to_the_primary_key(table, ordinal)?;
+        }
+    }
     Ok(Some(metadata))
+}
+
+/// Refuses a `DISTINCT` over a derived table reading one table unless the one
+/// column it reads is that table's whole primary key.
+///
+/// Measured on MySQL 8.4.11: ordered by its primary key, MySQL drops the
+/// repeated rows by reading the key in order and reports the columns read
+/// straight through; over any other column it writes the rows into a table
+/// of its own, or reads an index when one serves, and each reports shapes of
+/// its own.
+#[cfg(unix)]
+fn hold_a_distinct_to_the_primary_key(
+    table: &SourceTableColumns,
+    ordinal: usize,
+) -> Result<(), FrontendErrorKind> {
+    let column = table.column_ordinal(ordinal)?;
+    let primary = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.key() == MySqlColumnKey::Primary)
+        .map(|(position, _)| position)
+        .collect::<Vec<_>>();
+    if primary != [column] {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    Ok(())
 }
 
 /// Reads the column behind each column of a derived table joining tables, in

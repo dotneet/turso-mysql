@@ -567,6 +567,15 @@ in an `UPDATE` or a `DELETE`, each of which reads its own table. A name the body
 that is also another of the table's columns is refused where the statement needs the columns'
 types, since it would stand for two.
 
+A `DISTINCT` over a derived table or a CTE reading one table is taken only when it reads the
+table's single-column primary key and nothing else, ordered by that key first — TypeORM's
+`SELECT DISTINCT distinctAlias.User_id AS ids_User_id FROM (...) distinctAlias ORDER BY User_id
+ASC LIMIT 10`. Measured on 8.4.11, MySQL then reads the key in order and the column is read
+straight through; any other `DISTINCT` there is written into a table of MySQL's own — the
+table's own name, the result column's name and no database, a nullable column carrying the
+32768 flag — unless an index serves the column, so it is refused, where it used to be answered
+with the shapes read straight through.
+
 A body may also join tables: a first table and `LEFT JOIN`s, each matched `ON` columns, every
 column named with its table — TypeORM's pagination over an entity loaded with its relations,
 `SELECT DISTINCT distinctAlias.Post_id AS ids_Post_id, distinctAlias.Post_id FROM (SELECT

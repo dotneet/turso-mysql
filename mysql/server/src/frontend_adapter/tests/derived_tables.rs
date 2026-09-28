@@ -1775,3 +1775,62 @@ fn a_derived_table_joining_tables_refuses_what_has_not_been_measured() {
         );
     }
 }
+
+/// A `DISTINCT` over a derived table or a CTE reading one table is read
+/// straight through when it reads the table's primary key and is ordered by
+/// it, MySQL then reading the key in order. Measured on MySQL 8.4.11, any
+/// other such `DISTINCT` writes the rows into a table of MySQL's own — `posts`
+/// and no database, a nullable column carrying a flag of its own — or reads
+/// an index when one serves, so it is refused.
+#[test]
+fn a_distinct_over_a_derived_table_reading_one_table_is_held_to_its_key() {
+    let (_directory, mut adapter) = typeorm_adapter();
+    let key = |name, table| Column {
+        name,
+        table,
+        original_table: "p",
+        original_name: "i",
+        names_the_database: true,
+        column_type: MYSQL_TYPE_LONGLONG,
+        length: 20,
+        decimals: 0,
+        flags: MYSQL_NOT_NULL_FLAG
+            | MYSQL_PRI_KEY_FLAG
+            | MYSQL_AUTO_INCREMENT_FLAG
+            | MYSQL_PART_KEY_FLAG,
+        character_set: BINARY,
+    };
+    let sql = "SELECT DISTINCT x.i AS a, x.i FROM (SELECT p.id AS i, p.title AS t FROM posts p) x ORDER BY x.i DESC LIMIT 2";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_columns(sql, &columns, &[key("a", "x"), key("i", "x")]);
+    assert_eq!(
+        answered,
+        rows(&[&[Some("3"), Some("3")], &[Some("2"), Some("2")]])
+    );
+    let sql = "WITH a AS (SELECT p.id AS i, p.title AS t FROM posts p) SELECT DISTINCT a.i FROM a ORDER BY a.i LIMIT 2";
+    let (columns, answered) = read(&mut adapter, sql);
+    assert_columns(sql, &columns, &[key("i", "a")]);
+    assert_eq!(answered, rows(&[&[Some("1")], &[Some("2")]]));
+
+    for sql in [
+        // Written into MySQL's own table: `posts`, `i`, no database.
+        "SELECT DISTINCT x.i FROM (SELECT p.id AS i, p.title AS t FROM posts p) x LIMIT 2",
+        "SELECT DISTINCT x.t FROM (SELECT p.title AS t FROM posts p) x",
+        "SELECT DISTINCT x.t FROM (SELECT p.title AS t FROM posts p) x ORDER BY x.t",
+        "SELECT DISTINCT x.i, x.b FROM (SELECT p.id AS i, p.published_at AS b FROM posts p) x",
+        "SELECT DISTINCT * FROM (SELECT * FROM posts) x",
+        "WITH a AS (SELECT p.id AS i, p.title AS t FROM posts p) SELECT DISTINCT a.i, a.t FROM a",
+        // Not the table's key.
+        "SELECT DISTINCT x.u FROM (SELECT p.user_id AS u FROM posts p) x ORDER BY x.u",
+        // Beside another table.
+        "SELECT DISTINCT x.i FROM (SELECT p.id AS i FROM posts p) x JOIN tags t ON t.id = x.i ORDER BY x.i",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

@@ -37,6 +37,9 @@ pub struct MySqlDerivedColumns {
     /// Whether the statement reading a body that joins tables drops repeated
     /// rows, which MySQL does by writing them into a table of its own first.
     repeats_dropped_through_a_table: bool,
+    /// The one column a `DISTINCT` over a body reading one table reads, which
+    /// the frontend holds to being that table's whole primary key.
+    distinct_over_one_column: Option<usize>,
 }
 
 /// One column of a derived table whose body joins tables, and the table it
@@ -108,6 +111,12 @@ impl MySqlDerivedColumns {
     pub const fn repeats_dropped_through_a_table(&self) -> bool {
         self.repeats_dropped_through_a_table
     }
+
+    /// Returns the one column a `DISTINCT` over a body reading one table
+    /// reads, which has to be that table's whole primary key.
+    pub const fn distinct_over_one_column(&self) -> Option<usize> {
+        self.distinct_over_one_column
+    }
 }
 
 /// Reads what a derived table's or a CTE's body projects.
@@ -155,6 +164,7 @@ pub(super) fn derived_columns(
                     answers: Vec::new(),
                     joined: Vec::new(),
                     repeats_dropped_through_a_table: false,
+                    distinct_over_one_column: None,
                 },
             ));
         }
@@ -213,6 +223,7 @@ pub(super) fn derived_columns(
             answers,
             joined: Vec::new(),
             repeats_dropped_through_a_table: false,
+            distinct_over_one_column: None,
         },
     ))
 }
@@ -228,6 +239,7 @@ pub(super) fn only_counted(inner: &MySqlSelectSource) -> MySqlDerivedColumns {
         answers: Vec::new(),
         joined: Vec::new(),
         repeats_dropped_through_a_table: false,
+        distinct_over_one_column: None,
     }
 }
 
@@ -383,6 +395,7 @@ pub(super) fn render_derived_table_joining_tables(
                 names,
                 joined,
                 repeats_dropped_through_a_table: false,
+                distinct_over_one_column: None,
             }),
             catalog: None,
             hinted_indexes: Vec::new(),
@@ -473,25 +486,11 @@ pub(super) fn hold_the_statement_reading_joined_tables_through_a_derived_table(
         .derived
         .as_mut()
         .expect("the derived table was found above");
-    let mut result_names = Vec::with_capacity(select.projection.len());
-    let mut projected = Vec::with_capacity(select.projection.len());
-    for item in &select.projection {
-        let (expr, alias) = match item {
-            SelectItem::UnnamedExpr(expr) => (expr, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => return unsupported("wildcard over a derived table joining tables"),
-        };
-        let Some(ordinal) = derived_column_named(expr, &reference, &derived.names) else {
-            return unsupported(
-                "statement reading anything but the columns of a derived table joining tables",
-            );
-        };
-        result_names.push(alias.map_or_else(
-            || derived.names[ordinal].clone(),
-            |alias| alias.value.clone(),
-        ));
-        projected.push(ordinal);
-    }
+    let Some(projection) = columns_the_statement_reads(select, &reference, &derived.names) else {
+        return unsupported(
+            "statement reading anything but the columns of a derived table joining tables",
+        );
+    };
     let drops_repeats = select.distinct.is_some();
     match &query.order_by {
         Some(_) if !drops_repeats => {
@@ -502,13 +501,14 @@ pub(super) fn hold_the_statement_reading_joined_tables_through_a_derived_table(
                 return unsupported("SELECT ORDER BY option");
             };
             for expression in expressions {
-                if !orders_by_a_projected_column(
+                if projected_column_ordered_by(
                     &expression.expr,
                     &reference,
                     &derived.names,
-                    &result_names,
-                    &projected,
-                ) {
+                    &projection,
+                )
+                .is_none()
+                {
                     return unsupported(
                         "ORDER BY naming what a DISTINCT over a derived table joining tables does not project",
                     );
@@ -522,6 +522,140 @@ pub(super) fn hold_the_statement_reading_joined_tables_through_a_derived_table(
     }
     derived.repeats_dropped_through_a_table = drops_repeats;
     Ok(())
+}
+
+/// Holds a `DISTINCT` over a derived table or a CTE reading one table to the
+/// one shape measured of it.
+///
+/// Measured on MySQL 8.4.11, how MySQL drops the repeated rows decides every
+/// column's shape, and how it drops them turns on the statement's order and on
+/// the table's keys. Ordered by the table's primary key, it reads the key in
+/// order and the columns are read straight through; otherwise it writes the
+/// rows into a table of its own — `SELECT DISTINCT x.i FROM (SELECT p.id AS
+/// i, p.title AS t FROM posts p) x` names `posts`, `i` and no database —
+/// unless an index on the column serves, and a nullable column in that table
+/// carries a flag of its own. So a `DISTINCT` reading anything but one
+/// column, ordered by that column first, is refused, and the frontend holds
+/// the column to being its table's whole primary key: TypeORM's pagination of
+/// an entity, `SELECT DISTINCT distinctAlias.User_id AS ids_User_id FROM
+/// (...) distinctAlias ORDER BY User_id ASC LIMIT 10`, is that shape.
+pub(super) fn hold_a_distinct_reading_one_table_through_a_derived_table(
+    query: &sqlparser::ast::Query,
+    sources: &mut [MySqlSelectSource],
+) -> Result<(), ParseError> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    if select.distinct.is_none() {
+        return Ok(());
+    }
+    let Some(position) = sources.iter().position(|source| {
+        !source.subquery
+            && source
+                .derived
+                .as_ref()
+                .is_some_and(|derived| derived.joined.is_empty() && !derived.materialized)
+    }) else {
+        return Ok(());
+    };
+    if sources.iter().filter(|source| !source.subquery).count() != 1 {
+        return unsupported("DISTINCT over a derived table beside another table");
+    }
+    let reference = sources[position].reference.clone();
+    let derived = sources[position]
+        .derived
+        .as_mut()
+        .expect("the derived table was found above");
+    let Some(projection) = columns_the_statement_reads(select, &reference, &derived.names) else {
+        return unsupported("DISTINCT over a derived table reading anything but its columns");
+    };
+    let Some((&column, others)) = projection.ordinals.split_first() else {
+        return unsupported("SELECT without projections");
+    };
+    if others.iter().any(|other| *other != column) {
+        return unsupported("DISTINCT over a derived table reading more than one of its columns");
+    }
+    let first_order = query
+        .order_by
+        .as_ref()
+        .and_then(|order_by| match &order_by.kind {
+            sqlparser::ast::OrderByKind::Expressions(expressions) => expressions.first(),
+            sqlparser::ast::OrderByKind::All(_) => None,
+        });
+    if first_order.and_then(|order| {
+        projected_column_ordered_by(&order.expr, &reference, &derived.names, &projection)
+    }) != Some(column)
+    {
+        return unsupported("DISTINCT over a derived table not ordered by the column it reads");
+    }
+    derived.distinct_over_one_column = Some(column);
+    Ok(())
+}
+
+/// What a statement reading only a derived table's columns projects: each
+/// result column's name and the place among the derived table's columns of
+/// the one it reads.
+struct ReadColumns {
+    result_names: Vec<String>,
+    ordinals: Vec<usize>,
+}
+
+/// Reads a statement's projection as columns of one derived table, or
+/// nothing when it projects anything else.
+fn columns_the_statement_reads(
+    select: &sqlparser::ast::Select,
+    reference: &str,
+    names: &[String],
+) -> Option<ReadColumns> {
+    let mut read = ReadColumns {
+        result_names: Vec::with_capacity(select.projection.len()),
+        ordinals: Vec::with_capacity(select.projection.len()),
+    };
+    for item in &select.projection {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
+            _ => return None,
+        };
+        let ordinal = derived_column_named(expr, reference, names)?;
+        read.result_names
+            .push(alias.map_or_else(|| names[ordinal].clone(), |alias| alias.value.clone()));
+        read.ordinals.push(ordinal);
+    }
+    Some(read)
+}
+
+/// Returns the place among a derived table's columns of the projected column
+/// an `ORDER BY` term names: by its place, by the name it answers under, or
+/// as the derived table's column it reads. MySQL answers 3065 for any other
+/// beside a `DISTINCT`.
+fn projected_column_ordered_by(
+    expr: &Expr,
+    reference: &str,
+    names: &[String],
+    projection: &ReadColumns,
+) -> Option<usize> {
+    if let Expr::Value(value) = expr {
+        let sqlparser::ast::Value::Number(place, _) = &value.value else {
+            return None;
+        };
+        let place = place.parse::<usize>().ok()?;
+        return place
+            .checked_sub(1)
+            .and_then(|index| projection.ordinals.get(index))
+            .copied();
+    }
+    if let Expr::Identifier(name) = expr {
+        if let Some(index) = projection
+            .result_names
+            .iter()
+            .position(|result| result.eq_ignore_ascii_case(&name.value))
+        {
+            return Some(projection.ordinals[index]);
+        }
+    }
+    derived_column_named(expr, reference, names)
+        .filter(|ordinal| projection.ordinals.contains(ordinal))
 }
 
 /// Returns the place among a derived table's columns of the one an expression
@@ -539,34 +673,6 @@ fn derived_column_named(expr: &Expr, reference: &str, names: &[String]) -> Optio
     names
         .iter()
         .position(|candidate| candidate.eq_ignore_ascii_case(&name.value))
-}
-
-/// Reports whether an `ORDER BY` term names a column the statement projects:
-/// by its place, by the name it answers under, or as the derived table's
-/// column it reads. MySQL answers 3065 for any other beside a `DISTINCT`.
-fn orders_by_a_projected_column(
-    expr: &Expr,
-    reference: &str,
-    names: &[String],
-    result_names: &[String],
-    projected: &[usize],
-) -> bool {
-    if let Expr::Value(value) = expr {
-        return matches!(
-            &value.value,
-            sqlparser::ast::Value::Number(place, _)
-                if place.parse::<usize>().is_ok_and(|place| (1..=projected.len()).contains(&place))
-        );
-    }
-    if let Expr::Identifier(name) = expr {
-        if result_names
-            .iter()
-            .any(|result| result.eq_ignore_ascii_case(&name.value))
-        {
-            return true;
-        }
-    }
-    derived_column_named(expr, reference, names).is_some_and(|ordinal| projected.contains(&ordinal))
 }
 
 /// Reports whether an answer is one MySQL has been measured storing in the
