@@ -945,3 +945,41 @@ fn a_prepared_row_naming_its_own_id_moves_the_counter_past_it() {
         .unwrap();
     assert!(printed.contains("AUTO_INCREMENT=12"), "{printed}");
 }
+
+/// SQLAlchemy's `insert().on_duplicate_key_update()` names the offered row
+/// `new` and writes a `DECIMAL` from it, over several rows of a table counting
+/// its own ids. Measured on MySQL 8.4.11: the changed row counts 2 and the new
+/// one 1, the statement reports the new row's number, and the same rows again
+/// count nothing.
+#[test]
+fn sqlalchemys_upsert_names_the_offered_row_new() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE users (id BIGINT NOT NULL AUTO_INCREMENT, email VARCHAR(191) NOT NULL, name VARCHAR(100) NOT NULL, balance NUMERIC(10, 2) NOT NULL, is_active BOOL NOT NULL, PRIMARY KEY (id), UNIQUE (email))",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO users (email, name, balance, is_active) VALUES ('alice@example.com', 'Alice', 100.50, 1)"
+        ),
+        (1, 1)
+    );
+    let upsert = "INSERT INTO users (email, name, balance, is_active) VALUES ('alice@example.com', 'Alice Updated', 200.00, 1), ('erin@example.com', 'Erin', 3.00, 1) AS new ON DUPLICATE KEY UPDATE name = new.name, balance = new.balance";
+    assert_eq!(written(&mut adapter, upsert), (3, 2));
+    assert_eq!(
+        rows(&mut adapter, "SELECT LAST_INSERT_ID()"),
+        vec![some(&["2"])]
+    );
+    assert_eq!(written(&mut adapter, upsert), (0, 0));
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, email, name, balance, is_active FROM users ORDER BY id"
+        ),
+        vec![
+            some(&["1", "alice@example.com", "Alice Updated", "200.00", "1"]),
+            some(&["2", "erin@example.com", "Erin", "3.00", "1"]),
+        ]
+    );
+}
