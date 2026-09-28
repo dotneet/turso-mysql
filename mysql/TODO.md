@@ -422,6 +422,9 @@ speaks; anything measured here from now on has to pass that flag.
 | `CONNECTION_ID()`, `USER()`, `CURRENT_USER()`, `SESSION_USER()`, `SYSTEM_USER()`, `ROW_COUNT()`, `FOUND_ROWS()` | refused, alone or beside a `FROM`; each answers session state — the connection's ID, the account, the last statement's counts — that is not handed to the statement renderer. Measured: `CONNECTION_ID()` a NOT NULL unsigned `LONGLONG` of 21, `ROW_COUNT()` and `FOUND_ROWS()` a NOT NULL `LONGLONG` of 21, and the user calls a nullable `VAR_STRING` of 1152 |
 | `information_schema` columns beyond the eight of `TABLES` this answers | refused; the rest are statistics and timestamps this server does not keep, and answering NULL would be a claim of its own |
 | An `information_schema.SCHEMATA` query with no database selected, beyond `SELECT SCHEMA_NAME FROM information_schema.SCHEMATA` | refused; every other shape is answered by a table scanned on the selected database's connection |
+| A result longer than the runtime's write queue — `--max-write-bytes`, or more frames than `--max-write-frames`, which a result near the 4096-row limit reaches | answered 1235 in place of its rows; MySQL writes a result out as it reads it and has no such limit |
+| A statement several MiB long, such as one row of a dump's extended `INSERT` | taken, but the checked parsers read its text many times over: about 2 s a MiB in a debug build, linear in the length |
+| Long data for several parameters of a connection's statements, together over 64 MiB | answered 1105 at `COM_STMT_EXECUTE`; MySQL holds each parameter to `max_allowed_packet` on its own |
 | Multi-statement `COM_QUERY` beyond the bounded slice | negotiates `CLIENT_MULTI_STATEMENTS` and returns sequential results with `SERVER_MORE_RESULTS_EXISTS`. More than 32 statements and SQL whose delimiter changes under the session's backslash mode are refused before execution. An assembled response beyond 512 frames or 1 MiB closes the connection after execution, so preceding side effects may remain. A later statement can fail after earlier statements have run, as in MySQL. The runtime's configured write queue can impose a tighter limit |
 
 ---
@@ -431,7 +434,7 @@ speaks; anything measured here from now on has to pass that flag.
 | Variable | State |
 |---|---|
 | `@@version`, `@@version_comment`, `VERSION()` | works |
-| `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works |
+| `@@max_allowed_packet`, `@@wait_timeout`, `@@sql_notes` | works; `SET [SESSION] max_allowed_packet` answers 1621, as MySQL does |
 | The variables a driver reads before it sends any work — the `@@character_set_*` and `@@collation_*` names, `@@time_zone`, `@@system_time_zone`, `@@transaction_isolation`, `@@auto_increment_increment`, `@@auto_increment_offset`, `@@interactive_timeout`, `@@performance_schema`, `@@lower_case_table_names`, `@@init_connect`, `@@license` | works; each answers what this server decides for itself, and three read differently from MySQL's own — see COMPAT.md |
 | `SET NAMES`, `SET sql_mode`, `SET information_schema_stats_expiry` | taken when they name the state the server is already in; `sql_mode` may be an expression over `@@sql_mode`, `NO_AUTO_VALUE_ON_ZERO` is kept, and `TRADITIONAL` is taken, standing for modes of that list alone. `@@sql_mode` always reads back `ONLY_FULL_GROUP_BY`, which this server keeps whatever the session names |
 | `SET wait_timeout`, `SET sql_auto_is_null = 0`, `SET sql_safe_updates = 0`, several assignments in one `SET` | works |

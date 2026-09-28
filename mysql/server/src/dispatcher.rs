@@ -8,15 +8,16 @@ use std::{error::Error, fmt};
 
 use crate::{
     map_frontend_error, BinaryRowColumnType, BinaryRowPacket, BinaryRowValue, ClassicCommand,
-    ClassicConnection, ColumnCountPacket, ColumnDefinitionConfig, CommandPacketError,
-    ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, PacketCodec,
-    PacketSequence, ResponsePacketError, ResultTerminatorPacket, StmtPrepareOkPacketConfig,
-    TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS,
-    COMMAND_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION, MAX_RESULT_COLUMNS, MYSQL_TYPE_BIT,
-    MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME, MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT,
-    MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG, MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL,
-    MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP,
-    MYSQL_TYPE_TINY, MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
+    ClassicCommandPacket, ClassicConnection, ColumnCountPacket, ColumnDefinitionConfig,
+    CommandPacketError, ConnectionStateError, EofPacket, FrontendErrorKind, OkPacketConfig, Packet,
+    PacketCodec, PacketSequence, ResponsePacketError, ResultTerminatorPacket,
+    StmtPrepareOkPacketConfig, TextRowPacket, TextRowValue, CLIENT_DEPRECATE_EOF,
+    CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS, COMMAND_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION,
+    MAX_RESULT_COLUMNS, MYSQL_TYPE_BIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
+    MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG,
+    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT,
+    MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
+    MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
 };
 
 /// The first packet sequence number used by a server response to a command.
@@ -315,7 +316,39 @@ impl CommandDispatcher {
         executor: &mut E,
         frame: &[u8],
     ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
-        let command = match connection.receive_command_frame(frame) {
+        let command = connection.receive_command_frame(frame);
+        let mut frames = self.answer(connection, executor, command)?;
+        number_the_answer(&mut frames, SERVER_RESPONSE_SEQUENCE_ID);
+        Ok(frames)
+    }
+
+    /// Dispatches one command whose payload may have arrived split into
+    /// several packets.
+    ///
+    /// The answer's packets are numbered on from `response_sequence_id`, the
+    /// number after the last packet the command arrived in: measured on MySQL
+    /// 8.4.11, a query of exactly 0xFFFFFF bytes, sent as a full packet and an
+    /// empty one numbered 0 and 1, is answered from 2.
+    pub fn dispatch_packet<E: CommandExecutor + ?Sized>(
+        &self,
+        connection: &mut ClassicConnection,
+        executor: &mut E,
+        packet: Packet<'_>,
+        response_sequence_id: u8,
+    ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+        let command = connection.receive_command_packet(packet);
+        let mut frames = self.answer(connection, executor, command)?;
+        number_the_answer(&mut frames, response_sequence_id);
+        Ok(frames)
+    }
+
+    fn answer<E: CommandExecutor + ?Sized>(
+        &self,
+        connection: &mut ClassicConnection,
+        executor: &mut E,
+        command: Result<ClassicCommandPacket<'_>, ConnectionStateError>,
+    ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+        let command = match command {
             Ok(command) => command,
             Err(ConnectionStateError::Command(error)) if is_unsupported_command(&error) => {
                 let capabilities = negotiated_capabilities(connection)?;
@@ -484,6 +517,15 @@ impl CommandDispatcher {
     }
 }
 
+/// Numbers every packet of an answer in order, a row split into several
+/// packets taking a number for each of them.
+fn number_the_answer(frames: &mut [Vec<u8>], first_sequence_id: u8) {
+    let mut sequence_id = first_sequence_id;
+    for frame in frames {
+        sequence_id = crate::renumber_packets(frame, sequence_id);
+    }
+}
+
 fn execute_query_batch<E: CommandExecutor + ?Sized>(
     codec: PacketCodec,
     capability_flags: u32,
@@ -515,14 +557,13 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
 
     let mut frames = Vec::new();
     let mut total_bytes = 0usize;
-    let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
     for (index, statement) in statements.iter().enumerate() {
         if frames.len() >= MAX_MULTI_QUERY_RESPONSE_FRAMES
             || total_bytes >= MAX_MULTI_QUERY_RESPONSE_BYTES
         {
             let error =
                 encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
-            append_multi_query_frames(&mut frames, &mut sequence, error);
+            frames.extend(error);
             break;
         }
         let more_results = index + 1 < statements.len();
@@ -543,7 +584,7 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
             Err(CommandDispatcherError::ResultSetTooLarge { .. }) => {
                 let error =
                     encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
-                append_multi_query_frames(&mut frames, &mut sequence, error);
+                frames.extend(error);
                 break;
             }
             Err(error) => return Err(error),
@@ -557,28 +598,16 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
         {
             let error =
                 encode_frontend_error(codec, capability_flags, FrontendErrorKind::Unsupported)?;
-            append_multi_query_frames(&mut frames, &mut sequence, error);
+            frames.extend(error);
             break;
         }
         total_bytes = total_bytes.saturating_add(encoded_bytes);
-        append_multi_query_frames(&mut frames, &mut sequence, encoded);
+        frames.extend(encoded);
         if failed {
             break;
         }
     }
     Ok(frames)
-}
-
-fn append_multi_query_frames(
-    frames: &mut Vec<Vec<u8>>,
-    sequence: &mut PacketSequence,
-    encoded: Vec<Vec<u8>>,
-) {
-    for mut frame in encoded {
-        assert!(frame.len() >= crate::PACKET_HEADER_LEN);
-        frame[crate::PACKET_HEADER_LEN - 1] = sequence.next_sequence_id();
-        frames.push(frame);
-    }
 }
 
 fn set_more_results(result: &mut CommandExecutionResult, more_results: bool) {
@@ -1078,11 +1107,7 @@ fn encode_result_set(
                 None => TextRowValue::Null,
             })
             .collect::<Vec<_>>();
-        frames.push(TextRowPacket::encode(
-            codec,
-            sequence.next_sequence_id(),
-            &values,
-        )?);
+        frames.push(TextRowPacket::encode(sequence.next_sequence_id(), &values)?);
     }
 
     frames.push(ResultTerminatorPacket::encode(
@@ -1147,7 +1172,7 @@ pub(crate) fn encode_binary_result_set(
             status_flags,
         )?);
     }
-    for (row_index, row) in rows.iter().enumerate() {
+    for (row_index, row) in rows.into_iter().enumerate() {
         let values = row
             .iter()
             .enumerate()
@@ -1162,7 +1187,6 @@ pub(crate) fn encode_binary_result_set(
             })
             .collect::<Result<Vec<_>, _>>()?;
         frames.push(BinaryRowPacket::encode(
-            codec,
             sequence.next_sequence_id(),
             &values,
         )?);
@@ -1604,6 +1628,74 @@ mod tests {
         payload.push(command);
         payload.extend_from_slice(body);
         CODEC.encode(COMMAND_SEQUENCE_ID, &payload).unwrap()
+    }
+
+    #[test]
+    fn a_split_command_is_answered_from_the_number_after_its_last_packet() {
+        let mut connection = ready_connection(
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF,
+        );
+        let value = vec![b'y'; crate::MAX_PACKET_PAYLOAD_LEN + 10];
+        let mut executor = TestExecutor {
+            query_result: Some(Ok(CommandExecutionResult::ResultSet(TextResultSet {
+                columns: vec![ColumnDefinitionConfig::new("v", MYSQL_TYPE_BLOB)],
+                rows: vec![vec![Some(value.clone())]],
+                warnings: 0,
+                status_flags: SERVER_STATUS_AUTOCOMMIT,
+            }))),
+            ..TestExecutor::default()
+        };
+        let mut payload = vec![crate::COM_QUERY];
+        payload.extend_from_slice(b"SELECT v FROM t /*");
+        payload.resize(crate::MAX_PACKET_PAYLOAD_LEN - 2, b' ');
+        payload.extend_from_slice(b"*/");
+
+        let frames = CommandDispatcher::new()
+            .dispatch_packet(
+                &mut connection,
+                &mut executor,
+                Packet {
+                    sequence_id: COMMAND_SEQUENCE_ID,
+                    payload: &payload,
+                },
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(executor.query_calls[0].len(), payload.len() - 1);
+        let packets = frames
+            .iter()
+            .flat_map(|frame| packets_in(frame))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            packets
+                .iter()
+                .map(|(sequence_id, _)| *sequence_id)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6]
+        );
+        let (_, first_row_part) = &packets[2];
+        let (_, last_row_part) = &packets[3];
+        assert_eq!(first_row_part.len(), crate::MAX_PACKET_PAYLOAD_LEN);
+        let mut row = first_row_part.to_vec();
+        row.extend_from_slice(last_row_part);
+        let mut expected = crate::encode_lenenc_integer(value.len() as u64);
+        expected.extend_from_slice(&value);
+        assert!(row == expected);
+        assert_eq!(connection.state(), ConnectionState::Ready);
+    }
+
+    /// Each packet in a frame, as its sequence number and payload.
+    fn packets_in(frame: &[u8]) -> Vec<(u8, &[u8])> {
+        let mut packets = Vec::new();
+        let mut rest = frame;
+        while !rest.is_empty() {
+            let length =
+                usize::from(rest[0]) | (usize::from(rest[1]) << 8) | (usize::from(rest[2]) << 16);
+            packets.push((rest[3], &rest[4..4 + length]));
+            rest = &rest[4 + length..];
+        }
+        packets
     }
 
     #[test]

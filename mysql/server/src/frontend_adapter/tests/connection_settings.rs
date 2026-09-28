@@ -208,3 +208,38 @@ fn a_select_running_past_max_execution_time_is_stopped() {
         .execute_query("SET GLOBAL max_execution_time = 5")
         .is_err());
 }
+
+/// Measured on MySQL 8.4.11: `max_allowed_packet` reads back as 64 MiB in
+/// every scope and every spelling of a session assignment to it answers 1621,
+/// leaving it where it was.
+#[test]
+fn max_allowed_packet_reads_back_64_mib_and_the_session_cannot_set_it() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "SET SESSION max_allowed_packet = 1024",
+        "SET max_allowed_packet = 1024",
+        "SET @@max_allowed_packet = 1024",
+        "SET @@session.max_allowed_packet = DEFAULT",
+        "SET LOCAL max_allowed_packet = 1024",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::SessionMaxAllowedPacketIsReadOnly),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT @@max_allowed_packet, @@session.max_allowed_packet, @@global.max_allowed_packet"
+        ),
+        [vec![Some("67108864".to_owned()); 3]]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW VARIABLES LIKE 'max_allowed_packet'"),
+        [vec![
+            Some("max_allowed_packet".to_owned()),
+            Some("67108864".to_owned())
+        ]]
+    );
+}

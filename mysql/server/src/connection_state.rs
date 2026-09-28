@@ -24,9 +24,19 @@ use crate::{CachingSha2Verifier, CredentialProvider};
 /// The authentication plugin implemented by this state machine.
 pub const CACHING_SHA2_PASSWORD_PLUGIN: &str = "caching_sha2_password";
 
-/// The maximum payload accepted by the command decoder. Connector/J's
-/// information-schema `getColumns` query needs more than 4 KiB.
-pub const MAX_COMMAND_PAYLOAD_LENGTH: usize = 16 * 1024;
+/// What `@@max_allowed_packet` reads back, MySQL 8.4's default of 64 MiB.
+pub const MAX_ALLOWED_PACKET: usize = 64 * 1024 * 1024;
+/// The longest command payload taken, once a client has signed in.
+///
+/// Measured on MySQL 8.4.11: a `COM_QUERY` payload of 67108863 bytes runs and
+/// one of 67108864 answers 1153, so a payload has to be shorter than
+/// `max_allowed_packet`. A payload this long reaches the server split into
+/// packets of 0xFFFFFF bytes.
+pub const MAX_COMMAND_PAYLOAD_LENGTH: usize = MAX_ALLOWED_PACKET - 1;
+/// The longest packet taken before a client has signed in, and the longest one
+/// packet the connection's own codec decodes. Connector/J's information-schema
+/// `getColumns` query needs more than 4 KiB.
+pub const MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH: usize = 16 * 1024;
 /// The sequence number that starts each classic command packet.
 pub const COMMAND_SEQUENCE_ID: u8 = 0;
 /// Sequence number of an ordinary client handshake response or SSLRequest.
@@ -338,7 +348,7 @@ impl ClassicConnection {
         let packet_codec = PacketCodec::new(
             MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH
                 .max(MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH)
-                .max(MAX_COMMAND_PAYLOAD_LENGTH),
+                .max(MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH),
         )?;
         Self::with_codec(settings, packet_codec, transport_security)
     }
@@ -3040,27 +3050,26 @@ mod tests {
 
     #[test]
     fn enforces_an_independent_command_payload_bound() {
-        let command_codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH + 1).unwrap();
-        let mut connection = ClassicConnection::with_codec(
-            server_config(),
-            command_codec,
-            TransportSecurity::Secure,
-        )
-        .unwrap();
-        connection.send_initial_handshake().unwrap();
-        connection
-            .receive_client_handshake_response(client_response(
-                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
-            ))
+        let mut connection = ready_connection();
+        let mut payload = vec![b' '; MAX_COMMAND_PAYLOAD_LENGTH];
+        payload[..9].copy_from_slice(b"\x03SELECT 1");
+        let command = connection
+            .receive_command_packet(Packet {
+                sequence_id: COMMAND_SEQUENCE_ID,
+                payload: &payload,
+            })
             .unwrap();
-        connection
-            .apply_initial_authentication_result(InitialAuthenticationResult::FastAuthSuccess)
-            .unwrap();
-        connection.send_authentication_ok().unwrap();
-        let payload = vec![COM_QUERY; MAX_COMMAND_PAYLOAD_LENGTH + 1];
-        let frame = command_codec.encode(COMMAND_SEQUENCE_ID, &payload).unwrap();
+        let ClassicCommand::Query { sql } = command.command else {
+            panic!("the longest payload must be decoded as COM_QUERY");
+        };
+        assert_eq!(sql.len(), MAX_COMMAND_PAYLOAD_LENGTH - 1);
+
+        payload.push(b' ');
         assert_eq!(
-            connection.receive_command_frame(&frame),
+            connection.receive_command_packet(Packet {
+                sequence_id: COMMAND_SEQUENCE_ID,
+                payload: &payload,
+            }),
             Err(ConnectionStateError::Command(
                 CommandPacketError::PayloadTooLarge {
                     length: MAX_COMMAND_PAYLOAD_LENGTH + 1,
@@ -3073,7 +3082,7 @@ mod tests {
 
     #[test]
     fn accepts_connector_j_get_columns_sized_prepare_packet() {
-        let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH).unwrap();
+        let codec = PacketCodec::new(MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH).unwrap();
         let mut connection =
             ClassicConnection::with_codec(server_config(), codec, TransportSecurity::Secure)
                 .unwrap();

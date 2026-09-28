@@ -557,6 +557,9 @@ impl MySqlSessionVariables {
             | MySqlSessionSetting::SqlAutoIsNull(_)
             | MySqlSessionSetting::SqlSafeUpdates(_)
             | MySqlSessionSetting::SqlQuoteShowCreate(_) => {}
+            MySqlSessionSetting::SessionMaxAllowedPacket => {
+                unreachable!("the session's max_allowed_packet is refused before it is applied")
+            }
         }
     }
 
@@ -966,6 +969,9 @@ fn accept_session_setting(
         }
         MySqlSessionSetting::SqlQuoteShowCreate(true) => Ok(()),
         MySqlSessionSetting::SqlQuoteShowCreate(false) => Err(FrontendErrorKind::Unsupported),
+        MySqlSessionSetting::SessionMaxAllowedPacket => {
+            Err(FrontendErrorKind::SessionMaxAllowedPacketIsReadOnly)
+        }
         MySqlSessionSetting::CollationConnection(value) => {
             if ConnectionCollation::from_name(value).is_some()
                 || value.eq_ignore_ascii_case(LATIN1_COLLATION)

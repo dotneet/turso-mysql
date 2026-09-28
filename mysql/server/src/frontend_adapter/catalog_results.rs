@@ -7,6 +7,10 @@
 
 use super::*;
 
+/// The longest value a catalog listing sends. Every value in one describes the
+/// schema, so each row is kept to one small packet.
+pub(super) const MAX_CATALOG_VALUE_LENGTH: usize = crate::MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
+
 pub(super) fn admin_result_to_execution_result(
     result: MySqlAdminCommandResult,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
@@ -255,7 +259,7 @@ pub(super) fn show_tables_result_to_execution_result(
     let rows = tables
         .into_iter()
         .map(|name| {
-            if name.len() > MAX_TEXT_ROW_VALUE_LENGTH {
+            if name.len() > MAX_CATALOG_VALUE_LENGTH {
                 return Err(FrontendErrorKind::Internal);
             }
             retained_bytes = retained_bytes
@@ -369,7 +373,7 @@ pub(super) fn information_schema_tables_result_to_execution_result(
         if row
             .iter()
             .flatten()
-            .any(|value| value.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+            .any(|value| value.len() > MAX_CATALOG_VALUE_LENGTH)
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -1189,9 +1193,9 @@ pub(super) fn information_schema_columns_result_to_execution_result(
     let mut retained_bytes = 0usize;
     let mut rows = Vec::with_capacity(columns.len());
     for (ordinal, column) in columns.into_iter().enumerate() {
-        if column.name().len() > MAX_TEXT_ROW_VALUE_LENGTH
-            || column.extra().len() > MAX_TEXT_ROW_VALUE_LENGTH
-            || column.comment().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        if column.name().len() > MAX_CATALOG_VALUE_LENGTH
+            || column.extra().len() > MAX_CATALOG_VALUE_LENGTH
+            || column.comment().len() > MAX_CATALOG_VALUE_LENGTH
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -1200,7 +1204,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
             information_schema_column_sizes(&column, &column_type);
         let extra = show_column_extra(column.extra())?;
         let default = match column.default_value() {
-            Some(MySqlColumnDefault::Text(value)) if value.len() > MAX_TEXT_ROW_VALUE_LENGTH => {
+            Some(MySqlColumnDefault::Text(value)) if value.len() > MAX_CATALOG_VALUE_LENGTH => {
                 return Err(FrontendErrorKind::Internal);
             }
             _ => show_column_default_value(&column)?,
@@ -1233,7 +1237,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
         ];
         if value_lengths
             .iter()
-            .any(|length| *length > MAX_TEXT_ROW_VALUE_LENGTH)
+            .any(|length| *length > MAX_CATALOG_VALUE_LENGTH)
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -1245,7 +1249,7 @@ pub(super) fn information_schema_columns_result_to_execution_result(
                     .checked_add(payload_len)
                     .ok_or(FrontendErrorKind::Internal)
             })?;
-        if payload_len > MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
+        if payload_len > crate::MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
             return Err(FrontendErrorKind::Internal);
         }
         let row_bytes = value_lengths
@@ -1904,8 +1908,8 @@ pub(super) fn show_index_result_to_execution_result(
     }
     let mut rows = Vec::with_capacity(entries.len());
     for entry in entries {
-        if entry.key_name().len() > MAX_TEXT_ROW_VALUE_LENGTH
-            || entry.column_name().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        if entry.key_name().len() > MAX_CATALOG_VALUE_LENGTH
+            || entry.column_name().len() > MAX_CATALOG_VALUE_LENGTH
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -2148,7 +2152,7 @@ fn show_index_columns() -> Vec<ColumnDefinitionConfig> {
 }
 
 const fn abs_expression_length() -> u32 {
-    MAX_TEXT_ROW_VALUE_LENGTH as u32
+    MAX_CATALOG_VALUE_LENGTH as u32
 }
 
 pub(super) fn show_create_table_error_kind(error: MySqlShowCreateTableError) -> FrontendErrorKind {
@@ -2164,8 +2168,8 @@ pub(super) fn show_create_table_result_to_execution_result(
     result: MySqlShowCreateTableResult,
     status_flags: u16,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
-    if result.table().len() > MAX_TEXT_ROW_VALUE_LENGTH
-        || result.create_statement().len() > MAX_TEXT_ROW_VALUE_LENGTH
+    if result.table().len() > MAX_CATALOG_VALUE_LENGTH
+        || result.create_statement().len() > MAX_CATALOG_VALUE_LENGTH
     {
         return Err(FrontendErrorKind::Internal);
     }
@@ -2222,7 +2226,7 @@ pub(super) fn show_triggers_result(
         ];
         if fields
             .iter()
-            .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+            .any(|field| field.len() > MAX_CATALOG_VALUE_LENGTH)
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -2351,7 +2355,7 @@ pub(super) fn show_create_trigger_result(
     ];
     if fields
         .iter()
-        .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+        .any(|field| field.len() > MAX_CATALOG_VALUE_LENGTH)
     {
         return Err(FrontendErrorKind::Internal);
     }
@@ -2426,7 +2430,7 @@ pub(super) fn show_create_view_result(
     ];
     if fields
         .iter()
-        .any(|field| field.len() > MAX_TEXT_ROW_VALUE_LENGTH)
+        .any(|field| field.len() > MAX_CATALOG_VALUE_LENGTH)
     {
         return Err(FrontendErrorKind::Internal);
     }
@@ -2487,9 +2491,9 @@ pub(super) fn show_columns_result(
     let mut retained_bytes = 0usize;
     let mut rows = Vec::with_capacity(columns.len());
     for column in columns {
-        if column.name().len() > MAX_TEXT_ROW_VALUE_LENGTH
-            || column.extra().len() > MAX_TEXT_ROW_VALUE_LENGTH
-            || column.comment().len() > MAX_TEXT_ROW_VALUE_LENGTH
+        if column.name().len() > MAX_CATALOG_VALUE_LENGTH
+            || column.extra().len() > MAX_CATALOG_VALUE_LENGTH
+            || column.comment().len() > MAX_CATALOG_VALUE_LENGTH
         {
             return Err(FrontendErrorKind::Internal);
         }
@@ -2611,7 +2615,7 @@ fn checked_text_result_row_payload_len(
             .checked_add(value_len)
             .ok_or(FrontendErrorKind::Internal)
     })?;
-    if payload_len > MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
+    if payload_len > crate::MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
         return Err(FrontendErrorKind::Internal);
     }
     Ok(payload_len)
@@ -2703,7 +2707,7 @@ pub(super) fn show_default_at_scale(
             return Ok(Some(if *value { b"1".to_vec() } else { b"0".to_vec() }));
         }
     };
-    if value.len() > MAX_TEXT_ROW_VALUE_LENGTH {
+    if value.len() > MAX_CATALOG_VALUE_LENGTH {
         return Err(FrontendErrorKind::Internal);
     }
     Ok(Some(value.to_vec()))

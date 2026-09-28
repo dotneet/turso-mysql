@@ -102,9 +102,9 @@ use crate::{
     ColumnDefinitionConfig, CommandExecutionOptions, CommandExecutionResult, CommandExecutor,
     CommandOkResult, FrontendErrorKind, InitialDatabaseSelector, PreparedStatementExecutionResult,
     PreparedStatementResult, StatementExecuteDecodeError, StatementParameterType,
-    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_COMMAND_PAYLOAD_LENGTH,
-    MAX_DISPATCH_RESULT_ROWS, MAX_RESPONSE_PACKET_PAYLOAD_LENGTH, MAX_RESULT_COLUMNS,
-    MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
+    StatementParameterValue, TextResultSet, DEFAULT_UTF8MB4_COLLATION, MAX_DISPATCH_RESULT_ROWS,
+    MAX_RESULT_COLUMNS, MAX_ROW_PAYLOAD_LENGTH, MAX_TEXT_ROW_VALUE_LENGTH, MYSQL_TYPE_BIT,
+    SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_IN_TRANS,
 };
 
 const DEFAULT_MYSQL_WAIT_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
@@ -166,7 +166,7 @@ impl MySqlBootstrapSettings {
 
 impl Default for MySqlBootstrapSettings {
     fn default() -> Self {
-        Self::new(MAX_COMMAND_PAYLOAD_LENGTH, DEFAULT_MYSQL_WAIT_TIMEOUT)
+        Self::new(crate::MAX_ALLOWED_PACKET, DEFAULT_MYSQL_WAIT_TIMEOUT)
     }
 }
 
@@ -9444,8 +9444,14 @@ pub(crate) const MYSQL_BINARY_COLLATION: u16 = 63;
 /// Bytes utf8mb4 reserves for one character, which MySQL multiplies a declared
 /// character count by when it reports a column's length.
 const UTF8MB4_MAX_BYTES_PER_CHARACTER: u32 = 4;
-const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PREPARED_LONG_DATA_BYTES: usize = 8 * 1024 * 1024;
+/// The most one result may hold, which lets a value as long as the longest
+/// command a client may send be read back.
+const MAX_FRONTEND_ADAPTER_RESULT_BYTES: usize = crate::MAX_ALLOWED_PACKET;
+/// The most `COM_STMT_SEND_LONG_DATA` may hold on one connection. Measured on
+/// MySQL 8.4.11, a parameter of exactly `max_allowed_packet` bytes is taken
+/// and one a byte longer answers 1105 at `COM_STMT_EXECUTE`. MySQL holds each
+/// parameter to that; this holds the connection's parameters together to it.
+const MAX_PREPARED_LONG_DATA_BYTES: usize = crate::MAX_ALLOWED_PACKET;
 
 impl PendingLongData {
     fn append(&mut self, statement_id: u32, parameter_id: u16, data: &[u8], parameter_count: u16) {
@@ -9522,9 +9528,8 @@ impl PendingLongData {
 
 fn pending_long_data_error(error: PendingLongDataError) -> FrontendErrorKind {
     match error {
-        PendingLongDataError::InvalidParameter | PendingLongDataError::TooLarge => {
-            FrontendErrorKind::Syntax
-        }
+        PendingLongDataError::InvalidParameter => FrontendErrorKind::Syntax,
+        PendingLongDataError::TooLarge => FrontendErrorKind::LongDataTooLarge,
     }
 }
 
@@ -10337,7 +10342,7 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
         MYSQL_TYPE_LONG => 11,
         MYSQL_TYPE_LONGLONG => 20,
         MYSQL_TYPE_DOUBLE => 22,
-        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_BLOB => MAX_TEXT_ROW_VALUE_LENGTH as u32,
+        MYSQL_TYPE_VAR_STRING | MYSQL_TYPE_BLOB => COMPUTED_TEXT_COLUMN_LENGTH,
         MYSQL_TYPE_NULL => 0,
         _ => 0,
     };
@@ -10348,6 +10353,9 @@ fn column_definition(name: String, column_type: u8) -> ColumnDefinitionConfig {
     }
     definition
 }
+
+/// The length a computed text or blob column without a better one reports.
+const COMPUTED_TEXT_COLUMN_LENGTH: u32 = 4096;
 
 fn last_insert_id_column_definition(name: String) -> ColumnDefinitionConfig {
     let mut definition = column_definition(name, MYSQL_TYPE_LONGLONG);
@@ -10377,7 +10385,7 @@ fn checked_text_row_payload_len<'a>(
             .checked_add(value_len)
             .ok_or(LimboError::TooBig)?;
     }
-    if payload_len > MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
+    if payload_len > MAX_ROW_PAYLOAD_LENGTH {
         return Err(LimboError::TooBig);
     }
     Ok(payload_len)

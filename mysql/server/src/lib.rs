@@ -224,6 +224,96 @@ impl PacketCodec {
     }
 }
 
+/// Writes one payload as the packets the wire carries it in.
+///
+/// A payload of 0xFFFFFF bytes or more is sent as full 0xFFFFFF-byte packets
+/// followed by one shorter packet, which is empty when the payload is an exact
+/// multiple, because a full packet always tells the reader that another one
+/// follows. The packets take consecutive sequence numbers from `sequence_id`.
+pub fn encode_split_payload(sequence_id: u8, payload: &[u8]) -> Vec<u8> {
+    let packet_count = payload.len() / MAX_PACKET_PAYLOAD_LEN + 1;
+    let mut frame = Vec::with_capacity(payload.len() + packet_count * PACKET_HEADER_LEN);
+    let mut sequence_id = sequence_id;
+    let mut rest = payload;
+    loop {
+        let length = rest.len().min(MAX_PACKET_PAYLOAD_LEN);
+        frame.extend_from_slice(&[
+            (length & 0xFF) as u8,
+            ((length >> 8) & 0xFF) as u8,
+            ((length >> 16) & 0xFF) as u8,
+            sequence_id,
+        ]);
+        frame.extend_from_slice(&rest[..length]);
+        rest = &rest[length..];
+        sequence_id = sequence_id.wrapping_add(1);
+        if length < MAX_PACKET_PAYLOAD_LEN {
+            return frame;
+        }
+    }
+}
+
+/// Counts the packets in a frame holding one payload, split or not, and
+/// checks that every packet but the last is full and the last is not.
+pub fn split_payload_packet_count(frame: &[u8]) -> Result<usize, PacketCodecError> {
+    let mut offset = 0;
+    let mut packets = 0;
+    loop {
+        let header = frame.get(offset..offset + PACKET_HEADER_LEN).ok_or(
+            PacketCodecError::TruncatedHeader {
+                actual: frame.len() - offset,
+            },
+        )?;
+        let length =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let end = offset + PACKET_HEADER_LEN + length;
+        if end > frame.len() {
+            return Err(PacketCodecError::TruncatedPayload {
+                declared: length,
+                actual: frame.len() - offset - PACKET_HEADER_LEN,
+            });
+        }
+        packets += 1;
+        offset = end;
+        if length < MAX_PACKET_PAYLOAD_LEN {
+            if offset != frame.len() {
+                return Err(PacketCodecError::TrailingBytes {
+                    expected: offset,
+                    actual: frame.len(),
+                });
+            }
+            return Ok(packets);
+        }
+    }
+}
+
+/// Gives the packets of an encoded frame consecutive sequence numbers from
+/// `sequence_id` and returns the number the packet after them takes.
+///
+/// The frame is one the server encoded, so a header that runs past its end is
+/// a bug rather than a client's mistake.
+pub fn renumber_packets(frame: &mut [u8], sequence_id: u8) -> u8 {
+    let mut sequence_id = sequence_id;
+    let mut offset = 0;
+    while offset < frame.len() {
+        assert!(
+            offset + PACKET_HEADER_LEN <= frame.len(),
+            "an encoded frame ends with a whole packet"
+        );
+        let length = usize::from(frame[offset])
+            | (usize::from(frame[offset + 1]) << 8)
+            | (usize::from(frame[offset + 2]) << 16);
+        frame[offset + PACKET_HEADER_LEN - 1] = sequence_id;
+        sequence_id = sequence_id.wrapping_add(1);
+        offset += PACKET_HEADER_LEN + length;
+    }
+    assert_eq!(
+        offset,
+        frame.len(),
+        "an encoded frame ends with a whole packet"
+    );
+    sequence_id
+}
+
 /// Errors returned when a packet limit or frame boundary is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketCodecError {
@@ -397,6 +487,55 @@ mod tests {
             })
         );
         assert_eq!(mysql_common_max_payload_len(), MAX_PACKET_PAYLOAD_LEN);
+    }
+
+    #[test]
+    fn splits_a_payload_into_full_packets_and_a_shorter_last_one() {
+        let short = encode_split_payload(3, b"abc");
+        assert_eq!(short, b"\x03\x00\x00\x03abc");
+        assert_eq!(split_payload_packet_count(&short), Ok(1));
+
+        let exact = vec![b'x'; MAX_PACKET_PAYLOAD_LEN];
+        let frame = encode_split_payload(0, &exact);
+        assert_eq!(frame.len(), 2 * PACKET_HEADER_LEN + MAX_PACKET_PAYLOAD_LEN);
+        assert_eq!(&frame[..PACKET_HEADER_LEN], b"\xff\xff\xff\x00");
+        assert_eq!(
+            &frame[frame.len() - PACKET_HEADER_LEN..],
+            b"\x00\x00\x00\x01"
+        );
+        assert_eq!(split_payload_packet_count(&frame), Ok(2));
+
+        let longer = vec![b'y'; MAX_PACKET_PAYLOAD_LEN + 5];
+        let mut frame = encode_split_payload(255, &longer);
+        assert_eq!(frame[3], 255);
+        assert_eq!(
+            &frame[PACKET_HEADER_LEN + MAX_PACKET_PAYLOAD_LEN..][..PACKET_HEADER_LEN],
+            b"\x05\x00\x00\x00"
+        );
+        assert_eq!(split_payload_packet_count(&frame), Ok(2));
+        assert_eq!(renumber_packets(&mut frame, 7), 9);
+        assert_eq!(frame[3], 7);
+        assert_eq!(frame[PACKET_HEADER_LEN + MAX_PACKET_PAYLOAD_LEN + 3], 8);
+    }
+
+    #[test]
+    fn a_split_payload_needs_its_last_packet() {
+        let exact = vec![b'x'; MAX_PACKET_PAYLOAD_LEN];
+        let frame = encode_split_payload(0, &exact);
+        let without_last = &frame[..frame.len() - PACKET_HEADER_LEN];
+        assert_eq!(
+            split_payload_packet_count(without_last),
+            Err(PacketCodecError::TruncatedHeader { actual: 0 })
+        );
+        let mut two = encode_split_payload(0, b"ab");
+        two.extend_from_slice(&encode_split_payload(1, b"cd"));
+        assert_eq!(
+            split_payload_packet_count(&two),
+            Err(PacketCodecError::TrailingBytes {
+                expected: 6,
+                actual: 12,
+            })
+        );
     }
 
     #[test]

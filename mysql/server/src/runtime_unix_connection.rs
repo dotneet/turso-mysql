@@ -16,10 +16,11 @@ use crate::{
     ClassicConnectionOrchestrator, ClassicFrame, InitialHandshakeSettings, OrchestratorError,
     OrchestratorEvent, PacketCodec, PacketCodecError, PacketStreamDecoder,
     RuntimeUnixListenerError, StreamDecoderError, TransportSecurity, CLIENT_SSL,
-    MAX_COMMAND_PAYLOAD_LENGTH, SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+    MAX_ALLOWED_PACKET, MAX_COMMAND_PAYLOAD_LENGTH, MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH,
+    SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
-const READ_BUFFER_BYTES: usize = MAX_COMMAND_PAYLOAD_LENGTH;
+const READ_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_PACKETS_PER_FEED: usize = 16;
 const MAX_INPUT_BYTES_PER_FEED: usize = MAX_PACKETS_PER_FEED * crate::PACKET_HEADER_LEN;
 
@@ -208,7 +209,7 @@ where
     )
     .with_prepared_statement_authority(stream.prepared_statement_authority())
     .with_query_timeout(timeouts.query())
-    .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle())
+    .with_bootstrap_settings(MAX_ALLOWED_PACKET, timeouts.idle())
     .with_net_write_timeout(timeouts.write());
     if let Some(administration) = stream.account_administration() {
         factory = factory.with_account_administration(administration);
@@ -259,11 +260,14 @@ fn run_inner(
     write_timeout: Duration,
     mut before_frame: impl FnMut(),
 ) -> Result<(), RuntimeUnixConnectionError> {
-    let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH)
+    let codec = PacketCodec::new(MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH)
         .map_err(RuntimeUnixConnectionError::PacketCodec)?;
-    let mut decoder =
-        PacketStreamDecoder::new(codec, MAX_COMMAND_PAYLOAD_LENGTH, MAX_PACKETS_PER_FEED)
-            .expect("the fixed Unix stream decoder bounds are valid");
+    let mut decoder = PacketStreamDecoder::new(
+        codec,
+        MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH,
+        MAX_PACKETS_PER_FEED,
+    )
+    .expect("the fixed Unix stream decoder bounds are valid");
     let mut read_deadline = authentication_deadline;
     let mut admission_complete = false;
 
@@ -287,16 +291,30 @@ fn run_inner(
         // Even when a previous feed left one packet a byte from completion,
         // this chunk size cannot complete more than MAX_PACKETS_PER_FEED frames.
         for chunk in buffer[..read].chunks(MAX_INPUT_BYTES_PER_FEED) {
-            let packets = decoder
-                .feed(chunk)
-                .map_err(RuntimeUnixConnectionError::StreamDecoder)?;
+            let packets = match decoder.feed(chunk) {
+                Ok(packets) => packets,
+                Err(StreamDecoderError::SplitPayloadTooLarge { sequence_id, .. }) => {
+                    stream
+                        .begin_protocol_work()
+                        .map_err(RuntimeUnixConnectionError::Listener)?;
+                    orchestrator
+                        .refuse_packet_too_large(sequence_id)
+                        .map_err(RuntimeUnixConnectionError::Orchestrator)?;
+                    flush_writes(stream, orchestrator, Instant::now() + write_timeout)?;
+                    return Ok(());
+                }
+                Err(error) => return Err(RuntimeUnixConnectionError::StreamDecoder(error)),
+            };
             for packet in packets {
                 before_frame();
                 stream
                     .begin_protocol_work()
                     .map_err(RuntimeUnixConnectionError::Listener)?;
-                let frame = ClassicFrame::from_payload(codec, packet.sequence_id, &packet.payload)
-                    .map_err(RuntimeUnixConnectionError::PacketCodec)?;
+                let frame = ClassicFrame::from_split_payload(
+                    packet.sequence_id,
+                    packet.last_sequence_id,
+                    packet.payload,
+                );
                 let event = orchestrator
                     .receive_frame(frame)
                     .map_err(RuntimeUnixConnectionError::Orchestrator)?;
@@ -314,6 +332,7 @@ fn run_inner(
                                 .complete_admission()
                                 .map_err(RuntimeUnixConnectionError::Listener)?;
                             admission_complete = true;
+                            decoder.take_split_payloads_up_to(MAX_COMMAND_PAYLOAD_LENGTH);
                         }
                         // A complete, flushed command marks the start of a new
                         // idle period. Partial packets never extend this deadline.
@@ -735,6 +754,31 @@ mod tests {
         TempDir,
         std::path::PathBuf,
     ) {
+        protocol_runtime_writing_up_to(
+            authentication,
+            idle,
+            query,
+            shutdown,
+            MIN_WRITE_LIMIT,
+            Duration::from_secs(1),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn protocol_runtime_writing_up_to(
+        authentication: Duration,
+        idle: Duration,
+        query: Duration,
+        shutdown: Duration,
+        max_write_bytes: usize,
+        write: Duration,
+    ) -> (
+        RuntimeUnixListener,
+        TempDir,
+        TempDir,
+        TempDir,
+        std::path::PathBuf,
+    ) {
         let data_root = private_directory();
         let account_root = private_directory();
         let socket_directory = private_directory();
@@ -788,7 +832,7 @@ mod tests {
         drop(session);
         drop(catalog);
 
-        let limits = RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).unwrap();
+        let limits = RuntimeLimits::new(4, 4, max_write_bytes, 16).unwrap();
         let socket = UnixSocketConfig::new(
             socket_directory.path().canonicalize().unwrap(),
             "mysql.sock",
@@ -807,7 +851,7 @@ mod tests {
                 Duration::from_secs(1),
                 authentication,
                 idle,
-                Duration::from_secs(1),
+                write,
                 shutdown,
             )
             .unwrap()
@@ -829,7 +873,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn packet_codec() -> PacketCodec {
-        PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH).unwrap()
+        PacketCodec::new(crate::MAX_PACKET_PAYLOAD_LEN).unwrap()
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -838,7 +882,6 @@ mod tests {
         stream.read_exact(&mut header).unwrap();
         let payload_length =
             usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-        assert!(payload_length <= MAX_COMMAND_PAYLOAD_LENGTH);
         let mut frame = vec![0; PACKET_HEADER_LEN + payload_length];
         frame[..PACKET_HEADER_LEN].copy_from_slice(&header);
         stream.read_exact(&mut frame[PACKET_HEADER_LEN..]).unwrap();
@@ -964,6 +1007,113 @@ mod tests {
             .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &[COM_QUIT]).unwrap())
             .unwrap();
         drop(client);
+        assert!(worker.join().is_ok());
+        assert!(listener.shutdown().drained());
+    }
+
+    /// Measured on MySQL 8.4.11: long data longer than one packet arrives
+    /// split and is answered from the number after its last packet, a row that
+    /// long goes out split the same way, and a command that reaches
+    /// `max_allowed_packet` is answered 1153 at the header of the packet that
+    /// reaches it and the connection closed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn real_unix_socket_takes_and_sends_payloads_longer_than_one_packet() {
+        let (listener, _data_root, _account_root, _socket_directory, endpoint) =
+            protocol_runtime_writing_up_to(
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+                32 * 1024 * 1024,
+                Duration::from_secs(60),
+            );
+        let (mut client, worker) = start_worker(&listener, &endpoint);
+        client
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let capabilities = CLIENT_CONNECT_WITH_DB | CLIENT_DEPRECATE_EOF;
+        client_handshake(&mut client, Some("testdb"), capabilities);
+        let codec = packet_codec();
+        let send = |client: &mut UnixStream, payload: &[u8]| {
+            client
+                .write_all(&crate::encode_split_payload(COMMAND_SEQUENCE_ID, payload))
+                .unwrap();
+        };
+
+        let mut create = vec![COM_QUERY];
+        create.extend_from_slice(b"CREATE TABLE notes (id INT PRIMARY KEY, body LONGTEXT)");
+        send(&mut client, &create);
+        crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"INSERT INTO notes (id, body) VALUES (1, ?)");
+        send(&mut client, &prepare);
+        let prepare_ok = StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(prepare_ok.num_params, 1);
+        ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+
+        let value = vec![b'z'; crate::MAX_PACKET_PAYLOAD_LEN + 100];
+        let mut long_data = vec![COM_STMT_SEND_LONG_DATA];
+        long_data.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        long_data.extend_from_slice(&0u16.to_le_bytes());
+        long_data.extend_from_slice(&value);
+        send(&mut client, &long_data);
+        let mut execute = vec![COM_STMT_EXECUTE];
+        execute.extend_from_slice(&prepare_ok.statement_id.to_le_bytes());
+        execute.push(CURSOR_TYPE_NO_CURSOR);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        execute.extend_from_slice(&[0, 1, MYSQL_TYPE_BLOB, 0]);
+        send(&mut client, &execute);
+        let inserted = crate::ResponseOkPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(inserted.sequence_id, 1);
+        assert_eq!(inserted.affected_rows, 1);
+
+        let mut select = vec![COM_QUERY];
+        select.extend_from_slice(b"SELECT body FROM notes");
+        send(&mut client, &select);
+        let count = crate::ColumnCountPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        assert_eq!(count.sequence_id, 1);
+        ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).unwrap();
+        let first = read_frame(&mut client);
+        assert_eq!(&first[..4], [0xff, 0xff, 0xff, 3]);
+        let last = read_frame(&mut client);
+        assert_eq!(last[3], 4);
+        let mut row = first[4..].to_vec();
+        row.extend_from_slice(&last[4..]);
+        let mut expected = crate::encode_lenenc_integer(value.len() as u64);
+        expected.extend_from_slice(&value);
+        assert!(row == expected, "the row must arrive whole");
+        assert!(matches!(
+            ResultTerminatorPacket::decode(
+                codec,
+                &read_frame(&mut client),
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities,
+            )
+            .unwrap(),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 5
+        ));
+
+        let mut too_long = vec![COM_QUERY];
+        too_long.resize(crate::MAX_ALLOWED_PACKET, b' ');
+        let packets = crate::encode_split_payload(COMMAND_SEQUENCE_ID, &too_long);
+        let last_header = 4 * (PACKET_HEADER_LEN + crate::MAX_PACKET_PAYLOAD_LEN);
+        assert_eq!(&packets[last_header..last_header + 4], [4, 0, 0, 4]);
+        client.write_all(&packets[..last_header + 4]).unwrap();
+        let refused = crate::ErrPacket::decode(
+            codec,
+            &read_frame(&mut client),
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | capabilities,
+        )
+        .unwrap();
+        assert_eq!(refused.sequence_id, 5);
+        assert_eq!(refused.error_code, 1153);
+        assert_eq!(refused.sql_state, Some(*b"08S01"));
+        let mut rest = Vec::new();
+        assert_eq!(client.read_to_end(&mut rest).unwrap(), 0);
         assert!(worker.join().is_ok());
         assert!(listener.shutdown().drained());
     }

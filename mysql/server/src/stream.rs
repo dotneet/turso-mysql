@@ -2,13 +2,22 @@
 
 use std::{collections::VecDeque, error::Error, fmt};
 
-use crate::{PacketCodec, PacketCodecError, MAX_PACKET_PAYLOAD_LEN, PACKET_HEADER_LEN};
+use crate::{
+    split_payload_packet_count, PacketCodec, PacketCodecError, MAX_PACKET_PAYLOAD_LEN,
+    PACKET_HEADER_LEN,
+};
 
 /// An owned packet emitted by [`PacketStreamDecoder`].
+///
+/// Once the decoder takes split payloads, one of these may have arrived as
+/// several packets; `last_sequence_id` is the sequence number of the last one,
+/// which the answer follows on from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamPacket {
     /// Sequence number from the packet header.
     pub sequence_id: u8,
+    /// Sequence number of the last packet the payload arrived in.
+    pub last_sequence_id: u8,
     /// Packet payload without the four-byte header.
     pub payload: Vec<u8>,
 }
@@ -30,6 +39,7 @@ pub struct PacketStreamDecoder {
     codec: PacketCodec,
     max_buffered_payload_bytes: usize,
     max_packets_per_feed: usize,
+    max_split_payload_bytes: Option<usize>,
     header: [u8; PACKET_HEADER_LEN],
     header_len: usize,
     payload: Option<PartialPayload>,
@@ -39,9 +49,17 @@ pub struct PacketStreamDecoder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PartialPayload {
     sequence_id: u8,
-    expected_len: usize,
+    last_sequence_id: u8,
+    /// Bytes of the packet being read that have not arrived yet.
+    packet_remaining: usize,
+    /// Whether the packet being read is full, so another one follows it.
+    more_packets_follow: bool,
     bytes: Vec<u8>,
 }
+
+/// What a payload buffer starts with, so a header alone never makes the
+/// decoder set aside the whole length it declares.
+const INITIAL_PAYLOAD_CAPACITY: usize = 64 * 1024;
 
 impl PacketStreamDecoder {
     /// Creates a decoder with independent wire-payload, buffer, and output limits.
@@ -64,11 +82,19 @@ impl PacketStreamDecoder {
             codec,
             max_buffered_payload_bytes,
             max_packets_per_feed,
+            max_split_payload_bytes: None,
             header: [0; PACKET_HEADER_LEN],
             header_len: 0,
             payload: None,
             terminal: false,
         })
+    }
+
+    /// From the next packet on, takes payloads of up to `limit` bytes, split
+    /// into as many full packets as they need, in place of the codec's and the
+    /// buffer's limits.
+    pub fn take_split_payloads_up_to(&mut self, limit: usize) {
+        self.max_split_payload_bytes = Some(limit);
     }
 
     /// Returns the codec used to validate packet payload lengths.
@@ -124,75 +150,47 @@ impl PacketStreamDecoder {
         let mut offset = 0;
         let mut packets = Vec::new();
         while offset < chunk.len() {
-            if self.payload.is_none() {
-                let copied = self.copy_header(&chunk[offset..]);
+            let reading_payload = self
+                .payload
+                .as_ref()
+                .is_some_and(|payload| payload.packet_remaining > 0);
+            if reading_payload {
+                let payload = self.payload.as_mut().expect("a payload is being read");
+                let copied = payload.packet_remaining.min(chunk.len() - offset);
+                payload
+                    .bytes
+                    .extend_from_slice(&chunk[offset..offset + copied]);
+                payload.packet_remaining -= copied;
                 offset += copied;
+            } else {
+                offset += self.copy_header(&chunk[offset..]);
                 if self.header_len < PACKET_HEADER_LEN {
                     break;
                 }
-
-                if packets.len() >= self.max_packets_per_feed {
-                    return self.fail(StreamDecoderError::PacketsPerFeedExceeded {
-                        packets: packets.len(),
-                        limit: self.max_packets_per_feed,
-                    });
-                }
-
-                let payload_len = self.payload_len();
-                let sequence_id = self.header[3];
-                if payload_len == MAX_PACKET_PAYLOAD_LEN {
-                    return self
-                        .fail(StreamDecoderError::ContinuationPacketUnsupported { sequence_id });
-                }
-                if payload_len > self.codec.max_payload_len() {
-                    return self.fail(StreamDecoderError::PayloadTooLarge {
-                        length: payload_len,
-                        limit: self.codec.max_payload_len(),
-                    });
-                }
-                if payload_len > self.max_buffered_payload_bytes {
-                    return self.fail(StreamDecoderError::BufferBudgetExceeded {
-                        length: payload_len,
-                        limit: self.max_buffered_payload_bytes,
-                    });
-                }
-
                 self.header_len = 0;
-                self.payload = Some(PartialPayload {
-                    sequence_id,
-                    expected_len: payload_len,
-                    bytes: Vec::with_capacity(payload_len),
-                });
-                if payload_len == 0 {
-                    let payload = self
-                        .payload
-                        .take()
-                        .expect("zero-length payload was just initialized");
-                    packets.push(StreamPacket {
-                        sequence_id: payload.sequence_id,
-                        payload: payload.bytes,
-                    });
-                    continue;
+                if self.payload.is_some() {
+                    self.continue_split_payload()?;
+                } else {
+                    if packets.len() >= self.max_packets_per_feed {
+                        return self.fail(StreamDecoderError::PacketsPerFeedExceeded {
+                            packets: packets.len(),
+                            limit: self.max_packets_per_feed,
+                        });
+                    }
+                    self.begin_payload()?;
                 }
             }
-
-            let payload = self
-                .payload
-                .as_mut()
-                .expect("a non-empty payload is initialized before copying");
-            let remaining = payload.expected_len - payload.bytes.len();
-            let copied = remaining.min(chunk.len() - offset);
-            payload
-                .bytes
-                .extend_from_slice(&chunk[offset..offset + copied]);
-            offset += copied;
-            if payload.bytes.len() == payload.expected_len {
+            let complete = self.payload.as_ref().is_some_and(|payload| {
+                payload.packet_remaining == 0 && !payload.more_packets_follow
+            });
+            if complete {
                 let payload = self
                     .payload
                     .take()
-                    .expect("a complete payload was just copied");
+                    .expect("a complete payload was just read");
                 packets.push(StreamPacket {
                     sequence_id: payload.sequence_id,
+                    last_sequence_id: payload.last_sequence_id,
                     payload: payload.bytes,
                 });
             }
@@ -206,6 +204,74 @@ impl PacketStreamDecoder {
         self.header_len = 0;
         self.payload = None;
         self.terminal = false;
+    }
+
+    fn begin_payload(&mut self) -> Result<(), StreamDecoderError> {
+        let payload_len = self.payload_len();
+        let sequence_id = self.header[3];
+        if let Some(limit) = self.max_split_payload_bytes {
+            if payload_len > limit {
+                return self.fail(StreamDecoderError::SplitPayloadTooLarge {
+                    length: payload_len,
+                    limit,
+                    sequence_id,
+                });
+            }
+        } else {
+            if payload_len == MAX_PACKET_PAYLOAD_LEN {
+                return self
+                    .fail(StreamDecoderError::ContinuationPacketUnsupported { sequence_id });
+            }
+            if payload_len > self.codec.max_payload_len() {
+                return self.fail(StreamDecoderError::PayloadTooLarge {
+                    length: payload_len,
+                    limit: self.codec.max_payload_len(),
+                });
+            }
+            if payload_len > self.max_buffered_payload_bytes {
+                return self.fail(StreamDecoderError::BufferBudgetExceeded {
+                    length: payload_len,
+                    limit: self.max_buffered_payload_bytes,
+                });
+            }
+        }
+        self.payload = Some(PartialPayload {
+            sequence_id,
+            last_sequence_id: sequence_id,
+            packet_remaining: payload_len,
+            more_packets_follow: payload_len == MAX_PACKET_PAYLOAD_LEN,
+            bytes: Vec::with_capacity(payload_len.min(INITIAL_PAYLOAD_CAPACITY)),
+        });
+        Ok(())
+    }
+
+    fn continue_split_payload(&mut self) -> Result<(), StreamDecoderError> {
+        let payload_len = self.payload_len();
+        let sequence_id = self.header[3];
+        let limit = self
+            .max_split_payload_bytes
+            .expect("only a decoder taking split payloads continues one");
+        let payload = self.payload.as_ref().expect("a split payload is open");
+        let expected = payload.last_sequence_id.wrapping_add(1);
+        if sequence_id != expected {
+            return self.fail(StreamDecoderError::SplitPacketOutOfOrder {
+                expected,
+                actual: sequence_id,
+            });
+        }
+        let length = payload.bytes.len() + payload_len;
+        if length > limit {
+            return self.fail(StreamDecoderError::SplitPayloadTooLarge {
+                length,
+                limit,
+                sequence_id,
+            });
+        }
+        let payload = self.payload.as_mut().expect("a split payload is open");
+        payload.last_sequence_id = sequence_id;
+        payload.packet_remaining = payload_len;
+        payload.more_packets_follow = payload_len == MAX_PACKET_PAYLOAD_LEN;
+        Ok(())
     }
 
     fn copy_header(&mut self, input: &[u8]) -> usize {
@@ -243,6 +309,14 @@ pub enum StreamDecoderError {
     BufferBudgetExceeded { length: usize, limit: usize },
     /// A feed would emit more owned packets than its configured output bound.
     PacketsPerFeedExceeded { packets: usize, limit: usize },
+    /// The packet with `sequence_id` would take a split payload past `limit`.
+    SplitPayloadTooLarge {
+        length: usize,
+        limit: usize,
+        sequence_id: u8,
+    },
+    /// A packet continuing a split payload did not take the next number.
+    SplitPacketOutOfOrder { expected: u8, actual: u8 },
 }
 
 impl fmt::Display for StreamDecoderError {
@@ -263,6 +337,18 @@ impl fmt::Display for StreamDecoderError {
             Self::PacketsPerFeedExceeded { packets, limit } => write!(
                 f,
                 "feed would emit {packets} packets, exceeding per-feed limit {limit}"
+            ),
+            Self::SplitPayloadTooLarge {
+                length,
+                limit,
+                sequence_id,
+            } => write!(
+                f,
+                "packet {sequence_id} takes a split payload to {length} bytes, past limit {limit}"
+            ),
+            Self::SplitPacketOutOfOrder { expected, actual } => write!(
+                f,
+                "split payload continued with packet {actual}, expected {expected}"
             ),
         }
     }
@@ -352,21 +438,16 @@ impl PacketWriteQueue {
         self.max_queued_frames
     }
 
-    /// Queues one complete frame after strict codec validation.
+    /// Queues one complete frame after strict validation.
+    ///
+    /// A frame holds one payload, which may be split into full packets and a
+    /// shorter last one the way the wire carries a long row.
     pub fn enqueue(&mut self, frame: Vec<u8>) -> Result<(), PacketWriteQueueError> {
         if self.terminal {
             return Err(PacketWriteQueueError::Terminal);
         }
-        let packet = match self.codec.decode(&frame) {
-            Ok(packet) => packet,
-            Err(error) => {
-                return self.fail(PacketWriteQueueError::PacketCodec(error));
-            }
-        };
-        if packet.payload.len() == MAX_PACKET_PAYLOAD_LEN {
-            return self.fail(PacketWriteQueueError::ContinuationPacketUnsupported {
-                sequence_id: packet.sequence_id,
-            });
+        if let Err(error) = split_payload_packet_count(&frame) {
+            return self.fail(PacketWriteQueueError::PacketCodec(error));
         }
         if self.queue.len() >= self.max_queued_frames {
             return Err(PacketWriteQueueError::FrameLimitExceeded {
@@ -409,15 +490,7 @@ impl PacketWriteQueue {
                 });
             }
 
-            let packet = self
-                .codec
-                .decode(&frame)
-                .map_err(PacketWriteQueueError::PacketCodec)?;
-            if packet.payload.len() == MAX_PACKET_PAYLOAD_LEN {
-                return Err(PacketWriteQueueError::ContinuationPacketUnsupported {
-                    sequence_id: packet.sequence_id,
-                });
-            }
+            split_payload_packet_count(&frame).map_err(PacketWriteQueueError::PacketCodec)?;
 
             incoming_bytes = incoming_bytes
                 .checked_add(frame.len())
@@ -643,10 +716,12 @@ mod tests {
             vec![
                 StreamPacket {
                     sequence_id: 7,
+                    last_sequence_id: 7,
                     payload: b"hello".to_vec(),
                 },
                 StreamPacket {
                     sequence_id: 8,
+                    last_sequence_id: 8,
                     payload: b"world".to_vec(),
                 },
             ]
@@ -671,6 +746,7 @@ mod tests {
             decoder.feed(b"bc").unwrap(),
             vec![StreamPacket {
                 sequence_id: 9,
+                last_sequence_id: 9,
                 payload: b"abc".to_vec(),
             }]
         );
@@ -700,10 +776,12 @@ mod tests {
             vec![
                 StreamPacket {
                     sequence_id: u8::MAX,
+                    last_sequence_id: u8::MAX,
                     payload: Vec::new(),
                 },
                 StreamPacket {
                     sequence_id: 0,
+                    last_sequence_id: 0,
                     payload: Vec::new(),
                 },
             ]
@@ -780,6 +858,94 @@ mod tests {
     }
 
     #[test]
+    fn decoder_taking_split_payloads_joins_them_and_keeps_the_last_number() {
+        let mut decoder = PacketStreamDecoder::new(CODEC, 64, 8).unwrap();
+        decoder.take_split_payloads_up_to(MAX_PACKET_PAYLOAD_LEN + 3);
+        let payload = (0..MAX_PACKET_PAYLOAD_LEN + 3)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let wire = crate::encode_split_payload(0, &payload);
+        let mut packets = Vec::new();
+        for chunk in wire.chunks((1 << 20) + 7) {
+            packets.extend(decoder.feed(chunk).unwrap());
+        }
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].sequence_id, 0);
+        assert_eq!(packets[0].last_sequence_id, 1);
+        assert!(packets[0].payload == payload);
+
+        let exact = vec![b'x'; MAX_PACKET_PAYLOAD_LEN];
+        let wire = crate::encode_split_payload(5, &exact);
+        let (full, last) = wire.split_at(wire.len() - PACKET_HEADER_LEN);
+        assert!(decoder.feed(full).unwrap().is_empty());
+        assert!(decoder.has_partial_frame());
+        let packets = decoder.feed(last).unwrap();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].sequence_id, 5);
+        assert_eq!(packets[0].last_sequence_id, 6);
+        assert_eq!(packets[0].payload.len(), MAX_PACKET_PAYLOAD_LEN);
+
+        let packets = decoder.feed(&CODEC.encode(0, b"after").unwrap()).unwrap();
+        assert_eq!(packets[0].payload, b"after");
+        assert_eq!(packets[0].last_sequence_id, 0);
+    }
+
+    #[test]
+    fn decoder_refuses_a_split_payload_at_the_header_that_takes_it_past_the_limit() {
+        let mut decoder = PacketStreamDecoder::new(CODEC, 64, 8).unwrap();
+        decoder.take_split_payloads_up_to(MAX_PACKET_PAYLOAD_LEN + 2);
+        let wire = crate::encode_split_payload(0, &vec![b'x'; MAX_PACKET_PAYLOAD_LEN]);
+        assert!(decoder
+            .feed(&wire[..wire.len() - PACKET_HEADER_LEN])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decoder.feed(&[3, 0, 0, 1]),
+            Err(StreamDecoderError::SplitPayloadTooLarge {
+                length: MAX_PACKET_PAYLOAD_LEN + 3,
+                limit: MAX_PACKET_PAYLOAD_LEN + 2,
+                sequence_id: 1,
+            })
+        );
+        assert!(decoder.is_terminal());
+        assert_eq!(decoder.buffered_payload_bytes(), 0);
+    }
+
+    #[test]
+    fn decoder_refuses_a_split_payload_continued_out_of_order() {
+        let mut decoder = PacketStreamDecoder::new(CODEC, 64, 8).unwrap();
+        decoder.take_split_payloads_up_to(2 * MAX_PACKET_PAYLOAD_LEN);
+        let wire = crate::encode_split_payload(0, &vec![b'x'; MAX_PACKET_PAYLOAD_LEN]);
+        assert!(decoder
+            .feed(&wire[..wire.len() - PACKET_HEADER_LEN])
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decoder.feed(&[0, 0, 0, 2]),
+            Err(StreamDecoderError::SplitPacketOutOfOrder {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert!(decoder.is_terminal());
+    }
+
+    #[test]
+    fn writer_takes_a_frame_holding_a_split_payload() {
+        let mut writer = PacketWriteQueue::new(CODEC, 2 * MAX_PACKET_PAYLOAD_LEN, 2).unwrap();
+        let frame = crate::encode_split_payload(1, &vec![b'x'; MAX_PACKET_PAYLOAD_LEN]);
+        writer.enqueue_batch(vec![frame.clone()]).unwrap();
+        assert_eq!(writer.queued_bytes(), frame.len());
+        let without_last = frame[..frame.len() - PACKET_HEADER_LEN].to_vec();
+        assert_eq!(
+            writer.enqueue(without_last),
+            Err(PacketWriteQueueError::PacketCodec(
+                PacketCodecError::TruncatedHeader { actual: 0 }
+            ))
+        );
+    }
+
+    #[test]
     fn decoder_requires_a_nonzero_packets_per_feed_limit() {
         assert_eq!(
             PacketStreamDecoder::new(CODEC, 64, 0),
@@ -810,6 +976,7 @@ mod tests {
             decoder.feed(&CODEC.encode(4, b"ok").unwrap()).unwrap(),
             vec![StreamPacket {
                 sequence_id: 4,
+                last_sequence_id: 4,
                 payload: b"ok".to_vec(),
             }]
         );

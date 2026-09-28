@@ -1547,7 +1547,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn packet_codec() -> crate::PacketCodec {
-        crate::PacketCodec::new(crate::MAX_COMMAND_PAYLOAD_LENGTH).unwrap()
+        crate::PacketCodec::new(crate::MAX_PACKET_PAYLOAD_LEN).unwrap()
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1568,7 +1568,6 @@ mod tests {
         stream.read_exact(&mut header).unwrap();
         let payload_length =
             usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-        assert!(payload_length <= crate::MAX_COMMAND_PAYLOAD_LENGTH);
         let mut frame = vec![0; PACKET_HEADER_LEN + payload_length];
         frame[..PACKET_HEADER_LEN].copy_from_slice(&header);
         stream.read_exact(&mut frame[PACKET_HEADER_LEN..]).unwrap();

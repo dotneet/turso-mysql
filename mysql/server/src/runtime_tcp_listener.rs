@@ -1319,14 +1319,13 @@ mod tests {
         AccountStoreCheckpoint, AccountStoreCheckpointAuthority, AccountStoreCheckpointRequest,
         AuthMoreData, AuthMoreDataKind, AuthOkPacket, CheckpointAuthorityId, CheckpointPersistence,
         CheckpointReadError, ClientHandshakeResponseConfig, ClientSslRequestConfig,
-        ColumnCountPacket, ColumnDefinitionPacket, DatabasePrivileges, GlobalPrivileges,
+        ColumnCountPacket, ColumnDefinitionPacket, DatabasePrivileges, ErrPacket, GlobalPrivileges,
         InitialHandshake, OfflineAccountProvisioner, PacketCodec, ProtectedPassword,
         ResponseOkPacket, ResultTerminatorPacket, RuntimeConfig, RuntimeLimits, RuntimeTimeouts,
         TcpConfig, TextRowPacket, TextRowValue, TlsConfig, CACHING_SHA2_PASSWORD_PLUGIN,
         CLIENT_DEPRECATE_EOF, CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL, COMMAND_SEQUENCE_ID,
-        COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, DEFAULT_UTF8MB4_COLLATION,
-        MAX_COMMAND_PAYLOAD_LENGTH, MIN_WRITE_LIMIT, PACKET_HEADER_LEN,
-        REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
+        COM_INIT_DB, COM_PING, COM_QUERY, COM_QUIT, DEFAULT_UTF8MB4_COLLATION, MIN_WRITE_LIMIT,
+        PACKET_HEADER_LEN, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
 
     struct TestCheckpointReader {
@@ -1397,6 +1396,48 @@ mod tests {
         tls_timeout: Duration,
         maximum: usize,
     ) -> ProtocolRuntime {
+        protocol_runtime_with(
+            RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).expect("test limits"),
+            RuntimeTimeouts::new(
+                Duration::from_secs(1),
+                tls_timeout,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            )
+            .expect("test timeouts")
+            .with_query_timeout(Duration::from_secs(1))
+            .expect("query timeout"),
+            maximum,
+        )
+    }
+
+    /// A runtime that can take and send payloads longer than one packet, and
+    /// has the time to.
+    fn protocol_runtime_for_long_payloads() -> ProtocolRuntime {
+        protocol_runtime_with(
+            RuntimeLimits::new(4, 4, 32 * 1024 * 1024, 16).expect("test limits"),
+            RuntimeTimeouts::new(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            )
+            .expect("test timeouts")
+            .with_query_timeout(Duration::from_secs(60))
+            .expect("query timeout"),
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+        )
+    }
+
+    fn protocol_runtime_with(
+        limits: RuntimeLimits,
+        timeouts: RuntimeTimeouts,
+        maximum: usize,
+    ) -> ProtocolRuntime {
         let data_root = private_directory();
         let account_root = private_directory();
         let mut password = b"secret".to_vec();
@@ -1437,18 +1478,8 @@ mod tests {
             account_root.path().canonicalize().expect("account root"),
             CheckpointAuthorityId::new("runtime-checkpoints").expect("authority ID"),
             Duration::from_secs(1),
-            RuntimeLimits::new(4, 4, MIN_WRITE_LIMIT, 16).expect("test limits"),
-            RuntimeTimeouts::new(
-                Duration::from_secs(1),
-                tls_timeout,
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-            )
-            .expect("test timeouts")
-            .with_query_timeout(Duration::from_secs(1))
-            .expect("query timeout"),
+            limits,
+            timeouts,
         )
         .expect("test runtime config")
         .with_max_prepared_statement_count(maximum)
@@ -1478,7 +1509,7 @@ mod tests {
     }
 
     fn packet_codec() -> PacketCodec {
-        PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH).expect("test codec")
+        PacketCodec::new(crate::MAX_PACKET_PAYLOAD_LEN).expect("test codec")
     }
 
     fn read_frame(stream: &mut impl Read) -> Vec<u8> {
@@ -1486,7 +1517,6 @@ mod tests {
         stream.read_exact(&mut header).expect("frame header");
         let payload_length =
             usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-        assert!(payload_length <= MAX_COMMAND_PAYLOAD_LENGTH);
         let mut frame = vec![0; PACKET_HEADER_LEN + payload_length];
         frame[..PACKET_HEADER_LEN].copy_from_slice(&header);
         stream
@@ -1762,6 +1792,141 @@ mod tests {
             )
             .expect("quit write");
         drop(client);
+        assert!(worker.join().is_ok());
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// Measured on MySQL 8.4.11: a command of 0xFFFFFF bytes or more arrives
+    /// as full packets and a shorter last one; a row that long goes out the
+    /// same way; and a command that reaches `max_allowed_packet` is answered
+    /// 1153 at the header of the packet that reaches it, numbered after that
+    /// packet, and the connection is closed.
+    #[test]
+    fn tls_commands_and_rows_longer_than_one_packet_cross_whole() {
+        let runtime = protocol_runtime_for_long_payloads();
+        let (client, worker) = start_worker(&runtime.listener);
+        let mut client = authenticate_over_tls(client);
+        client
+            .sock
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("client read timeout");
+        client
+            .sock
+            .set_write_timeout(Some(Duration::from_secs(60)))
+            .expect("client write timeout");
+        let codec = packet_codec();
+        let capabilities =
+            REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL | CLIENT_DEPRECATE_EOF;
+        let run = |client: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+                   sql: &[u8]| {
+            let mut payload = vec![COM_QUERY];
+            payload.extend_from_slice(sql);
+            client
+                .write_all(&crate::encode_split_payload(COMMAND_SEQUENCE_ID, &payload))
+                .expect("query write");
+        };
+
+        let mut init_db = vec![COM_INIT_DB];
+        init_db.extend_from_slice(b"testdb");
+        client
+            .write_all(
+                &codec
+                    .encode(COMMAND_SEQUENCE_ID, &init_db)
+                    .expect("init db"),
+            )
+            .expect("init db write");
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("init db OK");
+        run(
+            &mut client,
+            b"CREATE TABLE posts (id INT PRIMARY KEY, body LONGTEXT)",
+        );
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("create OK");
+
+        let send = |client: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+                    payload: &[u8]| {
+            client
+                .write_all(&crate::encode_split_payload(COMMAND_SEQUENCE_ID, payload))
+                .expect("command write");
+        };
+        let mut prepare = vec![crate::COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"INSERT INTO posts (id, body) VALUES (1, ?)");
+        send(&mut client, &prepare);
+        let prepared =
+            crate::StmtPrepareOkPacket::decode(codec, &read_frame(&mut client)).expect("prepared");
+        ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).expect("parameter");
+        let value = vec![b'y'; crate::MAX_PACKET_PAYLOAD_LEN + 100];
+        let mut long_data = vec![crate::COM_STMT_SEND_LONG_DATA];
+        long_data.extend_from_slice(&prepared.statement_id.to_le_bytes());
+        long_data.extend_from_slice(&0u16.to_le_bytes());
+        long_data.extend_from_slice(&value);
+        send(&mut client, &long_data);
+        let mut execute = vec![crate::COM_STMT_EXECUTE];
+        execute.extend_from_slice(&prepared.statement_id.to_le_bytes());
+        execute.push(crate::CURSOR_TYPE_NO_CURSOR);
+        execute.extend_from_slice(&1u32.to_le_bytes());
+        execute.extend_from_slice(&[0, 1, crate::MYSQL_TYPE_BLOB, 0]);
+        send(&mut client, &execute);
+        let inserted =
+            ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("insert OK");
+        assert_eq!(inserted.sequence_id, 1);
+        assert_eq!(inserted.affected_rows, 1);
+
+        run(&mut client, b"SELECT body FROM posts");
+        assert_eq!(
+            ColumnCountPacket::decode(codec, &read_frame(&mut client))
+                .expect("column count")
+                .column_count,
+            1
+        );
+        ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).expect("column");
+        let first = read_frame(&mut client);
+        assert_eq!(&first[..4], [0xff, 0xff, 0xff, 3]);
+        let last = read_frame(&mut client);
+        assert_eq!(last[3], 4);
+        let mut row = first[4..].to_vec();
+        row.extend_from_slice(&last[4..]);
+        let mut expected = crate::encode_lenenc_integer(value.len() as u64);
+        expected.extend_from_slice(&value);
+        assert!(row == expected, "the row must arrive whole");
+        assert!(matches!(
+            ResultTerminatorPacket::decode(codec, &read_frame(&mut client), capabilities)
+                .expect("result terminator"),
+            ResultTerminatorPacket::Ok(packet) if packet.sequence_id == 5
+        ));
+
+        let full_packet = {
+            let mut packet = vec![0xff, 0xff, 0xff, 0];
+            packet.extend_from_slice(&vec![b' '; crate::MAX_PACKET_PAYLOAD_LEN]);
+            packet
+        };
+        for sequence_id in 0..4 {
+            let mut packet = full_packet.clone();
+            packet[3] = sequence_id;
+            if sequence_id == 0 {
+                packet[4] = COM_QUERY;
+            }
+            client.write_all(&packet).expect("full packet write");
+        }
+        client
+            .write_all(&[4, 0, 0, 4])
+            .expect("header past the limit");
+        let refused = ErrPacket::decode(codec, &read_frame(&mut client), capabilities)
+            .expect("1153 before the payload");
+        assert_eq!(refused.sequence_id, 5);
+        assert_eq!(refused.error_code, 1153);
+        assert_eq!(refused.sql_state, Some(*b"08S01"));
+        assert_eq!(
+            refused.message,
+            b"Got a packet bigger than 'max_allowed_packet' bytes"
+        );
+        let mut rest = Vec::new();
+        assert_eq!(
+            client
+                .read_to_end(&mut rest)
+                .map(|_| rest.len())
+                .unwrap_or(0),
+            0
+        );
         assert!(worker.join().is_ok());
         assert!(runtime.listener.shutdown().drained());
     }

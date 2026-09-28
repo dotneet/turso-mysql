@@ -21,7 +21,8 @@ use crate::{
     ClassicFrame, ClientSslRequest, ClientSslRequestError, InitialHandshakeSettings,
     OrchestratorError, OrchestratorEvent, PacketCodec, PacketCodecError,
     CLIENT_HANDSHAKE_SEQUENCE_ID, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-    MAX_COMMAND_PAYLOAD_LENGTH, PACKET_HEADER_LEN,
+    MAX_ALLOWED_PACKET, MAX_COMMAND_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN,
+    MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH, PACKET_HEADER_LEN,
     SUPPORTED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
 };
 
@@ -154,6 +155,63 @@ fn read_classic_frame<R: DeadlinePacketReader>(
     ClassicFrame::new(codec, frame).map_err(PreTlsPacketError::InvalidPacket)
 }
 
+/// Reads one command, joining a payload that arrives split into full packets.
+///
+/// The payload grows as its bytes arrive rather than by the length a header
+/// declares, so a header alone never makes the server set memory aside.
+fn read_command<R: DeadlinePacketReader>(
+    reader: &mut R,
+    deadline: Instant,
+) -> Result<ClassicFrame, PreTlsPacketError> {
+    let mut payload = Vec::new();
+    let mut first_sequence_id = None;
+    let mut last_sequence_id: Option<u8> = None;
+    loop {
+        let mut header = [0; PACKET_HEADER_LEN];
+        let part = if last_sequence_id.is_none() {
+            ReadPart::Header
+        } else {
+            ReadPart::Payload
+        };
+        read_exact_with_deadline(reader, &mut header, deadline, part)?;
+        let length =
+            usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
+        let sequence_id = header[3];
+        if let Some(last) = last_sequence_id {
+            let expected = last.wrapping_add(1);
+            if sequence_id != expected {
+                return Err(PreTlsPacketError::UnexpectedSequenceId {
+                    actual: sequence_id,
+                    expected,
+                });
+            }
+        }
+        if payload.len() + length > MAX_COMMAND_PAYLOAD_LENGTH {
+            return Err(PreTlsPacketError::CommandTooLarge { sequence_id });
+        }
+        let first_sequence_id = *first_sequence_id.get_or_insert(sequence_id);
+        last_sequence_id = Some(sequence_id);
+        let mut remaining = length;
+        while remaining > 0 {
+            let piece = remaining.min(READ_PIECE_BYTES);
+            let start = payload.len();
+            payload.resize(start + piece, 0);
+            read_exact_with_deadline(reader, &mut payload[start..], deadline, ReadPart::Payload)?;
+            remaining -= piece;
+        }
+        if length < MAX_PACKET_PAYLOAD_LEN {
+            return Ok(ClassicFrame::from_split_payload(
+                first_sequence_id,
+                sequence_id,
+                payload,
+            ));
+        }
+    }
+}
+
+/// The most a command read adds to its payload at once.
+const READ_PIECE_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Copy)]
 enum ReadPart {
     Header,
@@ -204,6 +262,9 @@ pub enum PreTlsPacketError {
     InvalidSslRequest(ClientSslRequestError),
     /// The complete frame did not satisfy the packet codec.
     InvalidPacket(PacketCodecError),
+    /// The packet numbered `sequence_id` would take a command's payload to
+    /// `max_allowed_packet`.
+    CommandTooLarge { sequence_id: u8 },
 }
 
 impl fmt::Display for PreTlsPacketError {
@@ -231,6 +292,10 @@ impl fmt::Display for PreTlsPacketError {
             }
             Self::InvalidSslRequest(error) => write!(f, "invalid SSLRequest: {error}"),
             Self::InvalidPacket(error) => write!(f, "invalid classic packet: {error}"),
+            Self::CommandTooLarge { sequence_id } => write!(
+                f,
+                "packet {sequence_id} takes a command past max_allowed_packet"
+            ),
         }
     }
 }
@@ -393,12 +458,12 @@ impl RuntimeTcpConnection {
         )
         .with_prepared_statement_authority(stream.prepared_statement_authority())
         .with_query_timeout(timeouts.query())
-        .with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, timeouts.idle())
+        .with_bootstrap_settings(MAX_ALLOWED_PACKET, timeouts.idle())
         .with_net_write_timeout(timeouts.write());
         if let Some(administration) = stream.account_administration() {
             factory = factory.with_account_administration(administration);
         }
-        let codec = PacketCodec::new(MAX_COMMAND_PAYLOAD_LENGTH)
+        let codec = PacketCodec::new(MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH)
             .map_err(RuntimeTcpConnectionError::PacketCodec)?;
         let orchestrator = ClassicConnectionOrchestrator::new(
             settings,
@@ -508,8 +573,20 @@ impl RuntimeTcpConnection {
             } else {
                 DeadlineKind::Authentication
             };
-            let Some(frame) = self.read_tls_frame(read_deadline, kind)? else {
-                return Ok(());
+            let frame = match self.read_tls_frame(read_deadline, kind) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => return Ok(()),
+                Err(RuntimeTcpConnectionError::Packet(PreTlsPacketError::CommandTooLarge {
+                    sequence_id,
+                })) => {
+                    self.begin_protocol_work()?;
+                    self.orchestrator
+                        .refuse_packet_too_large(sequence_id)
+                        .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+                    self.flush_tls_writes(Instant::now() + self.timeouts.write())?;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             };
             self.begin_protocol_work()?;
             let event = self
@@ -551,9 +628,14 @@ impl RuntimeTcpConnection {
         deadline: Instant,
         kind: DeadlineKind,
     ) -> Result<Option<ClassicFrame>, RuntimeTcpConnectionError> {
+        let signed_in = matches!(kind, DeadlineKind::Idle);
         let (result, control_write_error) = match self.transport.as_mut() {
             Some(TcpTransport::Tls(tls)) => {
-                let result = read_classic_frame(tls.as_mut(), self.codec, deadline);
+                let result = if signed_in {
+                    read_command(tls.as_mut(), deadline)
+                } else {
+                    read_classic_frame(tls.as_mut(), self.codec, deadline)
+                };
                 (result, tls.take_read_control_write_error())
             }
             Some(TcpTransport::Plain(_)) | None => {
@@ -881,11 +963,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{read_ssl_request_packet, DeadlinePacketReader, PreTlsPacketError};
+    use super::{read_command, read_ssl_request_packet, DeadlinePacketReader, PreTlsPacketError};
     use crate::{
         ClientSslRequestConfig, ClientSslRequestError, PacketCodec, CLIENT_HANDSHAKE_SEQUENCE_ID,
         CLIENT_PLUGIN_AUTH, CLIENT_SSL, CLIENT_SSL_REQUEST_PAYLOAD_LENGTH,
-        DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH,
+        DEFAULT_UTF8MB4_COLLATION, MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH, MAX_PACKET_PAYLOAD_LEN,
         MIN_SERVER_RESPONSE_PAYLOAD_LENGTH, REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES,
     };
 
@@ -1213,6 +1295,135 @@ mod tests {
             Err(PreTlsPacketError::InvalidSslRequest(
                 ClientSslRequestError::NonZeroReservedBytes
             ))
+        );
+    }
+
+    /// Serves packets of the given sequence numbers and lengths, each payload
+    /// all spaces, without holding the payloads.
+    struct PacketsReader {
+        packets: VecDeque<(u8, usize)>,
+        header: Option<Vec<u8>>,
+        payload_left: usize,
+        after: Vec<u8>,
+    }
+
+    impl PacketsReader {
+        fn new(packets: &[(u8, usize)], after: &[u8]) -> Self {
+            Self {
+                packets: packets.iter().copied().collect(),
+                header: None,
+                payload_left: 0,
+                after: after.to_vec(),
+            }
+        }
+
+        fn unread(&self) -> (usize, usize) {
+            (self.packets.len(), self.payload_left)
+        }
+    }
+
+    impl DeadlinePacketReader for PacketsReader {
+        fn read_with_deadline(
+            &mut self,
+            buffer: &mut [u8],
+            _deadline: Instant,
+        ) -> io::Result<usize> {
+            if let Some(header) = self.header.as_mut() {
+                let count = header.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&header[..count]);
+                header.drain(..count);
+                if header.is_empty() {
+                    self.header = None;
+                }
+                return Ok(count);
+            }
+            if self.payload_left > 0 {
+                let count = self.payload_left.min(buffer.len());
+                buffer[..count].fill(b' ');
+                self.payload_left -= count;
+                return Ok(count);
+            }
+            if let Some((sequence_id, length)) = self.packets.pop_front() {
+                self.header = Some(vec![
+                    length as u8,
+                    (length >> 8) as u8,
+                    (length >> 16) as u8,
+                    sequence_id,
+                ]);
+                self.payload_left = length;
+                return self.read_with_deadline(buffer, _deadline);
+            }
+            let count = self.after.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&self.after[..count]);
+            self.after.drain(..count);
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn a_command_split_into_full_packets_is_read_whole() {
+        let mut reader = PacketsReader::new(
+            &[(0, MAX_PACKET_PAYLOAD_LEN), (1, 0)],
+            b"\x01\x00\x00\x00\x0e",
+        );
+        let frame = read_command(&mut reader, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(frame.sequence_id(), 0);
+        assert_eq!(frame.response_sequence_id(), 2);
+        assert_eq!(frame.payload().len(), MAX_PACKET_PAYLOAD_LEN);
+
+        let ping = read_command(&mut reader, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(ping.payload(), [crate::COM_PING]);
+        assert_eq!(ping.response_sequence_id(), 1);
+    }
+
+    /// Measured on MySQL 8.4.11: a query of 67108863 bytes runs, and at the
+    /// header of the packet that takes one to 67108864 the server answers
+    /// 1153 without waiting for that packet's payload.
+    #[test]
+    fn a_command_reaching_max_allowed_packet_is_refused_at_the_header_that_reaches_it() {
+        let full = MAX_PACKET_PAYLOAD_LEN;
+        let longest_last = crate::MAX_COMMAND_PAYLOAD_LENGTH - 4 * full;
+        let mut reader = PacketsReader::new(
+            &[
+                (0, full),
+                (1, full),
+                (2, full),
+                (3, full),
+                (4, longest_last),
+            ],
+            b"",
+        );
+        let frame = read_command(&mut reader, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert_eq!(frame.payload().len(), crate::MAX_COMMAND_PAYLOAD_LENGTH);
+        assert_eq!(frame.response_sequence_id(), 5);
+        drop(frame);
+
+        let mut reader = PacketsReader::new(
+            &[
+                (0, full),
+                (1, full),
+                (2, full),
+                (3, full),
+                (4, longest_last + 1),
+            ],
+            b"",
+        );
+        assert_eq!(
+            read_command(&mut reader, Instant::now() + Duration::from_secs(5)).map(|_| ()),
+            Err(PreTlsPacketError::CommandTooLarge { sequence_id: 4 })
+        );
+        assert_eq!(reader.unread(), (0, longest_last + 1));
+    }
+
+    #[test]
+    fn a_split_command_continued_out_of_order_is_refused() {
+        let mut reader = PacketsReader::new(&[(0, MAX_PACKET_PAYLOAD_LEN), (2, 1)], b"");
+        assert_eq!(
+            read_command(&mut reader, Instant::now() + Duration::from_secs(5)).map(|_| ()),
+            Err(PreTlsPacketError::UnexpectedSequenceId {
+                actual: 2,
+                expected: 1,
+            })
         );
     }
 

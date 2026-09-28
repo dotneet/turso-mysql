@@ -16,42 +16,80 @@ use crate::{
     TransportSecurity, CLIENT_SSL,
 };
 
-/// A complete, owned classic MySQL packet frame.
+/// One complete, owned client payload.
 ///
-/// Construction validates the four-byte header, declared payload length, and
-/// configured payload limit. A stream decoder belongs outside the
-/// orchestrator; this type intentionally cannot represent a partial frame.
+/// Construction from a packet validates the four-byte header, declared payload
+/// length, and configured payload limit. A stream decoder belongs outside the
+/// orchestrator; this type intentionally cannot represent a partial frame. A
+/// command's payload may have arrived split into several packets, which the
+/// reader has already joined.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassicFrame {
-    bytes: Vec<u8>,
+    sequence_id: u8,
+    last_sequence_id: u8,
+    payload: Vec<u8>,
 }
 
 impl ClassicFrame {
     /// Validates and owns one complete packet frame.
-    pub fn new(codec: PacketCodec, bytes: Vec<u8>) -> Result<Self, PacketCodecError> {
-        codec.decode(&bytes)?;
-        Ok(Self { bytes })
+    pub fn new(codec: PacketCodec, mut bytes: Vec<u8>) -> Result<Self, PacketCodecError> {
+        let sequence_id = codec.decode(&bytes)?.sequence_id;
+        bytes.drain(..crate::PACKET_HEADER_LEN);
+        Ok(Self {
+            sequence_id,
+            last_sequence_id: sequence_id,
+            payload: bytes,
+        })
     }
 
-    /// Encodes and owns one complete packet frame.
+    /// Owns the payload of one packet after checking it against the codec.
     pub fn from_payload(
         codec: PacketCodec,
         sequence_id: u8,
         payload: &[u8],
     ) -> Result<Self, PacketCodecError> {
+        if payload.len() > codec.max_payload_len() {
+            return Err(PacketCodecError::PayloadTooLarge {
+                length: payload.len(),
+                limit: codec.max_payload_len(),
+            });
+        }
         Ok(Self {
-            bytes: codec.encode(sequence_id, payload)?,
+            sequence_id,
+            last_sequence_id: sequence_id,
+            payload: payload.to_vec(),
         })
     }
 
-    /// Returns the complete frame bytes for transport output or inspection.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+    /// Owns a payload a reader joined from the packets numbered
+    /// `sequence_id` through `last_sequence_id`.
+    pub fn from_split_payload(sequence_id: u8, last_sequence_id: u8, payload: Vec<u8>) -> Self {
+        Self {
+            sequence_id,
+            last_sequence_id,
+            payload,
+        }
     }
 
-    /// Returns the owned complete frame bytes.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    /// Returns the sequence number of the first packet.
+    pub const fn sequence_id(&self) -> u8 {
+        self.sequence_id
+    }
+
+    /// Returns the sequence number the answer to this payload starts from.
+    pub const fn response_sequence_id(&self) -> u8 {
+        self.last_sequence_id.wrapping_add(1)
+    }
+
+    /// Returns the payload, joined when it arrived split.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// Returns the packet a client sends before it has signed in, which is
+    /// never split.
+    fn sign_in_packet(&self) -> Vec<u8> {
+        crate::encode_split_payload(self.sequence_id, &self.payload)
     }
 }
 
@@ -90,6 +128,8 @@ pub enum OrchestratorError {
     ExecutorFactoryMissing,
     /// A ready command arrived without an executor installed after auth.
     ExecutorNotInstalled,
+    /// A payload too long to take was reported before the client signed in.
+    PacketTooLargeBeforeSignIn,
 }
 
 impl From<ConnectionStateError> for OrchestratorError {
@@ -119,6 +159,9 @@ impl fmt::Display for OrchestratorError {
                 f.write_str("authenticated executor factory is missing")
             }
             Self::ExecutorNotInstalled => f.write_str("authenticated executor is not installed"),
+            Self::PacketTooLargeBeforeSignIn => {
+                f.write_str("a payload too long to take arrived before sign-in")
+            }
         }
     }
 }
@@ -204,7 +247,7 @@ where
         let codec = PacketCodec::new(
             crate::MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH
                 .max(crate::MAX_CLIENT_HANDSHAKE_RESPONSE_PAYLOAD_LENGTH)
-                .max(crate::MAX_COMMAND_PAYLOAD_LENGTH),
+                .max(crate::MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH),
         )?;
         let connection = ClassicConnection::with_codec(settings, codec, transport_security)?;
         let write_queue = PacketWriteQueue::new(codec, max_queued_bytes, max_queued_frames)
@@ -288,7 +331,7 @@ where
         &mut self,
         frame: ClassicFrame,
     ) -> Result<OrchestratorEvent, OrchestratorError> {
-        let result = self.receive_frame_inner(frame.as_bytes());
+        let result = self.receive_frame_inner(&frame);
         match result {
             Ok(event) => {
                 if matches!(
@@ -301,6 +344,34 @@ where
             }
             Err(error) => self.fail(error),
         }
+    }
+
+    /// Answers a client whose payload would reach `max_allowed_packet`, and
+    /// starts closing.
+    ///
+    /// Measured on MySQL 8.4.11: as soon as the header of the packet that
+    /// takes a payload that far arrives, MySQL answers 1153 numbered after
+    /// that packet and closes the connection, without reading the rest.
+    /// `sequence_id` is the number of that packet.
+    pub fn refuse_packet_too_large(
+        &mut self,
+        sequence_id: u8,
+    ) -> Result<OrchestratorEvent, OrchestratorError> {
+        if self.connection.state() != ConnectionState::Ready {
+            return self.fail(OrchestratorError::PacketTooLargeBeforeSignIn);
+        }
+        let result = self.encode_error(
+            crate::FrontendErrorKind::PacketTooLarge,
+            sequence_id.wrapping_add(1),
+        );
+        let frame = match result {
+            Ok(frame) => frame,
+            Err(error) => return self.fail(error),
+        };
+        if let Err(error) = self.write_queue.enqueue_batch([frame]) {
+            return self.fail(OrchestratorError::WriteQueue(error));
+        }
+        self.close()
     }
 
     /// Supplies the bounded SSLRequest that precedes an external TLS handshake.
@@ -375,11 +446,12 @@ where
 
     fn receive_frame_inner(
         &mut self,
-        frame: &[u8],
+        frame: &ClassicFrame,
     ) -> Result<OrchestratorEvent, OrchestratorError> {
         match self.connection.state() {
             ConnectionState::AwaitClientResponse | ConnectionState::TlsNegotiated => {
-                self.connection.receive_client_handshake_frame(frame)?;
+                self.connection
+                    .receive_client_handshake_frame(&frame.sign_in_packet())?;
                 if self.connection.state() == ConnectionState::TlsUpgradeRequired {
                     return Ok(self.event());
                 }
@@ -388,18 +460,25 @@ where
                 }
                 self.authenticate_initial()?;
             }
-            ConnectionState::AuthenticateFull => self.authenticate_full(frame)?,
+            ConnectionState::AuthenticateFull => {
+                self.authenticate_full(&frame.sign_in_packet())?;
+            }
             ConnectionState::Ready => {
                 let executor = self
                     .executor
                     .as_mut()
                     .ok_or(OrchestratorError::ExecutorNotInstalled)?;
-                let frames = self
-                    .dispatcher
-                    .dispatch(&mut self.connection, executor, frame)?;
-                self.write_queue
-                    .enqueue_batch(frames)
-                    .map_err(OrchestratorError::WriteQueue)?;
+                let packet = crate::Packet {
+                    sequence_id: frame.sequence_id(),
+                    payload: frame.payload(),
+                };
+                let frames = self.dispatcher.dispatch_packet(
+                    &mut self.connection,
+                    executor,
+                    packet,
+                    frame.response_sequence_id(),
+                )?;
+                self.queue_answer(frames, frame.response_sequence_id())?;
             }
             state => {
                 return Err(OrchestratorError::Connection(
@@ -411,6 +490,55 @@ where
             }
         }
         Ok(self.event())
+    }
+
+    /// Queues an answer, or an error in its place when the answer is longer
+    /// than the whole write queue holds.
+    ///
+    /// The queue is empty while a command runs, since each answer is written
+    /// out before the next command is read, so an answer that does not fit
+    /// now never will. Only a result set can be that long; answering 1235 for
+    /// it, as for any other result this server will not send, keeps the
+    /// connection where dropping it would leave the client with no reason.
+    fn queue_answer(
+        &mut self,
+        frames: Vec<Vec<u8>>,
+        response_sequence_id: u8,
+    ) -> Result<(), OrchestratorError> {
+        match self.write_queue.enqueue_batch(frames) {
+            Ok(()) => Ok(()),
+            Err(
+                PacketWriteQueueError::ByteLimitExceeded { .. }
+                | PacketWriteQueueError::FrameLimitExceeded { .. },
+            ) if self.write_queue.queued_frames() == 0 => {
+                let error =
+                    self.encode_error(crate::FrontendErrorKind::Unsupported, response_sequence_id)?;
+                self.write_queue
+                    .enqueue_batch([error])
+                    .map_err(OrchestratorError::WriteQueue)
+            }
+            Err(error) => Err(OrchestratorError::WriteQueue(error)),
+        }
+    }
+
+    fn encode_error(
+        &self,
+        kind: crate::FrontendErrorKind,
+        sequence_id: u8,
+    ) -> Result<Vec<u8>, OrchestratorError> {
+        let capabilities =
+            self.connection
+                .negotiated_capabilities()
+                .ok_or(OrchestratorError::Dispatch(
+                    CommandDispatcherError::NegotiatedCapabilitiesRequired,
+                ))?;
+        crate::map_frontend_error(kind)
+            .encode(
+                self.connection.response_packet_codec(),
+                sequence_id,
+                capabilities,
+            )
+            .map_err(|error| OrchestratorError::Dispatch(CommandDispatcherError::Response(error)))
     }
 
     fn authenticate_initial(&mut self) -> Result<(), OrchestratorError> {
@@ -619,8 +747,19 @@ mod tests {
 
         fn execute_query(
             &mut self,
-            _sql: &str,
+            sql: &str,
         ) -> Result<CommandExecutionResult, crate::FrontendErrorKind> {
+            if sql == "SELECT twelve_rows" {
+                return Ok(CommandExecutionResult::ResultSet(crate::TextResultSet {
+                    columns: vec![crate::ColumnDefinitionConfig::new(
+                        "value",
+                        crate::MYSQL_TYPE_VAR_STRING,
+                    )],
+                    rows: vec![vec![Some(b"row".to_vec())]; 12],
+                    warnings: 0,
+                    status_flags: crate::SERVER_STATUS_AUTOCOMMIT,
+                }));
+            }
             Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
         }
     }
@@ -1955,6 +2094,73 @@ mod tests {
         let response = orchestrator.front_write().unwrap().to_vec();
         assert_eq!(CODEC.decode(&response).unwrap().sequence_id, 1);
         assert_eq!(response[4], crate::AUTH_OK_HEADER);
+    }
+
+    #[test]
+    fn a_result_longer_than_the_write_queue_is_answered_with_an_error() {
+        let mut orchestrator = orchestrator(None);
+        while let Some(front) = orchestrator.front_write() {
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        let mut query = vec![crate::COM_QUERY];
+        query.extend_from_slice(b"SELECT twelve_rows");
+        let query = ClassicFrame::from_payload(CODEC, crate::COMMAND_SEQUENCE_ID, &query).unwrap();
+        assert_eq!(
+            orchestrator.receive_frame(query).unwrap(),
+            OrchestratorEvent::Ready
+        );
+        let response = orchestrator.front_write().unwrap().to_vec();
+        let error = crate::ErrPacket::decode(CODEC, &response, crate::CLIENT_PROTOCOL_41).unwrap();
+        assert_eq!(error.sequence_id, 1);
+        assert_eq!(error.error_code, 1235);
+        let len = response.len();
+        orchestrator.advance_write(len).unwrap();
+        assert_eq!(orchestrator.front_write(), None);
+    }
+
+    #[test]
+    fn a_command_reaching_max_allowed_packet_is_answered_1153_and_closes() {
+        let mut orchestrator = orchestrator(None);
+        while let Some(front) = orchestrator.front_write() {
+            let len = front.len();
+            orchestrator.advance_write(len).unwrap();
+        }
+        assert_eq!(
+            orchestrator.refuse_packet_too_large(4).unwrap(),
+            OrchestratorEvent::Closing
+        );
+        let response = orchestrator.front_write().unwrap().to_vec();
+        let error = crate::ErrPacket::decode(CODEC, &response, crate::CLIENT_PROTOCOL_41).unwrap();
+        assert_eq!(error.sequence_id, 5);
+        assert_eq!(error.error_code, 1153);
+        assert_eq!(error.sql_state, Some(*b"08S01"));
+        assert_eq!(
+            error.message,
+            b"Got a packet bigger than 'max_allowed_packet' bytes"
+        );
+    }
+
+    #[test]
+    fn a_payload_too_long_before_sign_in_closes_without_an_answer() {
+        let mut orchestrator = ClassicConnectionOrchestrator::with_transport_security(
+            settings(),
+            TransportSecurity::Secure,
+            CachingSha2Verifier::<crate::DefaultCredentialProvider>::default(),
+            TestExecutorFactory,
+            4096,
+            8,
+        )
+        .unwrap();
+        orchestrator.start().unwrap();
+        let greeting = orchestrator.front_write().unwrap().len();
+        orchestrator.advance_write(greeting).unwrap();
+        assert_eq!(
+            orchestrator.refuse_packet_too_large(1),
+            Err(OrchestratorError::PacketTooLargeBeforeSignIn)
+        );
+        assert_eq!(orchestrator.state(), ConnectionState::Closing);
+        assert_eq!(orchestrator.front_write(), None);
     }
 
     #[test]

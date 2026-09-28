@@ -16,6 +16,7 @@ use std::sync::{
 use super::catalog_results::{
     database_list_column, information_schema_columns_columns, information_schema_schemata_column,
     show_column_extra, show_columns_columns, show_default_at_scale, show_tables_column,
+    MAX_CATALOG_VALUE_LENGTH,
 };
 use super::*;
 #[cfg(unix)]
@@ -12215,7 +12216,7 @@ fn bootstrap_settings_round_positive_idle_durations_up_to_seconds() {
 #[test]
 fn direct_adapter_serves_the_typed_driver_bootstrap_result() {
     let mut adapter =
-        adapter().with_bootstrap_settings(MAX_COMMAND_PAYLOAD_LENGTH, Duration::from_millis(1500));
+        adapter().with_bootstrap_settings(crate::MAX_ALLOWED_PACKET, Duration::from_millis(1500));
     let CommandExecutionResult::ResultSet(result) = adapter
         .execute_query("SELECT @@max_allowed_packet,@@wait_timeout")
         .unwrap()
@@ -12237,7 +12238,7 @@ fn direct_adapter_serves_the_typed_driver_bootstrap_result() {
     assert_eq!(
         result.rows,
         vec![vec![
-            Some(MAX_COMMAND_PAYLOAD_LENGTH.to_string().into_bytes()),
+            Some(crate::MAX_ALLOWED_PACKET.to_string().into_bytes()),
             Some(b"2".to_vec()),
         ]]
     );
@@ -12636,6 +12637,37 @@ fn direct_adapter_drops_long_data_for_unknown_statement_flood() {
         adapter.execute_stmt_execute(100_000, &[]),
         Err(FrontendErrorKind::UnknownPreparedStatement)
     );
+}
+
+/// Measured on MySQL 8.4.11: a parameter sent as long data of exactly
+/// `max_allowed_packet` bytes is taken, and one a byte longer answers 1105
+/// when the statement is executed.
+#[test]
+fn long_data_is_held_to_max_allowed_packet_and_answers_1105_past_it() {
+    let mut adapter = adapter();
+    adapter
+        .execute_query("CREATE TABLE long_notes (id INT PRIMARY KEY, body LONGBLOB)")
+        .unwrap();
+    let prepared = adapter
+        .execute_stmt_prepare("INSERT INTO long_notes (id, body) VALUES (1, ?)")
+        .unwrap();
+    let blob = [0, 1, MYSQL_TYPE_BLOB, 0];
+    let longest = vec![b'z'; crate::MAX_ALLOWED_PACKET];
+    adapter.execute_stmt_send_long_data(prepared.statement_id, 0, &longest);
+    let Ok(PreparedStatementExecutionResult::Ok(inserted)) =
+        adapter.execute_stmt_execute(prepared.statement_id, &blob)
+    else {
+        panic!("long data of exactly max_allowed_packet bytes must be taken");
+    };
+    assert_eq!(inserted.affected_rows, 1);
+
+    adapter.execute_stmt_send_long_data(prepared.statement_id, 0, &longest);
+    adapter.execute_stmt_send_long_data(prepared.statement_id, 0, b"z");
+    assert_eq!(
+        adapter.execute_stmt_execute(prepared.statement_id, &blob),
+        Err(FrontendErrorKind::LongDataTooLarge)
+    );
+    assert_eq!(adapter.pending_long_data.retained_bytes, 0);
 }
 
 #[test]
@@ -18078,7 +18110,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         Err(FrontendErrorKind::Internal)
     );
 
-    let oversized_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH);
+    let oversized_default = "x".repeat(MAX_CATALOG_VALUE_LENGTH);
     adapter
         .execute_query(&format!(
             "CREATE TABLE oversized_default (value TEXT DEFAULT '{oversized_default}')"
@@ -18100,7 +18132,7 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         Err(FrontendErrorKind::Internal)
     );
 
-    let packet_bound_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19);
+    let packet_bound_default = "x".repeat(MAX_CATALOG_VALUE_LENGTH - 19);
     adapter
         .execute_query(&format!(
             "CREATE TABLE packet_bound (value TEXT DEFAULT '{packet_bound_default}')"
@@ -18127,15 +18159,13 @@ fn show_columns_rejects_unencodable_results_before_dispatch() {
         .unwrap()
         .list_columns(&MySqlTableName::parse("retained").unwrap())
         .unwrap();
-    assert_eq!(
-        show_columns_result(
-            vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
-            SERVER_STATUS_AUTOCOMMIT,
-            false,
-            b"select",
-        ),
-        Err(FrontendErrorKind::Internal)
-    );
+    assert!(show_columns_result(
+        vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
+        SERVER_STATUS_AUTOCOMMIT,
+        false,
+        b"select",
+    )
+    .is_ok());
 }
 
 #[cfg(unix)]
@@ -20586,7 +20616,7 @@ fn connector_j_reserved_keywords_match_mysql_84() {
         .iter()
         .any(|row| row[0].as_deref() == Some(b"QUALIFY")));
 
-    let codec = PacketCodec::new(crate::MAX_COMMAND_PAYLOAD_LENGTH).unwrap();
+    let codec = PacketCodec::new(crate::MAX_SIGN_IN_PACKET_PAYLOAD_LENGTH).unwrap();
     let mut sequence = crate::PacketSequence::new(crate::SERVER_RESPONSE_SEQUENCE_ID);
     let mut frames = vec![
         crate::ColumnCountPacket::encode(codec, sequence.next_sequence_id(), 1).unwrap(),
@@ -20605,7 +20635,6 @@ fn connector_j_reserved_keywords_match_mysql_84() {
     for row in &result.rows {
         frames.push(
             crate::TextRowPacket::encode(
-                codec,
                 sequence.next_sequence_id(),
                 &[TextRowValue::Bytes(row[0].as_deref().unwrap())],
             )
@@ -21287,7 +21316,7 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
         Err(FrontendErrorKind::Internal)
     );
 
-    let oversized_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1);
+    let oversized_default = "x".repeat(MAX_CATALOG_VALUE_LENGTH + 1);
     adapter
         .execute_query(&format!(
             "CREATE TABLE oversized_default (value TEXT DEFAULT '{oversized_default}')"
@@ -21316,7 +21345,7 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
         Err(FrontendErrorKind::Internal)
     );
 
-    let packet_bound_default = "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19);
+    let packet_bound_default = "x".repeat(MAX_CATALOG_VALUE_LENGTH - 19);
     adapter
         .execute_query(&format!(
             "CREATE TABLE packet_bound (value TEXT DEFAULT '{packet_bound_default}')"
@@ -21355,22 +21384,20 @@ fn information_schema_columns_rejects_unencodable_results_before_dispatch() {
         .unwrap()
         .list_columns(&MySqlTableName::parse("retained").unwrap())
         .unwrap();
-    assert_eq!(
-        information_schema_columns_result_to_execution_result(
-            vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
-            &[
-                MySqlInformationSchemaColumnsColumn::ColumnName,
-                MySqlInformationSchemaColumnsColumn::OrdinalPosition,
-                MySqlInformationSchemaColumnsColumn::ColumnDefault,
-                MySqlInformationSchemaColumnsColumn::IsNullable,
-                MySqlInformationSchemaColumnsColumn::ColumnType,
-                MySqlInformationSchemaColumnsColumn::ColumnKey,
-                MySqlInformationSchemaColumnsColumn::Extra,
-            ],
-            SERVER_STATUS_AUTOCOMMIT,
-        ),
-        Err(FrontendErrorKind::Internal)
-    );
+    assert!(information_schema_columns_result_to_execution_result(
+        vec![retained[0].clone(); MAX_DISPATCH_RESULT_ROWS],
+        &[
+            MySqlInformationSchemaColumnsColumn::ColumnName,
+            MySqlInformationSchemaColumnsColumn::OrdinalPosition,
+            MySqlInformationSchemaColumnsColumn::ColumnDefault,
+            MySqlInformationSchemaColumnsColumn::IsNullable,
+            MySqlInformationSchemaColumnsColumn::ColumnType,
+            MySqlInformationSchemaColumnsColumn::ColumnKey,
+            MySqlInformationSchemaColumnsColumn::Extra,
+        ],
+        SERVER_STATUS_AUTOCOMMIT,
+    )
+    .is_ok());
 }
 
 #[cfg(unix)]
@@ -21543,7 +21570,7 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
 
     assert_eq!(
         information_schema_tables_result_to_execution_result(
-            &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1),
+            &"x".repeat(MAX_CATALOG_VALUE_LENGTH + 1),
             tables.clone(),
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
@@ -21556,7 +21583,7 @@ fn information_schema_tables_rejects_results_over_dispatch_bounds() {
     );
     assert_eq!(
         information_schema_tables_result_to_execution_result(
-            &"x".repeat(MAX_TEXT_ROW_VALUE_LENGTH - 19),
+            &"x".repeat(MAX_CATALOG_VALUE_LENGTH - 19),
             tables.clone(),
             &[
                 MySqlInformationSchemaTablesColumn::TableSchema,
@@ -21942,7 +21969,7 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
         show_tables_result_to_execution_result(
             "reports",
             None,
-            vec!["x".repeat(MAX_TEXT_ROW_VALUE_LENGTH + 1)],
+            vec!["x".repeat(MAX_CATALOG_VALUE_LENGTH + 1)],
             SERVER_STATUS_AUTOCOMMIT,
         ),
         Err(FrontendErrorKind::Internal)
@@ -21952,8 +21979,8 @@ fn show_tables_rejects_unencodable_results_before_dispatch() {
             "reports",
             None,
             vec![
-                "x".repeat(MAX_TEXT_ROW_VALUE_LENGTH);
-                (MAX_FRONTEND_ADAPTER_RESULT_BYTES / MAX_TEXT_ROW_VALUE_LENGTH) + 1
+                "x".repeat(MAX_CATALOG_VALUE_LENGTH);
+                (MAX_FRONTEND_ADAPTER_RESULT_BYTES / MAX_CATALOG_VALUE_LENGTH) + 1
             ],
             SERVER_STATUS_AUTOCOMMIT,
         ),
@@ -22049,11 +22076,16 @@ fn result_collection_stops_at_the_dispatcher_row_limit() {
 }
 
 #[test]
-fn aggregate_row_payload_is_rejected_before_values_are_copied() {
+fn a_row_longer_than_four_kilobytes_is_read_back_whole() {
     let mut adapter = adapter();
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        adapter.execute_query("SELECT left_value, right_value FROM wide_values")
+    else {
+        panic!("a row of two 2048-byte values must be read back");
+    };
     assert_eq!(
-        adapter.execute_query("SELECT left_value, right_value FROM wide_values"),
-        Err(FrontendErrorKind::Unsupported)
+        result.rows,
+        vec![vec![Some(vec![0; 2048]), Some(vec![0; 2048])]]
     );
 }
 

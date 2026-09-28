@@ -298,10 +298,17 @@ pub const MAX_RESULT_COLUMNS: usize = 256;
 pub const MAX_COLUMN_TEXT_LENGTH: usize = 1024;
 /// Maximum length of an ERR message under the protocol-4.1 layout.
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH - 9;
+/// Maximum payload of one result row.
+///
+/// A row is as long as the values in it, as in MySQL, which sends a row of
+/// 0xFFFFFF bytes or more split into packets of 0xFFFFFF bytes. It is held to
+/// the longest command a client may send, so a value a client could write can
+/// be read back.
+pub const MAX_ROW_PAYLOAD_LENGTH: usize = crate::MAX_COMMAND_PAYLOAD_LENGTH;
 /// Maximum length of one binary-safe text-row value.
-pub const MAX_TEXT_ROW_VALUE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
+pub const MAX_TEXT_ROW_VALUE_LENGTH: usize = MAX_ROW_PAYLOAD_LENGTH;
 /// Maximum length of one binary-protocol row value.
-pub const MAX_BINARY_ROW_VALUE_LENGTH: usize = MAX_RESPONSE_PACKET_PAYLOAD_LENGTH;
+pub const MAX_BINARY_ROW_VALUE_LENGTH: usize = MAX_ROW_PAYLOAD_LENGTH;
 
 /// Maximum packet sequence number before the protocol-defined wrap to zero.
 pub const MAX_PACKET_SEQUENCE_ID: u8 = u8::MAX;
@@ -420,6 +427,13 @@ pub enum FrontendErrorKind {
     MissingRequiredDefault,
     /// The configured statement execution deadline elapsed.
     QueryTimeout,
+    /// A command's payload would reach `max_allowed_packet`.
+    PacketTooLarge,
+    /// A `SET` named the session's `max_allowed_packet`.
+    SessionMaxAllowedPacketIsReadOnly,
+    /// A prepared statement's parameter sent with `COM_STMT_SEND_LONG_DATA`
+    /// ran past `max_allowed_packet`.
+    LongDataTooLarge,
     /// The statement or feature is not implemented.
     Unsupported,
     /// Authentication failed without exposing credential details.
@@ -649,6 +663,27 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::QueryTimeout => {
             (3024, *b"HY000", b"query execution time exceeded".as_slice())
         }
+        // Measured on MySQL 8.4.11, message and all.
+        FrontendErrorKind::PacketTooLarge => (
+            1153,
+            *b"08S01",
+            b"Got a packet bigger than 'max_allowed_packet' bytes".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11, message and all.
+        FrontendErrorKind::SessionMaxAllowedPacketIsReadOnly => (
+            1621,
+            *b"HY000",
+            b"SESSION variable 'max_allowed_packet' is read-only. Use SET GLOBAL to assign the value"
+                .as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: answered by the `COM_STMT_EXECUTE` that
+        // follows, message and all.
+        FrontendErrorKind::LongDataTooLarge => (
+            1105,
+            *b"HY000",
+            b"Parameter of prepared statement which is set through mysql_send_long_data() is longer than 'max_allowed_packet' bytes"
+                .as_slice(),
+        ),
         FrontendErrorKind::Unsupported => (1235, *b"42000", b"feature not supported".as_slice()),
         FrontendErrorKind::Authentication => (1045, *b"28000", b"access denied".as_slice()),
         FrontendErrorKind::AccessDenied => (1045, *b"28000", b"access denied".as_slice()),
@@ -1185,9 +1220,9 @@ pub struct BinaryRowPacket<'a> {
 }
 
 impl<'a> BinaryRowPacket<'a> {
-    /// Encodes one bounded binary-protocol row.
+    /// Encodes one bounded binary-protocol row, split into packets when it is
+    /// 0xFFFFFF bytes or longer.
     pub fn encode(
-        codec: PacketCodec,
         sequence_id: u8,
         values: &[BinaryRowValue<'a>],
     ) -> Result<Vec<u8>, ResponsePacketError> {
@@ -1198,7 +1233,7 @@ impl<'a> BinaryRowPacket<'a> {
                 .checked_add(null_bitmap_length)
                 .ok_or(ResponsePacketError::PayloadTooLarge {
                     length: usize::MAX,
-                    limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                    limit: MAX_ROW_PAYLOAD_LENGTH,
                 })?;
         for value in values {
             let length = binary_row_value_encoded_len(*value)?;
@@ -1207,10 +1242,10 @@ impl<'a> BinaryRowPacket<'a> {
                     .checked_add(length)
                     .ok_or(ResponsePacketError::PayloadTooLarge {
                         length: usize::MAX,
-                        limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                        limit: MAX_ROW_PAYLOAD_LENGTH,
                     })?;
         }
-        check_response_payload_length(payload_length)?;
+        check_row_payload_length(payload_length)?;
 
         let mut payload = Vec::with_capacity(payload_length);
         payload.push(BINARY_ROW_HEADER);
@@ -1249,9 +1284,7 @@ impl<'a> BinaryRowPacket<'a> {
             }
         }
         debug_assert_eq!(payload.len(), payload_length);
-        codec
-            .encode(sequence_id, &payload)
-            .map_err(ResponsePacketError::from)
+        Ok(crate::encode_split_payload(sequence_id, &payload))
     }
 
     /// Decodes one bounded binary row using its result-column types.
@@ -1262,7 +1295,7 @@ impl<'a> BinaryRowPacket<'a> {
     ) -> Result<Self, ResponsePacketError> {
         validate_column_count(column_types.len())?;
         let packet = codec.decode(frame).map_err(ResponsePacketError::from)?;
-        check_response_payload_length(packet.payload.len())?;
+        check_row_payload_length(packet.payload.len())?;
         let mut reader = ResponseReader::new(packet.payload);
         let header = reader.read_u8("binary-row header")?;
         if header != BINARY_ROW_HEADER {
@@ -1344,9 +1377,9 @@ pub struct TextRowPacket<'a> {
 }
 
 impl<'a> TextRowPacket<'a> {
-    /// Encodes one binary-safe text row.
+    /// Encodes one binary-safe text row, split into packets when it is
+    /// 0xFFFFFF bytes or longer.
     pub fn encode(
-        codec: PacketCodec,
         sequence_id: u8,
         values: &[TextRowValue<'a>],
     ) -> Result<Vec<u8>, ResponsePacketError> {
@@ -1367,7 +1400,7 @@ impl<'a> TextRowPacket<'a> {
                         .checked_add(bytes.len())
                         .ok_or(ResponsePacketError::PayloadTooLarge {
                             length: usize::MAX,
-                            limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                            limit: MAX_ROW_PAYLOAD_LENGTH,
                         })?
                 }
             };
@@ -1376,15 +1409,10 @@ impl<'a> TextRowPacket<'a> {
                     .checked_add(length)
                     .ok_or(ResponsePacketError::PayloadTooLarge {
                         length: usize::MAX,
-                        limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                        limit: MAX_ROW_PAYLOAD_LENGTH,
                     })?;
         }
-        if payload_length > MAX_RESPONSE_PACKET_PAYLOAD_LENGTH {
-            return Err(ResponsePacketError::PayloadTooLarge {
-                length: payload_length,
-                limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
-            });
-        }
+        check_row_payload_length(payload_length)?;
         let mut payload = Vec::with_capacity(payload_length);
         for value in values {
             match value {
@@ -1394,9 +1422,7 @@ impl<'a> TextRowPacket<'a> {
                 }
             }
         }
-        codec
-            .encode(sequence_id, &payload)
-            .map_err(ResponsePacketError::from)
+        Ok(crate::encode_split_payload(sequence_id, &payload))
     }
 
     /// Decodes one row with exactly `column_count` values.
@@ -1407,7 +1433,7 @@ impl<'a> TextRowPacket<'a> {
     ) -> Result<Self, ResponsePacketError> {
         validate_column_count(column_count)?;
         let packet = codec.decode(frame).map_err(ResponsePacketError::from)?;
-        check_response_payload_length(packet.payload.len())?;
+        check_row_payload_length(packet.payload.len())?;
         let mut reader = ResponseReader::new(packet.payload);
         let mut values = Vec::with_capacity(column_count);
         for _ in 0..column_count {
@@ -1638,7 +1664,7 @@ impl PacketCodec {
         sequence_id: u8,
         values: &[TextRowValue<'a>],
     ) -> Result<Vec<u8>, ResponsePacketError> {
-        TextRowPacket::encode(self, sequence_id, values)
+        TextRowPacket::encode(sequence_id, values)
     }
 
     /// Decodes one binary-safe text-protocol row.
@@ -1656,7 +1682,7 @@ impl PacketCodec {
         sequence_id: u8,
         values: &[BinaryRowValue<'a>],
     ) -> Result<Vec<u8>, ResponsePacketError> {
-        BinaryRowPacket::encode(self, sequence_id, values)
+        BinaryRowPacket::encode(sequence_id, values)
     }
 
     /// Decodes one binary-protocol result row using its result-column types.
@@ -1919,6 +1945,16 @@ fn validate_column_text(
     }
     if let Some(offset) = value.as_bytes().iter().position(|byte| *byte == 0) {
         return Err(ResponsePacketError::EmbeddedNul { field, offset });
+    }
+    Ok(())
+}
+
+fn check_row_payload_length(length: usize) -> Result<(), ResponsePacketError> {
+    if length > MAX_ROW_PAYLOAD_LENGTH {
+        return Err(ResponsePacketError::PayloadTooLarge {
+            length,
+            limit: MAX_ROW_PAYLOAD_LENGTH,
+        });
     }
     Ok(())
 }
@@ -2266,7 +2302,7 @@ fn binary_row_lenenc_value_len(length: usize) -> Result<usize, ResponsePacketErr
     lenenc_integer_len(length as u64).checked_add(length).ok_or(
         ResponsePacketError::PayloadTooLarge {
             length: usize::MAX,
-            limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+            limit: MAX_ROW_PAYLOAD_LENGTH,
         },
     )
 }
@@ -2567,6 +2603,13 @@ mod tests {
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
+            (FrontendErrorKind::PacketTooLarge, 1153, *b"08S01"),
+            (
+                FrontendErrorKind::SessionMaxAllowedPacketIsReadOnly,
+                1621,
+                *b"HY000",
+            ),
+            (FrontendErrorKind::LongDataTooLarge, 1105, *b"HY000"),
             (FrontendErrorKind::UnknownSystemVariable, 1193, *b"HY000"),
             (FrontendErrorKind::DataTooLong, 1406, *b"22001"),
             (FrontendErrorKind::GroupConcatCut, 1260, *b"HY000"),
@@ -2633,7 +2676,7 @@ mod tests {
             "payload"
         );
         let values = [TextRowValue::Bytes(b"\xff\0binary"), TextRowValue::Null];
-        let row = TextRowPacket::encode(CODEC, 2, &values).unwrap();
+        let row = TextRowPacket::encode(2, &values).unwrap();
         assert_eq!(
             TextRowPacket::decode(CODEC, &row, 2).unwrap().values,
             values
@@ -2649,7 +2692,7 @@ mod tests {
             BinaryRowValue::Bytes(b"\xff\0"),
             BinaryRowValue::String("hi"),
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             frame,
             [
@@ -2684,7 +2727,7 @@ mod tests {
             BinaryRowValue::Int64(i64::MIN),
             BinaryRowValue::Int64(i64::MAX),
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             CODEC.decode(&frame).unwrap().payload,
             [
@@ -2709,7 +2752,7 @@ mod tests {
     #[test]
     fn binary_rows_encode_unsigned_u64_max_without_sign_loss() {
         let values = [BinaryRowValue::UInt64(u64::MAX)];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             CODEC.decode(&frame).unwrap().payload,
             [0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
@@ -2743,7 +2786,7 @@ mod tests {
                 microseconds: 999_999,
             },
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         let payload = CODEC.decode(&frame).unwrap();
         assert_eq!(payload.payload[2], 12);
         assert_eq!(payload.payload[15], 11);
@@ -2768,7 +2811,7 @@ mod tests {
             BinaryRowValue::Int32(-2),
             BinaryRowValue::Int64(0x0102_0304_0506_0708),
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             CODEC.decode(&frame).unwrap().payload,
             [
@@ -2806,7 +2849,7 @@ mod tests {
             BinaryRowValue::Int32(i32::MIN),
             BinaryRowValue::Int32(i32::MAX),
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         let types = [
             BinaryRowColumnType::Int8,
             BinaryRowColumnType::Int8,
@@ -2830,7 +2873,7 @@ mod tests {
             BinaryRowValue::Int24(8_388_607),
             BinaryRowValue::Null,
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             CODEC.decode(&frame).unwrap().payload,
             [
@@ -2867,7 +2910,7 @@ mod tests {
                 })
             );
             assert_eq!(
-                BinaryRowPacket::encode(CODEC, 9, &[BinaryRowValue::Int24(value)]),
+                BinaryRowPacket::encode(9, &[BinaryRowValue::Int24(value)]),
                 Err(ResponsePacketError::BinaryIntegerOutOfRange {
                     value: i64::from(value),
                     column_type: BinaryRowColumnType::Int24,
@@ -2897,7 +2940,7 @@ mod tests {
             BinaryRowValue::Int32(3),
             BinaryRowValue::Int64(4),
         ];
-        let frame = BinaryRowPacket::encode(CODEC, 9, &values).unwrap();
+        let frame = BinaryRowPacket::encode(9, &values).unwrap();
         assert_eq!(
             CODEC.decode(&frame).unwrap().payload,
             [
@@ -2995,7 +3038,7 @@ mod tests {
     fn binary_row_null_bitmap_uses_the_offset_across_bytes() {
         let values = [BinaryRowValue::Null; 7];
         assert_eq!(
-            BinaryRowPacket::encode(CODEC, 4, &values).unwrap(),
+            BinaryRowPacket::encode(4, &values).unwrap(),
             [
                 0x03, 0x00, 0x00, 0x04, // packet header
                 0x00, // binary row header
@@ -3007,7 +3050,7 @@ mod tests {
     #[test]
     fn binary_rows_reject_invalid_column_counts_and_oversized_payloads() {
         assert_eq!(
-            BinaryRowPacket::encode(CODEC, 0, &[]),
+            BinaryRowPacket::encode(0, &[]),
             Err(ResponsePacketError::ColumnCountOutOfRange {
                 count: 0,
                 limit: MAX_RESULT_COLUMNS,
@@ -3015,18 +3058,18 @@ mod tests {
         );
         let too_many_values = vec![BinaryRowValue::Null; MAX_RESULT_COLUMNS + 1];
         assert_eq!(
-            BinaryRowPacket::encode(CODEC, 0, &too_many_values),
+            BinaryRowPacket::encode(0, &too_many_values),
             Err(ResponsePacketError::ColumnCountOutOfRange {
                 count: (MAX_RESULT_COLUMNS + 1) as u64,
                 limit: MAX_RESULT_COLUMNS,
             })
         );
-        let bytes = vec![b'x'; MAX_RESPONSE_PACKET_PAYLOAD_LENGTH - 2];
+        let bytes = vec![b'x'; MAX_ROW_PAYLOAD_LENGTH - 2];
         assert_eq!(
-            BinaryRowPacket::encode(CODEC, 0, &[BinaryRowValue::Bytes(&bytes)]),
+            BinaryRowPacket::encode(0, &[BinaryRowValue::Bytes(&bytes)]),
             Err(ResponsePacketError::PayloadTooLarge {
-                length: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH + 3,
-                limit: MAX_RESPONSE_PACKET_PAYLOAD_LENGTH,
+                length: MAX_ROW_PAYLOAD_LENGTH + 9,
+                limit: MAX_ROW_PAYLOAD_LENGTH,
             })
         );
         assert_eq!(
@@ -3083,14 +3126,11 @@ mod tests {
             decode_lenenc_integer(&[0xfc, 1, 0]),
             Err(ResponsePacketError::NonCanonicalLengthEncodedInteger { value: 1, .. })
         ));
-        let oversized = vec![b'x'; MAX_RESPONSE_PACKET_PAYLOAD_LENGTH + 1];
-        let large_codec = PacketCodec::new(MAX_RESPONSE_PACKET_PAYLOAD_LENGTH + 1).unwrap();
-        let frame = large_codec.encode(2, &oversized).unwrap();
+        let too_long = vec![b'x'; MAX_ROW_PAYLOAD_LENGTH];
         assert!(matches!(
-            TextRowPacket::decode(large_codec, &frame, 1),
+            TextRowPacket::encode(2, &[TextRowValue::Bytes(&too_long)]),
             Err(ResponsePacketError::PayloadTooLarge { length, limit })
-                if length == MAX_RESPONSE_PACKET_PAYLOAD_LENGTH + 1
-                    && limit == MAX_RESPONSE_PACKET_PAYLOAD_LENGTH
+                if length == MAX_ROW_PAYLOAD_LENGTH + 9 && limit == MAX_ROW_PAYLOAD_LENGTH
         ));
         let mut sequence = PacketSequence::new(MAX_PACKET_SEQUENCE_ID);
         sequence.accept(MAX_PACKET_SEQUENCE_ID).unwrap();

@@ -51,6 +51,9 @@ pub enum MySqlSessionSetting {
     CollationConnection(String),
     /// `SET sql_quote_show_create = 1` keeps the default quoted identifiers.
     SqlQuoteShowCreate(bool),
+    /// `SET [SESSION] max_allowed_packet = <n>`, which MySQL 8 refuses: the
+    /// session's value is read-only and only `SET GLOBAL` changes it.
+    SessionMaxAllowedPacket,
     /// `SET NAMES <charset> [COLLATE <collation>]`, with what it named.
     Names {
         character_set: String,
@@ -406,6 +409,11 @@ fn take_one_session_setting(
             return Ok(None);
         };
         MySqlSessionSetting::CollationConnection(value)
+    } else if name.eq_ignore_ascii_case("max_allowed_packet") {
+        if !scanner.take_keyword("DEFAULT") && scanner.take_unsigned().is_none() {
+            return Ok(None);
+        }
+        MySqlSessionSetting::SessionMaxAllowedPacket
     } else if name.eq_ignore_ascii_case("sql_quote_show_create") {
         let Some(value) = scanner.take_unsigned() else {
             return Ok(None);

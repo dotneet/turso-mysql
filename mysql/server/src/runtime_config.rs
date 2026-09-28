@@ -30,7 +30,10 @@ pub const MAX_RELOAD_INTERVAL: Duration = Duration::from_secs(60);
 /// Maximum values accepted for the three runtime resource limits.
 pub const MAX_CONNECTION_LIMIT: usize = 65_536;
 pub const MAX_ADMISSION_LIMIT: usize = 65_536;
-pub const MAX_WRITE_LIMIT: usize = 64 * 1024 * 1024;
+/// Twice `max_allowed_packet`, so a queue can be given room for the longest
+/// result a connection may hold, which is that long before its packet headers
+/// and column definitions are added.
+pub const MAX_WRITE_LIMIT: usize = 2 * crate::MAX_ALLOWED_PACKET;
 /// The smallest write queue that can retain one maximum-size initial handshake.
 pub const MIN_WRITE_LIMIT: usize = MAX_INITIAL_HANDSHAKE_PAYLOAD_LENGTH + PACKET_HEADER_LEN;
 /// The largest number of response frames retained by one connection.
