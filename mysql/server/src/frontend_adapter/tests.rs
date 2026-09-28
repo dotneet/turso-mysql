@@ -30844,3 +30844,6 @@ mod bound_expressions;
 
 #[cfg(unix)]
 mod prisma_statements;
+
+#[cfg(unix)]
+mod gorm_and_typeorm;

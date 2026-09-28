@@ -1452,6 +1452,11 @@ the value has to be arranged. For text columns, `COUNT(DISTINCT col)` adds
 `COLLATE MYSQL_UCA9_AI_CI` so MySQL's accent- and case-insensitive comparison is respected (e.g.
 `'b'` and `'B'` count as one distinct value). The column is named after the call
 as written, case kept and the argument unquoted, and an alias replaces that name.
+GORM counts distinct values as `COUNT(DISTINCT(user_id))`, with the column in
+parentheses; measured on 8.4.11, that counts what `COUNT(DISTINCT user_id)`
+counts, in the same shape, named `COUNT(DISTINCT(user_id))` as written, and so
+does it here — the parentheses around a counted column, qualified or not and
+with or without `DISTINCT`, are read as the bare column.
 
 `MIN`, `MAX`, `SUM`, `AVG` and `GROUP_CONCAT` are taken too, and they needed one thing `COUNT`
 did not: a type. The engine computes each value correctly but reports no source

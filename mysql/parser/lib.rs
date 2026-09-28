@@ -5661,8 +5661,10 @@ fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, Par
     let tokens = Tokenizer::new(&dialect, sql)
         .tokenize_with_location()
         .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
+    let tokens =
+        count_a_column_in_parentheses_as_the_column(spell_lock_in_share_mode_as_for_share(tokens));
     let statements = Parser::new(&dialect)
-        .with_tokens_with_locations(spell_lock_in_share_mode_as_for_share(tokens))
+        .with_tokens_with_locations(tokens)
         .parse_statements()
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let [statement] = statements.as_slice() else {
@@ -5709,6 +5711,71 @@ fn spell_lock_in_share_mode_as_for_share(mut tokens: Vec<TokenWithSpan>) -> Vec<
         tokens[lock].token = Token::make_keyword("FOR");
         tokens[in_].token = Token::Whitespace(Whitespace::Space);
         tokens[mode].token = Token::Whitespace(Whitespace::Space);
+    }
+    tokens
+}
+
+/// `COUNT(DISTINCT(col))` is `COUNT(DISTINCT col)`: GORM writes a distinct
+/// count with the column in parentheses, and the parentheses around a column
+/// change nothing it names.
+///
+/// Measured on MySQL 8.4.11, `COUNT(DISTINCT(user_id))` counts what
+/// `COUNT(DISTINCT user_id)` counts and answers the same `LONGLONG` of 21,
+/// named after the call as written — which is read out of the statement's
+/// text by place, so the parentheses are taken out without moving anything.
+/// `COUNT((user_id))` is taken the same way.
+fn count_a_column_in_parentheses_as_the_column(
+    mut tokens: Vec<TokenWithSpan>,
+) -> Vec<TokenWithSpan> {
+    let words = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !matches!(token.token, Token::Whitespace(_)))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    let is_name = |at: usize| matches!(tokens[at].token, Token::Word(_));
+    let is = |at: usize, expected: &Token| tokens[at].token == *expected;
+    let mut parentheses = Vec::new();
+    for (position, &count) in words.iter().enumerate() {
+        if !is_unquoted_word(&tokens[count].token, "COUNT") {
+            continue;
+        }
+        let rest = match &words[position + 1..] {
+            [open, distinct, rest @ ..]
+                if is(*open, &Token::LParen)
+                    && is_unquoted_word(&tokens[*distinct].token, "DISTINCT") =>
+            {
+                rest
+            }
+            [open, rest @ ..] if is(*open, &Token::LParen) => rest,
+            _ => continue,
+        };
+        let column_length = match rest {
+            [_, table, period, name, ..]
+                if is_name(*table) && is(*period, &Token::Period) && is_name(*name) =>
+            {
+                3
+            }
+            [_, name, ..] if is_name(*name) => 1,
+            _ => continue,
+        };
+        let (Some(&inner_open), Some(&inner_close), Some(&close)) = (
+            rest.first(),
+            rest.get(column_length + 1),
+            rest.get(column_length + 2),
+        ) else {
+            continue;
+        };
+        if is(inner_open, &Token::LParen)
+            && is(inner_close, &Token::RParen)
+            && is(close, &Token::RParen)
+        {
+            parentheses.push((inner_open, inner_close));
+        }
+    }
+    for (open, close) in parentheses {
+        tokens[open].token = Token::Whitespace(Whitespace::Space);
+        tokens[close].token = Token::Whitespace(Whitespace::Space);
     }
     tokens
 }
