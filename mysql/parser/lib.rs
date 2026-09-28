@@ -495,7 +495,12 @@ pub struct CheckedAutoIncrementInsert {
     /// `DEFAULT`.
     defaults_in_each_row: Vec<Vec<usize>>,
     ignored_null_columns: Vec<usize>,
+    /// Whether several rows meet a conflict clause, `IGNORE` or `ON DUPLICATE
+    /// KEY UPDATE`, each row answering it for itself.
     rowwise_conflicts: bool,
+    /// Whether the statement is a plain `INSERT` of several rows giving some
+    /// column `DEFAULT` in some rows only.
+    rows_differ_in_their_defaults: bool,
     /// Whether the statement carries `ON DUPLICATE KEY UPDATE`, rather than
     /// `IGNORE` or nothing.
     upserts: bool,
@@ -549,6 +554,23 @@ impl CheckedAutoIncrementInsert {
 
     pub fn rowwise_conflicts(&self) -> bool {
         self.rowwise_conflicts
+    }
+
+    /// Whether the rows are written one at a time, each by a statement of its
+    /// own: for a conflict clause each row answers, or for the defaults each
+    /// row asks for in a column other than the counted one, whose `DEFAULT`
+    /// the counter answers in one statement.
+    pub fn written_row_by_row(&self, counted_column: &str) -> bool {
+        self.rowwise_conflicts || self.rows_differ_beyond(counted_column)
+    }
+
+    fn rows_differ_beyond(&self, counted_column: &str) -> bool {
+        self.rows_differ_in_their_defaults
+            && self.mixed_default_columns.iter().any(|at| {
+                !self.columns[*at]
+                    .as_str()
+                    .eq_ignore_ascii_case(counted_column)
+            })
     }
 
     /// Whether the statement carries `ON DUPLICATE KEY UPDATE`.
@@ -619,7 +641,8 @@ impl CheckedAutoIncrementInsert {
         // leaves out the columns that row gives `DEFAULT` — what MySQL writes
         // for them, measured on 8.4.11, both in the row and in the row the
         // clause is offered.
-        let each_row_alone = self.rowwise_conflicts && self.upserts;
+        let each_row_alone = (self.rowwise_conflicts && self.upserts)
+            || self.rows_differ_beyond(allocator_column.as_str());
         if self
             .mixed_default_columns
             .iter()
@@ -824,8 +847,11 @@ impl BoundAutoIncrementInsert {
         &self.row_values
     }
 
+    /// Whether the rows are written one at a time; see
+    /// [`CheckedAutoIncrementInsert::written_row_by_row`].
     pub fn rowwise_conflicts(&self) -> bool {
-        self.insert.rowwise_conflicts
+        self.insert
+            .written_row_by_row(self.allocator_column.as_str())
     }
 
     /// Whether a row writes a reading of the clock, such as `NOW()`.
@@ -5297,6 +5323,17 @@ fn parse_checked_auto_increment_insert(
             }
         }
     }
+    // A plain `INSERT` of several rows giving a column `DEFAULT` in some rows
+    // only is written a row at a time too, each row leaving out the columns
+    // it gives `DEFAULT` — measured on MySQL 8.4.11, Drizzle's `values
+    // (default, 1, 'Hello', 'First post', ...), (default, 1, 'Draft', 'Not
+    // yet', default, 0)` takes the column's default in the rows that ask for
+    // it, the ids counting on from one statement's first, and a row that
+    // fails leaves none of the others written.
+    let rows_differ_in_their_defaults = values.rows.len() > 1
+        && !mixed_default_columns.is_empty()
+        && insert.on.is_none()
+        && !insert.ignore;
     let normalized_values = match normalized_insert
         .source
         .as_deref()
@@ -5400,6 +5437,7 @@ fn parse_checked_auto_increment_insert(
         defaults_in_each_row,
         ignored_null_columns,
         rowwise_conflicts,
+        rows_differ_in_their_defaults,
         upserts: insert.on.is_some(),
         upsert_columns,
         offered_columns,

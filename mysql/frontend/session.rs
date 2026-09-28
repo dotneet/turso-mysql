@@ -8891,7 +8891,9 @@ impl MySqlConnection {
                 ))
             }
             Ok(insert) => match self.load_auto_increment_table(insert.table_name().as_str())? {
-                Some(table) if insert.rowwise_conflicts() => {
+                Some(table)
+                    if insert.written_row_by_row(&table.definition.allocator_column_name) =>
+                {
                     self.execute_auto_increment_conflict_rows(
                         sql,
                         insert,
@@ -9005,8 +9007,10 @@ impl MySqlConnection {
                 .load_auto_increment_table(insert.table_name().as_str())
                 .map_err(MySqlQueryError::Engine)?
             {
-                Some(table) if insert.rowwise_conflicts() => self
-                    .execute_auto_increment_conflict_rows(
+                Some(table)
+                    if insert.written_row_by_row(&table.definition.allocator_column_name) =>
+                {
+                    self.execute_auto_increment_conflict_rows(
                         sql,
                         insert,
                         table,
@@ -9014,7 +9018,8 @@ impl MySqlConnection {
                         deadline,
                         affected_rows_mode,
                     )
-                    .map_err(MySqlQueryError::Engine),
+                    .map_err(MySqlQueryError::Engine)
+                }
                 Some(table) => {
                     self.check_write_deadline(deadline)?;
                     let bound = insert

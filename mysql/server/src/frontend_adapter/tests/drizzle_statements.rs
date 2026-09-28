@@ -200,3 +200,78 @@ fn serial_is_only_a_column_type() {
     );
     refused(&mut adapter, "create table t (id serial, n int)");
 }
+
+/// The affected rows and the id one write reports.
+fn written(adapter: &mut Adapter, sql: &str) -> (u64, u64) {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => (result.affected_rows, result.last_insert_id),
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+/// Drizzle writes `default` for each column a row leaves to its default, so
+/// one statement of several rows gives a column `DEFAULT` in some rows and a
+/// value in others. Measured on MySQL 8.4.11: each row takes the column's
+/// default where it asks for it, the ids count on from the statement's first,
+/// which is the id it reports, and a row that fails leaves none of the others
+/// written while the numbers they asked for are spent.
+#[test]
+fn drizzles_rows_give_default_to_different_columns() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `posts` (`id` bigint unsigned AUTO_INCREMENT NOT NULL, `user_id` bigint unsigned NOT NULL, `title` varchar(200) NOT NULL, `body` text, `published_at` datetime, `views` int NOT NULL DEFAULT 0, CONSTRAINT `posts_id` PRIMARY KEY(`id`), UNIQUE KEY (title))",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `posts` (`id`, `user_id`, `title`, `body`, `published_at`, `views`) values (default, 1, 'Hello', 'First post', '2024-01-02 03:04:05.000', 10), (default, 1, 'Draft', 'Not yet', default, 0), (default, 2, 'Bob writes', default, default, 3)",
+        ),
+        (3, 1)
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "insert into `posts` (`id`, `user_id`, `title`, `body`, `published_at`, `views`) values (default, 1, 'A', default, default, 7), (default, 1, 'Hello', 'x', default, default)",
+        ),
+        Err(FrontendErrorKind::ConstraintViolation)
+    ));
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into `posts` (`id`, `user_id`, `title`, `body`, `published_at`, `views`) values (default, 1, 'B', default, default, 7), (default, 1, 'C', 'x', default, default)",
+        ),
+        (2, 6)
+    );
+    let text = |value: &str| Some(value.to_owned());
+    assert_eq!(
+        rows(&mut adapter, "select * from posts order by id"),
+        [
+            [
+                text("1"),
+                text("1"),
+                text("Hello"),
+                text("First post"),
+                text("2024-01-02 03:04:05"),
+                text("10")
+            ],
+            [
+                text("2"),
+                text("1"),
+                text("Draft"),
+                text("Not yet"),
+                None,
+                text("0")
+            ],
+            [
+                text("3"),
+                text("2"),
+                text("Bob writes"),
+                None,
+                None,
+                text("3")
+            ],
+            [text("6"), text("1"), text("B"), None, None, text("7")],
+            [text("7"), text("1"), text("C"), text("x"), None, text("0")],
+        ]
+    );
+}

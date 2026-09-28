@@ -135,7 +135,10 @@ fn a_total_compared_in_having_with_a_bound_value_finds_the_groups_mysql_finds() 
     // numbers, as the engine does.
     assert_eq!(
         user_ids(&mut adapter, Bound::Real(2.9)),
-        Ok(vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(2)])
+        Ok(vec![
+            BinaryResultValue::Integer(1),
+            BinaryResultValue::Integer(2)
+        ])
     );
     // MySQL reads `'abc'` as 0 here and warns nothing, and `'2.9'` as 2.9;
     // a word naming no whole number is refused, as against the column.
