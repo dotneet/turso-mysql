@@ -754,3 +754,51 @@ fn a_join_in_parentheses_the_engine_cannot_follow_is_refused() {
         );
     }
 }
+
+/// `sequelize.query` with replacements sends
+/// `UPDATE posts SET body = CONCAT(COALESCE(body, ''), '!') WHERE user_id = 1`
+/// to append to a column that may be NULL. Measured on MySQL 8.4.11: the
+/// fallback stands for the NULL, so `x` becomes `x!` and NULL `!`, and both
+/// rows count as changed.
+#[test]
+fn sequelizes_raw_update_appends_to_a_column_that_may_be_null() {
+    let (_directory, mut adapter) = blog();
+    run(
+        &mut adapter,
+        "UPDATE posts SET title = CONCAT(IFNULL(body, 'none'), '-', `posts`.`title`) WHERE id IN (2, 3)",
+    );
+    let Ok(CommandExecutionResult::Ok(result)) = adapter
+        .execute_query("UPDATE posts SET body = CONCAT(COALESCE(body, ''), '!') WHERE user_id = 1")
+    else {
+        panic!("the append must be taken");
+    };
+    assert_eq!(result.affected_rows, 2);
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, title, body FROM posts ORDER BY id"
+        ),
+        values(&[
+            &[Some("1"), Some("a"), Some("x!")],
+            &[Some("2"), Some("none-b"), Some("!")],
+            &[Some("3"), Some("y-c"), Some("y")],
+        ])
+    );
+    // A number or a moment is spelled by rules of its own, and a column of
+    // numbers reads the words it is given as a number.
+    for sql in [
+        "UPDATE posts SET title = CONCAT(COALESCE(views, ''), '!')",
+        "UPDATE posts SET title = CONCAT(COALESCE(published_at, ''), '!')",
+        "UPDATE posts SET title = CONCAT(COALESCE(body, ''), views)",
+        "UPDATE posts SET views = CONCAT(COALESCE(body, ''), '1')",
+        "UPDATE posts SET body = 'z', title = CONCAT(COALESCE(body, ''), '!')",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}
