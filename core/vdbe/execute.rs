@@ -12623,6 +12623,7 @@ pub fn op_insert(
     state
         .supplied_rowid_cursors
         .retain(|supplied| supplied != cursor_id);
+    state.stored_assigned_values = None;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12635,21 +12636,6 @@ fn validate_assignment_before_insert(
     flag: InsertFlags,
     table_name: &str,
 ) -> Result<()> {
-    // A schema rewrite writes stored rows back under the schema it is
-    // replacing, so the record and the schema a validator can see do not
-    // describe each other.
-    if flag.has(InsertFlags::REWRITES_STORED_ROW) {
-        return Ok(());
-    }
-    let dialect_validator = program.connection.dialect().assignment_validator();
-    let validator = program
-        .prepare_options()
-        .assignment_validator
-        .as_deref()
-        .or(dialect_validator.as_deref());
-    let Some(validator) = validator else {
-        return Ok(());
-    };
     let record = match &state.registers[record_reg] {
         Register::Record(record) => std::borrow::Cow::Borrowed(record),
         Register::Value(value) => {
@@ -12659,31 +12645,151 @@ fn validate_assignment_before_insert(
         Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
     };
     let values = record.get_values_owned()?;
-    let catalog_name = match program.cursor_ref.get(cursor_id) {
-        Some((_, CursorType::BTreeTable(table))) => table.name.as_str(),
-        _ => table_name,
-    };
-    let Some(database_id) = state.cursor_database_ids.get(cursor_id).copied().flatten() else {
+    if state
+        .stored_assigned_values
+        .as_ref()
+        .is_some_and(|(stored_for, operation, stored)| {
+            *stored_for == cursor_id
+                && *operation == assignment_operation(state, cursor_id, flag)
+                && *stored == values
+        })
+    {
         return Ok(());
+    }
+    let Some(rewritten) =
+        assigned_values_as_stored(program, state, cursor_id, flag, table_name, &values)?
+    else {
+        return Ok(());
+    };
+    if rewritten == values {
+        return Ok(());
+    }
+    // The row's index entries were built from the values as they were before
+    // this rewrite; `StoreAssignedValues` rewrites them before that. Reaching
+    // here with an index means a write path that does not.
+    let catalog_name = assignment_catalog_name(program, cursor_id, table_name);
+    let has_indexes = state
+        .cursor_database_ids
+        .get(cursor_id)
+        .copied()
+        .flatten()
+        .is_some_and(|database_id| {
+            program.connection.with_schema(database_id, |schema| {
+                schema.get_indices(catalog_name).next().is_some()
+            })
+        });
+    if has_indexes {
+        return Err(LimboError::Corrupt(format!(
+            "a value written into {catalog_name} was rewritten after its index entries were built"
+        )));
+    }
+    let record = ImmutableRecord::from_values(&rewritten, rewritten.len())?;
+    state.registers[record_reg] = Register::Record(record);
+    Ok(())
+}
+
+pub fn op_store_assigned_values(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        StoreAssignedValues {
+            cursor_id,
+            record_reg,
+            start_reg,
+            flag,
+            table_name,
+        },
+        insn
+    );
+    let values = match &state.registers[*record_reg] {
+        Register::Record(record) => record.get_values_owned()?,
+        _ => {
+            return Err(LimboError::InternalError(
+                "StoreAssignedValues expects a record".to_string(),
+            )
+            .into())
+        }
+    };
+    let stored =
+        match assigned_values_as_stored(program, state, *cursor_id, *flag, table_name, &values)? {
+            Some(rewritten) => {
+                for (offset, (written, stored)) in values.iter().zip(&rewritten).enumerate() {
+                    if written != stored {
+                        state.registers[*start_reg + offset] = Register::Value(stored.clone());
+                    }
+                }
+                rewritten
+            }
+            None => values,
+        };
+    let operation = assignment_operation(state, *cursor_id, *flag);
+    state.stored_assigned_values = Some((*cursor_id, operation, stored));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The values the connection's assignment validator stores in place of
+/// `values`, a row about to be written; `None` when it keeps them as they are.
+fn assigned_values_as_stored(
+    program: &Program,
+    state: &ProgramState,
+    cursor_id: CursorID,
+    flag: InsertFlags,
+    table_name: &str,
+    values: &[Value],
+) -> Result<Option<Vec<Value>>> {
+    // A schema rewrite writes stored rows back under the schema it is
+    // replacing, so the record and the schema a validator can see do not
+    // describe each other.
+    if flag.has(InsertFlags::REWRITES_STORED_ROW) {
+        return Ok(None);
+    }
+    let dialect_validator = program.connection.dialect().assignment_validator();
+    let validator = program
+        .prepare_options()
+        .assignment_validator
+        .as_deref()
+        .or(dialect_validator.as_deref());
+    let Some(validator) = validator else {
+        return Ok(None);
+    };
+    let catalog_name = assignment_catalog_name(program, cursor_id, table_name);
+    let Some(database_id) = state.cursor_database_ids.get(cursor_id).copied().flatten() else {
+        return Ok(None);
     };
     let table_sql = program.connection.with_schema(database_id, |schema| {
         schema.table_sql(catalog_name).map(str::to_owned)
     });
-    let operation = if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) {
+    let operation = assignment_operation(state, cursor_id, flag);
+    validator.check_assignment(catalog_name, table_sql.as_deref(), operation, values)
+}
+
+fn assignment_operation(
+    state: &ProgramState,
+    cursor_id: CursorID,
+    flag: InsertFlags,
+) -> crate::AssignmentOperation {
+    if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) {
         crate::AssignmentOperation::Update
     } else if state.supplied_rowid_cursors.contains(&cursor_id) {
         crate::AssignmentOperation::InsertWithSuppliedRowid
     } else {
         crate::AssignmentOperation::Insert
-    };
-    let Some(rewritten) =
-        validator.check_assignment(catalog_name, table_sql.as_deref(), operation, &values)?
-    else {
-        return Ok(());
-    };
-    let record = ImmutableRecord::from_values(&rewritten, rewritten.len())?;
-    state.registers[record_reg] = Register::Record(record);
-    Ok(())
+    }
+}
+
+fn assignment_catalog_name<'a>(
+    program: &'a Program,
+    cursor_id: CursorID,
+    table_name: &'a str,
+) -> &'a str {
+    match program.cursor_ref.get(cursor_id) {
+        Some((_, CursorType::BTreeTable(table))) => table.name.as_str(),
+        _ => table_name,
+    }
 }
 
 pub fn op_int_64(

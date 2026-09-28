@@ -30848,6 +30848,9 @@ mod concurrent_transactions;
 mod prisma_client_reads;
 
 #[cfg(unix)]
+mod indexed_stored_forms;
+
+#[cfg(unix)]
 mod dropped_databases;
 
 /// How many times each kind of reading read a statement of `length` bytes

@@ -808,6 +808,12 @@ pub struct ProgramState {
     /// The cursors whose next insert takes a rowid a trigger rowid supplier
     /// chose, which is what that insert's record is validated as.
     pub(crate) supplied_rowid_cursors: Vec<CursorID>,
+    /// The row `StoreAssignedValues` last put into its stored form, with the
+    /// cursor and the kind of write it is for. The insert that writes exactly
+    /// this row has been checked already, and a second check could refuse
+    /// what the first one wrote: an ENUM's position 0 is stored as the empty
+    /// member, which a written empty word is refused as.
+    pub(crate) stored_assigned_values: Option<(CursorID, crate::AssignmentOperation, Vec<Value>)>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
     pre_op_registers: Option<Box<[Register]>>,
@@ -973,6 +979,7 @@ impl ProgramState {
             cursor_seqs,
             cursor_database_ids: vec![None; max_cursors],
             supplied_rowid_cursors: Vec::new(),
+            stored_assigned_values: None,
             registers,
             pre_op_registers: None,
             result_row: None,
@@ -1113,6 +1120,7 @@ impl ProgramState {
         }
         self.cursor_database_ids.fill(None);
         self.supplied_rowid_cursors.clear();
+        self.stored_assigned_values = None;
         for (mut cursor, context) in self.closed_index_method_cursors.drain(..) {
             cursor.close(&context);
         }

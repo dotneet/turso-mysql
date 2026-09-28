@@ -199,9 +199,13 @@ pub trait ReprepareParser: Send + Sync + 'static {
 /// SQL is supplied when it is available, so a frontend can rebuild private
 /// schema metadata without adding its types to the shared AST or schema.
 ///
-/// A replacement must be one this would leave alone if it saw it again: an
-/// insert that waits on I/O runs the check again over what it wrote the first
-/// time.
+/// The check runs on a row before its index entries are built, and what it
+/// answers is written into the row and its index entries alike. A row that
+/// reaches the table other than as the check answered it is checked again as
+/// it is written, and a table with an index refuses one that check would
+/// still rewrite. A replacement must be one this would leave alone if it saw
+/// it again: an insert that waits on I/O runs that check again over what it
+/// wrote the first time.
 pub trait AssignmentValidator: Send + Sync + 'static {
     fn check_assignment(
         &self,
@@ -5940,6 +5944,30 @@ mod tests {
         }
     }
 
+    /// Stores every word in capitals, the way a frontend stores a value of a
+    /// type of its own in a form of its own.
+    struct CapitalizeWords;
+
+    impl AssignmentValidator for CapitalizeWords {
+        fn check_assignment(
+            &self,
+            _table_name: &str,
+            _table_sql: Option<&str>,
+            _operation: AssignmentOperation,
+            values: &[Value],
+        ) -> Result<Option<Vec<Value>>> {
+            Ok(Some(
+                values
+                    .iter()
+                    .map(|value| match value {
+                        Value::Text(text) => Value::build_text(text.as_str().to_uppercase()),
+                        value => value.clone(),
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
     struct RequireTableSql(&'static str);
 
     impl AssignmentValidator for RequireTableSql {
@@ -6096,6 +6124,50 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("assignment rejected"));
         assert_eq!(query_single_i64(&conn, "SELECT COUNT(*) FROM t"), 1);
+    }
+
+    #[test]
+    fn a_value_the_validator_rewrites_is_stored_that_way_in_the_index_too() {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join("assignment-validator.db"));
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        let options =
+            PrepareOptions::default().with_assignment_validator(Arc::new(CapitalizeWords));
+        for (sql, stored) in [
+            ("INSERT INTO t VALUES (1, 'abc')", "ABC"),
+            ("UPDATE t SET v = 'def' WHERE id = 1", "DEF"),
+            (
+                "INSERT INTO t VALUES (1, 'ghi') ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+                "GHI",
+            ),
+        ] {
+            let (Some(Cmd::Stmt(stmt)), _) = conn.parse_sql(sql).unwrap() else {
+                panic!("expected a statement");
+            };
+            conn.prepare_translated_stmt_with_options(stmt, sql, &options)
+                .unwrap()
+                .run_ignore_rows()
+                .unwrap();
+            let mut check = conn.prepare("PRAGMA integrity_check").unwrap();
+            let mut answers = Vec::new();
+            check
+                .run_with_row_callback(|row| {
+                    answers.push(row.get::<String>(0)?);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(answers, ["ok"], "{sql}");
+            assert_eq!(
+                query_single_i64(
+                    &conn,
+                    &format!("SELECT id FROM t INDEXED BY t_v WHERE v = '{stored}'")
+                ),
+                1,
+                "{sql}"
+            );
+        }
     }
 
     #[test]

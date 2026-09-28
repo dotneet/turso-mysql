@@ -777,6 +777,21 @@ pub enum Insn {
         table_reference: Arc<BTreeTable>, // P4
     },
 
+    /// Rewrites the values about to be written as a row, in registers
+    /// `start_reg..`, into the forms the connection's assignment validator
+    /// stores them in, and refuses the ones it refuses. `record_reg` holds
+    /// those values made into a record. It runs before the row's index
+    /// entries are built from the same registers, so the index and the row
+    /// hold the same value: a validator that rewrote only the record at
+    /// `Insert` left the index holding the value as it was written.
+    StoreAssignedValues {
+        cursor_id: CursorID,
+        record_reg: usize,
+        start_reg: usize,
+        flag: InsertFlags,
+        table_name: String,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -2240,6 +2255,9 @@ pub(crate) fn dispatch_insn(
         Insn::ColumnRange { .. } => execute::op_column_range(program, state, insn, pager),
         Insn::ColumnHasField { .. } => execute::op_column_has_field(program, state, insn, pager),
         Insn::TypeCheck { .. } => execute::op_type_check(program, state, insn, pager),
+        Insn::StoreAssignedValues { .. } => {
+            execute::op_store_assigned_values(program, state, insn, pager)
+        }
         Insn::ArrayEncode { .. } => execute::op_array_encode(program, state, insn, pager),
         Insn::ArrayDecode { .. } => execute::op_array_decode(program, state, insn, pager),
         Insn::ArrayElement { .. } => execute::op_array_element(program, state, insn, pager),
@@ -2500,6 +2518,7 @@ impl InsnVariants {
             InsnVariants::ColumnRange => execute::op_column_range,
             InsnVariants::ColumnHasField => execute::op_column_has_field,
             InsnVariants::TypeCheck => execute::op_type_check,
+            InsnVariants::StoreAssignedValues => execute::op_store_assigned_values,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,

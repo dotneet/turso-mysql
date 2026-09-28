@@ -330,6 +330,9 @@ pub struct ProgramBuilder {
     /// type before translating the value argument.
     pub(crate) target_union_type: Option<Arc<crate::schema::TypeDef>>,
     schema_sql_formatter: Option<Arc<dyn crate::SchemaSqlFormatter>>,
+    /// The statement was prepared with an assignment validator of its own,
+    /// besides any the connection's dialect brings.
+    prepared_with_assignment_validator: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -740,6 +743,7 @@ impl ProgramBuilder {
             next_subquery_eqp_id: 1,
             target_union_type: None,
             schema_sql_formatter: None,
+            prepared_with_assignment_validator: false,
         }
     }
 
@@ -752,6 +756,17 @@ impl ProgramBuilder {
 
     pub(crate) fn schema_sql_formatter(&self) -> Option<&dyn crate::SchemaSqlFormatter> {
         self.schema_sql_formatter.as_deref()
+    }
+
+    pub(crate) fn set_prepared_with_assignment_validator(&mut self, prepared_with: bool) {
+        self.prepared_with_assignment_validator = prepared_with;
+    }
+
+    /// Whether the rows this program writes go through an assignment
+    /// validator, which may store a value in a form of its own.
+    pub(crate) fn validates_assignments(&self, connection: &crate::Connection) -> bool {
+        self.prepared_with_assignment_validator
+            || connection.dialect().assignment_validator().is_some()
     }
 
     pub const fn next_subquery_eqp_id(&mut self) -> usize {

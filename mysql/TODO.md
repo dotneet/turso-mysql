@@ -571,7 +571,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `JSON` | works |
 | A `JSON` number MySQL reads imprecisely | MySQL 8.4.11's RapidJSON conversion is reproduced, including `1000000000000000.1` becoming `1e15` and `1e-30` becoming `9.999999999999999e-31` |
 | A literal `DEFAULT` on a `JSON` column, or one as a direct key | refused with MySQL's measured 1101 and 3152 errors; `DEFAULT NULL` is accepted |
-| A value shorter than its `BINARY(n)` column, or a default narrower than it | refused; measured, MySQL fills it out with zero bytes, and filled out as the row is written the row and its index entries would disagree. `BINARY(0)` is refused as well |
+| A value shorter than its `BINARY(n)` column, or a default narrower than it | refused; measured, MySQL fills it out with zero bytes, which this does not do. `BINARY(0)` is refused as well |
 | `BIT` and `BIT(1)` | works: written 0, 1, `TRUE` or `FALSE`, read back as the one byte MySQL sends over both protocols, compared against a written number, and printed `bit(1)` with a `b'0'` or `b'1'` default |
 | `BIT(n)` wider than one bit | refused; it holds an n-bit number and crosses as ceil(n/8) bytes, which has not been measured |
 | A bit literal or a word written into a `BIT(1)`, or compared against one — `b'1'`, `x'01'`, `''` | refused; measured, MySQL takes `b'1'` and `x'01'` as the bit and `''` as 0, and answers 1406 for any other word |

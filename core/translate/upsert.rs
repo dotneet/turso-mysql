@@ -974,6 +974,26 @@ pub fn emit_upsert(
         }
     }
 
+    // The new index keys below are copied from the NEW row image, so a value
+    // the dialect stores in a form of its own must be in that form first.
+    if program.validates_assignments(connection) {
+        let record_reg = program.alloc_register();
+        emit_make_record(
+            program,
+            table.columns().iter(),
+            new_start,
+            record_reg,
+            table.btree().is_some_and(|bt| bt.is_strict),
+        );
+        program.emit_insn(Insn::StoreAssignedValues {
+            cursor_id: ctx.cursor_id,
+            record_reg,
+            start_reg: new_start,
+            flag: InsertFlags::new().assignment_is_update(),
+            table_name: table.get_name().to_string(),
+        });
+    }
+
     // Index maintenance (DELETE old key, INSERT new key), honoring
     // partial-index WHEREs. Mirroring SQLite, every UNIQUE constraint (the
     // rowid first, then each unique index) is verified against the NEW row

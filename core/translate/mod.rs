@@ -111,6 +111,7 @@ pub fn translate(
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.set_schema_sql_formatter(prepare_options.schema_sql_formatter.clone());
+    program.set_prepared_with_assignment_validator(prepare_options.assignment_validator.is_some());
 
     program.prologue();
     let mut resolver = Resolver::new(
@@ -148,13 +149,11 @@ pub fn translate(
         }
         stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
     };
-    // An assignment rule checks a row just before the row itself is written,
-    // after an UPDATE has deleted the old row and after the row's index
-    // entries or earlier rows are already in, so only a statement journal
-    // can undo the refused statement alone.
-    if prepare_options.assignment_validator.is_some()
-        || connection.dialect().assignment_validator().is_some()
-    {
+    // An assignment rule refuses a row after earlier rows of the statement
+    // are written, and checks it again when the row itself is written, after
+    // an UPDATE has deleted the old row and the row's index entries are in,
+    // so only a statement journal can undo the refused statement alone.
+    if program.validates_assignments(&connection) {
         program.set_multi_write(true);
         program.set_may_abort(true);
     }

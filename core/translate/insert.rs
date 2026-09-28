@@ -865,6 +865,24 @@ pub fn translate_insert(
     // copied in preflight constraint checks. Otherwise the index entry gets NULL
     // while the table row gets the default value, causing integrity_check failures.
     emit_notnulls(program, &ctx, &insertion, resolver)?;
+    // The index keys below are copied from the column registers, so a value
+    // the dialect stores in a form of its own must be in that form first.
+    if program.validates_assignments(connection) {
+        emit_make_record(
+            program,
+            insertion.col_mappings.iter().map(|m| m.column),
+            insertion.base_reg,
+            insertion.record_register(),
+            ctx.table.is_strict,
+        );
+        program.emit_insn(Insn::StoreAssignedValues {
+            cursor_id: ctx.cursor_id,
+            record_reg: insertion.record_register(),
+            start_reg: insertion.base_reg,
+            flag: InsertFlags::new(),
+            table_name: table_name.to_string(),
+        });
+    }
 
     // Populate register-to-affinity map so partial index WHERE clauses get
     // correct column affinity during INSERT.

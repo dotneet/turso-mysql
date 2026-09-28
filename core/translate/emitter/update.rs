@@ -1773,6 +1773,29 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // The new index keys below are copied from the column registers, so a
+    // value the dialect stores in a form of its own must be in that form
+    // first.
+    if let Table::BTree(ref table) = target_table.table {
+        if program.validates_assignments(connection) {
+            let record_reg = program.alloc_register();
+            emit_make_record(
+                program,
+                target_table.table.columns().iter(),
+                start,
+                record_reg,
+                table.is_strict,
+            );
+            program.emit_insn(Insn::StoreAssignedValues {
+                cursor_id: target_table_cursor_id,
+                record_reg,
+                start_reg: start,
+                flag: InsertFlags::new().assignment_is_update(),
+                table_name: target_table.identifier.clone(),
+            });
+        }
+    }
+
     // =========================================================================
     // Three-phase index update — matches SQLite's separated architecture.
     // Phase 1: Evaluate partial WHERE predicates, build new index keys,

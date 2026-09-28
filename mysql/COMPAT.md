@@ -3347,9 +3347,8 @@ binary flag — a `BINARY(16)` key carrying the key's flags besides — prints a
 `binary(n)`, a bare `BINARY` as `binary(1)`, and takes a key, which is how a
 table keyed by a UUID holds it; `VARBINARY(n)` takes one too. MySQL fills a
 shorter value out with zero bytes — `'ab'` in a `BINARY(4)` reads back
-`ab\0\0`, and `''` four zero bytes — and filled out as the row is written,
-after its index entries are, the row and its index would hold different
-values, so a shorter value is refused rather than stored otherwise; a dump
+`ab\0\0`, and `''` four zero bytes — and a shorter value is refused rather
+than filled out; a dump
 and a driver writing a UUID give the column its full width. A longer value
 answers 1406. A default narrower than the column is refused: MySQL prints it
 filled out, `DEFAULT 'y\0\0'`. A column of bytes reports its default in
@@ -5746,10 +5745,25 @@ not a number (1366), not a moment (1292), not a member (1265) or not a document
 (3140) each leaves the transaction open with its earlier rows and its
 savepoints; a multi-row `INSERT` refused on its second row keeps none of its
 rows, and an `UPDATE` refused on a later row leaves the rows before it as they
-were. So it is here. The engine checks a row just before writing it, after the
-row's index entries and any earlier rows are in, so every write under the
-validator takes a statement savepoint inside a transaction and a refusal rolls
-back to it, the way a failed `CHECK` or `NOT NULL` does.
+were. So it is here. The engine checks a row after any earlier rows are in, so
+every write under the validator takes a statement savepoint inside a
+transaction and a refusal rolls back to it, the way a failed `CHECK` or
+`NOT NULL` does.
+
+The check runs before the row's index entries are built, and a value MySQL
+stores in a form of its own is put into that form there, so a key over the
+column holds what the row holds. A `DATETIME(6)` written `'2024-01-02
+03:04:05'` is stored with its six digits in the row and in a key over it
+alike, and the same goes for a `TIMESTAMP` or `TIME` with a fraction, a
+`DATETIME` rounded to its second, a `DATE` written loosely, a two-digit
+`YEAR`, a `CHAR` with trailing spaces, a `SET` out of member order and a
+`FLOAT`, written by an `INSERT`, an `UPDATE` or an upsert. Such a key was
+written with the value as the statement spelled it and the row with the
+stored form, so `CHECK TABLE` reported the row missing from the key, a
+`DELETE` stopped on the entry it could not find, a lookup through the key
+missed the row, and a unique key took one moment spelled two ways twice. The
+row is checked again as it is written, and a table with a key refuses a row
+that check would still change rather than let the two differ.
 
 Two differences from MySQL, both measured. MySQL truncates an overflow made only
 of trailing spaces and reports note 1265 instead of refusing it; this refuses

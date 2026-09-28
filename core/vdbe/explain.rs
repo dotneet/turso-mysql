@@ -728,6 +728,21 @@ pub fn insn_to_row(
             0,
             String::from(""),
         ),
+        Insn::StoreAssignedValues {
+            cursor_id,
+            record_reg,
+            start_reg,
+            table_name,
+            ..
+        } => (
+            "StoreAssignedValues",
+            *cursor_id as i64,
+            *record_reg as i64,
+            *start_reg as i64,
+            Value::build_text(table_name.clone()),
+            0,
+            format!("r[{start_reg}..] = stored forms of r[{record_reg}] for {table_name}"),
+        ),
         Insn::ArrayEncode { data } => (
             "ArrayEncode",
             data.reg as i64,
