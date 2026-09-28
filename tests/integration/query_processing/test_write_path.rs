@@ -2065,3 +2065,47 @@ fn test_mysql_changed_rows_for_wal_updates(tmp_db: TempDatabase) -> anyhow::Resu
 fn test_mysql_changed_rows_for_mvcc_updates(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_mysql_changed_rows_for_updates(&tmp_db.connect_limbo())
 }
+
+/// A row an upsert leaves as it stood is not changed, whether an INSERT or an
+/// earlier upsert wrote it. The rowid alias is stored as NULL either way.
+fn assert_mysql_changed_rows_for_upserts(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT UNIQUE, n INTEGER)")?;
+    conn.execute("INSERT INTO t (name, n) VALUES ('a', 1)")?;
+    let upsert = "INSERT INTO t (name, n) VALUES ('a', 1) ON CONFLICT DO UPDATE SET n = excluded.n";
+    conn.execute(upsert)?;
+    assert_eq!(
+        conn.mysql_changed_rows(),
+        0,
+        "the row the INSERT wrote is left as it stood"
+    );
+    conn.execute(
+        "INSERT INTO t (name, n) VALUES ('a', 2) ON CONFLICT DO UPDATE SET n = excluded.n",
+    )?;
+    assert_eq!(conn.mysql_changed_rows(), 1, "n changed");
+    conn.execute("INSERT INTO t (name, n) VALUES ('a', 1) ON CONFLICT DO UPDATE SET id = id")?;
+    assert_eq!(conn.mysql_changed_rows(), 0, "the rowid set to itself");
+    conn.execute(
+        "INSERT INTO t (name, n) VALUES ('a', 1) ON CONFLICT DO UPDATE SET id = 7, n = excluded.n",
+    )?;
+    assert_eq!(conn.mysql_changed_rows(), 1, "the rowid moved");
+    assert_eq!(
+        limbo_exec_rows(conn, "SELECT id, name, n FROM t"),
+        vec![vec![
+            rusqlite::types::Value::Integer(7),
+            rusqlite::types::Value::Text("a".to_owned()),
+            rusqlite::types::Value::Integer(1),
+        ]]
+    );
+    conn.execute(upsert)?;
+    assert_eq!(
+        conn.mysql_changed_rows(),
+        0,
+        "the moved row left as it stood"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_mysql_changed_rows_for_wal_upserts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_mysql_changed_rows_for_upserts(&tmp_db.connect_limbo())
+}

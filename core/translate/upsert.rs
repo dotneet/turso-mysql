@@ -1260,7 +1260,19 @@ pub fn emit_upsert(
         }
     }
 
-    // Build NEW table payload
+    // Build NEW table payload. SQLite stores a rowid alias as NULL in the
+    // record, the rowid being the row's key, as INSERT and UPDATE already do
+    // here; writing the number instead made a row an upsert left as it stood
+    // differ from the row an INSERT wrote, and so count as changed. The NEW
+    // image keeps the number for the foreign keys and triggers read after.
+    let rowid_alias_reg = table
+        .columns()
+        .iter()
+        .position(|column| column.is_rowid_alias())
+        .map(|idx| layout.to_register(new_start, idx));
+    if let Some(reg) = rowid_alias_reg {
+        program.emit_insn(Insn::SoftNull { reg });
+    }
     let record_reg = program.alloc_register();
     emit_make_record(
         program,
@@ -1269,6 +1281,13 @@ pub fn emit_upsert(
         record_reg,
         table.btree().is_some_and(|bt| bt.is_strict),
     );
+    if let Some(reg) = rowid_alias_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            dst_reg: reg,
+            extra_amount: 0,
+        });
+    }
 
     // If rowid changed, delete+insert (uniqueness of the new rowid was
     // already verified before index maintenance above)
