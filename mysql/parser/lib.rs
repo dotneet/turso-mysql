@@ -4,6 +4,7 @@ mod account_admin;
 mod admin_command;
 mod alter_table_indexes;
 mod analyze_table;
+mod catalog_qualifiers;
 mod check_constraints;
 mod checked_primary_key;
 mod column_statistics;
@@ -119,6 +120,7 @@ pub use analyze_table::{
     parse_analyze_table, parse_check_table, parse_optional_analyze_table,
     parse_optional_check_table, MySqlAnalyzeTableCommand, MySqlCheckTableCommand,
 };
+pub use catalog_qualifiers::leave_out_the_catalog_table_in_its_columns;
 pub use check_constraints::{
     check_constraints_of, refuse_checks_numbered_out_of_order, table_a_check_is_dropped_from,
     table_with_a_check_changed, MySqlCheckChange, MySqlCheckConstraint,

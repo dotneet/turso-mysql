@@ -3871,6 +3871,16 @@ these columns is held to the type the column holds rather than to text, so
 `ORDER BY` over one of the text columns sorts without regard to case, the way
 MySQL sorts them.
 
+drizzle-kit reads the indexes as `select * from INFORMATION_SCHEMA.STATISTICS
+WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'db' and
+INFORMATION_SCHEMA.STATISTICS.INDEX_NAME != 'PRIMARY'`. A `SELECT` reading one
+`information_schema` table, with no alias, join or subquery, takes its columns
+after `FROM` written with `information_schema.T.` or `T.` in front, matched
+without regard to case as MySQL matches them under `lower_case_table_names=1`,
+which this server reports; measured on 8.4.11, written or prepared. The same
+name in the projected list is still refused: MySQL names the result column
+after the bare column, which the projection here would not.
+
 `information_schema.KEY_COLUMN_USAGE` is the third, and where a migration tool
 reads foreign keys. It reports one row per column of every key that constrains
 a value — the primary key, the unique keys and the foreign keys — and all

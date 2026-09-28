@@ -460,3 +460,38 @@ fn drizzles_qualified_columns_name_the_table_written() {
         )
         .is_err());
 }
+
+/// drizzle-kit reads a database's indexes naming each column with the
+/// schema's and the table's names in front. Measured on MySQL 8.4.11 with
+/// `lower_case_table_names=1`, as this server reports, the names match
+/// whatever their case, written or prepared.
+#[test]
+fn drizzle_kit_reads_indexes_with_qualified_columns() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` int NOT NULL, `name` varchar(10), CONSTRAINT `tags_id` PRIMARY KEY(`id`), CONSTRAINT `tags_name_unique` UNIQUE(`name`))",
+    );
+    let unique_key =
+        ["tags", "tags_name_unique", "0", "1", "name"].map(|value| Some(value.to_owned()));
+    for sql in [
+        "select TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME from INFORMATION_SCHEMA.STATISTICS WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'reports' and INFORMATION_SCHEMA.STATISTICS.INDEX_NAME != 'PRIMARY'",
+        "select TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME from INFORMATION_SCHEMA.STATISTICS WHERE STATISTICS.TABLE_SCHEMA = 'reports' and statistics.INDEX_NAME != 'PRIMARY'",
+        "select TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME from INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = 'reports' and INDEX_NAME != 'PRIMARY' ORDER BY STATISTICS.INDEX_NAME",
+    ] {
+        assert_eq!(rows(&mut adapter, sql), [unique_key.clone()], "{sql}");
+    }
+    let drizzle_kit_read = "select * from INFORMATION_SCHEMA.STATISTICS WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'reports' and INFORMATION_SCHEMA.STATISTICS.INDEX_NAME != 'PRIMARY'";
+    let result = result_set(&mut adapter, drizzle_kit_read);
+    assert_eq!(result.columns.len(), 18);
+    assert_eq!(result.rows.len(), 1);
+
+    let statement = adapter.execute_stmt_prepare(drizzle_kit_read).unwrap();
+    let PreparedStatementExecutionResult::ResultSet(result) = adapter
+        .execute_stmt_execute(statement.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("the prepared read must answer rows");
+    };
+    assert_eq!(result.rows.len(), 1);
+}

@@ -3161,6 +3161,12 @@ where
         )
         .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = update_unqualified.as_deref().unwrap_or(sql);
+        let catalog_unqualified = turso_mysql_parser::leave_out_the_catalog_table_in_its_columns(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = catalog_unqualified.as_deref().unwrap_or(sql);
         self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         match self.prepare_checked_database_statement(sql) {
             Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
@@ -3441,6 +3447,12 @@ where
         )
         .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = update_unqualified.as_deref().unwrap_or(sql);
+        let catalog_unqualified = turso_mysql_parser::leave_out_the_catalog_table_in_its_columns(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = catalog_unqualified.as_deref().unwrap_or(sql);
         self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
