@@ -1520,3 +1520,115 @@ fn a_row_refused_as_a_duplicate_spends_its_number_and_a_written_id_does_not() {
         }
     }
 }
+
+/// An `UPDATE` leaving a counted row as it stands answers 0 rows, however the
+/// row was written: a text or prepared `INSERT` of one row or several, one
+/// naming its own id, a copy from a `SELECT`, or a trigger's. MySQL 8.4.11
+/// counts only a row an `UPDATE` changes, so the first `UPDATE` of each row
+/// here answers 0, a moment written as `'2024-1-2 3:4:5'` and a `DECIMAL`
+/// written as `1.5` among the values it leaves.
+#[test]
+fn an_update_leaving_a_counted_row_as_it_stands_changes_nothing() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE items (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT, name VARCHAR(20), at DATETIME, price DECIMAL(10,2), big BIGINT UNSIGNED, doc JSON)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE drafts (k INT PRIMARY KEY, n INT)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE notes (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT, name VARCHAR(20))",
+    );
+    run(
+        &mut adapter,
+        "CREATE TRIGGER drafts_notes AFTER INSERT ON drafts FOR EACH ROW BEGIN INSERT INTO notes (n, name) VALUES (NEW.n, 'drafted'); END",
+    );
+    let columns = "n, name, at, price, big, doc";
+    let values = "5, 'a', '2024-1-2 3:4:5', 1.5, 18446744073709551615, '{\"k\": [1, 2]}'";
+    assert_eq!(
+        written(
+            &mut adapter,
+            &format!("INSERT INTO items ({columns}) VALUES ({values})")
+        ),
+        (1, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            &format!("INSERT INTO items ({columns}) VALUES ({values}), ({values})")
+        ),
+        (2, 2)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            &format!("INSERT INTO items (id, {columns}) VALUES (10, {values})")
+        ),
+        (1, 10)
+    );
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            &format!("INSERT INTO items ({columns}) VALUES (?, ?, ?, ?, ?, ?)"),
+            &words(&[
+                "5",
+                "a",
+                "2024-01-02 03:04:05",
+                "1.50",
+                "18446744073709551615",
+                "{\"k\": [1, 2]}"
+            ]),
+        ),
+        (1, 11)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO items (n, name, at) SELECT n, name, at FROM items WHERE id = 1"
+        ),
+        (1, 12)
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO drafts (k, n) VALUES (1, 5)"),
+        (1, 0)
+    );
+
+    assert_eq!(
+        written(&mut adapter, "UPDATE notes SET n = 5 WHERE id = 1"),
+        (0, 0)
+    );
+
+    let ids = ["1", "2", "3", "10", "11", "12"];
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM items ORDER BY id"),
+        ids.iter().map(|id| some(&[id])).collect::<Vec<_>>()
+    );
+    for id in ids {
+        assert_eq!(
+            written(
+                &mut adapter,
+                &format!("UPDATE items SET n = 5 WHERE id = {id}")
+            ),
+            (0, 0),
+            "row {id}"
+        );
+    }
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE items SET at = '2024-01-02 03:04:05', price = 1.50 WHERE id < 12"
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        written(&mut adapter, "UPDATE items SET n = n WHERE TRUE"),
+        (0, 0)
+    );
+    assert_eq!(
+        written(&mut adapter, "UPDATE items SET n = 6 WHERE id = 1"),
+        (1, 0)
+    );
+}

@@ -607,12 +607,6 @@ Behaviour that works but does not match MySQL lives in
   the millisecond, so digits past the third are zeros
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
-- On a table that counts its own ids, the first `UPDATE` of a row an `INSERT`
-  or an upsert wrote counts the row as changed even where nothing changed, and
-  so does the first upsert of a row an `UPDATE` wrote, which then also stamps
-  an `ON UPDATE CURRENT_TIMESTAMP` column the clause leaves; MySQL counts
-  neither. The engine stores such a row differently after the one than after
-  the other
 - complex compound projections still have conservative nullable metadata
 - complex window projections still have conservative source-column metadata
 - `SHOW FULL COLUMNS` derives `Privileges` from database or table grants;

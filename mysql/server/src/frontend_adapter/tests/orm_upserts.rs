@@ -1554,3 +1554,62 @@ fn a_prepared_upsert_of_one_row_stamps_the_row_it_changes() {
         ]
     );
 }
+
+/// A counted row left as it stands is neither counted nor stamped, whether an
+/// `INSERT`, an upsert or an `UPDATE` wrote it last. Measured on MySQL 8.4.11:
+/// an `UPDATE` setting the name the row holds and an upsert offering it both
+/// answer 0 rows and keep the row's moment.
+#[test]
+fn a_counted_row_left_as_it_stands_is_neither_counted_nor_stamped() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, TYPEORM_USERS);
+    run(
+        &mut adapter,
+        "INSERT INTO users (email, name, balance, updated_at) VALUES ('a@x', 'A', '1.50', '2020-01-01 00:00:00'), ('b@x', 'B', '2.50', '2020-01-01 00:00:00')",
+    );
+    let upsert = |email: &str, name: &str| {
+        format!("INSERT INTO `users` (`email`, `name`) VALUES ('{email}', '{name}') ON DUPLICATE KEY UPDATE `name` = VALUES(`name`)")
+    };
+    assert_eq!(
+        written_with_warnings(&mut adapter, &upsert("a@x", "A")),
+        (0, 0, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE users SET name = 'B' WHERE email = 'b@x'"
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        stamped_users(&mut adapter),
+        vec![user("1", "A", "1.50", false), user("2", "B", "2.50", false)]
+    );
+
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE users SET name = 'A2' WHERE email = 'a@x'"
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        written_with_warnings(&mut adapter, &upsert("c@x", "C")).0,
+        1
+    );
+    let before = moments_of_users(&mut adapter);
+    // The engine's clock reads to the millisecond.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert_eq!(
+        written_with_warnings(&mut adapter, &upsert("a@x", "A2")),
+        (0, 0, 1)
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE users SET name = 'C' WHERE email = 'c@x'"
+        ),
+        (0, 0)
+    );
+    assert_eq!(moments_of_users(&mut adapter), before);
+}

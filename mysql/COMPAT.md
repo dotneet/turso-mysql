@@ -2621,11 +2621,11 @@ zone is not UTC; and a table carrying a trigger, which the second writing would 
 An upsert whose clause writes the column itself is taken everywhere, as before, and answered
 with what the clause says.
 
-On a counted table a row an `UPDATE` wrote and a row an `INSERT` or an upsert wrote differ in
-how the engine stores them, so the first `UPDATE` of a row an `INSERT` wrote counts it as
-changed even where nothing changed, and so does the first upsert of a row an `UPDATE` wrote —
-and that upsert then stamps the moment too. MySQL counts neither and stamps nothing. This is
-listed under the known divergences in [TODO.md](TODO.md).
+A row left as it stood is neither counted nor stamped whichever write put it there — an
+`INSERT`, an upsert or an `UPDATE`. The engine's `UPDATE` used to store a counted row's id
+inside the row where an `INSERT` stores nothing, as SQLite does, so the first `UPDATE` of a row
+an `INSERT` wrote counted it as changed, and the first upsert of a row an `UPDATE` wrote counted
+and stamped it; the engine now stores the row alike after each.
 
 The clause is refused where it would be dropped rather than answered: on the
 `SET` form and the empty-row form, which leave no room for it, and beside
