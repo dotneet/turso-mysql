@@ -2495,6 +2495,11 @@ fn an_upsert_renders_the_row_it_was_offered() {
             "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = up.hits + offered.hits",
             "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (2, 3) ON CONFLICT DO UPDATE SET \"hits\" = (\"hits\" + \"excluded\".\"hits\")",
         ),
+        // A name on the offered row with no upsert to use it names nothing.
+        (
+            "INSERT INTO up (id, hits) VALUES (4, 1), (5, 2) AS offered",
+            "INSERT INTO \"up\" (\"id\", \"hits\") VALUES (4, 1), (5, 2)",
+        ),
     ] {
         let translated = parse_dml(sql, SessionSqlMode::default()).unwrap();
         assert_eq!(translated.as_sql(), normalized, "{sql}");
@@ -2505,8 +2510,6 @@ fn an_upsert_renders_the_row_it_was_offered() {
         "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = hits + offered.hits",
         // A qualifier naming neither of the two rows.
         "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = other.hits",
-        // A name on the offered row with no upsert to use it.
-        "INSERT INTO up (id, hits) VALUES (4, 1) AS offered",
         // Renaming what the offered row carries has not been measured.
         "INSERT INTO up (id, hits) VALUES (2, 3) AS offered (a, b) ON DUPLICATE KEY UPDATE hits = offered.b",
     ] {

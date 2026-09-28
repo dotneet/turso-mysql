@@ -8146,8 +8146,6 @@ fn an_upsert_steps_a_counter_and_reads_the_row_it_was_offered() {
         "INSERT INTO up (id, hits) VALUES (2, 3) AS offered ON DUPLICATE KEY UPDATE hits = hits + offered.hits",
         // A qualifier naming neither of the two rows.
         "INSERT INTO up (id, hits) VALUES (2, 3) ON DUPLICATE KEY UPDATE hits = other.hits",
-        // A name on the offered row means nothing without an upsert to use it.
-        "INSERT INTO up (id, hits) VALUES (4, 1) AS offered",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
@@ -30824,3 +30822,6 @@ mod database_qualified_names;
 
 #[cfg(unix)]
 mod orm_select_shapes;
+
+#[cfg(unix)]
+mod orm_upserts;

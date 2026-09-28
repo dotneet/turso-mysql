@@ -2264,9 +2264,15 @@ from the offered row lands as written.
 
 Once the offered row carries a name, a bare column is 1052 — ambiguous between
 the two rows — so only a qualified one names either, and the bare form is
-refused here as it is there. A qualifier naming neither row is refused, so is a
-name on the offered row with no upsert to use it, and so is renaming what that
-row carries, which has not been measured.
+refused here as it is there. A qualifier naming neither row is refused, and so
+is renaming what that row carries, which has not been measured.
+
+A name on the offered row with no upsert to use it names nothing, and Rails 8
+writes one on every `insert_all!` — `INSERT INTO tags (name) VALUES ('x') AS
+tags_values`. Measured on 8.4.11, such an insert writes, numbers its rows and
+answers 1062 for a duplicate exactly as the same insert without the name does,
+on a table that counts its own ids and on one that does not, so the name is
+dropped.
 
 An `UPDATE` may write a value worked out from the row rather than one written
 out: a word joined, lowered, trimmed or cut short, a number with a fallback or

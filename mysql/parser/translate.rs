@@ -2677,12 +2677,18 @@ pub(crate) fn translate_insert(
         || insert.output.is_some()
         || insert.priority.is_some()
         // An alias on the offered row is what names it in an
-        // `ON DUPLICATE KEY UPDATE`, and names nothing anywhere else. A list
-        // of column aliases beside it renames what the row carries, which is
-        // a shape this has not measured.
+        // `ON DUPLICATE KEY UPDATE`, and names nothing anywhere else: Rails
+        // writes one on every `insert_all!`, and measured on 8.4.11 a
+        // `VALUES` insert carrying one writes, numbers and refuses a
+        // duplicate exactly as the same insert without it. A list of column
+        // aliases beside it renames what the row carries, which is a shape
+        // this has not measured.
         || insert.insert_alias.as_ref().is_some_and(|alias| {
             alias.col_aliases.as_ref().is_some_and(|columns| !columns.is_empty())
-                || !matches!(insert.on, Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)))
+                || (!matches!(insert.on, Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(_)))
+                    && !insert.source.as_deref().is_some_and(|source| {
+                        matches!(source.body.as_ref(), SetExpr::Values(_))
+                    }))
         })
         || insert.settings.is_some()
         || insert.format_clause.is_some()
