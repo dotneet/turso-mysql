@@ -2,6 +2,7 @@
 //! `SHOW STATUS` counts.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -9,11 +10,17 @@ use std::time::{Duration, Instant};
 pub struct MySqlSessionRegistry {
     opened: Instant,
     sessions: Mutex<BTreeMap<u32, SessionActivity>>,
+    /// Numbers each registration, so one outliving its connection's ID —
+    /// the listener lets an ID go when the stream closes, which can be
+    /// before the session is dropped — never touches the session that ID
+    /// went to next.
+    next_registration: AtomicU64,
 }
 
 /// What one session is doing, as `SHOW PROCESSLIST` describes it.
 #[derive(Debug, Clone)]
 struct SessionActivity {
+    registration: u64,
     account: String,
     host: String,
     database: Option<String>,
@@ -48,16 +55,14 @@ impl Default for MySqlSessionRegistry {
         Self {
             opened: Instant::now(),
             sessions: Mutex::new(BTreeMap::new()),
+            next_registration: AtomicU64::new(1),
         }
     }
 }
 
 impl MySqlSessionRegistry {
     /// Lists a session that has logged in, until the returned registration is
-    /// dropped.
-    ///
-    /// Connection IDs are unique among the connections one server holds, so
-    /// the ID cannot already be listed.
+    /// dropped, in place of any session its ID was given to before.
     pub fn register(
         self: &Arc<Self>,
         id: u32,
@@ -65,9 +70,11 @@ impl MySqlSessionRegistry {
         host: String,
         database: Option<String>,
     ) -> MySqlSessionRegistration {
-        let replaced = self.lock().insert(
+        let registration = self.next_registration.fetch_add(1, Ordering::Relaxed);
+        self.lock().insert(
             id,
             SessionActivity {
+                registration,
                 account,
                 host,
                 database,
@@ -75,10 +82,10 @@ impl MySqlSessionRegistry {
                 since: Instant::now(),
             },
         );
-        assert!(replaced.is_none(), "connection {id} is registered once");
         MySqlSessionRegistration {
             registry: Arc::clone(self),
             id,
+            registration,
         }
     }
 
@@ -115,12 +122,14 @@ impl MySqlSessionRegistry {
             .expect("the session registry is never left half-changed")
     }
 
-    fn update(&self, id: u32, change: impl FnOnce(&mut SessionActivity)) {
-        let mut sessions = self.lock();
-        let activity = sessions
+    fn update(&self, id: u32, registration: u64, change: impl FnOnce(&mut SessionActivity)) {
+        if let Some(activity) = self
+            .lock()
             .get_mut(&id)
-            .expect("a registration's session stays listed until it is dropped");
-        change(activity);
+            .filter(|activity| activity.registration == registration)
+        {
+            change(activity);
+        }
     }
 }
 
@@ -128,44 +137,56 @@ impl MySqlSessionRegistry {
 pub struct MySqlSessionRegistration {
     registry: Arc<MySqlSessionRegistry>,
     id: u32,
+    registration: u64,
 }
 
 impl MySqlSessionRegistration {
     /// Notes that a command arrived, which restarts the session's clock.
     pub fn command_arrived(&self) {
         self.registry
-            .update(self.id, |activity| activity.since = Instant::now());
+            .update(self.id, self.registration, |activity| {
+                activity.since = Instant::now()
+            });
     }
 
     /// Notes that the session began running `statement`.
     pub fn statement_began(&self, statement: RunningStatement) {
-        self.registry.update(self.id, |activity| {
-            activity.running = Some(statement);
-            activity.since = Instant::now();
-        });
+        self.registry
+            .update(self.id, self.registration, |activity| {
+                activity.running = Some(statement);
+                activity.since = Instant::now();
+            });
     }
 
     /// Notes that the session finished a statement, and which database it
     /// has selected afterwards.
     pub fn statement_ended(&self, database: Option<&str>) {
-        self.registry.update(self.id, |activity| {
-            activity.running = None;
-            activity.database = database.map(str::to_owned);
-            activity.since = Instant::now();
-        });
+        self.registry
+            .update(self.id, self.registration, |activity| {
+                activity.running = None;
+                activity.database = database.map(str::to_owned);
+                activity.since = Instant::now();
+            });
     }
 
     /// Notes the database the session selected.
     pub fn database_selected(&self, database: &str) {
-        self.registry.update(self.id, |activity| {
-            activity.database = Some(database.to_owned());
-        });
+        self.registry
+            .update(self.id, self.registration, |activity| {
+                activity.database = Some(database.to_owned());
+            });
     }
 }
 
 impl Drop for MySqlSessionRegistration {
     fn drop(&mut self) {
-        self.registry.lock().remove(&self.id);
+        let mut sessions = self.registry.lock();
+        if sessions
+            .get(&self.id)
+            .is_some_and(|activity| activity.registration == self.registration)
+        {
+            sessions.remove(&self.id);
+        }
     }
 }
 
@@ -200,6 +221,26 @@ mod tests {
         assert_eq!(registry.logged_in(), 2);
         drop(other);
         drop(first);
+        assert_eq!(registry.logged_in(), 0);
+    }
+
+    /// The listener lets a connection's ID go when its stream closes, which
+    /// can come before its session is dropped.
+    #[test]
+    fn a_registration_outliving_its_id_leaves_the_next_session_alone() {
+        let registry = Arc::new(MySqlSessionRegistry::default());
+        let stale = registry.register(5, "app".into(), "localhost".into(), None);
+        let next = registry.register(5, "app".into(), "localhost".into(), Some("db".into()));
+        stale.statement_began(RunningStatement {
+            command: "Query",
+            text: "SELECT 1".into(),
+        });
+        drop(stale);
+        let listed = registry.sessions_of("app");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].running, None);
+        assert_eq!(listed[0].database.as_deref(), Some("db"));
+        drop(next);
         assert_eq!(registry.logged_in(), 0);
     }
 }
