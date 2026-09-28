@@ -2066,6 +2066,27 @@ fn test_mysql_changed_rows_for_mvcc_updates(tmp_db: TempDatabase) -> anyhow::Res
     assert_mysql_changed_rows_for_updates(&tmp_db.connect_limbo())
 }
 
+/// With foreign keys enforced, an UPDATE still stores the rowid alias as NULL,
+/// as SQLite does, so a row the UPDATE leaves as it stands keeps the bytes an
+/// INSERT wrote and is not counted as changed.
+#[turso_macros::test]
+fn test_mysql_changed_rows_for_wal_updates_with_foreign_keys(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert_mysql_changed_rows_for_updates(&conn)
+}
+
+#[turso_macros::test(mvcc)]
+fn test_mysql_changed_rows_for_mvcc_updates_with_foreign_keys(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    assert_mysql_changed_rows_for_updates(&conn)
+}
+
 /// A row an upsert leaves as it stood is not changed, whether an INSERT or an
 /// earlier upsert wrote it. The rowid alias is stored as NULL either way.
 fn assert_mysql_changed_rows_for_upserts(conn: &Arc<Connection>) -> anyhow::Result<()> {

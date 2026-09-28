@@ -1493,7 +1493,6 @@ fn emit_update_insns<'a>(
     // touched yet because later CHECK/PK/UNIQUE conflict handling may still
     // decide that `ON CONFLICT IGNORE` makes this row a no-op.
     if connection.foreign_keys_enabled() {
-        let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
             stabilize_new_row_for_fk(
                 program,
@@ -1501,7 +1500,6 @@ fn emit_update_insns<'a>(
                 &updated_column_indices,
                 target_table_cursor_id,
                 start,
-                rowid_new_reg,
             )?;
         }
     }

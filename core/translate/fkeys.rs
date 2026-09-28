@@ -577,13 +577,16 @@ pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
 
 /// Stabilize the NEW row image for FK checks (UPDATE):
 /// fill in unmodified PK columns from the current row so the NEW PK vector is complete.
+///
+/// A rowid alias is left alone: its register is the one the new record is made
+/// from, and SQLite stores NULL there, taking the value from the rowid. The FK
+/// code reads a rowid alias from the rowid register instead.
 pub fn stabilize_new_row_for_fk(
     program: &mut ProgramBuilder,
     table_btree: &BTreeTable,
     set_cols: &ColumnMask,
     cursor_id: usize,
     start: usize,
-    rowid_new_reg: usize,
 ) -> Result<()> {
     if table_btree.primary_key_columns.is_empty() {
         return Ok(());
@@ -594,17 +597,8 @@ pub fn stabilize_new_row_for_fk(
         let (pos, col) = table_btree
             .get_column(pk_name)
             .ok_or_else(|| LimboError::InternalError(format!("pk col {pk_name} missing")))?;
-        if !set_cols.get(pos) {
-            let dst_reg = layout.to_register(start, pos);
-            if col.is_rowid_alias() {
-                program.emit_insn(Insn::Copy {
-                    src_reg: rowid_new_reg,
-                    dst_reg,
-                    extra_amount: 0,
-                });
-            } else {
-                program.emit_column_or_rowid(cursor_id, pos, dst_reg);
-            }
+        if !set_cols.get(pos) && !col.is_rowid_alias() {
+            program.emit_column_or_rowid(cursor_id, pos, layout.to_register(start, pos));
         }
     }
     Ok(())
