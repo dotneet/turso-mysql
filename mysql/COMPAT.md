@@ -3201,6 +3201,16 @@ is refused. `@@sql_mode` reads `ONLY_FULL_GROUP_BY` back whatever a session
 names, the rule being one this server keeps regardless; MySQL drops it when a
 session leaves it out.
 
+sqlx opens every connection with `SET sql_mode=(SELECT CONCAT(@@sql_mode,
+',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4
+COLLATE utf8mb4_unicode_ci`, which was answered 1235 and left the session as
+it was. It is taken now: a mode worked out in parentheses, by a scalar
+`SELECT` or not, with or without `FROM DUAL`, sets what MySQL 8.4.11 sets,
+and `PIPES_AS_CONCAT` is taken and read back first, as MySQL reads it back.
+The mode only changes what `||` means — measured, `'a' || 'b'` is `ab` under
+it and `0` with warning 1287 without it — and this server refuses `||` in
+either case, so taking the mode changes no answer.
+
 `SHOW COLLATION` and `SHOW CHARACTER SET` (or `SHOW CHARSET`) list what this
 server has rather than everything MySQL has: the utf8mb4 collations a column,
 a table or the connection may be declared with — `utf8mb4_0900_ai_ci`,

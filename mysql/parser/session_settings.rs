@@ -785,7 +785,24 @@ impl<'a> Scanner<'a> {
         if self.take_keyword("DEFAULT") {
             return Some(SqlModeValue::Default);
         }
+        // sqlx opens every connection with
+        // `SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,...'))`:
+        // a value in parentheses, a scalar `SELECT` of one, with or without
+        // `FROM DUAL`, measured on MySQL 8.4.11 to set the same.
         let restore = self.cursor;
+        if self.take_byte(b'(') {
+            let selected = self.take_keyword("SELECT");
+            let value = self.take_sql_mode_value(mode);
+            if selected && self.take_keyword("FROM") && !self.take_keyword("DUAL") {
+                self.cursor = restore;
+                return None;
+            }
+            if value.is_none() || !self.take_byte(b')') {
+                self.cursor = restore;
+                return None;
+            }
+            return value;
+        }
         let concat = self.take_keyword("CONCAT");
         if !concat && !self.take_keyword("REPLACE") {
             return None;
@@ -1562,6 +1579,62 @@ mod tests {
         // A variable this reader does not know leaves the whole statement to
         // the other readers, which refuse it.
         assert_eq!(parse_all("SET time_zone = '+00:00' , x = 1"), None);
+    }
+
+    /// sqlx opens every connection with this, verbatim from its log: the
+    /// mode worked out by a scalar `SELECT` in parentheses, and `NAMES` after
+    /// two assignments.
+    #[test]
+    fn reads_the_set_sqlx_opens_with() {
+        let sqlx = "SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;";
+        let settings = parse_all(sqlx).unwrap();
+        assert_eq!(settings.len(), 3);
+        let MySqlSessionSetting::SqlModeExpression(sql_mode) = &settings[0] else {
+            panic!("{:?}", settings[0]);
+        };
+        assert_eq!(
+            sql_mode.named_modes("ONLY_FULL_GROUP_BY", ""),
+            [
+                "ONLY_FULL_GROUP_BY",
+                "PIPES_AS_CONCAT",
+                "NO_ENGINE_SUBSTITUTION"
+            ]
+        );
+        assert_eq!(
+            settings[1],
+            MySqlSessionSetting::TimeZone("+00:00".to_owned())
+        );
+        assert_eq!(
+            settings[2],
+            MySqlSessionSetting::Names {
+                character_set: "utf8mb4".to_owned(),
+                collation: Some("utf8mb4_unicode_ci".to_owned()),
+            }
+        );
+        for (sql, expected) in [
+            ("SET sql_mode = (CONCAT(@@sql_mode, ',X'))", "A,X"),
+            ("SET sql_mode = (SELECT 'X')", "X"),
+            (
+                "SET sql_mode = (SELECT CONCAT(@@sql_mode, ',X') FROM DUAL)",
+                "A,X",
+            ),
+        ] {
+            let Some(MySqlSessionSetting::SqlModeExpression(value)) = parse(sql) else {
+                let Some(MySqlSessionSetting::SqlMode(modes)) = parse(sql) else {
+                    panic!("{sql}");
+                };
+                assert_eq!(modes.join(","), expected, "{sql}");
+                continue;
+            };
+            assert_eq!(value.evaluate("A", ""), expected, "{sql}");
+        }
+        for sql in [
+            "SET sql_mode = (SELECT @@sql_mode FROM t)",
+            "SET sql_mode = (SELECT @@sql_mode",
+            "SET sql_mode = (SELECT @@sql_mode WHERE 1)",
+        ] {
+            assert_eq!(parse_all(sql), None, "{sql}");
+        }
     }
 
     /// Rails opens every connection with one `SET` of three assignments, and

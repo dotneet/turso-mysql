@@ -150,6 +150,39 @@ fn a_session_may_ask_for_the_traditional_modes() {
     assert!(adapter.execute_query("SET sql_mode = 'ANSI'").is_err());
 }
 
+/// sqlx opens every connection with this statement, verbatim from its log.
+/// Measured on MySQL 8.4.11: the mode reads back with `PIPES_AS_CONCAT`
+/// first, the zone as `+00:00` and the connection's collation as
+/// `utf8mb4_unicode_ci`. Under the mode `'a' || 'b'` is `ab`, and without it
+/// `0` with warnings; this server refuses `||` either way, which is why the
+/// mode can be taken.
+#[test]
+fn the_session_sqlx_opens_is_taken() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "SET sql_mode=(SELECT CONCAT(@@sql_mode, ',PIPES_AS_CONCAT,NO_ENGINE_SUBSTITUTION')),time_zone='+00:00',NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT @@sql_mode, @@time_zone, @@collation_connection"
+        ),
+        [[
+            Some(
+                "PIPES_AS_CONCAT,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,\
+                 NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
+                    .to_owned()
+            ),
+            Some("+00:00".to_owned()),
+            Some("utf8mb4_unicode_ci".to_owned()),
+        ]]
+    );
+    assert!(adapter.execute_query("SELECT 'a' || 'b'").is_err());
+    run(&mut adapter, "SET sql_mode = DEFAULT");
+    assert!(adapter.execute_query("SELECT 'a' || 'b'").is_err());
+}
+
 /// A `SELECT` running past `max_execution_time` is stopped. Measured on MySQL
 /// 8.4.11: any whole number of milliseconds is taken and read back as a
 /// LONGLONG of 21, `DEFAULT` is 0 — no limit — and a `SELECT` running longer

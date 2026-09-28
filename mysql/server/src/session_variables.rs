@@ -255,6 +255,9 @@ struct SqlModeChoices {
     /// `TRADITIONAL`, which MySQL keeps as a mode of its own beside the ones
     /// it stands for, and reads back.
     traditional: bool,
+    /// Read `||` as `CONCAT` rather than `OR`. This server refuses `||`
+    /// either way, so it changes no answer but what is read back.
+    pipes_as_concat: bool,
 }
 
 impl SqlModeChoices {
@@ -268,6 +271,7 @@ impl SqlModeChoices {
             strict_all_tables: named("STRICT_ALL_TABLES") || traditional,
             no_auto_value_on_zero: named("NO_AUTO_VALUE_ON_ZERO"),
             traditional,
+            pipes_as_concat: named("PIPES_AS_CONCAT"),
         }
     }
 }
@@ -1410,8 +1414,11 @@ fn accept_session_setting(
 /// reads the variable and writes it back is taken: writes are refused rather
 /// than truncated, an impossible date is refused, `InnoDB` is the only engine
 /// and is what `SHOW CREATE TABLE` reports, and division by zero never reaches
-/// a write. `TRADITIONAL` names nothing but modes of that list. Every other
-/// mode is refused rather than silently ignored.
+/// a write. `TRADITIONAL` names nothing but modes of that list.
+/// `PIPES_AS_CONCAT`, which sqlx sets on every connection, changes only what
+/// `||` means — `CONCAT` rather than `OR`, measured on MySQL 8.4.11 — and this
+/// server refuses `||` whichever it would mean, so no answer depends on it.
+/// Every other mode is refused rather than silently ignored.
 fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) -> bool {
     if mode.eq_ignore_ascii_case("ANSI_QUOTES") {
         return session_sql_mode.ansi_quotes;
@@ -1428,6 +1435,7 @@ fn session_names_the_mode_already(mode: &str, session_sql_mode: SessionSqlMode) 
         "ERROR_FOR_DIVISION_BY_ZERO",
         "NO_ENGINE_SUBSTITUTION",
         "TRADITIONAL",
+        "PIPES_AS_CONCAT",
     ]
     .iter()
     .any(|known| mode.eq_ignore_ascii_case(known))
@@ -1996,11 +2004,15 @@ pub(crate) fn reported_sql_mode(session_sql_mode: SessionSqlMode) -> String {
 
 /// The `sql_mode` a session reads back, with the flags it turned on.
 ///
-/// Measured on MySQL 8.4.11: `NO_AUTO_VALUE_ON_ZERO` reads back after
-/// `ONLY_FULL_GROUP_BY`, `STRICT_ALL_TABLES` after `STRICT_TRANS_TABLES`, and
-/// `TRADITIONAL` before `NO_ENGINE_SUBSTITUTION`.
+/// Measured on MySQL 8.4.11: `PIPES_AS_CONCAT` reads back first,
+/// `NO_AUTO_VALUE_ON_ZERO` after `ONLY_FULL_GROUP_BY`, `STRICT_ALL_TABLES`
+/// after `STRICT_TRANS_TABLES`, and `TRADITIONAL` before
+/// `NO_ENGINE_SUBSTITUTION`.
 fn reported_sql_mode_with(session_sql_mode: SessionSqlMode, choices: SqlModeChoices) -> String {
-    let mut modes = Vec::with_capacity(10);
+    let mut modes = Vec::with_capacity(11);
+    if choices.pipes_as_concat {
+        modes.push("PIPES_AS_CONCAT");
+    }
     if session_sql_mode.ansi_quotes {
         modes.push("ANSI_QUOTES");
     }
@@ -2765,7 +2777,6 @@ mod tests {
             "SET NAMES utf8mb4 COLLATE utf8mb4_bin",
             "SET sql_mode = 'ANSI_QUOTES'",
             "SET sql_mode = 'NO_BACKSLASH_ESCAPES'",
-            "SET sql_mode = 'PIPES_AS_CONCAT'",
             "SET time_zone = '+14:01'",
         ] {
             assert_eq!(run(sql), Err(FrontendErrorKind::Unsupported), "{sql}");
