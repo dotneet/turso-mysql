@@ -22,7 +22,7 @@ use sqlparser::tokenizer::{Location, Token, TokenWithSpan, Tokenizer, TokenizerE
 use turso_parser::{ast::Cmd as TursoCmd, parser::Parser as TursoParser};
 
 use crate::admin_command::{AdminToken, VersionedComments};
-use crate::{ParseError, SessionMySqlDialect, SessionSqlMode};
+use crate::{CheckedAutoIncrementInsert, ParseError, SessionMySqlDialect, SessionSqlMode};
 
 /// Keeps what reading each text gives until it is dropped.
 ///
@@ -52,6 +52,7 @@ impl Drop for KeptReads {
             STATEMENTS.with(|kept| kept.borrow_mut().clear());
             ENGINE_STATEMENTS.with(|kept| kept.borrow_mut().clear());
             ADMIN_TOKENS.with(|kept| kept.borrow_mut().clear());
+            COUNTED_INSERTS.with(|kept| kept.borrow_mut().clear());
         }
     }
 }
@@ -70,6 +71,9 @@ pub struct BytesRead {
     pub parsed_by_the_engine: usize,
     /// Read by the tokenizer of administrative commands.
     pub tokenized_as_a_command: usize,
+    /// Checked as a counted `INSERT`, which renders it and has the engine
+    /// read what was rendered.
+    pub checked_as_a_counted_insert: usize,
 }
 
 /// What this thread has read so far.
@@ -155,6 +159,31 @@ pub(crate) fn admin_tokens(
 ) -> Result<Vec<AdminToken>, ParseError> {
     answer(&ADMIN_TOKENS, (mode, versioned_comments), sql, || {
         count(|bytes| bytes.tokenized_as_a_command += sql.len());
+        read()
+    })
+}
+
+/// Which values a counted `INSERT` was checked to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountedValues {
+    /// Only values written into the statement.
+    Written,
+    /// Written values and bare `?` placeholders.
+    Bound,
+}
+
+/// A counted `INSERT` checked by `read`, which the frontend asks for up to
+/// three times a statement: to raise the counter past the ids it writes, to
+/// write rows naming their own ids, and to number the rest. Checking renders
+/// the whole statement and has the engine read it, so the answer is kept.
+pub(crate) fn counted_insert(
+    sql: &str,
+    mode: SessionSqlMode,
+    values: CountedValues,
+    read: impl FnOnce() -> Result<CheckedAutoIncrementInsert, ParseError>,
+) -> Result<CheckedAutoIncrementInsert, ParseError> {
+    answer(&COUNTED_INSERTS, (mode, values), sql, || {
+        count(|bytes| bytes.checked_as_a_counted_insert += sql.len());
         read()
     })
 }
@@ -254,12 +283,15 @@ thread_local! {
             parsed: 0,
             parsed_by_the_engine: 0,
             tokenized_as_a_command: 0,
+            checked_as_a_counted_insert: 0,
         })
     };
     static TOKENS: Kept<TokenDialect, KeptTokens> = const { RefCell::new(Vec::new()) };
     static STATEMENTS: Kept<SessionSqlMode, Result<Statement, ParseError>> =
         const { RefCell::new(Vec::new()) };
     static ENGINE_STATEMENTS: Kept<(), EngineReading> = const { RefCell::new(Vec::new()) };
+    static COUNTED_INSERTS: Kept<(SessionSqlMode, CountedValues), Result<CheckedAutoIncrementInsert, ParseError>> =
+        const { RefCell::new(Vec::new()) };
     static ADMIN_TOKENS: Kept<(SessionSqlMode, VersionedComments), Result<Vec<AdminToken>, ParseError>> =
         const { RefCell::new(Vec::new()) };
 }

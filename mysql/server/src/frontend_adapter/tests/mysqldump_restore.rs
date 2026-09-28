@@ -434,12 +434,16 @@ fn a_restored_schema_prints_and_behaves_as_it_was_dumped() {
 /// costs time in proportion to its length, so the long statement is read
 /// whole only a few times on its way to running: tokenized once for the
 /// session's dialect and once for sqlparser's own, parsed once into a syntax
-/// tree, read once by the engine and once by each of the three ways the
-/// command tokenizer reads it — and, since it names no columns, tokenized and
-/// parsed once more with its column list written out. Before the readings were
-/// kept while a
-/// statement is answered, it was tokenized 26 times, parsed 8 times and read
-/// by the command tokenizer 23 times.
+/// tree, read once by the engine, once by each of the three ways the command
+/// tokenizer reads it and checked once as a counted `INSERT` — and, since it
+/// names no columns, tokenized and parsed once more with its column list
+/// written out. The same holds for a table that counts no ids, which is
+/// checked as a counted `INSERT` before it is found to be none.
+///
+/// Before the readings were kept while a statement is answered, the one into
+/// the counted table was tokenized 26 times, parsed 8 times and read by the
+/// command tokenizer 23 times, and the other was tokenized 33 times, parsed
+/// 13 times, read by the engine 6 times and checked as a counted `INSERT` 3.
 #[test]
 fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
     let (_directory, mut adapter) = restoring_session();
@@ -449,7 +453,11 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
         &mut adapter,
         "CREATE TABLE `articles` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `title` varchar(200) NOT NULL, `body` text, `views` int NOT NULL DEFAULT '0', `published_at` datetime(6) DEFAULT NULL, PRIMARY KEY (`id`))",
     );
-    let written_rows = (1..=300)
+    run(
+        &mut adapter,
+        "CREATE TABLE `article_tags` (`article_id` bigint unsigned NOT NULL, `tag` varchar(50) NOT NULL, `note` text, PRIMARY KEY (`article_id`,`tag`))",
+    );
+    let articles = (1..=300)
         .map(|id| {
             format!(
                 "({id},'Post {id}','It\\'s line one\\nline two',{id},'2026-03-01 10:00:00.123456')"
@@ -457,19 +465,30 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
         })
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!("INSERT INTO `articles` VALUES {written_rows}");
+    let tags = (1..=300)
+        .map(|id| format!("({id},'tag {id}','It\\'s tagged')"))
+        .collect::<Vec<_>>()
+        .join(",");
 
-    let before = turso_mysql_parser::bytes_read();
-    assert_eq!(ok(&mut adapter, &sql).affected_rows, 300);
-    assert_eq!(
-        whole_readings(before, turso_mysql_parser::bytes_read(), sql.len()),
-        turso_mysql_parser::BytesRead {
-            tokenized: 3,
-            parsed: 2,
-            parsed_by_the_engine: 1,
-            tokenized_as_a_command: 3,
-        }
-    );
+    for sql in [
+        format!("INSERT INTO `articles` VALUES {articles}"),
+        format!("INSERT INTO `article_tags` VALUES {tags}"),
+    ] {
+        let before = turso_mysql_parser::bytes_read();
+        assert_eq!(ok(&mut adapter, &sql).affected_rows, 300);
+        assert_eq!(
+            whole_readings(before, turso_mysql_parser::bytes_read(), sql.len()),
+            turso_mysql_parser::BytesRead {
+                tokenized: 3,
+                parsed: 2,
+                parsed_by_the_engine: 1,
+                tokenized_as_a_command: 3,
+                checked_as_a_counted_insert: 1,
+            },
+            "{}",
+            &sql[..40]
+        );
+    }
     assert_eq!(
         rows(
             &mut adapter,
@@ -480,6 +499,13 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
             Some("300"),
             Some("It's line one\nline two")
         ])]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COUNT(*), MAX(article_id), MIN(note) FROM article_tags"
+        ),
+        [row(&[Some("300"), Some("300"), Some("It's tagged")])]
     );
 }
 

@@ -30868,5 +30868,8 @@ fn whole_readings(
         parsed_by_the_engine: (after.parsed_by_the_engine - before.parsed_by_the_engine) / length,
         tokenized_as_a_command: (after.tokenized_as_a_command - before.tokenized_as_a_command)
             / length,
+        checked_as_a_counted_insert: (after.checked_as_a_counted_insert
+            - before.checked_as_a_counted_insert)
+            / length,
     }
 }

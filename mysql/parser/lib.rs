@@ -4946,7 +4946,9 @@ pub fn parse_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_written_insert_value)
+    statement_reads::counted_insert(sql, mode, statement_reads::CountedValues::Written, || {
+        parse_checked_auto_increment_insert(sql, mode, is_written_insert_value)
+    })
 }
 
 /// Parses one AUTO_INCREMENT INSERT that can be executed through a prepared
@@ -4959,7 +4961,9 @@ pub fn parse_prepared_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value)
+    statement_reads::counted_insert(sql, mode, statement_reads::CountedValues::Bound, || {
+        parse_checked_auto_increment_insert(sql, mode, is_prepared_insert_value)
+    })
 }
 
 fn parse_checked_auto_increment_insert(

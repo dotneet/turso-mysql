@@ -161,6 +161,7 @@ fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed()
             parsed: 1,
             parsed_by_the_engine: 1,
             tokenized_as_a_command: 0,
+            checked_as_a_counted_insert: 1,
         }
     );
     assert_eq!(
@@ -170,6 +171,7 @@ fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed()
             parsed: 1,
             parsed_by_the_engine: 0,
             tokenized_as_a_command: 0,
+            checked_as_a_counted_insert: 0,
         }
     );
 }
