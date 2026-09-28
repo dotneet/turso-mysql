@@ -2675,6 +2675,8 @@ where
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
         let _kept_reads = turso_mysql_parser::keep_reads();
         self.error_message = None;
+        let answered = with_xorm_version_test_answered(sql, self.session.session_sql_mode());
+        let sql = answered.as_deref().unwrap_or(sql);
         if let Some(listed) = &self.listed {
             listed.statement_began(RunningStatement {
                 command: "Query",
@@ -2730,6 +2732,8 @@ where
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
         let _kept_reads = turso_mysql_parser::keep_reads();
         self.error_message = None;
+        let answered = with_xorm_version_test_answered(sql, self.session.session_sql_mode());
+        let sql = answered.as_deref().unwrap_or(sql);
         let result = self
             .follow_a_dropped_database()
             .and_then(|()| self.prepare_on_the_session(sql));
@@ -13261,6 +13265,26 @@ fn show_listing_columns(
             column
         })
         .collect()
+}
+
+/// A statement holding xorm's test of the server's version, with the test
+/// replaced by its answer, or `None` for any other statement.
+///
+/// xorm's `GetColumns` reads `VERSION()` apart to learn whether the server is
+/// a MariaDB that quotes its column defaults, which takes calls and
+/// comparisons of words with numbers the checked `SELECT` refuses. The answer
+/// depends on nothing but the version this server reports, so it is written
+/// in and the rest of the statement read as it stands. Measured on MySQL
+/// 8.4.11 the column is a `LONGLONG` of 1 without `NOT_NULL`; the written 0
+/// reports `NOT_NULL`.
+fn with_xorm_version_test_answered(sql: &str, mode: SessionSqlMode) -> Option<String> {
+    let span = turso_mysql_parser::xorm_mariadb_test_span(sql, mode)?;
+    let answer = turso_mysql_parser::xorm_mariadb_test_answer(crate::handshake::SERVER_VERSION)?;
+    Some(format!(
+        "{}{answer}{}",
+        &sql[..span.start],
+        &sql[span.end..]
+    ))
 }
 
 /// Reports whether a `SHOW` listing keeps one of its rows.

@@ -66,6 +66,7 @@ mod written_bytes;
 mod written_literals;
 mod written_number;
 mod written_value;
+mod xorm_version_test;
 
 use admin_command::{
     admin_command_ends, consume_admin_database_name, consume_admin_qualified_table_name,
@@ -268,6 +269,7 @@ pub use written_bytes::{
 };
 pub use written_number::{read_written_number, WrittenNumber};
 pub use written_value::WrittenValue;
+pub use xorm_version_test::{xorm_mariadb_test_answer, xorm_mariadb_test_span};
 
 /// Longest `VARCHAR` this server takes, in characters.
 ///

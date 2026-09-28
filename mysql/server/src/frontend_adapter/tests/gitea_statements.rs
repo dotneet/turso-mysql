@@ -305,3 +305,125 @@ fn xorms_uncounted_key_takes_a_display_width() {
         .execute_query("INSERT INTO `keyed` (`n`) VALUES (1)")
         .is_err());
 }
+
+/// What xorm's `GetColumns` asks for every table it syncs.
+const XORM_GET_COLUMNS: &str = "SELECT `COLUMN_NAME`, `IS_NULLABLE`, `COLUMN_DEFAULT`, `COLUMN_TYPE`, `COLUMN_KEY`, `EXTRA`, `COLUMN_COMMENT`, `CHARACTER_MAXIMUM_LENGTH`, (INSTR(VERSION(), 'maria') > 0 && (SUBSTRING_INDEX(VERSION(), '.', 1) > 10 || (SUBSTRING_INDEX(VERSION(), '.', 1) = 10 && (SUBSTRING_INDEX(SUBSTRING(VERSION(), 4), '.', 1) > 2 || (SUBSTRING_INDEX(SUBSTRING(VERSION(), 4), '.', 1) = 2 && SUBSTRING_INDEX(SUBSTRING(VERSION(), 6), '-', 1) >= 7))))) AS NEEDS_QUOTE, `COLLATION_NAME` FROM `INFORMATION_SCHEMA`.`COLUMNS` WHERE `TABLE_SCHEMA` = ? AND `TABLE_NAME` = ? ORDER BY `COLUMNS`.ORDINAL_POSITION ASC";
+
+/// xorm's column listing tests `VERSION()` for a MariaDB inside the
+/// statement; on a server that is none the test answers 0 and the rest reads
+/// `information_schema.COLUMNS`. Every row here is the one MySQL 8.4.11
+/// answered for the same table.
+#[test]
+fn xorms_column_listing_answers_its_version_test() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE IF NOT EXISTS `ver1` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `version` BIGINT(20) NULL, `name` VARCHAR(255) DEFAULT '' NOT NULL COMMENT 'nm', `flag` TINYINT(1) DEFAULT false NOT NULL, `body` TEXT NULL, `created` DATETIME NULL, UNIQUE INDEX `u1` (`name`)) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+    );
+    let result = prepared_rows(
+        &mut adapter,
+        XORM_GET_COLUMNS,
+        &[Bound::Word("reports"), Bound::Word("ver1")],
+    );
+    let needs_quote = &result.columns[8];
+    assert_eq!(needs_quote.name, "NEEDS_QUOTE");
+    assert_eq!(needs_quote.column_type, MYSQL_TYPE_LONGLONG);
+    let word = |value: &str| BinaryResultValue::Text(value.to_owned());
+    let bytes = |value: &str| BinaryResultValue::Blob(value.as_bytes().to_vec());
+    let null = BinaryResultValue::Null;
+    let zero = BinaryResultValue::Integer(0);
+    let row = |name: &str,
+               nullable: &str,
+               default: BinaryResultValue,
+               declared: &str,
+               key: &str,
+               extra: &str,
+               comment: &str,
+               length: BinaryResultValue,
+               collation: BinaryResultValue| {
+        vec![
+            word(name),
+            word(nullable),
+            default,
+            bytes(declared),
+            word(key),
+            word(extra),
+            bytes(comment),
+            length,
+            zero.clone(),
+            collation,
+        ]
+    };
+    let ai_ci = || word("utf8mb4_0900_ai_ci");
+    assert_eq!(
+        result.rows,
+        vec![
+            row(
+                "id",
+                "NO",
+                null.clone(),
+                "bigint",
+                "PRI",
+                "auto_increment",
+                "",
+                null.clone(),
+                null.clone()
+            ),
+            row(
+                "version",
+                "YES",
+                null.clone(),
+                "bigint",
+                "",
+                "",
+                "",
+                null.clone(),
+                null.clone()
+            ),
+            row(
+                "name",
+                "NO",
+                bytes(""),
+                "varchar(255)",
+                "UNI",
+                "",
+                "nm",
+                BinaryResultValue::Integer(255),
+                ai_ci()
+            ),
+            row(
+                "flag",
+                "NO",
+                bytes("0"),
+                "tinyint(1)",
+                "",
+                "",
+                "",
+                null.clone(),
+                null.clone()
+            ),
+            row(
+                "body",
+                "YES",
+                null.clone(),
+                "text",
+                "",
+                "",
+                "",
+                BinaryResultValue::Integer(65535),
+                ai_ci()
+            ),
+            row(
+                "created",
+                "YES",
+                null.clone(),
+                "datetime",
+                "",
+                "",
+                "",
+                null.clone(),
+                null
+            ),
+        ]
+    );
+}

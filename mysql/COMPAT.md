@@ -4441,6 +4441,19 @@ name that is not there answers rather than analysing everything quietly. One
 unqualified table at a time is taken — a list, a qualified name,
 `NO_WRITE_TO_BINLOG`, `LOCAL` and the histogram clauses are refused.
 
+xorm's `GetColumns`, which Gitea runs for every table it syncs, reads
+`information_schema.COLUMNS` beside a test of `VERSION()` for a MariaDB that
+quotes its column defaults — `INSTR(VERSION(), 'maria') > 0 && ...`, reading
+the version apart with `SUBSTRING_INDEX` and comparing the pieces with
+numbers, which the checked `SELECT` refuses. The test depends on nothing but
+the version this server reports, `8.0.36-turso`, which names no `maria`, so
+MySQL's `&&` answers 0 whatever the rest reads; the test is found by its
+tokens, written exactly as xorm writes it and outside any quoted word, and
+replaced by that 0 before the statement is read, text or prepared. The rest
+is an ordinary read of `COLUMNS` and answers the rows MySQL 8.4.11 answers.
+The column reports `NOT_NULL`, which a written 0 carries and MySQL's
+expression does not.
+
 `SHOW TABLE STATUS` describes each table in the selected database. The eighteen
 column shapes are measured on 8.4.11; the values are answered about this server.
 `Name`, `Engine`, `Rows`, `Collation`, `Create_options` and `Comment` it can
