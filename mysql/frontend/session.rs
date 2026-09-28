@@ -1895,12 +1895,20 @@ impl MySqlConnection {
         } else {
             Vec::new()
         };
+        // The engine holds a `BIGINT UNSIGNED` as a blob of its own, which a
+        // bound number meets only through the comparison a `DECIMAL` is read
+        // with, as a `SELECT` reads it. An `INSERT` compares nothing of the
+        // table it writes.
         let decimal_columns = columns
             .iter()
             .filter_map(|column| {
                 column
                     .decimal_size()
                     .map(|(_, scale)| (column.name().to_owned(), scale))
+                    .or_else(|| {
+                        (!inserts && column.type_name() == "BIGINT UNSIGNED")
+                            .then(|| (column.name().to_owned(), 0))
+                    })
             })
             .collect::<Vec<_>>();
         let integer_columns = columns
@@ -1908,7 +1916,6 @@ impl MySqlConnection {
             .filter(|column| is_integer_type(column.type_name()))
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
-        // An `INSERT` compares nothing of the table it writes.
         let text_columns = if inserts {
             Vec::new()
         } else {

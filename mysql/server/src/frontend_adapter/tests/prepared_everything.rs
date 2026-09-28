@@ -643,3 +643,68 @@ fn laravel_takes_its_next_job_skipping_locked_rows() {
     );
     adapter.execute_query("COMMIT").unwrap();
 }
+
+/// Every key Laravel makes is a `bigint unsigned`, and Eloquent updates and
+/// deletes a row by it, binding the id as a number: `update ... where id =
+/// ?`, `delete from posts where id = ?`, and a pivot's detach, `delete from
+/// post_tag where post_tag.post_id = ? and post_tag.tag_id in (?)`. Each
+/// matched no row, the engine comparing the number with the unsigned column's
+/// own stored form; MySQL finds the row.
+#[test]
+fn laravel_writes_a_row_found_by_its_unsigned_id() {
+    let (_directory, mut adapter) = adapter();
+    adapter.execute_query(LARAVEL_OPENS_WITH).unwrap();
+    for sql in [
+        "create table `jobs` (`id` bigint unsigned not null auto_increment primary key, `queue` varchar(255) not null, `attempts` tinyint unsigned not null, `reserved_at` int unsigned null) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "create table `post_tag` (`post_id` bigint unsigned not null, `tag_id` bigint unsigned not null, primary key (`post_id`, `tag_id`)) default character set utf8mb4 collate 'utf8mb4_unicode_ci'",
+        "insert into `jobs` (`queue`, `attempts`) values ('default', 0), ('default', 0)",
+        "insert into `post_tag` values (2, 2), (2, 3), (3, 3)",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "update `jobs` set `reserved_at` = ?, `attempts` = ? where `id` = ?",
+            &[
+                Bound::Number(1790561610),
+                Bound::Number(1),
+                Bound::Number(2)
+            ],
+        ),
+        1
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `id`, `attempts`, `reserved_at` from `jobs` order by `id`"
+        ),
+        [
+            [word("1"), word("0"), None],
+            [word("2"), word("1"), word("1790561610")]
+        ]
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "delete from `jobs` where `id` = ?",
+            &[Bound::Number(1)],
+        ),
+        1
+    );
+    assert_eq!(
+        affected(
+            &mut adapter,
+            "delete from `post_tag` where `post_tag`.`post_id` = ? and `post_tag`.`tag_id` in (?)",
+            &[Bound::Number(2), Bound::Number(2)],
+        ),
+        1
+    );
+    assert_eq!(
+        words_of(
+            &mut adapter,
+            "select `post_id`, `tag_id` from `post_tag` order by `post_id`, `tag_id`"
+        ),
+        [[word("2"), word("3")], [word("3"), word("3")]]
+    );
+}

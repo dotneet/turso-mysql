@@ -5114,7 +5114,12 @@ carries the full `u64` value. Inserting and reading the boundary values,
 ordering by the column, indexed equality and range comparisons, prepared
 unsigned parameters, and reopening the database are covered. MySQL 8.4.11
 accepts the same endpoints and rejects negative assignments with 1264, as
-this frontend does. An assignment above `u64::MAX` is also refused.
+this frontend does. An assignment above `u64::MAX` is also refused. A prepared
+`UPDATE` or `DELETE` finding its row by a `BIGINT UNSIGNED` column compared with a
+bound value — Eloquent's `where id = ?` over every key Laravel makes, and a
+pivot's `post_id = ? and tag_id in (?)` — compares it the way a prepared
+`SELECT` does; it used to match no row, the engine comparing the bound number
+with the column's stored form.
 
 This internal type is created only for the MySQL frontend. An older MySQL
 table declared as `BIGINT UNSIGNED` used signed integer storage; its original
