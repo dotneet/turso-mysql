@@ -8801,9 +8801,18 @@ impl MySqlConnection {
                 }
                 // Measured on 8.4.11, a bound double meets a count as a
                 // number, `COUNT(*) > 1.5` finding the groups of two, which is
-                // how the engine compares a whole number with a real.
+                // how the engine compares a whole number with a real. It meets
+                // a column of whole numbers the same way, exactly: mysql2
+                // binds every number a statement's parameters are not typed
+                // for as a double, and `views = 1.5` finds nothing, `views >=
+                // 1.5` finds 2, and a `BIGINT` of 9007199254740993 is not the
+                // double 9007199254740992.
                 MySqlPreparedValue::Real(_) => {
                     comparison.answers() == Some(CheckedComparisonAnswer::RowCount)
+                        || (whole_number_parameters.contains(ordinal)
+                            && !patterns
+                            && !stored_as_a_moment
+                            && !meets_words)
                 }
                 MySqlPreparedValue::Blob(_) => meets_bytes,
             };

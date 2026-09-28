@@ -5355,7 +5355,6 @@ fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Resu
         .prepare_checked_statement("SELECT id FROM records WHERE id = ?")
         .unwrap();
     for value in [
-        MySqlPreparedValue::Real(2.0),
         MySqlPreparedValue::Text("2.0".to_string()),
         MySqlPreparedValue::Text(" 2".to_string()),
         MySqlPreparedValue::Blob(vec![b'2']),
@@ -5368,17 +5367,19 @@ fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Resu
         ));
     }
     // A word naming a whole number is bound as that number, which is what
-    // MySQL reads it as.
-    assert_eq!(
-        connection
-            .execute_prepared_select(
-                invalid_metadata.statement_id,
-                &[MySqlPreparedValue::Text("02".to_string())],
-                None,
-            )
-            .map_err(|error| LimboError::InternalError(error.to_string()))?,
-        vec![vec![MySqlPreparedValue::Integer(2)]]
-    );
+    // MySQL reads it as, and a double is compared with the column exactly,
+    // measured on MySQL 8.4.11.
+    for value in [
+        MySqlPreparedValue::Text("02".to_string()),
+        MySqlPreparedValue::Real(2.0),
+    ] {
+        assert_eq!(
+            connection
+                .execute_prepared_select(invalid_metadata.statement_id, &[value], None)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?,
+            vec![vec![MySqlPreparedValue::Integer(2)]]
+        );
+    }
 
     connection.close()?;
     Ok(())
@@ -5570,7 +5571,6 @@ fn comparisons_leave_out_rows_whose_column_is_null() -> Result<()> {
     for value in [
         MySqlPreparedValue::Text("1.5".to_string()),
         MySqlPreparedValue::Text("1abc".to_string()),
-        MySqlPreparedValue::Real(1.5),
     ] {
         assert!(
             connection
@@ -5579,6 +5579,24 @@ fn comparisons_leave_out_rows_whose_column_is_null() -> Result<()> {
             "{value:?}"
         );
     }
+    // A double is compared exactly, and a NULL column still leaves its row
+    // out, measured on MySQL 8.4.11.
+    let prepared = connection
+        .prepare_checked_statement("SELECT id FROM records WHERE nullable_int > ? ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute_prepared_select(
+                prepared.statement_id,
+                &[MySqlPreparedValue::Real(0.5)],
+                None
+            )
+            .unwrap(),
+        vec![
+            vec![MySqlPreparedValue::Integer(1)],
+            vec![MySqlPreparedValue::Integer(3)]
+        ]
+    );
     connection.close()?;
     Ok(())
 }

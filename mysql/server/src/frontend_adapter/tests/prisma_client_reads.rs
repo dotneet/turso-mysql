@@ -131,11 +131,11 @@ fn a_total_compared_in_having_with_a_bound_value_finds_the_groups_mysql_finds() 
         user_ids(&mut adapter, Bound::Word("5")),
         Ok(vec![BinaryResultValue::Integer(1)])
     );
-    // MySQL finds both groups for 2.9. A fraction bound against a whole-number
-    // column is refused here, as it is against the column itself.
+    // MySQL finds both groups for 2.9, comparing the total with the double as
+    // numbers, as the engine does.
     assert_eq!(
         user_ids(&mut adapter, Bound::Real(2.9)),
-        Err(FrontendErrorKind::Unsupported)
+        Ok(vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(2)])
     );
     // MySQL reads `'abc'` as 0 here and warns nothing, and `'2.9'` as 2.9;
     // a word naming no whole number is refused, as against the column.

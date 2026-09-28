@@ -390,6 +390,80 @@ fn one_word(word: &str) -> Vec<u8> {
     payload
 }
 
+/// A double and then a word, as mysql2 binds a number and a string where a
+/// statement's parameters are not typed for it.
+fn a_double_and_a_word(number: f64, word: &str) -> Vec<u8> {
+    let mut payload = vec![0, 1, MYSQL_TYPE_DOUBLE, 0, MYSQL_TYPE_VAR_STRING, 0];
+    payload.extend_from_slice(&number.to_le_bytes());
+    payload.push(word.len() as u8);
+    payload.extend_from_slice(word.as_bytes());
+    payload
+}
+
+fn one_double(number: f64) -> Vec<u8> {
+    let mut payload = vec![0, 1, MYSQL_TYPE_DOUBLE, 0];
+    payload.extend_from_slice(&number.to_le_bytes());
+    payload
+}
+
+fn prepared_rows(adapter: &mut Adapter, sql: &str, payload: &[u8]) -> Vec<Vec<BinaryResultValue>> {
+    let statement = adapter.execute_stmt_prepare(sql).unwrap();
+    let result = adapter.execute_stmt_execute(statement.statement_id, payload);
+    adapter.execute_stmt_close(statement.statement_id);
+    match result {
+        Ok(PreparedStatementExecutionResult::ResultSet(result)) => result.rows,
+        other => panic!("{sql} must answer rows, answered {other:?}"),
+    }
+}
+
+/// `sequelize.query(sql, { bind })` sends its values through a prepared
+/// statement, and mysql2 binds a number as a double where the statement does
+/// not say the parameter is a whole number. Measured on MySQL 8.4.11, a bound
+/// double meets a column of whole numbers exactly, as the engine compares a
+/// whole number with a real.
+#[test]
+fn sequelizes_bound_number_meets_a_whole_number_column_as_a_double() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id INT PRIMARY KEY, views INT NOT NULL, big BIGINT, title VARCHAR(20))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO posts VALUES (1, 1, 9007199254740993, 'a'), (2, 2, 9007199254740992, 'b'), (3, 12, NULL, 'x')",
+    );
+    assert_eq!(
+        prepared_rows(
+            &mut adapter,
+            "SELECT COUNT(*) AS n FROM posts WHERE views >= ? AND title <> ?",
+            &a_double_and_a_word(1.0, "x"),
+        ),
+        [[BinaryResultValue::Integer(2)]]
+    );
+    for (sql, number, ids) in [
+        ("SELECT id FROM posts WHERE views = ?", 1.5, vec![]),
+        ("SELECT id FROM posts WHERE views = ?", 2.0, vec![2]),
+        (
+            "SELECT id FROM posts WHERE views >= ? ORDER BY id",
+            1.5,
+            vec![2, 3],
+        ),
+        (
+            "SELECT id FROM posts WHERE big = ?",
+            9_007_199_254_740_992.0,
+            vec![2],
+        ),
+    ] {
+        assert_eq!(
+            prepared_rows(&mut adapter, sql, &one_double(number)),
+            ids.into_iter()
+                .map(|id| vec![BinaryResultValue::Integer(id)])
+                .collect::<Vec<_>>(),
+            "{sql} bound {number}"
+        );
+    }
+}
+
 /// A transaction started inside another is a savepoint Sequelize names after
 /// the outer transaction's id, dashes and all.
 #[test]

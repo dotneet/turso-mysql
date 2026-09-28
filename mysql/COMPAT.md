@@ -441,6 +441,15 @@ among the statement's parameters: they used to be counted from the `WHERE` alone
 `ON UPDATE CURRENT_TIMESTAMP` column compared the second of two bound values against the
 first's and missed the change.
 
+A double bound against a signed whole-number column in a prepared `SELECT`'s `WHERE` is
+taken. mysql2 binds every number as a double where the statement's parameters are not said to
+be whole numbers, which this server does not say, so Sequelize's `sequelize.query(sql, { bind:
+[1, 'x'] })` binds `views >= ?` a double. Measured on 8.4.11, MySQL compares the two exactly:
+`views = 1.5` finds nothing, `views >= 1.5` finds 2, and a `BIGINT` of 9007199254740993 is not
+the double 9007199254740992 — which is how the engine compares a whole number with a real. A
+double against a `BIGINT UNSIGNED`, a `DECIMAL`, a word, a day or a moment is refused as
+before.
+
 `SET ratio = score / 2` scales a column down, and MySQL's `/` is decimal division where the
 engine's is integer division. What lands in the column is rounded to the column's own scale on
 the way in, which is what makes the two agree: measured on 8.4.11, 10 divided by 3 into a
