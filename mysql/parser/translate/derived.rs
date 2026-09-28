@@ -88,6 +88,11 @@ impl MySqlDerivedColumns {
         self.materialized
     }
 
+    /// Records that MySQL writes the body out into a table of its own.
+    pub(super) fn write_out(&mut self) {
+        self.materialized = true;
+    }
+
     /// Returns the name each projected column goes by, in order, or nothing
     /// for a body projecting its whole table.
     pub fn names(&self) -> &[String] {

@@ -973,3 +973,94 @@ fn sequelizes_writes_prepared_before_sync_force_run_over_the_new_tables() {
         ));
     }
 }
+
+/// `Post.findAndCountAll({ include: [Tag, User], limit, offset, order })`
+/// pages the posts in a derived table cut by a `LIMIT` and joins the tags and
+/// the user to the page. Measured on MySQL 8.4.11: the page keeps the rows
+/// its order puts first, and MySQL writes it out into a table of its own, so
+/// each of its columns keeps its type, NOT NULL and default but none of its
+/// keys, a moment staying a `DATETIME`.
+#[test]
+fn sequelizes_page_of_posts_is_cut_inside_a_derived_table() {
+    let (_directory, mut adapter) = blog();
+    let (shapes, rows) = report(
+        &mut adapter,
+        "SELECT `Post`.*, `tags`.`id` AS `tags.id`, `tags`.`name` AS `tags.name`, `tags->PostTag`.`post_id` AS `tags.PostTag.postId`, `user`.`id` AS `user.id`, `user`.`name` AS `user.name` FROM (SELECT `Post`.`id`, `Post`.`title`, `Post`.`body`, `Post`.`published_at` AS `publishedAt`, `Post`.`views`, `Post`.`created_at` AS `createdAt`, `Post`.`user_id` AS `userId` FROM `posts` AS `Post` ORDER BY `Post`.`id` ASC LIMIT 0, 1) AS `Post` LEFT OUTER JOIN ( `post_tags` AS `tags->PostTag` INNER JOIN `tags` AS `tags` ON `tags`.`id` = `tags->PostTag`.`tag_id`) ON `Post`.`id` = `tags->PostTag`.`post_id` LEFT OUTER JOIN `users` AS `user` ON `Post`.`userId` = `user`.`id` ORDER BY `Post`.`id` ASC;",
+    );
+    const PART_KEY: u16 = 16384;
+    const NO_DEFAULT: u16 = 4096;
+    const BINARY: u16 = 128;
+    assert_eq!(
+        shapes,
+        [
+            ("id", "Post", 1),
+            ("title", "Post", 1 | NO_DEFAULT),
+            ("body", "Post", 16),
+            ("publishedAt", "Post", BINARY),
+            ("views", "Post", 1),
+            ("createdAt", "Post", 1 | BINARY | NO_DEFAULT),
+            ("userId", "Post", 1 | NO_DEFAULT),
+            ("tags.id", "tags", 2 | 512 | PART_KEY),
+            ("tags.name", "tags", 4 | NO_DEFAULT | PART_KEY),
+            (
+                "tags.PostTag.postId",
+                "tags->PostTag",
+                2 | NO_DEFAULT | PART_KEY
+            ),
+            ("user.id", "user", 2 | 512 | PART_KEY),
+            ("user.name", "user", NO_DEFAULT),
+        ]
+        .map(|(name, table, flags)| (name.to_owned(), table.to_owned(), flags))
+    );
+    let mut tags = rows
+        .iter()
+        .map(|row| (row[0].clone(), row[8].clone(), row[11].clone()))
+        .collect::<Vec<_>>();
+    tags.sort();
+    assert_eq!(
+        tags,
+        [
+            (
+                Some("1".to_owned()),
+                Some("news".to_owned()),
+                Some("Alice".to_owned())
+            ),
+            (
+                Some("1".to_owned()),
+                Some("rust".to_owned()),
+                Some("Alice".to_owned())
+            ),
+        ]
+    );
+
+    // Words are put in order under the column's collation before the cut.
+    run(&mut adapter, "UPDATE posts SET title = 'B' WHERE id = 2");
+    for (cut, title) in [
+        ("LIMIT 1", "a"),
+        ("LIMIT 1 OFFSET 1", "B"),
+        ("LIMIT 2, 1", "c"),
+    ] {
+        assert_eq!(
+            report(
+                &mut adapter,
+                &format!("SELECT `Post`.`title` FROM (SELECT `Post`.`id`, `Post`.`title` FROM `posts` AS `Post` ORDER BY `Post`.`title` {cut}) AS `Post`")
+            )
+            .1,
+            values(&[&[Some(title)]]),
+            "{cut}"
+        );
+    }
+    for sql in [
+        "SELECT x.id FROM (SELECT id FROM posts LIMIT 1) AS x",
+        "SELECT x.id FROM (SELECT id FROM posts ORDER BY views + 1 LIMIT 1) AS x",
+        "SELECT x.id FROM (SELECT * FROM posts ORDER BY id LIMIT 1) AS x",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

@@ -2021,14 +2021,23 @@ fn render_derived_table(
             render_context,
         );
     }
+    let cut = subquery.limit_clause.is_some();
     let body = match unwrap_query_wrappers(subquery.body.as_ref())? {
         SetExpr::SetOperation { .. } => render_derived_catalog_union(subquery, render_context)?,
+        _ if cut => render_ordered_and_cut_body(subquery, render_context)?,
         _ => render_subquery(subquery, render_context)?.0,
     };
     let Some(source) = render_context.subquery_tables.pop() else {
         return unsupported("derived table requires one table");
     };
-    let (projected_columns, derived) = derived::derived_columns(subquery, &source, render_context)?;
+    let (projected_columns, mut derived) =
+        derived::derived_columns(subquery, &source, render_context)?;
+    if cut {
+        // Measured on MySQL 8.4.11: a body cut by a `LIMIT` is written out
+        // into a table of its own, as an aggregating one is, and each column
+        // keeps its type, NOT NULL and default but none of its keys.
+        derived.write_out();
+    }
     Ok((
         format!("({body}) AS {}", render_ident(&alias.name)),
         MySqlSelectSource {
@@ -2043,6 +2052,80 @@ fn render_derived_table(
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
         },
+    ))
+}
+
+/// Renders a derived table's body cut by a `LIMIT` in an order of its own —
+/// Sequelize's `findAndCountAll` with an include pages the posts in
+/// `(SELECT Post.id, ... FROM posts AS Post ORDER BY Post.id ASC LIMIT 0, 1)
+/// AS Post` and joins the rest to those.
+///
+/// A `LIMIT` without an order keeps whichever rows each engine reads first,
+/// so it is refused, and so is anything the order and the count could be
+/// but columns and written numbers, and a body projecting `*`.
+fn render_ordered_and_cut_body(
+    subquery: &sqlparser::ast::Query,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if subquery.with.is_some()
+        || subquery.fetch.is_some()
+        || !subquery.locks.is_empty()
+        || subquery.for_clause.is_some()
+        || subquery.settings.is_some()
+        || subquery.format_clause.is_some()
+        || !subquery.pipe_operators.is_empty()
+    {
+        return unsupported("derived table clause");
+    }
+    let Some(order_by) = &subquery.order_by else {
+        return unsupported("derived table cut by a LIMIT without an ORDER BY");
+    };
+    let SetExpr::Select(select) = subquery.body.as_ref() else {
+        return unsupported("derived table body");
+    };
+    if select.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    }) {
+        return unsupported("derived table cut by a LIMIT projecting a wildcard");
+    }
+    let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return unsupported("SELECT ORDER BY option");
+    };
+    if !expressions.iter().all(|expression| {
+        matches!(&expression.expr, Expr::Identifier(_))
+            || matches!(&expression.expr, Expr::CompoundIdentifier(parts) if parts.len() == 2)
+    }) {
+        return unsupported("derived table ordered by anything but its columns");
+    }
+    let (body, _) = render_subquery_select(select, render_context)?;
+    let ordered = render_select_order_by(order_by, &select.projection, render_context)?;
+    let (kept, skipped) = match subquery.limit_clause.as_ref() {
+        Some(sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+            (limit, Some(offset))
+        }
+        Some(sqlparser::ast::LimitClause::LimitOffset {
+            limit: Some(limit),
+            offset,
+            limit_by,
+        }) if limit_by.is_empty()
+            && offset
+                .as_ref()
+                .is_none_or(|offset| offset.rows == sqlparser::ast::OffsetRows::None) =>
+        {
+            (limit, offset.as_ref().map(|offset| &offset.value))
+        }
+        _ => return unsupported("derived table LIMIT option"),
+    };
+    let kept = render_select_row_count(kept)?;
+    let skipped = skipped
+        .map(render_select_row_count)
+        .transpose()?
+        .unwrap_or(0);
+    Ok(format!(
+        "{body} ORDER BY {ordered} LIMIT {kept} OFFSET {skipped}"
     ))
 }
 
