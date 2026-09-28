@@ -2703,6 +2703,9 @@ pub(super) fn show_default_at_scale(
         // Measured on MySQL 8.4.11: `COLUMN_DEFAULT` reads `CURRENT_TIMESTAMP`
         // for one of these, the same words `SHOW COLUMNS` reports.
         MySqlColumnDefault::Moment => b"CURRENT_TIMESTAMP",
+        // Measured on MySQL 8.4.11: an expression default reads as the call
+        // without its parentheses.
+        MySqlColumnDefault::MomentCall => b"now()",
         MySqlColumnDefault::Boolean(value) => {
             return Ok(Some(if *value { b"1".to_vec() } else { b"0".to_vec() }));
         }

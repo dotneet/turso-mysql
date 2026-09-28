@@ -269,6 +269,9 @@ fn render_default(column: &MySqlColumnMetadata) -> Option<String> {
         MySqlColumnDefault::Moment => {
             format!(" DEFAULT {}", the_moment(column.temporal_precision()))
         }
+        // Measured on MySQL 8.4.11: an expression default prints in its
+        // parentheses, the call lowercased.
+        MySqlColumnDefault::MomentCall => " DEFAULT (now())".to_owned(),
         // Measured on MySQL 8.4.11, and it is the rule a column's comment is
         // written by: a quote is doubled, a backslash written twice, and a
         // newline, a carriage return and a zero byte each named. A `DEFAULT`

@@ -459,6 +459,10 @@ pub enum MySqlColumnDefault {
     /// `DEFAULT CURRENT_TIMESTAMP`, which stores the moment the row is
     /// written rather than a value written into the statement.
     Moment,
+    /// `DEFAULT (now())`, an expression default storing the same moment,
+    /// which MySQL reports as the call it is rather than as
+    /// `CURRENT_TIMESTAMP`.
+    MomentCall,
 }
 
 /// One column reconstructed from its persisted normalized MySQL DDL.
@@ -2364,7 +2368,10 @@ impl MySqlConnection {
         if matches!(statement, Stmt::Insert { .. })
             && metadata.iter().any(|column| {
                 column.type_name() == "DATETIME"
-                    && column.default_value() == Some(&MySqlColumnDefault::Moment)
+                    && matches!(
+                        column.default_value(),
+                        Some(MySqlColumnDefault::Moment | MySqlColumnDefault::MomentCall)
+                    )
             })
         {
             return Err(MySqlQueryError::Unsupported(
@@ -10363,7 +10370,10 @@ fn mysql_column_metadata(
                 // Measured on MySQL 8.4.11: a column defaulting to the moment
                 // it is written reports `DEFAULT_GENERATED` where every other
                 // default reports nothing.
-                if value == MySqlColumnDefault::Moment {
+                if matches!(
+                    value,
+                    MySqlColumnDefault::Moment | MySqlColumnDefault::MomentCall
+                ) {
                     generated_default = true;
                 }
                 default_value = Some(value);
@@ -11435,6 +11445,9 @@ fn mysql_column_default(
         Expr::Literal(Literal::CurrentTimestamp) => {
             Ok(("CURRENT_TIMESTAMP".to_string(), MySqlColumnDefault::Moment))
         }
+        expression if turso_mysql_parser::reads_the_clock_as_an_expression(expression) => {
+            Ok(("(now())".to_string(), MySqlColumnDefault::MomentCall))
+        }
         // A column holding fractional seconds reads the moment to as many
         // digits, which is written into the engine's definition as a reading
         // of its clock and printed back the way MySQL prints it.
@@ -12179,7 +12192,8 @@ fn copied_column_declaration(name: &str, column: &MySqlColumnMetadata) -> Option
                 column.temporal_precision(),
             ));
         }
-        Some(MySqlColumnDefault::Text(_)) => return None,
+        // What a copy of an expression default writes has not been measured.
+        Some(MySqlColumnDefault::Text(_) | MySqlColumnDefault::MomentCall) => return None,
     }
     Some(rendered)
 }

@@ -4842,6 +4842,20 @@ row taking it is written the moment it lands. The default is taken on a
 `TIMESTAMP` and a `DATETIME` and no other column — measured, MySQL answers 1067
 for one on an `INT`.
 
+`DEFAULT (now())` — the expression default SQLAlchemy writes for
+`server_default=func.now()`, which its first Alembic migration declares — is
+taken over a whole-second `DATETIME` or `TIMESTAMP`, and so are `(NOW())`,
+`(current_timestamp)` and `(current_timestamp())`. Measured on 8.4.11 and
+matched: each stores the moment the row is written, in whole seconds, and prints
+back as `DEFAULT (now())`, where `DEFAULT now()` without its parentheses prints
+as `DEFAULT CURRENT_TIMESTAMP`; `SHOW COLUMNS` and `COLUMN_DEFAULT` read `now()`
+with an extra of `DEFAULT_GENERATED`. The engine's reading of the moment is
+written in parentheses, which is what says it was an expression. A column
+holding fractional seconds or a day, `(now(3))`, `(curdate())`,
+`(localtime())` and every other expression default are refused, and a
+`CREATE TABLE ... AS SELECT` copying such a column is refused, what either
+writes not having been measured.
+
 `ON UPDATE CURRENT_TIMESTAMP` is the other half of the pair every dumped schema
 carries, and the whole clause was refused. The engine has no such attribute, so
 the words live in the stored MySQL DDL alone — read back out of it before the

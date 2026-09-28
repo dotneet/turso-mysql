@@ -853,6 +853,9 @@ fn render_mysql_default(expr: &TursoExpr, mode: SessionSqlMode) -> Result<String
     if let Some(digits) = super::moment_with_fraction_digits(expr) {
         return Ok(format!("CURRENT_TIMESTAMP({digits})"));
     }
+    if super::reads_the_clock_as_an_expression(expr) {
+        return Ok("(now())".to_owned());
+    }
     match expr {
         TursoExpr::Literal(literal) => render_mysql_literal(literal, mode),
         TursoExpr::Unary(operator, expression) => {

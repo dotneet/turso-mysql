@@ -7326,6 +7326,14 @@ pub fn moment_with_fraction_sql(digits: u8) -> String {
     )
 }
 
+/// Whether an engine default is the reading of the clock written in
+/// parentheses, which is how a MySQL `DEFAULT (now())` is kept.
+pub fn reads_the_clock_as_an_expression(expr: &TursoExpr) -> bool {
+    matches!(expr, TursoExpr::Parenthesized(inner)
+        if matches!(inner.as_slice(), [inner]
+            if matches!(inner.as_ref(), TursoExpr::Literal(TursoLiteral::CurrentTimestamp))))
+}
+
 /// Reads back the digits of a reading [`moment_with_fraction_sql`] wrote, or
 /// `None` for any other expression.
 pub fn moment_with_fraction_digits(expr: &TursoExpr) -> Option<u8> {
@@ -7412,6 +7420,9 @@ fn render_column_option(
                     "DEFAULT ({})",
                     moment_with_fraction_sql(digits as u8)
                 )));
+            }
+            if let Expr::Nested(inner) = expr {
+                return reading_of_the_clock_default(inner, data_type).map(Some);
             }
             if matches!(data_type, DataType::Bit(_)) {
                 return Ok(Some(format!("DEFAULT {}", bit_default(expr)?)));
@@ -7513,6 +7524,39 @@ fn render_column_option(
         ColumnOption::Default(_) => unsupported("named DEFAULT constraint"),
         _ => unsupported("column attribute"),
     }
+}
+
+/// The engine default of a column declared with an expression default that
+/// reads the clock — SQLAlchemy writes `DEFAULT (now())` for
+/// `server_default=func.now()`.
+///
+/// Measured on MySQL 8.4.11: `(now())`, `(NOW())`, `(current_timestamp)` and
+/// `(current_timestamp())` over a `DATETIME` or a `TIMESTAMP` each store the
+/// moment the row is written, whole seconds, and print back as `DEFAULT
+/// (now())`, where `DEFAULT now()` without its parentheses prints as
+/// `DEFAULT CURRENT_TIMESTAMP`. The engine's own reading of the moment is
+/// written in parentheses, which is what says it was an expression. Every
+/// other expression is refused, and so is a column holding fractional
+/// seconds or a day, whose readings were not measured here.
+fn reading_of_the_clock_default(inner: &Expr, data_type: &DataType) -> Result<String, ParseError> {
+    let Expr::Function(function) = inner else {
+        return unsupported("DEFAULT expression");
+    };
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return unsupported("DEFAULT expression");
+    };
+    let reads_the_clock = ["NOW", "CURRENT_TIMESTAMP"]
+        .iter()
+        .any(|spelling| name.value.eq_ignore_ascii_case(spelling));
+    if !reads_the_clock || moment_precision(inner) != Some(0) {
+        return unsupported("DEFAULT expression");
+    }
+    if !matches!(data_type, DataType::Timestamp(_, _) | DataType::Datetime(_))
+        || declared_fraction_digits(data_type) != 0
+    {
+        return unsupported("DEFAULT (now()) on a column that holds no whole-second moment");
+    }
+    Ok("DEFAULT (CURRENT_TIMESTAMP)".to_owned())
 }
 
 /// The engine default of a `BIT(1)` column, the integer its bit is.

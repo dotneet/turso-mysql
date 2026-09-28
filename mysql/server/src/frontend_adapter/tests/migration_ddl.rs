@@ -187,6 +187,108 @@ fn a_whole_number_default_mysql_refuses_is_refused() {
     }
 }
 
+/// SQLAlchemy writes `server_default=func.now()` as the expression default
+/// `DEFAULT (now())`, which its first Alembic migration declares. Measured on
+/// MySQL 8.4.11: `(now())`, `(NOW())`, `(current_timestamp)` and
+/// `(current_timestamp())` over a `DATETIME` or a `TIMESTAMP` store the moment
+/// the row is written and print back as `DEFAULT (now())`; `SHOW COLUMNS` and
+/// `COLUMN_DEFAULT` read `now()` and the extra `DEFAULT_GENERATED`; and
+/// `DEFAULT now()`, without its parentheses, prints as `DEFAULT
+/// CURRENT_TIMESTAMP`.
+#[test]
+fn sqlalchemy_declares_a_moment_default_as_an_expression() {
+    let (directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE users ( id BIGINT NOT NULL AUTO_INCREMENT, email VARCHAR(191) NOT NULL, name VARCHAR(100) NOT NULL, balance NUMERIC(10, 2) NOT NULL, is_active BOOL NOT NULL, profile JSON, created_at DATETIME NOT NULL DEFAULT (now()), updated_at DATETIME NOT NULL DEFAULT (now()), PRIMARY KEY (id), UNIQUE (email) )",
+    );
+    run(
+        &mut adapter,
+        "create table spellings (id int primary key, a datetime default (NOW()), b datetime default (current_timestamp), c datetime default (current_timestamp()), e timestamp default (now()), h datetime default now())",
+    );
+    let expected_users = concat!(
+        "CREATE TABLE `users` (\n",
+        "  `id` bigint NOT NULL AUTO_INCREMENT,\n",
+        "  `email` varchar(191) NOT NULL,\n",
+        "  `name` varchar(100) NOT NULL,\n",
+        "  `balance` decimal(10,2) NOT NULL,\n",
+        "  `is_active` tinyint(1) NOT NULL,\n",
+        "  `profile` json DEFAULT NULL,\n",
+        "  `created_at` datetime NOT NULL DEFAULT (now()),\n",
+        "  `updated_at` datetime NOT NULL DEFAULT (now()),\n",
+        "  PRIMARY KEY (`id`),\n",
+        "  UNIQUE KEY `email` (`email`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    let expected_spellings = concat!(
+        "CREATE TABLE `spellings` (\n",
+        "  `id` int NOT NULL,\n",
+        "  `a` datetime DEFAULT (now()),\n",
+        "  `b` datetime DEFAULT (now()),\n",
+        "  `c` datetime DEFAULT (now()),\n",
+        "  `e` timestamp NULL DEFAULT (now()),\n",
+        "  `h` datetime DEFAULT CURRENT_TIMESTAMP,\n",
+        "  PRIMARY KEY (`id`)\n",
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    for reopen in [false, true] {
+        if reopen {
+            adapter = reopened(&directory, adapter);
+        }
+        let adapter = &mut adapter;
+        assert_eq!(printed_table(adapter, "users"), expected_users);
+        assert_eq!(printed_table(adapter, "spellings"), expected_spellings);
+        let shown = rows(adapter, "SHOW COLUMNS FROM `users`");
+        assert_eq!(
+            (shown[6][4].as_deref(), shown[6][5].as_deref()),
+            (Some("now()"), Some("DEFAULT_GENERATED"))
+        );
+        assert_eq!(
+            rows(
+                adapter,
+                "SELECT COLUMN_DEFAULT, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'spellings' AND COLUMN_NAME IN ('e', 'h') ORDER BY ORDINAL_POSITION"
+            ),
+            vec![
+                some(&["now()", "DEFAULT_GENERATED"]),
+                some(&["CURRENT_TIMESTAMP", "DEFAULT_GENERATED"])
+            ]
+        );
+    }
+
+    run(
+        &mut adapter,
+        "INSERT INTO users (email, name, balance, is_active) VALUES ('a@example.com', 'A', 1, 1)",
+    );
+    run(&mut adapter, "INSERT INTO spellings (id) VALUES (1)");
+    // Each reads the moment the row was written, in whole seconds.
+    let mut written = rows(&mut adapter, "SELECT created_at, updated_at FROM users");
+    written.extend(rows(&mut adapter, "SELECT a, b, c, e, h FROM spellings"));
+    for value in written.into_iter().flatten() {
+        let value = value.expect("a default moment is written");
+        assert_eq!(
+            turso_mysql_parser::normalize_datetime(&value),
+            Some(value.clone())
+        );
+    }
+
+    // A column holding fractional seconds or a day, another call, and any
+    // other expression were not measured, and are refused.
+    for sql in [
+        "create table f (id int primary key, g datetime(6) default (now()))",
+        "create table f (id int primary key, g datetime(3) default (now(3)))",
+        "create table f (id int primary key, g date default (curdate()))",
+        "create table f (id int primary key, g datetime default (localtime()))",
+        "create table f (id int primary key, g int default (1 + 1))",
+        "create table f (id int primary key, g int default (now()))",
+    ] {
+        assert_eq!(
+            refused_with(&mut adapter, sql),
+            FrontendErrorKind::Unsupported,
+            "{sql}"
+        );
+    }
+}
+
 fn refused_with(adapter: &mut Adapter, sql: &str) -> FrontendErrorKind {
     match adapter.execute_query(sql) {
         Err(error) => error,
