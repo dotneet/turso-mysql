@@ -573,3 +573,39 @@ fn giteas_access_checks_read_a_column_of_a_joined_subquery() {
         );
     }
 }
+
+/// xorm writes `max(index) AS index ... ORDER BY max(index)` for Gitea's
+/// latest commit statuses. Measured on MySQL 8.4.11, the name inside the
+/// aggregate is the table's column even where a result column shares it:
+/// `MIN(n) AS n ... ORDER BY MAX(n) DESC` orders the groups by the column's
+/// largest value, the same rows in the same order as here.
+#[test]
+fn an_ordering_aggregate_reads_the_column_an_alias_shares_its_name_with() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `commit_status` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `index` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL, `sha` VARCHAR(64) NOT NULL, `context_hash` VARCHAR(64) NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO `commit_status` (`index`, `repo_id`, `sha`, `context_hash`) VALUES (1, 1, 'x', 'a'), (9, 1, 'x', 'a'), (5, 1, 'x', 'b'), (6, 1, 'x', 'b'), (3, 1, 'x', 'c'), (4, 1, 'y', 'c')",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT min(`index`) AS `index`, context_hash FROM commit_status GROUP BY context_hash ORDER BY max(`index`) DESC"
+        ),
+        [
+            [Some("1".to_owned()), Some("a".to_owned())],
+            [Some("5".to_owned()), Some("b".to_owned())],
+            [Some("3".to_owned()), Some("c".to_owned())],
+        ]
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT max( `index` ) as `index` FROM `commit_status` WHERE (repo_id = 1) AND (sha = 'x') GROUP BY context_hash ORDER BY max( `index` ) desc"
+        ),
+        ["9", "6", "3"]
+    );
+}

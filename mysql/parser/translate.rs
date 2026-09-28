@@ -727,10 +727,20 @@ pub(crate) fn translate_select_query(
                 &mut render_context.columns_the_keys_decide,
             )?;
         }
+        let sole_reference = match source_tables
+            .iter()
+            .filter(|source| !source.subquery)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [source] => Some(source.reference.clone()),
+            _ => None,
+        };
         normalized.push_str(" ORDER BY ");
         normalized.push_str(&render_select_order_by(
             order_by,
             ordered_projection,
+            sole_reference.as_deref(),
             &mut render_context,
         )?);
     }
@@ -2122,6 +2132,7 @@ fn render_derived_body_in_order(
         body.push_str(&render_select_order_by(
             order_by,
             &select.projection,
+            None,
             render_context,
         )?);
     }
@@ -3006,6 +3017,7 @@ pub(crate) fn select_static_result_metadata(
 fn render_select_order_by(
     order_by: &sqlparser::ast::OrderBy,
     projection: &[SelectItem],
+    sole_reference: Option<&str>,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
@@ -3101,10 +3113,73 @@ fn render_select_order_by(
                 let expr = projected_expr(projection, ordinal)?;
                 return render_order_by_expr(expr, direction, render_context);
             }
+            if let Some(rendered) = render_aggregate_over_a_name_an_alias_shares(
+                &expression.expr,
+                direction,
+                projection,
+                sole_reference,
+                render_context,
+            )? {
+                return Ok(rendered);
+            }
             render_order_by_expr(&expression.expr, direction, render_context)
         })
         .collect::<Result<Vec<_>, _>>()
         .map(|expressions| expressions.join(", "))
+}
+
+/// Renders an aggregate the `ORDER BY` names whose column shares its name
+/// with a result column's alias, the column named through the statement's
+/// table, or `None` where no alias shares the name.
+///
+/// Measured on MySQL 8.4.11, a name inside an aggregate in an `ORDER BY` is
+/// the table's column even where a result column is called the same —
+/// `SELECT MIN(n) AS n ... GROUP BY g ORDER BY MAX(n)` orders by the column's
+/// largest value — where the engine would read the alias and find an
+/// aggregate inside an aggregate. xorm writes `max(index) AS index ... ORDER
+/// BY max(index)` for Gitea's commit statuses. A shared name over a join is
+/// refused, which table it belongs to not being worked out here.
+fn render_aggregate_over_a_name_an_alias_shares(
+    expr: &Expr,
+    direction: &str,
+    projection: &[SelectItem],
+    sole_reference: Option<&str>,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    let Expr::Function(function) = expr else {
+        return Ok(None);
+    };
+    let sqlparser::ast::FunctionArguments::List(list) = &function.args else {
+        return Ok(None);
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Identifier(column),
+    ))] = list.args.as_slice()
+    else {
+        return Ok(None);
+    };
+    let an_alias_shares_the_name = projection.iter().any(|item| {
+        matches!(item, SelectItem::ExprWithAlias { alias, .. }
+            if alias.value.eq_ignore_ascii_case(&column.value))
+    });
+    if !an_alias_shares_the_name {
+        return Ok(None);
+    }
+    let Some(reference) = sole_reference else {
+        return unsupported(
+            "SELECT ORDER BY an aggregate over a name an alias shares, over a join",
+        );
+    };
+    let rendered = render_order_by_expr(expr, direction, render_context)?;
+    let bare = format!("({})", render_ident(column));
+    if rendered.matches(&bare).count() != 1 {
+        return unsupported("SELECT ORDER BY an aggregate over a name an alias shares");
+    }
+    Ok(Some(rendered.replacen(
+        &bare,
+        &format!("({}.{})", render_ident_str(reference), render_ident(column)),
+        1,
+    )))
 }
 
 fn render_order_by_expr(

@@ -2195,6 +2195,14 @@ that being written out as comparisons whose collation has not been measured.
 The rest are a collation over a number, over a bound value — which carries no
 text until it binds — and one from another character set, which is 1253 there.
 
+An ordering may name an aggregate over a column whose name a result column's
+alias shares — xorm writes `max(index) AS index ... GROUP BY context_hash ORDER
+BY max(index)` for Gitea's commit statuses. Measured on MySQL 8.4.11 the name
+inside the aggregate is the table's column, `MIN(n) AS n ... ORDER BY MAX(n)`
+ordering the groups by the column's largest value, where the engine would read
+the alias; so the column is named through the statement's one table. Over a
+join, whose table the name belongs to is not worked out here, it is refused.
+
 An ordering may name a collation. Measured on MySQL 8.4.11 over 'beta',
 'Alpha', 'alpha', 'Beta', 'Zulu' and 'apple': naming none orders them without
 regard to case, `utf8mb4_bin` puts every capital first — which is byte order,
