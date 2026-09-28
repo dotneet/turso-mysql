@@ -709,7 +709,10 @@ as readily as a word. Its answer is as wide as its arguments laid end to end, me
 8.4.11, and a number spells as many characters as its type does rather than as many as its
 column reports: a `BOOLEAN` column reports one and spells four, being a `TINYINT` under the
 display width MySQL keeps for it. A moment, a day, a span of time and a year are spelled the
-way they are stored, so those are taken too.
+way they are stored, so those are taken too. A word with a comma and a space
+inside it — `CONCAT(a, ', ', b)` — keeps them; they used to be read as the gap
+between two arguments, which answered `x || y` for it and wrote that into a
+column through an `UPDATE`.
 
 A `DECIMAL`, a `FLOAT` and a `DOUBLE` are refused. Their conversion to text
 inside `CONCAT` needs MySQL's numeric formatting rules; the direct result

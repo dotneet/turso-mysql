@@ -236,6 +236,38 @@ fn substring_index_takes_a_bound_delimiter() {
     );
 }
 
+/// A comma and a space written inside one of `CONCAT`'s words are part of the
+/// word, in a projection and in an `UPDATE` alike; they used to be read as
+/// the gap between two arguments, and `CONCAT(a, ', ', b)` answered
+/// `www.mysql.com || x`.
+#[test]
+fn concat_keeps_a_comma_written_inside_a_word() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT CONCAT(a, ', ', b), CONCAT('a, b', a) FROM s ORDER BY id"
+        ),
+        expected(&[
+            &[Some("www.mysql.com, x"), Some("a, bwww.mysql.com")],
+            &[Some(", "), Some("a, b")],
+            &[None, None],
+            &[Some("aXbxcXd, Ünïcödé.日本.語"), Some("a, baXbxcXd")],
+            &[None, Some("a, baaaaa")],
+        ])
+    );
+    adapter
+        .execute_query("UPDATE s SET b = CONCAT(b, ', ', 'z') WHERE id IN (1, 2)")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT b FROM s WHERE id IN (1, 2) ORDER BY id"
+        ),
+        expected(&[&[Some("x, z")], &[Some(", z")]])
+    );
+}
+
 #[test]
 fn concat_ws_skips_a_null_part_and_keeps_an_empty_one() {
     let (_directory, mut adapter) = adapter();
