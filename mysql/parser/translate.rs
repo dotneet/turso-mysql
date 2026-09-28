@@ -2351,6 +2351,7 @@ fn render_in_subquery(
         .checked_subquery_comparisons
         .push(CheckedSubqueryComparison {
             qualifier,
+            inner_sources: Vec::new(),
             column_name: column.value.clone(),
             inner_table,
             inner_column_name,
@@ -2397,7 +2398,20 @@ fn render_subquery_select(
 ) -> Result<(String, Option<(String, String)>), ParseError> {
     let may_join = std::mem::take(&mut render_context.an_exists_may_join);
     let comparisons_before = render_context.checked_comparisons.len();
+    let memberships_before = render_context.checked_subquery_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
+    // A membership test written inside this subquery names its column among
+    // the subquery's tables first.
+    {
+        let references = sources
+            .iter()
+            .map(|source| source.reference.clone())
+            .collect::<Vec<_>>();
+        let references = references.iter().map(String::as_str).collect::<Vec<_>>();
+        for membership in &mut render_context.checked_subquery_comparisons[memberships_before..] {
+            membership.name_the_inner_sources(&references);
+        }
+    }
     // A subquery joining tables answers one column when it projects a column
     // named through one of them — Gitea's `repository.id IN (SELECT
     // team_repo.repo_id FROM team_repo INNER JOIN team_user ON ...)` — which
@@ -5765,6 +5779,7 @@ fn render_update_assignment_value(
                 .checked_subquery_comparisons
                 .push(CheckedSubqueryComparison {
                     qualifier: None,
+                    inner_sources: Vec::new(),
                     column_name: written.to_owned(),
                     inner_table: source.as_str().to_owned(),
                     inner_column_name: read,
@@ -11751,6 +11766,7 @@ fn render_comparison_over_a_scalar_subquery(
             .checked_subquery_comparisons
             .push(CheckedSubqueryComparison {
                 qualifier,
+                inner_sources: Vec::new(),
                 column_name: column.value.clone(),
                 inner_table: inner_table.as_str().to_owned(),
                 inner_column_name: inner_column_name.clone(),

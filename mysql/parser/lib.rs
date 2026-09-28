@@ -1356,6 +1356,11 @@ pub struct CheckedSubqueryComparison {
     /// The table the outer column is named through, which has to be the one
     /// table the statement reads.
     qualifier: Option<String>,
+    /// The tables of the subquery this membership test was written inside,
+    /// when it stands in one — `repo_id IN (SELECT id FROM repository WHERE
+    /// owner_id NOT IN (SELECT ...))`. Its outer column is looked for there
+    /// before the statement's own tables, which is how MySQL reads it.
+    inner_sources: Vec<String>,
     column_name: String,
     inner_table: String,
     inner_column_name: String,
@@ -1371,6 +1376,22 @@ impl CheckedSubqueryComparison {
     /// Returns the table the outer column is named through, if it is.
     pub fn qualifier(&self) -> Option<&str> {
         self.qualifier.as_deref()
+    }
+
+    /// Records the subquery this membership test was written inside.
+    pub(crate) fn name_the_inner_sources(&mut self, references: &[&str]) {
+        if self.inner_sources.is_empty() {
+            self.inner_sources = references
+                .iter()
+                .map(|reference| (*reference).to_owned())
+                .collect();
+        }
+    }
+
+    /// Returns every table of the subquery this membership test was written
+    /// inside, or none for one written in the statement itself.
+    pub fn inner_sources(&self) -> &[String] {
+        &self.inner_sources
     }
 
     /// Returns the outer column tested for membership.

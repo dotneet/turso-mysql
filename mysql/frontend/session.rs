@@ -7252,6 +7252,13 @@ impl MySqlConnection {
         comparisons: &[CheckedSubqueryComparison],
     ) -> Result<()> {
         for comparison in comparisons {
+            // One written inside a subquery names its column among that
+            // subquery's tables, which only a `SELECT` records.
+            if !comparison.inner_sources().is_empty() {
+                return Err(LimboError::InvalidArgument(
+                    "a membership test inside a subquery of a statement that writes".to_string(),
+                ));
+            }
             let source_table = source_table.ok_or_else(|| {
                 LimboError::InvalidArgument(
                     "SELECT IN requires a table column on its left".to_string(),
@@ -7286,7 +7293,7 @@ impl MySqlConnection {
     }
 
     /// The check `validate_subquery_comparison_columns` makes, for a `SELECT`
-    /// that may join tables.
+    /// that may join tables or nest one membership test inside another.
     ///
     /// Over a join the outer column is named through one of the joined
     /// tables, or without one, when it is the column of the joined table that
@@ -7299,8 +7306,32 @@ impl MySqlConnection {
         source_tables: &[MySqlSelectSource],
         comparisons: &[CheckedSubqueryComparison],
     ) -> Result<()> {
-        if source_table.is_some() || comparisons.is_empty() {
-            return self.validate_subquery_comparison_columns(source_table, comparisons);
+        // A membership test written inside a subquery names its column among
+        // that subquery's tables first — Gitea's `repo_id IN (SELECT id FROM
+        // repository WHERE repository.owner_id NOT IN (SELECT ...))`.
+        let (nested, outer): (Vec<_>, Vec<_>) = comparisons
+            .iter()
+            .cloned()
+            .partition(|comparison| !comparison.inner_sources().is_empty());
+        if source_table.is_some() {
+            self.validate_subquery_comparison_columns(source_table, &outer)?;
+        } else {
+            self.validate_membership_columns_by_name(source_tables, &outer)?;
+        }
+        self.validate_membership_columns_by_name(source_tables, &nested)
+    }
+
+    /// Holds each membership test's two columns to one kind, finding the
+    /// outer column by name: through its qualifier, or among the tables of
+    /// the subquery it stands in and then the statement's own, the first that
+    /// has it.
+    fn validate_membership_columns_by_name(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSubqueryComparison],
+    ) -> Result<()> {
+        if comparisons.is_empty() {
+            return Ok(());
         }
         if source_tables
             .iter()
@@ -7312,7 +7343,11 @@ impl MySqlConnection {
         }
         for comparison in comparisons {
             let mut outer_table = None;
-            for table in column_tables(source_tables, comparison.qualifier(), &[])? {
+            for table in column_tables(
+                source_tables,
+                comparison.qualifier(),
+                comparison.inner_sources(),
+            )? {
                 if self
                     .compared_column_metadata(&table, comparison.column_name())?
                     .is_some()

@@ -1778,7 +1778,12 @@ An unqualified projection over a join is refused, which of the tables it
 belongs to not being worked out here. The statement itself may join tables
 too — Gitea's `team.id IN (SELECT team_id FROM team_unit ...)` over `team
 INNER JOIN team_repo` — the outer column named through one of them, or without
-one where one joined table alone has it; a name two have is 1052.
+one where one joined table alone has it; a name two have is 1052. And a
+membership test may stand inside another's subquery — Gitea's branch listing
+asks `repo_id IN (SELECT id FROM repository WHERE repository.owner_id NOT IN
+(SELECT id FROM user WHERE ...))` — its column looked for among the tables of
+the subquery it stands in and then the statement's own, as MySQL reads it. A
+statement that writes still refuses one nested that way.
 
 `IN` over a list of values — `WHERE id IN (1, 2)` — follows the same rule one
 member at a time. Every member is recorded as its own checked comparison, so a

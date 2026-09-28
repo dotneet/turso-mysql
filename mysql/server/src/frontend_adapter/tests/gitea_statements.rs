@@ -839,3 +839,38 @@ fn giteas_count_updates_write_a_count_into_a_whole_number_column() {
         Err(FrontendErrorKind::OutOfRange)
     ));
 }
+
+/// Gitea nests one membership test inside another's subquery — its branch
+/// listing asks `repo_id IN (SELECT id FROM repository WHERE
+/// repository.owner_id NOT IN (SELECT id FROM user WHERE ...))`. The inner
+/// test's column is the subquery's own, named through its table or not.
+/// Every answer here was measured on MySQL 8.4.11 over the same rows.
+#[test]
+fn a_membership_test_inside_a_subquery_reads_the_subquerys_column() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `branch` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `name` VARCHAR(255) NOT NULL)",
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NULL, `is_private` TINYINT(1) DEFAULT 0 NOT NULL)",
+        "CREATE TABLE `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `visibility` INT DEFAULT 0 NOT NULL, `name` VARCHAR(255) NULL)",
+        "CREATE TABLE `collaboration` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NOT NULL, `user_id` BIGINT(20) NOT NULL)",
+        "INSERT INTO `user` (`visibility`) VALUES (0), (2), (0)",
+        "INSERT INTO `repository` (`owner_id`, `is_private`) VALUES (1, 0), (2, 1), (3, 1)",
+        "INSERT INTO `branch` (`repo_id`, `name`) VALUES (1, 'main'), (2, 'main'), (3, 'dev'), (3, 'main')",
+        "INSERT INTO `collaboration` (`repo_id`, `user_id`) VALUES (3, 1)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for sql in [
+        "SELECT id FROM branch WHERE repo_id IN (SELECT id FROM repository WHERE `repository`.owner_id NOT IN (SELECT id FROM `user` WHERE visibility IN (2))) ORDER BY id",
+        "SELECT id FROM branch WHERE repo_id IN (SELECT id FROM repository WHERE is_private = 0 OR `repository`.id IN (SELECT repo_id FROM `collaboration` WHERE `collaboration`.user_id = 1)) ORDER BY id",
+        "SELECT id FROM branch WHERE repo_id IN (SELECT id FROM repository WHERE owner_id IN (SELECT id FROM `user` WHERE visibility = 0)) ORDER BY id",
+    ] {
+        assert_eq!(first_column(&mut adapter, sql), ["1", "3", "4"], "{sql}");
+    }
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT id FROM branch WHERE repo_id IN (SELECT id FROM repository WHERE owner_id IN (SELECT name FROM `user`))"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}
