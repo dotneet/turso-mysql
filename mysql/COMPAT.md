@@ -4550,11 +4550,13 @@ that.
 `mysql_async`, reads it with `@@max_allowed_packet` and `@@wait_timeout` on
 every connection and, when it names a path, opens a second connection there and
 keeps that one. A server listening on TCP here listens on no socket — the two
-listeners are never configured together — so it reads NULL, which is how MySQL
-8.4.11 reads a path left unset (`@@init_file`), measured, in the same
-`VAR_STRING` of 87380 with 31 decimals and no flags a set one answers in; the
-driver takes NULL as no socket and stays on TCP. `SHOW VARIABLES` writes the
-unset path as an empty value, as MySQL does. `@@SESSION.socket` is refused, where
+listeners are never configured together — so it reads an empty path, in the
+same `VAR_STRING` of 87380 with 31 decimals and no flags a set one answers in,
+and `SHOW VARIABLES` writes it empty too. MySQL 8.4.11 reads a path left unset
+as NULL (`@@init_file`, measured), but a MySQL server always has a socket path,
+and the driver converts `@@socket` to a string without looking: a NULL made
+Prisma panic on every connection, in the framework harness. An empty path is
+one the driver fails to open, which it ignores, and it stays on TCP. `@@SESSION.socket` is refused, where
 MySQL answers 1238, and `SET @s = @@socket` with no socket is refused, since
 MySQL gives the variable a NULL of words there that this does not keep apart.
 

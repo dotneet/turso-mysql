@@ -365,9 +365,10 @@ fn a_dump_may_ask_for_the_new_replication_words() {
 
 /// Prisma's driver reads this on every connection and moves to the socket it
 /// names. Measured on MySQL 8.4.11: a `VAR_STRING` of 87380 with 31 decimals
-/// and no flags; a path left unset reads as NULL there — `@@init_file` — and
-/// as an empty value in `SHOW VARIABLES`; and `@@SESSION.socket` is 1238.
-/// A server listening on TCP here listens on no socket at all.
+/// and no flags, and `@@SESSION.socket` is 1238. A server listening on TCP
+/// here listens on no socket at all, which reads as an empty path: MySQL
+/// always has one, and mysql_async panics on a NULL there (Prisma failed to
+/// connect at all when it read NULL).
 #[test]
 fn the_socket_is_the_one_this_server_listens_on() {
     let (_directory, mut adapter) = adapter();
@@ -376,7 +377,7 @@ fn the_socket_is_the_one_this_server_listens_on() {
     else {
         panic!("the socket is answered");
     };
-    assert_eq!(read.rows[0][0], None);
+    assert_eq!(read.rows[0][0], Some(Vec::new()));
     let socket = &read.columns[0];
     assert_eq!(socket.name, "@@socket");
     assert_eq!(socket.column_type, MYSQL_TYPE_VAR_STRING);

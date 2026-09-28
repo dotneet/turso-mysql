@@ -1379,9 +1379,13 @@ fn system_variable_result(
         if read.names_the_session() && read.name().eq_ignore_ascii_case("socket") {
             return Err(FrontendErrorKind::Unsupported);
         }
+        // A server listening on no socket reads as an empty path, as `SHOW
+        // VARIABLES` shows it. MySQL itself always has a socket path, and
+        // mysql_async, which Prisma's engines use, panics converting a NULL
+        // `@@socket` to a string on every connection.
         if read.name().eq_ignore_ascii_case("socket") {
             columns.push(worded_variable_column(read));
-            row.push(facts.unix_socket_path().map(<[u8]>::to_vec));
+            row.push(Some(facts.unix_socket_path().unwrap_or_default().to_vec()));
             continue;
         }
         // One name this server cannot answer leaves the whole statement to the
