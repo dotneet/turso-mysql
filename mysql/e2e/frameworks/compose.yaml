@@ -216,3 +216,10 @@ services:
     image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-spring:local
     working_dir: /app
     command: ["./run.sh"]
+
+  efcore:
+    <<: *app
+    build: ./apps/efcore
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-efcore:local
+    working_dir: /app
+    command: ["./run.sh"]
