@@ -93,9 +93,9 @@ use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
     parse_optional_show_engines, parse_optional_show_errors, parse_optional_show_warnings,
     parse_optional_truncate_table, parse_select, MySqlHistogramQuery,
-    MySqlShowCharacterSetsCommand, MySqlShowListingFilter, MySqlShowStatusCommand,
-    MySqlShowValueTest, MySqlStatusCounterRead, MySqlStoredProgramKind, MySqlVariableScope,
-    SessionSqlMode,
+    MySqlShowCharacterSetsCommand, MySqlShowColumnTest, MySqlShowCondition, MySqlShowListingFilter,
+    MySqlShowStatusCommand, MySqlShowValueTest, MySqlStatusCounterRead, MySqlStoredProgramKind,
+    MySqlVariableScope, SessionSqlMode,
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
@@ -13268,34 +13268,59 @@ fn show_listing_keeps(
     match filter {
         MySqlShowListingFilter::Everything => Ok(true),
         MySqlShowListingFilter::Like(pattern) => Ok(pattern.matches(row[0])),
-        MySqlShowListingFilter::Where(tests) => {
-            for test in tests {
-                let position = columns
-                    .iter()
-                    .position(|column| column.name.eq_ignore_ascii_case(test.column()))
-                    .ok_or(FrontendErrorKind::UnknownColumn)?;
-                let value = row[position];
-                let holds = match test.test() {
-                    MySqlShowValueTest::EqualsWord(word) => value
-                        .trim_end_matches(' ')
-                        .eq_ignore_ascii_case(word.trim_end_matches(' ')),
-                    // A number compared with a column of words reads each
-                    // word as a number, which has not been measured here.
-                    MySqlShowValueTest::EqualsNumber(number) => {
-                        value
-                            .parse::<u64>()
-                            .map_err(|_| FrontendErrorKind::Unsupported)?
-                            == *number
-                    }
-                    MySqlShowValueTest::Like(pattern) => pattern.matches(value),
-                };
-                if !holds {
-                    return Ok(false);
-                }
+        MySqlShowListingFilter::Where(condition) => {
+            // MySQL answers 1054 for a column the listing has not got before
+            // it reads a row, whichever side of an `OR` names it.
+            for test in condition.tests() {
+                show_listing_position(columns, test)?;
             }
-            Ok(true)
+            show_listing_condition_holds(condition, columns, row)
         }
     }
+}
+
+fn show_listing_condition_holds(
+    condition: &MySqlShowCondition,
+    columns: &[ColumnDefinitionConfig],
+    row: &[&str],
+) -> Result<bool, FrontendErrorKind> {
+    Ok(match condition {
+        MySqlShowCondition::Test(test) => {
+            let value = row[show_listing_position(columns, test)?];
+            match test.test() {
+                MySqlShowValueTest::EqualsWord(word) => value
+                    .trim_end_matches(' ')
+                    .eq_ignore_ascii_case(word.trim_end_matches(' ')),
+                // A number compared with a column of words reads each word as
+                // a number, which has not been measured here.
+                MySqlShowValueTest::EqualsNumber(number) => {
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| FrontendErrorKind::Unsupported)?
+                        == *number
+                }
+                MySqlShowValueTest::Like(pattern) => pattern.matches(value),
+            }
+        }
+        MySqlShowCondition::Both(left, right) => {
+            show_listing_condition_holds(left, columns, row)?
+                && show_listing_condition_holds(right, columns, row)?
+        }
+        MySqlShowCondition::Either(left, right) => {
+            show_listing_condition_holds(left, columns, row)?
+                || show_listing_condition_holds(right, columns, row)?
+        }
+    })
+}
+
+fn show_listing_position(
+    columns: &[ColumnDefinitionConfig],
+    test: &MySqlShowColumnTest,
+) -> Result<usize, FrontendErrorKind> {
+    columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(test.column()))
+        .ok_or(FrontendErrorKind::UnknownColumn)
 }
 
 /// Answers `SHOW ERRORS` for what the last statement raised.

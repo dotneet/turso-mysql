@@ -165,3 +165,42 @@ fn xorms_table_listing_answers_each_counters_next_number() {
         ]
     );
 }
+
+/// Gitea's `CheckCollations` asks which case-sensitive collations the server
+/// has with a `WHERE` joining its tests by `OR`. Measured on MySQL 8.4.11, it
+/// answers `utf8mb4_bin` and every `_as_cs` collation, the `\_` matching an
+/// underscore and nothing else; this server lists the collations it has, of
+/// which `utf8mb4_bin` is the one that matches.
+#[test]
+fn giteas_collation_check_joins_its_tests_by_or() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SHOW COLLATION WHERE (Collation = 'utf8mb4_bin') OR (Collation LIKE '%\\_as\\_cs%')"
+        ),
+        vec![vec![
+            Some("utf8mb4_bin".to_owned()),
+            Some("utf8mb4".to_owned()),
+            Some("46".to_owned()),
+            Some(String::new()),
+            Some("Yes".to_owned()),
+            Some("1".to_owned()),
+            Some("PAD SPACE".to_owned()),
+        ]]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SHOW COLLATION WHERE Collation LIKE 'utf8mb4\\_0900%' OR Id = 63"
+        )
+        .into_iter()
+        .map(|row| row[0].clone().unwrap())
+        .collect::<Vec<_>>(),
+        ["binary", "utf8mb4_0900_ai_ci"]
+    );
+    assert!(matches!(
+        adapter.execute_query("SHOW COLLATION WHERE Id = 63 OR Nothing = 'x'"),
+        Err(FrontendErrorKind::UnknownColumn)
+    ));
+}

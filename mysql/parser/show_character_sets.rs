@@ -20,8 +20,33 @@ pub enum MySqlShowListingFilter {
     Everything,
     /// `LIKE 'pattern'`, matched against the listing's first column.
     Like(MySqlLikePattern),
-    /// `WHERE` over the listing's own columns: every test has to hold.
-    Where(Vec<MySqlShowColumnTest>),
+    /// `WHERE` over the listing's own columns.
+    Where(MySqlShowCondition),
+}
+
+/// A `WHERE` of a `SHOW` listing: tests of its columns joined by `AND` and
+/// `OR`, in whatever parentheses they were written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlShowCondition {
+    Test(MySqlShowColumnTest),
+    /// `AND`: both hold.
+    Both(Box<MySqlShowCondition>, Box<MySqlShowCondition>),
+    /// `OR`: either holds.
+    Either(Box<MySqlShowCondition>, Box<MySqlShowCondition>),
+}
+
+impl MySqlShowCondition {
+    /// Returns every test the condition makes, in the order it was written.
+    pub fn tests(&self) -> Vec<&MySqlShowColumnTest> {
+        match self {
+            Self::Test(test) => vec![test],
+            Self::Both(left, right) | Self::Either(left, right) => {
+                let mut tests = left.tests();
+                tests.extend(right.tests());
+                tests
+            }
+        }
+    }
 }
 
 /// One test a `WHERE` makes of one column of a `SHOW` listing.
@@ -55,7 +80,7 @@ impl MySqlShowColumnTest {
 }
 
 /// Parses `SHOW COLLATION` or `SHOW CHARACTER SET`, with an optional `LIKE`
-/// or a `WHERE` made of equality and `LIKE` tests joined by `AND`.
+/// or a `WHERE` made of equality and `LIKE` tests joined by `AND` and `OR`.
 ///
 /// Returns `None` for any other statement. A `WHERE` of any other shape is
 /// refused rather than read as something narrower.
@@ -112,9 +137,7 @@ fn listing_filter(
             MySqlLikePattern::new(&pattern, mode),
         )),
         Some(ShowStatementFilter::Where(expr)) => {
-            let mut tests = Vec::new();
-            read_column_tests(&expr, mode, &mut tests)?;
-            Ok(MySqlShowListingFilter::Where(tests))
+            Ok(MySqlShowListingFilter::Where(read_condition(&expr, mode)?))
         }
         Some(ShowStatementFilter::ILike(_) | ShowStatementFilter::NoKeyword(_)) => {
             Err(ParseError::Unsupported {
@@ -124,24 +147,28 @@ fn listing_filter(
     }
 }
 
-fn read_column_tests(
-    expr: &Expr,
-    mode: SessionSqlMode,
-    tests: &mut Vec<MySqlShowColumnTest>,
-) -> Result<(), ParseError> {
+fn read_condition(expr: &Expr, mode: SessionSqlMode) -> Result<MySqlShowCondition, ParseError> {
     let refused = || ParseError::Unsupported {
         feature: "SHOW listing WHERE test",
     };
     match expr {
-        Expr::Nested(inner) => read_column_tests(inner, mode, tests),
+        Expr::Nested(inner) => read_condition(inner, mode),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => {
-            read_column_tests(left, mode, tests)?;
-            read_column_tests(right, mode, tests)
-        }
+        } => Ok(MySqlShowCondition::Both(
+            Box::new(read_condition(left, mode)?),
+            Box::new(read_condition(right, mode)?),
+        )),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => Ok(MySqlShowCondition::Either(
+            Box::new(read_condition(left, mode)?),
+            Box::new(read_condition(right, mode)?),
+        )),
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
@@ -160,11 +187,10 @@ fn read_column_tests(
                 }
                 _ => return Err(refused()),
             };
-            tests.push(MySqlShowColumnTest {
+            Ok(MySqlShowCondition::Test(MySqlShowColumnTest {
                 column: column.value.clone(),
                 test,
-            });
-            Ok(())
+            }))
         }
         Expr::Like {
             negated: false,
@@ -182,11 +208,10 @@ fn read_column_tests(
             let Value::SingleQuotedString(pattern) = &pattern.value else {
                 return Err(refused());
             };
-            tests.push(MySqlShowColumnTest {
+            Ok(MySqlShowCondition::Test(MySqlShowColumnTest {
                 column: column.value.clone(),
                 test: MySqlShowValueTest::Like(MySqlLikePattern::new(pattern, mode)),
-            });
-            Ok(())
+            }))
         }
         _ => Err(refused()),
     }
@@ -223,20 +248,43 @@ mod tests {
             panic!("a LIKE is read");
         };
         assert!(pattern.matches("UTF8MB4_BIN"));
-        let Some(MySqlShowCharacterSetsCommand::Collations(MySqlShowListingFilter::Where(tests))) =
-            parse("SHOW COLLATION WHERE Charset = 'utf8mb4' AND (Id = 46 AND `Default` LIKE '')")
-                .unwrap()
+        let Some(MySqlShowCharacterSetsCommand::Collations(MySqlShowListingFilter::Where(
+            condition,
+        ))) = parse("SHOW COLLATION WHERE Charset = 'utf8mb4' AND (Id = 46 AND `Default` LIKE '')")
+            .unwrap()
         else {
             panic!("a WHERE is read");
         };
+        let tests = condition.tests();
         assert_eq!(
-            tests
-                .iter()
-                .map(MySqlShowColumnTest::column)
-                .collect::<Vec<_>>(),
+            tests.iter().map(|test| test.column()).collect::<Vec<_>>(),
             ["Charset", "Id", "Default"]
         );
         assert_eq!(tests[1].test(), &MySqlShowValueTest::EqualsNumber(46));
+    }
+
+    /// Gitea's `CheckCollations` asks which case-sensitive collations there
+    /// are this way.
+    #[test]
+    fn reads_tests_joined_by_or() {
+        let Some(MySqlShowCharacterSetsCommand::Collations(MySqlShowListingFilter::Where(
+            MySqlShowCondition::Either(left, right),
+        ))) = parse(
+            "SHOW COLLATION WHERE (Collation = 'utf8mb4_bin') OR (Collation LIKE '%\\_as\\_cs%')",
+        )
+        .unwrap()
+        else {
+            panic!("an OR is read");
+        };
+        assert_eq!(
+            left.tests()[0].test(),
+            &MySqlShowValueTest::EqualsWord("utf8mb4_bin".to_owned())
+        );
+        let MySqlShowValueTest::Like(pattern) = right.tests()[0].test() else {
+            panic!("the right side is a LIKE");
+        };
+        assert!(pattern.matches("utf8mb4_0900_as_cs"));
+        assert!(!pattern.matches("utf8mb4_0900_asxcs"));
     }
 
     #[test]
@@ -251,7 +299,6 @@ mod tests {
         }
         for sql in [
             "SHOW COLLATION WHERE Charset <> 'utf8mb4'",
-            "SHOW COLLATION WHERE Charset = 'utf8mb4' OR Id = 63",
             "SHOW COLLATION WHERE Charset NOT LIKE 'utf8%'",
             "SHOW COLLATION WHERE LOWER(Charset) = 'utf8mb4'",
             "SHOW CHARACTER SET WHERE Maxlen = -1",

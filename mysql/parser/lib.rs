@@ -205,7 +205,7 @@ pub use session_settings::{
 pub use shift_moment::shifted_moment;
 pub use show_character_sets::{
     parse_optional_show_character_sets, MySqlShowCharacterSetsCommand, MySqlShowColumnTest,
-    MySqlShowListingFilter, MySqlShowValueTest,
+    MySqlShowCondition, MySqlShowListingFilter, MySqlShowValueTest,
 };
 pub use show_engines::{parse_optional_show_engines, parse_show_engines, MySqlShowEnginesCommand};
 pub use show_full_tables::{

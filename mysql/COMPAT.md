@@ -3420,10 +3420,13 @@ a table or the connection may be declared with — `utf8mb4_0900_ai_ci`,
 lists 287 collations over 41 character sets. Each row and each column's shape
 was measured on 8.4.11, and both come back in name order, as MySQL answers
 them. No database need be selected. A `LIKE` names the rows to list and a
-`WHERE` may test the columns with `=` and `LIKE` joined by `AND`: measured,
-both match words without regard to case, so `Charset = 'UTF8MB4'` lists the
-utf8mb4 rows; a column the listing has not got is 1054, and any other test is
-refused.
+`WHERE` may test the columns with `=` and `LIKE` joined by `AND` and `OR`, in
+any parentheses: measured, both match words without regard to case, so
+`Charset = 'UTF8MB4'` lists the utf8mb4 rows; a column the listing has not got
+is 1054 whichever side of an `OR` names it, and any other test is refused.
+Gitea asks `WHERE (Collation = 'utf8mb4_bin') OR (Collation LIKE
+'%\_as\_cs%')` to learn which case-sensitive collations there are; MySQL lists
+`utf8mb4_bin` and its 32 `_as_cs` collations, and this `utf8mb4_bin` alone.
 
 `SHOW PROCESSLIST` and `SHOW STATUS` stay refused. Measured on 8.4.11, a
 session without the `PROCESS` privilege sees every connection of its own
