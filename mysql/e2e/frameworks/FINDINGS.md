@@ -82,3 +82,54 @@ connection.
 | GORM | 9/21 | 21/21 |
 | Django | up to `introspect`, then the panic | all |
 | Laravel, TypeORM, Rails, SQLAlchemy | not run (server stopped) | all |
+
+# Second run
+
+At local main `e818cdb60`'s parent, 2026-09-28, after the first run's fixes.
+The server did not stop. Django and SQLAlchemy did not build (their pinned
+requirements were missing from the repository; now committed), and Prisma
+still failed on `@@socket` answered as NULL (now answered as an empty path).
+
+| App | turso, first run | turso, second run |
+|---|---|---|
+| mysql CLI | 16/23 | 19/23 |
+| mysqldump | 0 | 5/9 (dump works; replay does not) |
+| GORM | 9/21 | 9/21 |
+| Rails | not run | 16/22 |
+| TypeORM | not run | 6/18 |
+| Laravel | not run | fails at `connect` (see below) |
+| Prisma | 0/22 | 2/22 (`@@socket` NULL; fixed after this run) |
+
+GORM's median statement time went from 55.9 ms to 1.08 ms (MySQL: 0.54 ms)
+with TCP_NODELAY, confirming the delayed-acknowledgement wait.
+
+Refused only by turso, by kind:
+
+- **Prepared statements Laravel sends for everything:**
+  `select version() as version, database() as db`;
+  `select @@character_set_client as client, ...` (answered 1054, wrongly);
+  `select exists(select * from `t` where `c` = ?) as `exists``;
+  ``update `users` set `balance` = ?, `users`.`updated_at` = ? where `email` = ?``;
+  ``update `cache` set `value` = ? where `key` = ?``;
+  ``delete from `migrations` where `migration` = ?``.
+- **`?` inside an expression, prepared (GORM):** `CAST(? AS JSON)`,
+  `HAVING COUNT(*) > ?`, `SET balance = balance - ?`, `JSON_EXTRACT(profile, ?) = ?`.
+- **Upserts:** `ON DUPLICATE KEY UPDATE id = id` (GORM),
+  `VALUES (DEFAULT, 'x') ... ON DUPLICATE KEY UPDATE name = VALUES(name)`
+  (TypeORM), Rails 8's `INSERT ... VALUES (...) AS users_values` with
+  `CURRENT_TIMESTAMP(6)`.
+- **Counting and grouping:** `SELECT COUNT(1) AS cnt FROM posts Post` (TypeORM),
+  `SELECT COUNT(*) FROM (SELECT 1 AS one FROM posts LIMIT 3 OFFSET 0)
+  subquery_for_count` (Rails), `HAVING (COUNT(*) > '1')` (Rails),
+  `GROUP_CONCAT(... ORDER BY ...)`, `SQL_CALC_FOUND_ROWS`.
+- **Comparisons as result columns:** `DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at`.
+- **Names qualified by the database:** ``SELECT * FROM `typeorm`.`migrations` ``,
+  ``drop table `laravel`.`cache`, ...``.
+- **Catalog reads:** `information_schema.tables where TABLE_SCHEMA=?`
+  (prepared), `STATISTICS ... = ?` (prepared), `group_concat(column_name order
+  by seq_in_index)` over STATISTICS (Laravel), `performance_schema.session_status`,
+  `concat(...) FROM INFORMATION_SCHEMA.VIEWS` (TypeORM).
+- **Other:** `UPDATE ... SET views = COALESCE(views, 0) + 1` (Rails),
+  `SELECT ... FOR UPDATE SKIP LOCKED` (Laravel's queue), a multi-row INSERT
+  with quoted quotes in a replayed dump, and a statement that is only a
+  `-- comment` line in a replayed dump.
