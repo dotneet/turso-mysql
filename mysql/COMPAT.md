@@ -3191,6 +3191,19 @@ measured on 8.4.11, a NOT NULL `LONGLONG` of length 1 carrying the binary and
 numeric flags; and `table_name IN (SELECT table_name FROM
 information_schema.tables ...)`, which Rails writes, compares text with text.
 
+A `SELECT`, `INSERT`, `UPDATE` or `DELETE` may write the selected database
+before a table it reads or writes and before a column — Prisma writes
+`prisma.users.id` for every column and TypeORM reads `typeorm.migrations`.
+Measured on MySQL 8.4.11, those answer the rows and the column metadata the
+bare names do, so the database is left out before the statement is read, in
+text and prepared statements alike, matched without regard to case as
+`lower_case_table_names=1` has MySQL do. Two shapes are refused rather than
+read: an expression projected without an alias that holds such a name,
+because MySQL names the result column after the text as written —
+`SELECT COUNT(probe.users.id)` answers a column named `COUNT(probe.users.id)`
+— and any other database, which the engine does not read from the selected
+database's connection.
+
 `information_schema.STATISTICS` is the second such table, and the first this
 frontend has ever answered. It reports one row per column of every index of
 every table the session may see: the primary key first under the name

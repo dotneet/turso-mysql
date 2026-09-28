@@ -2325,6 +2325,13 @@ where
         )
         .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = written.as_deref().unwrap_or(sql);
+        let left_out = turso_mysql_parser::leave_out_the_current_database(
+            sql,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = left_out.as_deref().unwrap_or(sql);
         match self.prepare_checked_database_statement(sql) {
             Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
                 if turso_mysql_parser::answers_no_rows_and_binds_nothing(
@@ -2482,6 +2489,13 @@ where
         )
         .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = written.as_deref().unwrap_or(sql);
+        let left_out = turso_mysql_parser::leave_out_the_current_database(
+            sql,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = left_out.as_deref().unwrap_or(sql);
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
             sql,

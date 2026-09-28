@@ -30794,3 +30794,6 @@ mod session_readings;
 
 #[cfg(unix)]
 mod mysql_client_statements;
+
+#[cfg(unix)]
+mod database_qualified_names;

@@ -112,7 +112,7 @@ pub use create_table_as_select::{
     MySqlCreateTableAsSelectColumn, MySqlCreateTableAsSelectSource,
 };
 pub use create_table_like::{parse_optional_create_table_like, MySqlCreateTableLike};
-pub use current_database::write_the_current_database_in;
+pub use current_database::{leave_out_the_current_database, write_the_current_database_in};
 pub use date_format::{
     days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,
 };

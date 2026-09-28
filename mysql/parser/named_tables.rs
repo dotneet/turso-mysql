@@ -6,9 +6,11 @@
 //! tables it would have opened.
 
 use sqlparser::ast::{
-    Expr, FromTable, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr, ShowCreateObject,
-    ShowStatementIn, Statement, TableFactor, TableObject, TableWithJoins, UpdateTableFromKind,
+    Expr, FromTable, Ident, ObjectName, ObjectNamePart, Query, SelectItem, SetExpr,
+    ShowCreateObject, ShowStatementIn, Spanned, Statement, TableFactor, TableObject,
+    TableWithJoins, UpdateTableFromKind,
 };
+use sqlparser::tokenizer::Span;
 
 use crate::{parse_one_statement, parse_optional_show_index, SessionSqlMode};
 
@@ -37,11 +39,35 @@ pub fn tables_named_by(sql: &str, mode: SessionSqlMode) -> Option<Vec<NamedTable
     Some(walk.found)
 }
 
+/// Where a statement writes a database before a table, and where it names a
+/// result column after the text of an expression.
+pub(crate) struct DatabaseQualifiers {
+    /// Each table name written with its database, as the two names.
+    pub(crate) tables: Vec<(Ident, Ident)>,
+    /// Where each projected expression other than a column stands. MySQL names
+    /// such a result column after the text as written, so leaving a database
+    /// out of that text would rename the column.
+    pub(crate) named_after_their_text: Vec<Span>,
+}
+
+/// The table names `statement` writes with a database, among the tables a
+/// `SELECT`, `INSERT`, `UPDATE` or `DELETE` reads or writes.
+pub(crate) fn database_qualifiers_in(statement: &Statement) -> DatabaseQualifiers {
+    let mut walk = Walk::default();
+    walk.statement(statement);
+    DatabaseQualifiers {
+        tables: walk.qualified,
+        named_after_their_text: walk.named_after_their_text,
+    }
+}
+
 #[derive(Default)]
 struct Walk {
     /// Names `WITH` clauses have defined so far.
     defined: Vec<String>,
     found: Vec<NamedTable>,
+    qualified: Vec<(Ident, Ident)>,
+    named_after_their_text: Vec<Span>,
 }
 
 impl Walk {
@@ -124,6 +150,11 @@ impl Walk {
         match body {
             SetExpr::Select(select) => {
                 for item in &select.projection {
+                    if let SelectItem::UnnamedExpr(expr) = item {
+                        if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                            self.named_after_their_text.push(expr.span());
+                        }
+                    }
                     if let SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } =
                         item
                     {
@@ -190,6 +221,19 @@ impl Walk {
     }
 
     fn name(&mut self, name: &ObjectName) {
+        // A qualified name never reads a `WITH` name, so leaving its database
+        // out would read something else.
+        if let [ObjectNamePart::Identifier(database), ObjectNamePart::Identifier(table)] =
+            name.0.as_slice()
+        {
+            if !self
+                .defined
+                .iter()
+                .any(|defined| defined.eq_ignore_ascii_case(&table.value))
+            {
+                self.qualified.push((database.clone(), table.clone()));
+            }
+        }
         let parts = name
             .0
             .iter()
