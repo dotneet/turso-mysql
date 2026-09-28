@@ -643,6 +643,25 @@ fn written_cast(cast: &Expr, data_type: &DataType) -> Option<(WrittenValue, Stri
             }
             Some((shape, quoted(&cast.written())))
         }
+        // Measured on MySQL 8.4.11: a NOT NULL `LONGLONG` of 21 holding the
+        // number, whichever of the two spellings. Only a whole number that
+        // fits is taken: past the range MySQL answers another number without
+        // a warning — `CAST(18446744073709551615 AS SIGNED)` is -1 — a
+        // fraction is rounded, and a word that is no whole number warns.
+        // `CAST(NULL AS SIGNED)`, nullable, is not taken either.
+        DataType::Signed | DataType::SignedInteger => {
+            let cast = written_decimal(cast)?;
+            if !cast.fraction.is_empty() {
+                return None;
+            }
+            let written = if cast.negative {
+                format!("-{}", cast.whole)
+            } else {
+                cast.whole
+            };
+            let number = written.parse::<i64>().ok()?;
+            Some((WrittenValue::WholeNumber { length: 21 }, number.to_string()))
+        }
         // Measured: a word naming no day answers NULL and warns, so only one
         // naming a day is taken.
         DataType::Date => {

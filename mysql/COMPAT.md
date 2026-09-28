@@ -1094,6 +1094,11 @@ answers a different one. Measured on 8.4.11:
   `p` digits, a sign and a point — `DECIMAL(10,2)` reports 12 — with `DECIMAL` alone meaning
   `DECIMAL(10,0)`. A number too wide for the type is refused: MySQL holds it to the widest
   one the type takes and warns. A word and a `DOUBLE` read into a `DECIMAL` are refused.
+- `CAST(<whole number> AS SIGNED)`, or `SIGNED INTEGER`, answers the number as a NOT NULL
+  `LONGLONG` of 21. Only a whole number `BIGINT` holds is taken: measured on 8.4.11, one past
+  the range answers another number without a warning (`CAST(18446744073709551615 AS SIGNED)`
+  is -1), a fraction is rounded, a word that is no whole number warns, and `CAST(NULL AS
+  SIGNED)` is nullable, none of which is repeated here.
 - `CAST('<day>' AS DATE)` and `CAST('<moment>' AS DATETIME)` answer the day or moment a
   column of that type would store, a `DATE` of 10 or a `DATETIME` of 19, nullable. A word
   naming no day is refused: MySQL answers NULL with warning 1292.

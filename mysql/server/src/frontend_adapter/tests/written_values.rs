@@ -307,6 +307,48 @@ fn a_written_value_cast_to_decimal_is_rounded_half_away_from_zero() {
     }
 }
 
+/// `CAST(n AS SIGNED)` over a written whole number answers the number as a
+/// NOT NULL `LONGLONG` of 21, in either spelling and in both protocols.
+#[test]
+fn a_written_whole_number_cast_to_signed_is_that_number() {
+    let (_directory, mut adapter) = adapter();
+    let sql = "SELECT CAST(-7 AS SIGNED) AS i, CAST(7 AS SIGNED INTEGER), CAST(9223372036854775807 AS SIGNED), CAST(-9223372036854775808 AS SIGNED)";
+    assert_eq!(
+        row(&mut adapter, sql),
+        ["-7", "7", "9223372036854775807", "-9223372036854775808"]
+    );
+    let shapes = shapes(&mut adapter, sql);
+    assert_eq!(shapes[0].0, "i");
+    assert_eq!(shapes[1].0, "CAST(7 AS SIGNED INTEGER)");
+    for shape in &shapes {
+        assert_eq!(
+            (shape.1, shape.2, shape.3, shape.4, shape.5),
+            (MYSQL_TYPE_LONGLONG, 21, 0, DECIMAL, BINARY)
+        );
+    }
+    assert_eq!(
+        binary_row(&mut adapter, sql),
+        [
+            BinaryResultValue::Integer(-7),
+            BinaryResultValue::Integer(7),
+            BinaryResultValue::Integer(i64::MAX),
+            BinaryResultValue::Integer(i64::MIN),
+        ]
+    );
+    // Past the range MySQL answers another number without a warning —
+    // `CAST(18446744073709551615 AS SIGNED)` is -1 — rounds a fraction, warns
+    // over a word that is no whole number, and answers a nullable column over
+    // NULL, none of which is repeated here.
+    for sql in [
+        "SELECT CAST(18446744073709551615 AS SIGNED)",
+        "SELECT CAST(1.5 AS SIGNED)",
+        "SELECT CAST('12' AS SIGNED)",
+        "SELECT CAST(NULL AS SIGNED)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}
+
 #[test]
 fn a_written_day_moment_or_document_cast_reads_the_way_mysql_stores_it() {
     let (_directory, mut adapter) = adapter();
