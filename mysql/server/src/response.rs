@@ -399,6 +399,8 @@ pub enum FrontendErrorKind {
     ForeignKeyViolation,
     /// A `TRUNCATE TABLE` named a table another table's foreign key names.
     TruncateReferencedByForeignKey,
+    /// A `DROP TABLE` named a table another table's foreign key names.
+    DropReferencedByForeignKey,
     /// A value was not one of the members its `ENUM` column lists.
     NotAMember,
     /// A value written to a `JSON` column was not a document.
@@ -649,6 +651,14 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1701,
             *b"42000",
             b"Cannot truncate a table referenced in a foreign key constraint".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11: dropping a table another table's foreign
+        // key names answers 3730, SQLSTATE HY000. MySQL names the table, the
+        // key and the other table in the message and this server does not.
+        FrontendErrorKind::DropReferencedByForeignKey => (
+            3730,
+            *b"HY000",
+            b"Cannot drop table referenced by a foreign key constraint".as_slice(),
         ),
         // Measured on MySQL 8.4.11: renaming a column onto a name the table
         // already carries answers 1060, SQLSTATE 42S21.

@@ -1083,3 +1083,71 @@ fn a_unique_column_restated_by_modify_keeps_its_key_across_a_restart() {
         .execute_query("INSERT INTO `auth_group` (`name`) VALUES ('viewers')")
         .unwrap();
 }
+
+/// GORM drops a table as ``DROP TABLE IF EXISTS `users` CASCADE``. Measured:
+/// MySQL takes either word and changes nothing for it — a missing table under
+/// `IF EXISTS` still leaves note 1051 — and writing both is 1064.
+#[test]
+fn restrict_or_cascade_after_drop_table_changes_nothing() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, "DROP TABLE IF EXISTS `users` CASCADE");
+    assert_eq!(
+        rows(&mut adapter, "SHOW WARNINGS"),
+        [some(&["Note", "1051", "Unknown table 'reports.users'"])]
+    );
+    run(&mut adapter, "CREATE TABLE d1 (id INT)");
+    run(&mut adapter, "CREATE TABLE d2 (id INT)");
+    run(&mut adapter, "DROP TABLE d1, d2 RESTRICT;");
+    assert!(!table_names(&mut adapter).contains(&"d1".to_owned()));
+    assert_eq!(
+        refused_with(&mut adapter, "DROP TABLE IF EXISTS d1 CASCADE RESTRICT"),
+        FrontendErrorKind::Syntax
+    );
+}
+
+/// Measured on MySQL 8.4.11: with foreign key checks on, a table another
+/// table's foreign key names answers 3730 and the statement drops nothing —
+/// under `IF EXISTS` and `CASCADE` too — unless the same statement drops the
+/// other table; a table whose key names itself is dropped; and with the
+/// checks off the table goes.
+#[test]
+fn drop_table_refuses_a_table_another_tables_key_names() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, "CREATE TABLE dp (id INT PRIMARY KEY)");
+    run(
+        &mut adapter,
+        "CREATE TABLE dc (id INT, p INT, FOREIGN KEY (p) REFERENCES dp (id))",
+    );
+    for sql in [
+        "DROP TABLE dp",
+        "DROP TABLE dp CASCADE",
+        "DROP TABLE IF EXISTS dp",
+        "DROP TABLE IF EXISTS nope, dp",
+    ] {
+        assert_eq!(
+            refused_with(&mut adapter, sql),
+            FrontendErrorKind::DropReferencedByForeignKey,
+            "{sql}"
+        );
+    }
+    assert!(table_names(&mut adapter).contains(&"dp".to_owned()));
+    run(&mut adapter, "DROP TABLE dp, dc");
+    assert!(!table_names(&mut adapter).contains(&"dc".to_owned()));
+
+    run(&mut adapter, "CREATE TABLE dp (id INT PRIMARY KEY)");
+    run(
+        &mut adapter,
+        "CREATE TABLE dc (id INT, p INT, FOREIGN KEY (p) REFERENCES dp (id))",
+    );
+    run(&mut adapter, "SET foreign_key_checks = 0");
+    run(&mut adapter, "DROP TABLE dp");
+    run(&mut adapter, "SET foreign_key_checks = 1");
+    assert!(!table_names(&mut adapter).contains(&"dp".to_owned()));
+
+    run(
+        &mut adapter,
+        "CREATE TABLE sr (id INT PRIMARY KEY, parent INT, FOREIGN KEY (parent) REFERENCES sr (id))",
+    );
+    run(&mut adapter, "DROP TABLE sr");
+    assert!(!table_names(&mut adapter).contains(&"sr".to_owned()));
+}

@@ -5804,6 +5804,18 @@ impl MySqlConnection {
         if !missing.is_empty() && !command.if_exists() {
             return Err(MySqlDropTableError::MissingTable);
         }
+        // Measured on MySQL 8.4.11: with foreign key checks on, a table
+        // another table's foreign key names answers 3730 and the statement
+        // drops nothing, `IF EXISTS` and a trailing `CASCADE` alike, unless
+        // the same statement drops that other table too; a table whose key
+        // names itself is dropped. With the checks off it goes.
+        if self.inner.foreign_keys_enabled()
+            && self
+                .another_table_names_one_of(&present)
+                .map_err(MySqlDropTableError::Engine)?
+        {
+            return Err(MySqlDropTableError::ReferencedByForeignKey);
+        }
         let mut result = Ok(());
         for table in self.children_before_parents(present) {
             let stmt = Stmt::DropTable {
@@ -5933,6 +5945,28 @@ impl MySqlConnection {
     }
 
     /// Whether any table's foreign key names this one as its parent.
+    /// Whether a table outside `dropped` has a foreign key naming one of them.
+    fn another_table_names_one_of(&self, dropped: &[MySqlTableName]) -> Result<bool> {
+        let schema = self.inner.current_schema();
+        let is_dropped = |name: &str| {
+            dropped
+                .iter()
+                .any(|table| table.as_str().eq_ignore_ascii_case(name))
+        };
+        Ok(self.list_tables()?.iter().any(|listed| {
+            !is_dropped(listed.name())
+                && schema
+                    .get_table(listed.name())
+                    .and_then(|core_table| core_table.btree())
+                    .is_some_and(|btree| {
+                        btree
+                            .foreign_keys
+                            .iter()
+                            .any(|key| is_dropped(&key.parent_table))
+                    })
+        }))
+    }
+
     fn a_foreign_key_names(&self, table: &str) -> Result<bool> {
         let schema = self.inner.current_schema();
         Ok(self.list_tables()?.iter().any(|listed| {

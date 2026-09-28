@@ -88,6 +88,11 @@ pub fn parse_optional_drop_table(
         }
         cursor += 1;
     }
+    // Measured on MySQL 8.4.11: one of these may close the statement and
+    // changes nothing — `DROP TABLE parent CASCADE` still answers 3730 while
+    // a child's foreign key names it — and writing both is 1064.
+    let _ = consume_admin_word(&tokens, &mut cursor, "RESTRICT")
+        || consume_admin_word(&tokens, &mut cursor, "CASCADE");
     if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
         cursor += 1;
     }
@@ -125,6 +130,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["users", "posts"]
         );
+        // GORM drops a table this way.
+        for sql in [
+            "DROP TABLE IF EXISTS `users` CASCADE",
+            "DROP TABLE users, posts RESTRICT;",
+        ] {
+            let command = parse_optional_drop_table(sql, SessionSqlMode::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(command.tables()[0].as_str(), "users", "{sql}");
+        }
     }
 
     #[test]
@@ -135,8 +150,9 @@ mod tests {
             "DROP TABLE db.x",
             "DROP TABLE a,",
             "DROP TABLE a, db.b",
-            "DROP TABLE x CASCADE",
-            "DROP TABLE x RESTRICT",
+            "DROP TABLE x CASCADE RESTRICT",
+            "DROP TABLE x RESTRICT CASCADE",
+            "DROP TABLE x CASCADE, y",
             "DROP TABLE x; SELECT 1",
             "DROP TABLE;;",
             "DROP TABLE sqlite_schema",

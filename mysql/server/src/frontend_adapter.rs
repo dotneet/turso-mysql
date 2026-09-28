@@ -3586,6 +3586,9 @@ fn execute_checked_query(
             .map_err(|error| match error {
                 MySqlDropTableError::MissingTable => FrontendErrorKind::UnknownTable,
                 MySqlDropTableError::NamedTwice => FrontendErrorKind::NotUniqueTable,
+                MySqlDropTableError::ReferencedByForeignKey => {
+                    FrontendErrorKind::DropReferencedByForeignKey
+                }
                 MySqlDropTableError::Engine(error) => frontend_error_kind(error),
             })?;
         // Measured on MySQL 8.4.11: one note for each table an `IF EXISTS`
