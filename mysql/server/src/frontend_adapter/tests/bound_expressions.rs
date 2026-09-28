@@ -1156,3 +1156,87 @@ fn gorm_joins_on_a_bound_word() {
         );
     }
 }
+
+const LARAVEL_JSON_UPDATE: &str = "update `users` set `profile` = json_set(`profile`, '$.\"city\"', ?), `users`.`updated_at` = ? where `email` = ?";
+
+/// Laravel's `update(['profile->city' => 'Kyoto'])` binds the member's new
+/// value into a `json_set`. Measured on MySQL 8.4.11 with a statement
+/// prepared once: a bound word goes in as a JSON string whatever it holds —
+/// a document's text included — NULL as the JSON null, a NULL document stays
+/// NULL, and a document that is no object is left as it was.
+#[test]
+fn laravel_sets_a_json_member_to_a_bound_word() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    let statement = adapter.execute_stmt_prepare(LARAVEL_JSON_UPDATE).unwrap();
+    let stamp = Bound::Word("2026-01-02 03:04:05");
+    for (value, email) in [
+        (Bound::Word("Kyoto"), "a@x"),
+        (Bound::Null, "b@x"),
+        (Bound::Word("x"), "c@x"),
+        (Bound::Word("x"), "d@x"),
+    ] {
+        let result = adapter.execute_stmt_execute(
+            statement.statement_id,
+            &payload(&[value, stamp, Bound::Word(email)]),
+        );
+        assert!(
+            matches!(result, Ok(PreparedStatementExecutionResult::Ok(_))),
+            "{email}: {result:?}"
+        );
+    }
+    assert_eq!(
+        first_column(&mut adapter, "SELECT profile FROM users ORDER BY id"),
+        [
+            r#"{"n": null, "s": "30", "ok": true, "age": 30, "city": "Kyoto", "tags": ["a", "b"]}"#,
+            r#"{"age": 30.0, "city": null}"#,
+            "NULL",
+            "[1, 2]",
+        ]
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT updated_at FROM users WHERE id = 1"),
+        ["2026-01-02 03:04:05.000"]
+    );
+    for word in [r#"{"a": 1}"#, "", "é\"\\"] {
+        let result = adapter.execute_stmt_execute(
+            statement.statement_id,
+            &payload(&[Bound::Word(word), stamp, Bound::Word("a@x")]),
+        );
+        assert!(result.is_ok(), "{word}: {result:?}");
+        assert_eq!(
+            one_value(
+                &mut adapter,
+                "SELECT JSON_UNQUOTE(JSON_EXTRACT(profile, '$.city')) FROM users WHERE id = 1"
+            ),
+            word
+        );
+    }
+    adapter.execute_stmt_close(statement.statement_id);
+}
+
+/// Measured on MySQL 8.4.11: a bound whole number goes in as a JSON number,
+/// and from then on the statement reads every bound word as a number and
+/// refuses it with 1292. A number is refused here rather than followed by
+/// that, and so is a double, whose JSON spelling has not been measured.
+#[test]
+fn a_number_bound_into_a_json_member_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    users_with_profiles(&mut adapter);
+    let stamp = Bound::Word("2026-01-02 03:04:05");
+    for value in [Bound::Whole(5), Bound::Real(1.5)] {
+        assert!(prepared(
+            &mut adapter,
+            LARAVEL_JSON_UPDATE,
+            &[value, stamp, Bound::Word("a@x")]
+        )
+        .is_err());
+    }
+    assert_eq!(
+        one_value(
+            &mut adapter,
+            "SELECT JSON_EXTRACT(profile, '$.city') FROM users WHERE id = 1"
+        ),
+        "\"Paris\""
+    );
+}

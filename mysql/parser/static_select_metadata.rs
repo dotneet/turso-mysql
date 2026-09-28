@@ -2679,6 +2679,13 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
                 }
                 continue;
             }
+            // Laravel writes every JSON update as `json_set(doc, '$."a"', ?)`.
+            if matches!(argument, sqlparser::ast::FunctionArg::Unnamed(
+                sqlparser::ast::FunctionArgExpr::Expr(value),
+            ) if crate::translate::is_a_bare_placeholder(value))
+            {
+                continue;
+            }
             json_argument_column(argument, &mut columns)?;
         }
         return Some(StaticSelectMetadata::ScalarCall {

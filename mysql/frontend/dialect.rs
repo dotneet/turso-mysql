@@ -537,6 +537,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_CAST_AS_JSON) {
             return Ok(Some(Func::Dialect(MYSQL_CAST_AS_JSON.to_string())));
         }
+        if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_JSON_BOUND_WORD) {
+            return Ok(Some(Func::Dialect(MYSQL_JSON_BOUND_WORD.to_string())));
+        }
         if arg_count == 2 && name.eq_ignore_ascii_case(MYSQL_JSON_COMPARE_BOUND) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_COMPARE_BOUND.to_string())));
         }
@@ -962,6 +965,17 @@ impl Dialect for MySqlDialect {
                 return Err(LimboError::ParseError(format!("{name} takes one argument")));
             };
             return cast_as_json(value);
+        }
+        if name.eq_ignore_ascii_case(MYSQL_JSON_BOUND_WORD) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            return match value {
+                Value::Text(_) | Value::Null => Ok(value.clone()),
+                _ => Err(LimboError::InvalidArgument(
+                    "a value bound into a JSON document has to be a word or NULL".to_string(),
+                )),
+            };
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_UNQUOTE) {
             let [document] = args else {
@@ -1788,6 +1802,11 @@ pub(crate) const MYSQL_JSON_UNQUOTE: &str = "mysql_json_unquote";
 /// value written whole into a `JSON` column: a word parsed as a document, a
 /// whole number as that JSON number.
 pub(crate) const MYSQL_CAST_AS_JSON: &str = "mysql_cast_as_json";
+/// Passes a value bound into `JSON_SET`, `JSON_INSERT` or `JSON_REPLACE`
+/// through when it is a word or NULL, which the engine puts into the document
+/// as a JSON string or the JSON null the way MySQL does, and refuses anything
+/// else.
+pub(crate) const MYSQL_JSON_BOUND_WORD: &str = "mysql_json_bound_word";
 /// Compares a JSON value read out of a column with a bound value, by what
 /// binds: a word as a JSON string, byte for byte, and a whole number as a
 /// JSON number, the way MySQL compares a written one of each.

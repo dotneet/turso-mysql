@@ -7680,6 +7680,15 @@ fn render_scalar_call(
                     return unsupported("SELECT call argument");
                 };
                 if !removes && position > 0 && position % 2 == 0 {
+                    // Measured on MySQL 8.4.11 with a statement prepared once:
+                    // a bound word goes in as a JSON string, whatever it
+                    // holds, and NULL as the JSON null. Once a number has been
+                    // bound, MySQL reads every later word as a number and
+                    // refuses it with 1292, so a number is refused here.
+                    if is_a_bare_placeholder(expr) {
+                        render_context.next_parameter_ordinal()?;
+                        return Ok("mysql_json_bound_word(?)".to_owned());
+                    }
                     return render_json_value_argument(expr, render_context);
                 }
                 // The document changed is a JSON column or text; MySQL refuses

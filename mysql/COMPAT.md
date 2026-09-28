@@ -4623,8 +4623,18 @@ Measured on 8.4.11 and matched: it names the member the bare name names, in the
 same column over both protocols. A reading written with `->` or `->>` over any
 other path — `doc->'$.a.*'`, a quoted name holding a space — is refused: the
 engine answered it, but in a column of no type at all, and `doc->'$.a.*'` over
-`{"a": {"b": 1}}` answered nothing where MySQL answers `[1]`, measured. A bound
-value put into a document by `JSON_SET` is refused, as a `?` inside a call is.
+`{"a": {"b": 1}}` answered nothing where MySQL answers `[1]`, measured.
+
+A value bound into `JSON_SET`, `JSON_INSERT` or `JSON_REPLACE` is how Laravel
+writes every JSON update — ``update `users` set `profile` =
+json_set(`profile`, '$."city"', ?)`` for `update(['profile->city' => 'Kyoto'])`.
+Measured on 8.4.11 with a statement prepared once and run again: a bound word
+goes into the document as a JSON string whatever it holds, a document's text
+and the empty word included, and NULL as the JSON null; a NULL document stays
+NULL and one that is not an object is left as it was. A bound whole number goes
+in as a JSON number, but from then on MySQL reads every word bound there as a
+number and refuses it with 1292, so a number is refused here when it binds,
+and so is a double and a binary string, which were not measured.
 
 JSON numbers follow MySQL 8.4.11's RapidJSON conversion, including its
 rounding at `1000000000000000.1` and `1e-30`. They read back as `1e15` and

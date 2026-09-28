@@ -125,8 +125,11 @@ and MySQL agree on. `JSON_ARRAY` and `JSON_OBJECT` refuse a nested call and a
 boolean literal, and they and `JSON_SET` refuse a `DECIMAL` with places, a
 number written with a trailing zero past its first place (`10.00`), a `TIME`, a `TIMESTAMP`, a `FLOAT`, a `SET`, a
 `BIT` and binary strings, each written into a document by a rule not followed
-or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
-`JSON_ARRAY` and no other call.
+or not measured. A `?` in their value places takes a word or NULL and refuses
+a number when it binds: measured, MySQL writes a bound number as a JSON number
+and then reads every word bound there as a number, refusing it with 1292,
+which this does not follow. `JSON_ARRAYAGG` over a built document takes
+`JSON_OBJECT` and `JSON_ARRAY` and no other call.
 
 ---
 
