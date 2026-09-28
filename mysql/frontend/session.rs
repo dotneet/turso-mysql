@@ -8362,9 +8362,16 @@ impl MySqlConnection {
                 continue;
             }
             // A call says what it answers, so the value it meets is held to
-            // that rather than to a column this would have to find first.
+            // that rather than to a column this would have to find first. A
+            // bound value meets a call answering a word as a word, which the
+            // statement's word parameters hold it to.
             if let Some(answers) = comparison.answers() {
-                if !checked_comparison_meets_an_answer(comparison.rhs(), answers) {
+                let a_bound_word = answers == CheckedComparisonAnswer::Text
+                    && matches!(
+                        comparison.rhs(),
+                        CheckedSelectComparisonRhs::Placeholder { .. }
+                    );
+                if !a_bound_word && !checked_comparison_meets_an_answer(comparison.rhs(), answers) {
                     return Err(LimboError::InvalidArgument(format!(
                         "SELECT comparison against a call requires {}",
                         answered_kind_name(answers)
@@ -8516,7 +8523,20 @@ impl MySqlConnection {
         source_tables: &[MySqlSelectSource],
         comparisons: &[CheckedSelectComparison],
     ) -> Result<Vec<usize>> {
-        self.string_comparison_parameters(source_tables, comparisons, is_text_type)
+        let mut words =
+            self.string_comparison_parameters(source_tables, comparisons, is_text_type)?;
+        // A value bound against a call answering a word — `lower(path) = ?` —
+        // is a word too.
+        words.extend(comparisons.iter().filter_map(|comparison| {
+            match (comparison.answers(), comparison.rhs()) {
+                (
+                    Some(CheckedComparisonAnswer::Text),
+                    CheckedSelectComparisonRhs::Placeholder { ordinal },
+                ) => Some(*ordinal),
+                _ => None,
+            }
+        }));
+        Ok(words)
     }
 
     /// Finds the parameters that meet a column of bytes, which bind a word or

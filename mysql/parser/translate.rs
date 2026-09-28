@@ -12263,8 +12263,15 @@ fn render_comparison_over_a_call(
     } else {
         (rendered_rhs, rhs)
     };
+    // A bound value meets a call answering a word as a word, the frontend
+    // refusing one bound as anything else, so it is compared under the
+    // collation a written word is — Gitea finds an LFS lock with `lower(path)
+    // = ?`.
     let collated = answers == crate::CheckedComparisonAnswer::Text
-        && matches!(rhs, CheckedSelectComparisonRhs::Text(_));
+        && matches!(
+            rhs,
+            CheckedSelectComparisonRhs::Text(_) | CheckedSelectComparisonRhs::Placeholder { .. }
+        );
     let collation = if collated {
         record_the_columns_a_text_call_reads(call, render_context);
         " COLLATE MYSQL_UCA9_AI_CI"

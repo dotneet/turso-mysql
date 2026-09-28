@@ -1195,8 +1195,11 @@ does after the call has answered — measured on 8.4.11, `LOWER(name) = 'ADA'` f
 holding `Ada`, and `LOWER(name) > 'b'` finds `bob` and `CARL`. A call answering a number
 meets a number. A call answering a day or a moment is held to the form one is stored in, the
 way a `DATE` or `DATETIME` column is, so `CAST(dt AS DATE) = '2024-6-15'` is refused for the
-reason the same value against a column is. A `?` meets none of them: it carries no type until
-it binds, and nothing puts it into that form.
+reason the same value against a column is. A `?` meets a call answering a word as a word —
+Gitea finds an LFS lock with `lower(path) = ?` — compared under the collation a written word
+is, and a number bound there is refused as against a column of words; in a statement that
+writes it is still refused. It meets no other call: it carries no type until it binds, and
+nothing puts it into a day's or a moment's form.
 
 Which calls can stand there is decided by what they answer, not by what they are called. The
 ones that answer a real number are left out: what a `DOUBLE` compares equal to is a rule of

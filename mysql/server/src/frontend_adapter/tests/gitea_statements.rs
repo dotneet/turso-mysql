@@ -1094,3 +1094,45 @@ fn an_ordering_case_over_words_orders_under_the_columns_collation() {
         );
     }
 }
+
+/// Gitea finds an LFS lock with `lower(path) = ?`. A value bound against a
+/// call answering a word is a word, compared under the collation of the
+/// column the call reads: measured on MySQL 8.4.11, `lower(path) =
+/// 'DOCS/README.MD'` finds `Docs/Readme.md`. A number bound there is refused,
+/// as against a column of words.
+#[test]
+fn a_call_answering_a_word_meets_a_bound_word() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `lfs_lock` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NOT NULL, `owner_id` BIGINT(20) NOT NULL, `path` TEXT NULL, `created` DATETIME NULL)",
+        "INSERT INTO `lfs_lock` (`repo_id`, `owner_id`, `path`) VALUES (1, 2, 'Docs/Readme.md'), (1, 2, 'src/main.go'), (2, 2, 'docs/readme.md')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let found = |adapter: &mut Adapter, path: &str| {
+        prepared_rows(
+            adapter,
+            "SELECT `id`, `repo_id`, `owner_id`, `path`, `created` FROM `lfs_lock` WHERE (lower(path) = ?) AND `repo_id`=? LIMIT 1",
+            &[Bound::Word(path), Bound::Whole(1)],
+        )
+        .rows
+        .iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        found(&mut adapter, "DOCS/README.MD"),
+        [BinaryResultValue::Integer(1)]
+    );
+    assert_eq!(
+        found(&mut adapter, "SRC/Main.GO"),
+        [BinaryResultValue::Integer(2)]
+    );
+    assert!(found(&mut adapter, "docs/other.md").is_empty());
+    assert!(prepared(
+        &mut adapter,
+        "SELECT `id` FROM `lfs_lock` WHERE (lower(path) = ?) AND `repo_id`=?",
+        &[Bound::Whole(5), Bound::Whole(1)],
+    )
+    .is_err());
+}
