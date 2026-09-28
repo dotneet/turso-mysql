@@ -183,6 +183,26 @@ fn the_session_sqlx_opens_is_taken() {
     assert!(adapter.execute_query("SELECT 'a' || 'b'").is_err());
 }
 
+/// MySQL Workbench opens with `SET @@SESSION.autocommit = ON`. Measured on
+/// MySQL 8.4.11: that spelling, `ON` and `OFF` among the values, sets the
+/// session's autocommit as `SET autocommit = 1` does.
+#[test]
+fn the_autocommit_workbench_sets_is_taken() {
+    let (_directory, mut adapter) = adapter();
+    let off = run(&mut adapter, "SET @@SESSION.autocommit = OFF");
+    assert_eq!(off.status_flags & SERVER_STATUS_AUTOCOMMIT, 0);
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@autocommit"),
+        [[Some("0".to_owned())]]
+    );
+    let on = run(&mut adapter, "SET @@SESSION.autocommit = ON");
+    assert_ne!(on.status_flags & SERVER_STATUS_AUTOCOMMIT, 0);
+    assert_eq!(
+        rows(&mut adapter, "SELECT @@autocommit"),
+        [[Some("1".to_owned())]]
+    );
+}
+
 /// A `SELECT` running past `max_execution_time` is stopped. Measured on MySQL
 /// 8.4.11: any whole number of milliseconds is taken and read back as a
 /// LONGLONG of 21, `DEFAULT` is 0 — no limit — and a `SELECT` running longer

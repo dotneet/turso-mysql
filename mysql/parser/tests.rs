@@ -8557,9 +8557,20 @@ fn reads_the_three_savepoint_statements() {
 #[test]
 fn parses_only_strict_autocommit_assignments() {
     let mode = SessionSqlMode::default();
+    // MySQL Workbench opens with `SET @@SESSION.autocommit = ON`; the rest
+    // were measured on MySQL 8.4.11 to set the session's autocommit too.
     for (sql, enabled) in [
         ("SET autocommit = 0", false),
         ("set session AUTOCOMMIT=1;", true),
+        ("SET @@SESSION.autocommit = ON", true),
+        ("SET @@session.autocommit = OFF", false),
+        ("SET @@LOCAL.autocommit = 1", true),
+        ("SET LOCAL autocommit = 0", false),
+        ("SET @@autocommit = 1", true),
+        ("SET autocommit = 'ON'", true),
+        ("SET autocommit = 'off'", false),
+        ("SET autocommit = TRUE", true),
+        ("SET autocommit = FALSE", false),
     ] {
         assert_eq!(
             parse_optional_autocommit_setting(sql, mode),
@@ -8574,10 +8585,10 @@ fn parses_only_strict_autocommit_assignments() {
 
     for sql in [
         "SET GLOBAL autocommit = 0",
+        "SET @@GLOBAL.autocommit = 0",
         "SET autocommit = 2",
-        "SET autocommit = ON",
+        "SET autocommit = 'maybe'",
         "SET autocommit = 1, sql_mode = ''",
-        "SET @@session.autocommit = 0",
         "/* hidden */ SET autocommit = 0",
         "SET autocommit = 0 -- hidden",
         "SET autocommit = 0; SELECT 1",

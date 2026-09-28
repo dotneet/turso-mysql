@@ -364,7 +364,7 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 | Feature | State |
 |---|---|
 | `BEGIN` / `START TRANSACTION`, `COMMIT`, `ROLLBACK` | works |
-| `SET autocommit = 0 \| 1` | works |
+| `SET autocommit = 0 \| 1` | works, also written `SESSION`, `LOCAL`, `@@SESSION.`, `@@LOCAL.` or `@@` and with `ON`, `OFF`, `TRUE`, `FALSE`, `'ON'` or `'OFF'`, all measured on MySQL 8.4.11 to set the session's; `GLOBAL` and any other value are refused |
 | A value a column refuses inside a transaction — 1406, 1264, 1366, 1292, 1265, 3140 | works; the statement fails and is undone, and the transaction, its earlier rows and its savepoints stay, as MySQL's do |
 | `LOCK TABLES` / `UNLOCK TABLES` | works, and the lock is held until the unlock. One lock over the whole database rather than one for each table, so it locks more than was asked for — see COMPAT.md |
 | Touching a table `LOCK TABLES` did not name | taken; MySQL answers 1100 and holds the session to the tables it locked, where one lock over everything has no reason to |

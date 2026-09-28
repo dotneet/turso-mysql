@@ -3588,17 +3588,30 @@ pub fn parse_optional_autocommit_setting(
         return unsupported("comments in SET autocommit");
     }
     let tokens = tokens.strip_suffix(&[&Token::SemiColon]).unwrap_or(&tokens);
+    // Measured on MySQL 8.4.11: `SESSION` and `LOCAL`, written as a word or
+    // as `@@SESSION.` and `@@LOCAL.`, and `@@autocommit` with no scope all
+    // set the session's autocommit.
     let assignment = match tokens {
         [set, name, equals, value]
             if is_unquoted_word(set, "SET")
-                && is_unquoted_word(name, "AUTOCOMMIT")
+                && (is_unquoted_word(name, "AUTOCOMMIT")
+                    || is_unquoted_word(name, "@@AUTOCOMMIT"))
                 && matches!(equals, Token::Eq) =>
         {
             value
         }
         [set, session, name, equals, value]
             if is_unquoted_word(set, "SET")
-                && is_unquoted_word(session, "SESSION")
+                && (is_unquoted_word(session, "SESSION") || is_unquoted_word(session, "LOCAL"))
+                && is_unquoted_word(name, "AUTOCOMMIT")
+                && matches!(equals, Token::Eq) =>
+        {
+            value
+        }
+        [set, session, Token::Period, name, equals, value]
+            if is_unquoted_word(set, "SET")
+                && (is_unquoted_word(session, "@@SESSION")
+                    || is_unquoted_word(session, "@@LOCAL"))
                 && is_unquoted_word(name, "AUTOCOMMIT")
                 && matches!(equals, Token::Eq) =>
         {
@@ -3606,10 +3619,16 @@ pub fn parse_optional_autocommit_setting(
         }
         _ => return unsupported("SET autocommit syntax"),
     };
+    // Measured on MySQL 8.4.11: `ON`, `OFF`, `TRUE`, `FALSE` and the quoted
+    // `'ON'` and `'OFF'` are taken beside 0 and 1; 2 answers 1231.
     let enabled = match assignment {
         Token::Number(value, false) if value == "0" => false,
         Token::Number(value, false) if value == "1" => true,
-        _ => return unsupported("SET autocommit value; expected 0 or 1"),
+        Token::SingleQuotedString(value) if value.eq_ignore_ascii_case("ON") => true,
+        Token::SingleQuotedString(value) if value.eq_ignore_ascii_case("OFF") => false,
+        value if is_unquoted_word(value, "ON") || is_unquoted_word(value, "TRUE") => true,
+        value if is_unquoted_word(value, "OFF") || is_unquoted_word(value, "FALSE") => false,
+        _ => return unsupported("SET autocommit value; expected 0, 1, ON or OFF"),
     };
     Ok(Some(MySqlAutocommitSetting { enabled }))
 }
