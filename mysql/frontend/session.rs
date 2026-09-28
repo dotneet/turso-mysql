@@ -1823,7 +1823,7 @@ impl MySqlConnection {
             }
             translated => translated?,
         };
-        self.refuse_offered_row_comparisons_answered_otherwise(sql, mode)?;
+        self.refuse_an_upsert_answered_otherwise(sql, mode)?;
         if translated
             .parse_ast()
             .is_ok_and(|statement| self.writes_a_value_a_trigger_replaces(&statement))
@@ -1964,38 +1964,53 @@ impl MySqlConnection {
         Ok((translated, column_types, table_definition))
     }
 
-    /// Refuses an upsert comparing a column between the row already there and
-    /// the row offered — Rails' `upsert_all` writes `t.name <=> offered.name` —
-    /// where the engine would answer otherwise than MySQL.
+    /// Refuses an upsert the engine would answer otherwise than MySQL.
     ///
-    /// MySQL puts the offered value into the column's type before it compares,
-    /// and the engine compares it as it was written: measured, `'2026-01-01'`
-    /// offered for a `DATETIME` holding that midnight is the same moment in
-    /// MySQL and a different word here. A word offered for a column of words,
-    /// compared under the column's collation in both, a whole number for a
-    /// column of them, and a written number for a `DECIMAL`, which the engine
-    /// puts into the column's form before it compares, answer alike.
-    fn refuse_offered_row_comparisons_answered_otherwise(
+    /// A table with an `ON UPDATE CURRENT_TIMESTAMP` column the clause does not
+    /// assign is refused: measured on 8.4.11, MySQL writes the moment into it
+    /// whenever the upsert changes the row, and the engine's upsert does not.
+    ///
+    /// A column the clause compares between the row already there and the row
+    /// offered — Rails' `upsert_all` writes `t.name <=> offered.name` — is held
+    /// to the pairs that answer alike. MySQL puts the offered value into the
+    /// column's type before it compares, and the engine compares it as it was
+    /// written: measured, `'2026-01-01'` offered for a `DATETIME` holding that
+    /// midnight is the same moment in MySQL and a different word here. A word
+    /// offered for a column of words, compared under the column's collation in
+    /// both, a whole number for a column of them, and a written number for a
+    /// `DECIMAL`, which the engine puts into the column's form before it
+    /// compares, answer alike.
+    fn refuse_an_upsert_answered_otherwise(
         &self,
         sql: &str,
         mode: SessionSqlMode,
     ) -> std::result::Result<(), MySqlParseError> {
-        const REFUSED: MySqlParseError = MySqlParseError::Unsupported {
-            feature: "an upsert comparing a column of the offered row this does not compare as MySQL does",
+        let upsert = match turso_mysql_parser::parse_optional_upsert(sql, mode) {
+            Ok(Some(upsert)) => upsert,
+            // A statement that is no upsert, or that does not parse, is
+            // answered by the path that runs it.
+            Ok(None) | Err(_) => return Ok(()),
         };
-        let comparisons = match turso_mysql_parser::offered_row_comparisons(sql, mode) {
-            Ok(comparisons) => comparisons,
-            // A statement that does not parse is answered by the path that
-            // runs it.
-            Err(_) => return Ok(()),
+        let table = MySqlTableName::parse(&upsert.table).map_err(|_| UPSERT_REFUSED)?;
+        let Ok(columns) = self.list_columns(&table) else {
+            return Ok(());
         };
-        for comparison in comparisons {
-            let table = MySqlTableName::parse(&comparison.table).map_err(|_| REFUSED)?;
-            let columns = self.list_columns(&table).map_err(|_| REFUSED)?;
+        if columns.iter().any(|column| {
+            column.extra().contains("on update CURRENT_TIMESTAMP")
+                && !upsert
+                    .assigned
+                    .iter()
+                    .any(|assigned| assigned.eq_ignore_ascii_case(column.name()))
+        }) {
+            return Err(MySqlParseError::Unsupported {
+                feature: "an upsert on a table with an ON UPDATE CURRENT_TIMESTAMP column it does not assign",
+            });
+        }
+        for comparison in upsert.comparisons {
             let column = columns
                 .iter()
                 .find(|column| column.name().eq_ignore_ascii_case(&comparison.column))
-                .ok_or(REFUSED)?;
+                .ok_or(UPSERT_REFUSED)?;
             let type_name = column.type_name();
             let offered_alike = |taken: &[OfferedValue]| {
                 comparison
@@ -2016,7 +2031,7 @@ impl MySqlConnection {
                 false
             };
             if !alike {
-                return Err(REFUSED);
+                return Err(UPSERT_REFUSED);
             }
         }
         Ok(())
@@ -7769,7 +7784,7 @@ impl MySqlConnection {
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
-        self.refuse_offered_row_comparisons_answered_otherwise(sql, self.parser_mode())
+        self.refuse_an_upsert_answered_otherwise(sql, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) if insert.reads_the_clock() && self.time_zone_offset_seconds() != 0 => {
@@ -7863,7 +7878,7 @@ impl MySqlConnection {
                 }
             }
         }
-        self.refuse_offered_row_comparisons_answered_otherwise(sql, self.parser_mode())
+        self.refuse_an_upsert_answered_otherwise(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)?;
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
@@ -12181,6 +12196,10 @@ fn inserted_value(expr: &Expr) -> InsertedValue {
         _ => InsertedValue::Value,
     }
 }
+
+const UPSERT_REFUSED: MySqlParseError = MySqlParseError::Unsupported {
+    feature: "an upsert comparing a column of the offered row this does not compare as MySQL does",
+};
 
 fn uses_session_local_clock(sql: &str) -> bool {
     sql.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')

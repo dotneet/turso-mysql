@@ -3218,20 +3218,29 @@ fn render_offered_row_unchanged(
     }
 }
 
-/// The columns an `INSERT`'s upsert clause compares with `<=>` between the
-/// row already there and the row offered, with what each row offers for them.
-pub(crate) fn offered_row_comparisons(
-    insert: &Insert,
-) -> Result<Vec<crate::OfferedRowComparison>, ParseError> {
+/// The table an `INSERT`'s upsert clause writes, the columns it assigns, and
+/// the columns it compares with `<=>` between the row already there and the
+/// row offered, with what each row offers for them.
+pub(crate) fn checked_upsert(insert: &Insert) -> Result<Option<crate::CheckedUpsert>, ParseError> {
     let Some(sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
-        return Ok(Vec::new());
+        return unsupported("INSERT ON DUPLICATE KEY UPDATE over a table this does not read");
     };
     let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
-        return Ok(Vec::new());
+        return unsupported("INSERT ON DUPLICATE KEY UPDATE over a qualified table");
     };
+    let assigned = assignments
+        .iter()
+        .map(|assignment| match &assignment.target {
+            sqlparser::ast::AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
+                [ObjectNamePart::Identifier(column)] => Ok(column.value.clone()),
+                _ => unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target"),
+            },
+            _ => unsupported("INSERT ON DUPLICATE KEY UPDATE assignment target"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let offered =
         insert
             .insert_alias
@@ -3248,7 +3257,7 @@ pub(crate) fn offered_row_comparisons(
         Some(SetExpr::Values(values)) => values.rows.as_slice(),
         _ => &[],
     };
-    Ok(compared
+    let comparisons = compared
         .into_iter()
         .map(|column| {
             let at = insert.columns.iter().position(|named| {
@@ -3263,7 +3272,6 @@ pub(crate) fn offered_row_comparisons(
                 })
                 .collect::<Vec<_>>();
             crate::OfferedRowComparison {
-                table: table.value.clone(),
                 column,
                 offered: if rows.is_empty() {
                     vec![crate::OfferedValue::Other]
@@ -3272,7 +3280,12 @@ pub(crate) fn offered_row_comparisons(
                 },
             }
         })
-        .collect())
+        .collect();
+    Ok(Some(crate::CheckedUpsert {
+        table: table.value.clone(),
+        assigned,
+        comparisons,
+    }))
 }
 
 fn collect_compared_columns(expr: &Expr, offered: Option<&str>, compared: &mut Vec<String>) {

@@ -2487,6 +2487,12 @@ way, so the engine says how many rows a statement wrote over and how many of
 those actually changed. What each of the three counts is set out further down,
 where that change is described.
 
+A table with an `ON UPDATE CURRENT_TIMESTAMP` column — TypeORM's `@UpdateDateColumn` — takes
+an upsert only when the clause writes that column itself. Measured on 8.4.11, MySQL writes the
+moment into it whenever the upsert changes the row and leaves it when the row stands as it was,
+and the engine's upsert writes nothing there, so the rest is refused rather than answered with
+the old moment, which is what it was before this.
+
 The clause is refused where it would be dropped rather than answered: on the
 `SET` form and the empty-row form, which leave no room for it, and beside
 `REPLACE` or `IGNORE`, which already decide what a collision does. On a table

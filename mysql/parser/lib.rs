@@ -4979,27 +4979,36 @@ pub fn parse_auto_increment_insert_target(
     Ok(Some(insert_name(&table)?.as_str().to_owned()))
 }
 
-/// The columns one `INSERT`'s upsert clause compares between the row already
-/// there and the row offered, with `<=>`, and what each row offers for them.
-///
-/// The engine compares the value offered as it was written where MySQL first
-/// puts it into the column's type, so the frontend holds each pair to a
-/// column whose type and offered values make those two the same.
-pub fn offered_row_comparisons(
+/// What the frontend holds one `INSERT ... ON DUPLICATE KEY UPDATE` to before
+/// it runs, or `None` for any other statement.
+pub fn parse_optional_upsert(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Vec<OfferedRowComparison>, ParseError> {
+) -> Result<Option<CheckedUpsert>, ParseError> {
     match parse_one_statement(sql, mode)? {
-        Statement::Insert(insert) => translate::offered_row_comparisons(&insert),
-        _ => Ok(Vec::new()),
+        Statement::Insert(insert) => translate::checked_upsert(&insert),
+        _ => Ok(None),
     }
+}
+
+/// One `INSERT ... ON DUPLICATE KEY UPDATE`: the table it writes, the columns
+/// its clause assigns, and the columns the clause compares between the row
+/// already there and the row offered, with `<=>`.
+///
+/// The engine compares the value offered as it was written where MySQL first
+/// puts it into the column's type, so the frontend holds each comparison to a
+/// column whose type and offered values make those two the same.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedUpsert {
+    pub table: String,
+    pub assigned: Vec<String>,
+    pub comparisons: Vec<OfferedRowComparison>,
 }
 
 /// One column an upsert compares between the two rows, and the values each
 /// row of the statement offers for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfferedRowComparison {
-    pub table: String,
     pub column: String,
     pub offered: Vec<OfferedValue>,
 }

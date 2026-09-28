@@ -757,3 +757,56 @@ fn an_upsert_comparison_the_engine_answers_otherwise_is_refused() {
         vec![some(&["ANN", "5", "2000-01-01 00:00:00.000000"])]
     );
 }
+
+/// MySQL writes the moment into an `ON UPDATE CURRENT_TIMESTAMP` column
+/// whenever an upsert changes the row, which the engine's upsert does not, so
+/// such an upsert is refused unless its clause writes the column itself.
+/// Measured on MySQL 8.4.11 over a row stamped in 2000: offering the same name
+/// leaves it, a new name stamps it now, and a clause writing the column writes
+/// what it says.
+#[test]
+fn an_upsert_leaving_an_on_update_column_to_mysql_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE plain (code varchar(10) PRIMARY KEY, name varchar(20) NOT NULL, updated_at datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO plain (code, name, updated_at) VALUES ('a', 'A', '2000-01-01 00:00:00')",
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO plain (code, name) VALUES ('a', 'B') ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert!(adapter
+        .execute_stmt_prepare(
+            "INSERT INTO plain (code, name) VALUES (?, ?) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+        )
+        .is_err());
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO plain (code, name) VALUES ('a', 'C') ON DUPLICATE KEY UPDATE name = VALUES(name), updated_at = '2000-01-01 00:00:00'"
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT code, name, updated_at FROM plain"),
+        vec![some(&["a", "C", "2000-01-01 00:00:00.000000"])]
+    );
+    // TypeORM's `@UpdateDateColumn`, on a table counting its own ids.
+    run(
+        &mut adapter,
+        "CREATE TABLE `users` (`id` bigint NOT NULL AUTO_INCREMENT, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `updated_at` datetime(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), UNIQUE INDEX `IDX_97672ac88f789774dd47f7c8be` (`email`), PRIMARY KEY (`id`)) ENGINE=InnoDB",
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO `users`(`id`, `email`, `name`, `updated_at`) VALUES (DEFAULT, 'a@x', 'A', DEFAULT), (DEFAULT, 'b@x', 'B', DEFAULT) ON DUPLICATE KEY UPDATE `email` = VALUES(`email`), `name` = VALUES(`name`)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(rows(&mut adapter, "SELECT COUNT(*) FROM users"), vec![some(&["0"])]);
+}
