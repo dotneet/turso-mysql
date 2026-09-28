@@ -220,7 +220,10 @@ where
 
     /// Reads the catalog through the text path, which authorizes the read as
     /// it authorizes any.
-    fn read_the_catalog(&mut self, sql: &str) -> Result<Vec<ReadRow>, FrontendErrorKind> {
+    pub(super) fn read_the_catalog(
+        &mut self,
+        sql: &str,
+    ) -> Result<Vec<ReadRow>, FrontendErrorKind> {
         let CommandExecutionResult::ResultSet(read) = self.execute_query_statement(sql)? else {
             return Err(FrontendErrorKind::Internal);
         };
@@ -230,18 +233,20 @@ where
 
 /// A database's name written into a catalog read. A name holding a quote or a
 /// backslash is refused rather than escaped: no database here has one.
-fn written_name(name: &str) -> Result<String, FrontendErrorKind> {
+pub(super) fn written_name(name: &str) -> Result<String, FrontendErrorKind> {
     if name.contains(['\'', '\\']) {
         return Err(FrontendErrorKind::Unsupported);
     }
     Ok(format!("'{name}'"))
 }
 
-fn fields<const N: usize>(row: ReadRow) -> Result<[Option<Vec<u8>>; N], FrontendErrorKind> {
+pub(super) fn fields<const N: usize>(
+    row: ReadRow,
+) -> Result<[Option<Vec<u8>>; N], FrontendErrorKind> {
     <[Option<Vec<u8>>; N]>::try_from(row).map_err(|_| FrontendErrorKind::Internal)
 }
 
-fn whole_number(value: Option<&[u8]>) -> Result<i64, FrontendErrorKind> {
+pub(super) fn whole_number(value: Option<&[u8]>) -> Result<i64, FrontendErrorKind> {
     value
         .and_then(|value| std::str::from_utf8(value).ok())
         .and_then(|value| value.parse().ok())

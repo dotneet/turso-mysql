@@ -3995,6 +3995,35 @@ joined columns follows `group_concat_max_len` — 73728 under 2048 — by a rule
 worked out past that, so under any limit but MySQL's own 1024 the two reads are
 refused.
 
+Entity Framework Core's `dotnet ef dbcontext scaffold`, through Pomelo 9 and
+MySqlConnector, reads the database's tables with an `IF` over `TABLES` beside a
+`LEFT JOIN` of `COLLATION_CHARACTER_SET_APPLICABILITY`, then each table's
+primary key and other indexes with `GROUP_CONCAT` over `CAST(IFNULL(SUB_PART,
+0) AS CHAR)` and `IFNULL(COLLATION, 'A')`, and its foreign keys with
+`GROUP_CONCAT(CONCAT_WS('|', ...))` beside a correlated subquery for the
+`DELETE_RULE`, all sent as text with the database and table written in. Those
+four, exactly as Pomelo writes them, with or without their closing `;`, are
+recognized before `SCHEMA()` is written out and answered from plain reads of
+`TABLES`, `STATISTICS`, `KEY_COLUMN_USAGE` and `REFERENTIAL_CONSTRAINTS`.
+Every row and column description was measured on a MySQL 8.4.11 initialized
+with `lower_case_table_names=1`, the rule this server reports; several columns
+are described differently there than under 0 — the table name a `VAR_STRING`
+with 31 decimals and no database, the foreign-key read's `TABLE_NAME` and
+`REFERENCED_TABLE_NAME` without the binary flag. The tables come in the order of
+their lower-cased names, a view's `VIEW` comment answered as the empty word and
+its character set and collation NULL; each collation's character set is the one
+`COLLATION_CHARACTER_SET_APPLICABILITY` lists for it. Indexes and foreign keys
+come in the order of their names without regard to case, each list joined by
+commas in the order of the columns' places, a whole column's prefix answered as
+`0` and every column sorted `A`. The joined lists are `LONG_BLOB`s of 36864 or
+65536 under MySQL's own `group_concat_max_len` of 1024, so under any other the
+three grouped reads are refused, as is a list longer than it, which MySQL
+cuts, and an order turning on a name outside ASCII. Prepared, the four are
+refused. The tables come back lower-cased, as they do from a MySQL under
+`lower_case_table_names=1`, so a model scaffolded here names `PostTags` as
+`posttags` where MySQL under its Linux default of 0 keeps the case; the
+harness app's `j.ToTable("PostTags")` check differs for that reason alone.
+
 Prisma's schema engine reads the catalog before `migrate deploy`, `db pull`,
 `migrate diff` and `db push` with six statements the statement path does not
 take: they compare and order names with `BINARY`, and join two catalog tables on

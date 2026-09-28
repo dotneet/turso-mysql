@@ -8,6 +8,8 @@
 mod catalog_results;
 mod named_lock_results;
 #[cfg(unix)]
+mod pomelo_catalog;
+#[cfg(unix)]
 mod prisma_catalog;
 
 use turso_mysql::named_locks::{MySqlNamedLockSession, MySqlNamedLocks};
@@ -3494,6 +3496,19 @@ where
         &mut self,
         sql: &str,
     ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        // Read before the current database is written in for `SCHEMA()` and
+        // the catalog tables' names are left out of their columns, both of
+        // which the scaffold's reads are written with.
+        if let Some(query) = turso_mysql_parser::parse_optional_pomelo_information_schema_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self
+                .pomelo_catalog_result(&query)
+                .map(CommandExecutionResult::ResultSet);
+        }
         let written = write_the_current_database_in(
             sql,
             self.session.selected_database(),

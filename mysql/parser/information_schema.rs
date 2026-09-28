@@ -771,7 +771,7 @@ fn names_information_schema(sql: &str) -> bool {
     mentions_ignoring_case(sql, "INFORMATION_SCHEMA")
 }
 
-fn connector_j_template_captures(
+pub(crate) fn connector_j_template_captures(
     actual: &[Token],
     template: &str,
     mode: SessionSqlMode,

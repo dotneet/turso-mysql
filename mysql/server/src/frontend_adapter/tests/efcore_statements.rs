@@ -885,6 +885,492 @@ fn the_catalog_names_a_keys_columns_as_they_were_declared() {
     );
 }
 
+/// `dotnet ef dbcontext scaffold` reads the database's tables, then each
+/// table's primary key, other indexes and foreign keys, each read grouping the
+/// catalog's rows with `GROUP_CONCAT` over `CAST`, `IFNULL` and `CONCAT_WS`,
+/// the first joining `COLLATION_CHARACTER_SET_APPLICABILITY` and the last
+/// reading each key's `ON DELETE` rule through a correlated subquery. The
+/// tables read answered 1235 and the scaffold stopped there.
+///
+/// Every row and column description here was measured on a MySQL 8.4.11
+/// initialized with `lower_case_table_names=1`, holding the same tables.
+#[test]
+fn the_scaffold_reads_the_tables_keys_indexes_and_foreign_keys() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `__EFMigrationsHistory` (\n    `MigrationId` varchar(150) CHARACTER SET utf8mb4 NOT NULL,\n    `ProductVersion` varchar(32) CHARACTER SET utf8mb4 NOT NULL,\n    CONSTRAINT `PK___EFMigrationsHistory` PRIMARY KEY (`MigrationId`)\n) CHARACTER SET=utf8mb4;\n",
+        "CREATE TABLE `Alpha` (`Id` bigint NOT NULL, `Code` int NOT NULL, PRIMARY KEY (`Id`), UNIQUE KEY `UX_Alpha_Id_Code` (`Id`, `Code`)) COMMENT 'alpha table' COLLATE utf8mb3_unicode_ci",
+        "CREATE TABLE `Zeta` (`Id` bigint NOT NULL PRIMARY KEY, `AlphaId` bigint NULL, `AlphaCode` int NULL, `Other` bigint NULL, CONSTRAINT `fk_z_second` FOREIGN KEY (`Other`) REFERENCES `Alpha` (`Id`) ON DELETE SET NULL, CONSTRAINT `FK_a_first` FOREIGN KEY (`AlphaId`, `AlphaCode`) REFERENCES `Alpha` (`Id`, `Code`))",
+        "CREATE INDEX `ya` ON `Zeta` (`Other`, `Id`)",
+        "CREATE UNIQUE INDEX `Xc` ON `Zeta` (`AlphaCode`, `Id`)",
+        "CREATE INDEX `_u` ON `Zeta` (`AlphaId`, `AlphaCode`, `Other`)",
+        "CREATE VIEW `AlphaView` AS SELECT `Id` FROM `Alpha`",
+    ] {
+        changed(&mut adapter, sql);
+    }
+
+    let tables = result_set(
+        &mut adapter,
+        "SELECT\n    `t`.`TABLE_NAME`,\n    `t`.`TABLE_TYPE`,\n    IF(`t`.`TABLE_COMMENT` = 'VIEW' AND `t`.`TABLE_TYPE` = 'VIEW', '', `t`.`TABLE_COMMENT`) AS `TABLE_COMMENT`,\n    `ccsa`.`CHARACTER_SET_NAME` as `TABLE_CHARACTER_SET`,\n    `t`.`TABLE_COLLATION`\nFROM\n    `INFORMATION_SCHEMA`.`TABLES` as `t`\nLEFT JOIN\n\t`INFORMATION_SCHEMA`.`COLLATION_CHARACTER_SET_APPLICABILITY` as `ccsa` ON `ccsa`.`COLLATION_NAME` = `t`.`TABLE_COLLATION`\nWHERE\n    `TABLE_SCHEMA` = SCHEMA()\nAND\n    `TABLE_TYPE` IN ('BASE TABLE', 'VIEW');",
+    );
+    assert_eq!(
+        text_rows(tables.rows),
+        [
+            row(&[
+                "__efmigrationshistory",
+                "BASE TABLE",
+                "",
+                "utf8mb4",
+                "utf8mb4_0900_ai_ci"
+            ]),
+            row(&[
+                "alpha",
+                "BASE TABLE",
+                "alpha table",
+                "utf8mb3",
+                "utf8mb3_unicode_ci"
+            ]),
+            row(&["alphaview", "VIEW", "", "NULL", "NULL"]),
+            row(&["posts", "BASE TABLE", "", "utf8mb4", "utf8mb4_0900_ai_ci"]),
+            row(&[
+                "posttags",
+                "BASE TABLE",
+                "",
+                "utf8mb4",
+                "utf8mb4_0900_ai_ci"
+            ]),
+            row(&["records", "BASE TABLE", "", "utf8mb4", "utf8mb4_0900_ai_ci"]),
+            row(&["tags", "BASE TABLE", "", "utf8mb4", "utf8mb4_0900_ai_ci"]),
+            row(&["users", "BASE TABLE", "", "utf8mb4", "utf8mb4_0900_ai_ci"]),
+            row(&["zeta", "BASE TABLE", "", "utf8mb4", "utf8mb4_0900_ai_ci"]),
+        ]
+    );
+    let key = MYSQL_UNIQUE_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_PART_KEY_FLAG;
+    assert_eq!(
+        described(&tables.columns),
+        [
+            (
+                "TABLE_NAME",
+                "TABLE_NAME",
+                "t",
+                "TABLES",
+                "",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                31
+            ),
+            (
+                "TABLE_TYPE",
+                "TABLE_TYPE",
+                "t",
+                "TABLES",
+                "information_schema",
+                MYSQL_TYPE_STRING,
+                44,
+                MYSQL_NOT_NULL_FLAG
+                    | MYSQL_MULTIPLE_KEY_FLAG
+                    | MYSQL_BINARY_FLAG
+                    | MYSQL_ENUM_FLAG
+                    | MYSQL_NO_DEFAULT_VALUE_FLAG
+                    | MYSQL_PART_KEY_FLAG,
+                0
+            ),
+            (
+                "TABLE_COMMENT",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_VAR_STRING,
+                8192,
+                0,
+                31
+            ),
+            (
+                "TABLE_CHARACTER_SET",
+                "CHARACTER_SET_NAME",
+                "ccsa",
+                "COLLATION_CHARACTER_SET_APPLICABILITY",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                key,
+                0
+            ),
+            (
+                "TABLE_COLLATION",
+                "TABLE_COLLATION",
+                "t",
+                "TABLES",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                key,
+                0
+            ),
+        ]
+    );
+
+    let primary_key = |table: &str| {
+        format!("SELECT `INDEX_NAME`,\n     GROUP_CONCAT(`COLUMN_NAME` ORDER BY `SEQ_IN_INDEX` SEPARATOR ',') AS `COLUMNS`,\n     GROUP_CONCAT(CAST(IFNULL(`SUB_PART`, 0) AS CHAR) ORDER BY `SEQ_IN_INDEX` SEPARATOR ',') AS `SUB_PARTS`\n     FROM `INFORMATION_SCHEMA`.`STATISTICS`\n     WHERE `TABLE_SCHEMA` = 'reports'\n     AND `TABLE_NAME` = '{table}'\n     AND `INDEX_NAME` = 'PRIMARY'\n     GROUP BY `INDEX_NAME`;")
+    };
+    for (table, columns) in [
+        ("posttags", "PostsId,TagsId"),
+        ("posts", "Id"),
+        ("__efmigrationshistory", "MigrationId"),
+        ("zeta", "Id"),
+    ] {
+        assert_eq!(
+            rows(&mut adapter, &primary_key(table)),
+            [row(&[
+                "PRIMARY",
+                columns,
+                &vec!["0"; columns.split(',').count()].join(",")
+            ])],
+            "{table}"
+        );
+    }
+    for table in ["records", "alphaview", "missing"] {
+        assert!(
+            rows(&mut adapter, &primary_key(table)).is_empty(),
+            "{table}"
+        );
+    }
+    let read = result_set(&mut adapter, &primary_key("PostTags"));
+    assert_eq!(
+        text_rows(read.rows),
+        [row(&["PRIMARY", "PostsId,TagsId", "0,0"])]
+    );
+    assert_eq!(
+        described(&read.columns),
+        [
+            (
+                "INDEX_NAME",
+                "INDEX_NAME",
+                "STATISTICS",
+                "STATISTICS",
+                "",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                31
+            ),
+            (
+                "COLUMNS",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                36864,
+                0,
+                31
+            ),
+            (
+                "SUB_PARTS",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                65536,
+                0,
+                31
+            ),
+        ]
+    );
+
+    let indexes = |table: &str| {
+        format!("SELECT `INDEX_NAME`,\n     `NON_UNIQUE`,\n     GROUP_CONCAT(`COLUMN_NAME` ORDER BY `SEQ_IN_INDEX` SEPARATOR ',') AS `COLUMNS`,\n     GROUP_CONCAT(CAST(IFNULL(`SUB_PART`, 0) AS CHAR) ORDER BY `SEQ_IN_INDEX` SEPARATOR ',') AS `SUB_PARTS`,\n     GROUP_CONCAT(IFNULL(`COLLATION`, 'A') ORDER BY `SEQ_IN_INDEX` SEPARATOR ',') AS `COLLATION`,\n     `INDEX_TYPE`\n     FROM `INFORMATION_SCHEMA`.`STATISTICS`\n     WHERE `TABLE_SCHEMA` = 'reports'\n     AND `TABLE_NAME` = '{table}'\n     AND `INDEX_NAME` <> 'PRIMARY'\n     GROUP BY `INDEX_NAME`, `NON_UNIQUE`, `INDEX_TYPE`;")
+    };
+    assert_eq!(
+        rows(&mut adapter, &indexes("posts")),
+        [row(&[
+            "IX_Posts_UserId_PublishedAt",
+            "1",
+            "UserId,PublishedAt",
+            "0,0",
+            "A,A",
+            "BTREE"
+        ])]
+    );
+    assert_eq!(
+        rows(&mut adapter, &indexes("tags")),
+        [row(&["IX_Tags_Name", "0", "Name", "0", "A", "BTREE"])]
+    );
+    assert_eq!(
+        rows(&mut adapter, &indexes("alpha")),
+        [row(&[
+            "UX_Alpha_Id_Code",
+            "0",
+            "Id,Code",
+            "0,0",
+            "A,A",
+            "BTREE"
+        ])]
+    );
+    assert_eq!(
+        rows(&mut adapter, &indexes("zeta")),
+        [
+            row(&[
+                "_u",
+                "1",
+                "AlphaId,AlphaCode,Other",
+                "0,0,0",
+                "A,A,A",
+                "BTREE"
+            ]),
+            row(&["Xc", "0", "AlphaCode,Id", "0,0", "A,A", "BTREE"]),
+            row(&["ya", "1", "Other,Id", "0,0", "A,A", "BTREE"]),
+        ]
+    );
+    assert!(rows(&mut adapter, &indexes("__efmigrationshistory")).is_empty());
+    let read = result_set(&mut adapter, &indexes("PostTags"));
+    assert_eq!(
+        text_rows(read.rows),
+        [row(&[
+            "IX_PostTags_TagsId",
+            "1",
+            "TagsId",
+            "0",
+            "A",
+            "BTREE"
+        ])]
+    );
+    let non_unique = (
+        "NON_UNIQUE",
+        "NON_UNIQUE",
+        "STATISTICS",
+        "",
+        "information_schema",
+        MYSQL_TYPE_LONG,
+        2,
+        MYSQL_NOT_NULL_FLAG,
+        0,
+    );
+    assert_eq!(
+        described(&read.columns),
+        [
+            (
+                "INDEX_NAME",
+                "INDEX_NAME",
+                "STATISTICS",
+                "",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                0
+            ),
+            non_unique,
+            (
+                "COLUMNS",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                36864,
+                0,
+                31
+            ),
+            (
+                "SUB_PARTS",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                65536,
+                0,
+                31
+            ),
+            (
+                "COLLATION",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                65536,
+                0,
+                31
+            ),
+            (
+                "INDEX_TYPE",
+                "INDEX_TYPE",
+                "STATISTICS",
+                "",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                44,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+                0
+            ),
+        ]
+    );
+    assert_eq!(read.columns[1].character_set, MYSQL_BINARY_COLLATION);
+
+    let foreign_keys = |table: &str| {
+        format!("SELECT\n \t`CONSTRAINT_NAME`,\n \t`TABLE_NAME`,\n \t`REFERENCED_TABLE_NAME`,\n \tGROUP_CONCAT(CONCAT_WS('|', `COLUMN_NAME`, `REFERENCED_COLUMN_NAME`) ORDER BY `ORDINAL_POSITION` SEPARATOR ',') AS PAIRED_COLUMNS,\n \t(SELECT `DELETE_RULE` FROM `INFORMATION_SCHEMA`.`REFERENTIAL_CONSTRAINTS` WHERE `REFERENTIAL_CONSTRAINTS`.`CONSTRAINT_NAME` = `KEY_COLUMN_USAGE`.`CONSTRAINT_NAME` AND `REFERENTIAL_CONSTRAINTS`.`CONSTRAINT_SCHEMA` = `KEY_COLUMN_USAGE`.`CONSTRAINT_SCHEMA`) AS `DELETE_RULE`\n FROM `INFORMATION_SCHEMA`.`KEY_COLUMN_USAGE`\n WHERE `TABLE_SCHEMA` = 'reports'\n \t\tAND `TABLE_NAME` = '{table}'\n \t\tAND `CONSTRAINT_NAME` <> 'PRIMARY'\n        AND `REFERENCED_TABLE_NAME` IS NOT NULL\n        GROUP BY `CONSTRAINT_SCHEMA`,\n        `CONSTRAINT_NAME`,\n        `TABLE_NAME`,\n        `REFERENCED_TABLE_NAME`;")
+    };
+    assert_eq!(
+        rows(&mut adapter, &foreign_keys("posts")),
+        [row(&[
+            "FK_Posts_Users_UserId",
+            "posts",
+            "users",
+            "UserId|Id",
+            "CASCADE"
+        ])]
+    );
+    assert_eq!(
+        rows(&mut adapter, &foreign_keys("zeta")),
+        [
+            row(&[
+                "FK_a_first",
+                "zeta",
+                "alpha",
+                "AlphaId|Id,AlphaCode|Code",
+                "NO ACTION"
+            ]),
+            row(&["fk_z_second", "zeta", "alpha", "Other|Id", "SET NULL"]),
+        ]
+    );
+    for table in ["users", "alpha", "records"] {
+        assert!(
+            rows(&mut adapter, &foreign_keys(table)).is_empty(),
+            "{table}"
+        );
+    }
+    let read = result_set(&mut adapter, &foreign_keys("PostTags"));
+    assert_eq!(
+        text_rows(read.rows),
+        [
+            row(&[
+                "FK_PostTags_Posts_PostsId",
+                "posttags",
+                "posts",
+                "PostsId|Id",
+                "CASCADE"
+            ]),
+            row(&[
+                "FK_PostTags_Tags_TagsId",
+                "posttags",
+                "tags",
+                "TagsId|Id",
+                "CASCADE"
+            ]),
+        ]
+    );
+    assert_eq!(
+        described(&read.columns),
+        [
+            (
+                "CONSTRAINT_NAME",
+                "CONSTRAINT_NAME",
+                "KEY_COLUMN_USAGE",
+                "",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                0
+            ),
+            (
+                "TABLE_NAME",
+                "TABLE_NAME",
+                "KEY_COLUMN_USAGE",
+                "",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                0
+            ),
+            (
+                "REFERENCED_TABLE_NAME",
+                "REFERENCED_TABLE_NAME",
+                "KEY_COLUMN_USAGE",
+                "",
+                "information_schema",
+                MYSQL_TYPE_VAR_STRING,
+                256,
+                0,
+                0
+            ),
+            (
+                "PAIRED_COLUMNS",
+                "",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_LONG_BLOB,
+                36864,
+                0,
+                31
+            ),
+            (
+                "DELETE_RULE",
+                "DELETE_RULE",
+                "",
+                "",
+                "",
+                MYSQL_TYPE_VAR_STRING,
+                44,
+                MYSQL_BINARY_FLAG,
+                0
+            ),
+        ]
+    );
+
+    // MySqlConnector sends each as text; prepared, the same statements are
+    // still refused rather than answered some other way.
+    assert!(adapter.execute_stmt_prepare(&primary_key("posts")).is_err());
+    assert!(adapter
+        .execute_stmt_prepare(&foreign_keys("posts"))
+        .is_err());
+    // The widths above follow `group_concat_max_len`, so under another limit
+    // the grouped reads are refused.
+    changed(&mut adapter, "SET SESSION group_concat_max_len = 2048");
+    assert!(adapter.execute_query(&indexes("posts")).is_err());
+}
+
+/// Each column as `(name, original name, table, original table, database,
+/// type, length, flags, decimals)`.
+#[allow(clippy::type_complexity)]
+fn described(
+    columns: &[ColumnDefinitionConfig],
+) -> Vec<(&str, &str, &str, &str, &str, u8, u32, u16, u8)> {
+    columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.original_name.as_str(),
+                column.table.as_str(),
+                column.original_table.as_str(),
+                column.schema.as_str(),
+                column.column_type,
+                column.column_length,
+                column.flags,
+                column.decimals,
+            )
+        })
+        .collect()
+}
+
+fn text_rows(rows: Vec<Vec<Option<Vec<u8>>>>) -> Vec<Vec<Option<String>>> {
+    rows.into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+                .collect()
+        })
+        .collect()
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,

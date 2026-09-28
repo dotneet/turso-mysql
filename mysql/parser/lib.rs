@@ -31,6 +31,7 @@ mod named_tables;
 mod network_address;
 mod nothing_to_run;
 mod number_format;
+mod pomelo_catalog;
 mod prisma_catalog;
 mod raw_bytes_in_words;
 mod replace_view;
@@ -98,6 +99,9 @@ pub use information_schema::{
     LaravelSchema, PerformanceSchemaRead, SqlxDatabaseExistsQuery,
 };
 use mysql_ddl::render_mysql_column;
+pub use pomelo_catalog::{
+    parse_optional_pomelo_information_schema_query, PomeloInformationSchemaQuery,
+};
 pub use prisma_catalog::{
     parse_optional_prisma_information_schema_query, PrismaInformationSchemaQuery,
 };
