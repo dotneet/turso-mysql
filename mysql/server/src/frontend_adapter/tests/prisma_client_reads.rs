@@ -255,6 +255,72 @@ fn a_like_over_a_json_member_tells_case_apart_the_way_mysql_does() {
     );
 }
 
+/// `findMany({ cursor: { id }, skip: 1, take })` reads from the row the
+/// cursor names through a subquery picking that row by its key. Measured on
+/// MySQL 8.4.11: cursor 2 skipping one answers post 3, a cursor naming no row
+/// answers nothing, a cursor bound as a word finds its row, and a subquery
+/// that is not picked by a key answers 1242 once it finds two rows — refused
+/// here, where the engine would take the first.
+#[test]
+fn a_cursor_picked_by_its_key_pages_from_the_row_mysql_pages_from() {
+    let (_directory, mut adapter) = adapter();
+    const CURSOR: &str = "SELECT `prisma`.`posts`.`id`, `prisma`.`posts`.`user_id`, `prisma`.`posts`.`title`, `prisma`.`posts`.`body`, `prisma`.`posts`.`published_at`, `prisma`.`posts`.`views` FROM `prisma`.`posts` WHERE `prisma`.`posts`.`id` >= (SELECT `prisma`.`posts`.`id` FROM `prisma`.`posts` WHERE (`prisma`.`posts`.`id`) = (?)) ORDER BY `prisma`.`posts`.`id` ASC LIMIT ? OFFSET ?";
+    let page = |adapter: &mut Adapter, cursor, take, skip| {
+        let rows = prepared_rows(
+            adapter,
+            CURSOR,
+            &[cursor, Bound::Whole(take), Bound::Whole(skip)],
+        )
+        .unwrap_or_else(|error| panic!("cursor {cursor:?}: {error:?}"));
+        first_values(&rows)
+    };
+    let id = BinaryResultValue::Integer;
+
+    assert_eq!(page(&mut adapter, Bound::Whole(2), 1, 1), [id(3)]);
+    assert_eq!(page(&mut adapter, Bound::Whole(2), 10, 0), [id(2), id(3)]);
+    assert_eq!(page(&mut adapter, Bound::Whole(99), 10, 0), []);
+    assert_eq!(page(&mut adapter, Bound::Word("2"), 10, 0), [id(2), id(3)]);
+
+    for unpicked in [
+        "SELECT id FROM posts WHERE id >= (SELECT id FROM posts WHERE user_id = 1)",
+        "SELECT id FROM posts WHERE id >= (SELECT id FROM posts WHERE id = 1 OR id = 2)",
+    ] {
+        assert!(adapter.execute_query(unpicked).is_err(), "{unpicked}");
+        assert_eq!(
+            adapter.execute_stmt_prepare(unpicked).map(|_| ()),
+            Err(FrontendErrorKind::Unsupported),
+            "{unpicked}"
+        );
+    }
+    // A unique key over a column that is never NULL picks one row too.
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM posts WHERE id >= (SELECT id FROM tags WHERE name = 'rust')",
+            &[],
+        ),
+        [2, 3]
+    );
+}
+
+/// A subquery's column is held to the kind of the column it meets whichever
+/// protocol the statement comes by; a prepared one was not held at all.
+#[test]
+fn a_prepared_subquery_is_held_to_the_kind_of_the_column_it_meets() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "SELECT id FROM posts WHERE title IN (SELECT id FROM tags)",
+        "SELECT id FROM posts WHERE title >= (SELECT id FROM posts WHERE id = 2)",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+        assert_eq!(
+            adapter.execute_stmt_prepare(sql).map(|_| ()),
+            Err(FrontendErrorKind::Unsupported),
+            "{sql}"
+        );
+    }
+}
+
 const NO_ROWS: [i64; 0] = [];
 
 /// The ids of the rows a prepared statement answers, in order.

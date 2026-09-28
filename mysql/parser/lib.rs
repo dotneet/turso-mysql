@@ -1235,15 +1235,35 @@ pub enum CheckedSelectComparisonOperator {
 /// literal comparison uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckedSubqueryComparison {
+    /// The table the outer column is named through, which has to be the one
+    /// table the statement reads.
+    qualifier: Option<String>,
     column_name: String,
     inner_table: String,
     inner_column_name: String,
+    /// The columns the subquery's `WHERE` fixes to one value each, for a
+    /// subquery answering a plain column rather than an aggregate. MySQL
+    /// answers 1242 when such a subquery finds more than one row, where the
+    /// engine takes the first, so the frontend holds these to cover a key of
+    /// the table. Empty for a subquery that needs no such proof.
+    fixed_columns: Vec<String>,
 }
 
 impl CheckedSubqueryComparison {
+    /// Returns the table the outer column is named through, if it is.
+    pub fn qualifier(&self) -> Option<&str> {
+        self.qualifier.as_deref()
+    }
+
     /// Returns the outer column tested for membership.
     pub fn column_name(&self) -> &str {
         &self.column_name
+    }
+
+    /// Returns the columns the subquery's `WHERE` fixes to one value each,
+    /// which have to cover a key of its table.
+    pub fn fixed_columns(&self) -> &[String] {
+        &self.fixed_columns
     }
 
     /// Returns the table the subquery reads.

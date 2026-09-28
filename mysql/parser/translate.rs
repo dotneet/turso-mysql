@@ -1899,9 +1899,11 @@ fn render_in_subquery(
     render_context
         .checked_subquery_comparisons
         .push(CheckedSubqueryComparison {
+            qualifier: None,
             column_name: column.value.clone(),
             inner_table,
             inner_column_name,
+            fixed_columns: Vec::new(),
         });
     Ok(format!(
         "({} {}IN ({rendered}))",
@@ -5061,9 +5063,11 @@ fn render_update_assignment_value(
             render_context
                 .checked_subquery_comparisons
                 .push(CheckedSubqueryComparison {
+                    qualifier: None,
                     column_name: written.to_owned(),
                     inner_table: source.as_str().to_owned(),
                     inner_column_name: read,
+                    fixed_columns: Vec::new(),
                 });
             Ok(format!("({rendered})"))
         }
@@ -10618,7 +10622,10 @@ fn whole_number_a_written_word_names(
 /// What makes them safe is that an aggregate over one implicit group answers
 /// exactly one row. A plain column does not: measured on MySQL 8.4.11,
 /// `id = (SELECT parent_id FROM child)` over two child rows answers 1242 where
-/// the engine takes the first row it finds, so that shape is refused.
+/// the engine takes the first row it finds, so that shape is refused — unless
+/// the subquery picks its row by a key, as Prisma's cursor does with
+/// `posts.id >= (SELECT posts.id FROM posts WHERE posts.id = ?)`, which never
+/// finds two.
 fn render_comparison_over_a_scalar_subquery(
     left: &Expr,
     op: &BinaryOperator,
@@ -10646,10 +10653,17 @@ fn render_comparison_over_a_scalar_subquery(
         );
     }
     let rendered_other = match (&answered, other) {
-        // MIN and MAX answer the column's own kind, so the two columns are
-        // held to the rule `column IN (SELECT column ...)` holds them to.
-        (ScalarSubqueryAnswer::TheColumnsOwnKind(_), Expr::Identifier(column)) => {
-            render_ident(column)
+        // MIN and MAX answer the column's own kind, and so does a column read
+        // out of the one row a key picks, so the two columns are held to the
+        // rule `column IN (SELECT column ...)` holds them to.
+        (
+            ScalarSubqueryAnswer::TheColumnsOwnKind(_) | ScalarSubqueryAnswer::OneRowsColumn { .. },
+            Expr::Identifier(column),
+        ) => render_ident(column),
+        (ScalarSubqueryAnswer::OneRowsColumn { .. }, Expr::CompoundIdentifier(parts))
+            if parts.len() == 2 =>
+        {
+            format!("{}.{}", render_ident(&parts[0]), render_ident(&parts[1]))
         }
         // A COUNT answers a whole number whatever it counts, so it meets a
         // whole number written out and nothing else.
@@ -10662,15 +10676,30 @@ fn render_comparison_over_a_scalar_subquery(
         return Ok(None);
     };
     let (rendered_subquery, _) = render_subquery(query, render_context)?;
-    if let (ScalarSubqueryAnswer::TheColumnsOwnKind(inner_column_name), Expr::Identifier(column)) =
-        (&answered, other)
+    let (inner_column_name, fixed_columns) = match &answered {
+        ScalarSubqueryAnswer::TheColumnsOwnKind(inner_column_name) => {
+            (Some(inner_column_name), Vec::new())
+        }
+        ScalarSubqueryAnswer::OneRowsColumn { column, fixed } => (Some(column), fixed.clone()),
+        _ => (None, Vec::new()),
+    };
+    let outer_column = match other {
+        Expr::Identifier(column) => Some((None, column)),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            Some((Some(parts[0].value.clone()), &parts[1]))
+        }
+        _ => None,
+    };
+    if let (Some(inner_column_name), Some((qualifier, column))) = (inner_column_name, outer_column)
     {
         render_context
             .checked_subquery_comparisons
             .push(CheckedSubqueryComparison {
+                qualifier,
                 column_name: column.value.clone(),
                 inner_table: inner_table.as_str().to_owned(),
                 inner_column_name: inner_column_name.clone(),
+                fixed_columns,
             });
     }
     let rendered_subquery = format!("({rendered_subquery})");
@@ -10771,12 +10800,17 @@ enum ScalarSubqueryAnswer {
     AWholeNumber,
     /// `AVG(c)`, which MySQL answers as a decimal four places past `c`'s own.
     AnExactAverage(String),
+    /// `c` itself, read out of the rows whose `fixed` columns the `WHERE`
+    /// fixes to one value each. It is one row at most only when those columns
+    /// cover a key, which the frontend checks.
+    OneRowsColumn { column: String, fixed: Vec<String> },
 }
 
-/// Reads what a subquery answers, when it answers exactly one value.
+/// Reads what a subquery answers, when it answers one value at most.
 ///
-/// Only an aggregate over one implicit group does. `SUM` is left out: it has
-/// not been measured against a column.
+/// An aggregate over one implicit group answers exactly one. `SUM` is left
+/// out: it has not been measured against a column. A plain column answers one
+/// when its `WHERE` fixes a key of the table to one value.
 fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<ScalarSubqueryAnswer> {
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
         return None;
@@ -10784,7 +10818,15 @@ fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<Scala
     if !group_by.is_empty() || select.having.is_some() || select.distinct.is_some() {
         return None;
     }
-    let [SelectItem::UnnamedExpr(Expr::Function(function))] = select.projection.as_slice() else {
+    let [SelectItem::UnnamedExpr(projected)] = select.projection.as_slice() else {
+        return None;
+    };
+    if let Some(column) = column_of_the_subquerys_table(projected, select) {
+        let fixed = columns_fixed_to_one_value(select.selection.as_ref()?, select);
+        return (!fixed.is_empty())
+            .then_some(ScalarSubqueryAnswer::OneRowsColumn { column, fixed });
+    }
+    let Expr::Function(function) = projected else {
         return None;
     };
     if static_select_metadata::is_count_call(function) {
@@ -10800,6 +10842,91 @@ fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<Scala
         }
         _ => None,
     }
+}
+
+/// Names the column `expr` reads when it is one of the subquery's own table,
+/// written bare or through the name the subquery reads its table under.
+fn column_of_the_subquerys_table(expr: &Expr, select: &sqlparser::ast::Select) -> Option<String> {
+    match expr {
+        Expr::Identifier(column) => Some(column.value.clone()),
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [table, column]
+                if subquery_table_reference(select)
+                    .is_some_and(|reference| reference.eq_ignore_ascii_case(&table.value)) =>
+            {
+                Some(column.value.clone())
+            }
+            _ => None,
+        },
+        Expr::Nested(inner) => column_of_the_subquerys_table(inner, select),
+        _ => None,
+    }
+}
+
+/// The columns a `WHERE` fixes to one written or bound value each, through
+/// `AND`s alone: `a = 1 AND (b) = (?)` fixes `a` and `b`, and anything else
+/// beside them only narrows the rows further. An `OR` fixes nothing.
+fn columns_fixed_to_one_value(condition: &Expr, select: &sqlparser::ast::Select) -> Vec<String> {
+    let mut fixed = Vec::new();
+    let mut pending = vec![condition];
+    while let Some(condition) = pending.pop() {
+        match condition {
+            Expr::Nested(inner) => pending.push(inner),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                pending.push(left);
+                pending.push(right);
+            }
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                let column = [(left, right), (right, left)]
+                    .into_iter()
+                    .find(|(_, value)| is_one_written_or_bound_value(value))
+                    .and_then(|(column, _)| column_of_the_subquerys_table(column, select));
+                fixed.extend(column);
+            }
+            _ => {}
+        }
+    }
+    fixed
+}
+
+fn is_one_written_or_bound_value(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => is_one_written_or_bound_value(inner),
+        Expr::Value(value) => matches!(
+            value.value,
+            Value::Number(..) | Value::SingleQuotedString(_) | Value::Placeholder(_)
+        ),
+        _ => false,
+    }
+}
+
+/// The name a subquery reads its one table under: its alias, or the table's
+/// own name.
+fn subquery_table_reference(select: &sqlparser::ast::Select) -> Option<&str> {
+    let [source] = select.from.as_slice() else {
+        return None;
+    };
+    if !source.joins.is_empty() {
+        return None;
+    }
+    let TableFactor::Table { name, alias, .. } = &source.relation else {
+        return None;
+    };
+    if let Some(alias) = alias {
+        return Some(alias.name.value.as_str());
+    }
+    let [ObjectNamePart::Identifier(name)] = name.0.as_slice() else {
+        return None;
+    };
+    Some(name.value.as_str())
 }
 
 /// Names the one table a subquery reads.

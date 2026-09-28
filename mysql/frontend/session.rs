@@ -1731,6 +1731,15 @@ impl MySqlConnection {
                         error.to_string(),
                     ))
                 })?;
+                self.validate_subquery_comparison_columns(
+                    translated.source_table(),
+                    translated.checked_subquery_comparisons(),
+                )
+                .map_err(|error| {
+                    MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
+                        error.to_string(),
+                    ))
+                })?;
                 // The count it notes is read after a statement run as text,
                 // and a prepared one would leave it unread.
                 if translated.calculates_found_rows() {
@@ -6816,6 +6825,20 @@ impl MySqlConnection {
                     "SELECT IN requires a table column on its left".to_string(),
                 )
             })?;
+            if comparison
+                .qualifier()
+                .is_some_and(|qualifier| qualifier != source_table)
+            {
+                return Err(LimboError::InvalidArgument(format!(
+                    "a column compared with a subquery has to be one of {source_table}"
+                )));
+            }
+            if !comparison.fixed_columns().is_empty() {
+                self.hold_a_subquery_to_one_row(
+                    comparison.inner_table(),
+                    comparison.fixed_columns(),
+                )?;
+            }
             let outer = self.column_kind(source_table, comparison.column_name())?;
             let inner =
                 self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
@@ -6828,6 +6851,52 @@ impl MySqlConnection {
             }
         }
         Ok(())
+    }
+
+    /// Holds a subquery answering a plain column to one row at most: the
+    /// columns its `WHERE` fixes to one value each have to cover the table's
+    /// primary key or a unique key over columns that are never NULL.
+    ///
+    /// Measured on MySQL 8.4.11, a subquery standing for a value that finds
+    /// two rows answers 1242, where the engine takes the first it finds.
+    fn hold_a_subquery_to_one_row(&self, table: &str, fixed: &[String]) -> Result<()> {
+        let refused = || {
+            LimboError::InvalidArgument(format!(
+                "a subquery standing for one value has to pick its row of {table} by a key"
+            ))
+        };
+        let schema = self.inner.current_schema();
+        let btree = schema.get_btree_table(table).ok_or_else(refused)?;
+        let is_fixed = |name: &str| fixed.iter().any(|column| column.eq_ignore_ascii_case(name));
+        if !btree.primary_key_columns.is_empty()
+            && btree
+                .primary_key_columns
+                .iter()
+                .all(|(name, _)| is_fixed(name))
+        {
+            return Ok(());
+        }
+        let table_name = MySqlTableName::parse(table)
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let columns = self.list_columns(&table_name).map_err(|_| refused())?;
+        let never_null = |name: &str| {
+            columns
+                .iter()
+                .any(|column| column.name().eq_ignore_ascii_case(name) && !column.nullable())
+        };
+        let a_unique_key_is_fixed = schema.get_indices(table).any(|index| {
+            index.unique
+                && index.where_clause.is_none()
+                && index
+                    .columns
+                    .iter()
+                    .all(|column| never_null(&column.name) && is_fixed(&column.name))
+        });
+        if a_unique_key_is_fixed {
+            Ok(())
+        } else {
+            Err(refused())
+        }
     }
 
     /// Returns whether one column holds signed integers or text, refusing the
