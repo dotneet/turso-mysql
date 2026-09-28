@@ -492,3 +492,46 @@ What still fails on turso alone:
 - dbtools: `getTablePrivileges`, `SHOW PLUGINS`, `information_schema.PARTITIONS`,
   Workbench's `performance_schema` join and `EXPLAIN`, all left refused on
   purpose for now: none of them can be answered truthfully yet.
+
+# Tenth and eleventh runs
+
+Both on 2026-09-28; every app passes every step against MySQL 8.4.11.
+
+The tenth run (at `1e569e12f`, after the sqlx and second Node rounds) had
+Spring back at 46/46, Sequelize at 20/23 and Drizzle at 18/20, but sqlx at
+9/22: the adapter replays had written each bound value's length in the
+shortest form, and sqlx writes a JSON parameter's length in the nine-byte form
+whatever it is, which the execute decoder refused (1064). MySQL takes it, and so
+does this now (`cd73d5b38`); sqlx then passed 22/22. Sequelize's
+`sync({ force: true })` dropped its keys by the names MySQL generates,
+`post_tags_ibfk_1`, which answered 1235 (`09565f5e4`). Two Sequelize checks
+assumed which of two posts written at once over two connections took the lower
+id — a race on MySQL too — and now find the post by its title.
+
+The eleventh run (at `0ffef16cb`, after the EF Core round):
+
+| app | steps passing on turso |
+|---|---|
+| django, gorm, laravel, mysqlcli, mysqldump, prisma, rails, spring, sqlalchemy, sqlx, typeorm | all |
+| sequelize | 21/23 |
+| drizzle | 18/20 |
+| efcore | 13/21, 16/21 after `SERIALIZABLE` was taken |
+| dbtools | 4/11 |
+
+EF Core's isolation step begins a `SERIALIZABLE` transaction, which
+MySqlConnector sends as the level and `start transaction;` without waiting
+between them; the refused level left the client reading every later answer one
+behind, and the json and upsert steps failed on that. The level is taken now,
+kept the way `REPEATABLE READ` is (see COMPAT.md for why that is serializable
+here).
+
+What still fails on turso alone:
+
+- Table names read back lowercased — this server is `lower_case_table_names=1`
+  (see COMPAT.md): Sequelize's migrate and undo-all (`SequelizeMeta`), EF
+  Core's migrate and rollback-all (`__EFMigrationsHistory`).
+- EF Core: the scaffold's catalog reads, the `Include` after `Take(1)`, and
+  `Take(2)` with no order, each refused (see TODO.md).
+- Drizzle: relational queries built from `LATERAL` joins of JSON aggregates.
+- dbtools: `getTablePrivileges`, `SHOW PLUGINS`, `information_schema.PARTITIONS`,
+  Workbench's `performance_schema` join and `EXPLAIN`, left refused on purpose.
