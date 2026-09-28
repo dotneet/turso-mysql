@@ -55,7 +55,9 @@ mod translate;
 mod trigger_definition;
 mod truncate_table;
 mod unknown_columns;
+mod update_qualifiers;
 mod updated_table_alias;
+mod values_call;
 mod view_definition;
 mod written_bytes;
 mod written_literals;
@@ -241,6 +243,8 @@ pub use trigger_definition::{
 };
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
 pub use unknown_columns::{unknown_column_named_by, UnknownColumn};
+pub use update_qualifiers::leave_out_the_table_in_an_update;
+pub use values_call::leave_out_the_table_in_values_calls;
 pub use view_definition::{
     created_view_name, mysql_create_view_ddl, render_show_create_written_view_mysql,
     select_reads_rows_as_they_come, translated_view_is_kept_as_mysql_prints_it,

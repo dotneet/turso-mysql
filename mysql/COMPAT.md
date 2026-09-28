@@ -2515,7 +2515,16 @@ An `ON DUPLICATE KEY UPDATE` value may join the row already there to the one
 offered, which is how a counter is stepped: `hits = hits + 1`, or
 `hits = hits + VALUES(hits)` to step it by the number offered. A bare column is
 the row already there in both MySQL and the engine, and `VALUES(col)` is the
-offered one, which the engine calls `excluded.col`.
+offered one, which the engine calls `excluded.col`. Drizzle writes the column
+qualified by the table, `values(`tags`.`name`)`; measured on 8.4.11 that is
+`VALUES(name)`, so the table is left out first, and another table's name, 1054
+in MySQL, is refused.
+
+Drizzle qualifies the columns of an `UPDATE` the same way, inside a call too —
+`set profile = JSON_SET(users.profile, '$.city', 'Kyoto')`. An `UPDATE` of one
+table under its own name, with no join, no `FROM` and no subquery, reads every
+column off that table, so the table's name is left out of each column first,
+which is what the bare column names.
 
 MySQL 8.0.20 deprecated `VALUES(col)`, and TypeORM and GORM still write it.
 Measured on 8.4.11, each call written raises warning 1287 once, however many

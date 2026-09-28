@@ -852,10 +852,13 @@ fn rails_counts_a_column_up_through_a_fallback() {
     );
 }
 
-/// A fallback naming its column through its table over a column holding
-/// anything but whole numbers is refused: MySQL reads a word or a `DECIMAL`
-/// by rules of its own there, and the engine would hand a `BIGINT UNSIGNED`
-/// on in its stored form.
+/// A fallback naming its column through its table over a `DECIMAL` or a
+/// `BIGINT UNSIGNED` is refused: MySQL reads a `DECIMAL` by rules of its own
+/// there, and the engine would hand a `BIGINT UNSIGNED` on in its stored form.
+/// Over a word, or with a word to fall back on, it answers what the bare
+/// column answers, which is what MySQL writes — measured on 8.4.11, `label =
+/// COALESCE(label, 0)` stores `'0'` in the NULL row and leaves the others,
+/// and a word falling into a whole-number column is 1366.
 #[test]
 fn a_fallback_in_a_set_over_another_kind_of_column_is_refused() {
     let (_directory, mut adapter) = adapter();
@@ -865,12 +868,37 @@ fn a_fallback_in_a_set_over_another_kind_of_column_is_refused() {
     );
     for sql in [
         "UPDATE counters SET counters.uid = COALESCE(counters.uid, 0) + 1 WHERE id = 1",
-        "UPDATE counters SET counters.label = COALESCE(counters.label, 0) WHERE id = 1",
         "UPDATE counters SET counters.price = COALESCE(counters.price, 0) + 1 WHERE id = 1",
-        "UPDATE counters SET counters.views = COALESCE(counters.views, 'x') WHERE id = 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+    run(&mut adapter, "INSERT INTO counters (id) VALUES (1), (2)");
+    run(
+        &mut adapter,
+        "UPDATE counters SET label = 'kept', views = 5 WHERE id = 2",
+    );
+    run(
+        &mut adapter,
+        "UPDATE counters SET counters.label = COALESCE(counters.label, 0)",
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT label FROM counters ORDER BY id"),
+        ["0", "kept"]
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "UPDATE counters SET counters.views = COALESCE(counters.views, 'x') WHERE id = 1"
+        ),
+        Err(FrontendErrorKind::IncorrectValue)
+    ));
+    run(
+        &mut adapter,
+        "UPDATE counters SET counters.views = COALESCE(counters.views, 'x') WHERE id = 2",
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT views FROM counters WHERE id = 2"),
+        ["5"]
+    );
 }
 
 /// SQLAlchemy compares a JSON member as text through a `CASE` that answers

@@ -275,3 +275,188 @@ fn drizzles_rows_give_default_to_different_columns() {
         ]
     );
 }
+
+/// Drizzle writes a moment as `'2024-01-02 03:04:05.000'`, which a
+/// `DATETIME` keeps as `'2024-01-02 03:04:05'`. The index over the column
+/// has to hold what the row holds: before, it held the value as written, so
+/// the row could not be deleted (the engine found the index out of step with
+/// the table) and a unique key let the same moment in twice. Measured on
+/// MySQL 8.4.11, each statement here answers as it does below.
+#[test]
+fn an_index_holds_the_value_its_row_stores() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE p1 (id INT PRIMARY KEY, user_id INT, published_at DATETIME)",
+    );
+    run(
+        &mut adapter,
+        "CREATE INDEX p1_pub ON p1 (user_id, published_at)",
+    );
+    run(
+        &mut adapter,
+        "insert into p1 values (1, 1, '2024-01-02 03:04:05.000')",
+    );
+    run(
+        &mut adapter,
+        "update p1 set published_at = '2024-01-02 03:04:06.000' where id = 1",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "select * from p1 where user_id = 1 and published_at = '2024-01-02 03:04:06'"
+        ),
+        [["1", "1", "2024-01-02 03:04:06"].map(|value| Some(value.to_owned()))]
+    );
+    assert_eq!(written(&mut adapter, "delete from p1"), (1, 0));
+
+    run(
+        &mut adapter,
+        "CREATE TABLE u1 (id INT PRIMARY KEY, at DATETIME, c CHAR(4), UNIQUE KEY (at), UNIQUE KEY (c))",
+    );
+    run(
+        &mut adapter,
+        "insert into u1 values (1, '2024-01-02 03:04:05', 'ab')",
+    );
+    // 1062: the same moment, and the same word once a CHAR drops its spaces.
+    for sql in [
+        "insert into u1 values (2, '2024-01-02 03:04:05.000', 'x')",
+        "insert into u1 values (3, '2024-01-02 03:04:07', 'ab  ')",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::ConstraintViolation)
+            ),
+            "{sql}"
+        );
+    }
+    run(
+        &mut adapter,
+        "insert into u1 values (4, '2024-01-02 03:04:08', 'cd  ')",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "insert into u1 values (1, '2024-01-02 03:04:09.000', 'q') on duplicate key update at = '2024-01-02 03:04:09.000'",
+        ),
+        (2, 0)
+    );
+    assert_eq!(
+        rows(&mut adapter, "select id, at from u1 order by id"),
+        [
+            [Some("1".to_owned()), Some("2024-01-02 03:04:09".to_owned())],
+            [Some("4".to_owned()), Some("2024-01-02 03:04:08".to_owned())],
+        ]
+    );
+    assert_eq!(written(&mut adapter, "delete from u1"), (2, 0));
+}
+
+/// The affected rows, the id and the warnings one write reports.
+fn written_with_warnings(adapter: &mut Adapter, sql: &str) -> (u64, u64, u16) {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => {
+            (result.affected_rows, result.last_insert_id, result.warnings)
+        }
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+/// Drizzle qualifies every column it writes, inside `VALUES()` of an upsert
+/// and inside a call in an `UPDATE` alike. Measured on MySQL 8.4.11, each
+/// names what the bare column names there, and each `VALUES()` still warns
+/// 1287.
+#[test]
+fn drizzles_qualified_columns_name_the_table_written() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT NOT NULL, `name` varchar(100) NOT NULL, CONSTRAINT `tags_id` PRIMARY KEY(`id`), CONSTRAINT `tags_name_unique` UNIQUE(`name`))",
+    );
+    run(
+        &mut adapter,
+        "insert into `tags` (`id`, `name`) values (default, 'news'), (default, 'rust'), (default, 'sql')",
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "insert into `tags` (`id`, `name`) values (default, 'go'), (default, 'news') on duplicate key update `name` = values(`tags`.`name`)",
+        ),
+        (1, 4, 1)
+    );
+    assert_eq!(
+        rows(&mut adapter, "select id, name from tags order by id"),
+        [["1", "news"], ["2", "rust"], ["3", "sql"], ["4", "go"]]
+            .map(|row| row.map(|value| Some(value.to_owned())))
+    );
+
+    run(
+        &mut adapter,
+        "CREATE TABLE `users` (`id` bigint unsigned AUTO_INCREMENT NOT NULL, `email` varchar(191) NOT NULL, `name` varchar(100) NOT NULL, `balance` decimal(10,2) NOT NULL DEFAULT '0.00', `is_active` boolean NOT NULL DEFAULT true, `profile` json, CONSTRAINT `users_id` PRIMARY KEY(`id`), CONSTRAINT `users_email_unique` UNIQUE(`email`))",
+    );
+    run(
+        &mut adapter,
+        "insert into `users` (`id`, `email`, `name`, `balance`, `is_active`, `profile`) values (default, 'alice@example.com', 'Alice', '100.50', default, '{\"city\":\"Tokyo\",\"tags\":[\"a\",\"b\"]}'), (default, 'bob@example.com', 'Bob', '20.25', false, '{\"city\":\"Osaka\",\"tags\":[\"c\"]}')",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "update `users` set `profile` = JSON_SET(`users`.`profile`, '$.city', 'Kyoto') where `users`.`id` = 2",
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "select `profile`->>'$.city' from `users` where `users`.`id` = 2"
+        ),
+        [[Some("Kyoto".to_owned())]]
+    );
+    assert_eq!(
+        written_with_warnings(
+            &mut adapter,
+            "insert into `users` (`id`, `email`, `name`, `balance`, `is_active`, `profile`) values (default, 'alice@example.com', 'Alice Upserted', '100.00', default, default), (default, 'erin@example.com', 'Erin', default, default, default) on duplicate key update `name` = values(`users`.`name`), `balance` = values(`users`.`balance`)",
+        )
+        .0,
+        3
+    );
+    let text = |value: &str| Some(value.to_owned());
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "select id, email, name, balance, is_active, profile from users order by id"
+        ),
+        [
+            [
+                text("1"),
+                text("alice@example.com"),
+                text("Alice Upserted"),
+                text("100.00"),
+                text("1"),
+                text("{\"city\": \"Tokyo\", \"tags\": [\"a\", \"b\"]}")
+            ],
+            [
+                text("2"),
+                text("bob@example.com"),
+                text("Bob"),
+                text("20.25"),
+                text("0"),
+                text("{\"city\": \"Kyoto\", \"tags\": [\"c\"]}")
+            ],
+            [
+                text("3"),
+                text("erin@example.com"),
+                text("Erin"),
+                text("0.00"),
+                text("1"),
+                None
+            ],
+        ]
+    );
+    // Another table's name is 1054 in MySQL, and refused here.
+    assert!(adapter
+        .execute_query(
+            "insert into `tags` (`id`, `name`) values (default, 'go') on duplicate key update `name` = values(`other`.`name`)"
+        )
+        .is_err());
+}

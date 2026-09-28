@@ -3149,6 +3149,18 @@ where
             turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = serial_written_out.as_deref().unwrap_or(sql);
+        let values_calls_unqualified = turso_mysql_parser::leave_out_the_table_in_values_calls(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = values_calls_unqualified.as_deref().unwrap_or(sql);
+        let update_unqualified = turso_mysql_parser::leave_out_the_table_in_an_update(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = update_unqualified.as_deref().unwrap_or(sql);
         self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         match self.prepare_checked_database_statement(sql) {
             Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
@@ -3417,6 +3429,18 @@ where
             turso_mysql_parser::write_serial_out(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?;
         let sql = serial_written_out.as_deref().unwrap_or(sql);
+        let values_calls_unqualified = turso_mysql_parser::leave_out_the_table_in_values_calls(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = values_calls_unqualified.as_deref().unwrap_or(sql);
+        let update_unqualified = turso_mysql_parser::leave_out_the_table_in_an_update(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = update_unqualified.as_deref().unwrap_or(sql);
         self.refuse_a_character_past_three_bytes_beside_utf8mb3(sql)?;
         let status_flags = self.status_flags();
         if let Some(result) = self.session_variables.execute_query(
