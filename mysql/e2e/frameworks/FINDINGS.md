@@ -180,3 +180,24 @@ Refused only by turso, by kind:
   `DEFAULT` in some rows.
 - **GORM:** `COUNT(DISTINCT(user_id))`, `UPDATE posts SET slug = CONCAT('p-', id)`,
   an upsert mixing an explicit id and `DEFAULT`.
+
+# Fourth run
+
+At local main after the Prisma, grouping, JSON/introspection and GORM/TypeORM
+rounds, 2026-09-28. Every step passes on turso for Django (22/22), GORM (21/21),
+Laravel (26/26), the mysql CLI (23/23), mysqldump (9/9), Rails (22/22) and
+SQLAlchemy (20/20).
+
+Left:
+
+- **Prisma 13/22:** two pooled connections each run `BEGIN` and an INSERT;
+  the second INSERT runs after the first transaction commits and still answers
+  1213 (deadlock / write conflict), apparently because its transaction's read
+  snapshot was taken before that commit. MySQL takes both rows. Behind it, a
+  SELECT with Prisma's relation counts (correlated `EXISTS`, `COALESCE` over a
+  grouped derived table) is refused.
+- **TypeORM 15/18:** the pagination `SELECT DISTINCT distinctAlias.Post_id ...
+  FROM (SELECT ... FROM posts Post LEFT JOIN ...) distinctAlias` (a derived
+  table over a join), `SELECT post.user_id AS userId, SUM(post.views) AS views
+  FROM posts post GROUP BY post.user_id HAVING SUM(post.views) > 5` (a qualified
+  aggregate in HAVING), and its rollback-migration step.
