@@ -73,9 +73,10 @@ pub use information_schema::{
     is_connector_j_information_schema_collation_query, is_connector_j_reserved_keywords_query,
     parse_connector_j_foreign_keys, parse_optional_connector_j_information_schema_query,
     parse_optional_connector_j_schemata_listing_query,
-    parse_optional_gorm_information_schema_prepared_query, ConnectorJForeignKey,
+    parse_optional_gorm_information_schema_prepared_query,
+    parse_optional_laravel_information_schema_query, ConnectorJForeignKey,
     ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery,
-    GormInformationSchemaPreparedQuery,
+    GormInformationSchemaPreparedQuery, LaravelInformationSchemaQuery, LaravelSchema,
 };
 use mysql_ddl::render_mysql_column;
 use static_select_metadata::classify_static_select_expr;

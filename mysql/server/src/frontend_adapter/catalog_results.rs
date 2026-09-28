@@ -4212,3 +4212,284 @@ fn show_processlist_columns(full: bool) -> Vec<ColumnDefinitionConfig> {
         })
         .collect()
 }
+
+/// The `group_concat_max_len` Laravel's catalog reads are answered under,
+/// MySQL's own, which no joined list of a key's columns here outgrows.
+pub(super) const LARAVEL_GROUP_CONCAT_MAX_LEN: u64 = 1024;
+
+/// Which protocol a result's columns are described for. MySQL describes
+/// Laravel's catalog reads differently over each: measured on 8.4.11, a
+/// column read through a view names its origin as the view's alias over the
+/// text protocol and as the catalog table's own column over the binary one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatalogProtocol {
+    Text,
+    Binary,
+}
+
+/// One row of a Laravel catalog read: words, and for an index whether it is
+/// unique.
+pub(super) struct LaravelCatalogRow {
+    words: Vec<String>,
+    unique: Option<bool>,
+}
+
+/// One index or foreign key a catalog read groups rows into: its name read
+/// without regard to case, which orders the groups, and the grouping columns.
+type CatalogGroup = (String, Vec<String>);
+
+/// One column of a key: its place in the key and the column names it lists.
+type KeyMember = (u64, Vec<String>);
+
+/// Groups the rows a plain catalog read answered into one row for each index
+/// or foreign key. The plain read's rows come as the grouping columns, then
+/// each column's place in the key, then the column names it lists.
+pub(super) fn laravel_catalog_rows(
+    query: &LaravelInformationSchemaQuery,
+    rows: Vec<crate::TextResultRow>,
+) -> Result<Vec<LaravelCatalogRow>, FrontendErrorKind> {
+    let grouped_by = match query {
+        LaravelInformationSchemaQuery::Indexes { .. } => 3,
+        LaravelInformationSchemaQuery::ForeignKeys { .. } => 5,
+    };
+    let mut groups: std::collections::BTreeMap<CatalogGroup, Vec<KeyMember>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let row = row
+            .into_iter()
+            .map(|value| {
+                value
+                    .ok_or(FrontendErrorKind::Unsupported)
+                    .and_then(|value| {
+                        String::from_utf8(value).map_err(|_| FrontendErrorKind::Internal)
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (key, rest) = row.split_at(grouped_by);
+        let [place, listed @ ..] = rest else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        let place = place.parse().map_err(|_| FrontendErrorKind::Internal)?;
+        groups
+            .entry((key[0].to_ascii_lowercase(), key.to_vec()))
+            .or_default()
+            .push((place, listed.to_vec()));
+    }
+    let mut answered = Vec::with_capacity(groups.len());
+    for ((_, key), mut members) in groups {
+        members.sort_by_key(|(place, _)| *place);
+        let lists = (0..members[0].1.len())
+            .map(|list| {
+                members
+                    .iter()
+                    .map(|(_, listed)| listed[list].as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect::<Vec<_>>();
+        if lists
+            .iter()
+            .any(|list| list.len() as u64 > LARAVEL_GROUP_CONCAT_MAX_LEN)
+        {
+            return Err(FrontendErrorKind::Unsupported);
+        }
+        answered.push(match query {
+            LaravelInformationSchemaQuery::Indexes { .. } => {
+                let [name, kind, non_unique] = key.as_slice() else {
+                    return Err(FrontendErrorKind::Internal);
+                };
+                LaravelCatalogRow {
+                    words: vec![name.clone(), lists[0].clone(), kind.clone()],
+                    unique: Some(non_unique == "0"),
+                }
+            }
+            LaravelInformationSchemaQuery::ForeignKeys { .. } => {
+                let [name, foreign_schema, foreign_table, on_update, on_delete] = key.as_slice()
+                else {
+                    return Err(FrontendErrorKind::Internal);
+                };
+                LaravelCatalogRow {
+                    words: vec![
+                        name.clone(),
+                        lists[0].clone(),
+                        foreign_schema.clone(),
+                        foreign_table.clone(),
+                        lists[1].clone(),
+                        on_update.clone(),
+                        on_delete.clone(),
+                    ],
+                    unique: None,
+                }
+            }
+        });
+    }
+    Ok(answered)
+}
+
+pub(super) fn laravel_catalog_text_result(
+    query: &LaravelInformationSchemaQuery,
+    rows: Vec<LaravelCatalogRow>,
+    status_flags: u16,
+) -> TextResultSet {
+    TextResultSet {
+        columns: laravel_catalog_columns(query, CatalogProtocol::Text),
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                let mut values = row
+                    .words
+                    .into_iter()
+                    .map(|word| Some(word.into_bytes()))
+                    .collect::<Vec<_>>();
+                if let Some(unique) = row.unique {
+                    values.push(Some(u8::from(unique).to_string().into_bytes()));
+                }
+                values
+            })
+            .collect(),
+        warnings: 0,
+        status_flags,
+    }
+}
+
+pub(super) fn laravel_catalog_binary_result(
+    query: &LaravelInformationSchemaQuery,
+    rows: Vec<LaravelCatalogRow>,
+    status_flags: u16,
+) -> BinaryResultSet {
+    let columns = laravel_catalog_columns(query, CatalogProtocol::Binary);
+    BinaryResultSet {
+        rows: rows
+            .into_iter()
+            .map(|row| {
+                let mut values = row
+                    .words
+                    .into_iter()
+                    .zip(&columns)
+                    .map(|(word, column)| {
+                        if column.column_type == MYSQL_TYPE_LONG_BLOB {
+                            BinaryResultValue::Blob(word.into_bytes())
+                        } else {
+                            BinaryResultValue::Text(word)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(unique) = row.unique {
+                    values.push(BinaryResultValue::Integer(i64::from(unique)));
+                }
+                values
+            })
+            .collect(),
+        columns,
+        warnings: 0,
+        status_flags,
+    }
+}
+
+/// The columns of one of Laravel's catalog reads, as MySQL 8.4.11 describes
+/// them over each protocol, measured with `group_concat_max_len` at 1024.
+pub(super) fn laravel_catalog_columns(
+    query: &LaravelInformationSchemaQuery,
+    protocol: CatalogProtocol,
+) -> Vec<ColumnDefinitionConfig> {
+    let binary = protocol == CatalogProtocol::Binary;
+    // A column read out of a catalog table: over the text protocol it names
+    // its alias as its origin and the view it was read through as its table,
+    // and over the binary one the catalog table's own column, with the
+    // decimals a word carries when it is worked out.
+    let read = |name: &str, table: &str, original: &str, original_table: &str, length, flags| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_VAR_STRING);
+        column.table = table.into();
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = length;
+        column.flags = flags;
+        if binary {
+            column.original_name = original.into();
+            column.original_table = original_table.into();
+        } else {
+            column.original_name = name.into();
+            column.schema = "information_schema".into();
+        }
+        column
+    };
+    let joined = |name: &str| {
+        let mut column = ColumnDefinitionConfig::new(name, MYSQL_TYPE_LONG_BLOB);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = 36864;
+        column.decimals = NOT_FIXED_DECIMALS;
+        column
+    };
+    match query {
+        LaravelInformationSchemaQuery::Indexes { .. } => {
+            let mut name = read("name", "statistics", "INDEX_NAME", "STATISTICS", 256, 0);
+            let mut kind = read(
+                "type",
+                "statistics",
+                "INDEX_TYPE",
+                "STATISTICS",
+                44,
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG,
+            );
+            if binary {
+                name.decimals = NOT_FIXED_DECIMALS;
+                kind.decimals = NOT_FIXED_DECIMALS;
+            }
+            let mut unique = ColumnDefinitionConfig::new(
+                "unique",
+                if binary {
+                    MYSQL_TYPE_LONGLONG
+                } else {
+                    MYSQL_TYPE_LONG
+                },
+            );
+            unique.character_set = MYSQL_BINARY_COLLATION;
+            unique.column_length = 1;
+            unique.flags = if binary {
+                MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+            } else {
+                unique.original_name = "unique".into();
+                MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+            };
+            vec![name, joined("columns"), kind, unique]
+        }
+        LaravelInformationSchemaQuery::ForeignKeys { .. } => {
+            let key = |name: &str, original: &str, flags| {
+                let mut column = read(name, "kc", original, "KEY_COLUMN_USAGE", 256, flags);
+                column.schema = "information_schema".into();
+                column
+            };
+            let rule = |name: &str, original: &str| {
+                let mut column = read(
+                    name,
+                    "rc",
+                    original,
+                    "REFERENTIAL_CONSTRAINTS",
+                    44,
+                    MYSQL_NOT_NULL_FLAG
+                        | MYSQL_BINARY_FLAG
+                        | MYSQL_ENUM_FLAG
+                        | MYSQL_NO_DEFAULT_VALUE_FLAG,
+                );
+                column.column_type = MYSQL_TYPE_STRING;
+                column.schema = "information_schema".into();
+                if !binary {
+                    column.original_table = "foreign_keys".into();
+                }
+                column
+            };
+            vec![
+                key("name", "CONSTRAINT_NAME", 0),
+                joined("columns"),
+                key(
+                    "foreign_schema",
+                    "REFERENCED_TABLE_SCHEMA",
+                    MYSQL_BINARY_FLAG,
+                ),
+                key("foreign_table", "REFERENCED_TABLE_NAME", MYSQL_BINARY_FLAG),
+                joined("foreign_columns"),
+                rule("on_update", "UPDATE_RULE"),
+                rule("on_delete", "DELETE_RULE"),
+            ]
+        }
+    }
+}

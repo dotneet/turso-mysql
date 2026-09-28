@@ -94,10 +94,11 @@ use turso_mysql_parser::{
 };
 #[cfg(unix)]
 use turso_mysql_parser::{
-    parse_optional_histogram_query, parse_optional_named_lock_query,
-    parse_optional_show_processlist, parse_optional_show_status,
+    parse_optional_histogram_query, parse_optional_laravel_information_schema_query,
+    parse_optional_named_lock_query, parse_optional_show_processlist, parse_optional_show_status,
     parse_optional_show_stored_programs, parse_optional_status_counter_read,
-    write_the_current_database_in, MySqlTransactionCommand,
+    write_the_current_database_in, LaravelInformationSchemaQuery, LaravelSchema,
+    MySqlTransactionCommand,
 };
 
 use crate::connection_facts::MySqlConnectionFacts;
@@ -259,6 +260,9 @@ enum RunAsText {
     /// The one row a read of what the session or the server knows answers —
     /// `DATABASE()`, `VERSION()`, system variables and a status counter.
     SessionRead(String),
+    /// The rows of one of Laravel's catalog reads, which are worked out from
+    /// the catalog the text path reads.
+    LaravelCatalog(LaravelInformationSchemaQuery),
 }
 
 #[cfg(unix)]
@@ -1692,6 +1696,56 @@ where
         }
     }
 
+    /// Works out one of Laravel's catalog reads from the rows the catalog
+    /// answers a plain read of, which the text path authorizes as it
+    /// authorizes any, grouped the way Laravel's `GROUP BY` groups them.
+    ///
+    /// Measured on MySQL 8.4.11: one row for each index or foreign key, in
+    /// the order of its name read without regard to case, each list of
+    /// columns joined by commas in the order of their place in the key.
+    fn laravel_catalog_rows(
+        &mut self,
+        query: &LaravelInformationSchemaQuery,
+    ) -> Result<Vec<catalog_results::LaravelCatalogRow>, FrontendErrorKind> {
+        let (schema, table) = match query {
+            LaravelInformationSchemaQuery::Indexes { schema, table }
+            | LaravelInformationSchemaQuery::ForeignKeys { schema, table } => (schema, table),
+        };
+        let written = |name: &str| {
+            if name.contains(['\'', '\\']) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+            Ok(format!("'{name}'"))
+        };
+        let schema = match schema {
+            LaravelSchema::Current => "schema()".to_owned(),
+            LaravelSchema::Named(name) => written(name)?,
+        };
+        let table = written(table)?;
+        let sql = match query {
+            LaravelInformationSchemaQuery::Indexes { .. } => format!(
+                "select index_name, index_type, non_unique, seq_in_index, column_name \
+                 from information_schema.statistics \
+                 where table_schema = {schema} and table_name = {table}"
+            ),
+            LaravelInformationSchemaQuery::ForeignKeys { .. } => format!(
+                "select kc.constraint_name, kc.referenced_table_schema, kc.referenced_table_name, \
+                 rc.update_rule, rc.delete_rule, kc.ordinal_position, kc.column_name, \
+                 kc.referenced_column_name \
+                 from information_schema.key_column_usage kc \
+                 join information_schema.referential_constraints rc \
+                 on kc.constraint_schema = rc.constraint_schema \
+                 and kc.constraint_name = rc.constraint_name \
+                 where kc.table_schema = {schema} and kc.table_name = {table} \
+                 and kc.referenced_table_name is not null"
+            ),
+        };
+        let CommandExecutionResult::ResultSet(read) = self.execute_query_statement(&sql)? else {
+            return Err(FrontendErrorKind::Internal);
+        };
+        catalog_results::laravel_catalog_rows(query, read.rows)
+    }
+
     fn execute_connector_j_catalog_query(
         &self,
         query: ConnectorJInformationSchemaQuery,
@@ -2333,13 +2387,27 @@ where
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
+        if let Some(query) =
+            parse_optional_laravel_information_schema_query(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            refuse_a_laravel_catalog_read_under_another_limit(&self.session_variables)?;
+            let columns = catalog_results::laravel_catalog_columns(
+                &query,
+                catalog_results::CatalogProtocol::Binary,
+            );
+            return self.prepare_text_statement(sql, RunAsText::LaravelCatalog(query), columns);
+        }
         if let Some(read) = self.read_the_session_or_server(sql)? {
             let CommandExecutionResult::ResultSet(read) = read else {
                 return Err(FrontendErrorKind::Internal);
             };
             binary_session_read(read.clone())?;
-            return self
-                .prepare_text_statement(RunAsText::SessionRead(sql.to_owned()), read.columns);
+            return self.prepare_text_statement(
+                sql,
+                RunAsText::SessionRead(sql.to_owned()),
+                read.columns,
+            );
         }
         if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
             sql,
@@ -2370,7 +2438,7 @@ where
                     self.session.session_sql_mode(),
                 ) =>
             {
-                self.prepare_text_statement(RunAsText::NoRows(sql.to_owned()), Vec::new())
+                self.prepare_text_statement(sql, RunAsText::NoRows(sql.to_owned()), Vec::new())
             }
             prepared => prepared,
         }
@@ -2702,6 +2770,16 @@ where
         .map_err(|_| FrontendErrorKind::Syntax)?
         {
             return self.execute_connector_j_catalog_query(query);
+        }
+        if let Some(query) =
+            parse_optional_laravel_information_schema_query(sql, self.session.session_sql_mode())
+                .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            refuse_a_laravel_catalog_read_under_another_limit(&self.session_variables)?;
+            let rows = self.laravel_catalog_rows(&query)?;
+            return Ok(CommandExecutionResult::ResultSet(
+                catalog_results::laravel_catalog_text_result(&query, rows, status_flags),
+            ));
         }
         // The one written shape this recognized before the engine could scan
         // the table still answers it, because it takes a `WHERE TABLE_SCHEMA =
@@ -3476,11 +3554,11 @@ where
     /// a statement answering no rows.
     fn prepare_text_statement(
         &mut self,
+        text: &str,
         statement: RunAsText,
         columns: Vec<ColumnDefinitionConfig>,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
-        let (RunAsText::NoRows(sql) | RunAsText::SessionRead(sql)) = &statement;
-        let text = sql.clone();
+        let text = text.to_owned();
         let database = self
             .session
             .selected_database()
@@ -3561,6 +3639,16 @@ where
                     }
                     CommandExecutionResult::Ok(_) => Err(FrontendErrorKind::Internal),
                 },
+                RunAsText::LaravelCatalog(query) => {
+                    let rows = self.laravel_catalog_rows(&query)?;
+                    Ok(PreparedStatementExecutionResult::ResultSet(
+                        catalog_results::laravel_catalog_binary_result(
+                            &query,
+                            rows,
+                            self.status_flags(),
+                        ),
+                    ))
+                }
             };
         }
         let (database, source_tables, read_only_select) = self
@@ -5114,6 +5202,20 @@ impl ProjectionOrigins {
         }
         Ok(columns)
     }
+}
+
+/// Refuses one of Laravel's catalog reads under a `group_concat_max_len`
+/// other than MySQL's own 1024: measured on 8.4.11, the width MySQL reports
+/// for the joined columns follows the limit — 36864 under 1024 and 73728
+/// under 2048 — by a rule not worked out past those.
+#[cfg(unix)]
+fn refuse_a_laravel_catalog_read_under_another_limit(
+    session_variables: &crate::session_variables::MySqlSessionVariables,
+) -> Result<(), FrontendErrorKind> {
+    if session_variables.group_concat_max_len() != catalog_results::LARAVEL_GROUP_CONCAT_MAX_LEN {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    Ok(())
 }
 
 /// The row a read of what the session knows answers, in the binary protocol's

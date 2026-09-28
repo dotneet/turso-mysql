@@ -15,8 +15,8 @@ use crate::{
     CLIENT_FOUND_ROWS, CLIENT_MULTI_STATEMENTS, COMMAND_SEQUENCE_ID, DEFAULT_UTF8MB4_COLLATION,
     MAX_RESULT_COLUMNS, MYSQL_TYPE_BIT, MYSQL_TYPE_BLOB, MYSQL_TYPE_DATE, MYSQL_TYPE_DATETIME,
     MYSQL_TYPE_DOUBLE, MYSQL_TYPE_FLOAT, MYSQL_TYPE_INT24, MYSQL_TYPE_JSON, MYSQL_TYPE_LONG,
-    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL, MYSQL_TYPE_SHORT,
-    MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
+    MYSQL_TYPE_LONGLONG, MYSQL_TYPE_LONG_BLOB, MYSQL_TYPE_NEWDECIMAL, MYSQL_TYPE_NULL,
+    MYSQL_TYPE_SHORT, MYSQL_TYPE_STRING, MYSQL_TYPE_TIME, MYSQL_TYPE_TIMESTAMP, MYSQL_TYPE_TINY,
     MYSQL_TYPE_VAR_STRING, MYSQL_TYPE_YEAR,
 };
 
@@ -1331,6 +1331,9 @@ fn binary_row_column_type(
         // both protocols — the type is `json`, the character set is binary, and
         // the value is the document's own bytes, length-encoded.
         MYSQL_TYPE_BLOB | MYSQL_TYPE_JSON => Some(BinaryRowColumnType::Bytes),
+        // A `GROUP_CONCAT` past 512 bytes is a `LONG_BLOB`, which crosses the
+        // binary protocol length-encoded as a `BLOB` does.
+        MYSQL_TYPE_LONG_BLOB => Some(BinaryRowColumnType::Bytes),
         // A BIT crosses as the bytes that hold its bits, length-encoded, which is
         // what MySQL's protocol names for one; the text protocol sends the same
         // bytes, measured on 8.4.11 as the one byte 0x01 for `b'1'`.

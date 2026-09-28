@@ -131,6 +131,91 @@ pub enum ConnectorJSchemataListingQuery {
     Schemas,
 }
 
+/// The catalog reads Laravel 12's schema builder sends, each grouping one
+/// table's rows with `GROUP_CONCAT(... ORDER BY ...)`, which the statement
+/// path does not take, so they are recognized and answered whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaravelInformationSchemaQuery {
+    /// `Schema::getIndexes`: one row for each index of a table.
+    Indexes {
+        schema: LaravelSchema,
+        table: String,
+    },
+    /// `Schema::getForeignKeys`: one row for each foreign key of a table.
+    ForeignKeys {
+        schema: LaravelSchema,
+        table: String,
+    },
+}
+
+/// The database a Laravel catalog read names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaravelSchema {
+    /// `schema()`, the one the session is in.
+    Current,
+    /// A database written by its name, as `db:table` writes it.
+    Named(String),
+}
+
+/// Recognizes Laravel's `getIndexes` and `getForeignKeys` reads, or returns
+/// `None` for any other statement.
+pub fn parse_optional_laravel_information_schema_query(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<LaravelInformationSchemaQuery>, ParseError> {
+    const INDEXES: &str = "select index_name as `name`, group_concat(column_name order by seq_in_index) as `columns`, \
+        index_type as `type`, not non_unique as `unique` from information_schema.statistics \
+        where table_schema = __SCHEMA__ and table_name = '__TABLE__' \
+        group by index_name, index_type, non_unique";
+    const FOREIGN_KEYS: &str = "select kc.constraint_name as `name`, \
+        group_concat(kc.column_name order by kc.ordinal_position) as `columns`, \
+        kc.referenced_table_schema as `foreign_schema`, kc.referenced_table_name as `foreign_table`, \
+        group_concat(kc.referenced_column_name order by kc.ordinal_position) as `foreign_columns`, \
+        rc.update_rule as `on_update`, rc.delete_rule as `on_delete` \
+        from information_schema.key_column_usage kc join information_schema.referential_constraints rc \
+        on kc.constraint_schema = rc.constraint_schema and kc.constraint_name = rc.constraint_name \
+        where kc.table_schema = __SCHEMA__ and kc.table_name = '__TABLE__' \
+        and kc.referenced_table_name is not null \
+        group by kc.constraint_name, kc.referenced_table_schema, kc.referenced_table_name, \
+        rc.update_rule, rc.delete_rule";
+
+    if !names_information_schema(sql) {
+        return Ok(None);
+    }
+    let actual = tokenize_information_schema_query(sql, mode)?;
+    if actual.iter().any(|token| {
+        matches!(
+            token,
+            Token::Whitespace(
+                Whitespace::SingleLineComment { .. } | Whitespace::MultiLineComment(_)
+            )
+        )
+    }) {
+        return Ok(None);
+    }
+    for (template, indexes) in [(INDEXES, true), (FOREIGN_KEYS, false)] {
+        for (spelled, current) in [("schema()", true), ("'__SCHEMA__'", false)] {
+            let template = template.replace("__SCHEMA__", spelled);
+            let Some(captures) = connector_j_template_captures(&actual, &template, mode)? else {
+                continue;
+            };
+            let (schema, table) = match (current, captures.as_slice()) {
+                (true, [Some(table)]) => (LaravelSchema::Current, table.clone()),
+                (false, [Some(schema), Some(table)]) => {
+                    (LaravelSchema::Named(schema.clone()), table.clone())
+                }
+                _ => return Ok(None),
+            };
+            return Ok(Some(if indexes {
+                LaravelInformationSchemaQuery::Indexes { schema, table }
+            } else {
+                LaravelInformationSchemaQuery::ForeignKeys { schema, table }
+            }));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectorJForeignKey {
     pub name: String,
@@ -463,6 +548,43 @@ fn same_catalog_token(actual: &Token, expected: &Token) -> bool {
 #[cfg(test)]
 mod connector_j_tests {
     use super::*;
+
+    /// The reads Laravel 12.12's `Schema::getIndexes` and
+    /// `Schema::getForeignKeys` send, as the live run logged them.
+    #[test]
+    fn laravel_catalog_reads_are_recognized_with_their_table_and_schema() {
+        let mode = SessionSqlMode::default();
+        let read = |sql: &str| parse_optional_laravel_information_schema_query(sql, mode).unwrap();
+        assert_eq!(
+            read("select index_name as `name`, group_concat(column_name order by seq_in_index) as `columns`, index_type as `type`, not non_unique as `unique` from information_schema.statistics where table_schema = schema() and table_name = 'users' group by index_name, index_type, non_unique"),
+            Some(LaravelInformationSchemaQuery::Indexes {
+                schema: LaravelSchema::Current,
+                table: "users".to_owned()
+            })
+        );
+        assert_eq!(
+            read("select index_name as `name`, group_concat(column_name order by seq_in_index) as `columns`, index_type as `type`, not non_unique as `unique` from information_schema.statistics where table_schema = 'laravel' and table_name = 'users' group by index_name, index_type, non_unique"),
+            Some(LaravelInformationSchemaQuery::Indexes {
+                schema: LaravelSchema::Named("laravel".to_owned()),
+                table: "users".to_owned()
+            })
+        );
+        assert_eq!(
+            read("select kc.constraint_name as `name`, group_concat(kc.column_name order by kc.ordinal_position) as `columns`, kc.referenced_table_schema as `foreign_schema`, kc.referenced_table_name as `foreign_table`, group_concat(kc.referenced_column_name order by kc.ordinal_position) as `foreign_columns`, rc.update_rule as `on_update`, rc.delete_rule as `on_delete` from information_schema.key_column_usage kc join information_schema.referential_constraints rc on kc.constraint_schema = rc.constraint_schema and kc.constraint_name = rc.constraint_name where kc.table_schema = schema() and kc.table_name = 'posts' and kc.referenced_table_name is not null group by kc.constraint_name, kc.referenced_table_schema, kc.referenced_table_name, rc.update_rule, rc.delete_rule"),
+            Some(LaravelInformationSchemaQuery::ForeignKeys {
+                schema: LaravelSchema::Current,
+                table: "posts".to_owned()
+            })
+        );
+        for sql in [
+            "select index_name as `name`, group_concat(column_name order by seq_in_index) as `columns`, index_type as `type`, not non_unique as `unique` from information_schema.statistics where table_schema = schema() and table_name = 'users' group by index_name, index_type",
+            "select index_name as `name`, group_concat(column_name order by seq_in_index desc) as `columns`, index_type as `type`, not non_unique as `unique` from information_schema.statistics where table_schema = schema() and table_name = 'users' group by index_name, index_type, non_unique",
+            "select index_name as `name`, group_concat(column_name order by seq_in_index) as `columns`, index_type as `type`, not non_unique as `unique` from information_schema.statistics where table_schema = ? and table_name = ? group by index_name, index_type, non_unique",
+            "select index_name from information_schema.statistics",
+        ] {
+            assert_eq!(read(sql), None, "{sql}");
+        }
+    }
 
     /// A statement that never names `INFORMATION_SCHEMA` is not read at all:
     /// one that does not tokenize is left to the path that reads it.

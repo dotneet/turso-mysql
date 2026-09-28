@@ -3266,6 +3266,23 @@ because MySQL names the result column after the text as written —
 — and any other database, which the engine does not read from the selected
 database's connection.
 
+Laravel's `Schema::getIndexes` and `Schema::getForeignKeys` — which `hasIndex`,
+`db:table` and a migration's introspection read — each group a table's rows of
+`STATISTICS`, or of `KEY_COLUMN_USAGE` joined to `REFERENTIAL_CONSTRAINTS`,
+with `GROUP_CONCAT(... ORDER BY ...)`, which the statement path does not take.
+Those two reads, exactly as Laravel 12 writes them with `schema()` or a named
+database, are recognized and answered from the rows a plain read of the same
+tables gives, over text and prepared. Measured on 8.4.11: one row for each index
+or foreign key in the order of its name without regard to case, its columns
+joined by commas in their order in the key; the joined columns a `LONG_BLOB` of
+36864; `unique` a NOT NULL `LONG` of 1 over the text protocol and a `LONGLONG`
+over the binary one; and each column read out of the catalog named after its
+alias as its origin, in the view it was read through, over the text protocol,
+and after the catalog table's own column over the binary one. The width of the
+joined columns follows `group_concat_max_len` — 73728 under 2048 — by a rule not
+worked out past that, so under any limit but MySQL's own 1024 the two reads are
+refused.
+
 `information_schema.STATISTICS` is the second such table, and the first this
 frontend has ever answered. It reports one row per column of every index of
 every table the session may see: the primary key first under the name
