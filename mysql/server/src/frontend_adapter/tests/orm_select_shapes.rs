@@ -269,3 +269,117 @@ fn rails_compares_a_count_with_a_word_naming_a_whole_number() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+/// The mysql command-line run's report of how old each row is, and the
+/// first run's `SELECT 2 > 1` and `SELECT (SELECT COUNT(*) FROM posts) > 0`.
+/// Measured on MySQL 8.4.11: each comparison answers a `LONGLONG` of length 1
+/// with the binary and numeric flags, NOT NULL where nothing it reads can be
+/// null. A count of days or units between two moments, a shifted reading of
+/// the clock and a subquery's count are reported nullable whatever they read.
+#[test]
+fn a_comparison_over_the_clock_a_count_or_numbers_is_a_result_column() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE events (id INT NOT NULL PRIMARY KEY, created_at DATETIME NOT NULL, deleted_at DATETIME NULL)",
+        "INSERT INTO events VALUES (1, '2026-01-02 03:04:05', NULL), (2, '2099-01-01 00:00:00', '2026-01-01 00:00:00')",
+    ] {
+        adapter.execute_query(sql).unwrap();
+    }
+    let nullable = MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG;
+    let not_null = MYSQL_NOT_NULL_FLAG | nullable;
+    let dates = result_set(
+        &mut adapter,
+        "SELECT DATE_FORMAT(created_at, '%Y-%m'), DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at,\n  TIMESTAMPDIFF(DAY, created_at, NOW()) >= 0 FROM events ORDER BY id",
+    );
+    assert_eq!(
+        text_rows(&dates),
+        [["2026-01", "0", "1"], ["2099-01", "1", "0"]].map(|row| row.map(|v| Some(v.to_owned())))
+    );
+    assert_eq!(
+        shapes(&dates)[1..],
+        [
+            (
+                "DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at",
+                MYSQL_TYPE_LONGLONG,
+                1,
+                0,
+                nullable
+            ),
+            (
+                "TIMESTAMPDIFF(DAY, created_at, NOW()) >= 0",
+                MYSQL_TYPE_LONGLONG,
+                1,
+                0,
+                nullable
+            ),
+        ]
+    );
+    let null_moments = result_set(
+        &mut adapter,
+        "SELECT deleted_at > DATE_SUB(NOW(), INTERVAL 1 DAY), DATEDIFF(NOW(), deleted_at) > 1, NOW() > deleted_at, NOW() > created_at FROM events ORDER BY id",
+    );
+    assert_eq!(
+        text_rows(&null_moments),
+        [
+            [None, None, None, Some("1".to_owned())],
+            ["0", "1", "1", "0"].map(|v| Some(v.to_owned())),
+        ]
+    );
+    assert_eq!(
+        shapes(&null_moments)
+            .into_iter()
+            .map(|(_, _, _, _, flags)| flags)
+            .collect::<Vec<_>>(),
+        [nullable, nullable, nullable, not_null]
+    );
+    for (sql, flags) in [
+        ("SELECT 2 > 1", not_null),
+        ("SELECT (SELECT COUNT(*) FROM posts) > 0", nullable),
+    ] {
+        let answered = result_set(&mut adapter, sql);
+        assert_eq!(text_rows(&answered), [[Some("1".to_owned())]], "{sql}");
+        assert_eq!(
+            shapes(&answered),
+            [(&sql["SELECT ".len()..], MYSQL_TYPE_LONGLONG, 1, 0, flags)],
+            "{sql}"
+        );
+    }
+    let statement = adapter
+        .execute_stmt_prepare(
+            "SELECT DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at, NOW() > deleted_at FROM events ORDER BY id",
+        )
+        .unwrap();
+    let PreparedStatementExecutionResult::ResultSet(prepared) = adapter
+        .execute_stmt_execute(statement.statement_id, &[])
+        .unwrap()
+    else {
+        panic!("the comparisons must answer rows");
+    };
+    assert_eq!(
+        prepared.rows,
+        [
+            vec![BinaryResultValue::Integer(0), BinaryResultValue::Null],
+            vec![BinaryResultValue::Integer(1), BinaryResultValue::Integer(1)],
+        ]
+    );
+    assert_eq!(
+        prepared
+            .columns
+            .iter()
+            .map(|column| (column.column_type, column.flags))
+            .collect::<Vec<_>>(),
+        [
+            (MYSQL_TYPE_LONGLONG, nullable),
+            (MYSQL_TYPE_LONGLONG, nullable)
+        ]
+    );
+    // Not measured, or held by the WHERE reader to a column of another kind.
+    for sql in [
+        "SELECT -1 < 0",
+        "SELECT CURDATE() <= created_at FROM events",
+        "SELECT (SELECT MAX(id) FROM posts) > 0",
+        "SELECT TIMESTAMPDIFF(DAY, created_at, NOW()) >= id FROM events",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+}

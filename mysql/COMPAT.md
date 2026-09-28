@@ -4029,7 +4029,18 @@ neither true nor false. The same shape stands beside other columns. A
 comparison is a column against a written number or word, written the way a
 `WHERE` writes it — so a word is compared under the column's collation and
 `name = 'APPLE'` is 1 over `apple` — or a `COUNT` against a written whole
-number. `NOT` and the truth tests read a column of whole numbers or a `DOUBLE`,
+number. So are the shapes a report of how old each row is writes, each read
+the way a `WHERE` reads it: a column against a reading of the clock
+(`NOW() > created_at`, NOT NULL where the column is), a column against a
+shifted reading (`DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at`), a
+`DATEDIFF` or `TIMESTAMPDIFF` against a written whole number, a subquery's
+`COUNT` against one (`(SELECT COUNT(*) FROM posts) > 0`), and two written
+whole numbers (`2 > 1`, NOT NULL). Measured on 8.4.11, the shifted reading,
+the counts of days or units and the subquery are nullable whatever they read,
+and a NULL moment answers NULL in both engines. A subquery's count beside a
+table read with an `ORDER BY` over a bare column is refused, the `ORDER BY`
+wanting the table's types, which a statement with a subquery is not read
+with. `NOT` and the truth tests read a column of whole numbers or a `DOUBLE`,
 each read as true where it is not zero; a word is refused, MySQL reading it as
 the number it begins with (`NOT 'apple'` is 1), and so is a `DECIMAL`. In a
 `WHERE`, `flag IS TRUE` and its kin test whatever the `WHERE` reader takes, so

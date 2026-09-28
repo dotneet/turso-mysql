@@ -5608,10 +5608,11 @@ fn having_accepts_count_distinct() {
 fn rejects_select_features_with_unproven_mysql_semantics() {
     for sql in [
         // Integer arithmetic is taken; a decimal or float operand, a
-        // modulo and a comparison in a projection are not.
+        // modulo and a comparison of numbers with a point in a projection
+        // are not.
         "SELECT 1.5 + 1",
         "SELECT 1 % 2",
-        "SELECT 1 = 1",
+        "SELECT 1.5 = 1",
         "SELECT id FROM app.users",
         "SELECT 9223372036854775808",
         "SELECT -9223372036854775809",

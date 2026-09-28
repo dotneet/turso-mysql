@@ -312,6 +312,10 @@ pub enum ScalarFunction {
     DividesWhole,
     /// A comparison, which answers 1, 0 or NULL.
     Compares,
+    /// A comparison over a count of days or units between two moments, a
+    /// shifted reading of the clock, or a subquery's count, which MySQL
+    /// reports as nullable whatever it reads.
+    ComparesACallOrASubquery,
     /// `NOT col`, which answers 1, 0 or NULL.
     NegatesTruth,
     /// `col IS TRUE`, `IS FALSE`, `IS NOT TRUE` and `IS NOT FALSE`, which
@@ -717,9 +721,16 @@ pub(super) fn interval_shift_as_call(expr: &Expr) -> Option<sqlparser::ast::Func
 
 /// Classifies a comparison standing as a result column.
 ///
-/// Two shapes are taken: a column against a written number or word, which the
-/// `WHERE` comparison reader holds to the column's type, and a `COUNT` against
-/// a written whole number, which never answers NULL.
+/// Each shape is one the `WHERE` comparison reader takes, rendered the same
+/// way. Measured on MySQL 8.4.11, each answers a `LONGLONG` of length 1, NOT
+/// NULL where nothing it reads can be null: a column against a written number
+/// or word, or against a reading of the clock — `NOW() > created_at` — is NOT
+/// NULL where the column is, and a `COUNT` or a written whole number against a
+/// written whole number always is. A count of days or units between two
+/// moments, a shifted reading of the clock and a subquery's count are reported
+/// nullable whatever they read — `TIMESTAMPDIFF(DAY, created_at, NOW()) >= 0`,
+/// `DATE_SUB(NOW(), INTERVAL 1 DAY) < created_at` and
+/// `(SELECT COUNT(*) FROM posts) > 0` all are, over a NOT NULL column.
 fn classify_comparison(expr: &Expr) -> Option<StaticSelectMetadata> {
     let Expr::BinaryOp { left, op, right } = expr else {
         return None;
@@ -749,19 +760,59 @@ fn classify_comparison(expr: &Expr) -> Option<StaticSelectMetadata> {
         _ => false,
     };
     let counted = |expr: &Expr| matches!(expr, Expr::Function(function) if is_count_call(function));
-    let (columns, not_null) = match (left.as_ref(), right.as_ref()) {
-        (Expr::Identifier(column), other) | (other, Expr::Identifier(column)) if written(other) => {
-            (vec![column.value.clone()], false)
-        }
-        (count, other) | (other, count)
-            if counted(count) && crate::translate::direct_signed_integer(other).is_some() =>
+    let whole = |expr: &Expr| crate::translate::direct_signed_integer(expr).is_some();
+    let reads_the_clock = |expr: &Expr| shifted_moment(expr).is_some();
+    let (function, columns, not_null) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Identifier(column), other) | (other, Expr::Identifier(column))
+            if written(other) || reads_the_clock(other) =>
         {
-            (Vec::new(), true)
+            (ScalarFunction::Compares, vec![column.value.clone()], false)
+        }
+        (count, other) | (other, count) if counted(count) && whole(other) => {
+            (ScalarFunction::Compares, Vec::new(), true)
+        }
+        // The name is the text as written, and a sign written first is not
+        // part of the span a comparison reports.
+        (Expr::Value(number), other)
+            if matches!(number.value, Value::Number(_, false)) && whole(left) && whole(other) =>
+        {
+            (ScalarFunction::Compares, Vec::new(), true)
+        }
+        (Expr::Identifier(column), shifted) | (shifted, Expr::Identifier(column))
+            if matches!(shifted, Expr::Function(function)
+                if crate::translate::shifts_a_reading_of_the_clock(function)) =>
+        {
+            (
+                ScalarFunction::ComparesACallOrASubquery,
+                vec![column.value.clone()],
+                false,
+            )
+        }
+        (Expr::Function(call), other) | (other, Expr::Function(call)) if whole(other) => {
+            let Some(StaticSelectMetadata::ScalarCall {
+                function: ScalarFunction::CountsDaysBetween | ScalarFunction::CountsUnitsBetween,
+                columns,
+                ..
+            }) = scalar_call(call)
+            else {
+                return None;
+            };
+            (ScalarFunction::ComparesACallOrASubquery, columns, false)
+        }
+        (Expr::Subquery(query), other) | (other, Expr::Subquery(query))
+            if whole(other)
+                && matches!(
+                    classify_scalar_subquery(query),
+                    Some(StaticSelectMetadata::ScalarSubquery(counted))
+                        if *counted == StaticSelectMetadata::Count
+                ) =>
+        {
+            (ScalarFunction::ComparesACallOrASubquery, Vec::new(), false)
         }
         _ => return None,
     };
     Some(StaticSelectMetadata::ScalarCall {
-        function: ScalarFunction::Compares,
+        function,
         columns,
         literal_characters: 0,
         not_null,

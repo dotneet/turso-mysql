@@ -7683,9 +7683,12 @@ fn scalar_call_column_definition(
     // key, `COUNT(*) > 0` always — and the truth tests always are.
     if matches!(
         function,
-        ScalarFunction::Compares | ScalarFunction::NegatesTruth | ScalarFunction::TestsTruth
+        ScalarFunction::Compares
+            | ScalarFunction::ComparesACallOrASubquery
+            | ScalarFunction::NegatesTruth
+            | ScalarFunction::TestsTruth
     ) {
-        let mut reads_nothing_null = true;
+        let mut reads_nothing_null = function != ScalarFunction::ComparesACallOrASubquery;
         for column_name in columns {
             let (table, ordinal) = source_metadata
                 .ok_or(FrontendErrorKind::Unsupported)?
@@ -7696,8 +7699,10 @@ fn scalar_call_column_definition(
                 .ok_or(FrontendErrorKind::Unsupported)?;
             // MySQL reads a word or a DECIMAL as a truth by a rule of its own
             // — `NOT 'apple'` is 1 — which the engine does not share.
-            if function != ScalarFunction::Compares
-                && !is_signed_whole_number_column(source.type_name())
+            if !matches!(
+                function,
+                ScalarFunction::Compares | ScalarFunction::ComparesACallOrASubquery
+            ) && !is_signed_whole_number_column(source.type_name())
                 && source.type_name() != "DOUBLE"
             {
                 return Err(FrontendErrorKind::Unsupported);
@@ -8699,7 +8704,10 @@ fn scalar_call_column_definition(
         | ScalarFunction::ShiftsRowOrWord => {
             unreachable!("the window calls were answered above")
         }
-        ScalarFunction::Compares | ScalarFunction::NegatesTruth | ScalarFunction::TestsTruth => {
+        ScalarFunction::Compares
+        | ScalarFunction::ComparesACallOrASubquery
+        | ScalarFunction::NegatesTruth
+        | ScalarFunction::TestsTruth => {
             unreachable!("the truth answers were answered above")
         }
         ScalarFunction::Concatenates

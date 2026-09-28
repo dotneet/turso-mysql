@@ -5542,14 +5542,22 @@ fn render_select_expr(
             if matches!(
                 static_select_metadata::classify_static_select_expr(expr),
                 Some(StaticSelectMetadata::ScalarCall {
-                    function: static_select_metadata::ScalarFunction::Compares,
+                    function: static_select_metadata::ScalarFunction::Compares
+                        | static_select_metadata::ScalarFunction::ComparesACallOrASubquery,
                     ..
                 })
             ) =>
         {
-            render_context.checks_type_sensitive_expression = true;
+            // A subquery's count against a written number reads no column of
+            // the statement's own, so no type has to be known for it.
+            if !matches!(left.as_ref(), Expr::Subquery(_))
+                && !matches!(right.as_ref(), Expr::Subquery(_))
+            {
+                render_context.checks_type_sensitive_expression = true;
+            }
             let counted = |expr: &Expr| matches!(expr, Expr::Function(function) if static_select_metadata::is_count_call(function));
-            if counted(left) || counted(right) {
+            let whole = |expr: &Expr| direct_signed_integer(expr).is_some();
+            if counted(left) || counted(right) || (whole(left) && whole(right)) {
                 return Ok(format!(
                     "({} {} {})",
                     render_select_expr(left, render_context)?,
@@ -7712,6 +7720,18 @@ fn source_text(source: &str, expr: &Expr) -> Option<String> {
         }
         if matches!(left.as_ref(), Expr::Interval(_)) {
             start = start_of_the_interval_keyword_before(source, start)?;
+        }
+        // A subquery's span covers its `SELECT` and not the parentheses around
+        // it, which MySQL names the column with.
+        if matches!(left.as_ref(), Expr::Subquery(_)) {
+            start = bytes[..start].iter().rposition(|byte| *byte == b'(')?;
+        }
+        if let Expr::Subquery(subquery) = right.as_ref() {
+            let subquery_start = byte_offset(source, subquery.span().start)?;
+            let opening = bytes[..subquery_start]
+                .iter()
+                .rposition(|byte| *byte == b'(')?;
+            end = end.max(closing_parenthesis(source, opening)?);
         }
     }
     // A call's span covers its name and arguments but not its closing
@@ -10004,6 +10024,12 @@ fn shifted_moment_count(
 /// `DATE` is exactly the ten characters of `YYYY-MM-DD`.
 fn render_shifted_moment(moment: &str, (count, unit): (i64, &'static str)) -> String {
     format!("mysql_shift_moment({moment}, {count}, '{unit}')")
+}
+
+/// Reports whether a call is `DATE_ADD` or `DATE_SUB` over a reading of the
+/// clock, which a comparison reads the way a `WHERE` does.
+pub(crate) fn shifts_a_reading_of_the_clock(function: &sqlparser::ast::Function) -> bool {
+    render_shifted_clock_reading(function).is_some()
 }
 
 fn render_shifted_clock_reading(
