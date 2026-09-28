@@ -30913,3 +30913,6 @@ mod drizzle_statements;
 mod sequelize_statements;
 #[cfg(unix)]
 mod sqlx_statements;
+
+#[cfg(unix)]
+mod efcore_statements;

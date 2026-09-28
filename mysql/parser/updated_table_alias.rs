@@ -4,7 +4,8 @@
 //! `update posts p1_0 set views=(p1_0.views+1) where p1_0.views<5`. Measured on
 //! MySQL 8.4.11 that changes the rows the statement without the alias changes,
 //! so the alias is taken out and each column written through it is written
-//! through the table's own name before the statement is read.
+//! bare before the statement is read. Entity Framework Core writes the same
+//! shape with `AS`: ``UPDATE `Users` AS `u` SET `u`.`Balance` = ...``.
 
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor};
 use sqlparser::tokenizer::Token;
@@ -84,12 +85,20 @@ pub(crate) fn without_the_updated_tables_alias(
             alias_left_out = true;
             continue;
         }
+        // The column is written bare rather than through the table's name: the
+        // engine does not find a table named with other letter case than the
+        // one it stores (`Users.Email` against `users`), and a bare name reads
+        // the one table the statement changes. It is quoted, since a column
+        // named after a period may be a reserved word.
         if alias_left_out && before_a_period && names(&token.token, &alias.value) {
+            let Some(Token::Word(column)) = words.get(at + 2).map(|token| &token.token) else {
+                return Ok(None);
+            };
             rewritten.push_str(&sql[copied_up_to..byte_offset_of(sql, token.span.start)?]);
             rewritten.push('`');
-            rewritten.push_str(&table.value.replace('`', "``"));
+            rewritten.push_str(&column.value.replace('`', "``"));
             rewritten.push('`');
-            copied_up_to = byte_offset_of(sql, token.span.end)?;
+            copied_up_to = byte_offset_of(sql, words[at + 2].span.end)?;
         }
     }
     if !alias_left_out {
@@ -119,11 +128,16 @@ mod tests {
     fn hibernate_s_bulk_update_names_its_table_instead_of_its_alias() {
         assert_eq!(
             rewritten("update posts p1_0 set views=(p1_0.views+1) where p1_0.views<5").as_deref(),
-            Some("update posts set views=(`posts`.views+1) where `posts`.views<5")
+            Some("update posts set views=(`views`+1) where `views`<5")
         );
         assert_eq!(
             rewritten("UPDATE posts AS p SET p.views = 1 WHERE p.id = ?").as_deref(),
-            Some("UPDATE posts SET `posts`.views = 1 WHERE `posts`.id = ?")
+            Some("UPDATE posts SET `views` = 1 WHERE `id` = ?")
+        );
+        assert_eq!(
+            rewritten("UPDATE `Users` AS `u` SET `u`.`order` = `u`.`order` - 10.0 WHERE `u`.`Email` = 'a'")
+                .as_deref(),
+            Some("UPDATE `Users` SET `order` = `order` - 10.0 WHERE `Email` = 'a'")
         );
     }
 
