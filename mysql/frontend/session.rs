@@ -11860,6 +11860,9 @@ fn refuse_dml_json_readings_mysql_reads_differently(
     schema: &turso_core::schema::Schema,
     translated: &TranslatedDml,
 ) -> Result<()> {
+    if let Some((table, columns)) = translated.json_cast_columns() {
+        refuse_json_casts_into_other_columns(schema, table, columns)?;
+    }
     if translated.checked_comparisons().iter().any(|comparison| {
         is_a_json_answer(comparison.answers())
             && matches!(
@@ -11888,6 +11891,27 @@ fn refuse_dml_json_readings_mysql_reads_differently(
 ///
 /// The readings are MySQL's over a document. Over a text column MySQL reads
 /// the text as a document first, which is not what this measured.
+/// Holds each column a `CAST(... AS JSON)` is written into to being a `JSON`
+/// column. What MySQL writes into any other kind has not been measured.
+fn refuse_json_casts_into_other_columns(
+    schema: &turso_core::schema::Schema,
+    table: &str,
+    columns: &[String],
+) -> Result<()> {
+    let table = schema
+        .get_btree_table(table)
+        .ok_or(LimboError::SchemaUpdated)?;
+    for name in columns {
+        let (_, column) = table.get_column(name).ok_or(LimboError::SchemaUpdated)?;
+        if !column.ty_str.eq_ignore_ascii_case("JSON") {
+            return Err(LimboError::InvalidArgument(format!(
+                "CAST AS JSON written into {name} requires a JSON column"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn refuse_json_readings_of_other_columns(
     schema: &turso_core::schema::Schema,
     table: &str,

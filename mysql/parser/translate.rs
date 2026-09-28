@@ -2668,6 +2668,8 @@ pub(crate) struct RenderedInsert {
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
     /// Which parameters stand where the `SELECT` writes a row count.
     pub(crate) row_count_parameters: Vec<usize>,
+    /// The columns a `VALUES` row writes a `CAST(... AS JSON)` into.
+    pub(crate) json_cast_columns: Vec<String>,
 }
 
 /// Renders one checked `INSERT`. An `INSERT ... SELECT` whose `SELECT` has to
@@ -2826,6 +2828,7 @@ pub(crate) fn translate_insert(
             compared_table: rendered.source_table.map(|table| table.as_str().to_owned()),
             checked_comparisons: rendered.checked_comparisons,
             row_count_parameters: rendered.row_count_parameters,
+            json_cast_columns: Vec::new(),
         });
     }
     if source.with.is_some()
@@ -2860,6 +2863,7 @@ pub(crate) fn translate_insert(
                 compared_table: None,
                 checked_comparisons: Vec::new(),
                 row_count_parameters: Vec::new(),
+                json_cast_columns: Vec::new(),
             });
         }
         return unsupported("INSERT without an explicit column list");
@@ -2884,6 +2888,7 @@ pub(crate) fn translate_insert(
     // so does naming the offered row.
     let defaulted = columns_given_their_default(&column_names, values)?;
     let kept = |at: usize| !defaulted[at];
+    let mut json_cast_columns = Vec::new();
     let rows = values
         .rows
         .iter()
@@ -2891,7 +2896,13 @@ pub(crate) fn translate_insert(
             row.iter()
                 .enumerate()
                 .filter(|(at, _)| kept(*at))
-                .map(|(_, value)| render_inserted_value(value))
+                .map(|(at, value)| match json_cast_operand(value) {
+                    Some(operand) => {
+                        json_cast_columns.push(column_names[at].to_owned());
+                        render_json_cast(operand)
+                    }
+                    None => render_inserted_value(value),
+                })
                 .collect::<Result<Vec<_>, _>>()
                 .map(|values| format!("({})", values.join(", ")))
         })
@@ -2916,6 +2927,7 @@ pub(crate) fn translate_insert(
             compared_table: None,
             checked_comparisons: Vec::new(),
             row_count_parameters: Vec::new(),
+            json_cast_columns: Vec::new(),
         });
     }
     Ok(RenderedInsert {
@@ -2929,6 +2941,7 @@ pub(crate) fn translate_insert(
         compared_table: None,
         checked_comparisons: Vec::new(),
         row_count_parameters: Vec::new(),
+        json_cast_columns,
     })
 }
 
@@ -3811,6 +3824,7 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedIns
         compared_table: None,
         checked_comparisons: Vec::new(),
         row_count_parameters: Vec::new(),
+        json_cast_columns: Vec::new(),
     })
 }
 
@@ -4727,6 +4741,15 @@ fn render_update_assignment_value(
                 render_set_arithmetic_operand(right, written, assigned, render_context)?
             ))
         }
+        _ if json_cast_operand(value).is_some() => {
+            let operand = json_cast_operand(value).expect("the guard read a JSON cast");
+            let rendered = render_json_cast(operand)?;
+            for _ in 0..placeholders_in(&rendered) {
+                render_context.next_parameter_ordinal()?;
+            }
+            render_context.json_cast_columns.push(written.to_owned());
+            Ok(rendered)
+        }
         // A call or a `CASE` writes a value worked out from the row, which is
         // how a statement trims a word or counts a default in. Each is
         // rendered the way a projection renders it, so what lands in the
@@ -4795,7 +4818,7 @@ fn render_update_assignment_value(
         // statement's parameters.
         _ => {
             let rendered = render_dml_expr(value)?;
-            for _ in 0..parameters_in_rendered_sql(&rendered) {
+            for _ in 0..placeholders_in(&rendered) {
                 render_context.next_parameter_ordinal()?;
             }
             Ok(rendered)
@@ -4832,23 +4855,6 @@ fn is_a_bare_placeholder(expr: &Expr) -> bool {
         Expr::Value(value) => matches!(&value.value, Value::Placeholder(marker) if marker == "?"),
         _ => false,
     }
-}
-
-/// Counts the `?` markers in rendered SQL, leaving out any inside a quoted
-/// word or name.
-fn parameters_in_rendered_sql(rendered: &str) -> usize {
-    let mut count = 0;
-    let mut quote = None;
-    for character in rendered.chars() {
-        match quote {
-            Some(delimiter) if character == delimiter => quote = None,
-            Some(_) => {}
-            None if character == '\'' || character == '"' => quote = Some(character),
-            None if character == '?' => count += 1,
-            None => {}
-        }
-    }
-    count
 }
 
 /// Reports whether a value reads only columns this `SET` has not written yet.
@@ -5017,6 +5023,51 @@ fn moment_read_to_places(function: &sqlparser::ast::Function) -> Option<u32> {
             ..
         } => Some(places),
         _ => None,
+    }
+}
+
+/// Reads the value inside `CAST(value AS JSON)`, or nothing when the
+/// expression is not one.
+pub(crate) fn json_cast_operand(expr: &Expr) -> Option<&Expr> {
+    let Expr::Cast {
+        kind: sqlparser::ast::CastKind::Cast,
+        expr,
+        data_type: DataType::JSON,
+        format: None,
+        array: false,
+    } = expr
+    else {
+        return None;
+    };
+    Some(expr)
+}
+
+/// Renders the value of `CAST(value AS JSON)` written whole into a column,
+/// which is how GORM writes a `datatypes.JSON`.
+///
+/// Measured on MySQL 8.4.11: a bound word is parsed as a document and stored
+/// the way MySQL stores one, a bound whole number as that JSON number and a
+/// NULL as NULL, and a word that is no document fails with 3141. The dialect
+/// reads a bound value that way when it binds, refusing what MySQL would
+/// answer 3141 for; a written word that is no document is refused here. The
+/// frontend holds the column written to being a `JSON` one.
+pub(crate) fn render_json_cast(operand: &Expr) -> Result<String, ParseError> {
+    let Expr::Value(value) = operand else {
+        return unsupported("CAST AS JSON of something other than a word or a ?");
+    };
+    match &value.value {
+        Value::Placeholder(marker) if marker == "?" => Ok("mysql_cast_as_json(?)".to_owned()),
+        Value::SingleQuotedString(written) | Value::DoubleQuotedString(written) => {
+            if crate::normalize_json(written).is_err() {
+                return unsupported("CAST AS JSON of a word that is no document");
+            }
+            Ok(format!(
+                "mysql_cast_as_json('{}')",
+                written.replace('\'', "''")
+            ))
+        }
+        Value::Null => Ok("NULL".to_owned()),
+        _ => unsupported("CAST AS JSON of something other than a word or a ?"),
     }
 }
 
@@ -5325,6 +5376,8 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Each `?` an `UPDATE` adds to, takes from or multiplies a value by,
     /// with the column the answer is written into.
     pub(crate) bound_arithmetic_operands: Vec<crate::BoundArithmeticOperand>,
+    /// The columns an `UPDATE` writes a `CAST(... AS JSON)` into.
+    pub(crate) json_cast_columns: Vec<String>,
     parameter_count: usize,
     /// How many `GROUP_CONCAT` calls the statement has rendered, which tells
     /// each one's count of joined values apart from the others'.
@@ -5404,6 +5457,7 @@ impl<'a> SelectRenderContext<'a> {
             checked_comparisons: Vec::new(),
             ordered_columns: Vec::new(),
             bound_arithmetic_operands: Vec::new(),
+            json_cast_columns: Vec::new(),
             parameter_count: 0,
             group_concat_calls: 0,
             renders_a_projection_item: false,

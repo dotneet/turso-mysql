@@ -1340,6 +1340,10 @@ pub struct TranslatedDml {
     /// again without a connection cannot do.
     copies_a_select_rendered_knowing_its_types: bool,
     bound_arithmetic_operands: Vec<BoundArithmeticOperand>,
+    /// The table the statement writes and the columns it writes a
+    /// `CAST(... AS JSON)` into, which the frontend holds to being `JSON`
+    /// columns.
+    json_cast_columns: Option<(String, Vec<String>)>,
 }
 
 /// A `?` an `UPDATE` adds to, takes from or multiplies a value by —
@@ -1368,6 +1372,14 @@ impl TranslatedDml {
     /// Returns each `?` the statement's `SET` does arithmetic with.
     pub fn bound_arithmetic_operands(&self) -> &[BoundArithmeticOperand] {
         &self.bound_arithmetic_operands
+    }
+
+    /// Returns the table the statement writes and the columns it writes a
+    /// `CAST(... AS JSON)` into, when it writes one.
+    pub fn json_cast_columns(&self) -> Option<(&str, &[String])> {
+        self.json_cast_columns
+            .as_ref()
+            .map(|(table, columns)| (table.as_str(), columns.as_slice()))
     }
 
     /// Reports whether the `SELECT` this `INSERT ... SELECT` copies from was
@@ -4545,12 +4557,22 @@ pub fn parse_dml_knowing_column_types(
     let read_tables;
     let mut inherited_comparisons = Vec::new();
     let mut row_count_parameters = Vec::new();
+    let mut json_cast_columns = None;
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
             let rendered = translate_insert(&insert, sql, mode, decimal_columns, None)?;
             read_tables = rendered.read_tables;
             inherited_comparisons = rendered.checked_comparisons;
             row_count_parameters = rendered.row_count_parameters;
+            if !rendered.json_cast_columns.is_empty() {
+                let TableObject::TableName(table) = &insert.table else {
+                    return unsupported("INSERT table source");
+                };
+                json_cast_columns = Some((
+                    insert_name(table)?.as_str().to_owned(),
+                    rendered.json_cast_columns,
+                ));
+            }
             // An INSERT ... SELECT compares against the table the SELECT reads,
             // not the one it writes, so that is the table the comparisons are
             // checked against.
@@ -4560,6 +4582,12 @@ pub fn parse_dml_knowing_column_types(
             let (rendered, tables, checked) = translate_update(&update, &mut render_context)?;
             read_tables = tables;
             let table = checked.table_name().to_owned();
+            if !render_context.json_cast_columns.is_empty() {
+                json_cast_columns = Some((
+                    table.clone(),
+                    std::mem::take(&mut render_context.json_cast_columns),
+                ));
+            }
             (rendered, Some(checked), Some(table))
         }
         Statement::Delete(delete) => {
@@ -4612,6 +4640,7 @@ pub fn parse_dml_knowing_column_types(
         row_count_parameters,
         copies_a_select_rendered_knowing_its_types: false,
         bound_arithmetic_operands: render_context.bound_arithmetic_operands,
+        json_cast_columns,
     })
 }
 
@@ -4654,6 +4683,7 @@ pub fn parse_insert_select_knowing_its_select(
         row_count_parameters: rendered.row_count_parameters,
         copies_a_select_rendered_knowing_its_types: true,
         bound_arithmetic_operands: Vec::new(),
+        json_cast_columns: None,
     })
 }
 
@@ -4675,7 +4705,7 @@ pub fn parse_auto_increment_insert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
-    parse_checked_auto_increment_insert(sql, mode, is_direct_insert_literal)
+    parse_checked_auto_increment_insert(sql, mode, is_written_insert_value)
 }
 
 /// Parses one AUTO_INCREMENT INSERT that can be executed through a prepared
@@ -4825,19 +4855,29 @@ fn parse_checked_auto_increment_insert(
         }
     }
     let mut ordinal = 0;
-    let source_values = values.rows.iter().map(|row| {
-        row.iter().enumerate().filter_map(|(at, value)| {
-            let parameter = matches!(value, Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?"));
-            let source = if parameter {
-                let at_parameter = ordinal;
-                ordinal += 1;
-                AutoIncrementSourceValue::Parameter(at_parameter)
-            } else {
-                AutoIncrementSourceValue::Written(written_insert_value(value, names[at]))
-            };
-            (!defaulted[at]).then_some(source)
-        }).collect::<Vec<_>>()
-    }).collect::<Vec<_>>();
+    let source_values = values
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .filter_map(|(at, value)| {
+                    // A `?` a `CAST(? AS JSON)` binds is written into its column as
+                    // the document it reads as, NULL where it binds NULL.
+                    let parameter = is_a_bare_placeholder(value)
+                        || translate::json_cast_operand(value).is_some_and(is_a_bare_placeholder);
+                    let source = if parameter {
+                        let at_parameter = ordinal;
+                        ordinal += 1;
+                        AutoIncrementSourceValue::Parameter(at_parameter)
+                    } else {
+                        AutoIncrementSourceValue::Written(written_insert_value(value, names[at]))
+                    };
+                    (!defaulted[at]).then_some(source)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let mixed_default_columns = mixed_default_columns
         .into_iter()
         .map(|at| at - defaulted[..at].iter().filter(|removed| **removed).count())
@@ -5104,6 +5144,11 @@ fn insert_name(name: &ObjectName) -> Result<TursoName, ParseError> {
     Ok(TursoName::exact(ident.value.clone()))
 }
 
+fn is_written_insert_value(expr: &Expr) -> bool {
+    is_direct_insert_literal(expr)
+        || translate::json_cast_operand(expr).is_some_and(is_direct_insert_literal)
+}
+
 fn is_direct_insert_literal(expr: &Expr) -> bool {
     match expr {
         Expr::Value(value) => match &value.value {
@@ -5135,10 +5180,17 @@ fn is_direct_insert_literal(expr: &Expr) -> bool {
 
 fn is_prepared_insert_value(expr: &Expr) -> bool {
     is_direct_insert_literal(expr)
-        || matches!(
-            expr,
-            Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?")
-        )
+        || is_a_bare_placeholder(expr)
+        || translate::json_cast_operand(expr).is_some_and(|operand| {
+            is_direct_insert_literal(operand) || is_a_bare_placeholder(operand)
+        })
+}
+
+fn is_a_bare_placeholder(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Value(value) if matches!(&value.value, Value::Placeholder(marker) if marker == "?")
+    )
 }
 
 /// Rebuilds strict signed-width metadata from normalized MySQL table DDL.

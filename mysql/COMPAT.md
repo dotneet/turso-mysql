@@ -4374,6 +4374,16 @@ names what its parser found and where, and the message here stays fixed, as
 every other one does. The column reports type 245 with the widest length
 there is, the binary collation, and the blob and binary flags.
 
+`CAST(value AS JSON)` written whole into a `JSON` column, in an `INSERT`'s
+`VALUES` or an `UPDATE`'s `SET`, is how GORM writes a `datatypes.JSON`, with
+the value bound. Measured on 8.4.11 with go-sql-driver's binary types: a bound
+word is parsed and stored the way MySQL stores a document, a bound whole
+number as that JSON number, and NULL as NULL; a word that is no document, the
+empty word among them, fails with 3141 and writes nothing. This does the same
+and refuses the word MySQL answers 3141 for, as it refuses a written one; a
+bound double, whose JSON spelling was not measured past one value, is refused
+too. The cast is taken only where its column is a `JSON` one.
+
 `JSON_EXTRACT(doc, '$.path')` reads one path out of a document and answers the
 JSON value it found, so a string comes back with its quotes;
 `JSON_UNQUOTE(JSON_EXTRACT(...))` takes those quotes off; and `JSON_VALID`

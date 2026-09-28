@@ -230,7 +230,7 @@ fn a_word_that_is_no_whole_number_is_refused_against_a_count() {
     }
 }
 
-/// The first column of every row a text statement answers.
+/// The first column of every row a text statement answers, NULL spelled out.
 fn first_column(adapter: &mut Adapter, sql: &str) -> Vec<String> {
     let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
         panic!("{sql} must answer rows");
@@ -238,7 +238,12 @@ fn first_column(adapter: &mut Adapter, sql: &str) -> Vec<String> {
     result
         .rows
         .into_iter()
-        .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+        .map(|row| {
+            row[0].clone().map_or_else(
+                || "NULL".to_owned(),
+                |value| String::from_utf8(value).unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -492,5 +497,142 @@ fn gorm_finds_the_rows_it_changes_by_a_bound_id() {
     assert_eq!(
         first_column(&mut adapter, "SELECT id FROM posts ORDER BY id"),
         ["1", "2"]
+    );
+}
+
+const GORM_CREATE_USER: &str = "INSERT INTO `users` (`email`,`name`,`balance`,`is_active`,`profile`,`created_at`,`updated_at`) VALUES (?,?,?,?,CAST(? AS JSON),?,?)";
+
+/// The row GORM's `Create` binds, with the profile bound as given.
+fn gorm_user<'a>(email: &'a str, profile: Bound<'a>) -> [Bound<'a>; 7] {
+    [
+        Bound::Word(email),
+        Bound::Word("Someone"),
+        Bound::Real(100.5),
+        Bound::Whole(1),
+        profile,
+        Bound::Word("2026-09-28 01:46:13.123"),
+        Bound::Word("2026-09-28 01:46:13.123"),
+    ]
+}
+
+/// GORM writes a `datatypes.JSON` as `CAST(? AS JSON)`. Measured on MySQL
+/// 8.4.11: a bound word is parsed and stored as MySQL stores a document —
+/// keys shortest first, one space after each colon and comma — a bound whole
+/// number as that JSON number and NULL as NULL. A word that is no document,
+/// the empty word among them, fails with 3141 and writes nothing, which is
+/// refused here; so is a bound double, whose JSON spelling was not measured.
+#[test]
+fn gorm_writes_a_bound_document_through_a_json_cast() {
+    let (_directory, mut adapter) = adapter();
+    for (email, profile) in [
+        (
+            "a@x",
+            Bound::Word("{\"city\": \"Paris\", \"tags\": [\"a\", \"b\"]}"),
+        ),
+        (
+            "b@x",
+            Bound::Word("  [1, 2.50, \"x\", null, true, {\"b\":1,\"a\":2}]  "),
+        ),
+        ("c@x", Bound::Whole(42)),
+        ("d@x", Bound::Null),
+    ] {
+        assert_eq!(
+            changed(&mut adapter, GORM_CREATE_USER, &gorm_user(email, profile)),
+            1
+        );
+    }
+    for profile in [
+        Bound::Word("not json"),
+        Bound::Word(""),
+        Bound::Word("{bad"),
+        Bound::Real(1.5),
+    ] {
+        assert_eq!(
+            prepared(&mut adapter, GORM_CREATE_USER, &gorm_user("e@x", profile)),
+            Err(FrontendErrorKind::Unsupported)
+        );
+    }
+    assert_eq!(
+        first_column(&mut adapter, "SELECT profile FROM users ORDER BY id"),
+        [
+            "{\"city\": \"Paris\", \"tags\": [\"a\", \"b\"]}",
+            "[1, 2.5, \"x\", null, true, {\"a\": 2, \"b\": 1}]",
+            "42",
+            "NULL"
+        ]
+    );
+}
+
+/// GORM's `Save` writes every column again, the document through the same
+/// cast, and a text statement may write one with a written word.
+#[test]
+fn a_json_cast_writes_a_document_in_an_update_and_in_text() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        changed(
+            &mut adapter,
+            GORM_CREATE_USER,
+            &gorm_user("a@x", Bound::Word("{\"x\": 0}"))
+        ),
+        1
+    );
+    let save = "UPDATE `users` SET `email`=?,`name`=?,`balance`=?,`is_active`=?,`profile`=CAST(? AS JSON),`created_at`=?,`updated_at`=? WHERE `id` = ?";
+    let saved = |profile| {
+        let [email, name, balance, active, _, created, updated] = gorm_user("a@x", profile);
+        [
+            email,
+            name,
+            balance,
+            active,
+            profile,
+            created,
+            updated,
+            Bound::Id(1),
+        ]
+    };
+    assert_eq!(
+        changed(&mut adapter, save, &saved(Bound::Word("{\"x\":1}"))),
+        1
+    );
+    assert_eq!(
+        prepared(&mut adapter, save, &saved(Bound::Word("{bad"))),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT profile FROM users"),
+        ["{\"x\": 1}"]
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO users (email, name, is_active, profile) VALUES ('t@x', 'T', 1, CAST('{\"k\": [1,2]}' AS JSON))",
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "INSERT INTO users (email, name, is_active, profile) VALUES ('u@x', 'U', 1, CAST('bad' AS JSON))"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        first_column(&mut adapter, "SELECT profile FROM users ORDER BY id"),
+        ["{\"x\": 1}", "{\"k\": [1, 2]}"]
+    );
+}
+
+/// What a `CAST(... AS JSON)` writes into a column that holds no document
+/// has not been measured, so it is refused.
+#[test]
+fn a_json_cast_into_another_kind_of_column_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    assert_eq!(
+        prepared(
+            &mut adapter,
+            "INSERT INTO `users` (`email`,`name`,`is_active`) VALUES (?,CAST(? AS JSON),?)",
+            &[Bound::Word("a@x"), Bound::Word("\"n\""), Bound::Whole(1)]
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE users SET name = CAST('\"n\"' AS JSON) WHERE is_active = 1"),
+        Err(FrontendErrorKind::Unsupported)
     );
 }

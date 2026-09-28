@@ -534,6 +534,9 @@ impl Dialect for MySqlDialect {
         if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_JSON_UNQUOTE) {
             return Ok(Some(Func::Dialect(MYSQL_JSON_UNQUOTE.to_string())));
         }
+        if arg_count == 1 && name.eq_ignore_ascii_case(MYSQL_CAST_AS_JSON) {
+            return Ok(Some(Func::Dialect(MYSQL_CAST_AS_JSON.to_string())));
+        }
         if arg_count == 2
             && (name.eq_ignore_ascii_case(MYSQL_JSON_EXTRACT)
                 || name.eq_ignore_ascii_case(MYSQL_JSON_TEXT_COMPARE)
@@ -918,6 +921,12 @@ impl Dialect for MySqlDialect {
                     )
                 })?;
             return Ok(found.map_or(Value::Null, Value::build_text));
+        }
+        if name.eq_ignore_ascii_case(MYSQL_CAST_AS_JSON) {
+            let [value] = args else {
+                return Err(LimboError::ParseError(format!("{name} takes one argument")));
+            };
+            return cast_as_json(value);
         }
         if name.eq_ignore_ascii_case(MYSQL_JSON_UNQUOTE) {
             let [document] = args else {
@@ -1733,6 +1742,10 @@ pub(crate) const MYSQL_JSON_MERGE_PRESERVE: &str = "mysql_json_merge_preserve";
 /// MySQL answers the word `null`.
 pub(crate) const MYSQL_JSON_EXTRACT: &str = "mysql_json_extract";
 pub(crate) const MYSQL_JSON_UNQUOTE: &str = "mysql_json_unquote";
+/// Reads a value as a JSON document the way `CAST(value AS JSON)` does, for a
+/// value written whole into a `JSON` column: a word parsed as a document, a
+/// whole number as that JSON number.
+pub(crate) const MYSQL_CAST_AS_JSON: &str = "mysql_cast_as_json";
 /// Compares the text a JSON reading answers with a value, the way MySQL
 /// compares it: against a word under `utf8mb4_bin`, and against a number as
 /// two doubles.
@@ -1894,6 +1907,29 @@ fn json_reading(name: &str, value: &Value) -> Value {
     match turso_mysql_parser::normalize_json(text) {
         Ok(canonical) => Value::build_text(canonical),
         Err(_) => value.clone(),
+    }
+}
+
+/// Measured on MySQL 8.4.11: `CAST(? AS JSON)` binding `'{"b":1,"a":2}'`
+/// stores `{"a": 2, "b": 1}`, binding 42 stores the JSON number 42, and binding
+/// NULL stores NULL; a word that is no document is error 3141, which is
+/// refused here, and so is a double, whose JSON spelling was not measured.
+fn cast_as_json(value: &Value) -> Result<Value> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Text(text) => turso_mysql_parser::normalize_json(text.as_str())
+            .map(Value::build_text)
+            .map_err(|_| {
+                LimboError::InvalidArgument(
+                    "CAST AS JSON of a word that is no JSON document".to_string(),
+                )
+            }),
+        Value::Numeric(turso_core::Numeric::Integer(number)) => {
+            Ok(Value::build_text(number.to_string()))
+        }
+        _ => Err(LimboError::InvalidArgument(
+            "CAST AS JSON of a value that is neither a word nor a whole number".to_string(),
+        )),
     }
 }
 
