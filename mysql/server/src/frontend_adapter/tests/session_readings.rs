@@ -451,6 +451,41 @@ fn a_session_the_runtime_did_not_accept_lists_no_process() {
         rows(&mut adapter, "SHOW STATUS LIKE 'Uptime'")[0][0].as_deref(),
         Some("Uptime")
     );
+    assert_eq!(adapter.statistics(), None);
+}
+
+/// The `mysql` client's `status` asks for `COM_STATISTICS`. Measured on MySQL
+/// 8.4.11 the line reads `Uptime: 106  Threads: 2  Questions: 52  Slow
+/// queries: 0  Opens: 136  Flush tables: 3  Open tables: 55  Queries per
+/// second avg: 0.490`; this answers the counters it keeps, `Questions`
+/// counted over every session.
+#[test]
+fn statistics_answer_the_counters_this_server_keeps() {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("app"));
+    let (_directory, catalog, _factory) = catalog_factory(authorizer);
+    let mut other = listed_session(&catalog, "reader", 8, 40001);
+    let mut asking = listed_session(&catalog, "app", 9, 40002);
+    for _ in 0..2 {
+        other.question_asked();
+    }
+    for _ in 0..3 {
+        asking.question_asked();
+    }
+    let line = asking.statistics().unwrap();
+    let (uptime, rest) = line
+        .strip_prefix("Uptime: ")
+        .and_then(|rest| rest.split_once("  "))
+        .unwrap();
+    let uptime = uptime.parse::<u64>().unwrap();
+    let average = if uptime == 0 { 0 } else { 5000 / uptime };
+    assert_eq!(
+        rest,
+        format!(
+            "Threads: 2  Questions: 5  Queries per second avg: {}.{:03}",
+            average / 1000,
+            average % 1000
+        )
+    );
 }
 
 /// Measured on MySQL 8.4.11: the counters a health check reads are the

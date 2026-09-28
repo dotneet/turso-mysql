@@ -15,6 +15,10 @@ pub struct MySqlSessionRegistry {
     /// before the session is dropped — never touches the session that ID
     /// went to next.
     next_registration: AtomicU64,
+    /// How many commands the sessions sent, each statement of a query that
+    /// holds several counted on its own, which `COM_STATISTICS` reports as
+    /// `Questions`.
+    questions: AtomicU64,
 }
 
 /// What one session is doing, as `SHOW PROCESSLIST` describes it.
@@ -56,6 +60,7 @@ impl Default for MySqlSessionRegistry {
             opened: Instant::now(),
             sessions: Mutex::new(BTreeMap::new()),
             next_registration: AtomicU64::new(1),
+            questions: AtomicU64::new(0),
         }
     }
 }
@@ -97,6 +102,12 @@ impl MySqlSessionRegistry {
     /// How many sessions are logged in.
     pub fn logged_in(&self) -> usize {
         self.lock().len()
+    }
+
+    /// How many commands and statements every session sent since the server
+    /// opened.
+    pub fn questions(&self) -> u64 {
+        self.questions.load(Ordering::Relaxed)
     }
 
     /// The sessions of one account, in the order of their IDs.
@@ -147,6 +158,11 @@ impl MySqlSessionRegistration {
             .update(self.id, self.registration, |activity| {
                 activity.since = Instant::now()
             });
+    }
+
+    /// Counts one command, or one more statement of a query holding several.
+    pub fn question_asked(&self) {
+        self.registry.questions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Notes that the session began running `statement`.

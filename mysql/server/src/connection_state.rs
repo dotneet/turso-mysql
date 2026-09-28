@@ -68,6 +68,9 @@ pub const COM_STMT_RESET: u8 = 0x1a;
 pub const COM_RESET_CONNECTION: u8 = 0x1f;
 /// Classic command identifier for turning multi-statements on or off.
 pub const COM_SET_OPTION: u8 = 0x1b;
+/// Classic command identifier for the one-line server statistics, which the
+/// `mysql` client's `status` asks for.
+pub const COM_STATISTICS: u8 = 0x09;
 /// The `COM_SET_OPTION` option that lets one `COM_QUERY` hold several
 /// statements.
 pub const MYSQL_OPTION_MULTI_STATEMENTS_ON: u16 = 0;
@@ -121,6 +124,8 @@ pub enum ClassicCommand<'a> {
     ResetConnection,
     /// A request to turn multi-statements on or off, with the option as sent.
     SetOption { option: u16 },
+    /// A request for the one-line server statistics.
+    Statistics,
     /// A request to select the connection's default database.
     InitDb { database: &'a str },
     /// A connection liveness check.
@@ -1292,6 +1297,8 @@ fn decode_command_packet<'a>(
             validate_exact_body_length(body, command, 0)?;
             ClassicCommand::ResetConnection
         }
+        // Measured on MySQL 8.4.11: bytes after the command are ignored.
+        COM_STATISTICS => ClassicCommand::Statistics,
         // Measured on MySQL 8.4.11: bytes after the two of the option are
         // ignored, and fewer than two answer 1835.
         COM_SET_OPTION => {

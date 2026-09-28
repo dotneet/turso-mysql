@@ -2293,6 +2293,41 @@ where
         }
     }
 
+    fn question_asked(&mut self) {
+        if let Some(listed) = &self.listed {
+            listed.question_asked();
+        }
+    }
+
+    /// Measured on MySQL 8.4.11, the line reads `Uptime: 106  Threads: 2
+    /// Questions: 52  Slow queries: 0  Opens: 136  Flush tables: 3  Open
+    /// tables: 55  Queries per second avg: 0.490`, the average cut to three
+    /// places rather than rounded. `Questions` counts every command and each
+    /// statement of a query holding several, `COM_STATISTICS` itself among
+    /// them, and no sign-in. This server keeps no count of slow queries or
+    /// of opened tables, so those four are left out rather than made up; the
+    /// `mysql` client prints whatever follows `Uptime` as it comes. `Threads`
+    /// is the sessions logged in, where MySQL also counts its own threads —
+    /// the event scheduler's — and connections still signing in. A session
+    /// the runtime did not accept has none of it.
+    fn statistics(&self) -> Option<String> {
+        self.listed.as_ref()?;
+        let sessions = self.catalog.sessions();
+        let uptime = sessions.uptime().as_secs();
+        let questions = sessions.questions();
+        let per_second_in_thousandths = if uptime == 0 {
+            0
+        } else {
+            u128::from(questions) * 1000 / u128::from(uptime)
+        };
+        Some(format!(
+            "Uptime: {uptime}  Threads: {}  Questions: {questions}  Queries per second avg: {}.{:03}",
+            sessions.logged_in(),
+            per_second_in_thousandths / 1000,
+            per_second_in_thousandths % 1000,
+        ))
+    }
+
     fn execute_init_db(
         &mut self,
         database: &str,

@@ -6613,6 +6613,22 @@ of the option are ignored, another option is 1047 `Unknown command` (SQLSTATE
 (`HY000`). The warning count here is always 0, where MySQL's carries the
 previous statement's.
 
+`COM_STATISTICS` (0x09), which the `mysql` client's `status` and
+`mysqladmin status` send, is answered with the counters this server keeps,
+where it used to answer 1235. Measured on MySQL 8.4.11 the answer is one bare
+packet numbered 1 — `Uptime: 106  Threads: 2  Questions: 52  Slow queries: 0
+Opens: 136  Flush tables: 3  Open tables: 55  Queries per second avg: 0.490`
+— bytes after the command are ignored, and `Questions` counts every command,
+the statistics command itself among them, and each statement of a query
+holding several on its own, over every session, and no sign-in. This answers
+`Uptime: N  Threads: N  Questions: N  Queries per second avg: N.NNN`, the
+average cut to three places as MySQL cuts it. `Slow queries`, `Opens`,
+`Flush tables` and `Open tables` are left out rather than made up, since this
+server counts none of them; the `mysql` client prints whatever follows
+`Uptime` as it comes. `Threads` is the sessions logged in, where MySQL also
+counts its own threads, the event scheduler's among them, and connections
+still signing in. A session the runtime did not accept answers 1235.
+
 Account administration has a deliberately narrow SQL surface: `CREATE USER
 'name'@'%' IDENTIFIED BY 'password'`, `GRANT SELECT ON db.table TO
 'name'@'%'`, and the matching `REVOKE`. The offline provisioner must explicitly

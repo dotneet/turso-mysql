@@ -272,6 +272,16 @@ pub trait CommandExecutor {
     /// it is not otherwise told about.
     fn command_arrived(&mut self, _command: ArrivedCommand) {}
 
+    /// Counts one command, or one more statement of a query holding several,
+    /// toward what `COM_STATISTICS` reports as `Questions`.
+    fn question_asked(&mut self) {}
+
+    /// Returns the line `COM_STATISTICS` answers, or `None` where this
+    /// executor keeps none of the counters it reports.
+    fn statistics(&self) -> Option<String> {
+        None
+    }
+
     /// Executes `COM_INIT_DB` without owning the borrowed database text.
     fn execute_init_db(
         &mut self,
@@ -393,6 +403,7 @@ impl CommandDispatcher {
             },
             Err(_) => ArrivedCommand::Other,
         });
+        executor.question_asked();
         let command = match command {
             Ok(command) => command,
             Err(ConnectionStateError::Command(error)) if is_unsupported_command(&error) => {
@@ -449,6 +460,10 @@ impl CommandDispatcher {
             ClassicCommand::Quit => Ok(Vec::new()),
             ClassicCommand::SetOption { option } => {
                 let answer = set_option(connection, executor, option);
+                close_on_response_error(connection, answer)
+            }
+            ClassicCommand::Statistics => {
+                let answer = statistics(connection, executor);
                 close_on_response_error(connection, answer)
             }
             ClassicCommand::InitDb { database } => {
@@ -638,6 +653,27 @@ fn set_option<E: CommandExecutor + ?Sized>(
     Ok(vec![answer])
 }
 
+/// Answers the one-line statistics as a bare packet, numbered 1, which is
+/// how MySQL answers it.
+fn statistics<E: CommandExecutor + ?Sized>(
+    connection: &ClassicConnection,
+    executor: &E,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    let capabilities = negotiated_capabilities(connection)?;
+    let Some(line) = executor.statistics() else {
+        return encode_frontend_error(
+            connection.response_packet_codec(),
+            capabilities,
+            FrontendErrorKind::Unsupported,
+        );
+    };
+    let answer = connection
+        .response_packet_codec()
+        .encode(SERVER_RESPONSE_SEQUENCE_ID, line.as_bytes())
+        .map_err(ResponsePacketError::from)?;
+    Ok(vec![answer])
+}
+
 /// Numbers every packet of an answer in order, a row split into several
 /// packets taking a number for each of them.
 fn number_the_answer(frames: &mut [Vec<u8>], first_sequence_id: u8) {
@@ -689,6 +725,9 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
             break;
         }
         let more_results = index + 1 < statements.len();
+        if index > 0 {
+            executor.question_asked();
+        }
         let result = executor.execute_query(statement);
         let failed = result.is_err();
         let result_is_set = matches!(&result, Ok(CommandExecutionResult::ResultSet(_)));
@@ -1635,9 +1674,18 @@ mod tests {
         reset_result: Option<Result<(), FrontendErrorKind>>,
         execute_result: Option<Result<PreparedStatementExecutionResult, FrontendErrorKind>>,
         execute_calls: Vec<(u32, Vec<u8>)>,
+        questions: u64,
     }
 
     impl CommandExecutor for TestExecutor {
+        fn question_asked(&mut self) {
+            self.questions += 1;
+        }
+
+        fn statistics(&self) -> Option<String> {
+            Some(format!("Uptime: 7  Questions: {}", self.questions))
+        }
+
         fn status_flags(&self) -> u16 {
             if self.status_flags == 0 {
                 SERVER_STATUS_AUTOCOMMIT
@@ -2179,6 +2227,76 @@ mod tests {
         assert_eq!(
             connection.negotiated_capabilities().unwrap() & CLIENT_MULTI_STATEMENTS,
             0
+        );
+    }
+
+    /// Measured on MySQL 8.4.11: the statistics line comes back as a bare
+    /// packet numbered 1, bytes after the command are ignored, and every
+    /// command counts toward `Questions` — the statistics command itself too
+    /// — with each statement of a query holding several counted on its own.
+    #[test]
+    fn statistics_answers_a_bare_line_counting_every_command_and_statement() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES
+            | CLIENT_MULTI_STATEMENTS
+            | CLIENT_MULTI_RESULTS;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = TestExecutor {
+            query_results: VecDeque::from([
+                Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+                Ok(CommandExecutionResult::Ok(CommandOkResult::default())),
+            ]),
+            ..TestExecutor::default()
+        };
+        for frame in [
+            command(crate::COM_PING, &[]),
+            command(crate::COM_QUERY, b"SET @x = 1; SET @y = 2"),
+        ] {
+            dispatch_command_frame(&mut connection, &mut executor, &frame).unwrap();
+        }
+        let answer = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STATISTICS, b"ignored"),
+        )
+        .unwrap();
+        assert_eq!(answer.len(), 1);
+        let answer = CODEC.decode(&answer[0]).unwrap();
+        assert_eq!(answer.sequence_id, 1);
+        assert_eq!(answer.payload, b"Uptime: 7  Questions: 4");
+    }
+
+    #[test]
+    fn statistics_without_counters_is_refused() {
+        struct NoCounters(TestExecutor);
+        impl CommandExecutor for NoCounters {
+            fn execute_init_db(
+                &mut self,
+                database: &str,
+            ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+                self.0.execute_init_db(database)
+            }
+
+            fn execute_query(
+                &mut self,
+                sql: &str,
+            ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+                self.0.execute_query(sql)
+            }
+        }
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES;
+        let mut connection = ready_connection(capabilities);
+        let mut executor = NoCounters(TestExecutor::default());
+        let answer = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STATISTICS, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::ErrPacket::decode(CODEC, &answer[0], capabilities)
+                .unwrap()
+                .error_code,
+            1235
         );
     }
 
