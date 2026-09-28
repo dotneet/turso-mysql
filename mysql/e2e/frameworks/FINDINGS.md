@@ -435,3 +435,60 @@ CLI's `status`) answers 1235; the step still passes.
 - The proxy logs a handshake the server closes without answering, as an
   `authenticate` entry naming the client's capabilities, collation and plugin,
   and `E2E_PROXY_DUMP=1` writes every packet in hex to `packets.txt`.
+
+# Seventh to ninth runs
+
+All three on 2026-09-28; every app passes every step against MySQL 8.4.11.
+
+The seventh run (at `264217efb`) kept the first nine apps where the fifth left
+them, but one Prisma connection was refused with 1045 at sign-in and passed
+when Prisma was run again alone. Two of its tries also ended with the turso
+container exiting at boot, unable to create `/log/server.log` in the
+bind-mounted directory `run.sh` had just emptied; `boot-turso.sh` now waits
+for the directory before starting anything.
+
+The eighth run (at `b5f306c4a`) came after the Java, protocol and Node work
+and the fix for a key over a value stored rewritten — a `DATETIME(6)` written
+without its fraction, which had stopped Spring's `delete p1_0 from posts p1_0`:
+
+| app | steps passing on turso |
+|---|---|
+| django, gorm, laravel, mysqlcli, mysqldump, rails, sqlalchemy, typeorm | all |
+| spring | 46/46 (was 2/46) |
+| drizzle | 17/20 (was 0/20) |
+| sequelize | 16/23 (was 2/23) |
+| prisma | 13/22 |
+| dbtools | 4/11 (was 3/11) |
+| efcore | 1/21 |
+| sqlx | 1/22 |
+
+Prisma's loss was one of its two concurrent `tag.create` calls answering 1205
+at once: the table's id counter lets one step in at a time and the frontend
+passed its `Busy` straight up. Each counter step now waits its turn for as
+long as the session waits for any lock (`c468c2f57`).
+
+The ninth run (at `c468c2f57`) has Prisma back at 22/22 and everything else as
+in the eighth, except one Spring step (`server-prep/revert-migration`) whose
+new connection was closed by the server before any answer; it passed in the
+eighth run. With Prisma's 1045 of the seventh run, that makes two sign-ins
+refused once each in a full run and never when an app runs alone, which is
+being looked into.
+
+What still fails on turso alone:
+
+- sqlx: `CREATE TABLE IF NOT EXISTS _sqlx_migrations (... installed_on
+  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, success BOOLEAN NOT NULL,
+  checksum BLOB NOT NULL ...)` answers 1235, so no migration runs and every
+  later step finds no table.
+- EF Core: a derived table over no table (`SELECT s.Value FROM (SELECT
+  CONCAT(VERSION(), ' ', DATABASE()) AS Value) AS s LIMIT 2`), the scaffold's
+  `information_schema.TABLES` read with `IF(...)`, its include and aggregate
+  queries (1064), and `UPDATE Users AS u SET u.Balance = ...` (1235).
+- Sequelize: table names read back lowercased (`sequelizemeta`), a join in
+  parentheses (`LEFT OUTER JOIN (a INNER JOIN b ON ...) ON ...`, 1064),
+  `UPDATE posts SET body = CONCAT(COALESCE(body, ''), '!')` (1235).
+- Drizzle: its relational queries and a `count(...)` over a left join grouped
+  by the key (1064).
+- dbtools: `getTablePrivileges`, `SHOW PLUGINS`, `information_schema.PARTITIONS`,
+  Workbench's `performance_schema` join and `EXPLAIN`, all left refused on
+  purpose for now: none of them can be answered truthfully yet.
