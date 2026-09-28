@@ -1,8 +1,8 @@
 //! Pathless Core attachment through the trusted MySQL database registry.
 
 use crate::named_locks::MySqlNamedLocks;
-use std::collections::BTreeMap;
 use crate::session_registry::MySqlSessionRegistry;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
