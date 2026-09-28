@@ -9434,6 +9434,11 @@ fn scalar_call_column_definition(
         return Err(FrontendErrorKind::Internal);
     };
     let (table, ordinal) = source_metadata.column_named(column_name)?;
+    if function == ScalarFunction::CastsToText {
+        if let Some(catalog_column) = table.catalog_columns.get(ordinal) {
+            return catalog_words_written_out(name, catalog_column);
+        }
+    }
     let source = table
         .columns
         .get(ordinal)
@@ -10366,6 +10371,43 @@ fn scalar_call_column_definition(
         // unsigned and zerofilled, and a checksum is never negative, so the
         // sign is put back after the flags every call shares.
         definition.flags |= MYSQL_UNSIGNED_FLAG;
+    }
+    Ok(definition)
+}
+
+/// What `CAST(col AS CHAR)` reports over an `information_schema` column of
+/// words, which sqlx writes because it will not read a column carrying the
+/// binary flag as text: `CAST(TABLE_NAME AS CHAR)` and `CAST(COLUMN_TYPE AS
+/// CHAR)`.
+///
+/// Measured on MySQL 8.4.11 over a sorted read — the shape every catalog
+/// column here already takes: a word keeps its type, width and decimals and
+/// loses every flag, 256 wide over `TABLE_NAME`; a `BLOB` of words is four
+/// times as wide again and keeps only the blob flag, 268435440 over
+/// `COLUMN_TYPE`. A column of numbers or an `ENUM` has not been measured.
+#[cfg(unix)]
+fn catalog_words_written_out(
+    name: String,
+    catalog_column: &ColumnDefinitionConfig,
+) -> Result<ColumnDefinitionConfig, FrontendErrorKind> {
+    if catalog_column.character_set == MYSQL_BINARY_COLLATION {
+        return Err(FrontendErrorKind::Unsupported);
+    }
+    let mut definition = ColumnDefinitionConfig::new(name, catalog_column.column_type);
+    definition.character_set = catalog_column.character_set;
+    definition.decimals = catalog_column.decimals;
+    match catalog_column.column_type {
+        MYSQL_TYPE_VAR_STRING => {
+            definition.column_length = catalog_column.column_length;
+            definition.flags = 0;
+        }
+        MYSQL_TYPE_BLOB => {
+            definition.column_length = catalog_column
+                .column_length
+                .saturating_mul(UTF8MB4_MAX_BYTES_PER_CHARACTER);
+            definition.flags = MYSQL_BLOB_FLAG;
+        }
+        _ => return Err(FrontendErrorKind::Unsupported),
     }
     Ok(definition)
 }

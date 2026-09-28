@@ -3779,6 +3779,17 @@ answer reports the column's own shape — its type, length, collation and flags
 flag off it. A catalog column beside a written value or another column, or
 under `IFNULL` or `COALESCE`, stays refused.
 
+`CAST(col AS CHAR)` over an `information_schema` column of words is taken
+too. sqlx will not read a column carrying the binary flag as text, and every
+name in the catalog carries it, so an app on sqlx lists its tables with
+`SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES ...` and a
+table's columns with `CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR)`.
+Measured on 8.4.11 over a sorted read, the shape every catalog column here
+takes: a word keeps its type, width and decimals and loses every flag, 256
+wide over `TABLE_NAME`, and a `BLOB` of words is four times as wide again with
+only the blob flag, 268435440 over `COLUMN_TYPE`. A catalog number or `ENUM`
+written out stays refused.
+
 `DATABASE()` and `SCHEMA()` after the `FROM` of a query reading
 `information_schema` are the selected database's name, or NULL when none is
 selected, which is what they answer; this is how Rails, Django and Laravel

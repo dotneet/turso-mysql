@@ -237,3 +237,87 @@ fn sqlx_keeps_its_migrations_under_a_signed_bigint_key() {
         ]]
     );
 }
+
+/// sqlx will not read a column carrying the binary flag as text, and every
+/// name `information_schema` holds carries it, so an app listing its tables
+/// and a table's columns writes each name out with `CAST(... AS CHAR)`.
+/// Measured on MySQL 8.4.11: the cast keeps the name's type and width and
+/// drops every flag, and over `COLUMN_TYPE`, a `BLOB` of words, is four times
+/// as wide again with only the blob flag left.
+#[test]
+fn sqlx_lists_tables_and_columns_with_the_names_written_out() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE posts (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(200) NOT NULL, views INT NOT NULL DEFAULT 0)",
+    );
+    let tables = prepared_rows(
+        &mut adapter,
+        "SELECT CAST(TABLE_NAME AS CHAR) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME",
+        &[],
+    );
+    assert_eq!(
+        shapes(&tables.columns),
+        [(MYSQL_TYPE_VAR_STRING, 0, 256, 0)]
+    );
+    assert_eq!(
+        tables.rows,
+        [
+            [BinaryResultValue::Text("posts".to_owned())],
+            [BinaryResultValue::Text("records".to_owned())],
+        ]
+    );
+
+    let columns = prepared_rows(
+        &mut adapter,
+        "SELECT CAST(COLUMN_NAME AS CHAR), CAST(COLUMN_TYPE AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+        &[Bound::Word("posts")],
+    );
+    assert_eq!(
+        shapes(&columns.columns),
+        [
+            (MYSQL_TYPE_VAR_STRING, 0, 256, 0),
+            (MYSQL_TYPE_BLOB, 0x10, 268435440, 0),
+        ]
+    );
+    let names: Vec<(String, String)> = columns
+        .rows
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [BinaryResultValue::Text(name), BinaryResultValue::Blob(declared)] => {
+                (name.clone(), String::from_utf8(declared.clone()).unwrap())
+            }
+            other => panic!("a name and a type, answered {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("id".to_owned(), "bigint unsigned".to_owned()),
+            ("title".to_owned(), "varchar(200)".to_owned()),
+            ("views".to_owned(), "int".to_owned()),
+        ]
+    );
+
+    // A catalog number written out has not been measured.
+    assert_eq!(
+        adapter.execute_query(
+            "SELECT CAST(ORDINAL_POSITION AS CHAR) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'posts'"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    );
+}
+
+fn shapes(columns: &[ColumnDefinitionConfig]) -> Vec<(u8, u16, u32, u8)> {
+    columns
+        .iter()
+        .map(|column| {
+            (
+                column.column_type,
+                column.flags,
+                column.column_length,
+                column.decimals,
+            )
+        })
+        .collect()
+}
