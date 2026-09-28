@@ -389,6 +389,13 @@ impl MySqlSessionVariables {
         }
     }
 
+    /// Notes that the statement that answered rows asked with
+    /// `SQL_CALC_FOUND_ROWS` for the rows it answers without its `LIMIT`,
+    /// which `FOUND_ROWS()` reads instead of the rows it answered.
+    pub(crate) fn note_found_rows(&mut self, found: u64) {
+        self.statement_counts.found_rows = Some(found);
+    }
+
     /// The collation ID every text column of a result reports.
     pub(crate) const fn connection_collation_id(&self) -> u16 {
         self.connection_collation.id()

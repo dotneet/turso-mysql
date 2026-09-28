@@ -525,3 +525,105 @@ fn a_count_on_the_outer_side_of_a_left_join_is_nullable() {
         )
         .is_err());
 }
+
+/// The mysql command-line run's pagination: `SELECT SQL_CALC_FOUND_ROWS id,
+/// title FROM posts ORDER BY id LIMIT 2 OFFSET 1; SELECT FOUND_ROWS()`.
+/// Measured on MySQL 8.4.11: `FOUND_ROWS()` answers the rows the statement
+/// answers without its `LIMIT` — its groups, its distinct rows, and all of
+/// them past an offset beyond the last — and the statement warns 1287.
+#[test]
+fn found_rows_counts_what_a_limit_left_out_after_sql_calc_found_rows() {
+    let (_directory, mut adapter) = adapter();
+    for (sql, rows, found) in [
+        (
+            "SELECT SQL_CALC_FOUND_ROWS id, title FROM posts ORDER BY id LIMIT 2 OFFSET 1",
+            vec![["2", "Second"], ["3", "Carols post"]],
+            "3",
+        ),
+        (
+            "SELECT SQL_CALC_FOUND_ROWS id, title FROM posts ORDER BY id LIMIT 2 OFFSET 5",
+            Vec::new(),
+            "3",
+        ),
+        (
+            "SELECT SQL_CALC_FOUND_ROWS id, title FROM posts ORDER BY id LIMIT 1, 1",
+            vec![["2", "Second"]],
+            "3",
+        ),
+        (
+            "SELECT SQL_CALC_FOUND_ROWS id, title FROM posts WHERE id > 1 ORDER BY id",
+            vec![["2", "Second"], ["3", "Carols post"]],
+            "2",
+        ),
+    ] {
+        let answered = arrived(&mut adapter, sql);
+        assert_eq!(
+            text_rows(&answered),
+            rows.iter()
+                .map(|row| row.map(|value| Some(value.to_owned())).to_vec())
+                .collect::<Vec<_>>(),
+            "{sql}"
+        );
+        assert_eq!(answered.warnings, 1, "{sql}");
+        assert_eq!(
+            text_rows(&arrived(&mut adapter, "SHOW WARNINGS")),
+            [[
+                Some("Warning".to_owned()),
+                Some("1287".to_owned()),
+                Some("SQL_CALC_FOUND_ROWS is deprecated and will be removed in a future release. Consider using two separate queries instead.".to_owned()),
+            ]],
+            "{sql}"
+        );
+        arrived(&mut adapter, sql);
+        assert_eq!(
+            text_rows(&arrived(&mut adapter, "SELECT FOUND_ROWS()")),
+            [[Some(found.to_owned())]],
+            "{sql}"
+        );
+    }
+    for (sql, found) in [
+        (
+            "SELECT SQL_CALC_FOUND_ROWS user_id, COUNT(*) FROM posts GROUP BY user_id ORDER BY user_id LIMIT 1",
+            "2",
+        ),
+        (
+            "SELECT SQL_CALC_FOUND_ROWS DISTINCT user_id FROM posts ORDER BY user_id LIMIT 1",
+            "2",
+        ),
+    ] {
+        arrived(&mut adapter, sql);
+        assert_eq!(
+            text_rows(&arrived(&mut adapter, "SELECT FOUND_ROWS()")),
+            [[Some(found.to_owned())]],
+            "{sql}"
+        );
+    }
+    // Without the modifier, the rows answered.
+    arrived(&mut adapter, "SELECT id FROM posts LIMIT 1");
+    assert_eq!(
+        text_rows(&arrived(&mut adapter, "SELECT FOUND_ROWS()")),
+        [[Some("1".to_owned())]]
+    );
+    // MySQL answers 1234 for it in a subquery. A bound value, a `WITH` and a
+    // prepared statement are refused: the count reads the statement a
+    // second time, and a prepared one is not read back.
+    for sql in [
+        "SELECT id FROM posts WHERE id IN (SELECT SQL_CALC_FOUND_ROWS id FROM posts)",
+        "SELECT SQL_CALC_FOUND_ROWS id FROM posts UNION SELECT id FROM users",
+        "WITH p AS (SELECT id FROM posts) SELECT SQL_CALC_FOUND_ROWS id FROM p LIMIT 1",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert!(adapter
+        .execute_stmt_prepare("SELECT SQL_CALC_FOUND_ROWS id FROM posts LIMIT 1")
+        .is_err());
+}
+
+/// Runs one statement the way a `COM_QUERY` carrying it reaches the session.
+fn arrived(
+    adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+    sql: &str,
+) -> TextResultSet {
+    adapter.command_arrived(ArrivedCommand::Query);
+    result_set(adapter, sql)
+}

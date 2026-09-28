@@ -280,7 +280,7 @@ mod tests {
         )
         .is_ok());
         assert!(crate::parse_select(
-            "SELECT SQL_CALC_FOUND_ROWS * FROM records",
+            "SELECT SQL_BUFFER_RESULT * FROM records",
             crate::SessionSqlMode::default()
         )
         .is_err());

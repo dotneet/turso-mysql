@@ -400,6 +400,8 @@ pub(crate) struct RenderedSelect {
     /// Whether a `GROUP_CONCAT` is rendered, whose cut this rendering warns
     /// about rather than fails on.
     pub(crate) concatenates_groups: bool,
+    /// Whether the statement notes the rows it answers without its `LIMIT`.
+    pub(crate) calculates_found_rows: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,6 +588,20 @@ pub(crate) fn translate_select_query(
         [source] => Some(source.table.clone()),
         _ => None,
     };
+    // Measured on MySQL 8.4.11: `FOUND_ROWS()` after `SQL_CALC_FOUND_ROWS`
+    // answers the rows the statement answers without its `LIMIT` — its groups
+    // or its distinct rows, and all of them past an offset beyond the last.
+    // The count reads the statement as it stands before its `ORDER BY`, so a
+    // bound value, which it would bind a second time, and a `WITH`, which it
+    // would read outside of, are refused.
+    let found_rows_counted = if render_context.calculates_found_rows {
+        if render_context.parameter_count > 0 || query.with.is_some() {
+            return unsupported("SQL_CALC_FOUND_ROWS with a bound value or a WITH");
+        }
+        Some(format!("(SELECT COUNT(*) FROM ({normalized}))"))
+    } else {
+        None
+    };
     if let Some(order_by) = &query.order_by {
         if let SetExpr::Select(select) = query.body.as_ref() {
             grouping::hold_the_grouped_order_by(order_by, select)?;
@@ -601,11 +617,24 @@ pub(crate) fn translate_select_query(
     // its ordinal from where it stands in the statement, and a client binds by
     // that ordinal.
     let mut row_count_parameters = Vec::new();
-    if let Some(limit) = &query.limit_clause {
+    if let Some(counted) = &found_rows_counted {
+        let limit = match &query.limit_clause {
+            Some(limit) => render_select_limit(
+                limit,
+                &mut render_context,
+                &mut row_count_parameters,
+                Some(counted),
+            )?,
+            // `LIMIT -1` keeps every row, as no `LIMIT` does.
+            None => format!(" LIMIT {}", note_found_rows(counted, "-1")),
+        };
+        normalized.push_str(&limit);
+    } else if let Some(limit) = &query.limit_clause {
         normalized.push_str(&render_select_limit(
             limit,
             &mut render_context,
             &mut row_count_parameters,
+            None,
         )?);
     }
     // Measured on MySQL 8.4.11: `ORDER BY GROUP_CONCAT(a)` with no such call
@@ -636,6 +665,7 @@ pub(crate) fn translate_select_query(
         row_count_parameters,
         parameter_count: render_context.parameter_count,
         concatenates_groups: render_context.group_concat_calls > 0,
+        calculates_found_rows: render_context.calculates_found_rows,
     })
 }
 
@@ -806,7 +836,9 @@ fn render_select_body(
                 || modifiers.sql_small_result
                 || modifiers.sql_big_result
                 || modifiers.sql_buffer_result
-                || modifiers.sql_calc_found_rows
+                // MySQL answers 1234 for it anywhere but the statement's own
+                // `SELECT`.
+                || (modifiers.sql_calc_found_rows && !render_context.renders_the_outer_projection)
         })
         || select.top.is_some()
         || select.top_before_distinct
@@ -835,6 +867,10 @@ fn render_select_body(
     // else — a subquery, a branch of a `UNION` — the engine would read the
     // text it is worked out to.
     let outer_projection = std::mem::take(&mut render_context.renders_the_outer_projection);
+    render_context.calculates_found_rows |= select
+        .select_modifiers
+        .as_ref()
+        .is_some_and(|modifiers| modifiers.sql_calc_found_rows);
     render_context.renders_a_projection_item = false;
     let outer_counts_in_having = std::mem::replace(
         &mut render_context.counts_group_concat_in_having,
@@ -1598,6 +1634,7 @@ fn render_counted_derived_table(
             limit,
             render_context,
             &mut bound_row_counts,
+            None,
         )?);
         if !bound_row_counts.is_empty() {
             return unsupported("bound row count in a counted derived table");
@@ -2445,6 +2482,7 @@ fn render_select_limit(
     clause: &sqlparser::ast::LimitClause,
     render_context: &mut SelectRenderContext<'_>,
     row_count_parameters: &mut Vec<usize>,
+    found_rows_counted: Option<&str>,
 ) -> Result<String, ParseError> {
     use sqlparser::ast::{LimitClause, OffsetRows};
 
@@ -2486,6 +2524,10 @@ fn render_select_limit(
             render_context,
             row_count_parameters,
         )?;
+        let limit = match found_rows_counted {
+            Some(counted) => note_found_rows(counted, &limit),
+            None => limit,
+        };
         return Ok(format!(" LIMIT {offset}, {limit}"));
     }
     let limit = render_written_row_count(
@@ -2494,6 +2536,10 @@ fn render_select_limit(
         render_context,
         row_count_parameters,
     )?;
+    let limit = match found_rows_counted {
+        Some(counted) => note_found_rows(counted, &limit),
+        None => limit,
+    };
     let mut rendered = format!(" LIMIT {limit}");
     if let Some(offset) = offset {
         rendered.push_str(&format!(
@@ -2507,6 +2553,14 @@ fn render_select_limit(
         ));
     }
     Ok(rendered)
+}
+
+/// Writes a `LIMIT`'s count so that working it out notes the rows the
+/// statement answers without it, which `FOUND_ROWS()` reads next. The engine
+/// works a `LIMIT` out once, before the first row, inside the statement's own
+/// read of the database.
+fn note_found_rows(counted: &str, limit: &str) -> String {
+    format!("mysql_note_found_rows({counted}, {limit})")
 }
 
 /// Which of a `LIMIT`'s two counts a written number is.
@@ -4622,6 +4676,9 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the derived table about to be rendered is one the statement
     /// only counts the rows of, which nothing reads a column of.
     counts_the_rows_of_the_derived_table: bool,
+    /// Whether the statement's own `SELECT` asked with `SQL_CALC_FOUND_ROWS`
+    /// for the rows it would answer without its `LIMIT`.
+    calculates_found_rows: bool,
     orders_a_bare_column: bool,
     checks_type_sensitive_expression: bool,
     /// Whether a `CASE`, `IF`, `IFNULL` or `COALESCE` naming a column was
@@ -4710,6 +4767,7 @@ impl<'a> SelectRenderContext<'a> {
             subquery_tables: Vec::new(),
             renders_the_outer_projection: false,
             counts_the_rows_of_the_derived_table: false,
+            calculates_found_rows: false,
             orders_a_bare_column: false,
             checks_type_sensitive_expression: false,
             renders_a_condition_without_column_types: false,

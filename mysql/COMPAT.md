@@ -5258,8 +5258,18 @@ not report, the count is not known and a call reading it is refused until a
 statement says what it is again: `FOUND_ROWS()` after an `UPDATE` (MySQL makes
 it the rows the `UPDATE` matched), after `SHOW ERRORS`, and both after a
 prepared-statement command, a `COM_RESET_CONNECTION`, or a `COM_QUERY` refused
-before any statement of it ran. `SQL_CALC_FOUND_ROWS`, which asks `FOUND_ROWS()`
-for the rows a `LIMIT` left out, is refused; MySQL has deprecated it. A
+before any statement of it ran. `SQL_CALC_FOUND_ROWS` on a statement's own
+`SELECT` asks `FOUND_ROWS()` for the rows the statement answers without its
+`LIMIT` instead — measured on 8.4.11, its groups or its distinct rows, and all
+of them past an offset beyond the last — and warns 1287, as MySQL, which has
+deprecated it, does. The count is worked out inside the statement's own read
+of the database: its `LIMIT` is written as a call counting the statement
+without its `ORDER BY` and `LIMIT`, which the engine works out once before the
+first row, so the count and the rows answered come from the same rows. In a
+subquery or a `UNION` it is refused, where MySQL answers 1234 for the first; so
+is one beside a bound value or a `WITH`, which the count would read a second
+time, and one in a prepared statement, whose count would not be read back.
+MySQL also warns 1287 for `FOUND_ROWS()` itself, which this server does not. A
 connection the runtime did not accept knows neither its login nor its ID nor
 its counts, and refuses each of these calls.
 

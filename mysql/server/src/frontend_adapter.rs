@@ -2152,8 +2152,18 @@ where
             });
         }
         let result = self.execute_client_query(sql);
+        let found_rows_before_the_limit = self
+            .session
+            .connection()
+            .ok()
+            .and_then(MySqlConnection::take_found_rows_before_the_limit);
         let result = self.answer_what_is_missing(sql, result);
         self.session_variables.note_statement_outcome(sql, &result);
+        if let (Some(found), Ok(CommandExecutionResult::ResultSet(_))) =
+            (found_rows_before_the_limit, &result)
+        {
+            self.session_variables.note_found_rows(found);
+        }
         if let Some(listed) = &self.listed {
             listed.statement_ended(self.session.selected_database());
         }
@@ -4079,6 +4089,9 @@ fn execute_checked_query(
             the_shorter_limit(query_timeout, select_time_limit),
         )?;
         result.status_flags = connection_status_flags(connection);
+        if connection.noted_found_rows_before_the_limit() {
+            raised.push(MySqlWarning::calculating_found_rows_is_deprecated());
+        }
         raised.extend(
             connection
                 .take_group_concat_cuts()
@@ -10435,6 +10448,16 @@ impl MySqlWarning {
             level: "Warning",
             code: 138,
             message: "InnoDB: WITH CONSISTENT SNAPSHOT was ignored because this phrase can only be used with REPEATABLE READ isolation level.".to_owned(),
+        }
+    }
+
+    /// The warning MySQL raises for `SQL_CALC_FOUND_ROWS`. Measured on MySQL
+    /// 8.4.11: `Warning`, code 1287, and this message.
+    fn calculating_found_rows_is_deprecated() -> Self {
+        Self {
+            level: "Warning",
+            code: 1287,
+            message: "SQL_CALC_FOUND_ROWS is deprecated and will be removed in a future release. Consider using two separate queries instead.".to_owned(),
         }
     }
 

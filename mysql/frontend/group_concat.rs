@@ -21,6 +21,8 @@ use std::collections::HashMap;
 
 use turso_core::{Connection, LimboError, Result, Value};
 
+use crate::call_state::with_call_state;
+
 pub(crate) const MYSQL_GROUP_CONCAT: &str = "mysql_group_concat";
 pub(crate) const MYSQL_GROUP_CONCAT_COUNT: &str = "mysql_group_concat_count";
 
@@ -33,7 +35,7 @@ pub const DEFAULT_GROUP_CONCAT_MAX_LEN: u64 = 1024;
 
 /// What a session's `GROUP_CONCAT` calls keep between groups, left on the
 /// engine connection because each call is worked out once per group.
-struct GroupConcatProgress {
+pub(crate) struct GroupConcatProgress {
     max_len: u64,
     calls: HashMap<i64, CallProgress>,
     cuts: Vec<Cut>,
@@ -100,12 +102,7 @@ fn with_progress<T>(
     connection: &Connection,
     read: impl FnOnce(&mut GroupConcatProgress) -> T,
 ) -> T {
-    let mut state = connection.mysql_function_state();
-    let state = state.get_or_insert_with(|| Box::new(GroupConcatProgress::default()));
-    let progress = state
-        .downcast_mut::<GroupConcatProgress>()
-        .expect("only GROUP_CONCAT keeps state on a MySQL connection");
-    read(progress)
+    with_call_state(connection, |state| read(&mut state.group_concat))
 }
 
 /// `mysql_group_concat(gathered, separator, call, on_cut)`, and

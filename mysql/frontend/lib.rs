@@ -1,6 +1,7 @@
 //! MySQL frontend for Turso.
 
 mod alter_table_indexes;
+mod call_state;
 mod catalog_tables;
 mod create_table_as_select;
 #[cfg(unix)]
@@ -12,6 +13,7 @@ mod database_open;
 mod database_registry;
 mod dialect;
 mod drop_table;
+mod found_rows;
 mod group_concat;
 pub mod named_locks;
 pub mod schema_sql;

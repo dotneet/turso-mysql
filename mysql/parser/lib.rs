@@ -945,6 +945,9 @@ pub struct TranslatedSelect {
     /// Whether a `GROUP_CONCAT` is rendered, whose cut this rendering warns
     /// about rather than fails on.
     concatenates_groups: bool,
+    /// Whether `SQL_CALC_FOUND_ROWS` asked for the rows the statement answers
+    /// without its `LIMIT`.
+    calculates_found_rows: bool,
     collation_sensitive_call_columns: Vec<String>,
     json_reading_columns: Vec<String>,
     reads_table: bool,
@@ -1715,6 +1718,12 @@ impl TranslatedSelect {
     /// of.
     pub const fn locks_rows(&self) -> bool {
         self.locks_rows
+    }
+
+    /// Reports whether `SQL_CALC_FOUND_ROWS` asked for the rows the statement
+    /// answers without its `LIMIT`, which running it notes on the connection.
+    pub const fn calculates_found_rows(&self) -> bool {
+        self.calculates_found_rows
     }
 
     /// Returns which parameters stand where a row count is written.
@@ -4388,6 +4397,7 @@ fn parse_select_inner(
         compares_a_large_decimal_integer,
         checked_subquery_comparisons,
         concatenates_groups,
+        calculates_found_rows,
     } = translate_select_query(
         &query,
         sql,
@@ -4427,6 +4437,7 @@ fn parse_select_inner(
         row_count_parameters,
         parameter_count,
         concatenates_groups,
+        calculates_found_rows,
     })
 }
 

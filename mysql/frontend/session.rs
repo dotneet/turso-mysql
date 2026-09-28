@@ -1624,6 +1624,15 @@ impl MySqlConnection {
                         error.to_string(),
                     ))
                 })?;
+                // The count it notes is read after a statement run as text,
+                // and a prepared one would leave it unread.
+                if translated.calculates_found_rows() {
+                    return Err(MySqlPreparedStatementError::Prepare(
+                        MySqlQueryError::Unsupported(
+                            "SQL_CALC_FOUND_ROWS in a prepared statement".to_string(),
+                        ),
+                    ));
+                }
                 static_result_metadata = translated.static_result_metadata().to_vec();
                 let statement = translated.parse_ast().map_err(|error| {
                     MySqlPreparedStatementError::Prepare(MySqlQueryError::Syntax(error.to_string()))
@@ -3279,6 +3288,19 @@ impl MySqlConnection {
     /// MySQL warns about them, each the row its warning 1260 names.
     pub fn take_group_concat_cuts(&self) -> Vec<u64> {
         crate::group_concat::take_cut_rows(&self.inner)
+    }
+
+    /// How many rows the last `SQL_CALC_FOUND_ROWS` statement would have
+    /// answered without its `LIMIT`, if the last statement was one. Reading
+    /// it forgets it, so a statement that is not one leaves nothing behind.
+    pub fn take_found_rows_before_the_limit(&self) -> Option<u64> {
+        crate::found_rows::take(&self.inner)
+    }
+
+    /// Whether the statement that ran noted the rows it answers without its
+    /// `LIMIT`, left for `take_found_rows_before_the_limit` to read.
+    pub fn noted_found_rows_before_the_limit(&self) -> bool {
+        crate::found_rows::noted(&self.inner)
     }
 
     /// Takes the lock `LOCK TABLES` asks for and holds it.
