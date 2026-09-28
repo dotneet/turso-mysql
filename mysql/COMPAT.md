@@ -1772,7 +1772,10 @@ team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id =
 team_repo.team_id LEFT JOIN team_unit ON ... WHERE team_user.uid = ?)`, and the
 projected column is held to the outer one's kind as a one-table subquery's is.
 An unqualified projection over a join is refused, which of the tables it
-belongs to not being worked out here.
+belongs to not being worked out here. The statement itself may join tables
+too — Gitea's `team.id IN (SELECT team_id FROM team_unit ...)` over `team
+INNER JOIN team_repo` — the outer column named through one of them, or without
+one where one joined table alone has it; a name two have is 1052.
 
 `IN` over a list of values — `WHERE id IN (1, 2)` — follows the same rule one
 member at a time. Every member is recorded as its own checked comparison, so a

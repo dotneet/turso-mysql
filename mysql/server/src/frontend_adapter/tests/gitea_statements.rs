@@ -720,3 +720,43 @@ fn an_unqualified_name_in_a_join_is_the_column_of_the_table_that_has_it() {
         Err(FrontendErrorKind::Unsupported)
     ));
 }
+
+/// Gitea asks which teams may write to a repository with `team.id IN (SELECT
+/// team_id FROM team_unit ...)` in a statement joining `team` and
+/// `team_repo`. The outer column is named through one of the joined tables,
+/// or without one where one of them alone has it. Every answer here was
+/// measured on MySQL 8.4.11 over the same rows.
+#[test]
+fn a_membership_test_reads_a_column_of_a_joined_statement() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `team` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `lower_name` VARCHAR(255) NULL, `authorize` INT NULL)",
+        "CREATE TABLE `team_repo` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+        "CREATE TABLE `team_unit` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `type` INT NULL, `access_mode` INT NULL)",
+        "INSERT INTO `team` (`org_id`, `lower_name`, `authorize`) VALUES (3, 'owners', 4), (3, 'devs', 1), (3, 'readers', 1)",
+        "INSERT INTO `team_repo` (`org_id`, `team_id`, `repo_id`) VALUES (3, 1, 7), (3, 2, 7), (3, 3, 7), (3, 3, 8)",
+        "INSERT INTO `team_unit` (`org_id`, `team_id`, `type`, `access_mode`) VALUES (3, 2, 1, 2), (3, 3, 1, 1)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT team.id FROM `team` INNER JOIN `team_repo` ON team_repo.team_id = team.id WHERE (team_repo.org_id = 3 AND team_repo.repo_id = 7) AND ((team.authorize >= 2) OR team.id IN (SELECT team_id FROM team_unit WHERE (team_unit.team_id = team.id) AND team_unit.type = 1 AND team_unit.access_mode >= 2)) ORDER BY team.id"
+        ),
+        ["1", "2"]
+    );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT team.id FROM `team` INNER JOIN `team_repo` ON team_repo.team_id = team.id WHERE team_repo.repo_id = 8 AND team_id NOT IN (SELECT team_id FROM team_unit WHERE access_mode >= 2) ORDER BY team.id"
+        ),
+        ["3"]
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT team.id FROM `team` INNER JOIN `team_repo` ON team_repo.team_id = team.id WHERE team.lower_name IN (SELECT team_id FROM team_unit)"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}

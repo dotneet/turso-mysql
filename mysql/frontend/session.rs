@@ -1929,8 +1929,9 @@ impl MySqlConnection {
                         error.to_string(),
                     ))
                 })?;
-                self.validate_subquery_comparison_columns(
+                self.validate_select_subquery_comparison_columns(
                     translated.source_table(),
+                    translated.source_tables(),
                     translated.checked_subquery_comparisons(),
                 )
                 .map_err(|error| {
@@ -4565,8 +4566,9 @@ impl MySqlConnection {
             translated.source_tables(),
             translated.checked_comparisons(),
         )?;
-        self.validate_subquery_comparison_columns(
+        self.validate_select_subquery_comparison_columns(
             translated.source_table(),
+            translated.source_tables(),
             translated.checked_subquery_comparisons(),
         )
     }
@@ -6973,8 +6975,9 @@ impl MySqlConnection {
             translated.checked_comparisons(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
-        self.validate_subquery_comparison_columns(
+        self.validate_select_subquery_comparison_columns(
             translated.source_table(),
+            translated.source_tables(),
             translated.checked_subquery_comparisons(),
         )
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
@@ -7269,6 +7272,63 @@ impl MySqlConnection {
                 )?;
             }
             let outer = self.column_kind(source_table, comparison.column_name())?;
+            let inner =
+                self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
+            if outer != inner {
+                return Err(LimboError::InvalidArgument(format!(
+                    "SELECT IN compares {} with {}, whose types are not the same kind",
+                    comparison.column_name(),
+                    comparison.inner_column_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The check `validate_subquery_comparison_columns` makes, for a `SELECT`
+    /// that may join tables.
+    ///
+    /// Over a join the outer column is named through one of the joined
+    /// tables, or without one, when it is the column of the joined table that
+    /// has it — Gitea's `team.id IN (SELECT team_id FROM team_unit ...)` over
+    /// `team INNER JOIN team_repo`. A name two joined tables have is refused
+    /// by the engine as ambiguous.
+    fn validate_select_subquery_comparison_columns(
+        &self,
+        source_table: Option<&str>,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSubqueryComparison],
+    ) -> Result<()> {
+        if source_table.is_some() || comparisons.is_empty() {
+            return self.validate_subquery_comparison_columns(source_table, comparisons);
+        }
+        if source_tables
+            .iter()
+            .any(|source| source.catalog().is_some())
+        {
+            return Err(LimboError::InvalidArgument(
+                "SELECT IN over a join reading an information_schema table".to_string(),
+            ));
+        }
+        for comparison in comparisons {
+            let mut outer_table = None;
+            for table in column_tables(source_tables, comparison.qualifier(), &[])? {
+                if self
+                    .compared_column_metadata(&table, comparison.column_name())?
+                    .is_some()
+                {
+                    outer_table = Some(table);
+                    break;
+                }
+            }
+            let outer_table = outer_table.ok_or(LimboError::SchemaUpdated)?;
+            if !comparison.fixed_columns().is_empty() {
+                self.hold_a_subquery_to_one_row(
+                    comparison.inner_table(),
+                    comparison.fixed_columns(),
+                )?;
+            }
+            let outer = self.column_kind(outer_table.as_str(), comparison.column_name())?;
             let inner =
                 self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
             if outer != inner {
