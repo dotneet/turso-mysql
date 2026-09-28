@@ -201,3 +201,11 @@ Left:
   table over a join), `SELECT post.user_id AS userId, SUM(post.views) AS views
   FROM posts post GROUP BY post.user_id HAVING SUM(post.views) > 5` (a qualified
   aggregate in HAVING), and its rollback-migration step.
+
+# Fifth run
+
+After the concurrent-transaction fix, Prisma's client statements and the
+counted-row fix, 2026-09-28. Every step passes on turso for Django (22/22),
+GORM (21/21), Laravel (26/26), the mysql CLI (23/23), mysqldump (9/9), Prisma
+(22/22), Rails (22/22) and SQLAlchemy (20/20). TypeORM passes 17/18; its
+pagination over a derived table that joins tables is still refused.
