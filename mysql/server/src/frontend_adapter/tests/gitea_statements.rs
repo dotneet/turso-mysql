@@ -665,3 +665,58 @@ fn giteas_user_search_matches_a_case_changed_column() {
     );
     assert_eq!(counted.rows, [[BinaryResultValue::Integer(4)]]);
 }
+
+/// xorm joins with an unqualified name on one side of the `ON` — Gitea's
+/// assignees are read with `SELECT * FROM user INNER JOIN issue_assignees ON
+/// assignee_id = user.id`. Measured on MySQL 8.4.11, the name is the column
+/// of whichever joined table has one, and a name two of them have is 1052.
+#[test]
+fn an_unqualified_name_in_a_join_is_the_column_of_the_table_that_has_it() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `lower_name` VARCHAR(255) NOT NULL, `name` VARCHAR(255) NOT NULL)",
+        "CREATE TABLE `issue_assignees` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `assignee_id` BIGINT(20) NULL, `issue_id` BIGINT(20) NULL)",
+        "INSERT INTO `user` (`lower_name`, `name`) VALUES ('a', 'A'), ('b', 'B')",
+        "INSERT INTO `issue_assignees` (`assignee_id`, `issue_id`) VALUES (1, 5), (2, 5), (2, 6)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let text = |value: &str| Some(value.to_owned());
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT * FROM `user` INNER JOIN `issue_assignees` ON assignee_id = `user`.id WHERE (issue_assignees.issue_id = 5)"
+        ),
+        [
+            [text("1"), text("a"), text("A"), text("1"), text("1"), text("5")],
+            [text("2"), text("b"), text("B"), text("2"), text("2"), text("5")],
+        ]
+    );
+    let assigned = prepared_rows(
+        &mut adapter,
+        "SELECT * FROM `user` INNER JOIN `issue_assignees` ON assignee_id = `user`.id WHERE (issue_assignees.issue_id = ?)",
+        &[Bound::Whole(6)],
+    );
+    assert_eq!(assigned.rows.len(), 1);
+    assert_eq!(assigned.rows[0][2], BinaryResultValue::Text("B".to_owned()));
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT `user`.name FROM `user` INNER JOIN `issue_assignees` ON assignee_id = `user`.id WHERE issue_id = 6"
+        ),
+        ["B"]
+    );
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT `user`.id FROM `user` INNER JOIN `issue_assignees` ON id = `user`.id"
+        ),
+        Err(FrontendErrorKind::AmbiguousColumn)
+    ));
+    // A word against a number is still refused, the column found in the join.
+    assert!(matches!(
+        adapter.execute_query(
+            "SELECT `user`.name FROM `user` INNER JOIN `issue_assignees` ON assignee_id = `user`.id WHERE lower_name = 5"
+        ),
+        Err(FrontendErrorKind::Unsupported)
+    ));
+}

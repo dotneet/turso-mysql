@@ -1957,7 +1957,14 @@ ambiguous`.
 A `WHERE` comparison against a literal works in a joined statement too, and the
 qualifier is what makes it work: it names which of the joined tables the
 column belongs to, and that is the table the value's type is checked against. A
-qualifier naming no table the statement reads is refused.
+qualifier naming no table the statement reads is refused. A comparison may name
+its column without the table too, in the `WHERE` or the `ON` — xorm reads
+Gitea's assignees with `INNER JOIN issue_assignees ON assignee_id = user.id`:
+the column is the one of whichever joined table has it, and its type is checked
+against that table's; a name two of them have is 1052, measured on 8.4.11 as
+`Column 'id' in on clause is ambiguous`, which the engine answers as well. A
+join over a derived table or a `WITH` name still wants the qualifier, those
+showing fewer columns than their table has.
 
 Refused: a non-equality `ON`.
 

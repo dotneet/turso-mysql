@@ -1274,8 +1274,24 @@ fn column_tables(
         .iter()
         .filter(|source| !source.subquery() && source.branch() == 0)
         .collect::<Vec<_>>();
-    if let [source] = readable.as_slice() {
-        candidates.push(source.table().clone());
+    match readable.as_slice() {
+        [source] => candidates.push(source.table().clone()),
+        // An unqualified name in a join is the column of whichever joined
+        // table has one — Gitea's `INNER JOIN issue_assignees ON assignee_id
+        // = user.id`. The first that has it is taken; where two have it the
+        // engine refuses the name as ambiguous, as MySQL answers 1052. A
+        // derived table or a CTE shows fewer columns than its table has, so a
+        // join over one is left out.
+        joined
+            if joined.iter().all(|source| {
+                source.derived().is_none()
+                    && source.catalog().is_none()
+                    && source.projected_columns().is_empty()
+            }) =>
+        {
+            candidates.extend(joined.iter().map(|source| source.table().clone()));
+        }
+        _ => {}
     }
     if candidates.is_empty() {
         return Err(LimboError::InvalidArgument(
