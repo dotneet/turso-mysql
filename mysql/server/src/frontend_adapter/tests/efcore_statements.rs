@@ -737,6 +737,25 @@ fn include_reads_relations_through_derived_tables_sorted_across_them() {
     );
     assert_eq!(read(&split, &[0, 3]), ["1 news", "1 rust", "2 sql"]);
 
+    // The split query's posts are a join of two tables alone, sorted across
+    // them the same way: measured, no column keeps its keys.
+    let posts = result_set(
+        &mut adapter,
+        "SELECT `p`.`Id`, `p`.`Body`, `p`.`PublishedAt`, `p`.`Title`, `p`.`UserId`, `p`.`Views`, `u`.`Id`\nFROM `Users` AS `u`\nINNER JOIN `Posts` AS `p` ON `u`.`Id` = `p`.`UserId`\nORDER BY `u`.`Id`, `p`.`Id`",
+    );
+    assert_eq!(
+        shapes(&posts),
+        [
+            "Id reports.p posts 8 20 0x1",
+            "Body reports.p posts 252 262140 0x10",
+            "PublishedAt reports.p posts 12 26 0x80",
+            "Title reports.p posts 253 800 0x1001",
+            "UserId reports.p posts 8 20 0x1001",
+            "Views reports.p posts 3 11 0x1001",
+            "Id reports.u users 8 20 0x1",
+        ]
+    );
+
     // A condition may make MySQL read a table as one constant row, and an
     // order within one table leaves which table it reads first to MySQL.
     for refused in [

@@ -11310,8 +11310,10 @@ fn a_join_reports_each_column_against_its_own_table() {
     );
 
     // An outer join keeps the rows with no match, and the side that can go
-    // missing loses its NOT NULL flag while keeping its key flags —
-    // measured on MySQL 8.4.11.
+    // missing loses its NOT NULL flag — measured on MySQL 8.4.11. Ordered by
+    // columns of both tables, MySQL sorts the rows through a table of its own,
+    // and neither table's column keeps its key flags there (measured again:
+    // `id` reports NOT_NULL NO_DEFAULT_VALUE and `p.id` NO_DEFAULT_VALUE).
     adapter
         .execute_query("INSERT INTO owners (id, name) VALUES (3, 'cat')")
         .unwrap();
@@ -11338,8 +11340,15 @@ fn a_join_reports_each_column_against_its_own_table() {
     );
     assert_eq!(outer.columns[1].flags & MYSQL_NOT_NULL_FLAG, 0);
     assert_eq!(
-        outer.columns[1].flags & MYSQL_PRI_KEY_FLAG,
-        MYSQL_PRI_KEY_FLAG
+        outer
+            .columns
+            .iter()
+            .map(|column| column.flags)
+            .collect::<Vec<_>>(),
+        [
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            MYSQL_NO_DEFAULT_VALUE_FLAG
+        ]
     );
 
     // A RIGHT JOIN is the mirror image: the first table is the one that

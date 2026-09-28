@@ -609,11 +609,46 @@ fn hold_a_statement_sorted_through_a_table(
     query: &sqlparser::ast::Query,
     sources: &mut [MySqlSelectSource],
 ) -> Result<(), ParseError> {
+    if let Err(feature) = sorted_across_its_tables(query, sources) {
+        return unsupported(feature);
+    }
+    note_the_sort_through_a_table(sources);
+    Ok(())
+}
+
+/// Notes a statement joining tables alone that MySQL sorts through a table
+/// of its own — Entity Framework Core's split query reads `... FROM Users AS
+/// u INNER JOIN Posts AS p ON u.Id = p.UserId ORDER BY u.Id, p.Id` — for the
+/// reasons [`hold_a_statement_sorted_through_a_table`] gives. Measured on
+/// MySQL 8.4.11 over no rows, three and thousands, every column then loses
+/// its keys. Any other statement is left as it is.
+pub(super) fn note_a_join_sorted_across_its_tables(
+    query: &sqlparser::ast::Query,
+    sources: &mut [MySqlSelectSource],
+) {
+    let read = sources
+        .iter()
+        .filter(|source| is_read_by_the_statement(source))
+        .collect::<Vec<_>>();
+    if read.len() < 2 || read.iter().any(|source| source.derived.is_some()) {
+        return;
+    }
+    if sorted_across_its_tables(query, sources).is_ok() {
+        note_the_sort_through_a_table(sources);
+    }
+}
+
+/// Answers why MySQL might not sort a statement's rows through a table of its
+/// own, or nothing when it does: see [`hold_a_statement_sorted_through_a_table`].
+fn sorted_across_its_tables(
+    query: &sqlparser::ast::Query,
+    sources: &[MySqlSelectSource],
+) -> Result<(), &'static str> {
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return unsupported("derived table joining tables in a set operation");
+        return Err("statement joining tables in a set operation");
     };
     let sqlparser::ast::GroupByExpr::Expressions(group_by, _) = &select.group_by else {
-        return unsupported("statement grouping a derived table joining tables");
+        return Err("statement grouping the tables it joins");
     };
     if query.with.is_some()
         || !query.locks.is_empty()
@@ -622,9 +657,7 @@ fn hold_a_statement_sorted_through_a_table(
         || select.having.is_some()
         || select.distinct.is_some()
     {
-        return unsupported(
-            "statement narrowing, grouping or dropping repeats of tables it joins beside a derived table",
-        );
+        return Err("statement narrowing, grouping or dropping repeats of the tables it joins");
     }
     // A column is traced through the name of the table it is read from, so
     // two tables read under one name would leave it unsaid which.
@@ -633,7 +666,7 @@ fn hold_a_statement_sorted_through_a_table(
             .iter()
             .any(|earlier| earlier.reference.eq_ignore_ascii_case(&source.reference))
         {
-            return unsupported("statement reading two tables under one name");
+            return Err("statement reading two tables under one name");
         }
     }
     for source in sources
@@ -648,17 +681,15 @@ fn hold_a_statement_sorted_through_a_table(
             .as_ref()
             .is_some_and(|derived| !derived.joined.is_empty() && !derived.materialized);
         if !a_table && !joining_tables {
-            return unsupported("statement joining a derived table beside anything but tables");
+            return Err("statement joining a derived table beside anything but tables");
         }
     }
     for item in &select.projection {
         let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
-            return unsupported("statement joining a derived table projecting a wildcard");
+            return Err("statement joining tables projecting a wildcard");
         };
         if table_read_for(expr, sources).is_none() {
-            return unsupported(
-                "statement joining a derived table projecting anything but its tables' columns",
-            );
+            return Err("statement joining tables projecting anything but their columns");
         }
     }
     let Some(sqlparser::ast::OrderBy {
@@ -666,22 +697,24 @@ fn hold_a_statement_sorted_through_a_table(
         ..
     }) = &query.order_by
     else {
-        return unsupported("statement joining a derived table beside another table unordered");
+        return Err("statement joining a derived table beside another table unordered");
     };
     let mut ordering_tables = Vec::new();
     for expression in expressions {
         let Some(table) = table_read_for(&expression.expr, sources) else {
-            return unsupported(
-                "statement joining a derived table ordered by anything but columns",
-            );
+            return Err("statement joining tables ordered by anything but their columns");
         };
         if !ordering_tables.contains(&table) {
             ordering_tables.push(table);
         }
     }
     if ordering_tables.len() < 2 {
-        return unsupported("statement joining a derived table ordered by one table's columns");
+        return Err("statement joining a derived table ordered by one table's columns");
     }
+    Ok(())
+}
+
+fn note_the_sort_through_a_table(sources: &mut [MySqlSelectSource]) {
     for source in sources
         .iter_mut()
         .filter(|source| is_read_by_the_statement(source))
@@ -691,7 +724,6 @@ fn hold_a_statement_sorted_through_a_table(
             None => source.sorted_through_a_table = true,
         }
     }
-    Ok(())
 }
 
 fn is_read_by_the_statement(source: &MySqlSelectSource) -> bool {

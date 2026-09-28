@@ -611,8 +611,9 @@ fn values(rows: &[&[Option<&str>]]) -> Vec<Vec<Option<String>>> {
 /// joined in parentheses, `LEFT OUTER JOIN (post_tags INNER JOIN tags ON ...)
 /// ON ...`. Measured on MySQL 8.4.11: a post with no tag, or whose one row in
 /// the join table names a tag that is not there, is read once with every
-/// column of both tables missing, and those columns keep their keys but not
-/// `NOT NULL`.
+/// column of both tables missing. Ordered across two tables, the rows are
+/// sorted through a table of MySQL's own, so no column keeps its keys, and
+/// only the first table's key keeps `NOT NULL`.
 #[test]
 fn sequelizes_include_through_a_join_table_joins_two_tables_in_parentheses() {
     let (_directory, mut adapter) = blog();
@@ -620,25 +621,23 @@ fn sequelizes_include_through_a_join_table_joins_two_tables_in_parentheses() {
         &mut adapter,
         "SELECT `User`.`id`, `posts`.`id` AS `posts.id`, `posts->tags`.`id` AS `posts.tags.id`, `posts->tags`.`name` AS `posts.tags.name`, `posts->tags->PostTag`.`post_id` AS `posts.tags.PostTag.postId`, `posts->tags->PostTag`.`tag_id` AS `posts.tags.PostTag.tagId` FROM `users` AS `User` LEFT OUTER JOIN `posts` AS `posts` ON `User`.`id` = `posts`.`user_id` LEFT OUTER JOIN ( `post_tags` AS `posts->tags->PostTag` INNER JOIN `tags` AS `posts->tags` ON `posts->tags`.`id` = `posts->tags->PostTag`.`tag_id`) ON `posts`.`id` = `posts->tags->PostTag`.`post_id` ORDER BY `User`.`id` ASC, `posts`.`id` ASC;",
     );
-    const PART_KEY: u16 = 16384;
     const NO_DEFAULT: u16 = 4096;
-    const KEY: u16 = 2 | 512 | PART_KEY;
     assert_eq!(
         shapes,
         [
-            ("id", "User", 1 | KEY),
-            ("posts.id", "posts", KEY),
-            ("posts.tags.id", "posts->tags", KEY),
-            ("posts.tags.name", "posts->tags", 4 | NO_DEFAULT | PART_KEY),
+            ("id", "User", 1),
+            ("posts.id", "posts", 0),
+            ("posts.tags.id", "posts->tags", 0),
+            ("posts.tags.name", "posts->tags", NO_DEFAULT),
             (
                 "posts.tags.PostTag.postId",
                 "posts->tags->PostTag",
-                2 | NO_DEFAULT | PART_KEY
+                NO_DEFAULT
             ),
             (
                 "posts.tags.PostTag.tagId",
                 "posts->tags->PostTag",
-                2 | NO_DEFAULT | PART_KEY
+                NO_DEFAULT
             ),
         ]
         .map(|(name, table, flags)| (name.to_owned(), table.to_owned(), flags))

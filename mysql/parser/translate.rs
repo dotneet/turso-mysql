@@ -662,6 +662,7 @@ pub(crate) fn translate_select_query(
         &mut source_tables,
     )?;
     derived::hold_a_distinct_reading_one_table_through_a_derived_table(query, &mut source_tables)?;
+    derived::note_a_join_sorted_across_its_tables(query, &mut source_tables);
     derived::resolve_comparisons_through_derived_columns(
         &mut render_context.checked_comparisons,
         &source_tables,

@@ -1914,6 +1914,16 @@ is the mirror image, and a chain marks every table the join can leave out.
 `CROSS JOIN` produces the full Cartesian product without an `ON` clause, and
 preserves the `NOT_NULL` flag on both tables because neither side can go missing.
 
+A join ordered by columns of more than one of its tables, with no condition,
+grouping or `DISTINCT` and nothing but columns projected — Entity Framework
+Core's split query, `... FROM Users AS u INNER JOIN Posts AS p ON u.Id =
+p.UserId ORDER BY u.Id, p.Id` — reports no key flags on any column. Measured on
+8.4.11 over no rows, three and thousands: MySQL sorts such rows through a table
+of its own, only the first table it reads being able to hand them over in an
+order, and that table keeps every flag of a column but its keys and its
+auto-increment. A join with a condition is left as it was: one naming a key can
+make MySQL read a table as one constant row, which reports other shapes.
+
 MySQL's comma join is that same cross join, and a `WHERE` naming a qualified
 column on each side is what bounds it: `FROM users, accounts WHERE users.id =
 accounts.user_id` answers what the written join answers. That predicate is the
@@ -3949,7 +3959,9 @@ when some tag matches it (`... ON q AND EXISTS (SELECT 1 FROM tags WHERE p)
 LEFT JOIN tags ON p`), a condition naming the tag moving with the tag. Measured
 on MySQL 8.4.11 and matched in both protocols: a post with no tag, or whose row
 in the join table names a tag that is not there, is read once with every column
-of both tables missing, and those columns keep their keys and lose `NOT_NULL`.
+of both tables missing, and those columns lose `NOT_NULL`; ordered across two
+tables, as Sequelize orders an include, the rows are sorted through a table of
+MySQL's own and no column keeps its keys.
 Two tables joined by an inner join are all this reads in the parentheses, and
 the inner `ON` has to match a column of one against a column of the other; the
 rest is refused (see TODO.md). A `SELECT` refused while it is read used to
