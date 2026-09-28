@@ -4056,7 +4056,13 @@ here, which is what separates this table from `STATISTICS`. A foreign key names
 the table and column it points at and its position in the key it references; a
 primary or unique key leaves those four columns NULL, the way MySQL does. A key
 written without a `CONSTRAINT` name is reported as `` `t_ibfk_1` ``, the same
-name `SHOW CREATE TABLE` prints for it.
+name `SHOW CREATE TABLE` prints for it. Here and in `STATISTICS` a key's
+columns, and the parent columns a foreign key names, are spelled as each column
+was declared, whatever case the key wrote them in — measured on 8.4.11,
+``PRIMARY KEY (`id`, `CODE`)`` over `Id` and `Code` reports `Id` and `Code`.
+The engine keeps the columns of a key written apart from its columns in lower
+case, and these two tables read them back as the table declares them; Entity
+Framework Core's scaffold matches a key's columns to the table's by name.
 
 `information_schema.TABLE_CONSTRAINTS` and
 `information_schema.REFERENTIAL_CONSTRAINTS` finish the set a migration tool

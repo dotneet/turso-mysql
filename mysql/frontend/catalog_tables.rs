@@ -614,7 +614,7 @@ impl InternalVirtualTable for InformationSchemaStatistics {
                     non_unique: 0,
                     index_name: "PRIMARY".to_owned(),
                     sequence: position as i64 + 1,
-                    column_name: column_name.clone(),
+                    column_name: declared_column_name(&btree, column_name),
                     // MySQL holds every key column NOT NULL. The engine does
                     // not mark the column its rowid stands for, which is the
                     // counted key of an `AUTO_INCREMENT` table, so it is not
@@ -790,7 +790,7 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
                 rows.push(KeyColumnUsageRow {
                     constraint: "PRIMARY".to_owned(),
                     table: name.clone(),
-                    column_name: column_name.clone(),
+                    column_name: declared_column_name(&btree, column_name),
                     ordinal: position as i64 + 1,
                     referenced: None,
                 });
@@ -814,17 +814,22 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
             }
             for key in &btree.foreign_keys {
                 let constraint = foreign_key_name(name, key);
+                let parent_table = schema.get_btree_table(&key.parent_table);
                 // MySQL writes the parent columns in the constraint, so there
                 // is one for each child column; a key stored without them came
                 // from no MySQL statement and reports the columns it has.
                 let columns = key.child_columns.iter().zip(key.parent_columns.iter());
                 for (position, (child, parent)) in columns.enumerate() {
+                    let parent = match &parent_table {
+                        Some(parent_table) => declared_column_name(parent_table, parent),
+                        None => parent.clone(),
+                    };
                     rows.push(KeyColumnUsageRow {
                         constraint: constraint.clone(),
                         table: name.clone(),
-                        column_name: child.clone(),
+                        column_name: declared_column_name(&btree, child),
                         ordinal: position as i64 + 1,
-                        referenced: Some((key.parent_table.clone(), parent.clone())),
+                        referenced: Some((key.parent_table.clone(), parent)),
                     });
                 }
             }
@@ -852,6 +857,24 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
     ) -> std::result::Result<turso_ext::IndexInfo, turso_ext::ResultCode> {
         catalog_best_index(constraints)
     }
+}
+
+/// The name a key's column was declared with in the table.
+///
+/// The engine keeps the columns a table-level key lists folded to lower case —
+/// ``PRIMARY KEY (`PostsId`, `TagsId`)`` as `postsid` and `tagsid` — and so the
+/// columns of a foreign key on either side. Measured on MySQL 8.4.11, every
+/// catalog table names them as the column was declared, whatever case the key
+/// wrote them in.
+fn declared_column_name(table: &turso_core::schema::BTreeTable, name: &str) -> String {
+    let folded = name.to_lowercase();
+    table
+        .columns()
+        .iter()
+        .filter_map(|column| column.name.as_deref())
+        .find(|declared| declared.to_lowercase() == folded)
+        .unwrap_or(name)
+        .to_owned()
 }
 
 /// One column of one key, which is one row of

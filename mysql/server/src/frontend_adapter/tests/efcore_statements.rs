@@ -827,6 +827,64 @@ fn the_connection_check_reads_the_version_and_database_through_a_derived_table()
     );
 }
 
+/// The scaffold matches the columns a key lists against the table's columns
+/// by name, and the catalog named the columns of `PostTags`' two-column
+/// primary key and of every foreign key in lower case — `postsid`, `userid`
+/// and the parent's `id` — where they were declared `PostsId`, `UserId` and
+/// `Id`.
+///
+/// Measured on MySQL 8.4.11: `STATISTICS` and `KEY_COLUMN_USAGE` name each as
+/// the column was declared, whatever case the key wrote it in.
+#[test]
+fn the_catalog_names_a_keys_columns_as_they_were_declared() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE kp (`Id` int NOT NULL, `Code` int NOT NULL, PRIMARY KEY (`id`, `CODE`))",
+        "CREATE TABLE kc (`UserId` int NOT NULL, `UserCode` int NOT NULL, PRIMARY KEY (`userid`), KEY `ix_k` (`USERCODE`), CONSTRAINT `fk_k` FOREIGN KEY (`userID`, `usercode`) REFERENCES `kp` (`ID`, `code`))",
+    ] {
+        changed(&mut adapter, sql);
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME IN ('kp', 'kc', 'PostTags') ORDER BY 1, 2, 3"
+        ),
+        [
+            row(&["kc", "fk_k", "1", "UserId"]),
+            row(&["kc", "fk_k", "2", "UserCode"]),
+            row(&["kc", "ix_k", "1", "UserCode"]),
+            row(&["kc", "PRIMARY", "1", "UserId"]),
+            row(&["kp", "PRIMARY", "1", "Id"]),
+            row(&["kp", "PRIMARY", "2", "Code"]),
+            row(&["posttags", "IX_PostTags_TagsId", "1", "TagsId"]),
+            row(&["posttags", "PRIMARY", "1", "PostsId"]),
+            row(&["posttags", "PRIMARY", "2", "TagsId"]),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION, COLUMN_NAME, REFERENCED_COLUMN_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = 'reports' AND TABLE_NAME IN ('kp', 'kc', 'Posts', 'PostTags') ORDER BY 1, 2, 3"
+        ),
+        [
+            row(&["kc", "fk_k", "1", "UserId", "Id"]),
+            row(&["kc", "fk_k", "2", "UserCode", "Code"]),
+            row(&["kc", "PRIMARY", "1", "UserId", "NULL"]),
+            row(&["kp", "PRIMARY", "1", "Id", "NULL"]),
+            row(&["kp", "PRIMARY", "2", "Code", "NULL"]),
+            row(&["posts", "FK_Posts_Users_UserId", "1", "UserId", "Id"]),
+            row(&["posts", "PRIMARY", "1", "Id", "NULL"]),
+            row(&["posttags", "FK_PostTags_Posts_PostsId", "1", "PostsId", "Id"]),
+            row(&["posttags", "FK_PostTags_Tags_TagsId", "1", "TagsId", "Id"]),
+            row(&["posttags", "PRIMARY", "1", "PostsId", "NULL"]),
+            row(&["posttags", "PRIMARY", "2", "TagsId", "NULL"]),
+        ]
+    );
+}
+
 fn updated_at(adapter: &mut Adapter, id: u32) -> String {
     let read = rows(
         adapter,
