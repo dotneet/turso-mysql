@@ -3783,6 +3783,7 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
             [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
                 true
             }
+            [argument] if counts_every_row(argument) => true,
             [argument] => counts_a_column(argument),
             _ => false,
         },
@@ -3791,6 +3792,24 @@ pub(super) fn is_count_call(function: &sqlparser::ast::Function) -> bool {
         }
         _ => false,
     }
+}
+
+/// Reports whether a count's argument is a written whole number, which is
+/// never NULL, so the call counts every row as `COUNT(*)` does.
+///
+/// Measured on MySQL 8.4.11: `COUNT(1)` and `COUNT(0)` answer the row count
+/// and the shape `COUNT(*)` answers, and TypeORM counts that way. A written
+/// NULL counts nothing, and a word or a fraction has not been needed.
+pub(super) fn counts_every_row(argument: &sqlparser::ast::FunctionArg) -> bool {
+    matches!(
+        argument,
+        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Value(
+            sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::Number(number, false),
+                ..
+            }
+        ))) if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    )
 }
 
 /// Reports whether a call is the bare aggregate form and nothing more.

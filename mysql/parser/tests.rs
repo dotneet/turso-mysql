@@ -5632,7 +5632,7 @@ fn rejects_select_features_with_unproven_mysql_semantics() {
         "SELECT MIN(id + 1) FROM users",
         "SELECT SUM(id + 1) FROM users",
         "SELECT SUM(DISTINCT id) FROM users",
-        "SELECT MIN(users.id) FROM users",
+        "SELECT MIN(u.id) FROM users u JOIN posts p ON p.user_id = u.id",
         // MySQL orders the parts it joins and the engine's group_concat has no
         // way to say in what order, so the ORDER BY form stays refused.
         "SELECT GROUP_CONCAT(name ORDER BY name DESC) FROM users",

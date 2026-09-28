@@ -833,8 +833,22 @@ A count takes a qualified column, which is what a join has to write. `COUNT(b.id
 cannot leave the qualifier off. A count is the one aggregate this can take qualified, because
 it is the one whose result does not depend on what the column holds — measured on 8.4.11, a
 count is a non-null `LONGLONG` of length 21 whatever it counts. `MIN`, `MAX`, `SUM`, `AVG`
-and the rest answer their argument's own type, so each still takes a bare column: reading the
-table a qualifier names is work the result metadata has not been taught.
+and the rest answer their argument's own type, so over a join each still takes a bare column:
+reading the table a qualifier names is work the result metadata has not been taught. A
+statement reading one table is the exception, which is how TypeORM's query builder
+(`SUM(user.balance)` over `FROM users user`) and Django (`SUM(users.balance)`) write every
+aggregate: outside a subquery the qualifier can only name that table, so the argument is read
+as the bare column, and measured on 8.4.11 the answer and its shape are the bare column's, the
+result column still named after the call as written. The same holds for the column a JSON
+reading in the projection or the `WHERE` reads — TypeORM's
+`JSON_UNQUOTE(JSON_EXTRACT(user.profile, '$.city')) = 'Tokyo'`. Both look the name up among
+the table's own columns afterwards, so a name that is no column of it is still refused; a
+`HAVING` and an `ORDER BY` are left as written, the engine reading a bare name there as one of
+the projection's aliases when no column has it.
+
+A count of a written whole number — `COUNT(1)`, `COUNT(0)`, which TypeORM's `count` writes —
+counts every row: measured on 8.4.11, it answers what `COUNT(*)` answers, value and shape, and
+is named as written. `COUNT(NULL)`, which counts nothing, a word and a fraction are refused.
 
 A reading of the moment is shifted by an interval, which is how a suite asks for the rows of
 the last month: `WHERE created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)`. `DATE_ADD` and

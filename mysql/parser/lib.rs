@@ -4347,9 +4347,10 @@ fn parse_select_inner(
 ) -> Result<TranslatedSelect, ParseError> {
     let sql = &*without_utf8mb4_introducers(sql, mode)?;
     let statement = parse_one_statement(sql, mode)?;
-    let Statement::Query(query) = statement else {
+    let Statement::Query(mut query) = statement else {
         return Err(ParseError::ExpectedSelect);
     };
+    translate::leave_the_one_table_out(&mut query);
     let tokens = Tokenizer::new(&SessionMySqlDialect::new(mode), sql)
         .tokenize()
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;

@@ -12,9 +12,12 @@
 
 use super::*;
 
+pub(crate) use one_table_columns::leave_the_one_table_out;
+
 mod derived;
 mod grouping;
 mod json_condition;
+mod one_table_columns;
 mod recursive;
 mod rollup;
 
@@ -4986,6 +4989,11 @@ fn aggregate_argument_name(function: &sqlparser::ast::Function) -> String {
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
             format!("{prefix}*")
         }
+        [argument @ sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+            Expr::Value(value),
+        ))] if static_select_metadata::counts_every_row(argument) => {
+            format!("{prefix}{}", value.value)
+        }
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => format!("{prefix}{}", column.value),
@@ -5014,6 +5022,7 @@ fn render_aggregate_argument(
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)] => {
             format!("{prefix}*")
         }
+        [argument] if static_select_metadata::counts_every_row(argument) => "*".to_owned(),
         [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
             Expr::Identifier(column),
         ))] => {

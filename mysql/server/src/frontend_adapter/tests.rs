@@ -23410,12 +23410,12 @@ fn a_count_takes_the_qualified_column_a_join_has_to_write() {
     };
     assert_eq!(distinct.rows, vec![vec![Some(b"2".to_vec())]]);
 
-    // The other aggregates still take a bare column: each answers its
-    // argument's own type, which means reading the column the qualifier names
-    // out of the table it belongs to.
+    // Over a join the other aggregates still take a bare column: each answers
+    // its argument's own type, which means reading the column the qualifier
+    // names out of the table it belongs to. Over one table the qualifier can
+    // only name that table, which orm_select_shapes covers.
     for sql in [
-        "SELECT MIN(b.id) FROM books b",
-        "SELECT SUM(b.id) FROM books b",
+        "SELECT MIN(b.id) FROM authors a JOIN books b ON b.author_id = a.id",
         "SELECT a.id, AVG(b.id) FROM authors a JOIN books b ON b.author_id = a.id GROUP BY a.id",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
@@ -30797,3 +30797,6 @@ mod mysql_client_statements;
 
 #[cfg(unix)]
 mod database_qualified_names;
+
+#[cfg(unix)]
+mod orm_select_shapes;
