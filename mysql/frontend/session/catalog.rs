@@ -108,6 +108,24 @@ impl MySqlConnection {
             .any(|listed| listed.name.eq_ignore_ascii_case(table.as_str())))
     }
 
+    /// Whether a statement on this connection can read a table of this name,
+    /// a temporary one among them, which [`Self::names_a_table`] leaves out.
+    ///
+    /// The engine is asked to compile a read of it rather than
+    /// `sqlite_temp_schema` being read: reading that table sets up the
+    /// connection's temporary database, and statements run after it were
+    /// seen to be refused or to answer differently.
+    pub fn can_read_table(&self, table: &MySqlTableName) -> Result<bool> {
+        let sql = format!("SELECT 1 FROM \"{}\" WHERE 0", table.as_str());
+        match self.inner.prepare_internal(&sql) {
+            Ok(_) => Ok(true),
+            Err(LimboError::ParseError(message)) if message.starts_with("no such table") => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Renders `SHOW CREATE TABLE` for one base table in the selected database.
     pub fn show_create_table(
         &self,

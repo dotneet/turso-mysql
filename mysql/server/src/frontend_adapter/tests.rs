@@ -30788,3 +30788,6 @@ mod triggers;
 
 #[cfg(unix)]
 mod refused_values;
+
+#[cfg(unix)]
+mod missing_tables;

@@ -232,6 +232,13 @@ pub trait CommandExecutor {
         u16::from(DEFAULT_UTF8MB4_COLLATION)
     }
 
+    /// Takes the words of the error the last command answered with, where
+    /// MySQL's message names what the fixed message of its kind cannot — the
+    /// table a 1146 did not find.
+    fn take_error_message(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Returns the idle time this session asked for with `SET wait_timeout`,
     /// which the connection keeps in place of the runtime's own.
     fn session_wait_timeout(&self) -> Option<std::time::Duration> {
@@ -405,6 +412,7 @@ impl CommandDispatcher {
                         connection.response_packet_codec(),
                         capabilities,
                         executor.execute_init_db(database),
+                        None,
                     ),
                 )
             }
@@ -434,6 +442,7 @@ impl CommandDispatcher {
                         connection.response_packet_codec(),
                         capabilities,
                         result,
+                        None,
                     ),
                 )
             }
@@ -445,10 +454,12 @@ impl CommandDispatcher {
                     prepared
                 });
                 let statement_id = prepared.as_ref().ok().map(|result| result.statement_id);
+                let message = executor.take_error_message();
                 let encoded = encode_prepared_statement(
                     connection.response_packet_codec(),
                     prepared,
                     capabilities,
+                    message,
                 );
                 if encoded.is_err() {
                     if let Some(statement_id) = statement_id {
@@ -475,6 +486,7 @@ impl CommandDispatcher {
                         connection.response_packet_codec(),
                         capabilities,
                         result,
+                        None,
                     ),
                 )
             }
@@ -492,24 +504,25 @@ impl CommandDispatcher {
                 ..
             } => {
                 let capabilities = negotiated_capabilities(connection)?;
+                let result = executor
+                    .execute_stmt_execute(statement_id, parameter_payload)
+                    .map(|mut result| {
+                        if let PreparedStatementExecutionResult::ResultSet(rows) = &mut result {
+                            follow_the_connection_collation(
+                                &mut rows.columns,
+                                executor.connection_collation(),
+                            );
+                        }
+                        result
+                    });
+                let message = executor.take_error_message();
                 close_on_response_error(
                     connection,
                     encode_prepared_execution_result(
                         connection.response_packet_codec(),
                         capabilities,
-                        executor
-                            .execute_stmt_execute(statement_id, parameter_payload)
-                            .map(|mut result| {
-                                if let PreparedStatementExecutionResult::ResultSet(rows) =
-                                    &mut result
-                                {
-                                    follow_the_connection_collation(
-                                        &mut rows.columns,
-                                        executor.connection_collation(),
-                                    );
-                                }
-                                result
-                            }),
+                        result,
+                        message,
                     ),
                 )
             }
@@ -546,7 +559,8 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
             )?;
             Ok(result)
         });
-        return encode_execution_result(codec, capability_flags, result);
+        let message = executor.take_error_message();
+        return encode_execution_result(codec, capability_flags, result, message);
     }
     if capability_flags & CLIENT_MULTI_STATEMENTS == 0 {
         return encode_frontend_error(codec, capability_flags, FrontendErrorKind::Syntax);
@@ -579,7 +593,8 @@ fn execute_query_batch<E: CommandExecutor + ?Sized>(
             )?;
             Ok(result)
         });
-        let encoded = match encode_execution_result(codec, capability_flags, result) {
+        let message = executor.take_error_message();
+        let encoded = match encode_execution_result(codec, capability_flags, result, message) {
             Ok(encoded) => encoded,
             Err(CommandDispatcherError::ResultSetTooLarge { .. }) => {
                 let error =
@@ -935,10 +950,11 @@ fn encode_execution_result(
     codec: PacketCodec,
     capability_flags: u32,
     result: Result<CommandExecutionResult, FrontendErrorKind>,
+    message: Option<Vec<u8>>,
 ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
     match result {
         Ok(result) => encode_result(codec, capability_flags, result),
-        Err(kind) => encode_frontend_error(codec, capability_flags, kind),
+        Err(kind) => encode_worded_error(codec, capability_flags, kind, message),
     }
 }
 
@@ -946,6 +962,7 @@ fn encode_prepared_execution_result(
     codec: PacketCodec,
     capability_flags: u32,
     result: Result<PreparedStatementExecutionResult, FrontendErrorKind>,
+    message: Option<Vec<u8>>,
 ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
     match result {
         Ok(PreparedStatementExecutionResult::ResultSet(result)) => {
@@ -954,7 +971,7 @@ fn encode_prepared_execution_result(
         Ok(PreparedStatementExecutionResult::Ok(result)) => {
             encode_ok(codec, capability_flags, result)
         }
-        Err(kind) => encode_frontend_error(codec, capability_flags, kind),
+        Err(kind) => encode_worded_error(codec, capability_flags, kind, message),
     }
 }
 
@@ -962,10 +979,11 @@ fn encode_prepared_statement(
     codec: PacketCodec,
     result: Result<PreparedStatementResult, FrontendErrorKind>,
     capability_flags: u32,
+    message: Option<Vec<u8>>,
 ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
     let result = match result {
         Ok(result) => result,
-        Err(kind) => return encode_frontend_error(codec, capability_flags, kind),
+        Err(kind) => return encode_worded_error(codec, capability_flags, kind, message),
     };
     let num_columns = u16::try_from(result.columns.len()).map_err(|_| {
         CommandDispatcherError::ResultSetTooLarge {
@@ -1041,8 +1059,20 @@ fn encode_frontend_error(
     capability_flags: u32,
     kind: FrontendErrorKind,
 ) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
+    encode_worded_error(codec, capability_flags, kind, None)
+}
+
+fn encode_worded_error(
+    codec: PacketCodec,
+    capability_flags: u32,
+    kind: FrontendErrorKind,
+    message: Option<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>, CommandDispatcherError> {
     let mut sequence = PacketSequence::new(SERVER_RESPONSE_SEQUENCE_ID);
-    let config = map_frontend_error(kind);
+    let mut config = map_frontend_error(kind);
+    if let Some(message) = message {
+        config.message = message;
+    }
     Ok(vec![config.encode(
         codec,
         sequence.next_sequence_id(),

@@ -22,6 +22,7 @@ mod like_pattern;
 mod lock_tables;
 mod moment_difference;
 mod mysql_ddl;
+mod named_tables;
 mod network_address;
 mod number_format;
 mod replace_view;
@@ -41,6 +42,7 @@ mod temporal_value;
 mod translate;
 mod trigger_definition;
 mod truncate_table;
+mod unknown_columns;
 mod view_definition;
 mod written_bytes;
 mod written_number;
@@ -138,6 +140,7 @@ pub use mysql_ddl::{
     render_create_view_mysql_with_mode, render_show_create_view_mysql,
     render_view_definition_mysql, stored_character_length, stored_temporal_precision,
 };
+pub use named_tables::{tables_named_by, NamedTable};
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
@@ -194,6 +197,7 @@ pub use trigger_definition::{
     MySqlTriggerWrite, MySqlTriggerWriteKind, MySqlWrittenTrigger,
 };
 pub use truncate_table::{parse_optional_truncate_table, MySqlTruncateTableCommand};
+pub use unknown_columns::{unknown_column_named_by, UnknownColumn};
 pub use view_definition::{
     created_view_name, mysql_create_view_ddl, render_show_create_written_view_mysql,
     select_reads_rows_as_they_come, translated_view_is_kept_as_mysql_prints_it,

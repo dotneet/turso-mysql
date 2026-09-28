@@ -649,6 +649,7 @@ where
             prepared_statements: DatabasePreparedStatementRegistry::default(),
             pending_long_data: PendingLongData::default(),
             named_locks,
+            error_message: None,
         })
     }
 }
@@ -679,6 +680,18 @@ pub struct AuthorizedDatabaseCommandAdapter<A> {
     /// The named locks this session holds, in the table every session of the
     /// server shares.
     named_locks: MySqlNamedLockSession,
+    /// The words of the error the last statement answered with, where they
+    /// name what the fixed message of its kind cannot.
+    error_message: Option<Vec<u8>>,
+}
+
+/// What looking for a table a statement names that is not there found.
+#[cfg(unix)]
+enum MissingTable {
+    Found(String),
+    NoneMissing,
+    /// The statement could not be read, or named a table this cannot look up.
+    CannotTell,
 }
 
 #[cfg(unix)]
@@ -1966,22 +1979,14 @@ where
         Ok(CommandExecutionResult::Ok(CommandOkResult::default()))
     }
 
+    fn take_error_message(&mut self) -> Option<Vec<u8>> {
+        self.error_message.take()
+    }
+
     fn execute_query(&mut self, sql: &str) -> Result<CommandExecutionResult, FrontendErrorKind> {
-        refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
-        self.session_variables
-            .set_database_collation(self.session.selected_database_collation());
-        let connection = self.session.connection().ok().cloned();
-        if let Some(connection) = &connection {
-            prepare_for_client_statement(connection, &self.session_variables)?;
-        }
-        let result = self.execute_query_statement(sql);
-        let result = match &connection {
-            Some(connection) => {
-                finish_client_statement(connection, &mut self.session_variables, result)
-            }
-            None => result,
-        };
-        refuse_a_result_in_latin1(&self.session_variables, result)
+        self.error_message = None;
+        let result = self.execute_client_query(sql);
+        self.answer_what_is_missing(sql, result)
     }
 
     fn execute_reset_connection(&mut self) -> Result<(), FrontendErrorKind> {
@@ -2007,35 +2012,9 @@ where
         &mut self,
         sql: &str,
     ) -> Result<PreparedStatementResult, FrontendErrorKind> {
-        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
-        self.session_variables
-            .set_database_collation(self.session.selected_database_collation());
-        if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
-            sql,
-            self.session.session_sql_mode(),
-        )
-        .map_err(|_| FrontendErrorKind::Syntax)?
-        {
-            return self.prepare_gorm_catalog_query(query);
-        }
-        let written = write_the_current_database_in(
-            sql,
-            self.session.selected_database(),
-            self.session.session_sql_mode(),
-        )
-        .map_err(|_| FrontendErrorKind::Syntax)?;
-        let sql = written.as_deref().unwrap_or(sql);
-        match self.prepare_checked_database_statement(sql) {
-            Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
-                if turso_mysql_parser::answers_no_rows_and_binds_nothing(
-                    sql,
-                    self.session.session_sql_mode(),
-                ) =>
-            {
-                self.prepare_text_statement(sql)
-            }
-            prepared => prepared,
-        }
+        self.error_message = None;
+        let result = self.prepare_client_statement(sql);
+        self.answer_what_is_missing(sql, result)
     }
 
     fn execute_stmt_close(&mut self, statement_id: u32) {
@@ -2112,6 +2091,195 @@ impl<A> AuthorizedDatabaseCommandAdapter<A>
 where
     A: DatabaseAuthorizer,
 {
+    fn execute_client_query(
+        &mut self,
+        sql: &str,
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        refuse_what_latin1_reads_differently(&self.session_variables, sql)?;
+        self.session_variables
+            .set_database_collation(self.session.selected_database_collation());
+        let connection = self.session.connection().ok().cloned();
+        if let Some(connection) = &connection {
+            prepare_for_client_statement(connection, &self.session_variables)?;
+        }
+        let result = self.execute_query_statement(sql);
+        let result = match &connection {
+            Some(connection) => {
+                finish_client_statement(connection, &mut self.session_variables, result)
+            }
+            None => result,
+        };
+        refuse_a_result_in_latin1(&self.session_variables, result)
+    }
+
+    fn prepare_client_statement(
+        &mut self,
+        sql: &str,
+    ) -> Result<PreparedStatementResult, FrontendErrorKind> {
+        refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
+        self.session_variables
+            .set_database_collation(self.session.selected_database_collation());
+        if let Some(query) = parse_optional_gorm_information_schema_prepared_query(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return self.prepare_gorm_catalog_query(query);
+        }
+        let written = write_the_current_database_in(
+            sql,
+            self.session.selected_database(),
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?;
+        let sql = written.as_deref().unwrap_or(sql);
+        match self.prepare_checked_database_statement(sql) {
+            Err(FrontendErrorKind::Unsupported | FrontendErrorKind::Syntax)
+                if turso_mysql_parser::answers_no_rows_and_binds_nothing(
+                    sql,
+                    self.session.session_sql_mode(),
+                ) =>
+            {
+                self.prepare_text_statement(sql)
+            }
+            prepared => prepared,
+        }
+    }
+
+    /// Answers 1146 for a statement refused while it names a table that is
+    /// not there, and 1054 for one refused while it names a column its table
+    /// does not have, which is what MySQL answers before anything else.
+    ///
+    /// Measured on MySQL 8.4.11: `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
+    /// `DESCRIBE`, `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, a join
+    /// and a subquery naming a table that is not there all answer 1146,
+    /// SQLSTATE `42S02`, `Table 'probe.missing' doesn't exist`, the names
+    /// lowercased under `lower_case_table_names=1`, which this server reports;
+    /// and a name that is no column answers 1054, SQLSTATE `42S22`,
+    /// `Unknown column 'nope' in 'where clause'`, naming it as written. A
+    /// statement this server refuses for another reason, or reads without
+    /// looking the table up, would otherwise answer 1235 or 1064, and a
+    /// framework looking for 1146 to tell whether a table exists would be
+    /// misled. Only a session that may query the whole database is told what
+    /// is not there, the way MySQL answers 1142 first to one that may not,
+    /// unless the statement already answered that it is not there and only
+    /// the words are added.
+    fn answer_what_is_missing<T>(
+        &mut self,
+        sql: &str,
+        result: Result<T, FrontendErrorKind>,
+    ) -> Result<T, FrontendErrorKind> {
+        let Err(
+            kind @ (FrontendErrorKind::Unsupported
+            | FrontendErrorKind::Syntax
+            | FrontendErrorKind::MissingObject
+            | FrontendErrorKind::UnknownColumn),
+        ) = result
+        else {
+            return result;
+        };
+        let Some(database) = self
+            .session
+            .selected_database()
+            .map(str::to_ascii_lowercase)
+        else {
+            return result;
+        };
+        match self.missing_table_named_by(sql, &database) {
+            MissingTable::Found(table)
+                if kind == FrontendErrorKind::MissingObject
+                    || self.may_be_told_about(&database) =>
+            {
+                self.error_message =
+                    Some(format!("Table '{database}.{table}' doesn't exist").into_bytes());
+                return Err(FrontendErrorKind::MissingObject);
+            }
+            MissingTable::NoneMissing => {}
+            MissingTable::Found(_) | MissingTable::CannotTell => return result,
+        }
+        if kind == FrontendErrorKind::MissingObject {
+            return result;
+        }
+        let Some(unknown) = self.unknown_column_named_by(sql) else {
+            return result;
+        };
+        if kind != FrontendErrorKind::UnknownColumn && !self.may_be_told_about(&database) {
+            return result;
+        }
+        self.error_message = Some(
+            format!(
+                "Unknown column '{}' in '{}'",
+                unknown.written, unknown.clause
+            )
+            .into_bytes(),
+        );
+        Err(FrontendErrorKind::UnknownColumn)
+    }
+
+    /// Whether this session may query all of `database`, and so be told what
+    /// is not there. The database is lowercased, as MySQL names it under
+    /// `lower_case_table_names=1`.
+    fn may_be_told_about(&self, database: &str) -> bool {
+        self.authorize(DatabaseAction::Query { database }).is_ok()
+    }
+
+    /// The first name `sql` uses that is no column of the one table it reads
+    /// or writes in the selected database.
+    fn unknown_column_named_by(&self, sql: &str) -> Option<turso_mysql_parser::UnknownColumn> {
+        let connection = self.session.connection().ok()?;
+        turso_mysql_parser::unknown_column_named_by(
+            sql,
+            self.session.session_sql_mode(),
+            &mut |table| {
+                let table = MySqlTableName::parse(table).ok()?;
+                let columns = connection.list_columns(&table).ok()?;
+                Some(
+                    columns
+                        .iter()
+                        .map(|column| column.name().to_owned())
+                        .collect(),
+                )
+            },
+        )
+    }
+
+    /// The first table `sql` names, in the selected database, that is neither
+    /// a table, a view nor a temporary table there.
+    fn missing_table_named_by(&self, sql: &str, database: &str) -> MissingTable {
+        let Ok(connection) = self.session.connection() else {
+            return MissingTable::CannotTell;
+        };
+        let Some(named) = turso_mysql_parser::tables_named_by(sql, self.session.session_sql_mode())
+        else {
+            return MissingTable::CannotTell;
+        };
+        for turso_mysql_parser::NamedTable {
+            database: qualifier,
+            table,
+        } in named
+        {
+            if qualifier.is_some_and(|qualifier| !qualifier.eq_ignore_ascii_case(database)) {
+                return MissingTable::CannotTell;
+            }
+            let Ok(table) = MySqlTableName::parse(&table) else {
+                return MissingTable::CannotTell;
+            };
+            let there = match connection.names_a_table(&table) {
+                Ok(true) => true,
+                Ok(false) => match connection.can_read_table(&table) {
+                    Ok(readable) => readable,
+                    Err(_) => return MissingTable::CannotTell,
+                },
+                Err(_) => return MissingTable::CannotTell,
+            };
+            if !there {
+                return MissingTable::Found(table.as_str().to_owned());
+            }
+        }
+        MissingTable::NoneMissing
+    }
+
     fn execute_query_statement(
         &mut self,
         sql: &str,

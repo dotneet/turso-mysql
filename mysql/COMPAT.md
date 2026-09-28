@@ -5059,6 +5059,33 @@ MySQL answers `select $$` with 1064 rather than 1054, because `$$` is not a
 legal identifier there while `$` is; both are measured, and this frontend
 answers 1054 for both.
 
+A table that is not there answers 1146 and a name that is no column answers
+1054, in MySQL's own words, where this server used to refuse the statement with
+1235 before it looked the name up. Measured on MySQL 8.4.11, which opens every
+table a statement names before anything else: `SELECT`, `INSERT`, `UPDATE`,
+`DELETE`, `DESCRIBE`, `SHOW COLUMNS`, `SHOW INDEX`, `SHOW CREATE TABLE`, a join
+and a subquery naming a table that is not there all answer 1146, SQLSTATE
+`42S02`, `Table 'probe.missing' doesn't exist`, the first such table in the
+order written and, under `lower_case_table_names=1`, which this server reports,
+with both names lowercased; a `WITH` name is a table in the statement after it
+and, under `WITH RECURSIVE`, in its own body too. A name that is no column
+answers 1054, SQLSTATE `42S22`, `Unknown column 'nope' in 'where clause'`, the
+name as written and qualified as written — `p.id` when `p` names no table —
+checked in MySQL's order: a `SELECT`'s select list (`field list`) before its
+`WHERE`, an `UPDATE`'s `WHERE` before its `SET`, which is the `field list`, a
+`DELETE`'s `WHERE`, an `INSERT`'s column list and `VALUES`. Frameworks tell
+whether a table exists by catching 1146 — Laravel, Django and Rails all do.
+This server answers the same, text and prepared alike, whenever it would
+otherwise refuse such a statement, by reading the statement again for the
+tables it names; a temporary table and a view are tables it names. Only a
+session that may query the whole database is told a table is not there, the
+way MySQL answers 1142 first to one that may not. For 1054 the statement must
+read or write one table and use only the expressions this follows — columns,
+written values, operators, `IN`, `BETWEEN`, `LIKE` and calls over them; any
+other shape keeps this server's own answer rather than risk naming the wrong
+clause. These two messages carry the name, as MySQL's do; every other message
+here stays the short fixed one.
+
 The handshake negotiates capabilities rather than refusing them. MySQL's own
 client does not mask its capability word against the greeting: measured on
 8.4.11, `mysql` sent 0x19BFA285 and `mysqldump` sent 0x19BEA285 unchanged while

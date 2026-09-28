@@ -107,9 +107,14 @@ fn a_saved_column_qualified_by_its_table_is_that_column() {
         ),
         ["c"]
     );
-    // Another table's name is not a column of this one.
+    // Another table's name is not a column of this one. Measured on MySQL
+    // 8.4.11: `Unknown column 'posts.name' in 'field list'`.
     assert_eq!(
         adapter.execute_query("UPDATE `users` SET `posts`.`name` = 'd' WHERE `users`.`id` = 1"),
-        Err(FrontendErrorKind::Unsupported)
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+    assert_eq!(
+        adapter.take_error_message(),
+        Some(b"Unknown column 'posts.name' in 'field list'".to_vec())
     );
 }
