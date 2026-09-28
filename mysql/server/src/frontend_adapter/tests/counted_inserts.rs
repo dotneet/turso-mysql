@@ -181,29 +181,59 @@ fn a_counted_row_takes_the_clock_as_a_value() {
     );
 }
 
-/// Each row of these is written by a statement of its own, where MySQL reads
-/// the clock once for the whole statement.
+/// Each row of these is written by a statement of its own, and MySQL reads the
+/// clock once for the whole statement, so every row reads one moment — which
+/// forty rows written one at a time would otherwise run past, the engine's
+/// clock reading to the millisecond.
 #[test]
-fn a_clock_reading_is_refused_where_the_rows_are_written_one_at_a_time() {
+fn a_clock_reading_is_one_moment_where_the_rows_are_written_one_at_a_time() {
     let (_directory, mut adapter) = adapter();
     run(
         &mut adapter,
-        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20) UNIQUE, posted_at DATETIME NULL)",
+        "CREATE TABLE posts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20) UNIQUE, posted_at DATETIME(6) NULL)",
+    );
+    let forty_rows = |prefix: &str, id: &str| {
+        (1..=40)
+            .map(|at| format!("({id}'{prefix}{at}', NOW(6))"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    assert_eq!(
+        written(
+            &mut adapter,
+            &format!(
+                "INSERT INTO posts (title, posted_at) VALUES {} ON DUPLICATE KEY UPDATE posted_at = NOW(6)",
+                forty_rows("t", "")
+            )
+        ),
+        (40, 1)
     );
     assert_eq!(
-        adapter.execute_query(
-            "INSERT INTO posts (title, posted_at) VALUES ('a', NOW()), ('b', NOW()) ON DUPLICATE KEY UPDATE posted_at = NOW()"
+        rows(
+            &mut adapter,
+            "SELECT COUNT(*), COUNT(DISTINCT posted_at), MIN(id), MAX(id) FROM posts"
         ),
-        Err(FrontendErrorKind::Unsupported)
+        vec![some(&["40", "1", "1", "40"])]
     );
     // A written id past the counter beside rows asking for the next one.
     assert_eq!(
-        adapter.execute_query(
-            "INSERT INTO posts (id, title, posted_at) VALUES (NULL, 'a', NOW()), (50, 'b', NOW())"
+        written(
+            &mut adapter,
+            &format!(
+                "INSERT INTO posts (id, title, posted_at) VALUES {}, (500, 'x', NOW(6))",
+                forty_rows("u", "NULL, ")
+            )
         ),
-        Err(FrontendErrorKind::Unsupported)
+        (41, 41)
     );
-    assert_eq!(one(&mut adapter, "SELECT COUNT(*) FROM posts"), "0");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COUNT(*), COUNT(DISTINCT posted_at), MIN(id), MAX(id) FROM posts WHERE title NOT LIKE 't%'"
+        ),
+        vec![some(&["41", "1", "41", "500"])]
+    );
+    assert_eq!(counter(&mut adapter, "posts").as_deref(), Some("501"));
 }
 
 /// A bound value beside the clock, over several rows.

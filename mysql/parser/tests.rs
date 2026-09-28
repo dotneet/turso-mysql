@@ -6191,6 +6191,7 @@ fn a_counted_insert_takes_the_clock_readings_an_ordinary_insert_takes() {
         "INSERT INTO users (name, created_at) VALUES ('a', CURDATE()), ('b', CURRENT_TIMESTAMP)",
         "INSERT INTO users (name, created_at) VALUES ('a', NOW() + INTERVAL 1 DAY)",
         "INSERT INTO users (name, created_at) VALUES ('a', DATE_SUB(NOW(), INTERVAL 30 DAY))",
+        "INSERT INTO users (name, created_at) VALUES ('a', NOW(6)), ('b', CURRENT_TIMESTAMP(3))",
     ] {
         let checked = parse_auto_increment_insert(sql, mode).unwrap();
         assert!(checked.reads_the_clock(), "{sql}");
@@ -6208,7 +6209,8 @@ fn a_counted_insert_takes_the_clock_readings_an_ordinary_insert_takes() {
     );
     // A call the ordinary path does not write stays refused here too.
     for sql in [
-        "INSERT INTO users (name, created_at) VALUES ('a', NOW(6))",
+        "INSERT INTO users (name, created_at) VALUES ('a', NOW(7))",
+        "INSERT INTO users (name, created_at) VALUES ('a', CURTIME(6))",
         "INSERT INTO users (name) VALUES (CONCAT('a', 'b'))",
         "INSERT INTO users (id, name) VALUES (NOW(), 'a')",
     ] {
@@ -6223,7 +6225,8 @@ fn a_counted_insert_takes_the_clock_readings_an_ordinary_insert_takes() {
         });
         assert!(refused.is_err(), "{sql}");
     }
-    // Written one row at a time, the rows would each read the clock again.
+    // Written one row at a time, the rows read one moment between them, which
+    // the frontend holds them to.
     let table = parse_auto_increment_create_table(
         "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT UNIQUE, created_at DATETIME)",
         mode,
@@ -6235,7 +6238,7 @@ fn a_counted_insert_takes_the_clock_readings_an_ordinary_insert_takes() {
     )
     .unwrap()
     .bind_allocator_table(&table)
-    .is_err());
+    .is_ok());
 }
 
 #[test]

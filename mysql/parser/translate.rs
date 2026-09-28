@@ -2867,7 +2867,7 @@ pub(crate) fn translate_insert(
             row.iter()
                 .enumerate()
                 .filter(|(at, _)| kept(*at))
-                .map(|(_, value)| render_dml_expr(value))
+                .map(|(_, value)| render_inserted_value(value))
                 .collect::<Result<Vec<_>, _>>()
                 .map(|values| format!("({})", values.join(", ")))
         })
@@ -3290,7 +3290,7 @@ fn render_duplicate_key_value(
                 )?
             ))
         }
-        _ => render_dml_expr(value),
+        _ => render_inserted_value(value),
     }
 }
 
@@ -3466,7 +3466,7 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedIns
             return unsupported("INSERT SET assignment target");
         };
         columns.push(render_unqualified_name(name)?);
-        values.push(render_dml_expr(&assignment.value)?);
+        values.push(render_inserted_value(&assignment.value)?);
     }
     reject_ignored_null(
         insert,
@@ -4599,6 +4599,50 @@ fn written_only_as_a_reading(value: &Expr) -> bool {
     }
 }
 
+/// Renders one value an `INSERT` writes into a column, a row of `VALUES`, an
+/// assignment of the `SET` form or of an upsert clause.
+///
+/// Beside what [`render_dml_expr`] renders, this takes the moment read to a
+/// count of places of a second — `CURRENT_TIMESTAMP(6)`, which Rails writes
+/// into every `created_at` and `updated_at` its `insert_all` and `upsert_all`
+/// fill. The engine's clock reads to the millisecond, so a fourth place and
+/// beyond are zeros: a reading MySQL's own clock could have taken, as the
+/// same reading in a projection argues. What lands in the column is then
+/// held to the column's own places the way a written moment is — measured on
+/// 8.4.11, `NOW(6)` into a `DATETIME(2)` rounds to two places and into a
+/// `DATETIME` to the whole second.
+fn render_inserted_value(expr: &Expr) -> Result<String, ParseError> {
+    match expr {
+        Expr::Function(function) if moment_read_to_places(function).is_some() => {
+            match moment_read_to_places(function).expect("the guard read the places") {
+                0 => Ok(CheckedComparisonNow::Moment.engine_call().to_owned()),
+                places => Ok(render_clock_to_a_fraction("%Y-%m-%d %H:%M:%f", 20, places)),
+            }
+        }
+        _ => render_dml_expr(expr),
+    }
+}
+
+/// The places of a second a reading of the moment written with a count of
+/// them keeps — 6 for `NOW(6)`, 0 for `CURRENT_TIMESTAMP(0)` — or `None` for
+/// any other call, the bare `NOW()` included.
+fn moment_read_to_places(function: &sqlparser::ast::Function) -> Option<u32> {
+    if !matches!(&function.args, FunctionArguments::List(arguments) if !arguments.args.is_empty()) {
+        return None;
+    }
+    match static_select_metadata::scalar_call(function)? {
+        StaticSelectMetadata::ScalarCall {
+            function: static_select_metadata::ScalarFunction::Now,
+            ..
+        } => Some(0),
+        StaticSelectMetadata::ScalarCall {
+            function: static_select_metadata::ScalarFunction::NowToAFraction { places },
+            ..
+        } => Some(places),
+        _ => None,
+    }
+}
+
 fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
     match expr {
         Expr::Identifier(ident) => Ok(render_ident(ident)),
@@ -4669,13 +4713,15 @@ fn render_dml_expr(expr: &Expr) -> Result<String, ParseError> {
 }
 
 /// Whether one written value is a reading of the clock that
-/// [`render_dml_expr`] writes as the engine's own call — `NOW()`, `CURDATE()`,
-/// `CURTIME()`, their other spellings, or one of them shifted by an interval.
+/// [`render_inserted_value`] writes as the engine's own call — `NOW()`,
+/// `CURDATE()`, `CURTIME()`, their other spellings, one of them shifted by an
+/// interval, or the moment read to a count of places, `NOW(6)`.
 pub(crate) fn is_clock_reading_value(expr: &Expr) -> bool {
     match expr {
         Expr::Function(function) => {
             CheckedComparisonNow::read(function).is_some()
                 || render_shifted_clock_reading(function).is_some()
+                || moment_read_to_places(function).is_some()
         }
         Expr::BinaryOp { .. } => shifted_clock_reading_operator(expr).is_some(),
         _ => false,

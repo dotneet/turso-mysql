@@ -551,12 +551,6 @@ impl CheckedAutoIncrementInsert {
         {
             return unsupported("AUTO_INCREMENT INSERT table does not match its definition");
         }
-        // MySQL reads the clock once for the whole statement. Each of these
-        // rows is written by a statement of its own, which would read it once
-        // for each row instead.
-        if self.reads_the_clock && self.rowwise_conflicts {
-            return unsupported("a clock reading in a multirow IGNORE or ON DUPLICATE KEY UPDATE");
-        }
         let allocator_column = TursoName::exact(table.allocator_column_name.clone());
         if self
             .upsert_columns

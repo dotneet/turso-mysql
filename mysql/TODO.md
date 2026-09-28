@@ -325,7 +325,6 @@ or not measured. `JSON_ARRAYAGG` over a built document takes `JSON_OBJECT` and
 | `INSERT ... ON DUPLICATE KEY UPDATE` over several rows on an `AUTO_INCREMENT` table | supported when every row generates an id and the update leaves the counted column unchanged — writing it to itself, GORM's `id = id`, included; rows are applied in order, and the first inserted id and affected-row count are reported — or, where no row was added but one was changed, the id of the last row matched. A prepared statement is taken the same way, a value bound in the upsert clause included. Explicit ids in this form, and `REPLACE`, remain refused |
 | `INSERT IGNORE` writing NULL | supported for an `AUTO_INCREMENT` column, where NULL asks for the next id; other NULL coercions remain refused |
 | `INSERT IGNORE` over several rows on an `AUTO_INCREMENT` table | supported when every row generates an id, prepared or not. A skipped row consumes a reserved slot, and later successful rows reuse the next number MySQL assigns. Explicit ids in this form remain refused |
-| A reading of the clock in a counted `INSERT` whose rows are written one at a time — several rows with `IGNORE` or `ON DUPLICATE KEY UPDATE`, or rows asking for the next id beside one naming its own id past the counter | refused; MySQL reads the clock once for the statement, and each of these rows is written by a statement of its own |
 | `INSERT ... SELECT` into an `AUTO_INCREMENT` table mixing rows that name their own id with rows asking for the next | refused; measured, MySQL takes a new batch of numbers whenever a written id passes the batch it holds — `NULL`, `100`, `NULL` into a table counting at 37 writes 37, 100 and 101 and leaves `AUTO_INCREMENT=103` — which the copy path does not repeat |
 | `INSERT IGNORE ... SELECT`, `REPLACE ... SELECT` and `INSERT ... SELECT ... ON DUPLICATE KEY UPDATE` into an `AUTO_INCREMENT` table | refused; what a colliding row spends and reports beside a `SELECT` has not been measured |
 | `INSERT ... SELECT` into an `AUTO_INCREMENT` table in a session whose time zone is not UTC | refused; the copy path does not shift `TIMESTAMP` values between zones |
@@ -582,9 +581,10 @@ Behaviour that works but does not match MySQL lives in
 - A `REPEATABLE READ` transaction that writes after another session committed
   since its first read is rolled back with 1213, where MySQL writes and keeps
   reading the old snapshot for the rows it did not touch
-- `CURRENT_TIMESTAMP(n)` as a default or on update, and `NOW(n)`,
-  `CURTIME(n)` and their spellings as a result column, read the engine's
-  clock, which stops at the millisecond, so digits past the third are zeros
+- `CURRENT_TIMESTAMP(n)` as a default or on update, `NOW(n)` and its
+  spellings as a result column or a value an `INSERT` writes, and
+  `CURTIME(n)` as a result column, read the engine's clock, which stops at
+  the millisecond, so digits past the third are zeros
 - `NOW()` written into a `DATE` keeps the day without MySQL's note 1292 about
   the discarded time
 - complex compound projections still have conservative nullable metadata

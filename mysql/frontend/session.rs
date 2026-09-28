@@ -8766,7 +8766,10 @@ impl MySqlConnection {
         self.inner
             .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
             .run_ignore_rows()?;
-        let result = (|| -> Result<MySqlWriteResult> {
+        // MySQL reads the clock once for the whole statement, and each row
+        // here is written by a statement of its own, so they read one moment
+        // between them.
+        let result = turso_core::read_the_clock_once(|| -> Result<MySqlWriteResult> {
             let mut affected_rows = 0_u64;
             let mut first_inserted = None;
             let mut last_matched = None;
@@ -8829,7 +8832,7 @@ impl MySqlConnection {
                 affected_rows,
                 last_insert_id,
             })
-        })();
+        });
         if result.is_err() {
             self.inner
                 .prepare(format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?
@@ -8946,14 +8949,6 @@ impl MySqlConnection {
                 "mixed AUTO_INCREMENT INSERT with negative explicit ids is unsupported".to_string(),
             ));
         }
-        // MySQL reads the clock once for the whole statement, and each row
-        // below is written by a statement of its own.
-        if bound.reads_the_clock() {
-            return Err(LimboError::ParseError(
-                "a clock reading beside a new explicit AUTO_INCREMENT high-water mark is unsupported"
-                    .to_string(),
-            ));
-        }
         if highest_explicit > auto_increment_ceiling(table) {
             return Err(LimboError::Constraint(
                 "AUTO_INCREMENT value is outside the column's type".to_string(),
@@ -8988,7 +8983,10 @@ impl MySqlConnection {
         self.inner
             .prepare(format!("SAVEPOINT {SAVEPOINT}"))?
             .run_ignore_rows()?;
-        let result = (|| -> Result<MySqlWriteResult> {
+        // MySQL reads the clock once for the whole statement, and each row
+        // below is written by a statement of its own, so they read one moment
+        // between them.
+        let result = turso_core::read_the_clock_once(|| -> Result<MySqlWriteResult> {
             let mut affected_rows = 0_u64;
             let mut first_generated = None;
             let mut last_explicit = None;
@@ -9069,7 +9067,7 @@ impl MySqlConnection {
                 affected_rows,
                 last_insert_id: first_generated.or(last_explicit).unwrap_or(0),
             })
-        })();
+        });
         let result = result.and_then(|result| {
             lease.release()?;
             self.inner

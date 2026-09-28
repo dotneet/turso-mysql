@@ -528,3 +528,106 @@ fn a_counted_id_written_to_itself_leaves_a_signed_table_as_it_stood() {
         vec![some(&["1", "go"]), some(&["3", "x1"]), some(&["5", "x2"])]
     );
 }
+
+const RAILS_USERS: &str = "CREATE TABLE `users` (`id` bigint NOT NULL AUTO_INCREMENT PRIMARY KEY, `email` varchar(255) NOT NULL, `name` varchar(100) NOT NULL, `balance` decimal(10,2) DEFAULT 0.0 NOT NULL, `is_active` tinyint(1) DEFAULT TRUE NOT NULL, `profile` json, `created_at` datetime(6) NOT NULL, `updated_at` datetime(6) NOT NULL, UNIQUE INDEX `index_users_on_email` (`email`)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
+
+/// Rails 8's `insert!` and `insert_all` stamp `created_at` and `updated_at`
+/// with `CURRENT_TIMESTAMP(6)`, which MySQL reads once for the whole
+/// statement. The engine's clock reads to the millisecond, so the places past
+/// the third are zeros.
+#[test]
+fn rails_stamps_a_row_with_one_moment_to_the_microsecond() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, RAILS_USERS);
+    let insert = "INSERT INTO `users` (`email`,`name`,`created_at`,`updated_at`) VALUES ('alice@example.com', 'Again', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) AS `users_values`";
+    assert_eq!(written(&mut adapter, insert), (1, 1));
+    let stamped = rows(&mut adapter, "SELECT created_at, updated_at FROM users");
+    let created = stamped[0][0].clone().unwrap();
+    assert_eq!(stamped[0][1].as_deref(), Some(created.as_str()));
+    assert_eq!(created.len(), 26, "{created}");
+    assert!(created.ends_with("000"), "{created}");
+    // Rails' `insert!` of a duplicate is how it finds one.
+    assert_eq!(
+        adapter.execute_query(insert),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    // Several rows, written one at a time beside an upsert, read one moment
+    // between them. Measured: the new row takes 3, the duplicate before
+    // having spent 2.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO `users` (`email`,`name`,`created_at`,`updated_at`) VALUES ('alice@example.com', 'A2', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)), ('bob@example.com', 'B', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) AS v ON DUPLICATE KEY UPDATE name = v.name, updated_at = v.updated_at"
+        ),
+        (3, 3)
+    );
+    let bob = rows(
+        &mut adapter,
+        "SELECT id, name, created_at, updated_at FROM users WHERE email = 'bob@example.com'",
+    );
+    assert_eq!(bob[0][..2], some(&["3", "B"]));
+    assert_eq!(bob[0][2], bob[0][3]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(DISTINCT updated_at) FROM users"),
+        vec![some(&["1"])]
+    );
+}
+
+/// `NOW(6)` into an ordinary table, held to each column's own places the way a
+/// written moment is: measured on 8.4.11, a `DATETIME(2)` rounds it to two
+/// places and a `DATETIME` to the second, and a column of words takes all
+/// twenty-six characters.
+#[test]
+fn the_moment_to_the_microsecond_is_held_to_its_column() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE ev (code varchar(10) PRIMARY KEY, at6 datetime(6) NULL, at2 datetime(2) NULL, at0 datetime NULL, w varchar(40) NULL, n bigint NULL)",
+    );
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT INTO ev (code, at6, at2, at0, w) VALUES ('a', CURRENT_TIMESTAMP(6), NOW(6), LOCALTIMESTAMP(6), NOW(6)), ('b', NOW(3), NOW(3), NOW(0), NOW(1))"
+        ),
+        (2, 0)
+    );
+    let read = rows(
+        &mut adapter,
+        "SELECT at6, at2, at0, w FROM ev ORDER BY code",
+    );
+    let [first, second] = read.as_slice() else {
+        panic!("{read:?}");
+    };
+    let first = first
+        .iter()
+        .map(|value| value.clone().unwrap())
+        .collect::<Vec<_>>();
+    let second = second
+        .iter()
+        .map(|value| value.clone().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(first[0].len(), 26, "{first:?}");
+    assert!(first[0].ends_with("000"), "{first:?}");
+    assert_eq!(first[1].len(), 22, "{first:?}");
+    assert_eq!(first[2].len(), 19, "{first:?}");
+    assert_eq!(first[3], first[0]);
+    // `NOW(3)` is the same moment cut to three places, `NOW(1)` to one and
+    // `NOW(0)` to the second, where writing it into a `DATETIME` rounds.
+    assert_eq!(second[0], first[0]);
+    assert_eq!(second[1], first[1]);
+    assert_eq!(second[2], first[0][..19]);
+    assert_eq!(second[3], first[0][..21]);
+    // The moment as a number, seven places and the time of day to places are
+    // refused, as the moment itself into a number is.
+    for sql in [
+        "INSERT INTO ev (code, n) VALUES ('c', NOW(6))",
+        "INSERT INTO ev (code, at6) VALUES ('d', NOW(7))",
+        "INSERT INTO ev (code, at6) VALUES ('e', CURTIME(6))",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT COUNT(*) FROM ev"),
+        vec![some(&["2"])]
+    );
+}

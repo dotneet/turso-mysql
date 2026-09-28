@@ -357,8 +357,20 @@ column reports that many decimals and is that much wider, one more for the point
 `DATETIME` of 26 and `CURTIME(3)` a `TIME` of 12. The engine's clock reads to the millisecond,
 so a reading asked for four places or more answers zeroes past the third — a reading MySQL's
 own clock could have taken, at a coarser grain — and the fraction is cut rather than rounded,
-as MySQL cuts it. A reading carrying a fraction is taken as a result column only, not in a
-comparison or a shift.
+as MySQL cuts it. A reading carrying a fraction is taken as a result column and as a value an
+`INSERT` writes, not in a comparison or a shift.
+
+The moment read to a count of places — `NOW(6)`, `CURRENT_TIMESTAMP(3)`, `LOCALTIMESTAMP(6)` —
+is written as a value in a row of `VALUES`, the `SET` form and an upsert clause; Rails 8 stamps
+`created_at` and `updated_at` with `CURRENT_TIMESTAMP(6)` on every `insert_all` and
+`upsert_all`. The same argument holds: past the third place the reading is zeros, a moment
+MySQL's clock could have read. What lands in the column is held to the column's own places the
+way a written moment is — measured on 8.4.11, `NOW(6)` into a `DATETIME(2)` rounds to two places
+and into a `DATETIME` to the whole second, while `NOW(0)` is the second cut short, and a column
+of words takes all twenty-six characters. MySQL reads the clock once for the whole statement,
+and so does the engine now, once for each step of a statement as SQLite does, so two columns
+one row stamps agree and so do the rows of one statement. Seven places is refused, where MySQL
+answers 1426, and so is the time of day read to places, `CURTIME(6)`, as a value.
 
 The same three readings are written as values, which is how a row records when it was made:
 `INSERT INTO t (created_at) VALUES (NOW())`, `INSERT ... SET d = CURRENT_DATE`, an
@@ -2622,10 +2634,12 @@ them shifted by an interval — so `INSERT INTO users (name, created_at, updated
 ('Fi', NOW(), NOW())` is numbered like any other row, beside written values and bound `?`s
 alike. Measured on 8.4.11, three such rows into an empty table report 1, two more writing
 NULL and 0 into the id beside `NOW()` take 4 and 5 as they would anywhere else, and the table
-then prints `AUTO_INCREMENT=6`. MySQL reads the clock once for the whole statement, so a
-statement this writes one row at a time is refused when it reads the clock: several rows with
-`IGNORE` or `ON DUPLICATE KEY UPDATE`, and rows asking for the next number beside one naming its
-own id past the counter.
+then prints `AUTO_INCREMENT=6`. MySQL reads the clock once for the whole statement, and a
+statement this writes one row at a time — several rows with `IGNORE` or `ON DUPLICATE KEY
+UPDATE`, and rows asking for the next number beside one naming its own id past the counter —
+reads it once between all its rows: measured, forty rows stamped with `NOW(6)` beside an upsert
+hold one moment, where the engine's clock, reading to the millisecond, would have run past
+several.
 
 `INSERT INTO t (a, b) SELECT ...` into a table that counts its own ids is taken — Laravel's
 `insertUsing` and a data migration's copy both write it. The `SELECT` is held to the rules an
