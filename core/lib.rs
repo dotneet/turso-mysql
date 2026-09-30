@@ -131,10 +131,10 @@ pub(crate) use connection::{AtomicTransactionState, TransactionState};
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
-    Database, DatabaseLifetimeGuard, DatabaseOpts, EncryptionOpts, OpenDbAsyncPhase,
-    OpenDbAsyncState, OpenOptions, PreopenedDatabase, PreopenedDatabaseAccess,
-    PreopenedDatabaseIdentity, PreopenedDatabaseWithWal, SharedWalCoordinationOpenTelemetryMode,
-    SharedWalOpenTelemetry,
+    ConnectAsyncState, Database, DatabaseAllocators, DatabaseLifetimeGuard, DatabaseOpts,
+    EncryptionOpts, OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, PreopenedDatabase,
+    PreopenedDatabaseAccess, PreopenedDatabaseIdentity, PreopenedDatabaseWithWal,
+    SharedWalCoordinationOpenTelemetryMode, SharedWalOpenTelemetry,
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};

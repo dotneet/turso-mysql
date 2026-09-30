@@ -16,7 +16,8 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, Index, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -424,16 +425,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
-        ast::Literal::Blob(s) => Ok(Value::Blob(
-            ast::blob_literal_hex(s)
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
-                    u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
-                })
-                .try_collect()?,
-        )),
+        ast::Literal::Blob(s) => Ok(Value::Blob(ast::blob_literal_bytes(s).try_collect()?)),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
         ast::Literal::False => Ok(Value::from_i64(0)),
@@ -714,6 +706,7 @@ fn emit_add_virtual_column_validation(
         cursor_id,
         pc_if_next: loop_start,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(skip_label);
@@ -1450,7 +1443,11 @@ pub fn translate_alter_table(
                 }
             }
             let constraints = col_def.constraints.clone();
-            let mut column = Column::try_from(&col_def)?;
+            let mut column = Column::from_definition(
+                &col_def,
+                FromDefinitionFlags::empty()
+                    .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+            )?;
 
             if btree.columns().len() >= crate::types::MAX_COLUMN {
                 return Err(LimboError::ParseError(format!(
@@ -1511,7 +1508,7 @@ pub fn translate_alter_table(
                     }
                 }
 
-                default_type_mismatch = strict_default_type_mismatch(&column)?;
+                default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
             }
 
             // If a column has no explicit DEFAULT but its custom type defines
@@ -2095,7 +2092,11 @@ pub fn translate_alter_table(
                         // resolved, so the one replacing it has to be too, or a
                         // MySQL DECIMAL would read as NUMERIC until a reopen
                         // and its rows would be rewritten under that affinity.
-                        let mut replacement_column = Column::try_from(&definition)?;
+                        let mut replacement_column = Column::from_definition(
+                            &definition,
+                            FromDefinitionFlags::empty()
+                                .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+                        )?;
                         resolver.with_schema(database_id, |schema| {
                             schema.resolve_custom_type_affinity(
                                 &mut replacement_column,
@@ -2119,8 +2120,8 @@ pub fn translate_alter_table(
                         // serial type and SQLite's `PRAGMA integrity_check` reports the
                         // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
                         // changing NUMERIC -> TEXT). See issue #3706.
-                        let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                            != replacement_column.affinity_with_strict(btree.is_strict);
+                        let affinity_changed =
+                            old_column.affinity() != replacement_column.affinity();
                         let rewrites_physical_layout =
                             becomes_generated || virtuality_changed || affinity_changed;
                         (
@@ -2969,7 +2970,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect()
 }
 

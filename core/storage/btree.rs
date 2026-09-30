@@ -71,7 +71,19 @@ use std::{
 /// this threshold.
 const STACK_ALLOC_KEY_VALS_MAX: usize = 16;
 
+#[inline(always)]
 fn write_varint_to_vec(value: u64, payload: &mut crate::alloc::Vec<u8>) -> Result<()> {
+    if value <= 0x7f {
+        crate::with_btree_allocation_site!(CellPayload, payload.try_push(value as u8))?;
+        return Ok(());
+    }
+    if value <= 0x3fff {
+        crate::with_btree_allocation_site!(
+            CellPayload,
+            payload.try_extend([(((value >> 7) & 0x7f) | 0x80) as u8, (value & 0x7f) as u8])
+        )?;
+        return Ok(());
+    }
     let mut varint = [0u8; 9];
     let len = write_varint(&mut varint, value);
     crate::with_btree_allocation_site!(
@@ -251,6 +263,7 @@ pub enum OverwriteCellState {
         new_payload: crate::alloc::Vec<u8>,
         old_offset: usize,
         old_local_size: usize,
+        old_first_overflow_page: Option<u32>,
     },
 }
 
@@ -603,6 +616,18 @@ pub struct InteriorPageBinarySearchState {
     eq_seen: bool,
 }
 
+struct LeafSearchOutcome {
+    cell_index: i32,
+    has_record: Option<bool>,
+    result: SeekResult,
+}
+
+enum CurrentTableLeafSeek {
+    SearchFromRoot,
+    SearchCurrentLeaf,
+    NotFoundAtEnd,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LeafPageBinarySearchState {
     min_cell_idx: isize,
@@ -661,6 +686,32 @@ pub enum SavePositionResult {
     MustInvalidate,
 }
 
+/// The result value of advancing a cursor.
+///
+/// This is an optimization for [CursorTrait::next_row] and [CursorTrait::prev_row]. Combining the
+/// return type into the [Result] lets the compiler use a direct return (through registers) instead
+/// of a structure return (LLVM `sret`).
+#[repr(u64)]
+#[derive(Debug)]
+#[must_use]
+pub enum CursorStep {
+    Row,
+    Empty,
+    IO(IOCompletions),
+    Error(Box<LimboError>),
+}
+
+impl CursorStep {
+    #[inline]
+    fn at_row(has_row: bool) -> Self {
+        if has_row {
+            CursorStep::Row
+        } else {
+            CursorStep::Empty
+        }
+    }
+}
+
 pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> IOResultOr<()>;
@@ -668,6 +719,35 @@ pub trait CursorTrait: Any + Send + Sync {
     fn next(&mut self) -> IOResultOr<()>;
     /// Move cursor to previous entry.
     fn prev(&mut self) -> IOResultOr<()>;
+    /// The `Next` opcode in one virtual call: clears the null-row flag and,
+    /// unless it was set, moves to the next entry. Returns whether the cursor
+    /// points at a row afterwards. A NullRow cursor does not advance, like
+    /// SQLite's OP_Next when btreeNext() sees CURSOR_INVALID.
+    fn next_row(&mut self) -> CursorStep {
+        let was_null_row = self.get_null_flag();
+        self.set_null_flag(false);
+        if was_null_row {
+            return CursorStep::Empty;
+        }
+        match self.next() {
+            Ok(IOResult::IO(io)) => CursorStep::IO(io),
+            Err(err) => CursorStep::Error(err),
+            Ok(IOResult::Done(())) => CursorStep::at_row(!self.is_empty()),
+        }
+    }
+    /// The `Prev` opcode counterpart of [`CursorTrait::next_row`].
+    fn prev_row(&mut self) -> CursorStep {
+        let was_null_row = self.get_null_flag();
+        self.set_null_flag(false);
+        if was_null_row {
+            return CursorStep::Empty;
+        }
+        match self.prev() {
+            Ok(IOResult::IO(io)) => CursorStep::IO(io),
+            Err(err) => CursorStep::Error(err),
+            Ok(IOResult::Done(())) => CursorStep::at_row(!self.is_empty()),
+        }
+    }
     /// Get the rowid of the entry the cursor is poiting to if any
     fn rowid(&mut self) -> IOResultOr<Option<i64>>;
 
@@ -708,6 +788,20 @@ pub trait CursorTrait: Any + Send + Sync {
     fn note_external_row_write(&mut self, _rowid: Option<i64>) {}
     /// Get the record of the entry the cursor is poiting to if any
     fn record(&mut self) -> IOResultOr<Option<&ImmutableRecord>>;
+    /// The serialized record of the entry the cursor points to, if any, for
+    /// decoding in place. A b-tree cursor hands out the bytes of the pinned
+    /// page when the cell has no overflow, so the caller must not move the
+    /// cursor while it holds the slice. None for a cursor in the null-row
+    /// state, like the rowid. Default: the bytes of `record`.
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
+        Ok(match self.record()? {
+            IOResult::Done(record) => IOResult::Done(record.map(ImmutableRecord::get_payload)),
+            IOResult::IO(io) => IOResult::IO(io),
+        })
+    }
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult>;
     /// Seek using registers directly without serializing them into an ImmutableRecord first.
@@ -729,12 +823,13 @@ pub trait CursorTrait: Any + Send + Sync {
     fn count(&mut self) -> IOResultOr<usize>;
     fn is_empty(&self) -> bool;
     fn root_page(&self) -> i64;
+    fn set_root_page(&mut self, _root_page: i64) {}
     /// Move cursor at the start.
     fn rewind(&mut self) -> IOResultOr<()>;
     /// Check if cursor is poiting at a valid entry with a record.
     fn has_record(&self) -> bool;
     fn set_has_record(&mut self, has_record: bool);
-    fn get_index_info(&self) -> &Arc<IndexInfo>;
+    fn index_info(&self) -> Option<&Arc<IndexInfo>>;
 
     fn seek_end(&mut self) -> IOResultOr<()>;
     fn seek_to_last(&mut self) -> IOResultOr<()>;
@@ -756,6 +851,10 @@ pub trait CursorTrait: Any + Send + Sync {
     /// Opt into the pager's cursor_registry. Default no-op so non-BTreeCursor
     /// impls (MvccLazyCursor) stay out. Opt-in impls must unregister in Drop.
     fn register_with_pager(&self) {}
+    /// Drops the cursor at statement reset. BTreeCursor keeps its heap
+    /// allocation in the pager's pool for the next cursor; the default is a
+    /// plain drop.
+    fn recycle(self: Box<Self>) {}
     /// Mirror of SQLite's BTCF_Multiple flag; toggled by Pager when a bucket
     /// crosses the 1↔2 threshold.
     fn set_has_peers_for_external_writes(&self, _has_peers: bool) {}
@@ -777,6 +876,8 @@ pub struct BTreeCursor {
     /// 1. an uninitialized database,
     /// 2. an initialized database when the command is immediately followed by VACUUM.
     usable_space_cached: usize,
+    /// The overflow limits for the usable space above
+    payload_limits: PayloadLimits,
     /// Page id of the root page used to go back up fast.
     root_page: i64,
     /// Rowid and record are stored before being consumed.
@@ -798,6 +899,13 @@ pub struct BTreeCursor {
     stack: PageStack,
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: Option<ImmutableRecord>,
+    /// Where the payload of the cell under the cursor starts and how big it
+    /// is, noted by the rowid read and by a column read of a payload without
+    /// overflow, so that the next column read on the same row does not parse
+    /// the cell again (SQLite keeps the same in BtCursor.info). Cleared
+    /// wherever the reusable record is invalidated and before every write
+    /// through the cursor, because it holds an offset into the page.
+    noted_payload: NotedPayload,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -879,6 +987,18 @@ pub struct BTreeCursor {
     yield_injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
     #[cfg(any(test, injected_yields))]
     yield_instance_id: u64,
+}
+
+/// See [`BTreeCursor::noted_payload`]. A payload is never empty (its header
+/// takes at least one byte), so a size of 0 means nothing is noted.
+#[derive(Clone, Copy)]
+struct NotedPayload {
+    start: u32,
+    size: u32,
+}
+
+impl NotedPayload {
+    const NONE: Self = Self { start: 0, size: 0 };
 }
 
 /// Records the in-flight descent for `iteration_pending_descent`. The direction
@@ -1073,7 +1193,16 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
-    pub fn new(pager: Arc<Pager>, root_page: i64, _num_columns: usize) -> Self {
+    pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
+        Self::new_with_index_info(pager, root_page, num_columns, None)
+    }
+
+    fn new_with_index_info(
+        pager: Arc<Pager>,
+        root_page: i64,
+        _num_columns: usize,
+        index_info: Option<Arc<IndexInfo>>,
+    ) -> Self {
         let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
@@ -1084,6 +1213,7 @@ impl BTreeCursor {
             pager,
             root_page,
             usable_space_cached: usable_space,
+            payload_limits: PayloadLimits::new(usable_space),
             has_record: false,
             null_flag: false,
             going_upwards: false,
@@ -1093,10 +1223,11 @@ impl BTreeCursor {
             stack: PageStack {
                 current_page: -1,
                 node_states: [BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1],
-                stack: [const { None }; BTCURSOR_MAX_DEPTH + 1],
+                stack: std::mem::ManuallyDrop::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
             reusable_immutable_record: None,
-            index_info: None,
+            noted_payload: NotedPayload::NONE,
+            index_info,
             count: 0,
             context: None,
             valid_state,
@@ -1136,13 +1267,21 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
+    /// Moves the cursor to the heap, into an allocation retired by an earlier
+    /// cursor on the same pager when the pool has one.
+    pub fn into_boxed(self) -> Box<Self> {
+        match self.pager.take_cursor_allocation() {
+            Some(allocation) => Box::write(allocation, self),
+            None => Box::new(self),
+        }
+    }
+
     pub fn new_without_rowid_table(
         pager: Arc<Pager>,
         root_page: i64,
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
-        let mut cursor = Self::new(pager, root_page, num_columns);
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1153,11 +1292,11 @@ impl BTreeCursor {
                 nulls_order: None,
             }
         });
-        cursor.index_info = Some(Arc::new(
+        let index_info = Arc::new(
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
-        ));
-        cursor
+        );
+        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
     }
 
     pub fn new_index(
@@ -1166,9 +1305,23 @@ impl BTreeCursor {
         index: &Index,
         num_columns: usize,
     ) -> Result<Self> {
-        let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)?));
-        Ok(cursor)
+        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        Ok(Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+        ))
+    }
+
+    pub fn new_index_boxed(
+        pager: Arc<Pager>,
+        root_page: i64,
+        index: &Index,
+        num_columns: usize,
+    ) -> Result<Box<Self>> {
+        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -1177,19 +1330,6 @@ impl BTreeCursor {
     fn invalidate_count_cache(&mut self) {
         self.count_state = CountState::Start;
         self.count = 0;
-    }
-
-    pub fn get_index_rowid_from_record(&self) -> Option<i64> {
-        if !self.has_rowid() {
-            return None;
-        }
-        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value() {
-            Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
-            _ => unreachable!(
-                "index where has_rowid() is true should have an integer rowid as the last value"
-            ),
-        };
-        Some(rowid)
     }
 
     /// Check if the table is empty.
@@ -1364,8 +1504,9 @@ impl BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    /// Reads the record of a cell that has overflow pages. This is a state machine that requires to be called until completion so everything
-    /// that calls this function should be reentrant.
+    /// Reads the record of a cell that has overflow pages.
+    ///
+    /// After this has returned `Ok(IOResult::Done)`, the result can be retrieved with `self.get_immutable_record()`.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn process_overflow_read(
         &mut self,
@@ -1500,10 +1641,10 @@ impl BTreeCursor {
     /// Check if any ancestor pages still have cells to iterate.
     /// If not, traversing back up to parent is of no use because we are at the end of the tree.
     fn ancestor_pages_have_more_children(&self) -> bool {
-        let node_states = self.stack.node_states;
-        (0..self.stack.current())
+        self.stack.node_states[..self.stack.current()]
+            .iter()
             .rev()
-            .any(|idx| !node_states[idx].is_at_end())
+            .any(|node_state| !node_state.is_at_end())
     }
 
     /// Move the cursor to the next record and return it.
@@ -1547,7 +1688,7 @@ impl BTreeCursor {
                 let mem_page = mem_page.clone();
                 let contents = mem_page.get_contents();
                 tracing::debug!(
-                    id = mem_page.get().id,
+                    id = mem_page.get().id(),
                     cell = self.stack.current_cell_index(),
                     cell_count,
                     "current_before_advance",
@@ -1562,7 +1703,7 @@ impl BTreeCursor {
                 if should_skip_advance {
                     tracing::debug!(
                         going_upwards = self.going_upwards,
-                        page = mem_page.get().id,
+                        page = mem_page.get().id(),
                         cell_idx = self.stack.current_cell_index(),
                         "skipping advance",
                     );
@@ -1573,7 +1714,7 @@ impl BTreeCursor {
                 // Important to advance only after loading the page in order to not advance > 1 times
                 self.stack.advance();
                 let cell_idx = self.stack.current_cell_index() as usize;
-                tracing::debug!(id = mem_page.get().id, cell = cell_idx, "current");
+                tracing::debug!(id = mem_page.get().id(), cell = cell_idx, "current");
 
                 if cell_idx >= cell_count {
                     let rightmost_already_traversed = cell_idx > cell_count;
@@ -1619,7 +1760,7 @@ impl BTreeCursor {
                 turso_assert!(
                     cell_idx < cell_count,
                     "cell index out of bounds",
-                    { "cell_idx": cell_idx, "cell_count": cell_count, "page_type": contents.page_type().ok(), "page_id": mem_page.get().id }
+                    { "cell_idx": cell_idx, "cell_count": cell_count, "page_type": contents.page_type().ok(), "page_id": mem_page.get().id() }
                 );
 
                 if is_leaf {
@@ -1725,6 +1866,14 @@ impl BTreeCursor {
         self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
+        // The stack still holds the pinned root page from the last descent
+        // unless the cursor was invalidated, which clears the stack. Keep it
+        // and drop the pages below it, like SQLite's moveToRoot, instead of
+        // going through the page cache again.
+        if self.stack.holds_root(self.root_page) {
+            self.stack.pop_to_root();
+            return Ok(IOResult::Done(None));
+        }
         let (mem_page, c) = return_if_io!(self.read_page(self.root_page));
         self.stack.clear();
         self.stack.push(mem_page);
@@ -1744,7 +1893,7 @@ impl BTreeCursor {
                         // balancing, or a peer cursor's write (e.g. a trigger subprogram's, via
                         // the saveAllCursors pass) — invalidates it.
                         let current_page = self.stack.top_ref();
-                        if current_page.get().id == *rightmost_page_id {
+                        if current_page.get().id() == *rightmost_page_id {
                             let contents = current_page.get_contents();
                             let cell_count = contents.cell_count();
                             self.stack.set_cell_index(cell_count as i32 - 1);
@@ -1760,7 +1909,7 @@ impl BTreeCursor {
                 }
                 MoveToRightState::ProcessPage => {
                     let mem_page = self.stack.top_ref();
-                    let page_idx = mem_page.get().id;
+                    let page_idx = mem_page.get().id();
                     let contents = mem_page.get_contents();
                     if contents.is_leaf() {
                         self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
@@ -1867,105 +2016,105 @@ impl BTreeCursor {
         cell_count: usize,
         state: &mut InteriorPageBinarySearchState,
     ) -> Result<ControlFlow<IOResult<()>>> {
-        let min = state.min_cell_idx;
-        let max = state.max_cell_idx;
-        if min > max {
-            if let Some(nearest_matching_cell) = state.nearest_matching_cell {
-                let left_child_page = self
-                    .stack
-                    .get_page_contents_at_level(old_top_idx)
-                    .unwrap()
-                    .cell_interior_read_left_child_page(nearest_matching_cell)?;
-                // On `IO(spill_c)` we keep `seek_state` at
-                // `InteriorPageBinarySearch` (the caller persists `state` to
-                // it after we return), so re-entry retries this same step
-                // with no double-push and no cell-index drift.
-                match self.read_page(left_child_page as i64)? {
-                    IOResult::Done((mem_page, c)) => {
-                        self.stack.set_cell_index(nearest_matching_cell as i32);
-                        self.stack.push(mem_page);
-                        self.seek_state = CursorSeekState::MovingBetweenPages {
-                            eq_seen: state.eq_seen,
-                        };
-                        if let Some(c) = c {
-                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+        // The compares need no I/O, so narrow the range on this page in one
+        // go. The caller persists the state once afterwards, before the child
+        // page read below, which is the only step here that can yield.
+        {
+            let contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
+            if matches!(seek_op, SeekOp::GE { .. } | SeekOp::LE { .. }) {
+                tablebtree_search_interior::<true>(contents, rowid, seek_op, state)?;
+            } else {
+                tablebtree_search_interior::<false>(contents, rowid, seek_op, state)?;
+            }
+
+            #[inline]
+            fn tablebtree_search_interior<const INCLUSIVE: bool>(
+                contents: &PageContent,
+                rowid: i64,
+                seek_op: SeekOp,
+                state: &mut InteriorPageBinarySearchState,
+            ) -> Result<()> {
+                let mut min = state.min_cell_idx;
+                let mut max = state.max_cell_idx;
+                while min <= max {
+                    let cur_cell_idx = (min + max) >> 1;
+                    let cell_rowid =
+                        contents.cell_table_interior_read_rowid(cur_cell_idx as usize)?;
+                    let is_on_left = if INCLUSIVE {
+                        cell_rowid >= rowid
+                    } else {
+                        match seek_op {
+                            SeekOp::GT => cell_rowid > rowid,
+                            SeekOp::GE { .. } | SeekOp::LE { .. } => cell_rowid >= rowid,
+                            SeekOp::LT => cell_rowid + 1 >= rowid,
                         }
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    IOResult::IO(IOCompletions(spill_c)) => {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
+                    };
+                    if is_on_left {
+                        state.nearest_matching_cell = Some(cur_cell_idx as usize);
+                        max = cur_cell_idx - 1;
+                    } else {
+                        min = cur_cell_idx + 1;
                     }
                 }
+                state.min_cell_idx = min;
+                state.max_cell_idx = max;
+                Ok(())
             }
-            match self
+        }
+
+        if let Some(nearest_matching_cell) = state.nearest_matching_cell {
+            let left_child_page = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
                 .unwrap()
-                .rightmost_pointer()?
-            {
-                Some(right_most_pointer) => match self.read_page(right_most_pointer as i64)? {
-                    IOResult::Done((mem_page, c)) => {
-                        self.stack.set_cell_index(cell_count as i32 + 1);
-                        self.stack.push(mem_page);
-                        self.seek_state = CursorSeekState::MovingBetweenPages {
-                            eq_seen: state.eq_seen,
-                        };
-                        if let Some(c) = c {
-                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
-                        }
-                        return Ok(ControlFlow::Continue(()));
+                .cell_interior_read_left_child_page(nearest_matching_cell)?;
+            // On `IO(spill_c)` we keep `seek_state` at
+            // `InteriorPageBinarySearch` (the caller persists `state` to
+            // it after we return), so re-entry retries this same step
+            // with no double-push and no cell-index drift.
+            match self.read_page(left_child_page as i64)? {
+                IOResult::Done((mem_page, c)) => {
+                    self.stack.set_cell_index(nearest_matching_cell as i32);
+                    self.stack.push(mem_page);
+                    self.seek_state = CursorSeekState::MovingBetweenPages {
+                        eq_seen: state.eq_seen,
+                    };
+                    if let Some(c) = c {
+                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
                     }
-                    IOResult::IO(IOCompletions(spill_c)) => {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
-                    }
-                },
-                None => {
-                    unreachable!("we shall not go back up! The only way is down the slope");
+                    return Ok(ControlFlow::Continue(()));
+                }
+                IOResult::IO(IOCompletions(spill_c)) => {
+                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
                 }
             }
         }
-        let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
-        let cell_rowid = self
+        match self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_table_interior_read_rowid(cur_cell_idx as usize)?;
-        // in sqlite btrees left child pages have <= keys.
-        // table btrees can have a duplicate rowid in the interior cell, so for example if we are looking for rowid=10,
-        // and we find an interior cell with rowid=10, we need to move to the left page since (due to the <= rule of sqlite btrees)
-        // the left page may have a rowid=10.
-        // Logic table for determining if target leaf page is in left subtree
-        //
-        // Forwards iteration (looking for first match in tree):
-        // OP  | Current Cell vs Seek Key   | Action?  | Explanation
-        // GT  | >                          | go left  | First > key is in left subtree
-        // GT  | = or <                     | go right | First > key is in right subtree
-        // GE  | > or =                     | go left  | First >= key is in left subtree
-        // GE  | <                          | go right | First >= key is in right subtree
-        //
-        // Backwards iteration (looking for last match in tree):
-        // OP  | Current Cell vs Seek Key   | Action?  | Explanation
-        // LE  | > or =                     | go left  | Last <= key is in left subtree
-        // LE  | <                          | go right | Last <= key is in right subtree
-        // LT  | > or =                     | go left  | Last < key is in left subtree
-        // LT  | <                          | go right?| Last < key is in right subtree, except if cell rowid is exactly 1 less
-        //
-        // No iteration (point query):
-        // EQ  | > or =                     | go left  | Last = key is in left subtree
-        // EQ  | <                          | go right | Last = key is in right subtree
-        let is_on_left = match seek_op {
-            SeekOp::GT => cell_rowid > rowid,
-            SeekOp::GE { .. } => cell_rowid >= rowid,
-            SeekOp::LE { .. } => cell_rowid >= rowid,
-            SeekOp::LT => cell_rowid + 1 >= rowid,
-        };
-        if is_on_left {
-            state.nearest_matching_cell.replace(cur_cell_idx as usize);
-            state.max_cell_idx = cur_cell_idx - 1;
-        } else {
-            state.min_cell_idx = cur_cell_idx + 1;
+            .rightmost_pointer()?
+        {
+            Some(right_most_pointer) => match self.read_page(right_most_pointer as i64)? {
+                IOResult::Done((mem_page, c)) => {
+                    self.stack.set_cell_index(cell_count as i32 + 1);
+                    self.stack.push(mem_page);
+                    self.seek_state = CursorSeekState::MovingBetweenPages {
+                        eq_seen: state.eq_seen,
+                    };
+                    if let Some(c) = c {
+                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+                    }
+                    Ok(ControlFlow::Continue(()))
+                }
+                IOResult::IO(IOCompletions(spill_c)) => {
+                    Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))))
+                }
+            },
+            None => {
+                unreachable!("we shall not go back up! The only way is down the slope");
+            }
         }
-        Ok(ControlFlow::Continue(()))
     }
 
     /// Specialized version of move_to() for index btrees.
@@ -2117,189 +2266,171 @@ impl BTreeCursor {
         state: &mut InteriorPageBinarySearchState,
     ) -> Result<ControlFlow<IOResult<()>>> {
         let iter_dir = cmp.iteration_direction();
-        let min = state.min_cell_idx;
-        let max = state.max_cell_idx;
-        if min > max {
-            let Some(leftmost_matching_cell) = state.nearest_matching_cell else {
-                match self
-                    .stack
-                    .get_page_contents_at_level(old_top_idx)
-                    .unwrap()
-                    .rightmost_pointer()?
-                {
-                    Some(right_most_pointer) => {
-                        // On `IO(spill_c)` keep seek_state at the binary
-                        // search so re-entry retries this same step. None
-                        // of the cursor mutations have happened yet.
-                        match self.read_page(right_most_pointer as i64)? {
-                            IOResult::Done((mem_page, c)) => {
-                                self.stack.set_cell_index(cell_count as i32 + 1);
-                                self.stack.push(mem_page);
-                                self.seek_state = CursorSeekState::MovingBetweenPages {
-                                    eq_seen: state.eq_seen,
-                                };
-                                if let Some(c) = c {
-                                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
-                                }
-                                return Ok(ControlFlow::Continue(()));
-                            }
-                            IOResult::IO(IOCompletions(spill_c)) => {
-                                return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(
-                                    spill_c,
-                                ))));
-                            }
-                        }
-                    }
-                    None => {
-                        unreachable!("we shall not go back up! The only way is down the slope");
-                    }
-                }
-            };
-            let matching_cell = self
+        // Compare cells until the range is exhausted: only an overflow key
+        // read can yield here, and it returns before the range changes, so
+        // re-entry retries the same cell. The caller persists the state once
+        // per call instead of once per compare.
+        let payload_limits = self.payload_limits;
+        while state.min_cell_idx <= state.max_cell_idx {
+            let cur_cell_idx = (state.min_cell_idx + state.max_cell_idx) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
+            self.stack.set_cell_index(cur_cell_idx as i32);
+
+            let (payload, payload_size, first_overflow_page) = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
                 .unwrap()
-                .cell_get(leftmost_matching_cell, self.usable_space())?;
-            // We don't advance in case of forward iteration and index tree
-            // internal nodes because we will visit this node going up.
-            // In backwards iteration, we must retreat because otherwise we
-            // would unnecessarily visit this node again. Example:
-            //   parent:     key 666 (target found in left child)
-            //   left child: key 663, key 664, key 665
-            // we need to move to the previous parent (e.g. key 662) when
-            // iterating backwards so that we don't end up back here again.
-            //
-            // On `IO(spill_c)` we MUST NOT mutate `cell_idx` (set or
-            // retreat) — see the Done branch.
-            let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                left_child_page, ..
-            }) = &matching_cell
-            else {
-                unreachable!("unexpected cell type: {:?}", matching_cell);
+                .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
+
+            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
+                let res = self.process_overflow_read(payload, next_page, payload_size)?;
+                if res.is_io() {
+                    return Ok(ControlFlow::Break(res));
+                }
+                self.get_immutable_record()
+                    .expect("the overflow read filled the reusable record")
+                    .get_payload()
+            } else {
+                payload
             };
 
-            {
-                let page = self.stack.get_page_at_level(old_top_idx).unwrap();
-                turso_assert!(
-                    page.get().id != *left_child_page as usize,
-                    "corrupt: current page and left child page are the same",
-                    { "cell": leftmost_matching_cell, "page_id": page.get().id }
-                );
+            let (target_leaf_page_is_in_left_subtree, is_eq) = {
+                let interior_cell_vs_index_key = record_comparer.compare_payload(
+                    cell_payload,
+                    key_values,
+                    self.index_info
+                        .as_ref()
+                        .expect("indexbtree_move_to: index_info required"),
+                    tie_breaker,
+                )?;
+
+                // in sqlite btrees left child pages have <= keys.
+                // in general, in forwards iteration we want to find the first key that matches the seek condition.
+                // in backwards iteration we want to find the last key that matches the seek condition.
+                //
+                // Logic table for determining if target leaf page is in left subtree.
+                // For index b-trees this is a bit more complicated since the interior cells contain payloads (the key is the payload).
+                // and for non-unique indexes there might be several cells with the same key.
+                //
+                // Forwards iteration (looking for first match in tree):
+                // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+                // GT  | >                         | go left  | First > key could be exactly this one, or in left subtree
+                // GT  | = or <                    | go right | First > key must be in right subtree
+                // GE  | >                         | go left  | First >= key could be exactly this one, or in left subtree
+                // GE  | =                         | go left  | First >= key could be exactly this one, or in left subtree
+                // GE  | <                         | go right | First >= key must be in right subtree
+                //
+                // Backwards iteration (looking for last match in tree):
+                // OP  | Current Cell vs Seek Key  | Action?  | Explanation
+                // LE  | >                         | go left  | Last <= key must be in left subtree
+                // LE  | =                         | go right | Last <= key is either this one, or somewhere to the right of this one. So we need to go right to make sure
+                // LE  | <                         | go right | Last <= key must be in right subtree
+                // LT  | >                         | go left  | Last < key must be in left subtree
+                // LT  | =                         | go left  | Last < key must be in left subtree since we want strictly less than
+                // LT  | <                         | go right | Last < key could be exactly this one, or in right subtree
+                //
+                // No iteration (point query):
+                // EQ  | >                         | go left  | First = key must be in left subtree
+                // EQ  | =                         | go left  | First = key could be exactly this one, or in left subtree
+                // EQ  | <                         | go right | First = key must be in right subtree
+
+                (
+                    match cmp {
+                        SeekOp::GT => interior_cell_vs_index_key.is_gt(),
+                        SeekOp::GE { .. } => interior_cell_vs_index_key.is_ge(),
+                        SeekOp::LE { .. } => interior_cell_vs_index_key.is_gt(),
+                        SeekOp::LT => interior_cell_vs_index_key.is_ge(),
+                    },
+                    interior_cell_vs_index_key.is_eq(),
+                )
+            };
+
+            if is_eq {
+                state.eq_seen = true;
             }
 
-            match self.read_page(*left_child_page as i64)? {
-                IOResult::Done((mem_page, c)) => {
-                    self.stack.set_cell_index(leftmost_matching_cell as i32);
-                    if iter_dir == IterationDirection::Backwards {
-                        self.stack.retreat();
-                    }
-                    self.stack.push(mem_page);
-                    self.seek_state = CursorSeekState::MovingBetweenPages {
-                        eq_seen: state.eq_seen,
-                    };
-                    if let Some(c) = c {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
-                    }
-                }
-                IOResult::IO(IOCompletions(spill_c)) => {
-                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
-                }
+            if target_leaf_page_is_in_left_subtree {
+                state.nearest_matching_cell = Some(cur_cell_idx as usize);
+                state.max_cell_idx = cur_cell_idx - 1;
+            } else {
+                state.min_cell_idx = cur_cell_idx + 1;
             }
-            return Ok(ControlFlow::Continue(()));
         }
 
-        let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
-        self.stack.set_cell_index(cur_cell_idx as i32);
-
-        let (payload, payload_size, first_overflow_page) = self
+        let Some(leftmost_matching_cell) = state.nearest_matching_cell else {
+            match self
+                .stack
+                .get_page_contents_at_level(old_top_idx)
+                .unwrap()
+                .rightmost_pointer()?
+            {
+                Some(right_most_pointer) => {
+                    // On `IO(spill_c)` keep seek_state at the binary
+                    // search so re-entry retries this same step. None
+                    // of the cursor mutations have happened yet.
+                    match self.read_page(right_most_pointer as i64)? {
+                        IOResult::Done((mem_page, c)) => {
+                            self.stack.set_cell_index(cell_count as i32 + 1);
+                            self.stack.push(mem_page);
+                            self.seek_state = CursorSeekState::MovingBetweenPages {
+                                eq_seen: state.eq_seen,
+                            };
+                            if let Some(c) = c {
+                                return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+                            }
+                            return Ok(ControlFlow::Continue(()));
+                        }
+                        IOResult::IO(IOCompletions(spill_c)) => {
+                            return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
+                        }
+                    }
+                }
+                None => {
+                    unreachable!("we shall not go back up! The only way is down the slope");
+                }
+            }
+        };
+        let left_child_page = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
-
-        if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, next_page, payload_size)?;
-            if res.is_io() {
-                return Ok(ControlFlow::Break(res));
-            }
-        } else {
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(payload)
-            )?;
-        };
-
-        let (target_leaf_page_is_in_left_subtree, is_eq) = {
-            let record = self.get_immutable_record();
-            let record = record.as_ref().unwrap();
-
-            let interior_cell_vs_index_key = record_comparer.compare(
-                record,
-                key_values,
-                self.index_info
-                    .as_ref()
-                    .expect("indexbtree_move_to: index_info required"),
-                0,
-                tie_breaker,
-            )?;
-
-            // in sqlite btrees left child pages have <= keys.
-            // in general, in forwards iteration we want to find the first key that matches the seek condition.
-            // in backwards iteration we want to find the last key that matches the seek condition.
-            //
-            // Logic table for determining if target leaf page is in left subtree.
-            // For index b-trees this is a bit more complicated since the interior cells contain payloads (the key is the payload).
-            // and for non-unique indexes there might be several cells with the same key.
-            //
-            // Forwards iteration (looking for first match in tree):
-            // OP  | Current Cell vs Seek Key  | Action?  | Explanation
-            // GT  | >                         | go left  | First > key could be exactly this one, or in left subtree
-            // GT  | = or <                    | go right | First > key must be in right subtree
-            // GE  | >                         | go left  | First >= key could be exactly this one, or in left subtree
-            // GE  | =                         | go left  | First >= key could be exactly this one, or in left subtree
-            // GE  | <                         | go right | First >= key must be in right subtree
-            //
-            // Backwards iteration (looking for last match in tree):
-            // OP  | Current Cell vs Seek Key  | Action?  | Explanation
-            // LE  | >                         | go left  | Last <= key must be in left subtree
-            // LE  | =                         | go right | Last <= key is either this one, or somewhere to the right of this one. So we need to go right to make sure
-            // LE  | <                         | go right | Last <= key must be in right subtree
-            // LT  | >                         | go left  | Last < key must be in left subtree
-            // LT  | =                         | go left  | Last < key must be in left subtree since we want strictly less than
-            // LT  | <                         | go right | Last < key could be exactly this one, or in right subtree
-            //
-            // No iteration (point query):
-            // EQ  | >                         | go left  | First = key must be in left subtree
-            // EQ  | =                         | go left  | First = key could be exactly this one, or in left subtree
-            // EQ  | <                         | go right | First = key must be in right subtree
-
-            (
-                match cmp {
-                    SeekOp::GT => interior_cell_vs_index_key.is_gt(),
-                    SeekOp::GE { .. } => interior_cell_vs_index_key.is_ge(),
-                    SeekOp::LE { .. } => interior_cell_vs_index_key.is_gt(),
-                    SeekOp::LT => interior_cell_vs_index_key.is_ge(),
-                },
-                interior_cell_vs_index_key.is_eq(),
-            )
-        };
-
-        if is_eq {
-            state.eq_seen = true;
+            .cell_interior_read_left_child_page(leftmost_matching_cell)?;
+        // We don't advance in case of forward iteration and index tree
+        // internal nodes because we will visit this node going up.
+        // In backwards iteration, we must retreat because otherwise we
+        // would unnecessarily visit this node again. Example:
+        //   parent:     key 666 (target found in left child)
+        //   left child: key 663, key 664, key 665
+        // we need to move to the previous parent (e.g. key 662) when
+        // iterating backwards so that we don't end up back here again.
+        //
+        // On `IO(spill_c)` we MUST NOT mutate `cell_idx` (set or
+        // retreat) — see the Done branch.
+        {
+            let page = self.stack.get_page_at_level(old_top_idx).unwrap();
+            turso_assert!(
+                page.get().id() != left_child_page as usize,
+                "corrupt: current page and left child page are the same",
+                { "cell": leftmost_matching_cell, "page_id": page.get().id() }
+            );
         }
 
-        if target_leaf_page_is_in_left_subtree {
-            state.nearest_matching_cell = Some(cur_cell_idx as usize);
-            state.max_cell_idx = cur_cell_idx - 1;
-        } else {
-            state.min_cell_idx = cur_cell_idx + 1;
+        match self.read_page(left_child_page as i64)? {
+            IOResult::Done((mem_page, c)) => {
+                self.stack.set_cell_index(leftmost_matching_cell as i32);
+                if iter_dir == IterationDirection::Backwards {
+                    self.stack.retreat();
+                }
+                self.stack.push(mem_page);
+                self.seek_state = CursorSeekState::MovingBetweenPages {
+                    eq_seen: state.eq_seen,
+                };
+                if let Some(c) = c {
+                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+                }
+            }
+            IOResult::IO(IOCompletions(spill_c)) => {
+                return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
+            }
         }
         Ok(ControlFlow::Continue(()))
     }
@@ -2308,13 +2439,22 @@ impl BTreeCursor {
     /// of iterating cells in order.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<SeekResult> {
-        if matches!(
-            self.seek_state,
-            CursorSeekState::Start
-                | CursorSeekState::MovingBetweenPages { .. }
-                | CursorSeekState::InteriorPageBinarySearch { .. }
-        ) {
-            // No need for another move_to_root. Move_to already moves to root
+        let search_tree = if matches!(self.seek_state, CursorSeekState::Start) {
+            match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
+                CurrentTableLeafSeek::SearchFromRoot => true,
+                CurrentTableLeafSeek::SearchCurrentLeaf => false,
+                CurrentTableLeafSeek::NotFoundAtEnd => {
+                    return Ok(IOResult::Done(SeekResult::NotFound));
+                }
+            }
+        } else {
+            matches!(
+                self.seek_state,
+                CursorSeekState::MovingBetweenPages { .. }
+                    | CursorSeekState::InteriorPageBinarySearch { .. }
+            )
+        };
+        if search_tree {
             return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
             let page = self.stack.top_ref();
             let contents = page.get_contents();
@@ -2328,142 +2468,227 @@ impl BTreeCursor {
                 self.stack.set_cell_index(0);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
-            let min_cell_idx = 0;
-            let max_cell_idx = cell_count as isize - 1;
-
-            // If iter dir is forwards, we want the first cell that matches;
-            // If iter dir is backwards, we want the last cell that matches.
-            let nearest_matching_cell = None;
-
-            self.seek_state = CursorSeekState::LeafPageBinarySearch {
-                state: LeafPageBinarySearchState {
-                    min_cell_idx,
-                    max_cell_idx,
-                    nearest_matching_cell,
-                    eq_seen: false, // not relevant for table btrees
-                    target_cell_when_not_found: match seek_op.iteration_direction() {
-                        IterationDirection::Forwards => cell_count as i32,
-                        IterationDirection::Backwards => -1,
-                    },
-                },
-            };
+            self.start_table_leaf_search(cell_count, seek_op);
         }
 
         let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
             unreachable!("we must be in a leaf binary search state");
         };
 
-        let page = self.stack.top_ref().clone();
-        let contents = page.get_contents();
-        let mut state = *state;
-
-        loop {
-            let control = self.tablebtree_seek_inner(rowid, seek_op, contents, &mut state)?;
-            // Persist state after each iteration since inner function modifies it
-            if matches!(
-                self.seek_state,
-                CursorSeekState::LeafPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
-            }
-            match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(res) => {
-                    return Ok(res);
-                }
-            }
+        let mut search = *state;
+        let outcome = Self::tablebtree_leaf_search(
+            rowid,
+            seek_op,
+            self.stack.top_ref().get_contents(),
+            &mut search,
+        )?;
+        self.seek_state = CursorSeekState::LeafPageBinarySearch { state: search };
+        self.stack.set_cell_index(outcome.cell_index);
+        if let Some(has_record) = outcome.has_record {
+            self.has_record = has_record;
         }
+        Ok(IOResult::Done(outcome.result))
     }
 
-    fn tablebtree_seek_inner(
+    #[inline(never)]
+    fn try_start_seek_on_current_table_leaf(
         &mut self,
         rowid: i64,
         seek_op: SeekOp,
-        contents: &mut PageContent,
-        state: &mut LeafPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<SeekResult>>> {
-        let iter_dir = seek_op.iteration_direction();
-        let min = state.min_cell_idx;
-        let max = state.max_cell_idx;
-        let target_cell_when_not_found = state.target_cell_when_not_found;
-        if min > max {
-            if let Some(nearest_matching_cell) = state.nearest_matching_cell {
-                self.stack.set_cell_index(nearest_matching_cell as i32);
-                self.set_has_record(true);
-                return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
-            } else {
-                // if !eq_only - matching entry can exist in neighbour leaf page
-                // this can happen if key in the interiour page was deleted - but divider kept untouched
-                // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
-                // in this case, caller must advance cursor if necessary
-                return Ok(ControlFlow::Break(IOResult::Done(if seek_op.eq_only() {
-                    let has_record = target_cell_when_not_found >= 0
-                        && target_cell_when_not_found < contents.cell_count() as i32;
-                    self.has_record = has_record;
-                    self.stack.set_cell_index(target_cell_when_not_found);
-                    SeekResult::NotFound
-                } else {
-                    // set cursor to the position where which would hold the op-boundary if it were present
-                    self.stack.set_cell_index(target_cell_when_not_found);
-                    SeekResult::TryAdvance
-                })));
-            };
+    ) -> Result<CurrentTableLeafSeek> {
+        if !matches!(seek_op, SeekOp::GE { eq_only: true })
+            || self.valid_state != CursorValidState::Valid
+            || !self.has_record
+            || !matches!(self.move_to_state, MoveToState::Start)
+            || self.stack.current_page < 0
+        {
+            return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
 
-        let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
-        let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
-
-        let cmp = cell_rowid.cmp(&rowid);
-
-        let found = match seek_op {
-            SeekOp::GT => cmp.is_gt(),
-            SeekOp::GE { eq_only: true } => cmp.is_eq(),
-            SeekOp::GE { eq_only: false } => cmp.is_ge(),
-            SeekOp::LE { eq_only: true } => cmp.is_eq(),
-            SeekOp::LE { eq_only: false } => cmp.is_le(),
-            SeekOp::LT => cmp.is_lt(),
+        let (seek, cell_count) = {
+            let page = self.stack.top_ref();
+            turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
+            let contents = page.get_contents();
+            if !contents.is_table() || !contents.is_leaf() {
+                return Ok(CurrentTableLeafSeek::SearchFromRoot);
+            }
+            let cell_count = contents.cell_count();
+            if cell_count == 0 {
+                return Ok(CurrentTableLeafSeek::SearchFromRoot);
+            }
+            let last_rowid = contents.cell_table_leaf_read_rowid(cell_count - 1)?;
+            let seek = if rowid > last_rowid {
+                if self.ancestor_pages_have_more_children() {
+                    return Ok(CurrentTableLeafSeek::SearchFromRoot);
+                }
+                turso_debug_assert!(
+                    (0..cell_count).all(|i| contents
+                        .cell_table_leaf_read_rowid(i)
+                        .is_ok_and(|cell_rowid| cell_rowid < rowid)),
+                    "a rowid past the last cell must be past every cell"
+                );
+                CurrentTableLeafSeek::NotFoundAtEnd
+            } else if rowid >= contents.cell_table_leaf_read_rowid(0)? {
+                CurrentTableLeafSeek::SearchCurrentLeaf
+            } else {
+                return Ok(CurrentTableLeafSeek::SearchFromRoot);
+            };
+            (seek, cell_count)
         };
 
-        // rowids are unique, so we can return the rowid immediately
-        if found && seek_op.eq_only() {
-            self.stack.set_cell_index(cur_cell_idx as i32);
-            self.set_has_record(true);
-            return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+        match seek {
+            CurrentTableLeafSeek::SearchCurrentLeaf => {
+                self.start_table_leaf_search(cell_count, seek_op);
+                Ok(CurrentTableLeafSeek::SearchCurrentLeaf)
+            }
+            CurrentTableLeafSeek::NotFoundAtEnd => {
+                self.stack.set_cell_index(cell_count as i32);
+                self.has_record = false;
+                Ok(CurrentTableLeafSeek::NotFoundAtEnd)
+            }
+            CurrentTableLeafSeek::SearchFromRoot => unreachable!(),
+        }
+    }
+
+    fn start_table_leaf_search(&mut self, cell_count: usize, seek_op: SeekOp) {
+        self.seek_state = CursorSeekState::LeafPageBinarySearch {
+            state: LeafPageBinarySearchState {
+                min_cell_idx: 0,
+                max_cell_idx: cell_count as isize - 1,
+                nearest_matching_cell: None,
+                eq_seen: false,
+                target_cell_when_not_found: match seek_op.iteration_direction() {
+                    IterationDirection::Forwards => cell_count as i32,
+                    IterationDirection::Backwards => -1,
+                },
+            },
+        };
+    }
+
+    fn tablebtree_leaf_search(
+        rowid: i64,
+        seek_op: SeekOp,
+        contents: &PageContent,
+        state: &mut LeafPageBinarySearchState,
+    ) -> Result<LeafSearchOutcome> {
+        if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+            return leaf_search::<true>(rowid, seek_op, contents, state);
+        } else {
+            return leaf_search::<false>(rowid, seek_op, contents, state);
         }
 
-        if found {
-            state.nearest_matching_cell = Some(cur_cell_idx as usize);
-            match iter_dir {
-                IterationDirection::Forwards => {
-                    state.max_cell_idx = cur_cell_idx - 1;
+        #[inline]
+        fn leaf_search<const EXACT_FORWARD: bool>(
+            rowid: i64,
+            seek_op: SeekOp,
+            contents: &PageContent,
+            state: &mut LeafPageBinarySearchState,
+        ) -> Result<LeafSearchOutcome> {
+            let seek_op = if EXACT_FORWARD {
+                SeekOp::GE { eq_only: true }
+            } else {
+                seek_op
+            };
+            let iter_dir = seek_op.iteration_direction();
+            let mut min = state.min_cell_idx;
+            let mut max = state.max_cell_idx;
+            while min <= max {
+                // Both indices are nonnegative. This avoids signed division for the midpoint.
+                let cur_cell_idx = (min + max) >> 1;
+                let cell_rowid = contents.cell_table_leaf_read_rowid(cur_cell_idx as usize)?;
+
+                let cmp = cell_rowid.cmp(&rowid);
+
+                let found = if EXACT_FORWARD {
+                    cell_rowid == rowid
+                } else {
+                    match seek_op {
+                        SeekOp::GT => cmp.is_gt(),
+                        SeekOp::GE { eq_only: true } => cmp.is_eq(),
+                        SeekOp::GE { eq_only: false } => cmp.is_ge(),
+                        SeekOp::LE { eq_only: true } => cmp.is_eq(),
+                        SeekOp::LE { eq_only: false } => cmp.is_le(),
+                        SeekOp::LT => cmp.is_lt(),
+                    }
+                };
+
+                if found && seek_op.eq_only() {
+                    state.min_cell_idx = min;
+                    state.max_cell_idx = max;
+                    return Ok(LeafSearchOutcome {
+                        cell_index: cur_cell_idx as i32,
+                        has_record: Some(true),
+                        result: SeekResult::Found,
+                    });
                 }
-                IterationDirection::Backwards => {
-                    state.min_cell_idx = cur_cell_idx + 1;
+
+                if found {
+                    state.nearest_matching_cell = Some(cur_cell_idx as usize);
+                    match iter_dir {
+                        IterationDirection::Forwards => {
+                            max = cur_cell_idx - 1;
+                        }
+                        IterationDirection::Backwards => {
+                            min = cur_cell_idx + 1;
+                        }
+                    }
+                } else if cmp.is_gt() {
+                    if !EXACT_FORWARD && matches!(seek_op, SeekOp::GE { eq_only: true }) {
+                        state.target_cell_when_not_found =
+                            state.target_cell_when_not_found.min(cur_cell_idx as i32);
+                    }
+                    max = cur_cell_idx - 1;
+                } else if EXACT_FORWARD || cmp.is_lt() {
+                    if matches!(seek_op, SeekOp::LE { eq_only: true }) {
+                        state.target_cell_when_not_found =
+                            state.target_cell_when_not_found.max(cur_cell_idx as i32);
+                    }
+                    min = cur_cell_idx + 1;
+                } else {
+                    match iter_dir {
+                        IterationDirection::Forwards => {
+                            min = cur_cell_idx + 1;
+                        }
+                        IterationDirection::Backwards => {
+                            max = cur_cell_idx - 1;
+                        }
+                    }
                 }
             }
-        } else if cmp.is_gt() {
-            if matches!(seek_op, SeekOp::GE { eq_only: true }) {
-                state.target_cell_when_not_found =
-                    target_cell_when_not_found.min(cur_cell_idx as i32);
+
+            state.min_cell_idx = min;
+            state.max_cell_idx = max;
+            if EXACT_FORWARD {
+                state.target_cell_when_not_found = min as i32;
             }
-            state.max_cell_idx = cur_cell_idx - 1;
-        } else if cmp.is_lt() {
-            if matches!(seek_op, SeekOp::LE { eq_only: true }) {
-                state.target_cell_when_not_found =
-                    target_cell_when_not_found.max(cur_cell_idx as i32);
-            }
-            state.min_cell_idx = cur_cell_idx + 1;
-        } else {
-            match iter_dir {
-                IterationDirection::Forwards => {
-                    state.min_cell_idx = cur_cell_idx + 1;
-                }
-                IterationDirection::Backwards => {
-                    state.max_cell_idx = cur_cell_idx - 1;
+            let target_cell_when_not_found = state.target_cell_when_not_found;
+            if !EXACT_FORWARD {
+                if let Some(nearest_matching_cell) = state.nearest_matching_cell {
+                    return Ok(LeafSearchOutcome {
+                        cell_index: nearest_matching_cell as i32,
+                        has_record: Some(true),
+                        result: SeekResult::Found,
+                    });
                 }
             }
+            // A range seek may find its match on the next leaf.
+            Ok(if seek_op.eq_only() {
+                LeafSearchOutcome {
+                    cell_index: target_cell_when_not_found,
+                    has_record: Some(
+                        target_cell_when_not_found >= 0
+                            && target_cell_when_not_found < contents.cell_count() as i32,
+                    ),
+                    result: SeekResult::NotFound,
+                }
+            } else {
+                LeafSearchOutcome {
+                    cell_index: target_cell_when_not_found,
+                    has_record: None,
+                    result: SeekResult::TryAdvance,
+                }
+            })
         }
-        Ok(ControlFlow::Continue(()))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -2580,28 +2805,19 @@ impl BTreeCursor {
 
         let mut state = *state;
 
-        loop {
-            let control = self.indexbtree_seek_inner(
-                seek_op,
-                old_top_idx,
-                key_values,
-                record_comparer,
-                &mut state,
-            )?;
-            // Persist state after each iteration since inner function modifies it
-            if matches!(
-                self.seek_state,
-                CursorSeekState::LeafPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
-            }
-            match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(res) => {
-                    return Ok(res);
-                }
-            }
-        }
+        let result = self.indexbtree_seek_inner(
+            seek_op,
+            old_top_idx,
+            key_values,
+            record_comparer,
+            &mut state,
+        )?;
+        // The search state goes back to the cursor once per call, not once
+        // per compare, as for the interior pages: only an overflow key read
+        // yields, and it returns before the range changes, so re-entry
+        // retries the same cell.
+        self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
+        Ok(result)
     }
 
     fn indexbtree_seek_inner(
@@ -2611,133 +2827,160 @@ impl BTreeCursor {
         key_values: &[ValueRef<'_>],
         record_comparer: RecordCompare,
         state: &mut LeafPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<SeekResult>>> {
-        let iter_dir = seek_op.iteration_direction();
-        let min = state.min_cell_idx;
-        let max = state.max_cell_idx;
-        let eq_seen = state.eq_seen;
-        if min > max {
-            if let Some(nearest_matching_cell) = state.nearest_matching_cell {
-                self.stack.set_cell_index(nearest_matching_cell as i32);
-                self.set_has_record(true);
-
-                return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
-            } else {
-                // set cursor to the position where which would hold the op-boundary if it were present
-                let target_cell = state.target_cell_when_not_found;
-                self.stack.set_cell_index(target_cell);
-                let has_record = target_cell >= 0
-                    && target_cell
-                        < self
-                            .stack
-                            .get_page_contents_at_level(old_top_idx)
-                            .unwrap()
-                            .cell_count() as i32;
-                self.has_record = has_record;
-
-                // Similar logic as in tablebtree_seek(), but for indexes.
-                // The difference is that since index keys are not necessarily unique, we need to TryAdvance
-                // even when eq_only=true and we have seen an EQ match up in the tree in an interior node.
-                if seek_op.eq_only() && !eq_seen {
-                    return Ok(ControlFlow::Break(IOResult::Done(SeekResult::NotFound)));
-                }
-                return Ok(ControlFlow::Break(IOResult::Done(SeekResult::TryAdvance)));
-            };
-        }
-
-        let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
-        self.stack.set_cell_index(cur_cell_idx as i32);
-
-        let (payload, payload_size, first_overflow_page) = self
-            .stack
-            .get_page_contents_at_level(old_top_idx)
-            .unwrap()
-            .cell_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
-
-        if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, next_page, payload_size)?;
-            if let IOResult::IO(io) = res {
-                return Ok(ControlFlow::Break(IOResult::IO(io)));
-            }
+    ) -> IOResultOr<SeekResult> {
+        if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+            self.indexbtree_seek_impl::<true>(
+                seek_op,
+                old_top_idx,
+                key_values,
+                record_comparer,
+                state,
+            )
         } else {
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(payload)
-            )?;
-        };
-
-        let (cmp, found) = self.compare_with_current_record(
-            key_values,
-            seek_op,
-            &record_comparer,
-            self.index_info
-                .as_ref()
-                .expect("indexbtree_seek: index_info required"),
-        )?;
-        if found {
-            state.nearest_matching_cell.replace(cur_cell_idx as usize);
-            match iter_dir {
-                IterationDirection::Forwards => {
-                    state.max_cell_idx = cur_cell_idx - 1;
-                }
-                IterationDirection::Backwards => {
-                    state.min_cell_idx = cur_cell_idx + 1;
-                }
-            }
-        } else if cmp.is_gt() {
-            if matches!(seek_op, SeekOp::GE { eq_only: true }) {
-                state.target_cell_when_not_found =
-                    state.target_cell_when_not_found.min(cur_cell_idx as i32);
-            }
-            state.max_cell_idx = cur_cell_idx - 1;
-        } else if cmp.is_lt() {
-            if matches!(seek_op, SeekOp::LE { eq_only: true }) {
-                state.target_cell_when_not_found =
-                    state.target_cell_when_not_found.max(cur_cell_idx as i32);
-            }
-            state.min_cell_idx = cur_cell_idx + 1;
-        } else {
-            match iter_dir {
-                IterationDirection::Forwards => {
-                    state.min_cell_idx = cur_cell_idx + 1;
-                }
-                IterationDirection::Backwards => {
-                    state.max_cell_idx = cur_cell_idx - 1;
-                }
-            }
+            self.indexbtree_seek_impl::<false>(
+                seek_op,
+                old_top_idx,
+                key_values,
+                record_comparer,
+                state,
+            )
         }
-        Ok(ControlFlow::Continue(()))
     }
 
-    fn compare_with_current_record(
-        &self,
-        key_values: &[ValueRef],
+    fn indexbtree_seek_impl<const EXACT_FORWARD: bool>(
+        &mut self,
         seek_op: SeekOp,
-        record_comparer: &RecordCompare,
-        index_info: &IndexInfo,
-    ) -> Result<(Ordering, bool)> {
-        let record = self.get_immutable_record();
-        let record = record.as_ref().unwrap();
-
-        let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
-        let cmp = record_comparer.compare(record, key_values, index_info, 0, tie_breaker)?;
-
-        let found = match seek_op {
-            SeekOp::GT => cmp.is_gt(),
-            SeekOp::GE { eq_only: true } => cmp.is_eq(),
-            SeekOp::GE { eq_only: false } => cmp.is_ge(),
-            SeekOp::LE { eq_only: true } => cmp.is_eq(),
-            SeekOp::LE { eq_only: false } => cmp.is_le(),
-            SeekOp::LT => cmp.is_lt(),
+        old_top_idx: usize,
+        key_values: &[ValueRef<'_>],
+        record_comparer: RecordCompare,
+        state: &mut LeafPageBinarySearchState,
+    ) -> IOResultOr<SeekResult> {
+        let seek_op = if EXACT_FORWARD {
+            SeekOp::GE { eq_only: true }
+        } else {
+            seek_op
         };
-        Ok((cmp, found))
+        let iter_dir = seek_op.iteration_direction();
+        let eq_seen = state.eq_seen;
+        let payload_limits = self.payload_limits;
+        loop {
+            let min = state.min_cell_idx;
+            let max = state.max_cell_idx;
+            if min > max {
+                if let Some(nearest_matching_cell) = state.nearest_matching_cell {
+                    self.stack.set_cell_index(nearest_matching_cell as i32);
+                    self.set_has_record(true);
+
+                    return Ok(IOResult::Done(SeekResult::Found));
+                } else {
+                    // set cursor to the position where which would hold the op-boundary if it were present
+                    let target_cell = state.target_cell_when_not_found;
+                    self.stack.set_cell_index(target_cell);
+                    let has_record = target_cell >= 0
+                        && target_cell
+                            < self
+                                .stack
+                                .get_page_contents_at_level(old_top_idx)
+                                .unwrap()
+                                .cell_count() as i32;
+                    self.has_record = has_record;
+
+                    // Similar logic as in tablebtree_seek(), but for indexes.
+                    // The difference is that since index keys are not necessarily unique, we need to TryAdvance
+                    // even when eq_only=true and we have seen an EQ match up in the tree in an interior node.
+                    if seek_op.eq_only() && !eq_seen {
+                        return Ok(IOResult::Done(SeekResult::NotFound));
+                    }
+                    return Ok(IOResult::Done(SeekResult::TryAdvance));
+                };
+            }
+
+            let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
+            self.stack.set_cell_index(cur_cell_idx as i32);
+
+            let (payload, payload_size, first_overflow_page) = self
+                .stack
+                .get_page_contents_at_level(old_top_idx)
+                .unwrap()
+                .cell_read_payload_ptr(cur_cell_idx as usize, payload_limits)?;
+
+            let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
+                let res = self.process_overflow_read(payload, next_page, payload_size)?;
+                if let IOResult::IO(io) = res {
+                    return Ok(IOResult::IO(io));
+                }
+                self.get_immutable_record()
+                    .expect("the overflow read filled the reusable record")
+                    .get_payload()
+            } else {
+                payload
+            };
+
+            let (cmp, found) = compare_cell_with_key(
+                cell_payload,
+                key_values,
+                seek_op,
+                &record_comparer,
+                self.index_info
+                    .as_ref()
+                    .expect("indexbtree_seek: index_info required"),
+            )?;
+            if found {
+                state.nearest_matching_cell.replace(cur_cell_idx as usize);
+                match iter_dir {
+                    IterationDirection::Forwards => {
+                        state.max_cell_idx = cur_cell_idx - 1;
+                    }
+                    IterationDirection::Backwards => {
+                        state.min_cell_idx = cur_cell_idx + 1;
+                    }
+                }
+            } else if cmp.is_gt() {
+                if matches!(seek_op, SeekOp::GE { eq_only: true }) {
+                    state.target_cell_when_not_found =
+                        state.target_cell_when_not_found.min(cur_cell_idx as i32);
+                }
+                state.max_cell_idx = cur_cell_idx - 1;
+            } else if cmp.is_lt() {
+                if matches!(seek_op, SeekOp::LE { eq_only: true }) {
+                    state.target_cell_when_not_found =
+                        state.target_cell_when_not_found.max(cur_cell_idx as i32);
+                }
+                state.min_cell_idx = cur_cell_idx + 1;
+            } else {
+                match iter_dir {
+                    IterationDirection::Forwards => {
+                        state.min_cell_idx = cur_cell_idx + 1;
+                    }
+                    IterationDirection::Backwards => {
+                        state.max_cell_idx = cur_cell_idx - 1;
+                    }
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn compare_cell_with_key(
+            payload: &[u8],
+            key_values: &[ValueRef],
+            seek_op: SeekOp,
+            record_comparer: &RecordCompare,
+            index_info: &IndexInfo,
+        ) -> Result<(Ordering, bool)> {
+            let tie_breaker = get_tie_breaker_from_seek_op(seek_op);
+            let cmp =
+                record_comparer.compare_payload(payload, key_values, index_info, tie_breaker)?;
+
+            let found = match seek_op {
+                SeekOp::GT => cmp.is_gt(),
+                SeekOp::GE { eq_only: true } => cmp.is_eq(),
+                SeekOp::GE { eq_only: false } => cmp.is_ge(),
+                SeekOp::LE { eq_only: true } => cmp.is_eq(),
+                SeekOp::LE { eq_only: false } => cmp.is_le(),
+                SeekOp::LT => cmp.is_lt(),
+            };
+            Ok((cmp, found))
+        }
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -2809,7 +3052,10 @@ impl BTreeCursor {
             .get_record()
             .expect("expected record present on insert");
         if let CursorState::None = &self.state {
-            self.state = CursorState::Write(WriteState::Start);
+            std::mem::forget(std::mem::replace(
+                &mut self.state,
+                CursorState::Write(WriteState::Start),
+            ));
         }
         let usable_space = self.usable_space();
         let ret = loop {
@@ -2839,9 +3085,7 @@ impl BTreeCursor {
                         match cell {
                             BTreeCell::TableLeafCell(tbl_leaf) => {
                                 if tbl_leaf.rowid == bkey.to_rowid() {
-                                    tracing::debug!(
-                                        "TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting"
-                                    );
+                                    tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.has_record = true;
                                     *write_state = WriteState::Overwrite {
                                         page,
@@ -2855,13 +3099,14 @@ impl BTreeCursor {
                                 return_if_io!(self.record());
                                 let cmp = compare_immutable_iter(
                                     record.iter()?,
-                                    self.get_immutable_record().as_ref().unwrap().iter()?,
-                                    &self.index_info.as_ref().unwrap().key_info,
+                                    self.get_immutable_record()
+                                        .as_ref()
+                                        .unwrap()
+                                        .iter()?,
+                                        &self.index_info.as_ref().unwrap().key_info,
                                 )?;
                                 if cmp == Ordering::Equal {
-                                    tracing::debug!(
-                                        "IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting"
-                                    );
+                                    tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.set_has_record(true);
                                     let CursorState::Write(write_state) = &mut self.state else {
                                         panic!("expected write state");
@@ -2875,13 +3120,11 @@ impl BTreeCursor {
                                 } else {
                                     turso_assert!(
                                         !matches!(cell, BTreeCell::IndexInteriorCell(..)),
-                                        "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
+                                         "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
                                     );
                                 }
                             }
-                            other => panic!(
-                                "unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"
-                            ),
+                            other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
                         }
                     }
 
@@ -2901,12 +3144,17 @@ impl BTreeCursor {
                             payload.try_reserve(needed_capacity - payload.capacity())
                         )?;
                     }
-                    *write_state = WriteState::Insert {
-                        page,
-                        cell_idx,
-                        new_payload: payload,
-                        fill_cell_payload_state: FillCellPayloadState::Start,
-                    };
+                    // The current state (`WriteState::Start`) has no allocations, so
+                    // we std::mem::forget it to save on drop glue
+                    std::mem::forget(std::mem::replace(
+                        write_state,
+                        WriteState::Insert {
+                            page,
+                            cell_idx,
+                            new_payload: payload,
+                            fill_cell_payload_state: FillCellPayloadState::Start,
+                        },
+                    ));
                     continue;
                 }
                 WriteState::Insert {
@@ -2916,13 +3164,13 @@ impl BTreeCursor {
                     ref mut fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
-                        &PinGuard::new(page.clone()),
+                        page,
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
                         &record,
                         usable_space,
-                        self.pager.clone(),
+                        &self.pager,
                         fill_cell_payload_state,
                     ));
 
@@ -2963,7 +3211,7 @@ impl BTreeCursor {
                     cell_idx,
                     ref mut state,
                 } => {
-                    turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id });
+                    turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
                     let page = page.clone();
 
                     // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
@@ -3018,8 +3266,11 @@ impl BTreeCursor {
             // it's probably not the greatest idea in the world to do this eagerly here,
             // but at least it works.
             return_if_io!(self.restore_context());
+            // WriteState::Finish owns nothing: std::mem::forget it to skip the drop glue
+            std::mem::forget(std::mem::replace(&mut self.state, CursorState::None));
+        } else {
+            self.state = CursorState::None;
         }
-        self.state = CursorState::None;
         ret
     }
 
@@ -3114,10 +3365,11 @@ impl BTreeCursor {
                                     mark_unlikely();
                                     LimboError::Corrupt(format!(
                                         "parent page {} is a leaf page, expected interior page",
-                                        parent.get().id
+                                        parent.get().id()
                                     ))
                                 })?;
-                            if parent.get().id != 1 && parent_rightmost == cur_page.get().id as u32
+                            if parent.get().id() != 1
+                                && parent_rightmost == cur_page.get().id() as u32
                             {
                                 // If all of the following are true, we can use the balance_quick() fast path:
                                 // - The page is a table leaf page
@@ -3190,7 +3442,7 @@ impl BTreeCursor {
             .rightmost_pointer()?
             .expect("parent should have a rightmost pointer");
         turso_assert!(
-            rightmost_pointer == old_rightmost_leaf.get().id as u32,
+            rightmost_pointer == old_rightmost_leaf.get().id() as u32,
             "leaf should be the rightmost page in the subtree"
         );
 
@@ -3213,7 +3465,7 @@ impl BTreeCursor {
 
         // Create a new divider cell in the parent - it contains the page number of the old rightmost leaf, plus the largest rowid on that page.
         let mut new_divider: [u8; 13] = [0; 13]; // 4 bytes for page number, max 9 bytes for rowid (varint)
-        new_divider[0..4].copy_from_slice(&(old_rightmost_leaf.get().id as u32).to_be_bytes());
+        new_divider[0..4].copy_from_slice(&(old_rightmost_leaf.get().id() as u32).to_be_bytes());
         let largest_rowid = old_rightmost_leaf_contents
             .cell_table_leaf_read_rowid(old_rightmost_leaf_contents.cell_count() - 1)?;
         let n = write_varint(&mut new_divider[4..], largest_rowid as u64);
@@ -3226,7 +3478,7 @@ impl BTreeCursor {
             parent_contents.cell_count(),
             usable_space,
         )?;
-        parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
+        parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id() as u32);
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
 
@@ -3291,10 +3543,7 @@ impl BTreeCursor {
                         // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
                         // This can only happen on index btrees.
                         if matches!(page_type, PageType::IndexInterior) {
-                            turso_assert!(
-                                parent_contents.overflow_cells.len() == 1,
-                                "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement"
-                            );
+                            turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
                             turso_assert!(false, "page type must have no overflow cells", {
                                 "page_type": page_type
@@ -3306,7 +3555,7 @@ impl BTreeCursor {
                         turso_assert!(
                             overflow_cell.index == parent_page_cell_idx,
                             "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent unbalanced, and hence parent page's position must equal overflow_cell.index",
-                            { "parent_page_id": parent_page.get().id, "parent_page_cell_idx": parent_page_cell_idx, "overflow_cell_index": overflow_cell.index }
+                            { "parent_page_id": parent_page.get().id(), "parent_page_cell_idx": parent_page_cell_idx, "overflow_cell_index": overflow_cell.index }
                         );
                     }
                     self.pager.add_dirty(parent_page)?;
@@ -3315,7 +3564,7 @@ impl BTreeCursor {
 
                     tracing::debug!(
                         "balance_non_root(parent_id={} page_to_balance_idx={})",
-                        parent_page.get().id,
+                        parent_page.get().id(),
                         page_to_balance_idx
                     );
                     // Part 1: Find the sibling pages to balance
@@ -3594,7 +3843,7 @@ impl BTreeCursor {
                             let actual_cell_idx = cell_idx - parent_contents.overflow_cells.len();
                             // Use pre-computed page parameters for faster lookup.
                             // Note: cell_count must be fresh as it changes during the loop.
-                            let (cell_start, cell_len) = parent_contents
+                            let (cell_start, cell_len, _) = parent_contents
                                 ._cell_get_raw_region_faster(
                                     actual_cell_idx,
                                     usable_space,
@@ -3683,7 +3932,7 @@ impl BTreeCursor {
                         let cell_count = old_page_contents.cell_count();
                         debug_validate_cells!(&old_page_contents, usable_space);
                         for cell_idx in 0..cell_count {
-                            let (cell_start, cell_len) = old_page_contents
+                            let (cell_start, cell_len, _) = old_page_contents
                                 ._cell_get_raw_region_faster(
                                     cell_idx,
                                     usable_space,
@@ -4136,7 +4385,7 @@ impl BTreeCursor {
                             .take(sibling_count_new)
                             .enumerate()
                         {
-                            page_numbers[i] = page.as_ref().unwrap().get().id;
+                            page_numbers[i] = page.as_ref().unwrap().get().id();
                         }
                         page_numbers.sort_unstable();
                         for (page, new_id) in pages_to_balance_new
@@ -4146,8 +4395,8 @@ impl BTreeCursor {
                             .zip(page_numbers.iter().rev().take(sibling_count_new))
                         {
                             let page = page.as_ref().unwrap();
-                            if *new_id != page.get().id {
-                                page.get().id = *new_id;
+                            if *new_id != page.get().id() {
+                                page.get().set_id(*new_id);
                                 self.pager
                                     .upsert_page_in_cache(*new_id, page.0.clone(), true)?;
                             }
@@ -4157,12 +4406,12 @@ impl BTreeCursor {
                         {
                             tracing::debug!(
                                 "balance_non_root(parent page_id={})",
-                                parent_page.get().id
+                                parent_page.get().id()
                             );
                             for page in pages_to_balance_new.iter().take(sibling_count_new) {
                                 tracing::debug!(
                                     "balance_non_root(new_sibling page_id={})",
-                                    page.as_ref().unwrap().get().id
+                                    page.as_ref().unwrap().get().id()
                                 );
                             }
                         }
@@ -4180,7 +4429,7 @@ impl BTreeCursor {
                         .as_ref()
                         .unwrap()
                         .get()
-                        .id as u32;
+                        .id() as u32;
                     let rightmost_pointer = balance_info.rightmost_pointer;
                     let rightmost_pointer =
                         unsafe { std::slice::from_raw_parts_mut(rightmost_pointer, 4) };
@@ -4241,7 +4490,7 @@ impl BTreeCursor {
                             // divider cell now points to this page
                             balance_info
                                 .reusable_divider_cell
-                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id() as u32).to_be_bytes());
                             // now copy the rest of the divider cell:
                             // Table Interior page:
                             //   * varint rowid
@@ -4264,7 +4513,7 @@ impl BTreeCursor {
                             let (rowid, _) = read_varint(&divider_cell[n_bytes_payload..])?;
                             balance_info
                                 .reusable_divider_cell
-                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id() as u32).to_be_bytes());
                             write_varint_to_vec(rowid, &mut balance_info.reusable_divider_cell)?;
                         } else {
                             // Leaf index
@@ -4285,7 +4534,7 @@ impl BTreeCursor {
                             };
                             balance_info
                                 .reusable_divider_cell
-                                .extend_from_slice(&(page.get().id as u32).to_be_bytes());
+                                .extend_from_slice(&(page.get().id() as u32).to_be_bytes());
                             balance_info
                                 .reusable_divider_cell
                                 .extend_from_slice(divider_cell);
@@ -4296,7 +4545,7 @@ impl BTreeCursor {
                             0,
                         );
                         turso_assert!(
-                            left_pointer != parent_page.get().id as u32,
+                            left_pointer != parent_page.get().id() as u32,
                             "left pointer is the same as parent page id"
                         );
                         #[cfg(debug_assertions)]
@@ -4310,7 +4559,7 @@ impl BTreeCursor {
                             );
                         }
                         turso_assert!(
-                            left_pointer == page.get().id as u32,
+                            left_pointer == page.get().id() as u32,
                             "left pointer is not the same as page id"
                         );
                         // FIXME: remove this lock
@@ -4361,9 +4610,9 @@ impl BTreeCursor {
                         for page in pages_to_balance_new.iter().take(sibling_count_new) {
                             let page = page.as_ref().unwrap();
                             turso_assert!(
-                                pages_pointed_to.contains(&(page.get().id as u32)),
+                                pages_pointed_to.contains(&(page.get().id() as u32)),
                                 "page not pointed to by divider cell or rightmost pointer",
-                                { "page_id": page.get().id }
+                                { "page_id": page.get().id() }
                             );
                         }
                     }
@@ -4438,7 +4687,7 @@ impl BTreeCursor {
                                 )
                             };
                             let page = pages_to_balance_new[page_idx].as_ref().unwrap();
-                            tracing::debug!("pre_edit_page(page={})", page.get().id);
+                            tracing::debug!("pre_edit_page(page={})", page.get().id());
                             let page_contents = page.get_contents();
                             edit_page(
                                 page_contents,
@@ -4451,7 +4700,7 @@ impl BTreeCursor {
                             debug_validate_cells!(page_contents, usable_space);
                             tracing::trace!(
                                 "edit_page page={} cells={}",
-                                page.get().id,
+                                page.get().id(),
                                 page_contents.cell_count()
                             );
                             page_contents.overflow_cells.clear();
@@ -4476,7 +4725,7 @@ impl BTreeCursor {
                         // b-tree structure by one. This is described as the "balance-shallower"
                         // sub-algorithm in some documentation.
                         turso_assert_eq!(sibling_count_new, 1);
-                        let parent_offset = if parent_page.get().id == 1 {
+                        let parent_offset = if parent_page.get().id() == 1 {
                             DatabaseHeader::SIZE
                         } else {
                             0
@@ -4564,7 +4813,7 @@ impl BTreeCursor {
                     } else {
                         let balance_info = balance_info.as_ref().expect("must be balancing");
                         let page = balance_info.pages_to_balance[*curr_page].as_ref().unwrap();
-                        return_if_io!(self.pager.free_page(Some(page.0.clone()), page.get().id));
+                        return_if_io!(self.pager.free_page(Some(page.0.clone()), page.get().id()));
                         *sub_state = BalanceSubState::FreePages {
                             curr_page: *curr_page + 1,
                             sibling_count_new: *sibling_count_new,
@@ -4619,9 +4868,9 @@ impl BTreeCursor {
         // Verify the left pointer points to the correct page
         turso_assert_eq!(
             left_pointer,
-            child_page.get().id as u32,
+            child_page.get().id() as u32,
             "inserted cell doesn't point to correct page",
-            { "left_pointer": left_pointer, "child_page_id": child_page.get().id }
+            { "left_pointer": left_pointer, "child_page_id": child_page.get().id() }
         );
     }
 
@@ -4646,23 +4895,21 @@ impl BTreeCursor {
             match cell {
                 BTreeCell::TableInteriorCell(table_interior_cell) => {
                     let left_child_page = table_interior_cell.left_child_page;
-                    if left_child_page == parent_page.get().id as u32 {
-                        tracing::error!(
-                            "balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
-                            parent_page.get().id,
-                            left_child_page,
-                        );
+                    if left_child_page == parent_page.get().id() as u32 {
+                        tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
+                                parent_page.get().id(),
+                                left_child_page,
+                            );
                         valid = false;
                     }
                 }
                 BTreeCell::IndexInteriorCell(index_interior_cell) => {
                     let left_child_page = index_interior_cell.left_child_page;
-                    if left_child_page == parent_page.get().id as u32 {
-                        tracing::error!(
-                            "balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
-                            parent_page.get().id,
-                            left_child_page,
-                        );
+                    if left_child_page == parent_page.get().id() as u32 {
+                        tracing::error!("balance_non_root(parent_divider_points_to_same_page, page_id={}, cell_left_child_page={})",
+                                parent_page.get().id(),
+                                left_child_page,
+                            );
                         valid = false;
                     }
                 }
@@ -4687,9 +4934,8 @@ impl BTreeCursor {
                 let cell_buf = to_static_buf(&mut buf[cell_start..cell_start + cell_len]);
                 let cell_buf_in_array = &cells_debug[current_index_cell];
                 if cell_buf != cell_buf_in_array {
-                    tracing::error!(
-                        "balance_non_root(cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
-                        page.get().id,
+                    tracing::error!("balance_non_root(cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
+                        page.get().id(),
                         current_index_cell,
                     );
                     valid = false;
@@ -4705,19 +4951,17 @@ impl BTreeCursor {
                 match &cell {
                     BTreeCell::TableInteriorCell(table_interior_cell) => {
                         let left_child_page = table_interior_cell.left_child_page;
-                        if left_child_page == page.get().id as u32 {
-                            tracing::error!(
-                                "balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
-                                page.get().id,
+                        if left_child_page == page.get().id() as u32 {
+                            tracing::error!("balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id(),
                                 left_child_page,
                                 page_idx
                             );
                             valid = false;
                         }
-                        if left_child_page == parent_page.get().id as u32 {
-                            tracing::error!(
-                                "balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
-                                page.get().id,
+                        if left_child_page == parent_page.get().id() as u32 {
+                            tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id(),
                                 left_child_page,
                                 page_idx
                             );
@@ -4726,19 +4970,17 @@ impl BTreeCursor {
                     }
                     BTreeCell::IndexInteriorCell(index_interior_cell) => {
                         let left_child_page = index_interior_cell.left_child_page;
-                        if left_child_page == page.get().id as u32 {
-                            tracing::error!(
-                                "balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
-                                page.get().id,
+                        if left_child_page == page.get().id() as u32 {
+                            tracing::error!("balance_non_root(child_page_points_same_page, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id(),
                                 left_child_page,
                                 page_idx
                             );
                             valid = false;
                         }
-                        if left_child_page == parent_page.get().id as u32 {
-                            tracing::error!(
-                                "balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
-                                page.get().id,
+                        if left_child_page == parent_page.get().id() as u32 {
+                            tracing::error!("balance_non_root(child_page_points_parent_of_child, page_id={}, cell_left_child_page={}, page_idx={})",
+                                page.get().id(),
                                 left_child_page,
                                 page_idx
                             );
@@ -4784,8 +5026,7 @@ impl BTreeCursor {
                     || cells_debug.len() != contents.cell_count()
                     || contents.cell_count() != parent_contents.cell_count()
                 {
-                    tracing::error!(
-                        "balance_non_root(balance_shallower_incorrect_cell_count, current_index_cell={}, cells_debug={}, cell_count={}, parent_cell_count={})",
+                    tracing::error!("balance_non_root(balance_shallower_incorrect_cell_count, current_index_cell={}, cells_debug={}, cell_count={}, parent_cell_count={})",
                         current_index_cell,
                         cells_debug.len(),
                         contents.cell_count(),
@@ -4794,13 +5035,12 @@ impl BTreeCursor {
                     valid = false;
                 }
 
-                if right_page_id == page.get().id as u32
-                    || right_page_id == parent_page.get().id as u32
+                if right_page_id == page.get().id() as u32
+                    || right_page_id == parent_page.get().id() as u32
                 {
-                    tracing::error!(
-                        "balance_non_root(balance_shallower_rightmost_pointer, page_id={}, parent_page_id={}, rightmost={})",
-                        page.get().id,
-                        parent_page.get().id,
+                    tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, page_id={}, parent_page_id={}, rightmost={})",
+                        page.get().id(),
+                        parent_page.get().id(),
                         right_page_id,
                     );
                     valid = false;
@@ -4808,8 +5048,7 @@ impl BTreeCursor {
 
                 if let Some(rm) = contents.rightmost_pointer().ok().flatten() {
                     if rm != right_page_id {
-                        tracing::error!(
-                            "balance_non_root(balance_shallower_rightmost_pointer, page_rightmost={}, rightmost={})",
+                        tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, page_rightmost={}, rightmost={})",
                             rm,
                             right_page_id,
                         );
@@ -4819,8 +5058,7 @@ impl BTreeCursor {
 
                 if let Some(rm) = parent_contents.rightmost_pointer().ok().flatten() {
                     if rm != right_page_id {
-                        tracing::error!(
-                            "balance_non_root(balance_shallower_rightmost_pointer, parent_rightmost={}, rightmost={})",
+                        tracing::error!("balance_non_root(balance_shallower_rightmost_pointer, parent_rightmost={}, rightmost={})",
                             rm,
                             right_page_id,
                         );
@@ -4829,8 +5067,7 @@ impl BTreeCursor {
                 }
 
                 if parent_contents.page_type().ok() != Some(page_type) {
-                    tracing::error!(
-                        "balance_non_root(balance_shallower_parent_page_type, page_type={:?}, parent_page_type={:?})",
+                    tracing::error!("balance_non_root(balance_shallower_parent_page_type, page_type={:?}, parent_page_type={:?})",
                         page_type,
                         parent_contents.page_type().ok()
                     );
@@ -4855,9 +5092,8 @@ impl BTreeCursor {
                     );
 
                     if cell_buf != cell_buf_in_array || cell_buf != parent_cell_buf {
-                        tracing::error!(
-                            "balance_non_root(balance_shallower_cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
-                            page.get().id,
+                        tracing::error!("balance_non_root(balance_shallower_cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
+                            page.get().id(),
                             parent_cell_idx,
                         );
                         valid = false;
@@ -4868,11 +5104,10 @@ impl BTreeCursor {
                 // insert cell could've defragmented the page and invalidated the pointer.
                 // right pointer, we just check right pointer points to this page.
                 if cell_divider_idx == parent_contents.cell_count()
-                    && right_page_id != page.get().id as u32
+                    && right_page_id != page.get().id() as u32
                 {
-                    tracing::error!(
-                        "balance_non_root(cell_divider_right_pointer, should point to {}, but points to {})",
-                        page.get().id,
+                    tracing::error!("balance_non_root(cell_divider_right_pointer, should point to {}, but points to {})",
+                        page.get().id(),
                         right_page_id
                     );
                     valid = false;
@@ -4883,14 +5118,13 @@ impl BTreeCursor {
                 for overflow_cell in &parent_contents.overflow_cells {
                     if overflow_cell.index == cell_divider_idx {
                         let left_pointer = read_u32(&overflow_cell.payload, 0);
-                        if left_pointer != page.get().id as u32 {
-                            tracing::error!(
-                                "balance_non_root(cell_divider_left_pointer_overflow, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
-                                page.get().id,
-                                left_pointer,
-                                page_idx,
-                                parent_contents.overflow_cells.len()
-                            );
+                        if left_pointer != page.get().id() as u32 {
+                            tracing::error!("balance_non_root(cell_divider_left_pointer_overflow, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                        page.get().id(),
+                        left_pointer,
+                        page_idx,
+                        parent_contents.overflow_cells.len()
+                    );
                             valid = false;
                         }
                         was_overflow = true;
@@ -4910,10 +5144,9 @@ impl BTreeCursor {
                     .cell_get_raw_region(cell_divider_idx, usable_space)
                     .unwrap();
                 let cell_left_pointer = read_u32(&parent_buf[cell_start..cell_start + cell_len], 0);
-                if cell_left_pointer != page.get().id as u32 {
-                    tracing::error!(
-                        "balance_non_root(cell_divider_left_pointer, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
-                        page.get().id,
+                if cell_left_pointer != page.get().id() as u32 {
+                    tracing::error!("balance_non_root(cell_divider_left_pointer, should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                        page.get().id(),
                         cell_left_pointer,
                         page_idx,
                         parent_contents.overflow_cells.len()
@@ -4951,9 +5184,8 @@ impl BTreeCursor {
                         _ => unreachable!(),
                     };
                     if rowid_parent != rowid {
-                        tracing::error!(
-                            "balance_non_root(cell_divider_rowid, page_id={}, cell_divider_idx={}, rowid_parent={}, rowid={})",
-                            page.get().id,
+                        tracing::error!("balance_non_root(cell_divider_rowid, page_id={}, cell_divider_idx={}, rowid_parent={}, rowid={})",
+                            page.get().id(),
                             cell_divider_idx,
                             rowid_parent,
                             rowid
@@ -4966,10 +5198,9 @@ impl BTreeCursor {
                     for overflow_cell in &parent_contents.overflow_cells {
                         if overflow_cell.index == cell_divider_idx {
                             let left_pointer = read_u32(&overflow_cell.payload, 0);
-                            if left_pointer != page.get().id as u32 {
-                                tracing::error!(
-                                    "balance_non_root(cell_divider_divider_cell_overflow should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
-                                    page.get().id,
+                            if left_pointer != page.get().id() as u32 {
+                                tracing::error!("balance_non_root(cell_divider_divider_cell_overflow should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                                    page.get().id(),
                                     left_pointer,
                                     page_idx,
                                     parent_contents.overflow_cells.len()
@@ -4995,14 +5226,13 @@ impl BTreeCursor {
                         &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len],
                         0,
                     );
-                    if left_pointer != page.get().id as u32 {
-                        tracing::error!(
-                            "balance_non_root(divider_cell_left_pointer_interior should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
-                            page.get().id,
-                            left_pointer,
-                            page_idx,
-                            parent_contents.overflow_cells.len()
-                        );
+                    if left_pointer != page.get().id() as u32 {
+                        tracing::error!("balance_non_root(divider_cell_left_pointer_interior should point to page_id={}, but points to {}, divider_cell={}, overflow_cells_parent={})",
+                                    page.get().id(),
+                                    left_pointer,
+                                    page_idx,
+                                    parent_contents.overflow_cells.len()
+                                );
                         valid = false;
                     }
                     match page_type {
@@ -5010,9 +5240,8 @@ impl BTreeCursor {
                             let parent_cell_buf =
                                 &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len];
                             if parent_cell_buf[4..] != cell_buf_in_array[4..] {
-                                tracing::error!(
-                                    "balance_non_root(cell_divider_cell, page_id={}, cell_divider_idx={})",
-                                    page.get().id,
+                                tracing::error!("balance_non_root(cell_divider_cell, page_id={}, cell_divider_idx={})",
+                                    page.get().id(),
                                     cell_divider_idx,
                                 );
                                 valid = false;
@@ -5030,9 +5259,8 @@ impl BTreeCursor {
                                 && cell_buf_in_array[..parent_payload.len()] == *parent_payload
                                 && (cell_buf_in_array.len() == parent_payload.len() || padded);
                             if !matches {
-                                tracing::error!(
-                                    "balance_non_root(cell_divider_cell_index_leaf, page_id={}, cell_divider_idx={})",
-                                    page.get().id,
+                                tracing::error!("balance_non_root(cell_divider_cell_index_leaf, page_id={}, cell_divider_idx={})",
+                                    page.get().id(),
                                     cell_divider_idx,
                                 );
                                 valid = false;
@@ -5082,15 +5310,15 @@ impl BTreeCursor {
             BtreePageAllocMode::Any
         ));
 
-        let is_page_1 = root.get().id == 1;
+        let is_page_1 = root.get().id() == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
         #[cfg(debug_assertions)]
         turso_assert_eq!(offset, root_contents.offset());
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
-            root.get().id,
-            child.get().id,
+            root.get().id(),
+            child.get().id(),
             root_contents.page_type().ok()
         );
 
@@ -5133,14 +5361,14 @@ impl BTreeCursor {
         } as u8;
         // set new page type
         root_contents.write_page_type(new_root_page_type);
-        root_contents.write_rightmost_ptr(child.get().id as u32);
+        root_contents.write_rightmost_ptr(child.get().id() as u32);
         root_contents.write_cell_content_area(self.usable_space());
         root_contents.write_cell_count(0);
         root_contents.write_first_freeblock(0);
 
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
-        self.root_page = root.get().id as i64;
+        self.root_page = root.get().id() as i64;
         self.stack.clear();
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
@@ -5155,11 +5383,11 @@ impl BTreeCursor {
         self.usable_space_cached
     }
 
-    /// Clear the overflow pages linked to a specific page provided by the leaf cell
-    /// Uses a state machine to keep track of it's operations so that traversal can be
-    /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> IOResultOr<()> {
+    fn clear_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
+        if first_overflow_page.is_none() && matches!(self.overflow_state, OverflowState::Start) {
+            return Ok(IOResult::Done(()));
+        }
         // `database_size` is invariant for the duration of this invocation, so
         // read the page-1 header at most once and reuse it for every overflow
         // page validation below instead of re-reading it per `ReadNext`.
@@ -5167,15 +5395,6 @@ impl BTreeCursor {
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
-                    let first_overflow_page = match cell {
-                        BTreeCell::TableLeafCell(leaf_cell) => leaf_cell.first_overflow_page,
-                        BTreeCell::IndexLeafCell(leaf_cell) => leaf_cell.first_overflow_page,
-                        BTreeCell::IndexInteriorCell(interior_cell) => {
-                            interior_cell.first_overflow_page
-                        }
-                        BTreeCell::TableInteriorCell(_) => return Ok(IOResult::Done(())), // No overflow pages
-                    };
-
                     if let Some(next_page) = first_overflow_page {
                         let database_size =
                             return_if_io!(self.overflow_database_size(&mut database_size));
@@ -5201,7 +5420,7 @@ impl BTreeCursor {
 
                     let contents = page.get_contents();
                     let next = contents.read_u32_no_offset(0);
-                    let next_page_id = page.get().id;
+                    let next_page_id = page.get().id();
 
                     return_if_io!(self.pager.free_page(Some(page), next_page_id));
 
@@ -5436,7 +5655,7 @@ impl BTreeCursor {
                     }
                 }
                 DestroyState::ClearOverflowPages { cell } => {
-                    return_if_io!(self.clear_overflow_pages(&cell));
+                    return_if_io!(self.clear_overflow_pages(cell.first_overflow_page()));
                     match cell {
                         //  For an index interior cell, clear the left child page now that overflow pages have been cleared
                         BTreeCell::IndexInteriorCell(index_int_cell) => {
@@ -5493,7 +5712,7 @@ impl BTreeCursor {
                 }
                 DestroyState::FreePage => {
                     let page = self.stack.top();
-                    let page_id = page.get().id;
+                    let page_id = page.get().id();
 
                     if self.stack.has_parent() {
                         return_if_io!(self.pager.free_page(Some(page), page_id));
@@ -5584,7 +5803,7 @@ impl BTreeCursor {
             return Err(LimboError::BlobHandleExpired.into());
         }
         let cell_idx = cell_idx as usize;
-        let leaf_id = self.stack.top_ref().get().id;
+        let leaf_id = self.stack.top_ref().get().id();
         if self.blob_cache.valid
             && self.blob_cache.leaf_id == leaf_id
             && self.blob_cache.cell_idx == cell_idx
@@ -5768,7 +5987,7 @@ impl BTreeCursor {
                         return Err(LimboError::Corrupt(
                             "blob value needs overflow pages but has none".to_string(),
                         )
-                        .into());
+                        .into())
                     }
                 }
             };
@@ -5965,7 +6184,7 @@ impl BTreeCursor {
         state: &mut OverwriteCellState,
     ) -> IOResultOr<()> {
         loop {
-            turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id });
+            turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
             match state {
                 OverwriteCellState::AllocatePayload => {
                     let serial_types_len = record.column_count();
@@ -5993,26 +6212,26 @@ impl BTreeCursor {
                 } => {
                     {
                         return_if_io!(fill_cell_payload(
-                            &PinGuard::new(page.clone()),
+                            page,
                             *rowid,
                             new_payload,
                             cell_idx,
                             record,
                             self.usable_space(),
-                            self.pager.clone(),
+                            &self.pager,
                             fill_cell_payload_state,
                         ));
                     }
-                    // figure out old cell offset & size
-                    let (old_offset, old_local_size) = {
+                    let (old_offset, old_local_size, old_first_overflow_page) = {
                         let contents = page.get_contents();
-                        contents.cell_get_raw_region(cell_idx, self.usable_space())?
+                        contents.cell_get_raw_region_and_overflow(cell_idx, self.usable_space())?
                     };
 
                     *state = OverwriteCellState::ClearOverflowPagesAndOverwrite {
                         new_payload: take_vec(new_payload),
                         old_offset,
                         old_local_size,
+                        old_first_overflow_page,
                     };
                     continue;
                 }
@@ -6020,10 +6239,22 @@ impl BTreeCursor {
                     new_payload,
                     old_offset,
                     old_local_size,
+                    old_first_overflow_page,
                 } => {
+                    #[cfg(debug_assertions)]
+                    {
+                        let parsed = page
+                            .get_contents()
+                            .cell_get(cell_idx, self.usable_space())?
+                            .first_overflow_page();
+                        turso_debug_assert!(
+                            *old_first_overflow_page == parsed,
+                            "the cell region and the parsed cell disagree on the first overflow page"
+                        );
+                    }
+                    let old_first_overflow_page = *old_first_overflow_page;
+                    return_if_io!(self.clear_overflow_pages(old_first_overflow_page));
                     let contents = page.get_contents();
-                    let cell = contents.cell_get(cell_idx, self.usable_space())?;
-                    return_if_io!(self.clear_overflow_pages(&cell));
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
@@ -6050,17 +6281,29 @@ impl BTreeCursor {
         Ok(())
     }
 
+    #[inline]
     fn get_immutable_record_or_create(&mut self) -> Result<Option<&mut ImmutableRecord>> {
-        let reusable_immutable_record = &mut self.reusable_immutable_record;
-        if reusable_immutable_record.is_none() {
-            let page_size = self.pager.get_page_size_unchecked().get();
-            let record = crate::with_btree_allocation_site!(
-                RecordPayload,
-                ImmutableRecord::new(page_size as usize)
-            )?;
-            reusable_immutable_record.replace(record);
+        if self.reusable_immutable_record.is_none() {
+            self.allocate_reusable_record()?;
         }
-        Ok(reusable_immutable_record.as_mut())
+        Ok(self.reusable_immutable_record.as_mut())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn allocate_reusable_record(&mut self) -> Result<()> {
+        let record = match self.pager.take_record_buf() {
+            Some(buf) => ImmutableRecord::from_buf(buf),
+            None => {
+                let page_size = self.pager.get_page_size_unchecked().get();
+                crate::with_btree_allocation_site!(
+                    RecordPayload,
+                    ImmutableRecord::new(page_size as usize)
+                )?
+            }
+        };
+        self.reusable_immutable_record.replace(record);
+        Ok(())
     }
 
     fn get_immutable_record(&self) -> Option<&ImmutableRecord> {
@@ -6083,6 +6326,29 @@ impl BTreeCursor {
     /// from the root.
     pub fn is_positioned_past_page_start(&self) -> bool {
         self.has_record() && self.stack.current_cell_index() > 0
+    }
+
+    /// True iff the cursor has run off the last cell of the table's rightmost
+    /// leaf: `next()` left it on that leaf with the cell index one past the
+    /// last cell and no record, and no ancestor has a child to the right.
+    ///
+    /// That is the append slot. A key larger than every key in the table
+    /// belongs there, and there is no right-hand divider that could put it
+    /// anywhere else, so the MVCC checkpoint's sequential-write optimization
+    /// can insert here without re-seeking from the root. Without this check
+    /// every append pays a full root-to-leaf seek: `next()` after inserting
+    /// the last cell always runs off the end.
+    pub fn is_at_end_of_rightmost_leaf(&self) -> bool {
+        if self.has_record()
+            || self.valid_state != CursorValidState::Valid
+            || self.stack.current_page < 0
+        {
+            return false;
+        }
+        let contents = self.stack.top_ref().get_contents();
+        contents.is_leaf()
+            && self.stack.current_cell_index() == contents.cell_count() as i32
+            && !self.ancestor_pages_have_more_children()
     }
 
     /// Rowid of the table-leaf cell the cursor currently sits on, or `None` when the
@@ -6158,6 +6424,7 @@ impl BTreeCursor {
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(cursor_context);
+        self.noted_payload = NotedPayload::NONE;
         // The tree is about to change under this cursor (that is the only reason a
         // position ever gets saved), so cached payload offsets and overflow page
         // numbers must not survive: blob I/O through them would touch relocated or
@@ -6336,6 +6603,9 @@ impl BTreeCursor {
 impl Drop for BTreeCursor {
     fn drop(&mut self) {
         self.clear_transient_overflow_cells();
+        if let Some(record) = self.reusable_immutable_record.take() {
+            self.pager.recycle_record_buf(record.retire());
+        }
         if !self
             .did_register
             .load(crate::sync::atomic::Ordering::Relaxed)
@@ -6365,6 +6635,17 @@ impl CursorTrait for BTreeCursor {
     }
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> IOResultOr<()> {
+        if self.can_advance_within_leaf() {
+            self.stack.advance();
+            self.invalidate_record();
+            return Ok(IOResult::Done(()));
+        }
+        if self.is_on_last_cell_of_tree() {
+            self.stack.advance();
+            self.invalidate_record();
+            self.set_has_record(false);
+            return Ok(IOResult::Done(()));
+        }
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
@@ -6404,6 +6685,36 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
+    #[inline(always)]
+    fn next_row(&mut self) -> CursorStep {
+        if self.null_flag {
+            self.null_flag = false;
+            return CursorStep::Empty;
+        }
+        if self.can_advance_within_leaf() {
+            self.stack.advance();
+            self.invalidate_record();
+            return CursorStep::Row;
+        }
+        match self.next() {
+            Ok(IOResult::IO(io)) => CursorStep::IO(io),
+            Err(err) => CursorStep::Error(err),
+            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+        }
+    }
+
+    fn prev_row(&mut self) -> CursorStep {
+        if self.null_flag {
+            self.null_flag = false;
+            return CursorStep::Empty;
+        }
+        match self.prev() {
+            Ok(IOResult::IO(io)) => CursorStep::IO(io),
+            Err(err) => CursorStep::Error(err),
+            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+        }
+    }
+
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> IOResultOr<()> {
         self.set_null_flag(false);
@@ -6437,27 +6748,53 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
+    #[inline(always)]
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
         if self.needs_restore() {
-            return_if_io!(self.restore_context());
+            return rowid_general(self);
         }
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        if self.has_record() {
+        return if self.has_record() {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
-            let page_type = contents.page_type()?;
-            if page_type.is_table() {
+            if contents.is_table() {
                 let cell_idx = self.stack.current_cell_index();
-                let rowid = contents.cell_table_leaf_read_rowid(cell_idx as usize)?;
-                Ok(IOResult::Done(Some(rowid)))
+                let cell = contents.cell_table_leaf_read_header(cell_idx as usize)?;
+                self.noted_payload = NotedPayload {
+                    start: cell.payload_start as u32,
+                    size: u32::try_from(cell.payload_size).unwrap_or(0),
+                };
+                Ok(IOResult::Done(Some(cell.rowid)))
             } else {
-                let _ = return_if_io!(self.record());
-                Ok(IOResult::Done(self.get_index_rowid_from_record()))
+                index_rowid(self)
             }
         } else {
             Ok(IOResult::Done(None))
+        };
+
+        #[inline(never)]
+        fn rowid_general(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
+            return_if_io!(cursor.restore_context());
+            cursor.rowid()
+        }
+
+        #[inline(never)]
+        fn index_rowid(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
+            if !cursor.has_rowid() {
+                return Ok(IOResult::Done(None));
+            }
+            let Some(payload) = return_if_io!(cursor.record_payload()) else {
+                return Ok(IOResult::Done(None));
+            };
+            let rowid = match crate::types::ValueIterator::new(payload)?.last() {
+                Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
+                _ => unreachable!(
+                    "index where has_rowid() is true should have an integer rowid as the last value"
+                ),
+            };
+            Ok(IOResult::Done(Some(rowid)))
         }
     }
 
@@ -6519,29 +6856,67 @@ impl CursorTrait for BTreeCursor {
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
         let (payload, payload_size, first_overflow_page) =
-            contents.cell_read_payload_ptr(cell_idx as usize, self.usable_space())?;
+            contents.cell_read_payload_ptr(cell_idx as usize, self.payload_limits)?;
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
         } else {
-            self.get_immutable_record_or_create()?
-                .as_mut()
-                .unwrap()
-                .invalidate();
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                self.get_immutable_record_or_create()?
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(payload)
-            )?;
+            let record = self
+                .get_immutable_record_or_create()?
+                .expect("record was allocated above");
+            record.invalidate();
+            crate::with_btree_allocation_site!(RecordPayload, record.start_serialization(payload))?;
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
     }
 
+    #[inline(always)]
+    fn record_payload(&mut self) -> IOResultOr<Option<&[u8]>> {
+        if self.needs_restore() {
+            return restore_record_payload(self);
+        }
+        if self.null_flag || !self.has_record() {
+            return Ok(IOResult::Done(None));
+        }
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Ok(IOResult::Done(Some(payload)));
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        if let Some((payload, start)) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
+        {
+            self.noted_payload = NotedPayload {
+                start: start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
+        }
+        return self.record_payload_general();
+
+        #[inline(never)]
+        fn restore_record_payload(cursor: &mut BTreeCursor) -> IOResultOr<Option<&[u8]>> {
+            return_if_io!(cursor.restore_context());
+            cursor.record_payload()
+        }
+    }
+
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
+        self.noted_payload = NotedPayload::NONE;
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -6566,6 +6941,7 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
+        self.noted_payload = NotedPayload::NONE;
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -6659,7 +7035,7 @@ impl CursorTrait for BTreeCursor {
 
                     tracing::debug!(
                         "DeleteState::FindCell: page_id: {}, cell_idx: {}",
-                        page.get().id,
+                        page.get().id(),
                         cell_idx
                     );
 
@@ -6681,7 +7057,7 @@ impl CursorTrait for BTreeCursor {
 
                 DeleteState::ClearOverflowPages { cell, .. } => {
                     let cell = cell.clone();
-                    return_if_io!(self.clear_overflow_pages(&cell));
+                    return_if_io!(self.clear_overflow_pages(cell.first_overflow_page()));
 
                     let CursorState::Delete(DeleteState::ClearOverflowPages {
                         cell_idx,
@@ -6803,7 +7179,7 @@ impl CursorTrait for BTreeCursor {
                     // Step 2: Replace the cell in the parent (interior) page.
                     {
                         let parent_contents = page.get_contents();
-                        let parent_page_id = page.get().id;
+                        let parent_page_id = page.get().id();
                         let left_child_page = u32::from_be_bytes(
                             cell_payload[..4].try_into().expect("invalid cell payload"),
                         );
@@ -7168,6 +7544,10 @@ impl CursorTrait for BTreeCursor {
         self.root_page
     }
 
+    fn set_root_page(&mut self, root_page: i64) {
+        self.root_page = root_page;
+    }
+
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> IOResultOr<()> {
         self.set_null_flag(false);
@@ -7205,6 +7585,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn invalidate_record(&mut self) {
+        self.noted_payload = NotedPayload::NONE;
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }
@@ -7229,6 +7610,7 @@ impl CursorTrait for BTreeCursor {
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
         self.has_record = false;
+        self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
         self.blob_cache.reset();
@@ -7251,6 +7633,20 @@ impl CursorTrait for BTreeCursor {
         self.did_register
             .store(true, crate::sync::atomic::Ordering::Relaxed);
         self.pager.register_cursor(self);
+    }
+
+    fn recycle(self: Box<Self>) {
+        let pager = self.pager.clone();
+        let raw = Box::into_raw(self);
+        // SAFETY: `raw` came from a Box of a live cursor. Its contents are
+        // dropped exactly once here (Drop unregisters the cursor and retires
+        // its record buffer), and the allocation goes on as uninitialized
+        // memory of the same layout.
+        let allocation = unsafe {
+            std::ptr::drop_in_place(raw);
+            Box::from_raw(raw.cast::<std::mem::MaybeUninit<BTreeCursor>>())
+        };
+        pager.recycle_cursor_allocation(allocation);
     }
 
     fn set_has_peers_for_external_writes(&self, has_peers: bool) {
@@ -7352,8 +7748,8 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[inline]
-    fn get_index_info(&self) -> &Arc<IndexInfo> {
-        self.index_info.as_ref().unwrap()
+    fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+        self.index_info.as_ref()
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
@@ -7427,11 +7823,73 @@ impl CursorTrait for BTreeCursor {
     }
 }
 
+impl BTreeCursor {
+    #[inline(never)]
+    fn record_payload_general(&mut self) -> IOResultOr<Option<&[u8]>> {
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        let (payload, payload_start, _payload_size, first_overflow_page) =
+            contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
+        if first_overflow_page.is_none() {
+            self.noted_payload = NotedPayload {
+                start: payload_start as u32,
+                size: payload.len() as u32,
+            };
+            return Ok(IOResult::Done(Some(payload)));
+        }
+        let record = return_if_io!(self.record());
+        Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+    }
+
+    /// True when the next cell is on the same leaf page and no resumable
+    /// state is pending, so advancing cannot yield and `next()` can skip
+    /// its state machine. Every pending flag routes to the full path,
+    /// which owns its handling: `skip_advance` (restore landed on the
+    /// iteration target; advancing would skip a row), an abandoned
+    /// overflow read, and an in-flight spill descent.
+    #[inline(always)]
+    fn can_advance_within_leaf(&self) -> bool {
+        if self.has_pending_advance_state() {
+            return false;
+        }
+        let (page, cell_idx) = self.stack.top_and_cell_index();
+        let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
+        cell_idx >= 0 && is_leaf && cell_idx as usize + 1 < cell_count
+    }
+
+    /// True when the cursor sits on the last cell of the rightmost leaf and
+    /// nothing is pending: the tree has no next record, so `next()` only has
+    /// to step past the cell. This is what every NewRowid does before an
+    /// append, and what a scan does once at its end.
+    #[inline(always)]
+    fn is_on_last_cell_of_tree(&self) -> bool {
+        if self.has_pending_advance_state() {
+            return false;
+        }
+        let (page, cell_idx) = self.stack.top_and_cell_index();
+        let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
+        cell_idx >= 0
+            && is_leaf
+            && cell_idx as usize + 1 == cell_count
+            && !self.ancestor_pages_have_more_children()
+    }
+
+    #[inline(always)]
+    fn has_pending_advance_state(&self) -> bool {
+        !matches!(self.advance_state, AdvanceState::Start)
+            || !matches!(self.valid_state, CursorValidState::Valid)
+            || self.needs_restore()
+            || self.skip_advance
+            || !self.has_record
+            || self.read_overflow_state.is_some()
+            || self.iteration_pending_descent.is_some()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum IntegrityCheckError {
-    #[error(
-        "Cell {cell_idx} in page {page_id} is out of range. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}"
-    )]
+    #[error("Cell {cell_idx} in page {page_id} is out of range. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}")]
     CellOutOfRange {
         cell_idx: usize,
         page_id: i64,
@@ -7440,9 +7898,7 @@ pub enum IntegrityCheckError {
         content_area: usize,
         usable_space: usize,
     },
-    #[error(
-        "Cell {cell_idx} in page {page_id} extends out of page. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}"
-    )]
+    #[error("Cell {cell_idx} in page {page_id} extends out of page. cell_range={cell_start}..{cell_end}, content_area={content_area}, usable_space={usable_space}")]
     CellOverflowsPage {
         cell_idx: usize,
         page_id: i64,
@@ -7451,9 +7907,7 @@ pub enum IntegrityCheckError {
         content_area: usize,
         usable_space: usize,
     },
-    #[error(
-        "Page {page_id} ({page_category:?}) cell {cell_idx} has rowid={rowid} in wrong order. Parent cell has parent_rowid={max_intkey} and next_rowid={next_rowid}"
-    )]
+    #[error("Page {page_id} ({page_category:?}) cell {cell_idx} has rowid={rowid} in wrong order. Parent cell has parent_rowid={max_intkey} and next_rowid={next_rowid}")]
     CellRowidOutOfRange {
         page_id: i64,
         page_category: PageCategory,
@@ -7462,9 +7916,7 @@ pub enum IntegrityCheckError {
         max_intkey: i64,
         next_rowid: i64,
     },
-    #[error(
-        "Page {page_id} is at different depth from another leaf page this_page_depth={this_page_depth}, other_page_depth={other_page_depth} "
-    )]
+    #[error("Page {page_id} is at different depth from another leaf page this_page_depth={this_page_depth}, other_page_depth={other_page_depth} ")]
     LeafDepthMismatch {
         page_id: i64,
         this_page_depth: usize,
@@ -7476,9 +7928,7 @@ pub enum IntegrityCheckError {
         start: usize,
         end: usize,
     },
-    #[error(
-        "Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}"
-    )]
+    #[error("Page {page_id} cell overlap detected at position={start} with previous_end={prev_end}. content_area={content_area}, is_free_block={is_free_block}")]
     CellOverlap {
         page_id: i64,
         start: usize,
@@ -7492,9 +7942,7 @@ pub enum IntegrityCheckError {
         got: usize,
         expected: usize,
     },
-    #[error(
-        "Page {page_id} referenced multiple times (references={references:?}, page_category={page_category:?})"
-    )]
+    #[error("Page {page_id} referenced multiple times (references={references:?}, page_category={page_category:?})")]
     PageReferencedMultipleTimes {
         page_id: i64,
         references: crate::alloc::Vec<i64>,
@@ -7744,14 +8192,14 @@ pub fn integrity_check(
                 if next_freelist_trunk_page as usize > state.db_size {
                     tracing::error!(
                         "integrity_check: freelist trunk page {} has invalid next pointer {}. header_bytes={:02x?}",
-                        page.get().id,
+                        page.get().id(),
                         next_freelist_trunk_page,
                         &contents.as_ptr()[0..16]
                     );
                     push_integrity_error(
                         errors,
                         IntegrityCheckError::FreelistPointerOutOfRange {
-                            page_id: page.get().id as i64,
+                            page_id: page.get().id() as i64,
                             pointer: next_freelist_trunk_page as i64,
                         },
                     )?;
@@ -7766,7 +8214,7 @@ pub fn integrity_check(
                         overflow_pages_expected: None,
                         overflow_pages_seen: 0,
                     },
-                    page.get().id as i64,
+                    page.get().id() as i64,
                     errors,
                 )?;
             }
@@ -7777,7 +8225,7 @@ pub fn integrity_check(
             if unlikely(page_pointers as usize > max_pointers) {
                 tracing::error!(
                     "integrity_check: freelist trunk page {} has invalid leaf count {} (max {}). header_bytes={:02x?}",
-                    page.get().id,
+                    page.get().id(),
                     page_pointers,
                     max_pointers,
                     &contents.as_ptr()[0..16]
@@ -7785,7 +8233,7 @@ pub fn integrity_check(
                 push_integrity_error(
                     errors,
                     IntegrityCheckError::FreelistTrunkCorrupt {
-                        page_id: page.get().id as i64,
+                        page_id: page.get().id() as i64,
                         page_pointers,
                         max_pointers,
                     },
@@ -7798,14 +8246,14 @@ pub fn integrity_check(
                 if unlikely(offset + FREELIST_LEAF_PTR_SIZE > page_size) {
                     tracing::error!(
                         "integrity_check: freelist trunk page {} has invalid leaf offset {}. header_bytes={:02x?}",
-                        page.get().id,
+                        page.get().id(),
                         offset,
                         &contents.as_ptr()[0..16]
                     );
                     push_integrity_error(
                         errors,
                         IntegrityCheckError::FreelistTrunkCorrupt {
-                            page_id: page.get().id as i64,
+                            page_id: page.get().id() as i64,
                             page_pointers,
                             max_pointers,
                         },
@@ -7816,14 +8264,14 @@ pub fn integrity_check(
                 if page_pointer as usize > state.db_size {
                     tracing::error!(
                         "integrity_check: freelist trunk page {} has invalid leaf pointer {}. header_bytes={:02x?}",
-                        page.get().id,
+                        page.get().id(),
                         page_pointer,
                         &contents.as_ptr()[0..16]
                     );
                     push_integrity_error(
                         errors,
                         IntegrityCheckError::FreelistPointerOutOfRange {
-                            page_id: page.get().id as i64,
+                            page_id: page.get().id() as i64,
                             pointer: page_pointer as i64,
                         },
                     )?;
@@ -7838,7 +8286,7 @@ pub fn integrity_check(
                         overflow_pages_expected: None,
                         overflow_pages_seen: 0,
                     },
-                    page.get().id as i64,
+                    page.get().id() as i64,
                     errors,
                 )?;
             }
@@ -7861,7 +8309,7 @@ pub fn integrity_check(
                         overflow_pages_expected,
                         overflow_pages_seen,
                     },
-                    page.get().id as i64,
+                    page.get().id() as i64,
                     errors,
                 )?;
             } else if let Some(expected) = overflow_pages_expected {
@@ -7879,7 +8327,7 @@ pub fn integrity_check(
         }
 
         let usable_space = pager.usable_space();
-        let mut coverage_checker = CoverageChecker::new(page.get().id as i64);
+        let mut coverage_checker = CoverageChecker::new(page.get().id() as i64);
 
         // Now we check every cell for few things:
         // 1. Check cell is in correct range. Not exceeds page and not starts before we have marked
@@ -7899,7 +8347,7 @@ pub fn integrity_check(
                     errors,
                     IntegrityCheckError::CellOutOfRange {
                         cell_idx,
-                        page_id: page.get().id as i64,
+                        page_id: page.get().id() as i64,
                         cell_start,
                         cell_end: cell_start + cell_length,
                         content_area: contents.cell_content_area() as usize,
@@ -7912,7 +8360,7 @@ pub fn integrity_check(
                     errors,
                     IntegrityCheckError::CellOverflowsPage {
                         cell_idx,
-                        page_id: page.get().id as i64,
+                        page_id: page.get().id() as i64,
                         cell_start,
                         cell_end: cell_start + cell_length,
                         content_area: contents.cell_content_area() as usize,
@@ -7933,7 +8381,7 @@ pub fn integrity_check(
                             overflow_pages_expected: None,
                             overflow_pages_seen: 0,
                         },
-                        page.get().id as i64,
+                        page.get().id() as i64,
                         errors,
                     )?;
                     let rowid = table_interior_cell.rowid;
@@ -7941,7 +8389,7 @@ pub fn integrity_check(
                         push_integrity_error(
                             errors,
                             IntegrityCheckError::CellRowidOutOfRange {
-                                page_id: page.get().id as i64,
+                                page_id: page.get().id() as i64,
                                 page_category,
                                 cell_idx,
                                 rowid,
@@ -7959,7 +8407,7 @@ pub fn integrity_check(
                             push_integrity_error(
                                 errors,
                                 IntegrityCheckError::LeafDepthMismatch {
-                                    page_id: page.get().id as i64,
+                                    page_id: page.get().id() as i64,
                                     this_page_depth: level,
                                     other_page_depth: expected_leaf_level,
                                 },
@@ -7973,7 +8421,7 @@ pub fn integrity_check(
                         push_integrity_error(
                             errors,
                             IntegrityCheckError::CellRowidOutOfRange {
-                                page_id: page.get().id as i64,
+                                page_id: page.get().id() as i64,
                                 page_category,
                                 cell_idx,
                                 rowid,
@@ -7998,7 +8446,7 @@ pub fn integrity_check(
                                 overflow_pages_expected: Some(expected_pages),
                                 overflow_pages_seen: 0,
                             },
-                            page.get().id as i64,
+                            page.get().id() as i64,
                             errors,
                         )?;
                     }
@@ -8013,7 +8461,7 @@ pub fn integrity_check(
                             overflow_pages_expected: None,
                             overflow_pages_seen: 0,
                         },
-                        page.get().id as i64,
+                        page.get().id() as i64,
                         errors,
                     )?;
                     if let Some(first_overflow_page) = index_interior_cell.first_overflow_page {
@@ -8031,7 +8479,7 @@ pub fn integrity_check(
                                 overflow_pages_expected: Some(expected_pages),
                                 overflow_pages_seen: 0,
                             },
-                            page.get().id as i64,
+                            page.get().id() as i64,
                             errors,
                         )?;
                     }
@@ -8043,7 +8491,7 @@ pub fn integrity_check(
                             push_integrity_error(
                                 errors,
                                 IntegrityCheckError::LeafDepthMismatch {
-                                    page_id: page.get().id as i64,
+                                    page_id: page.get().id() as i64,
                                     this_page_depth: level,
                                     other_page_depth: expected_leaf_level,
                                 },
@@ -8067,7 +8515,7 @@ pub fn integrity_check(
                                 overflow_pages_expected: Some(expected_pages),
                                 overflow_pages_seen: 0,
                             },
-                            page.get().id as i64,
+                            page.get().id() as i64,
                             errors,
                         )?;
                     }
@@ -8085,7 +8533,7 @@ pub fn integrity_check(
                     overflow_pages_expected: None,
                     overflow_pages_seen: 0,
                 },
-                page.get().id as i64,
+                page.get().id() as i64,
                 errors,
             )?;
         }
@@ -8102,7 +8550,7 @@ pub fn integrity_check(
                     push_integrity_error(
                         errors,
                         IntegrityCheckError::FreeBlockOutOfRange {
-                            page_id: page.get().id as i64,
+                            page_id: page.get().id() as i64,
                             start: pc,
                             end: pc + size,
                         },
@@ -8250,7 +8698,9 @@ struct PageStack {
     /// Pointer to the current page being consumed
     current_page: i32,
     /// List of pages in the stack. Root page will be in index 0
-    pub stack: [Option<PageRef>; BTCURSOR_MAX_DEPTH + 1],
+    ///
+    /// [ManuallyDrop] because as an optimization, [Self::drop] clears only the slots that actually hold pages.
+    pub stack: std::mem::ManuallyDrop<[Option<PageRef>; BTCURSOR_MAX_DEPTH + 1]>,
     /// List of cell indices in the stack.
     /// node_states[current_page] is the current cell index being consumed. Similarly
     /// node_states[current_page-1] is the cell index of the parent of the current page
@@ -8266,7 +8716,7 @@ impl PageStack {
     /// This effectively means traversing to a child page.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::push"))]
     fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
-        tracing::trace!(current = self.current_page, new_page_id = page.get().id,);
+        tracing::trace!(current = self.current_page, new_page_id = page.get().id(),);
         'validate: {
             let current = self.current_page;
             if current == -1 {
@@ -8275,9 +8725,9 @@ impl PageStack {
             let current_top = self.stack[current as usize].as_ref();
             if let Some(current_top) = current_top {
                 turso_assert!(
-                    current_top.get().id != page.get().id,
+                    current_top.get().id() != page.get().id(),
                     "about to push page twice",
-                    { "page_id": page.get().id }
+                    { "page_id": page.get().id() }
                 );
             }
         }
@@ -8317,12 +8767,12 @@ impl PageStack {
         turso_assert!(
             page.is_pinned(),
             "parent page is not pinned",
-            { "page_id": page.get().id }
+            { "page_id": page.get().id() }
         );
         turso_assert!(
             page.is_loaded(),
             "parent page is not loaded",
-            { "page_id": page.get().id }
+            { "page_id": page.get().id() }
         );
         let contents = page.get_contents();
         let cell_count = contents.cell_count() as i32;
@@ -8366,11 +8816,22 @@ impl PageStack {
         page
     }
 
+    /// The page at the top of the stack. Pages on the stack are pinned, and
+    /// every read of the page asserts that its buffer is present, so the
+    /// loaded flag is not tested here again.
+    #[inline(always)]
     fn top_ref(&self) -> &PageRef {
         let current = self.current();
-        let page = self.stack[current].as_ref().unwrap();
-        turso_assert!(page.is_loaded(), "page should be loaded");
-        page
+        self.stack[current].as_ref().unwrap()
+    }
+
+    #[inline(always)]
+    fn top_and_cell_index(&self) -> (&PageRef, i32) {
+        let current = self.current();
+        (
+            self.stack[current].as_ref().unwrap(),
+            self.node_states[current].cell_idx,
+        )
     }
 
     /// Current page pointer being used
@@ -8381,6 +8842,7 @@ impl PageStack {
     }
 
     /// Cell index of the current page
+    #[inline(always)]
     fn current_cell_index(&self) -> i32 {
         let current = self.current();
         self.node_states[current].cell_idx
@@ -8445,12 +8907,19 @@ impl PageStack {
     /// unpinned again on the next reset, decrementing the pin count of a
     /// page another cursor's stack still relies on.
     fn unpin_all_and_clear_slots(&mut self) {
-        for slot in self.stack.iter_mut() {
+        // Only the slots up to the current page hold pages and states: push
+        // fills the slot above the top and pop clears the top slot.
+        let used = (self.current_page + 1).max(0) as usize;
+        debug_assert!(
+            self.stack[used..].iter().all(|slot| slot.is_none()),
+            "page stack holds a page above its top"
+        );
+        for slot in self.stack[..used].iter_mut() {
             if let Some(page) = slot.take() {
                 let _ = page.try_unpin();
             }
         }
-        for state in self.node_states.iter_mut() {
+        for state in self.node_states[..used].iter_mut() {
             *state = BTreeNodeState::default();
         }
     }
@@ -8458,6 +8927,33 @@ impl PageStack {
     fn clear(&mut self) {
         self.unpin_all_and_clear_slots();
         self.current_page = -1;
+    }
+
+    /// Whether slot 0 holds the loaded root page of the btree.
+    fn holds_root(&self, root_page: i64) -> bool {
+        self.current_page >= 0
+            && self.stack[0]
+                .as_ref()
+                .is_some_and(|page| page.get().id() as i64 == root_page && page.is_loaded())
+    }
+
+    /// Drop every page below the root and leave the stack on the root as a
+    /// fresh push of it would.
+    fn pop_to_root(&mut self) {
+        let used = (self.current_page + 1) as usize;
+        for slot in self.stack[1..used].iter_mut() {
+            if let Some(page) = slot.take() {
+                let _ = page.try_unpin();
+            }
+        }
+        for state in self.node_states[1..used].iter_mut() {
+            *state = BTreeNodeState::default();
+        }
+        self.node_states[0] = BTreeNodeState {
+            cell_idx: -1,
+            cell_count: None,
+        };
+        self.current_page = 0;
     }
 }
 
@@ -8602,7 +9098,7 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
     contents.overflow_cells.clear();
     tracing::debug!(
         "btree_init_page(id={}, offset={}, usable_space={})",
-        page.get().id,
+        page.get().id(),
         offset,
         usable_space
     );
@@ -9015,25 +9511,19 @@ fn free_cell_range(
         return_corrupt!("free_cell_range: minimum cell size is {CELL_SIZE_MIN}");
     }
     if unlikely(offset > usable_space.saturating_sub(CELL_SIZE_MIN)) {
-        return_corrupt!(
-            "free_cell_range: start offset beyond usable space: offset={offset} usable_space={usable_space}"
-        );
+        return_corrupt!("free_cell_range: start offset beyond usable space: offset={offset} usable_space={usable_space}");
     }
 
     let mut size = len;
     let mut end = offset + len;
     if unlikely(end > usable_space) {
-        return_corrupt!(
-            "free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}"
-        );
+        return_corrupt!("free_cell_range: freed range extends beyond usable space: offset={offset} len={len} end={end} usable_space={usable_space}");
     }
     let cur_content_area = page.cell_content_area() as usize;
     let first_block = page.first_freeblock() as usize;
     if first_block == 0 {
         if unlikely(offset < cur_content_area) {
-            return_corrupt!(
-                "free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}"
-            );
+            return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
         }
         if offset == cur_content_area {
             // if the freeblock list is empty and the freed range is exactly at the beginning of the content area,
@@ -9060,9 +9550,7 @@ fn free_cell_range(
 
     while let Some(next) = next_block {
         if unlikely(prev_block.is_some_and(|prev| next <= prev)) {
-            return_corrupt!(
-                "free_cell_range: freeblocks not in ascending order: next_block={next} prev_block={prev_block:?}"
-            );
+            return_corrupt!("free_cell_range: freeblocks not in ascending order: next_block={next} prev_block={prev_block:?}");
         }
         if next >= offset {
             break;
@@ -9077,9 +9565,7 @@ fn free_cell_range(
 
     if let Some(next) = next_block {
         if unlikely(next + CELL_SIZE_MIN > usable_space) {
-            return_corrupt!(
-                "free_cell_range: free block beyond usable space: next_block={next} usable_space={usable_space}"
-            );
+            return_corrupt!("free_cell_range: free block beyond usable space: next_block={next} usable_space={usable_space}");
         }
     }
     let mut removed_fragmentation = 0;
@@ -9091,17 +9577,13 @@ fn free_cell_range(
     if let Some(next) = next_block {
         if end + SINGLE_FRAGMENT_SIZE_MAX >= next {
             if unlikely(end > next) {
-                return_corrupt!(
-                    "free_cell_range: freed range overlaps next freeblock: end={end} next_block={next}"
-                );
+                return_corrupt!("free_cell_range: freed range overlaps next freeblock: end={end} next_block={next}");
             }
             removed_fragmentation = (next - end) as u8;
             let next_size = page.read_u16_no_offset(next + 2) as usize;
             end = next + next_size;
             if unlikely(end > usable_space) {
-                return_corrupt!(
-                    "free_cell_range: coalesced block extends beyond page: offset={offset} len={len} end={end} usable_space={usable_space}"
-                );
+                return_corrupt!("free_cell_range: coalesced block extends beyond page: offset={offset} len={len} end={end} usable_space={usable_space}");
             }
             size = end - offset;
             // Since we merged the two freeblocks, we need to update the next_block to the next freeblock in the list.
@@ -9132,26 +9614,20 @@ fn free_cell_range(
 
     let cur_frag_free_bytes = page.num_frag_free_bytes();
     if unlikely(removed_fragmentation > cur_frag_free_bytes) {
-        return_corrupt!(
-            "free_cell_range: invalid fragmentation count: removed_fragmentation={removed_fragmentation} num_frag_free_bytes={cur_frag_free_bytes}"
-        );
+        return_corrupt!("free_cell_range: invalid fragmentation count: removed_fragmentation={removed_fragmentation} num_frag_free_bytes={cur_frag_free_bytes}");
     }
     let frag = cur_frag_free_bytes - removed_fragmentation;
     page.write_fragmented_bytes_count(frag);
 
     if unlikely(offset < cur_content_area) {
-        return_corrupt!(
-            "free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}"
-        );
+        return_corrupt!("free_cell_range: free block before content area: offset={offset} cell_content_area={cur_content_area}");
     }
 
     // As above, if the freed range is exactly at the beginning of the content area, we are not creating a freeblock;
     // instead we are just extending the unallocated region.
     if offset == cur_content_area {
         if unlikely(prev_block.is_some_and(|prev| prev != first_block)) {
-            return_corrupt!(
-                "free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev_block:?} first_block={first_block}"
-            );
+            return_corrupt!("free_cell_range: invalid content area merge - freed range should have been merged with previous freeblock: prev={prev_block:?} first_block={first_block}");
         }
         // If we get here, we are freeing data from the left end of the content area,
         // so we are extending the unallocated region instead of creating a freeblock.
@@ -9160,9 +9636,7 @@ fn free_cell_range(
         match next_block {
             Some(next) => {
                 if unlikely(next <= end) {
-                    return_corrupt!(
-                        "free_cell_range: invalid content area merge - first freeblock should either be 0 or greater than the content area start: next_block={next} end={end}"
-                    );
+                    return_corrupt!("free_cell_range: invalid content area merge - first freeblock should either be 0 or greater than the content area start: next_block={next} end={end}");
                 }
                 let next_u16: u16 = next
                     .try_into()
@@ -9460,7 +9934,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     let mut cells = SmallVec::<[CellInfo; MAX_STACK_CELLS]>::with_capacity(cell_count);
     for i in 0..cell_count {
         let pc = page.read_u16_no_offset(cell_offset + (i * 2));
-        let (_, size) = page._cell_get_raw_region_faster(
+        let (_, size, _) = page._cell_get_raw_region_faster(
             i,
             usable_space,
             cell_count,
@@ -9581,7 +10055,7 @@ fn _insert_into_cell(
         #[cfg(debug_assertions)]
         {
             if let Some(overflow_cell) = page.overflow_cells.last() {
-                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id, "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
+                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential", { "page_id": page.id(), "last_overflow_index": overflow_cell.index, "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len() });
             }
         }
         let mut payload = crate::with_btree_allocation_site!(OverflowCell, payload.try_to_vec())?;
@@ -9661,31 +10135,32 @@ fn insert_into_cell(
 /// Free blocks can be zero, meaning the "real free space" that can be used to allocate is expected
 /// to be between first cell byte and end of cell pointer area.
 #[allow(unused_assignments)]
-#[inline]
+#[inline(always)]
 fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> {
     // TODO(pere): maybe free space is not calculated correctly with offset
 
     // Usable space, not the same as free space, simply means:
     // space that is not reserved for extensions by sqlite. Usually reserved_space is 0.
 
-    let first_cell = page.offset() + page.header_size() + (2 * page.cell_count());
+    let header = page.btree_free_space_fields();
+    let first_cell = page.offset() + header.header_size + (2 * header.cell_count);
     if unlikely(first_cell > usable_space) {
         return_corrupt!(
             "compute_free_space: first_cell beyond usable space: first_cell={first_cell} usable_space={usable_space}"
         );
     }
 
-    let cell_content_area_start = page.cell_content_area() as usize;
+    let cell_content_area_start = header.cell_content_area as usize;
     if unlikely(cell_content_area_start > usable_space) {
         return_corrupt!(
             "compute_free_space: cell content area beyond usable space: cell_content_area_start={cell_content_area_start} usable_space={usable_space}"
         );
     }
 
-    let mut free_space_bytes = cell_content_area_start + page.num_frag_free_bytes() as usize;
+    let mut free_space_bytes = cell_content_area_start + header.num_frag_free_bytes as usize;
 
     // #3 is computed by iterating over the freeblocks linked list
-    let mut cur_freeblock_ptr = page.first_freeblock() as usize;
+    let mut cur_freeblock_ptr = header.first_freeblock as usize;
     if cur_freeblock_ptr > 0 {
         if unlikely(cur_freeblock_ptr < cell_content_area_start) {
             return_corrupt!(
@@ -9838,15 +10313,19 @@ pub enum CopyDataState {
 /// may require I/O.
 #[allow(clippy::too_many_arguments)]
 fn fill_cell_payload(
-    page: &PinGuard,
+    page: &PageRef,
     int_key: Option<i64>,
     cell_payload: &mut crate::alloc::Vec<u8>,
     cell_idx: usize,
     record: &impl AsRef<[u8]>,
     usable_space: usize,
-    pager: Arc<Pager>,
+    pager: &Pager,
     fill_cell_payload_state: &mut FillCellPayloadState,
 ) -> IOResultOr<()> {
+    debug_assert!(
+        page.is_pinned(),
+        "fill_cell_payload needs a pinned page, so the pager cannot take its buffer away"
+    );
     let overflow_page_pointer_size = 4;
     let overflow_page_data_size = usable_space - overflow_page_pointer_size;
     let result = loop {
@@ -9878,20 +10357,21 @@ fn fill_cell_payload(
                 let max_local = payload_overflow_threshold_max(page_type, usable_space);
                 let min_local = payload_overflow_threshold_min(page_type, usable_space);
 
-                let (overflows, local_size_if_overflow) =
-                    payload_overflows(record_buf.len(), max_local, min_local, usable_space);
-                if !overflows {
+                let Some(local_payload_size) =
+                    payload_overflows(record_buf.len(), max_local, min_local, usable_space)
+                else {
                     // enough allowed space to fit inside a btree page
                     crate::with_btree_allocation_site!(
                         CellPayload,
-                        cell_payload.try_extend(record_buf.iter().copied())
+                        cell_payload.try_reserve(record_buf.len())
                     )?;
+                    cell_payload.extend_from_slice(record_buf);
                     break Ok(IOResult::Done(()));
-                }
+                };
 
                 // so far we've written any of: left child page, rowid, payload size (depending on page type)
                 let cell_non_payload_elems_size = cell_payload.len();
-                let new_total_local_size = cell_non_payload_elems_size + local_size_if_overflow;
+                let new_total_local_size = cell_non_payload_elems_size + local_payload_size;
                 crate::with_btree_allocation_site!(
                     CellPayload,
                     cell_payload.try_reserve(new_total_local_size - cell_payload.len())
@@ -9900,7 +10380,7 @@ fn fill_cell_payload(
 
                 *fill_cell_payload_state = FillCellPayloadState::CopyData {
                     state: CopyDataState::Copy,
-                    space_left_on_cur_page: local_size_if_overflow - overflow_page_pointer_size, // local_size_if_overflow includes the overflow page pointer, but we don't want to write payload data there.
+                    space_left_on_cur_page: local_payload_size - overflow_page_pointer_size,
                     src_data_offset: 0,
                     dst_data_offset: cell_non_payload_elems_size,
                     current_overflow_page: None,
@@ -9960,7 +10440,7 @@ fn fill_cell_payload(
                             new_overflow_page.is_loaded(),
                             "new overflow page is not loaded"
                         );
-                        let new_overflow_page_id = new_overflow_page.get().id as u32;
+                        let new_overflow_page_id = new_overflow_page.get().id() as u32;
 
                         if let Some(prev_page) = current_overflow_page {
                             // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.
@@ -9991,6 +10471,35 @@ fn fill_cell_payload(
     };
     result
 }
+
+/// The payload sizes at which a cell spills to overflow pages
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadLimits {
+    pub usable_size: usize,
+    pub max_local_table: usize,
+    pub max_local_index: usize,
+    pub min_local: usize,
+}
+
+impl PayloadLimits {
+    pub fn new(usable_size: usize) -> Self {
+        Self {
+            usable_size,
+            max_local_table: payload_overflow_threshold_max(PageType::TableLeaf, usable_size),
+            max_local_index: payload_overflow_threshold_max(PageType::IndexLeaf, usable_size),
+            min_local: payload_overflow_threshold_min(PageType::TableLeaf, usable_size),
+        }
+    }
+
+    #[inline(always)]
+    pub fn max_local(&self, page_type: PageType) -> usize {
+        match page_type {
+            PageType::IndexInterior | PageType::IndexLeaf => self.max_local_index,
+            PageType::TableInterior | PageType::TableLeaf => self.max_local_table,
+        }
+    }
+}
+
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
 ///
 /// For table leaf pages: X = usable_size - 35
@@ -10120,6 +10629,19 @@ mod tests {
 
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
+    #[test]
+    fn write_varint_to_vec_matches_sqlite_encoding() {
+        for value in [0, 0x7f, 0x80, 0x3fff, 0x4000, 0x00ff_ffff, u64::MAX] {
+            let mut actual = crate::alloc::vec![];
+            write_varint_to_vec(value, &mut actual).unwrap();
+
+            let mut expected = [0; 9];
+            let len = write_varint(&mut expected, value);
+
+            assert_eq!(&actual[..], &expected[..len], "value: {value}");
+        }
+    }
+
     #[derive(Debug)]
     struct TargetedYieldInjector {
         point: YieldPoint,
@@ -10175,7 +10697,7 @@ mod tests {
 
         {
             let inner = page.get();
-            inner.buffer = Some(Arc::new(Buffer::new_temporary(4096)));
+            inner.set_buffer(Arc::new(Buffer::new_temporary(4096)));
         }
         page.set_loaded();
 
@@ -10626,7 +11148,7 @@ mod tests {
                     pos,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -10756,7 +11278,7 @@ mod tests {
                         pager.io.step().unwrap();
                     }
                     child_pages.push(child_page);
-                    if left_child_page == page.get().id as u32 {
+                    if left_child_page == page.get().id() as u32 {
                         valid = false;
                         tracing::error!(
                             "left child page is the same as parent {}",
@@ -10810,7 +11332,7 @@ mod tests {
             if !p.is_loaded() {
                 let (new_page, _c) = pager
                     .io
-                    .block(|| pager.read_page(p.get().id as i64))
+                    .block(|| pager.read_page(p.get().id() as i64))
                     .unwrap();
                 *p = new_page;
             }
@@ -10824,7 +11346,7 @@ mod tests {
                 if !page.is_loaded() {
                     let (new_page, _c) = pager
                         .io
-                        .block(|| pager.read_page(page.get().id as i64))
+                        .block(|| pager.read_page(page.get().id() as i64))
                         .unwrap();
                     *page = new_page;
                 }
@@ -10918,11 +11440,142 @@ mod tests {
             &pager,
         )
         .unwrap();
-        run_until_done(|| pager.commit_tx(&conn, true), &pager).unwrap();
+        run_until_done(
+            || pager.commit_tx(&conn, conn.get_sync_mode(), true),
+            &pager,
+        )
+        .unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
-        (pager, page2.get().id as i64, db, conn)
+        (pager, page2.get().id() as i64, db, conn)
+    }
+
+    #[test]
+    fn exact_table_seek_uses_loaded_leaf_after_page_descent() {
+        let (pager, root_page, _, _) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        let registers = &[Register::Value(Value::Text(Text::new("x".repeat(128))))];
+        let record = ImmutableRecord::from_registers(registers, registers.len()).unwrap();
+
+        for rowid in (2..=800).step_by(2) {
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap();
+            run_until_done(
+                || cursor.insert(&BTreeKey::new_table_rowid(rowid, Some(&record))),
+                &pager,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(400), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::Found
+        );
+
+        let (leaf_page, first_rowid, last_rowid) = {
+            let page = cursor.stack.top_ref();
+            let contents = page.get_contents();
+            let cell_count = contents.cell_count();
+            (
+                page.get().id(),
+                contents.cell_table_leaf_read_rowid(0).unwrap(),
+                contents.cell_table_leaf_read_rowid(cell_count - 1).unwrap(),
+            )
+        };
+        assert!(first_rowid < last_rowid);
+
+        let missing_rowid = first_rowid + 1;
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(
+                    SeekKey::TableRowId(missing_rowid),
+                    SeekOp::GE { eq_only: true },
+                ),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::NotFound
+        );
+        assert_eq!(
+            run_until_done(|| cursor.rowid(), &pager).unwrap(),
+            Some(first_rowid + 2)
+        );
+        assert_eq!(cursor.stack.top_ref().get().id(), leaf_page);
+
+        // A trigger can rebalance this B-tree while an unpositioned peer keeps its old page stack.
+        // The next seek must ignore that stack and search from the root.
+        cursor.set_has_record(false);
+        assert!(matches!(
+            cursor
+                .try_start_seek_on_current_table_leaf(last_rowid, SeekOp::GE { eq_only: true })
+                .unwrap(),
+            CurrentTableLeafSeek::SearchFromRoot
+        ));
+        assert!(matches!(cursor.seek_state, CursorSeekState::Start));
+
+        // A page read can yield before a root search reaches its target leaf.
+        // The seek must finish that search before it reuses a leaf.
+        cursor.set_has_record(true);
+        cursor.move_to_state = MoveToState::MoveToPage;
+        assert!(matches!(
+            cursor
+                .try_start_seek_on_current_table_leaf(last_rowid, SeekOp::GE { eq_only: true })
+                .unwrap(),
+            CurrentTableLeafSeek::SearchFromRoot
+        ));
+        assert!(matches!(cursor.seek_state, CursorSeekState::Start));
+
+        // A positioned cursor with no active page descent can use its loaded leaf.
+        cursor.move_to_state = MoveToState::Start;
+        assert!(matches!(
+            cursor
+                .try_start_seek_on_current_table_leaf(last_rowid, SeekOp::GE { eq_only: true })
+                .unwrap(),
+            CurrentTableLeafSeek::SearchCurrentLeaf
+        ));
+        assert!(matches!(
+            cursor.seek_state,
+            CursorSeekState::LeafPageBinarySearch { .. }
+        ));
+        assert!(matches!(
+            cursor
+                .tablebtree_seek(last_rowid, SeekOp::GE { eq_only: true })
+                .unwrap(),
+            IOResult::Done(SeekResult::Found)
+        ));
+        assert_eq!(cursor.stack.top_ref().get().id(), leaf_page);
+
+        cursor.seek_state = CursorSeekState::Start;
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(800), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::Found
+        );
+        let rightmost_page = cursor.stack.top_ref().get().id();
+        let cell_count = cursor.stack.top_ref().get_contents().cell_count();
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(801), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::NotFound
+        );
+        assert_eq!(cursor.stack.current_cell_index(), cell_count as i32);
+        assert!(!cursor.has_record);
+        assert!(matches!(cursor.seek_state, CursorSeekState::Start));
+        assert_eq!(cursor.stack.top_ref().get().id(), rightmost_page);
     }
 
     #[test]
@@ -11035,10 +11688,7 @@ mod tests {
             .io
             .block(|| pager.with_header(|header| header.freelist_pages.get()))
             .unwrap();
-        assert_eq!(
-            freelist_after_overwrite, EXPECTED_OVERFLOW_PAGES,
-            "Freelist count should be {EXPECTED_OVERFLOW_PAGES} after overwrite, was {freelist_after_overwrite}"
-        );
+        assert_eq!(freelist_after_overwrite, EXPECTED_OVERFLOW_PAGES, "Freelist count should be {EXPECTED_OVERFLOW_PAGES} after overwrite, was {freelist_after_overwrite}");
 
         // Verify the record was actually overwritten by reading it back
         run_until_done(
@@ -11244,7 +11894,10 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -11383,7 +12036,10 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
             }
 
             // Check that all keys can be found by seeking
@@ -11615,7 +12271,10 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager
+                    .io
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .unwrap();
             }
 
             // Final validation
@@ -11941,7 +12600,10 @@ mod tests {
             if let Some(c) = c {
                 pager.io.wait_for_completion(c).unwrap();
             }
-            pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+            pager
+                .io
+                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                .unwrap();
 
             // Full scan: every key must appear exactly once.
             pager.begin_read_tx().unwrap();
@@ -12152,7 +12814,9 @@ mod tests {
             .block(|| pager.with_header(|header| header.freelist_pages))?
             .get();
         // Clear overflow pages
-        pager.io.block(|| cursor.clear_overflow_pages(&leaf_cell))?;
+        pager
+            .io
+            .block(|| cursor.clear_overflow_pages(leaf_cell.first_overflow_page()))?;
         let (freelist_pages, freelist_trunk_page) = pager
             .io
             .block(|| {
@@ -12295,6 +12959,31 @@ mod tests {
         assert_eq!(final_count, n as usize);
     }
 
+    /// An oversized on-disk cell count must not panic the rowid binary search:
+    /// indexing the cell-pointer array off the page should surface `Corrupt`.
+    /// Regression test for https://github.com/tursodatabase/turso/issues/7473.
+    #[test]
+    fn table_leaf_oversized_cell_count_reads_corrupt_not_panic() {
+        let (pager, root_page, _db, _conn) = empty_btree();
+
+        let (root, _c) = pager.io.block(|| pager.read_page(root_page)).unwrap();
+        while root.is_locked() {
+            pager.io.step().unwrap();
+        }
+
+        // Forge an oversized cell count, as a corrupt file would.
+        let contents = root.get_contents();
+        contents.write_cell_count(0xFFFF);
+
+        // In range per the forged count, but its array entry lies off the page.
+        let oob_idx = pager.usable_space() / CELL_PTR_SIZE_BYTES;
+        let result = contents.cell_table_leaf_read_rowid(oob_idx);
+        assert!(
+            matches!(result, Err(LimboError::Corrupt(_))),
+            "expected Corrupt error, got {result:?}"
+        );
+    }
+
     #[test]
     pub fn test_clear_overflow_pages_no_overflow() -> Result<()> {
         let pager = setup_test_env(5);
@@ -12318,7 +13007,9 @@ mod tests {
             .get() as usize;
 
         // Try to clear non-existent overflow pages
-        pager.io.block(|| cursor.clear_overflow_pages(&leaf_cell))?;
+        pager
+            .io
+            .block(|| cursor.clear_overflow_pages(leaf_cell.first_overflow_page()))?;
         let (freelist_pages, freelist_trunk_page) = pager.io.block(|| {
             pager.with_header(|header| {
                 (
@@ -12372,15 +13063,15 @@ mod tests {
             let contents = root_page.get_contents();
 
             // Set rightmost pointer to page4
-            contents.write_rightmost_ptr(page4.get().id as u32);
+            contents.write_rightmost_ptr(page4.get().id() as u32);
 
             // Create a cell with pointer to page3
             let cell_content = vec![
                 // First 4 bytes: left child pointer (page3)
-                (page3.get().id >> 24) as u8,
-                (page3.get().id >> 16) as u8,
-                (page3.get().id >> 8) as u8,
-                page3.get().id as u8,
+                (page3.get().id() >> 24) as u8,
+                (page3.get().id() >> 16) as u8,
+                (page3.get().id() >> 8) as u8,
+                page3.get().id() as u8,
                 // Next byte: rowid as varint (simple value 100)
                 100,
             ];
@@ -12395,8 +13086,8 @@ mod tests {
 
             // Simple record with just a rowid and payload
             let record_bytes = vec![
-                5,                   // Payload length (varint)
-                page.get().id as u8, // Rowid (varint)
+                5,                     // Payload length (varint)
+                page.get().id() as u8, // Rowid (varint)
                 b'h',
                 b'e',
                 b'l',
@@ -12831,7 +13522,7 @@ mod tests {
                                 cell_idx,
                                 &record,
                                 4096,
-                                conn.pager.load().clone(),
+                                &conn.pager.load(),
                                 &mut fill_cell_payload_state,
                             )
                         },
@@ -12914,7 +13605,7 @@ mod tests {
                                     cell_idx,
                                     &record,
                                     4096,
-                                    conn.pager.load().clone(),
+                                    &conn.pager.load(),
                                     &mut fill_cell_payload_state,
                                 )
                             },
@@ -12964,16 +13655,16 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let queries = vec![
-            "CREATE TABLE lustrous_petit (awesome_nomous TEXT,ambitious_amargi TEXT,fantastic_daniels BLOB,stupendous_highleyman TEXT,relaxed_crane TEXT,elegant_bromma INTEGER,proficient_castro BLOB,ambitious_liman TEXT,responsible_lusbert BLOB);",
-            "INSERT INTO lustrous_petit VALUES ('funny_sarambi', 'hardworking_naoumov', X'666561726C6573735F68696C6C', 'elegant_iafd', 'rousing_flag', 681399778772406122, X'706572736F6E61626C655F676F6477696E6772696D6D', 'insightful_anonymous', X'706F77657266756C5F726F636861'), ('personable_holmes', 'diligent_pera', X'686F6E6573745F64696D656E73696F6E', 'energetic_raskin', 'gleaming_federasyon', -2778469859573362611, X'656666696369656E745F6769617A', 'sensible_skirda', X'66616E7461737469635F6B656174696E67'), ('inquisitive_baedan', 'brave_sphinx', X'67656E65726F75735F6D6F6E7473656E79', 'inquisitive_syndicate', 'amiable_room', 6954857961525890638, X'7374756E6E696E675F6E6965747A73636865', 'glowing_coordinator', X'64617A7A6C696E675F7365766572696E65'), ('upbeat_foxtale', 'engaging_aktimon', X'63726561746976655F6875746368696E6773', 'ample_locura', 'creative_barrett', 6413352509911171593, X'6772697070696E675F6D696E7969', 'competitive_parissi', X'72656D61726B61626C655F77696E7374616E6C6579');",
-            "INSERT INTO lustrous_petit VALUES ('ambitious_berry', 'devoted_marshall', X'696E7175697369746976655F6C6172657661', 'flexible_pramen', 'outstanding_stauch', 6936508362673228293, X'6C6F76696E675F6261756572', 'charming_anonymous', X'68617264776F726B696E675F616E6E6973'), ('enchanting_cohen', 'engaging_rubel', X'686F6E6573745F70726F766F63617A696F6E65', 'humorous_robin', 'imaginative_shuzo', 4762266264295288131, X'726F7573696E675F6261796572', 'vivid_bolling', X'6F7267616E697A65645F7275696E73'), ('affectionate_resistance', 'gripping_rustamova', X'6B696E645F6C61726B696E', 'bright_boulanger', 'upbeat_ashirov', -1726815435854320541, X'61646570745F66646361', 'dazzling_tashjian', X'68617264776F726B696E675F6D6F72656C'), ('zestful_ewald', 'favorable_lewis', X'73747570656E646F75735F7368616C6966', 'bright_combustion', 'blithesome_harding', 8408539013935554176, X'62726176655F737079726F706F756C6F75', 'hilarious_finnegan', X'676976696E675F6F7267616E697A696E67'), ('blithesome_picqueray', 'sincere_william', X'636F75726167656F75735F6D69746368656C6C', 'rousing_atan', 'mirthful_katie', -429232313453215091, X'6C6F76656C795F776174616E616265', 'stupendous_mcmillan', X'666F63757365645F6B61666568'), ('incredible_kid', 'friendly_yvetot', X'706572666563745F617A697A', 'helpful_manhattan', 'shining_horrox', -4318061095860308846, X'616D626974696F75735F726F7765', 'twinkling_anarkiya', X'696D6167696E61746976655F73756D6E6572');",
-            "INSERT INTO lustrous_petit VALUES ('sleek_graeber', 'approachable_ghazzawi', X'62726176655F6865776974747768697465', 'adaptable_zimmer', 'polite_cohn', -5464225138957223865, X'68756D6F726F75735F736E72', 'adaptable_igualada', X'6C6F76656C795F7A686F75'), ('imaginative_rautiainen', 'magnificent_ellul', X'73706C656E6469645F726F6361', 'responsible_brown', 'upbeat_uruguaya', -1185340834321792223, X'616D706C655F6D6470', 'philosophical_kelly', X'676976696E675F6461676865726D6172676F7369616E'), ('blithesome_darkness', 'creative_newell', X'6C757374726F75735F61706174726973', 'engaging_kids', 'charming_wark', -1752453819873942466, X'76697669645F6162657273', 'independent_barricadas', X'676C697374656E696E675F64686F6E6474'), ('productive_chardronnet', 'optimistic_karnage', X'64696C6967656E745F666F72657374', 'engaging_beggar', 'sensible_wolke', 784341549042407442, X'656E676167696E675F6265726B6F7769637A', 'blithesome_zuzenko', X'6E6963655F70726F766F63617A696F6E65');",
-            "INSERT INTO lustrous_petit VALUES ('shining_sagris', 'considerate_mother', X'6F70656E5F6D696E6465645F72696F74', 'polite_laufer', 'patient_mink', 2240393952789100851, X'636F75726167656F75735F6D636D696C6C616E', 'glowing_robertson', X'68656C7066756C5F73796D6F6E6473'), ('dazzling_glug', 'stupendous_poznan', X'706572736F6E61626C655F6672616E6B73', 'open_minded_ruins', 'qualified_manes', 2937238916206423261, X'696E736967687466756C5F68616B69656C', 'passionate_borl', X'616D6961626C655F6B7570656E647561'), ('wondrous_parry', 'knowledgeable_giovanni', X'6D6F76696E675F77696E6E', 'shimmering_aberlin', 'affectionate_calhoun', 702116954493913499, X'7265736F7572636566756C5F62726F6D6D61', 'propitious_mezzagarcia', X'746563686E6F6C6F676963616C5F6E6973686974616E69');",
-            "INSERT INTO lustrous_petit VALUES ('kind_room', 'hilarious_crow', X'6F70656E5F6D696E6465645F6B6F74616E7969', 'hardworking_petit', 'adaptable_zarrow', 2491343172109894986, X'70726F647563746976655F646563616C6F677565', 'willing_sindikalis', X'62726561746874616B696E675F6A6F7264616E');",
-            "INSERT INTO lustrous_petit VALUES ('confident_etrebilal', 'agreeable_shifu', X'726F6D616E7469635F7363687765697A6572', 'loving_debs', 'gripping_spooner', -3136910055229112693, X'677265676172696F75735F736B726F7A6974736B79', 'ample_ontiveros', X'7175616C69666965645F726F6D616E69656E6B6F'), ('competitive_call', 'technological_egoumenides', X'6469706C6F6D617469635F6D6F6E616768616E', 'willing_stew', 'frank_neal', -5973720171570031332, X'6C6F76696E675F6465737461', 'dazzling_gambone', X'70726F647563746976655F6D656E64656C676C6565736F6E'), ('favorable_delesalle', 'sensible_atterbury', X'666169746866756C5F64617861', 'bountiful_aldred', 'marvelous_malgraith', 5330463874397264493, X'706572666563745F7765726265', 'lustrous_anti', X'6C6F79616C5F626F6F6B6368696E'), ('stellar_corlu', 'loyal_espana', X'6D6F76696E675F7A6167', 'efficient_nelson', 'qualified_shepard', 1015518116803600464, X'737061726B6C696E675F76616E6469766572', 'loving_scoffer', X'686F6E6573745F756C72696368'), ('adaptable_taylor', 'shining_yasushi', X'696D6167696E61746976655F776974746967', 'alluring_blackmore', 'zestful_coeurderoy', -7094136731216188999, X'696D6167696E61746976655F757A63617465677569', 'gleaming_hernandez', X'6672616E6B5F646F6D696E69636B'), ('competitive_luis', 'stellar_fredericks', X'616772656561626C655F6D696368656C', 'optimistic_navarro', 'funny_hamilton', 4003895682491323194, X'6F70656E5F6D696E6465645F62656C6D6173', 'incredible_thorndycraft', X'656C6567616E745F746F6C6B69656E'), ('remarkable_parsons', 'sparkling_ulrich', X'737061726B6C696E675F6D6172696E636561', 'technological_leighlais', 'warmhearted_konok', -5789111414354869563, X'676976696E675F68657272696E67', 'adept_dabtara', X'667269656E646C795F72617070');",
-            "INSERT INTO lustrous_petit VALUES ('hardworking_norberg', 'approachable_winter', X'62726176655F68617474696E6768', 'imaginative_james', 'open_minded_capital', -5950508516718821688, X'6C757374726F75735F72616E7473', 'warmhearted_limanov', X'696E736967687466756C5F646F637472696E65'), ('generous_shatz', 'generous_finley', X'726176697368696E675F6B757A6E6574736F76', 'stunning_arrigoni', 'favorable_volcano', -8442328990977069526, X'6D6972746866756C5F616C7467656C64', 'thoughtful_zurbrugg', X'6D6972746866756C5F6D6F6E726F65'), ('frank_kerr', 'splendid_swain', X'70617373696F6E6174655F6D6470', 'flexible_dubey', 'sensible_tj', 6352949260574274181, X'656666696369656E745F6B656D736B79', 'vibrant_ege', X'736C65656B5F6272696768746F6E'), ('organized_neal', 'glistening_sugar', X'656E676167696E675F6A6F72616D', 'romantic_krieger', 'qualified_corr', -4774868512022958085, X'706572666563745F6B6F7A6172656B', 'bountiful_zaikowska', X'74686F7567687466756C5F6C6F6767616E73'), ('excellent_lydiettcarrion', 'diligent_denslow', X'666162756C6F75735F6D616E68617474616E', 'confident_tomar', 'glistening_ligt', -1134906665439009896, X'7175616C69666965645F6F6E6B656E', 'remarkable_anarkiya', X'6C6F79616C5F696E64616261'), ('passionate_melis', 'loyal_xsilent', X'68617264776F726B696E675F73637564', 'lustrous_barnes', 'nice_sugako', -4097897163377829983, X'726F6D616E7469635F6461686572', 'bright_imrie', X'73656E7369626C655F6D61726B'), ('giving_mlb', 'breathtaking_fourier', X'736C65656B5F616E61726368697374', 'glittering_malet', 'brilliant_crew', 8791228049111405793, X'626F756E746966756C5F626576656E736565', 'lovely_swords', X'70726F706974696F75735F696E656469746173'), ('honest_wright', 'qualified_rabble', X'736C65656B5F6D6172656368616C', 'shimmering_marius', 'blithesome_mckelvie', -1330737263592370654, X'6F70656E5F6D696E6465645F736D616C6C', 'energetic_gorman', X'70726F706974696F75735F6B6F74616E7969');",
-            "DELETE FROM lustrous_petit WHERE (ambitious_liman > 'adept_dabtaqu');",
-            "INSERT INTO lustrous_petit VALUES ('technological_dewey', 'fabulous_st', X'6F7074696D69737469635F73687562', 'considerate_levy', 'adaptable_kernis', 4195134012457716562, X'61646570745F736F6C6964617269646164', 'vibrant_crump', X'6C6F79616C5F72796E6572'), ('super_marjan', 'awesome_gethin', X'736C65656B5F6F737465727765696C', 'diplomatic_loidl', 'qualified_bokani', -2822676417968234733, X'6272696768745F64756E6C6170', 'creative_en', X'6D6972746866756C5F656C6F6666'), ('philosophical_malet', 'unique_garcia', X'76697669645F6E6F7262657267', 'spellbinding_fire', 'faithful_barringtonbush', -7293711848773657758, X'6272696C6C69616E745F6F6B65656665', 'gripping_guillon', X'706572736F6E61626C655F6D61726C696E7370696B65'), ('thoughtful_morefus', 'lustrous_rodriguez', X'636F6E666964656E745F67726F73736D616E726F73686368696E', 'devoted_jackson', 'propitious_karnage', -7802999054396485709, X'63617061626C655F64', 'enchanting_orwell', X'7477696E6B6C696E675F64616C616B6F676C6F75'), ('alluring_guillon', 'brilliant_pinotnoir', X'706572736F6E61626C655F6A6165636B6C65', 'open_minded_azeez', 'courageous_romania', 2126962403055072268, X'746563686E6F6C6F676963616C5F6962616E657A', 'open_minded_rosa', X'6C757374726F75735F6575726F7065'), ('courageous_kolokotronis', 'inquisitive_gahman', X'677265676172696F75735F626172726574', 'ambitious_shakur', 'fantastic_apatris', -1232732971861520864, X'737061726B6C696E675F7761746368', 'captivating_clover', X'636F6E666964656E745F736574686E65737363617374726F'), ('charming_sullivan', 'focused_congress', X'7368696D6D6572696E675F636C7562', 'wondrous_skrbina', 'giving_mendanlioglu', -6837337053772308333, X'636861726D696E675F73616C696E6173', 'rousing_hedva', X'6469706C6F6D617469635F7061796E');",
+"CREATE TABLE lustrous_petit (awesome_nomous TEXT,ambitious_amargi TEXT,fantastic_daniels BLOB,stupendous_highleyman TEXT,relaxed_crane TEXT,elegant_bromma INTEGER,proficient_castro BLOB,ambitious_liman TEXT,responsible_lusbert BLOB);",
+"INSERT INTO lustrous_petit VALUES ('funny_sarambi', 'hardworking_naoumov', X'666561726C6573735F68696C6C', 'elegant_iafd', 'rousing_flag', 681399778772406122, X'706572736F6E61626C655F676F6477696E6772696D6D', 'insightful_anonymous', X'706F77657266756C5F726F636861'), ('personable_holmes', 'diligent_pera', X'686F6E6573745F64696D656E73696F6E', 'energetic_raskin', 'gleaming_federasyon', -2778469859573362611, X'656666696369656E745F6769617A', 'sensible_skirda', X'66616E7461737469635F6B656174696E67'), ('inquisitive_baedan', 'brave_sphinx', X'67656E65726F75735F6D6F6E7473656E79', 'inquisitive_syndicate', 'amiable_room', 6954857961525890638, X'7374756E6E696E675F6E6965747A73636865', 'glowing_coordinator', X'64617A7A6C696E675F7365766572696E65'), ('upbeat_foxtale', 'engaging_aktimon', X'63726561746976655F6875746368696E6773', 'ample_locura', 'creative_barrett', 6413352509911171593, X'6772697070696E675F6D696E7969', 'competitive_parissi', X'72656D61726B61626C655F77696E7374616E6C6579');",
+"INSERT INTO lustrous_petit VALUES ('ambitious_berry', 'devoted_marshall', X'696E7175697369746976655F6C6172657661', 'flexible_pramen', 'outstanding_stauch', 6936508362673228293, X'6C6F76696E675F6261756572', 'charming_anonymous', X'68617264776F726B696E675F616E6E6973'), ('enchanting_cohen', 'engaging_rubel', X'686F6E6573745F70726F766F63617A696F6E65', 'humorous_robin', 'imaginative_shuzo', 4762266264295288131, X'726F7573696E675F6261796572', 'vivid_bolling', X'6F7267616E697A65645F7275696E73'), ('affectionate_resistance', 'gripping_rustamova', X'6B696E645F6C61726B696E', 'bright_boulanger', 'upbeat_ashirov', -1726815435854320541, X'61646570745F66646361', 'dazzling_tashjian', X'68617264776F726B696E675F6D6F72656C'), ('zestful_ewald', 'favorable_lewis', X'73747570656E646F75735F7368616C6966', 'bright_combustion', 'blithesome_harding', 8408539013935554176, X'62726176655F737079726F706F756C6F75', 'hilarious_finnegan', X'676976696E675F6F7267616E697A696E67'), ('blithesome_picqueray', 'sincere_william', X'636F75726167656F75735F6D69746368656C6C', 'rousing_atan', 'mirthful_katie', -429232313453215091, X'6C6F76656C795F776174616E616265', 'stupendous_mcmillan', X'666F63757365645F6B61666568'), ('incredible_kid', 'friendly_yvetot', X'706572666563745F617A697A', 'helpful_manhattan', 'shining_horrox', -4318061095860308846, X'616D626974696F75735F726F7765', 'twinkling_anarkiya', X'696D6167696E61746976655F73756D6E6572');",
+"INSERT INTO lustrous_petit VALUES ('sleek_graeber', 'approachable_ghazzawi', X'62726176655F6865776974747768697465', 'adaptable_zimmer', 'polite_cohn', -5464225138957223865, X'68756D6F726F75735F736E72', 'adaptable_igualada', X'6C6F76656C795F7A686F75'), ('imaginative_rautiainen', 'magnificent_ellul', X'73706C656E6469645F726F6361', 'responsible_brown', 'upbeat_uruguaya', -1185340834321792223, X'616D706C655F6D6470', 'philosophical_kelly', X'676976696E675F6461676865726D6172676F7369616E'), ('blithesome_darkness', 'creative_newell', X'6C757374726F75735F61706174726973', 'engaging_kids', 'charming_wark', -1752453819873942466, X'76697669645F6162657273', 'independent_barricadas', X'676C697374656E696E675F64686F6E6474'), ('productive_chardronnet', 'optimistic_karnage', X'64696C6967656E745F666F72657374', 'engaging_beggar', 'sensible_wolke', 784341549042407442, X'656E676167696E675F6265726B6F7769637A', 'blithesome_zuzenko', X'6E6963655F70726F766F63617A696F6E65');",
+"INSERT INTO lustrous_petit VALUES ('shining_sagris', 'considerate_mother', X'6F70656E5F6D696E6465645F72696F74', 'polite_laufer', 'patient_mink', 2240393952789100851, X'636F75726167656F75735F6D636D696C6C616E', 'glowing_robertson', X'68656C7066756C5F73796D6F6E6473'), ('dazzling_glug', 'stupendous_poznan', X'706572736F6E61626C655F6672616E6B73', 'open_minded_ruins', 'qualified_manes', 2937238916206423261, X'696E736967687466756C5F68616B69656C', 'passionate_borl', X'616D6961626C655F6B7570656E647561'), ('wondrous_parry', 'knowledgeable_giovanni', X'6D6F76696E675F77696E6E', 'shimmering_aberlin', 'affectionate_calhoun', 702116954493913499, X'7265736F7572636566756C5F62726F6D6D61', 'propitious_mezzagarcia', X'746563686E6F6C6F676963616C5F6E6973686974616E69');",
+"INSERT INTO lustrous_petit VALUES ('kind_room', 'hilarious_crow', X'6F70656E5F6D696E6465645F6B6F74616E7969', 'hardworking_petit', 'adaptable_zarrow', 2491343172109894986, X'70726F647563746976655F646563616C6F677565', 'willing_sindikalis', X'62726561746874616B696E675F6A6F7264616E');",
+"INSERT INTO lustrous_petit VALUES ('confident_etrebilal', 'agreeable_shifu', X'726F6D616E7469635F7363687765697A6572', 'loving_debs', 'gripping_spooner', -3136910055229112693, X'677265676172696F75735F736B726F7A6974736B79', 'ample_ontiveros', X'7175616C69666965645F726F6D616E69656E6B6F'), ('competitive_call', 'technological_egoumenides', X'6469706C6F6D617469635F6D6F6E616768616E', 'willing_stew', 'frank_neal', -5973720171570031332, X'6C6F76696E675F6465737461', 'dazzling_gambone', X'70726F647563746976655F6D656E64656C676C6565736F6E'), ('favorable_delesalle', 'sensible_atterbury', X'666169746866756C5F64617861', 'bountiful_aldred', 'marvelous_malgraith', 5330463874397264493, X'706572666563745F7765726265', 'lustrous_anti', X'6C6F79616C5F626F6F6B6368696E'), ('stellar_corlu', 'loyal_espana', X'6D6F76696E675F7A6167', 'efficient_nelson', 'qualified_shepard', 1015518116803600464, X'737061726B6C696E675F76616E6469766572', 'loving_scoffer', X'686F6E6573745F756C72696368'), ('adaptable_taylor', 'shining_yasushi', X'696D6167696E61746976655F776974746967', 'alluring_blackmore', 'zestful_coeurderoy', -7094136731216188999, X'696D6167696E61746976655F757A63617465677569', 'gleaming_hernandez', X'6672616E6B5F646F6D696E69636B'), ('competitive_luis', 'stellar_fredericks', X'616772656561626C655F6D696368656C', 'optimistic_navarro', 'funny_hamilton', 4003895682491323194, X'6F70656E5F6D696E6465645F62656C6D6173', 'incredible_thorndycraft', X'656C6567616E745F746F6C6B69656E'), ('remarkable_parsons', 'sparkling_ulrich', X'737061726B6C696E675F6D6172696E636561', 'technological_leighlais', 'warmhearted_konok', -5789111414354869563, X'676976696E675F68657272696E67', 'adept_dabtara', X'667269656E646C795F72617070');",
+"INSERT INTO lustrous_petit VALUES ('hardworking_norberg', 'approachable_winter', X'62726176655F68617474696E6768', 'imaginative_james', 'open_minded_capital', -5950508516718821688, X'6C757374726F75735F72616E7473', 'warmhearted_limanov', X'696E736967687466756C5F646F637472696E65'), ('generous_shatz', 'generous_finley', X'726176697368696E675F6B757A6E6574736F76', 'stunning_arrigoni', 'favorable_volcano', -8442328990977069526, X'6D6972746866756C5F616C7467656C64', 'thoughtful_zurbrugg', X'6D6972746866756C5F6D6F6E726F65'), ('frank_kerr', 'splendid_swain', X'70617373696F6E6174655F6D6470', 'flexible_dubey', 'sensible_tj', 6352949260574274181, X'656666696369656E745F6B656D736B79', 'vibrant_ege', X'736C65656B5F6272696768746F6E'), ('organized_neal', 'glistening_sugar', X'656E676167696E675F6A6F72616D', 'romantic_krieger', 'qualified_corr', -4774868512022958085, X'706572666563745F6B6F7A6172656B', 'bountiful_zaikowska', X'74686F7567687466756C5F6C6F6767616E73'), ('excellent_lydiettcarrion', 'diligent_denslow', X'666162756C6F75735F6D616E68617474616E', 'confident_tomar', 'glistening_ligt', -1134906665439009896, X'7175616C69666965645F6F6E6B656E', 'remarkable_anarkiya', X'6C6F79616C5F696E64616261'), ('passionate_melis', 'loyal_xsilent', X'68617264776F726B696E675F73637564', 'lustrous_barnes', 'nice_sugako', -4097897163377829983, X'726F6D616E7469635F6461686572', 'bright_imrie', X'73656E7369626C655F6D61726B'), ('giving_mlb', 'breathtaking_fourier', X'736C65656B5F616E61726368697374', 'glittering_malet', 'brilliant_crew', 8791228049111405793, X'626F756E746966756C5F626576656E736565', 'lovely_swords', X'70726F706974696F75735F696E656469746173'), ('honest_wright', 'qualified_rabble', X'736C65656B5F6D6172656368616C', 'shimmering_marius', 'blithesome_mckelvie', -1330737263592370654, X'6F70656E5F6D696E6465645F736D616C6C', 'energetic_gorman', X'70726F706974696F75735F6B6F74616E7969');",
+"DELETE FROM lustrous_petit WHERE (ambitious_liman > 'adept_dabtaqu');",
+"INSERT INTO lustrous_petit VALUES ('technological_dewey', 'fabulous_st', X'6F7074696D69737469635F73687562', 'considerate_levy', 'adaptable_kernis', 4195134012457716562, X'61646570745F736F6C6964617269646164', 'vibrant_crump', X'6C6F79616C5F72796E6572'), ('super_marjan', 'awesome_gethin', X'736C65656B5F6F737465727765696C', 'diplomatic_loidl', 'qualified_bokani', -2822676417968234733, X'6272696768745F64756E6C6170', 'creative_en', X'6D6972746866756C5F656C6F6666'), ('philosophical_malet', 'unique_garcia', X'76697669645F6E6F7262657267', 'spellbinding_fire', 'faithful_barringtonbush', -7293711848773657758, X'6272696C6C69616E745F6F6B65656665', 'gripping_guillon', X'706572736F6E61626C655F6D61726C696E7370696B65'), ('thoughtful_morefus', 'lustrous_rodriguez', X'636F6E666964656E745F67726F73736D616E726F73686368696E', 'devoted_jackson', 'propitious_karnage', -7802999054396485709, X'63617061626C655F64', 'enchanting_orwell', X'7477696E6B6C696E675F64616C616B6F676C6F75'), ('alluring_guillon', 'brilliant_pinotnoir', X'706572736F6E61626C655F6A6165636B6C65', 'open_minded_azeez', 'courageous_romania', 2126962403055072268, X'746563686E6F6C6F676963616C5F6962616E657A', 'open_minded_rosa', X'6C757374726F75735F6575726F7065'), ('courageous_kolokotronis', 'inquisitive_gahman', X'677265676172696F75735F626172726574', 'ambitious_shakur', 'fantastic_apatris', -1232732971861520864, X'737061726B6C696E675F7761746368', 'captivating_clover', X'636F6E666964656E745F736574686E65737363617374726F'), ('charming_sullivan', 'focused_congress', X'7368696D6D6572696E675F636C7562', 'wondrous_skrbina', 'giving_mendanlioglu', -6837337053772308333, X'636861726D696E675F73616C696E6173', 'rousing_hedva', X'6469706C6F6D617469635F7061796E');",
         ];
 
         for query in queries {
@@ -13003,36 +13694,36 @@ mod tests {
         let conn = db.connect().unwrap();
 
         let queries = vec![
-            "CREATE TABLE super_becky (engrossing_berger BLOB,plucky_chai BLOB,mirthful_asbo REAL,bountiful_jon REAL,competitive_petit REAL,engrossing_rexroth REAL);",
-            "INSERT INTO super_becky VALUES (X'636861726D696E675F6261796572', X'70726F647563746976655F70617269737369', 6847793643.408741, 7330361375.924953, -6586051582.891455, -6921021872.711397), (X'657863656C6C656E745F6F7267616E697A696E67', X'6C757374726F75735F73696E64696B616C6973', 9905774996.48619, 570325205.2246342, 5852346465.53047, 728566012.1968269), (X'7570626561745F73656174746C65', X'62726176655F6661756E', -2202725836.424899, 5424554426.388281, 2625872085.917082, -6657362503.808359), (X'676C6F77696E675F6D617877656C6C', X'7761726D686561727465645F726F77616E', -9610936969.793116, 4886606277.093559, -3414536174.7928505, 6898267795.317778), (X'64796E616D69635F616D616E', X'7374656C6C61725F7374657073', 3918935692.153696, 151068445.947237, 4582065669.356403, -3312668220.4789667), (X'64696C6967656E745F64757272757469', X'7175616C69666965645F6D726163686E696B', 5527271629.262201, 6068855126.044355, 289904657.13490677, 2975774820.0877323), (X'6469706C6F6D617469635F726F76657363696F', X'616C6C7572696E675F626F7474696369', 9844748192.66119, -6180276383.305578, -4137330511.025565, -478754566.79494476), (X'776F6E64726F75735F6173686572', X'6465766F7465645F6176657273696F6E', 2310211470.114773, -6129166761.628184, -2865371645.3145514, 7542428654.8645935), (X'617070726F61636861626C655F6B686F6C61', X'6C757374726F75735F6C696E6E656C6C', -4993113161.458349, 7356727284.362968, -3228937035.568404, -1779334005.5067253);",
-            "INSERT INTO super_becky VALUES (X'74686F7567687466756C5F726576696577', X'617765736F6D655F63726F73736579', 9401977997.012783, 8428201961.643898, 2822821303.052643, 4555601220.718847), (X'73706563746163756C61725F6B686179617469', X'616772656561626C655F61646F6E696465', 7414547022.041355, 365016845.73330307, 50682963.055828094, -9258802584.962656), (X'6C6F79616C5F656D6572736F6E', X'676C6F77696E675F626174616C6F', -5522070106.765736, 2712536599.6384163, 6631385631.869345, 1242757880.7583427), (X'68617264776F726B696E675F6F6B656C6C79', X'666162756C6F75735F66696C697373', 6682622809.9778805, 4233900041.917185, 9017477903.795563, -756846353.6034946), (X'68617264776F726B696E675F626C61756D616368656E', X'616666656374696F6E6174655F6B6F736D616E', -1146438175.3174362, -7545123696.438596, -6799494012.403366, 5646913977.971333), (X'66616E7461737469635F726F77616E', X'74686F7567687466756C5F7465727269746F72696573', -4414529784.916277, -6209371635.279242, 4491104121.288605, 2590223842.117277);",
-            "INSERT INTO super_becky VALUES (X'676C697374656E696E675F706F72746572', X'696E7175697369746976655F656D', 2986144164.3676434, 3495899172.5935287, -849280584.9386635, 6869709150.2699375), (X'696D6167696E61746976655F6D65726C696E6F', X'676C6F77696E675F616B74696D6F6E', 8733490615.829357, 6782649864.719433, 6926744218.74107, 1532081022.4379768), (X'6E6963655F726F73736574', X'626C69746865736F6D655F66696C697373', -839304300.0706863, 6155504968.705227, -2951592321.950267, -6254186334.572437), (X'636F6E666964656E745F6C69626574', X'676C696D6D6572696E675F6B6F74616E7969', -5344675223.37533, -8703794729.211002, 3987472096.020382, -7678989974.961197), (X'696D6167696E61746976655F6B61726162756C7574', X'64796E616D69635F6D6367697272', 2028227065.6995697, -7435689525.030833, 7011220815.569796, 5526665697.213846), (X'696E7175697369746976655F636C61726B', X'616666656374696F6E6174655F636C6561766572', 3016598350.546356, -3686782925.383732, 9671422351.958004, 9099319829.078941), (X'63617061626C655F746174616E6B61', X'696E6372656469626C655F6F746F6E6F6D61', 6339989259.432795, -8888997534.102034, 6855868409.475763, -2565348887.290493), (X'676F7267656F75735F6265726E657269', X'65647563617465645F6F6D6F77616C69', 6992467657.527826, -3538089391.748543, -7103111660.146708, 4019283237.3740463), (X'616772656561626C655F63756C74757265', X'73706563746163756C61725F657370616E61', 189387871.06959534, 6211851191.361202, 1786455196.9768047, 7966404387.318119);",
-            "INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F6C656967686C616973', X'666162756C6F75735F73656D696E61746F7265', 8688321500.141502, -7855144036.024546, -5234949709.573349, -9937638367.366447), (X'617070726F61636861626C655F726F677565', X'676C65616D696E675F6D7574696E79', -5351540099.744092, -3614025150.9013805, -2327775310.276925, 2223379997.077526), (X'676C696D6D6572696E675F63617263686961', X'696D6167696E61746976655F61737379616E6E', 4104832554.8371887, -5531434716.627781, 1652773397.4099865, 3884980522.1830273);",
-            "DELETE FROM super_becky WHERE (plucky_chai != X'7761726D686561727465645F6877616E67' AND mirthful_asbo != 9537234687.183533 AND bountiful_jon = -3538089391.748543);",
-            "INSERT INTO super_becky VALUES (X'706C75636B795F6D617263616E74656C', X'696D6167696E61746976655F73696D73', 9535651632.375484, 92270815.0720501, 1299048084.6248207, 6460855331.572151), (X'726F6D616E7469635F706F746C61746368', X'68756D6F726F75735F63686165686F', 9345375719.265533, 7825332230.247925, -7133157299.39028, -6939677879.6597), (X'656666696369656E745F6261676E696E69', X'63726561746976655F67726168616D', -2615470560.1954746, 6790849074.977201, -8081732985.448849, -8133707792.312794), (X'677265676172696F75735F73637564', X'7368696E696E675F67726F7570', -7996394978.2610035, -9734939565.228964, 1108439333.8481388, -5420483517.169478), (X'6C696B61626C655F6B616E6176616C6368796B', X'636F75726167656F75735F7761726669656C64', -1959869609.656724, 4176668769.239971, -8423220404.063669, 9987687878.685959), (X'657863656C6C656E745F68696C6473646F74746572', X'676C6974746572696E675F7472616D7564616E61', -5220160777.908238, 3892402687.8826714, 9803857762.617172, -1065043714.0265541), (X'6D61676E69666963656E745F717565657273', X'73757065725F717565657273', -700932053.2006226, -4706306995.253335, -5286045811.046467, 1954345265.5250092), (X'676976696E675F6275636B65726D616E6E', X'667269656E646C795F70697A7A6F6C61746F', -2186859620.9089565, -6098492099.446075, -7456845586.405931, 8796967674.444252);",
-            "DELETE FROM super_becky WHERE TRUE;",
-            "INSERT INTO super_becky VALUES (X'6F7074696D69737469635F6368616E69616C', X'656E657267657469635F6E65677261', 1683345860.4208698, 4163199322.9289455, -4192968616.7868404, -7253371206.571701), (X'616C6C7572696E675F686176656C', X'7477696E6B6C696E675F626965627579636B', -9947019174.287437, 5975899640.893995, 3844707723.8570194, -9699970750.513876), (X'6F7074696D69737469635F7A686F75', X'616D626974696F75735F636F6E6772657373', 4143738484.1081524, -2138255286.170598, 9960750454.03466, 5840575852.80299), (X'73706563746163756C61725F6A6F6E67', X'73656E7369626C655F616269646F72', -1767611042.9716015, -7684260477.580351, 4570634429.188147, -9222640121.140202), (X'706F6C6974655F6B657272', X'696E736967687466756C5F63686F646F726B6F6666', -635016769.5123329, -4359901288.494518, -7531565119.905825, -1180410948.6572971), (X'666C657869626C655F636F6D756E69656C6C6F', X'6E6963655F6172636F73', 8708423014.802425, -6276712625.559328, -771680766.2485523, 8639486874.113342);",
-            "DELETE FROM super_becky WHERE (mirthful_asbo < 9730384310.536528 AND plucky_chai < X'6E6963655F61726370B2');",
-            "DELETE FROM super_becky WHERE (mirthful_asbo > 6248699554.426553 AND bountiful_jon > 4124481472.333034);",
-            "INSERT INTO super_becky VALUES (X'676C696D6D6572696E675F77656C7368', X'64696C6967656E745F636F7262696E', 8217054003.369003, 8745594518.77864, 1928172803.2261295, -8375115534.050233), (X'616772656561626C655F6463', X'6C6F76696E675F666F72656D616E', -5483889804.871533, -8264576639.127487, 4770567289.404846, -3409172927.2573576), (X'6D617276656C6F75735F6173696D616B6F706F756C6F73', X'746563686E6F6C6F676963616C5F6A61637175696572', 2694858779.206814, -1703227425.3442516, -4504989231.263319, -3097265869.5230227), (X'73747570656E646F75735F64757075697364657269', X'68696C6172696F75735F6D75697268656164', 568174708.66469, -4878260547.265669, -9579691520.956625, 73507727.8100338), (X'626C69746865736F6D655F626C6F6B', X'61646570745F6C65696572', 7772117077.916897, 4590608571.321514, -881713470.657032, -9158405774.647465);",
-            "INSERT INTO super_becky VALUES (X'6772697070696E675F6573736578', X'67656E65726F75735F636875726368696C6C', -4180431825.598956, 7277443000.677654, 2499796052.7878246, -2858339306.235305), (X'756E697175655F6D6172656368616C', X'62726561746874616B696E675F636875726368696C6C', 1401354536.7625294, -611427440.2796707, -4621650430.463729, 1531473111.7482872), (X'657863656C6C656E745F66696E6C6579', X'666169746866756C5F62726F636B', -4020697828.0073624, -2833530733.19637, -7766170050.654022, 8661820959.434689);",
-            "INSERT INTO super_becky VALUES (X'756E697175655F6C617061797265', X'6C6F76696E675F7374617465', 7063237787.258968, -5425712581.365798, -7750509440.0141945, -7570954710.892544), (X'62726561746874616B696E675F6E65616C', X'636F75726167656F75735F61727269676F6E69', 289862394.2028198, 9690362375.014446, -4712463267.033899, 2474917855.0973473), (X'7477696E6B6C696E675F7368616B7572', X'636F75726167656F75735F636F6D6D6974746565', 5449035403.229155, -2159678989.597906, 3625606019.1150894, -3752010405.4475393);",
-            "INSERT INTO super_becky VALUES (X'70617373696F6E6174655F73686970776179', X'686F6E6573745F7363687765697A6572', 4193384746.165228, -2232151704.896323, 8615245520.962444, -9789090953.995636);",
-            "INSERT INTO super_becky VALUES (X'6C696B61626C655F69', X'6661766F7261626C655F6D626168', 6581403690.769894, 3260059398.9544716, -407118859.046051, -3155853965.2700634), (X'73696E636572655F6F72', X'616772656561626C655F617070656C6261756D', 9402938544.308651, -7595112171.758331, -7005316716.211025, -8368210960.419411);",
-            "INSERT INTO super_becky VALUES (X'6D617276656C6F75735F6B61736864616E', X'6E6963655F636F7272', -5976459640.85817, -3177550476.2092276, 2073318650.736992, -1363247319.9978447);",
-            "INSERT INTO super_becky VALUES (X'73706C656E6469645F6C616D656E646F6C61', X'677265676172696F75735F766F6E6E65677574', 6898259773.050102, 8973519699.707073, -25070632.280548096, -1845922497.9676847), (X'617765736F6D655F7365766572', X'656E657267657469635F706F746C61746368', -8750678407.717808, 5130907533.668898, -6778425327.111566, 3718982135.202587);",
-            "INSERT INTO super_becky VALUES (X'70726F706974696F75735F6D616C617465737461', X'657863656C6C656E745F65766572657474', -8846855772.62094, -6168969732.697067, -8796372709.125793, 9983557891.544613), (X'73696E636572655F6C6177', X'696E7175697369746976655F73616E647374726F6D', -6366985697.975358, 3838628702.6652164, 3680621713.3371124, -786796486.8049564), (X'706F6C6974655F676C6561736F6E', X'706C75636B795F677579616E61', -3987946379.104308, -2119148244.413993, -1448660343.6888638, -1264195510.1611118), (X'676C6974746572696E675F6C6975', X'70657273697374656E745F6F6C6976696572', 6741779968.943846, -3239809989.227495, -1026074003.5506897, 4654600514.871752);",
-            "DELETE FROM super_becky WHERE (engrossing_berger < X'6566651A3C70278D4E200657551D8071A1' AND competitive_petit > 1236742147.9451914);",
-            "INSERT INTO super_becky VALUES (X'6661766F7261626C655F726569746D616E', X'64657465726D696E65645F726974746572', -7412553243.829927, -7572665195.290464, 7879603411.222157, 3706943306.5691853), (X'70657273697374656E745F6E6F6C616E', X'676C6974746572696E675F73686570617264', 7028261282.277422, -2064164782.3494844, -5244048504.507779, -2399526243.005843), (X'6B6E6F776C6564676561626C655F70617474656E', X'70726F66696369656E745F726F7365627261756768', 3713056763.583538, 3919834206.566164, -6306779387.430006, -9939464323.995546), (X'616461707461626C655F7172757A', X'696E7175697369746976655F68617261776179', 6519349690.299835, -9977624623.820414, 7500579325.440605, -8118341251.362242);",
-            "INSERT INTO super_becky VALUES (X'636F6E73696465726174655F756E696F6E', X'6E6963655F6573736578', -1497385534.8720198, 9957688503.242973, 9191804202.566128, -179015615.7117195), (X'666169746866756C5F626F776C656773', X'6361707469766174696E675F6D6367697272', 893707300.1576138, 3381656294.246702, 6884723724.381908, 6248331214.701559), (X'6B6E6F776C6564676561626C655F70656E6E61', X'6B696E645F616A697468', -3335162603.6574974, 1812878172.8505402, 5115606679.658335, -5690100280.808182), (X'617765736F6D655F77696E7374616E6C6579', X'70726F706974696F75735F6361726173736F', -7395576292.503981, 4956546102.029215, -1468521769.7486448, -2968223925.60355), (X'636F75726167656F75735F77617266617265', X'74686F7567687466756C5F7361707068697265', 7052982930.566017, -9806098174.104418, -6910398936.377775, -4041963031.766964), (X'657863656C6C656E745F6B62', X'626C69746865736F6D655F666F75747A6F706F756C6F73', 6142173202.994768, 5193126957.544125, -7522202722.983735, -1659088056.594862), (X'7374756E6E696E675F6E6576616461', X'626F756E746966756C5F627572746F6E', -3822097036.7628613, -3458840259.240303, 2544472236.86788, 6928890176.466003);",
-            "INSERT INTO super_becky VALUES (X'706572736F6E61626C655F646D69747269', X'776F6E64726F75735F6133796F', 2651932559.0077076, 811299402.3174248, -8271909238.671928, 6761098864.189909);",
-            "INSERT INTO super_becky VALUES (X'726F7573696E675F6B6C6166657461', X'64617A7A6C696E675F6B6E617070', 9370628891.439335, -5923332007.253168, -2763161830.5880013, -9156194881.875952), (X'656666696369656E745F6C6576656C6C6572', X'616C6C7572696E675F706561636F7474', 3102641409.8314342, 2838360181.628153, 2466271662.169607, 1015942181.844162), (X'6469706C6F6D617469635F7065726B696E73', X'726F7573696E675F6172616269', -1551071129.022499, -8079487600.186886, 7832984580.070087, -6785993247.895652), (X'626F756E746966756C5F6D656D62657273', X'706F77657266756C5F70617269737369', 9226031830.72445, 7012021503.536997, -2297349030.108919, -2738320055.4710903), (X'676F7267656F75735F616E6172636F7469636F', X'68656C7066756C5F7765696C616E64', -8394163480.676959, -2978605095.699134, -6439355448.021704, 9137308022.281273), (X'616666656374696F6E6174655F70726F6C65696E666F', X'706C75636B795F73616E7A', 3546758708.3524914, -1870964264.9353771, 338752565.3643894, -3908023657.299715), (X'66756E6E795F706F70756C61697265', X'6F75747374616E64696E675F626576696E67746F6E', -1533858145.408224, 6164225076.710373, 8419445987.622173, 584555253.6852646), (X'76697669645F6D7474', X'7368696D6D6572696E675F70616F6E65737361', 5512251366.193035, -8680583180.123213, -4445968638.153208, -3274009935.4229546);",
-            "INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F686F7264', X'657863656C6C656E745F67757373656C7370726F757473', -816909447.0240917, -3614686681.8786583, 7701617524.26067, -4541962047.183721), (X'616D6961626C655F69676E6174696576', X'6D61676E69666963656E745F70726F76696E6369616C69', -1318532883.847702, -4918966075.976474, -7601723171.33518, -3515747704.3847466), (X'70726F66696369656E745F32303137', X'66756E6E795F6E77', -1264540201.518032, 8227396547.578808, 6245093925.183641, -8368355328.110817);",
-            "INSERT INTO super_becky VALUES (X'77696C6C696E675F6E6F6B6B65', X'726F6D616E7469635F677579616E61', 6618610796.3707695, -3814565359.1524105, 1663106272.4565296, -4175107840.768817), (X'72656C617865645F7061766C6F76', X'64657465726D696E65645F63686F646F726B6F6666', -3350029338.034504, -3520837855.4619064, 3375167499.631817, -8866806483.714607), (X'616D706C655F67696464696E6773', X'667269656E646C795F6A6F686E', 1458864959.9942684, 1344208968.0486107, 9335156635.91314, -6180643697.918882), (X'72656C617865645F6C65726F79', X'636F75726167656F75735F6E6F72646772656E', -5164986537.499656, 8820065797.720875, 6146530425.891005, 6949241471.958189), (X'666F63757365645F656D6D61', X'696D6167696E61746976655F6C6F6E67', -9587619060.80035, 6128068142.184402, 6765196076.956905, 800226302.7983418);",
-            "INSERT INTO super_becky VALUES (X'616D626974696F75735F736F6E67', X'706572666563745F6761686D616E', 4989979180.706432, -9374266591.537058, 314459621.2820797, -3200029490.9553604), (X'666561726C6573735F626C6174', X'676C697374656E696E675F616374696F6E', -8512203612.903147, -7625581186.013805, -9711122307.234787, -301590929.32751083), (X'617765736F6D655F6669646573', X'666169746866756C5F63756E6E696E6768616D', -1428228887.9205084, 7669883854.400173, 5604446195.905277, -1509311057.9653416), (X'68756D6F726F75735F77697468647261776E', X'62726561746874616B696E675F7472617562656C', -7292778713.676636, -6728132503.529593, 2805341768.7252483, 330416975.2300949);",
-            "INSERT INTO super_becky VALUES (X'677265676172696F75735F696873616E', X'7374656C6C61725F686172746D616E', 8819210651.1988, 5298459883.813452, 7293544377.958424, 460475869.72971725), (X'696E736967687466756C5F62657765726E69747A', X'676C65616D696E675F64656E736C6F77', -6911957282.193239, 1754196756.2193146, -6316860403.693853, -3094020672.236368), (X'6D6972746866756C5F616D6265727261656B656C6C79', X'68756D6F726F75735F6772617665', 1785574023.0269203, -372056983.82761574, 4133719439.9538956, 9374053482.066044), (X'76697669645F736169747461', X'7761726D686561727465645F696E656469746173', 2787071361.6099434, 9663839418.553448, -5934098589.901047, -9774745509.608858), (X'61646570745F6F6375727279', X'6C696B61626C655F726569746D616E', -3098540915.1310825, 5460848322.672174, -6012867197.519758, 6769770087.661135), (X'696E646570656E64656E745F6F', X'656C6567616E745F726F6F726461', 1462542860.3143978, 3360904654.2464733, 5458876201.665213, -5522844849.529962), (X'72656D61726B61626C655F626F6B616E69', X'6F70656E5F6D696E6465645F686F72726F78', 7589481760.867031, 7970075121.546291, 7513467575.5213585, 9663061478.289227), (X'636F6E666964656E745F6C616479', X'70617373696F6E6174655F736B726F7A6974736B79', 8266917234.53915, -7172933478.625412, 309854059.94031143, -8309837814.497616);",
-            "DELETE FROM super_becky WHERE (competitive_petit != 8725256604.165474 OR engrossing_rexroth > -3607424615.7839313 OR plucky_chai < X'726F7573696E675F6216E20375');",
-            "INSERT INTO super_becky VALUES (X'7368696E696E675F736F6C69646169726573', X'666561726C6573735F63617264616E', -170727879.20838165, 2744601113.384678, 5676912434.941502, 6757573601.657997), (X'636F75726167656F75735F706C616E636865', X'696E646570656E64656E745F636172736F6E', -6271723086.761938, -180566679.7470188, -1285774632.134449, 1359665735.7842407), (X'677265676172696F75735F7374616D61746F76', X'7374756E6E696E675F77696C64726F6F7473', -6210238866.953484, 2492683045.8287067, -9688894361.68205, 5420275482.048567), (X'696E646570656E64656E745F6F7267616E697A6572', X'676C6974746572696E675F736F72656C', 9291163783.3073, -6843003475.769236, -1320245894.772686, -5023483808.044955), (X'676C6F77696E675F6E65736963', X'676C65616D696E675F746F726D6579', 829526382.8027191, 9365690945.1316, 4761505764.826195, -4149154965.0024815), (X'616C6C7572696E675F646F637472696E65', X'6E6963655F636C6561766572', 3896644979.981762, -288600448.8016701, 9462856570.130062, -909633752.5993862);",
+"CREATE TABLE super_becky (engrossing_berger BLOB,plucky_chai BLOB,mirthful_asbo REAL,bountiful_jon REAL,competitive_petit REAL,engrossing_rexroth REAL);",
+"INSERT INTO super_becky VALUES (X'636861726D696E675F6261796572', X'70726F647563746976655F70617269737369', 6847793643.408741, 7330361375.924953, -6586051582.891455, -6921021872.711397), (X'657863656C6C656E745F6F7267616E697A696E67', X'6C757374726F75735F73696E64696B616C6973', 9905774996.48619, 570325205.2246342, 5852346465.53047, 728566012.1968269), (X'7570626561745F73656174746C65', X'62726176655F6661756E', -2202725836.424899, 5424554426.388281, 2625872085.917082, -6657362503.808359), (X'676C6F77696E675F6D617877656C6C', X'7761726D686561727465645F726F77616E', -9610936969.793116, 4886606277.093559, -3414536174.7928505, 6898267795.317778), (X'64796E616D69635F616D616E', X'7374656C6C61725F7374657073', 3918935692.153696, 151068445.947237, 4582065669.356403, -3312668220.4789667), (X'64696C6967656E745F64757272757469', X'7175616C69666965645F6D726163686E696B', 5527271629.262201, 6068855126.044355, 289904657.13490677, 2975774820.0877323), (X'6469706C6F6D617469635F726F76657363696F', X'616C6C7572696E675F626F7474696369', 9844748192.66119, -6180276383.305578, -4137330511.025565, -478754566.79494476), (X'776F6E64726F75735F6173686572', X'6465766F7465645F6176657273696F6E', 2310211470.114773, -6129166761.628184, -2865371645.3145514, 7542428654.8645935), (X'617070726F61636861626C655F6B686F6C61', X'6C757374726F75735F6C696E6E656C6C', -4993113161.458349, 7356727284.362968, -3228937035.568404, -1779334005.5067253);",
+"INSERT INTO super_becky VALUES (X'74686F7567687466756C5F726576696577', X'617765736F6D655F63726F73736579', 9401977997.012783, 8428201961.643898, 2822821303.052643, 4555601220.718847), (X'73706563746163756C61725F6B686179617469', X'616772656561626C655F61646F6E696465', 7414547022.041355, 365016845.73330307, 50682963.055828094, -9258802584.962656), (X'6C6F79616C5F656D6572736F6E', X'676C6F77696E675F626174616C6F', -5522070106.765736, 2712536599.6384163, 6631385631.869345, 1242757880.7583427), (X'68617264776F726B696E675F6F6B656C6C79', X'666162756C6F75735F66696C697373', 6682622809.9778805, 4233900041.917185, 9017477903.795563, -756846353.6034946), (X'68617264776F726B696E675F626C61756D616368656E', X'616666656374696F6E6174655F6B6F736D616E', -1146438175.3174362, -7545123696.438596, -6799494012.403366, 5646913977.971333), (X'66616E7461737469635F726F77616E', X'74686F7567687466756C5F7465727269746F72696573', -4414529784.916277, -6209371635.279242, 4491104121.288605, 2590223842.117277);",
+"INSERT INTO super_becky VALUES (X'676C697374656E696E675F706F72746572', X'696E7175697369746976655F656D', 2986144164.3676434, 3495899172.5935287, -849280584.9386635, 6869709150.2699375), (X'696D6167696E61746976655F6D65726C696E6F', X'676C6F77696E675F616B74696D6F6E', 8733490615.829357, 6782649864.719433, 6926744218.74107, 1532081022.4379768), (X'6E6963655F726F73736574', X'626C69746865736F6D655F66696C697373', -839304300.0706863, 6155504968.705227, -2951592321.950267, -6254186334.572437), (X'636F6E666964656E745F6C69626574', X'676C696D6D6572696E675F6B6F74616E7969', -5344675223.37533, -8703794729.211002, 3987472096.020382, -7678989974.961197), (X'696D6167696E61746976655F6B61726162756C7574', X'64796E616D69635F6D6367697272', 2028227065.6995697, -7435689525.030833, 7011220815.569796, 5526665697.213846), (X'696E7175697369746976655F636C61726B', X'616666656374696F6E6174655F636C6561766572', 3016598350.546356, -3686782925.383732, 9671422351.958004, 9099319829.078941), (X'63617061626C655F746174616E6B61', X'696E6372656469626C655F6F746F6E6F6D61', 6339989259.432795, -8888997534.102034, 6855868409.475763, -2565348887.290493), (X'676F7267656F75735F6265726E657269', X'65647563617465645F6F6D6F77616C69', 6992467657.527826, -3538089391.748543, -7103111660.146708, 4019283237.3740463), (X'616772656561626C655F63756C74757265', X'73706563746163756C61725F657370616E61', 189387871.06959534, 6211851191.361202, 1786455196.9768047, 7966404387.318119);",
+"INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F6C656967686C616973', X'666162756C6F75735F73656D696E61746F7265', 8688321500.141502, -7855144036.024546, -5234949709.573349, -9937638367.366447), (X'617070726F61636861626C655F726F677565', X'676C65616D696E675F6D7574696E79', -5351540099.744092, -3614025150.9013805, -2327775310.276925, 2223379997.077526), (X'676C696D6D6572696E675F63617263686961', X'696D6167696E61746976655F61737379616E6E', 4104832554.8371887, -5531434716.627781, 1652773397.4099865, 3884980522.1830273);",
+"DELETE FROM super_becky WHERE (plucky_chai != X'7761726D686561727465645F6877616E67' AND mirthful_asbo != 9537234687.183533 AND bountiful_jon = -3538089391.748543);",
+"INSERT INTO super_becky VALUES (X'706C75636B795F6D617263616E74656C', X'696D6167696E61746976655F73696D73', 9535651632.375484, 92270815.0720501, 1299048084.6248207, 6460855331.572151), (X'726F6D616E7469635F706F746C61746368', X'68756D6F726F75735F63686165686F', 9345375719.265533, 7825332230.247925, -7133157299.39028, -6939677879.6597), (X'656666696369656E745F6261676E696E69', X'63726561746976655F67726168616D', -2615470560.1954746, 6790849074.977201, -8081732985.448849, -8133707792.312794), (X'677265676172696F75735F73637564', X'7368696E696E675F67726F7570', -7996394978.2610035, -9734939565.228964, 1108439333.8481388, -5420483517.169478), (X'6C696B61626C655F6B616E6176616C6368796B', X'636F75726167656F75735F7761726669656C64', -1959869609.656724, 4176668769.239971, -8423220404.063669, 9987687878.685959), (X'657863656C6C656E745F68696C6473646F74746572', X'676C6974746572696E675F7472616D7564616E61', -5220160777.908238, 3892402687.8826714, 9803857762.617172, -1065043714.0265541), (X'6D61676E69666963656E745F717565657273', X'73757065725F717565657273', -700932053.2006226, -4706306995.253335, -5286045811.046467, 1954345265.5250092), (X'676976696E675F6275636B65726D616E6E', X'667269656E646C795F70697A7A6F6C61746F', -2186859620.9089565, -6098492099.446075, -7456845586.405931, 8796967674.444252);",
+"DELETE FROM super_becky WHERE TRUE;",
+"INSERT INTO super_becky VALUES (X'6F7074696D69737469635F6368616E69616C', X'656E657267657469635F6E65677261', 1683345860.4208698, 4163199322.9289455, -4192968616.7868404, -7253371206.571701), (X'616C6C7572696E675F686176656C', X'7477696E6B6C696E675F626965627579636B', -9947019174.287437, 5975899640.893995, 3844707723.8570194, -9699970750.513876), (X'6F7074696D69737469635F7A686F75', X'616D626974696F75735F636F6E6772657373', 4143738484.1081524, -2138255286.170598, 9960750454.03466, 5840575852.80299), (X'73706563746163756C61725F6A6F6E67', X'73656E7369626C655F616269646F72', -1767611042.9716015, -7684260477.580351, 4570634429.188147, -9222640121.140202), (X'706F6C6974655F6B657272', X'696E736967687466756C5F63686F646F726B6F6666', -635016769.5123329, -4359901288.494518, -7531565119.905825, -1180410948.6572971), (X'666C657869626C655F636F6D756E69656C6C6F', X'6E6963655F6172636F73', 8708423014.802425, -6276712625.559328, -771680766.2485523, 8639486874.113342);",
+"DELETE FROM super_becky WHERE (mirthful_asbo < 9730384310.536528 AND plucky_chai < X'6E6963655F61726370B2');",
+"DELETE FROM super_becky WHERE (mirthful_asbo > 6248699554.426553 AND bountiful_jon > 4124481472.333034);",
+"INSERT INTO super_becky VALUES (X'676C696D6D6572696E675F77656C7368', X'64696C6967656E745F636F7262696E', 8217054003.369003, 8745594518.77864, 1928172803.2261295, -8375115534.050233), (X'616772656561626C655F6463', X'6C6F76696E675F666F72656D616E', -5483889804.871533, -8264576639.127487, 4770567289.404846, -3409172927.2573576), (X'6D617276656C6F75735F6173696D616B6F706F756C6F73', X'746563686E6F6C6F676963616C5F6A61637175696572', 2694858779.206814, -1703227425.3442516, -4504989231.263319, -3097265869.5230227), (X'73747570656E646F75735F64757075697364657269', X'68696C6172696F75735F6D75697268656164', 568174708.66469, -4878260547.265669, -9579691520.956625, 73507727.8100338), (X'626C69746865736F6D655F626C6F6B', X'61646570745F6C65696572', 7772117077.916897, 4590608571.321514, -881713470.657032, -9158405774.647465);",
+"INSERT INTO super_becky VALUES (X'6772697070696E675F6573736578', X'67656E65726F75735F636875726368696C6C', -4180431825.598956, 7277443000.677654, 2499796052.7878246, -2858339306.235305), (X'756E697175655F6D6172656368616C', X'62726561746874616B696E675F636875726368696C6C', 1401354536.7625294, -611427440.2796707, -4621650430.463729, 1531473111.7482872), (X'657863656C6C656E745F66696E6C6579', X'666169746866756C5F62726F636B', -4020697828.0073624, -2833530733.19637, -7766170050.654022, 8661820959.434689);",
+"INSERT INTO super_becky VALUES (X'756E697175655F6C617061797265', X'6C6F76696E675F7374617465', 7063237787.258968, -5425712581.365798, -7750509440.0141945, -7570954710.892544), (X'62726561746874616B696E675F6E65616C', X'636F75726167656F75735F61727269676F6E69', 289862394.2028198, 9690362375.014446, -4712463267.033899, 2474917855.0973473), (X'7477696E6B6C696E675F7368616B7572', X'636F75726167656F75735F636F6D6D6974746565', 5449035403.229155, -2159678989.597906, 3625606019.1150894, -3752010405.4475393);",
+"INSERT INTO super_becky VALUES (X'70617373696F6E6174655F73686970776179', X'686F6E6573745F7363687765697A6572', 4193384746.165228, -2232151704.896323, 8615245520.962444, -9789090953.995636);",
+"INSERT INTO super_becky VALUES (X'6C696B61626C655F69', X'6661766F7261626C655F6D626168', 6581403690.769894, 3260059398.9544716, -407118859.046051, -3155853965.2700634), (X'73696E636572655F6F72', X'616772656561626C655F617070656C6261756D', 9402938544.308651, -7595112171.758331, -7005316716.211025, -8368210960.419411);",
+"INSERT INTO super_becky VALUES (X'6D617276656C6F75735F6B61736864616E', X'6E6963655F636F7272', -5976459640.85817, -3177550476.2092276, 2073318650.736992, -1363247319.9978447);",
+"INSERT INTO super_becky VALUES (X'73706C656E6469645F6C616D656E646F6C61', X'677265676172696F75735F766F6E6E65677574', 6898259773.050102, 8973519699.707073, -25070632.280548096, -1845922497.9676847), (X'617765736F6D655F7365766572', X'656E657267657469635F706F746C61746368', -8750678407.717808, 5130907533.668898, -6778425327.111566, 3718982135.202587);",
+"INSERT INTO super_becky VALUES (X'70726F706974696F75735F6D616C617465737461', X'657863656C6C656E745F65766572657474', -8846855772.62094, -6168969732.697067, -8796372709.125793, 9983557891.544613), (X'73696E636572655F6C6177', X'696E7175697369746976655F73616E647374726F6D', -6366985697.975358, 3838628702.6652164, 3680621713.3371124, -786796486.8049564), (X'706F6C6974655F676C6561736F6E', X'706C75636B795F677579616E61', -3987946379.104308, -2119148244.413993, -1448660343.6888638, -1264195510.1611118), (X'676C6974746572696E675F6C6975', X'70657273697374656E745F6F6C6976696572', 6741779968.943846, -3239809989.227495, -1026074003.5506897, 4654600514.871752);",
+"DELETE FROM super_becky WHERE (engrossing_berger < X'6566651A3C70278D4E200657551D8071A1' AND competitive_petit > 1236742147.9451914);",
+"INSERT INTO super_becky VALUES (X'6661766F7261626C655F726569746D616E', X'64657465726D696E65645F726974746572', -7412553243.829927, -7572665195.290464, 7879603411.222157, 3706943306.5691853), (X'70657273697374656E745F6E6F6C616E', X'676C6974746572696E675F73686570617264', 7028261282.277422, -2064164782.3494844, -5244048504.507779, -2399526243.005843), (X'6B6E6F776C6564676561626C655F70617474656E', X'70726F66696369656E745F726F7365627261756768', 3713056763.583538, 3919834206.566164, -6306779387.430006, -9939464323.995546), (X'616461707461626C655F7172757A', X'696E7175697369746976655F68617261776179', 6519349690.299835, -9977624623.820414, 7500579325.440605, -8118341251.362242);",
+"INSERT INTO super_becky VALUES (X'636F6E73696465726174655F756E696F6E', X'6E6963655F6573736578', -1497385534.8720198, 9957688503.242973, 9191804202.566128, -179015615.7117195), (X'666169746866756C5F626F776C656773', X'6361707469766174696E675F6D6367697272', 893707300.1576138, 3381656294.246702, 6884723724.381908, 6248331214.701559), (X'6B6E6F776C6564676561626C655F70656E6E61', X'6B696E645F616A697468', -3335162603.6574974, 1812878172.8505402, 5115606679.658335, -5690100280.808182), (X'617765736F6D655F77696E7374616E6C6579', X'70726F706974696F75735F6361726173736F', -7395576292.503981, 4956546102.029215, -1468521769.7486448, -2968223925.60355), (X'636F75726167656F75735F77617266617265', X'74686F7567687466756C5F7361707068697265', 7052982930.566017, -9806098174.104418, -6910398936.377775, -4041963031.766964), (X'657863656C6C656E745F6B62', X'626C69746865736F6D655F666F75747A6F706F756C6F73', 6142173202.994768, 5193126957.544125, -7522202722.983735, -1659088056.594862), (X'7374756E6E696E675F6E6576616461', X'626F756E746966756C5F627572746F6E', -3822097036.7628613, -3458840259.240303, 2544472236.86788, 6928890176.466003);",
+"INSERT INTO super_becky VALUES (X'706572736F6E61626C655F646D69747269', X'776F6E64726F75735F6133796F', 2651932559.0077076, 811299402.3174248, -8271909238.671928, 6761098864.189909);",
+"INSERT INTO super_becky VALUES (X'726F7573696E675F6B6C6166657461', X'64617A7A6C696E675F6B6E617070', 9370628891.439335, -5923332007.253168, -2763161830.5880013, -9156194881.875952), (X'656666696369656E745F6C6576656C6C6572', X'616C6C7572696E675F706561636F7474', 3102641409.8314342, 2838360181.628153, 2466271662.169607, 1015942181.844162), (X'6469706C6F6D617469635F7065726B696E73', X'726F7573696E675F6172616269', -1551071129.022499, -8079487600.186886, 7832984580.070087, -6785993247.895652), (X'626F756E746966756C5F6D656D62657273', X'706F77657266756C5F70617269737369', 9226031830.72445, 7012021503.536997, -2297349030.108919, -2738320055.4710903), (X'676F7267656F75735F616E6172636F7469636F', X'68656C7066756C5F7765696C616E64', -8394163480.676959, -2978605095.699134, -6439355448.021704, 9137308022.281273), (X'616666656374696F6E6174655F70726F6C65696E666F', X'706C75636B795F73616E7A', 3546758708.3524914, -1870964264.9353771, 338752565.3643894, -3908023657.299715), (X'66756E6E795F706F70756C61697265', X'6F75747374616E64696E675F626576696E67746F6E', -1533858145.408224, 6164225076.710373, 8419445987.622173, 584555253.6852646), (X'76697669645F6D7474', X'7368696D6D6572696E675F70616F6E65737361', 5512251366.193035, -8680583180.123213, -4445968638.153208, -3274009935.4229546);",
+"INSERT INTO super_becky VALUES (X'7068696C6F736F70686963616C5F686F7264', X'657863656C6C656E745F67757373656C7370726F757473', -816909447.0240917, -3614686681.8786583, 7701617524.26067, -4541962047.183721), (X'616D6961626C655F69676E6174696576', X'6D61676E69666963656E745F70726F76696E6369616C69', -1318532883.847702, -4918966075.976474, -7601723171.33518, -3515747704.3847466), (X'70726F66696369656E745F32303137', X'66756E6E795F6E77', -1264540201.518032, 8227396547.578808, 6245093925.183641, -8368355328.110817);",
+"INSERT INTO super_becky VALUES (X'77696C6C696E675F6E6F6B6B65', X'726F6D616E7469635F677579616E61', 6618610796.3707695, -3814565359.1524105, 1663106272.4565296, -4175107840.768817), (X'72656C617865645F7061766C6F76', X'64657465726D696E65645F63686F646F726B6F6666', -3350029338.034504, -3520837855.4619064, 3375167499.631817, -8866806483.714607), (X'616D706C655F67696464696E6773', X'667269656E646C795F6A6F686E', 1458864959.9942684, 1344208968.0486107, 9335156635.91314, -6180643697.918882), (X'72656C617865645F6C65726F79', X'636F75726167656F75735F6E6F72646772656E', -5164986537.499656, 8820065797.720875, 6146530425.891005, 6949241471.958189), (X'666F63757365645F656D6D61', X'696D6167696E61746976655F6C6F6E67', -9587619060.80035, 6128068142.184402, 6765196076.956905, 800226302.7983418);",
+"INSERT INTO super_becky VALUES (X'616D626974696F75735F736F6E67', X'706572666563745F6761686D616E', 4989979180.706432, -9374266591.537058, 314459621.2820797, -3200029490.9553604), (X'666561726C6573735F626C6174', X'676C697374656E696E675F616374696F6E', -8512203612.903147, -7625581186.013805, -9711122307.234787, -301590929.32751083), (X'617765736F6D655F6669646573', X'666169746866756C5F63756E6E696E6768616D', -1428228887.9205084, 7669883854.400173, 5604446195.905277, -1509311057.9653416), (X'68756D6F726F75735F77697468647261776E', X'62726561746874616B696E675F7472617562656C', -7292778713.676636, -6728132503.529593, 2805341768.7252483, 330416975.2300949);",
+"INSERT INTO super_becky VALUES (X'677265676172696F75735F696873616E', X'7374656C6C61725F686172746D616E', 8819210651.1988, 5298459883.813452, 7293544377.958424, 460475869.72971725), (X'696E736967687466756C5F62657765726E69747A', X'676C65616D696E675F64656E736C6F77', -6911957282.193239, 1754196756.2193146, -6316860403.693853, -3094020672.236368), (X'6D6972746866756C5F616D6265727261656B656C6C79', X'68756D6F726F75735F6772617665', 1785574023.0269203, -372056983.82761574, 4133719439.9538956, 9374053482.066044), (X'76697669645F736169747461', X'7761726D686561727465645F696E656469746173', 2787071361.6099434, 9663839418.553448, -5934098589.901047, -9774745509.608858), (X'61646570745F6F6375727279', X'6C696B61626C655F726569746D616E', -3098540915.1310825, 5460848322.672174, -6012867197.519758, 6769770087.661135), (X'696E646570656E64656E745F6F', X'656C6567616E745F726F6F726461', 1462542860.3143978, 3360904654.2464733, 5458876201.665213, -5522844849.529962), (X'72656D61726B61626C655F626F6B616E69', X'6F70656E5F6D696E6465645F686F72726F78', 7589481760.867031, 7970075121.546291, 7513467575.5213585, 9663061478.289227), (X'636F6E666964656E745F6C616479', X'70617373696F6E6174655F736B726F7A6974736B79', 8266917234.53915, -7172933478.625412, 309854059.94031143, -8309837814.497616);",
+"DELETE FROM super_becky WHERE (competitive_petit != 8725256604.165474 OR engrossing_rexroth > -3607424615.7839313 OR plucky_chai < X'726F7573696E675F6216E20375');",
+"INSERT INTO super_becky VALUES (X'7368696E696E675F736F6C69646169726573', X'666561726C6573735F63617264616E', -170727879.20838165, 2744601113.384678, 5676912434.941502, 6757573601.657997), (X'636F75726167656F75735F706C616E636865', X'696E646570656E64656E745F636172736F6E', -6271723086.761938, -180566679.7470188, -1285774632.134449, 1359665735.7842407), (X'677265676172696F75735F7374616D61746F76', X'7374756E6E696E675F77696C64726F6F7473', -6210238866.953484, 2492683045.8287067, -9688894361.68205, 5420275482.048567), (X'696E646570656E64656E745F6F7267616E697A6572', X'676C6974746572696E675F736F72656C', 9291163783.3073, -6843003475.769236, -1320245894.772686, -5023483808.044955), (X'676C6F77696E675F6E65736963', X'676C65616D696E675F746F726D6579', 829526382.8027191, 9365690945.1316, 4761505764.826195, -4149154965.0024815), (X'616C6C7572696E675F646F637472696E65', X'6E6963655F636C6561766572', 3896644979.981762, -288600448.8016701, 9462856570.130062, -909633752.5993862);",
         ];
 
         for query in queries {
@@ -13326,7 +14017,7 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13412,7 +14103,7 @@ mod tests {
                     0,
                     &record,
                     4096,
-                    conn.pager.load().clone(),
+                    &conn.pager.load(),
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13663,7 +14354,7 @@ mod tests {
                     cell_idx as usize,
                     &record,
                     pager.usable_space(),
-                    pager.clone(),
+                    &pager,
                     &mut fill_cell_payload_state,
                 )
             },
@@ -13818,7 +14509,7 @@ mod tests {
             let (pager, root_a, _db, _conn) = empty_btree();
             let page_b = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             btree_init_page(&page_b, PageType::TableLeaf, 0, pager.usable_space());
-            let root_b = page_b.get().id as i64;
+            let root_b = page_b.get().id() as i64;
 
             let cursor_a = make_registered_cursor(&pager, root_a, 1);
             let cursor_b = make_registered_cursor(&pager, root_b, 1);
@@ -13978,6 +14669,66 @@ mod tests {
                 Some(6),
                 "next() after peer deletion of our row must land on the next-greater rowid"
             );
+        }
+
+        #[test]
+        fn record_payload_restores_after_peer_insert() {
+            for size in [16, 6000] {
+                let (pager, root_page, _db, _conn) = empty_btree();
+                let mut writer = make_registered_cursor(&pager, root_page, 1);
+                let mut reader = make_registered_cursor(&pager, root_page, 1);
+                let value = Value::Blob(crate::alloc::vec![b'x'; size]);
+                let expected =
+                    ImmutableRecord::from_registers(&[Register::Value(value.clone())], 1).unwrap();
+                insert_record(&mut writer, &pager, 5, value).unwrap();
+                run_until_done(|| reader.rewind(), pager.deref()).unwrap();
+
+                for rowid in [1, 2] {
+                    insert_record(&mut writer, &pager, rowid, Value::from_i64(rowid)).unwrap();
+                    assert!(reader.needs_restore());
+                    // The second read exercises the remembered location or overflow buffer.
+                    for _ in 0..2 {
+                        let payload = run_until_done(
+                            || {
+                                Ok(reader
+                                    .record_payload()?
+                                    .map(|payload| payload.map(<[u8]>::to_vec)))
+                            },
+                            pager.deref(),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(payload, expected.get_payload());
+                        assert!(!reader.needs_restore());
+                    }
+                }
+
+                insert_record(&mut writer, &pager, 3, Value::from_i64(3)).unwrap();
+                assert!(reader.needs_restore());
+                reader.set_null_flag(true);
+                let restored = run_until_done(
+                    || {
+                        Ok(reader
+                            .record_payload()?
+                            .map(|payload| payload.map(<[u8]>::to_vec)))
+                    },
+                    pager.deref(),
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(restored, expected.get_payload());
+                assert!(!reader.needs_restore());
+                assert!(!reader.get_null_flag());
+
+                reader.set_null_flag(true);
+                let missing = run_until_done(
+                    || Ok(reader.record_payload()?.map(|payload| payload.is_none())),
+                    pager.deref(),
+                )
+                .unwrap();
+                assert!(missing);
+                assert!(!reader.needs_restore());
+            }
         }
 
         #[test]
@@ -14661,5 +15412,63 @@ mod tests {
                 defragment_page(contents, PAGE_SIZE, 4).is_err()
             }
         }
+    }
+
+    /// `next()` past the last row must leave the cursor exactly on the
+    /// append slot the MVCC checkpoint's sequential-write optimization
+    /// inserts into: end of the rightmost leaf, one past the last cell,
+    /// with no ancestor holding a child to the right. The tree is grown
+    /// past one leaf so the predicate has ancestors to check.
+    #[test]
+    fn next_past_the_last_row_lands_on_the_rightmost_leaf_append_slot() {
+        let (pager, root_page, _db, _conn) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        let cursor = &mut cursor;
+
+        let payload = crate::alloc::vec![b'X'; 512];
+        let regs = &[Register::Value(Value::Blob(payload))];
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+
+        for rowid in 1..=64 {
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }),
+                pager.deref(),
+            )
+            .unwrap();
+            let key = BTreeKey::new_table_rowid(rowid, Some(&record));
+            run_until_done(|| cursor.insert(&key), pager.deref()).unwrap();
+        }
+
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        assert!(
+            !cursor.is_at_end_of_rightmost_leaf(),
+            "a cursor on the first row is not at the append slot"
+        );
+
+        let mut rows = 0;
+        while cursor.has_record {
+            rows += 1;
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        }
+        assert_eq!(rows, 64);
+        assert!(
+            cursor.is_at_end_of_rightmost_leaf(),
+            "next() past the last row must land on the append slot"
+        );
+
+        // Inserting the next consecutive rowid at that position must append.
+        let key = BTreeKey::new_table_rowid(65, Some(&record));
+        run_until_done(|| cursor.insert(&key), pager.deref()).unwrap();
+
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+        let mut rowids = crate::alloc::vec![];
+        while cursor.has_record {
+            let rowid = run_until_done(|| cursor.rowid(), pager.deref())
+                .unwrap()
+                .unwrap();
+            rowids.push(rowid);
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+        }
+        assert_eq!(rowids, (1..=65).collect::<Vec<i64>>());
     }
 }

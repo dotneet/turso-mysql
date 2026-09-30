@@ -64,6 +64,8 @@ pub enum LimboError {
     UnsupportedDatabaseDialectMarker { marker: u32 },
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("{0}")]
+    IoBackendUnavailable(String),
     /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
     /// e.g. ALTER TABLE validation or window-function argument checks.
     /// Displayed bare, like sqlite3_errmsg. Kept distinct from `Constraint`
@@ -72,8 +74,10 @@ pub enum LimboError {
     SqlError(String),
     #[error(transparent)]
     CacheError(#[from] CacheError),
-    #[error("Database is full: {0}")]
-    DatabaseFull(String),
+    #[error("database or disk is full")]
+    DatabaseFull,
+    #[error("nextval: reached {} value of sequence \"{name}\"", sequence_bound(.ascending))]
+    SequenceExhausted { name: String, ascending: bool },
     #[error("Parse error: {0}")]
     ParseError(String),
     /// Boxed: the parser error is ~96 bytes inline and would dominate
@@ -151,7 +155,7 @@ pub enum LimboError {
     TooBig,
     #[error("database table is locked")]
     TableLocked,
-    #[error("Error: Resource is read-only")]
+    #[error("attempt to write a readonly database")]
     ReadOnly,
     #[error("Database is busy")]
     Busy,
@@ -262,7 +266,7 @@ impl LimboError {
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
             Self::Corrupt(_) => 11,
-            Self::DatabaseFull(_) => 13,
+            Self::DatabaseFull | Self::SequenceExhausted { .. } => 13,
             Self::SchemaUpdated | Self::SchemaConflict => 17,
             Self::TooBig => 18,
             Self::NotADB
@@ -285,6 +289,14 @@ impl LimboError {
             Self::Raise(resolve_type, _) => *resolve_type == turso_parser::ast::ResolveType::Fail,
             _ => false,
         }
+    }
+}
+
+fn sequence_bound(ascending: &bool) -> &'static str {
+    if *ascending {
+        "maximum"
+    } else {
+        "minimum"
     }
 }
 

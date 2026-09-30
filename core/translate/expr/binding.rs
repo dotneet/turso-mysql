@@ -59,15 +59,23 @@ pub(super) fn resolve_qualified_on_ref(
         }));
     }
 
-    if let Table::BTree(btree) = table {
-        if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
-            if !btree.has_rowid {
-                return Err(crate::LimboError::NoSuchColumn {
-                    name: normalized_id.to_string(),
-                });
+    match table {
+        Table::BTree(btree) => {
+            if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
+                if !btree.has_rowid {
+                    return Err(crate::LimboError::NoSuchColumn {
+                        name: normalized_id.to_string(),
+                    });
+                }
+                return Ok(Some(QualifiedMatch::RowId));
             }
-            return Ok(Some(QualifiedMatch::RowId));
         }
+        Table::Virtual(_) => {
+            if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
+                return Ok(Some(QualifiedMatch::RowId));
+            }
+        }
+        _ => {}
     }
 
     Ok(None)
@@ -158,6 +166,15 @@ pub fn bind_and_rewrite_expr<'a>(
                                         name: id.as_str().to_string(),
                                     });
                                 }
+                                *expr = row_id_expr;
+                                return Ok(WalkControl::Continue);
+                            }
+                        } else if let Table::Virtual(_) = &joined_table.table {
+                            if let Some(row_id_expr) =
+                                parse_row_id(&normalized_id, joined_tables[0].internal_id, || {
+                                    joined_tables.len() != 1
+                                })?
+                            {
                                 *expr = row_id_expr;
                                 return Ok(WalkControl::Continue);
                             }

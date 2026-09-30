@@ -351,13 +351,19 @@ fn finalize_vacuum_target_header(
 ) -> crate::types::IOResultOr<()> {
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
-        return mv_store
-            .with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())
-            .map(crate::IOResult::Done)
-            .map_err(Into::into);
+        mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
+        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+        return Ok(crate::IOResult::Done(()));
     }
     let pager = target_conn.pager.load();
     pager.with_header_mut(|header| header_meta.apply_to(header))
+}
+
+fn set_mvcc_schema_version_from_header_cookie(
+    target_conn: &Arc<Connection>,
+    schema_cookie: u32,
+) -> Result<()> {
+    target_conn.with_schema_mut(|schema| schema.schema_version = schema_cookie)
 }
 
 /// Finish a VACUUM INTO output database with durable on-disk state.
@@ -2083,12 +2089,12 @@ fn vacuum_in_place_step(
                     turso_assert!(
                         page.is_loaded(),
                         "VACUUM read batch page must be loaded before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                     turso_assert!(
                         !page.is_locked(),
                         "VACUUM read batch page lock leaked before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                 }
                 let all_read = *next_page > *total_pages;
@@ -2656,7 +2662,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 42);
         assert_eq!(runs[0].1.len(), 1);
-        assert_eq!(runs[0].1[0].get().id, 1);
+        assert_eq!(runs[0].1[0].get().id(), 1);
     }
 
     #[test]
@@ -2675,12 +2681,12 @@ mod tests {
         assert_eq!(runs[0].0, 10);
         assert_eq!(runs[0].1.len(), 3);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(runs[1].0, 14);
         assert_eq!(runs[1].1.len(), 1);
-        assert_eq!(runs[1].1[0].get().id, 4);
+        assert_eq!(runs[1].1[0].get().id(), 4);
     }
 
     #[test]
@@ -2736,7 +2742,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 10);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![2, 3, 1, 4]
         );
     }
@@ -3241,6 +3247,62 @@ mod tests {
             header,
             (42, CacheSize::new(321), TextEncoding::Utf8, 17, 29)
         );
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.db");
+        let target_path = target_path.to_str().unwrap();
+        let target_db = Database::open_file_with_flags(
+            io,
+            target_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let target_conn = target_db.connect()?;
+        target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        target_conn.wal_auto_actions_disable();
+
+        target_conn.execute("BEGIN IMMEDIATE")?;
+        target_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        target_conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+
+        let mut source_header = DatabaseHeader::default();
+        source_header.schema_cookie = 41.into();
+        source_header.user_version = 17.into();
+        source_header.application_id = 29.into();
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
+
+        match finalize_vacuum_target_header(&target_conn, &header_meta)? {
+            crate::IOResult::Done(()) => {}
+            crate::IOResult::IO(_) => panic!("MVCC header update should not need async I/O"),
+        }
+        target_conn.execute("COMMIT")?;
+        target_conn.checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+
+        let pager = target_conn.pager.load();
+        let on_disk = pager.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.schema_cookie.get(),
+                    header.user_version.get(),
+                    header.application_id.get(),
+                )
+            })
+        })?;
+        assert_eq!(on_disk, (42, 17, 29));
+
+        let schema_version = target_conn.pragma_query("schema_version")?;
+        assert_eq!(schema_version, vec![vec![crate::Value::from_i64(42)]]);
 
         Ok(())
     }
