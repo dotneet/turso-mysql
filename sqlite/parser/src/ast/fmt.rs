@@ -103,6 +103,11 @@ impl<T: Write> TokenStream for WriteTokenStream<'_, T> {
             }
         }
     }
+
+    fn append_attached(&mut self, ty: TokenType, value: Option<&str>) -> fmt::Result {
+        self.spaced = true;
+        self.append(ty, value)
+    }
 }
 
 pub struct BlankContext;
@@ -116,6 +121,12 @@ pub trait TokenStream {
 
     /// Push token to this stream
     fn append(&mut self, ty: TokenType, value: Option<&str>) -> Result<(), Self::Error>;
+
+    /// Push a token written against the one before it, with no space between,
+    /// as the `(` of `VARCHAR(10)`.
+    fn append_attached(&mut self, ty: TokenType, value: Option<&str>) -> Result<(), Self::Error> {
+        self.append(ty, value)
+    }
 
     /// Interspace iterator with commas
     fn comma<I, C: ToSqlContext>(&mut self, items: I, context: &C) -> Result<(), Self::Error>
@@ -2481,7 +2492,9 @@ impl ToTokens for Type {
     ) -> Result<(), S::Error> {
         s.append(TK_ID, Some(&self.name))?;
         if let Some(ref size) = self.size {
-            s.append(TK_LP, None)?;
+            // SQLite stores `VARCHAR(10)` as written, and a schema rebuilt from
+            // the AST should read the same.
+            s.append_attached(TK_LP, None)?;
             size.to_tokens(s, context)?;
             s.append(TK_RP, None)?;
         }

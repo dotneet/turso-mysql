@@ -85,7 +85,7 @@ test alter-table-keeps-declared-type-sizes {
     SELECT sql FROM sqlite_schema;
 }
 expect {
-    CREATE TABLE t (a VARCHAR (8), b DECIMAL (10, 2), c INT)
+    CREATE TABLE t (a VARCHAR(8), b DECIMAL(10, 2), c INT)
 }
 
 test fail-alter-column-primary-key {
