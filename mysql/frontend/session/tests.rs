@@ -4302,6 +4302,59 @@ fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result
 }
 
 #[test]
+fn kept_statements_are_not_run_on_a_closed_connection() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-kept-after-close.db", [0x5d; 16])?;
+    connection.execute(
+        "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, u INT UNIQUE)",
+    )?;
+    let named = connection
+        .prepare_checked_statement("INSERT INTO records (id, u) VALUES (?, ?)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    for (id, u) in [(1, 1), (2, 2)] {
+        connection.execute_transaction_command("BEGIN").unwrap();
+        connection
+            .execute_checked_write(
+                &format!("INSERT INTO records (u) VALUES ({})", u + 10),
+                None,
+            )
+            .unwrap();
+        connection.execute_transaction_command("COMMIT").unwrap();
+        connection
+            .execute_checked_write(&format!("DELETE FROM records WHERE u = {}", u + 10), None)
+            .unwrap();
+        connection
+            .execute_prepared_statement(
+                named.statement_id,
+                &[
+                    MySqlPreparedValue::Integer(id),
+                    MySqlPreparedValue::Integer(u),
+                ],
+                None,
+                MySqlAffectedRowsMode::Changed,
+            )
+            .unwrap();
+    }
+    connection.inner().close()?;
+    assert!(connection.execute_transaction_command("BEGIN").is_err());
+    assert!(connection
+        .execute_checked_write("INSERT INTO records (u) VALUES (30)", None)
+        .is_err());
+    assert!(connection
+        .execute_prepared_statement(
+            named.statement_id,
+            &[
+                MySqlPreparedValue::Integer(1),
+                MySqlPreparedValue::Integer(1)
+            ],
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+        .is_err());
+    Ok(())
+}
+
+#[test]
 fn kept_statements_still_run_after_a_rollback_to_a_savepoint_and_a_new_table() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-kept-after-savepoints.db", [0x5c; 16])?;

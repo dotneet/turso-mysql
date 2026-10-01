@@ -3733,7 +3733,7 @@ impl MySqlConnection {
                     .inject_row_ids(&reserved.ids)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
                 self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
-                    let reusable = stamped.is_empty();
+                    let reusable = stamped.is_empty() && !self.inner.is_closed();
                     let last = reusable
                         .then(|| {
                             insert
@@ -4269,15 +4269,16 @@ impl MySqlConnection {
         sql: &str,
     ) -> std::result::Result<(), MySqlQueryError> {
         const KEPT_TRANSACTION_STATEMENTS: usize = 8;
-        let keepable = matches!(
-            statement,
-            Stmt::Begin { .. }
-                | Stmt::Commit { .. }
-                | Stmt::Rollback {
-                    savepoint_name: None,
-                    ..
-                }
-        );
+        let keepable = !self.inner.is_closed()
+            && matches!(
+                statement,
+                Stmt::Begin { .. }
+                    | Stmt::Commit { .. }
+                    | Stmt::Rollback {
+                        savepoint_name: None,
+                        ..
+                    }
+            );
         if !keepable {
             return self
                 .inner
@@ -10975,6 +10976,9 @@ impl MySqlConnection {
         &self,
         sql: &'static str,
     ) -> std::result::Result<(), MySqlQueryError> {
+        if self.inner.is_closed() {
+            return self.run_internal(sql);
+        }
         let prepared = self
             .prepared_counted_rows_savepoints
             .lock()
