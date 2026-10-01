@@ -53,8 +53,9 @@ fn run(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>, sql:
 
 fn n_of(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>, id: i64) -> String {
     let sql = format!("SELECT n FROM c WHERE id = {id}");
-    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(&sql) else {
-        panic!("{sql} must return a result set");
+    let outcome = adapter.execute_query(&sql);
+    let Ok(CommandExecutionResult::ResultSet(result)) = outcome else {
+        panic!("{sql} must return a result set: {outcome:?}");
     };
     String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
 }
@@ -92,6 +93,33 @@ fn repeatable_read_keeps_its_snapshot_and_gives_up_a_stale_write_with_1213() {
     assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
     assert_eq!(n_of(&mut one, 2), "5");
     run(&mut one, "UPDATE c SET n = 7 WHERE id = 1");
+    assert_eq!(n_of(&mut two, 1), "7");
+}
+
+/// Measured on MySQL 8.4.11: a transaction that read one table writes it
+/// after another session committed a row into a second table, and goes on
+/// reading the second table as its first read found it (no rows). Here the
+/// write goes ahead too, because nothing the transaction read changed; it
+/// then reads the row, as a transaction begun after that commit would.
+#[test]
+fn repeatable_read_writes_after_another_session_committed_to_a_table_it_did_not_read() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "CREATE TABLE d (id INT NOT NULL PRIMARY KEY)");
+
+    run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
+    run(&mut two, "INSERT INTO d (id) VALUES (1)");
+    run(&mut one, "UPDATE c SET n = 7 WHERE id = 1");
+    let Ok(CommandExecutionResult::ResultSet(result)) = one.execute_query("SELECT COUNT(*) FROM d")
+    else {
+        panic!("the count must read back");
+    };
+    assert_eq!(result.rows[0][0].as_deref(), Some(&b"1"[..]));
+    run(&mut one, "COMMIT");
     assert_eq!(n_of(&mut two, 1), "7");
 }
 

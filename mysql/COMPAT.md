@@ -4943,11 +4943,12 @@ level is used up by the next transaction that begins — `START TRANSACTION`, or
 statement reading a table, which is a transaction of its own — but not by
 `SELECT 1` or by a statement that fails. `SERIALIZABLE` is taken and kept the
 way `REPEATABLE READ` is, which already gives it: every write waits for the one
-write lock and is given up with 1213 when another session committed since the
-transaction's snapshot, so the transactions that write run as if one after
-another in the order they commit, and one that only reads sees the database as
-one of them left it. MySQL keeps it with locks instead — each read takes a
-shared lock — and gets to the same place: measured on 8.4.11, two
+write lock and is given up with 1213 when another session committed, since the
+transaction's snapshot, a change to a page the transaction read, so the
+transactions that write run as if one after another in the order they commit,
+and one that only reads sees the database as one of them left it. MySQL keeps
+it with locks instead — each read takes a shared lock — and gets to the same
+place: measured on 8.4.11, two
 `SERIALIZABLE` transactions that each read two rows and then write the one the
 other did not end with the first committed and the second answered 1213, and so
 they do here. Where MySQL makes a writer wait for a reader to finish, this
@@ -4969,9 +4970,21 @@ write fails instead. The transaction is rolled back and answered with 1213,
 SQLSTATE 40001 — what MySQL answers for a transaction it has to give up on,
 rolling it back the same way — and a client that retries a transaction on 1213
 or 40001 recovers by running it again. Prisma reports it as P2034 and leaves
-the retry to the application. It happens only when another session committed
+the retry to the application. It happens only when another session committed,
 between the transaction's first read, by an earlier statement, and its first
-write.
+write, a change to a page of the database file the transaction read: a row
+stored beside one it read, an index entry beside one it looked up, the table's
+definition, or the file's header, which also changes when the file grows or
+shrinks. A commit that changed none of them leaves everything the transaction
+read as it would read it after that commit, so the write goes ahead as if the
+transaction had begun after it. Measured on 8.4.11, a transaction that read
+one table writes it after another session inserted a row into a second table,
+and so it does here. What differs is the second table afterwards: MySQL goes
+on reading it as the transaction's first read found it, without the row, while
+here the transaction, now placed after that commit, reads the row. With
+sysbench's `oltp_read_write` (100,000 rows, eight sessions, where each commit
+changes a few of a few thousand pages but often a hot one) this took the share
+of attempts given up with 1213 from 88% to 80%.
 
 What is not a read here does not start the snapshot either. Preparing a
 statement reads this server's own catalog and not the tables, and MySQL takes

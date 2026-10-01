@@ -1632,6 +1632,10 @@ impl MySqlConnection {
         // out. The engine waits the same way for the one write lock it holds
         // over the database, so the wait is set to the one MySQL starts with.
         inner.set_busy_timeout(Self::DEFAULT_LOCK_WAIT);
+        // A transaction that read and then writes is given up with 1213 only
+        // when another session's commit changed a page it read; see
+        // `Connection::set_write_after_unrelated_commits`.
+        inner.set_write_after_unrelated_commits(true);
         // MySQL's InnoDB enforces a foreign key, and the engine enforces one
         // only with this on. Left off, a `FOREIGN KEY` written by a client is
         // stored and never checked, which is a guarantee handed over and not
