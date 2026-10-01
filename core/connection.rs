@@ -2202,6 +2202,14 @@ impl Connection {
         Ok((db, encryption_opts))
     }
 
+    /// Lets a transaction that read before other connections committed
+    /// still write when none of their commits changed a page it read, rather
+    /// than failing with `BusySnapshot`. Off by default, as in SQLite. Applies
+    /// to the main database in WAL mode.
+    pub fn set_write_after_unrelated_commits(&self, allow: bool) {
+        self.get_pager().set_tracks_pages_read(allow);
+    }
+
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
         self.fk_pragma.store(enable, Ordering::Release);
         self.bump_prepare_context_generation();

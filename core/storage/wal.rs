@@ -650,6 +650,19 @@ pub trait Wal: Debug + Send + Sync {
     /// externally (e.g. the sync engine) pass an empty set to opt out.
     fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()>;
 
+    /// Begins a write transaction like [`Wal::begin_write_tx`], except that
+    /// when other connections committed since this one's snapshot without
+    /// writing any page in `pages_read`, the snapshot moves forward to their
+    /// last commit instead of failing with `BusySnapshot`. Returns whether it
+    /// moved, in which case pages cached from the old snapshot may be stale.
+    fn begin_write_tx_after_reads(
+        &self,
+        allowed_auto_actions: WalAutoActions,
+        _pages_read: &roaring::RoaringBitmap,
+    ) -> Result<bool> {
+        self.begin_write_tx(allowed_auto_actions).map(|()| false)
+    }
+
     /// End a read transaction.
     fn end_read_tx(&self);
 
@@ -3549,79 +3562,18 @@ impl Wal for WalFile {
         }
     }
 
-    /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self, allowed_auto_actions: WalAutoActions) -> Result<()> {
-        tracing::debug!("begin_write_tx");
-        let begin_write_result: Result<()> = {
-            // sqlite/src/wal.c 3702
-            // Cannot start a write transaction without first holding a read
-            // transaction.
-            // assert(pWal->readLock >= 0);
-            // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
-            turso_assert!(
-                self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
-                "must have a read transaction to begin a write transaction"
-            );
-            turso_assert!(
-                !self.holds_write_lock(),
-                "write lock already held by this connection"
-            );
-            self.note_lock_releases_before_trying();
-            if !self.coordination.try_begin_write_tx() {
-                return Err(LimboError::Busy);
-            }
-            let db_changed =
-                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
-            if db_changed {
-                // Snapshot is stale, give up and let caller retry from scratch.
-                // Return BusySnapshot instead of Busy so the caller knows it must
-                // restart the read transaction to get a fresh snapshot.
-                // Retrying with busy_timeout will NEVER HELP.
-                tracing::debug!(
-                    "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
-                    self.max_frame.load(Ordering::Acquire),
-                    self.load_coordination_snapshot().max_frame
-                );
-                self.coordination.end_write_tx();
-                return Err(LimboError::BusySnapshot);
-            }
+        self.begin_write_tx_unless_reads_changed(allowed_auto_actions, None)
+            .map(|_| ())
+    }
 
-            Ok(())
-        };
-        begin_write_result?;
-        if self
-            .write_lock_held
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.coordination.end_write_tx();
-            turso_assert!(
-                false,
-                "begin_write_tx called while write lock already held according to connection state"
-            );
-        }
-
-        if !allowed_auto_actions.contains(WalAutoActions::Restart) {
-            return Ok(());
-        }
-
-        let result = self.try_restart_log_before_write();
-        if let Err(LimboError::Busy) | Ok(()) = &result {
-            // it's fine if we were unable to restart WAL file due to Busy errors
-            return Ok(());
-        }
-
-        // don't forget to release the write-lock if
-        self.coordination.end_write_tx();
-        turso_assert!(
-            self.write_lock_held
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "end_write_tx called while write lock not held according to connection state"
-        );
-
-        Err(result.expect_err("Ok case handled above"))
+    fn begin_write_tx_after_reads(
+        &self,
+        allowed_auto_actions: WalAutoActions,
+        pages_read: &roaring::RoaringBitmap,
+    ) -> Result<bool> {
+        self.begin_write_tx_unless_reads_changed(allowed_auto_actions, Some(pages_read))
     }
 
     /// End a write transaction
@@ -4906,6 +4858,126 @@ impl WalFile {
             io_ctx: RwLock::new(IOContext::default()),
             dirty: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn begin_write_tx_unless_reads_changed(
+        &self,
+        allowed_auto_actions: WalAutoActions,
+        pages_read: Option<&roaring::RoaringBitmap>,
+    ) -> Result<bool> {
+        tracing::debug!("begin_write_tx");
+        let mut snapshot_moved = false;
+        let begin_write_result: Result<()> = {
+            // sqlite/src/wal.c 3702
+            // Cannot start a write transaction without first holding a read
+            // transaction.
+            // assert(pWal->readLock >= 0);
+            // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
+            turso_assert!(
+                self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
+                "must have a read transaction to begin a write transaction"
+            );
+            turso_assert!(
+                !self.holds_write_lock(),
+                "write lock already held by this connection"
+            );
+            self.note_lock_releases_before_trying();
+            if !self.coordination.try_begin_write_tx() {
+                return Err(LimboError::Busy);
+            }
+            let db_changed =
+                self.db_changed_against(self.load_coordination_snapshot(), self.connection_state());
+            if db_changed
+                && pages_read
+                    .is_some_and(|pages_read| self.move_snapshot_past_unrelated_commits(pages_read))
+            {
+                snapshot_moved = true;
+            } else if db_changed {
+                // Snapshot is stale, give up and let caller retry from scratch.
+                // Return BusySnapshot instead of Busy so the caller knows it must
+                // restart the read transaction to get a fresh snapshot.
+                // Retrying with busy_timeout will NEVER HELP.
+                tracing::debug!(
+                    "unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}",
+                    self.max_frame.load(Ordering::Acquire),
+                    self.load_coordination_snapshot().max_frame
+                );
+                self.coordination.end_write_tx();
+                return Err(LimboError::BusySnapshot);
+            }
+
+            Ok(())
+        };
+        begin_write_result?;
+        if self
+            .write_lock_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.coordination.end_write_tx();
+            turso_assert!(
+                false,
+                "begin_write_tx called while write lock already held according to connection state"
+            );
+        }
+
+        if !allowed_auto_actions.contains(WalAutoActions::Restart) {
+            return Ok(snapshot_moved);
+        }
+
+        let result = self.try_restart_log_before_write();
+        if let Err(LimboError::Busy) | Ok(()) = &result {
+            // it's fine if we were unable to restart WAL file due to Busy errors
+            return Ok(snapshot_moved);
+        }
+
+        // don't forget to release the write-lock if
+        self.coordination.end_write_tx();
+        turso_assert!(
+            self.write_lock_held
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "end_write_tx called while write lock not held according to connection state"
+        );
+
+        Err(result.expect_err("Ok case handled above"))
+    }
+
+    /// Runs while this connection holds the write lock, so no other connection can commit meanwhile.
+    fn move_snapshot_past_unrelated_commits(&self, pages_read: &roaring::RoaringBitmap) -> bool {
+        let local = self.connection_state();
+        let shared = self.load_coordination_snapshot();
+        if shared.checkpoint_seq != local.snapshot.checkpoint_seq
+            || shared.max_frame < local.snapshot.max_frame
+        {
+            return false;
+        }
+        if self
+            .coordination
+            .ensure_local_frame_cache_covers(&self.io, shared)
+            .is_err()
+        {
+            return false;
+        }
+        let first_new_frame = local.snapshot.max_frame + 1;
+        let written_since = |page: u64| {
+            first_new_frame <= shared.max_frame
+                && self
+                    .coordination
+                    .find_frame(page, first_new_frame, shared.max_frame, None)
+                    .is_some()
+        };
+        if written_since(DatabaseHeader::PAGE_ID as u64)
+            || pages_read.iter().any(|page| written_since(u64::from(page)))
+        {
+            return false;
+        }
+        let Some(read_guard) = self.coordination.try_begin_read_tx(shared) else {
+            return false;
+        };
+        self.coordination.end_read_tx(local.read_guard);
+        self.install_connection_state(WalConnectionState::new(shared, read_guard));
+        true
     }
 
     fn note_lock_releases_before_trying(&self) {

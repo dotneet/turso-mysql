@@ -5041,7 +5041,13 @@ pub fn op_transaction_inner(
                             !conn.is_nested_stmt(),
                             "nested stmt should not begin a new write transaction"
                         );
-                        let begin_w_tx_res = pager.begin_write_tx(conn.wal_auto_actions());
+                        let begin_w_tx_res = if pager.tracks_pages_read()
+                            && conn.n_active_root_statements.load(Ordering::SeqCst) <= 1
+                        {
+                            pager.begin_write_tx_after_reads(conn.wal_auto_actions())
+                        } else {
+                            pager.begin_write_tx(conn.wal_auto_actions())
+                        };
                         if matches!(
                             &begin_w_tx_res,
                             Err(err) if matches!(**err, LimboError::Busy | LimboError::BusySnapshot)

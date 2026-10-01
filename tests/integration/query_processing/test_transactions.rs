@@ -211,6 +211,121 @@ fn test_blocking_writer_wakes_when_the_write_lock_is_released(tmp_db: TempDataba
     assert_eq!(rows, vec![(2 * waits.len() as i64,)]);
 }
 
+fn two_tables_and_a_reader_of_the_first(
+    tmp_db: &TempDatabase,
+    allow: bool,
+) -> (Arc<Connection>, Arc<Connection>) {
+    let writer = tmp_db.connect_limbo();
+    writer
+        .execute("CREATE TABLE first (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE second (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    writer.execute("INSERT INTO first VALUES (1, 'a')").unwrap();
+    writer
+        .execute("INSERT INTO second VALUES (1, 'a')")
+        .unwrap();
+    let reader = tmp_db.connect_limbo();
+    reader.set_write_after_unrelated_commits(allow);
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM second");
+    assert_eq!(rows, vec![(1,)]);
+    reader.execute("BEGIN").unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM first");
+    assert_eq!(rows, vec![(1,)]);
+    (writer, reader)
+}
+
+#[turso_macros::test]
+fn test_write_after_a_commit_that_changed_no_page_the_transaction_read(tmp_db: TempDatabase) {
+    let (writer, reader) = two_tables_and_a_reader_of_the_first(&tmp_db, true);
+    writer
+        .execute("INSERT INTO second VALUES (2, 'b')")
+        .unwrap();
+
+    reader.execute("INSERT INTO first VALUES (2, 'b')").unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM second");
+    assert_eq!(rows, vec![(2,)]);
+    reader.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64, i64)> =
+        writer.exec_rows("SELECT (SELECT COUNT(*) FROM first), (SELECT COUNT(*) FROM second)");
+    assert_eq!(rows, vec![(2, 2)]);
+    let rows: Vec<(String,)> = writer.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+}
+
+#[turso_macros::test]
+fn test_write_after_unrelated_commits_stays_off_by_default(tmp_db: TempDatabase) {
+    let (writer, reader) = two_tables_and_a_reader_of_the_first(&tmp_db, false);
+    writer
+        .execute("INSERT INTO second VALUES (2, 'b')")
+        .unwrap();
+
+    let result = reader.execute("INSERT INTO first VALUES (2, 'b')");
+    assert!(
+        matches!(result, Err(LimboError::BusySnapshot)),
+        "got {result:?}"
+    );
+}
+
+#[turso_macros::test]
+fn test_no_write_after_a_commit_that_changed_a_page_the_transaction_read(tmp_db: TempDatabase) {
+    let (writer, reader) = two_tables_and_a_reader_of_the_first(&tmp_db, true);
+    writer
+        .execute("UPDATE first SET value = 'changed' WHERE id = 1")
+        .unwrap();
+
+    let result = reader.execute("INSERT INTO second VALUES (2, 'b')");
+    assert!(
+        matches!(result, Err(LimboError::BusySnapshot)),
+        "got {result:?}"
+    );
+    reader.execute("ROLLBACK").unwrap();
+    let rows: Vec<(i64,)> = writer.exec_rows("SELECT COUNT(*) FROM second");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+#[turso_macros::test]
+fn test_no_write_after_a_commit_that_changed_the_schema(tmp_db: TempDatabase) {
+    let (writer, reader) = two_tables_and_a_reader_of_the_first(&tmp_db, true);
+    writer
+        .execute("CREATE TABLE third (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let result = reader.execute("INSERT INTO first VALUES (2, 'b')");
+    assert!(
+        matches!(result, Err(LimboError::BusySnapshot)),
+        "got {result:?}"
+    );
+}
+
+// Each transaction reads both rows and then changes the one the other did not
+// read last: whichever writes second must not commit, as that would be write
+// skew.
+#[turso_macros::test]
+fn test_write_skew_is_refused_when_writing_after_unrelated_commits(tmp_db: TempDatabase) {
+    let (writer, reader) = two_tables_and_a_reader_of_the_first(&tmp_db, true);
+    let other = tmp_db.connect_limbo();
+    other.set_write_after_unrelated_commits(true);
+    other.execute("BEGIN").unwrap();
+    let rows: Vec<(i64,)> = other.exec_rows("SELECT COUNT(*) FROM first");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(i64,)> = other.exec_rows("SELECT COUNT(*) FROM second");
+    assert_eq!(rows, vec![(1,)]);
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM second");
+    assert_eq!(rows, vec![(1,)]);
+
+    reader.execute("INSERT INTO first VALUES (2, 'b')").unwrap();
+    reader.execute("COMMIT").unwrap();
+    let result = other.execute("INSERT INTO second VALUES (2, 'b')");
+    assert!(
+        matches!(result, Err(LimboError::BusySnapshot)),
+        "got {result:?}"
+    );
+    drop(writer);
+}
+
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
 //
 // 1. Both transactions T1 and T2 start at the same time.

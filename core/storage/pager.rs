@@ -1601,6 +1601,12 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
+    /// Set by a connection that lets a transaction write after commits that
+    /// changed none of the pages it read; see [`Pager::begin_write_tx_after_reads`].
+    tracks_pages_read: AtomicBool,
+    /// The pages read since the current read transaction began, while
+    /// `tracks_pages_read` is set.
+    pages_read: RwLock<RoaringBitmap>,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
@@ -1915,6 +1921,8 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
+            tracks_pages_read: AtomicBool::new(false),
+            pages_read: RwLock::new(RoaringBitmap::new()),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
@@ -3287,6 +3295,9 @@ impl Pager {
             return Ok(());
         };
         let changed = wal.begin_read_tx()?;
+        if self.tracks_pages_read.load(Ordering::Relaxed) {
+            self.pages_read.write().clear();
+        }
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -3340,6 +3351,49 @@ impl Pager {
         // the positions belong to the current WAL generation.
         self.materialize_savepoint_wal_positions();
         Ok(IOResult::Done(()))
+    }
+
+    /// Begins a write transaction, and when other connections committed
+    /// since this connection's snapshot without writing a page it read in
+    /// this transaction, moves the snapshot past their commits rather than
+    /// failing with `BusySnapshot`. Every read it made would read the same
+    /// bytes at the newer snapshot, so the transaction is the same as one
+    /// that began there.
+    pub fn begin_write_tx_after_reads(
+        &self,
+        allowed_auto_actions: WalAutoActions,
+    ) -> IOResultOr<()> {
+        turso_assert!(
+            self.tracks_pages_read.load(Ordering::Relaxed),
+            "the pages a transaction read are known only while the pager tracks them"
+        );
+        return_if_io!(self.maybe_allocate_page1());
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok(IOResult::Done(()));
+        };
+        let moved =
+            wal.begin_write_tx_after_reads(allowed_auto_actions, &self.pages_read.read())?;
+        if moved {
+            self.clear_page_cache(false);
+            self.set_schema_cookie(None);
+        }
+        self.materialize_savepoint_wal_positions();
+        Ok(IOResult::Done(()))
+    }
+
+    /// Makes this pager remember the pages each read transaction reads, which
+    /// [`Pager::begin_write_tx_after_reads`] needs.
+    pub fn set_tracks_pages_read(&self, tracks: bool) {
+        turso_assert!(
+            !self.holds_read_lock(),
+            "the pages a transaction reads must be tracked from its first read"
+        );
+        self.tracks_pages_read.store(tracks, Ordering::Relaxed);
+        self.pages_read.write().clear();
+    }
+
+    pub fn tracks_pages_read(&self) -> bool {
+        self.tracks_pages_read.load(Ordering::Relaxed)
     }
 
     /// Fill in the WAL position of savepoints opened before this write
@@ -3630,6 +3684,9 @@ impl Pager {
     ) -> Result<(PageRef, Completion)> {
         turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
+        if self.tracks_pages_read.load(Ordering::Relaxed) {
+            self.pages_read.write().insert(page_idx as u32);
+        }
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
         let Some(wal) = self.wal.as_ref() else {
@@ -3700,6 +3757,9 @@ impl Pager {
             "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug"
         );
         tracing::debug!("read_page_nonblock(page_idx = {})", page_idx);
+        if self.tracks_pages_read.load(Ordering::Relaxed) {
+            self.pages_read.write().insert(page_idx as u32);
+        }
         #[cfg(test)]
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
