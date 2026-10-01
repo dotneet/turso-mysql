@@ -1710,3 +1710,29 @@ fn commit_is_prepared_and_begin_answers_1295() {
         .unwrap();
     assert_eq!(rows(&mut adapter, "SELECT v FROM t"), vec![some(&["7"])]);
 }
+
+/// An insert into a counted table reads the table's definition, which once
+/// parsed its stored DDL each time — about a fifth of the server's time in
+/// sysbench's `oltp_insert`. The definition is read once for each text.
+#[test]
+fn an_insert_into_a_counted_table_parses_its_definition_once() {
+    let (_directory, mut adapter) = adapter();
+    let definition = "CREATE TABLE sbtest1(\n  id INTEGER NOT NULL AUTO_INCREMENT,\n  k INTEGER DEFAULT '0' NOT NULL,\n  c CHAR(120) DEFAULT '' NOT NULL,\n  pad CHAR(60) DEFAULT '' NOT NULL,\n  PRIMARY KEY (id)\n) /*! ENGINE = innodb */ ";
+    run(&mut adapter, definition);
+    let insert = "INSERT INTO sbtest1 (id, k, c, pad) VALUES (0, 1, 'a', 'b')";
+    run(&mut adapter, insert);
+    let before = turso_mysql_parser::bytes_read();
+    run(&mut adapter, insert);
+    let after = turso_mysql_parser::bytes_read();
+    let parsed = after.parsed - before.parsed;
+    assert!(
+        parsed < definition.len(),
+        "the insert parsed {parsed} bytes, its own text being {} and the definition {}",
+        insert.len(),
+        definition.len()
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM sbtest1"),
+        vec![some(&["1"]), some(&["2"])]
+    );
+}

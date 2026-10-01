@@ -13672,6 +13672,7 @@ struct FrozenSelectParser {
     untracked_source: bool,
 }
 
+#[derive(Clone)]
 struct AutoIncrementTable {
     name: String,
     definition: CheckedAutoIncrementCreateTable,
@@ -13769,7 +13770,45 @@ fn refuse_a_byte_parameter_bound_otherwise(
 
 /// The counted table a stored `CREATE TABLE` describes, or `None` for a table
 /// that counts nothing.
+/// Reads the counted table a stored definition describes, once for each
+/// definition and database.
+///
+/// Every `INSERT` into a counted table reads its definition, and reading it
+/// parses the stored DDL; in sysbench's `oltp_insert` that parse alone took
+/// about a fifth of the server's time. What it answers depends on the stored
+/// text and the database's identity and nothing else, so it is kept by both;
+/// a changed definition is a different text.
 fn counted_table_from_stored_sql(
+    sql: &str,
+    database_identity: Option<[u8; 16]>,
+) -> Result<Option<AutoIncrementTable>> {
+    type ReadDefinitions = HashMap<(String, Option<[u8; 16]>), Option<AutoIncrementTable>>;
+    static READ: std::sync::LazyLock<Mutex<ReadDefinitions>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    /// Enough for every counted table a server is busy with; past it the
+    /// definitions are read again as they come.
+    const KEPT: usize = 1024;
+
+    let key = (sql.to_owned(), database_identity);
+    if let Some(table) = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Ok(table.clone());
+    }
+    let table = read_counted_table_from_stored_sql(sql, database_identity)?;
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if read.len() >= KEPT {
+        read.clear();
+    }
+    read.insert(key, table.clone());
+    Ok(table)
+}
+
+fn read_counted_table_from_stored_sql(
     sql: &str,
     database_identity: Option<[u8; 16]>,
 ) -> Result<Option<AutoIncrementTable>> {
