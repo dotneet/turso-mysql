@@ -42,6 +42,8 @@ const WAL_SUFFIX: &str = "-wal";
 const MAIN_INFO_SUFFIX: &str = ".turso-mysql-main-info";
 const WAL_INFO_SUFFIX: &str = ".turso-mysql-wal-info";
 const ALLOCATOR_SUFFIX: &str = ".turso-mysql-auto-increment";
+/// The logical log a database keeps while the experimental MVCC switch is on.
+const MVCC_LOG_SUFFIX: &str = ".turso-mysql-mvcc-log";
 const PRIVATE_TEMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 const PRIVATE_TEMP_PREFIXES: [(&[u8], PrivateTemporaryKind); 6] = [
@@ -1064,6 +1066,7 @@ pub(crate) struct OsDatabaseHandle {
     main_file: File,
     wal_file: File,
     allocator_file: File,
+    mvcc_log_file: Option<File>,
     identity: OpaqueFileKey,
 }
 
@@ -1074,6 +1077,7 @@ pub(crate) struct OsDatabaseStage {
     main_file: File,
     wal_file: File,
     allocator_file: File,
+    mvcc_log_file: Option<File>,
     main_info_file: File,
     wal_info_file: File,
     main_temporary: String,
@@ -1252,9 +1256,23 @@ impl OsDatabaseHandle {
     pub(crate) fn identity(&self) -> &OpaqueFileKey {
         &self.identity
     }
+
+    pub(crate) fn mvcc_log_file(&self) -> Result<Option<File>, RegistryError> {
+        self.mvcc_log_file
+            .as_ref()
+            .map(|file| file.try_clone().map_err(|_| RegistryError::Backend))
+            .transpose()
+    }
 }
 
 impl OsDatabaseStage {
+    pub(crate) fn mvcc_log_file(&self) -> Result<Option<File>, RegistryError> {
+        self.mvcc_log_file
+            .as_ref()
+            .map(|file| file.try_clone().map_err(|_| RegistryError::Backend))
+            .transpose()
+    }
+
     pub(crate) fn main_file(&self) -> Result<File, RegistryError> {
         self.main_file
             .try_clone()
@@ -1351,6 +1369,23 @@ impl OsDataRoot {
         }
         // SAFETY: `fd` is a fresh descriptor owned by this value.
         Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    /// Opens, creating it when missing, the logical log a database keeps in
+    /// MVCC mode, or nothing while the experimental switch is off.
+    ///
+    /// Not yet one of the verified artifacts: a dropped database leaves it
+    /// behind, under a key no later database takes.
+    fn open_mvcc_log(
+        &self,
+        expected: &DatabaseFileExpectation,
+    ) -> Result<Option<File>, RegistryError> {
+        if !crate::database_open::experimental_mvcc_is_on() {
+            return Ok(None);
+        }
+        let name = format!("{}{MVCC_LOG_SUFFIX}", expected.file_key().as_str());
+        self.open_child(&name, libc::O_RDWR | libc::O_CREAT, 0o600)
+            .map(Some)
     }
 
     fn open_child_optional(&self, name: &str, flags: i32) -> Result<Option<File>, RegistryError> {
@@ -2244,10 +2279,18 @@ impl RegistryRoot for OsDataRoot {
             self.abort_stage_names(&names)?;
             return Err(error);
         }
+        let mvcc_log_file = match self.open_mvcc_log(expected) {
+            Ok(file) => file,
+            Err(error) => {
+                self.abort_stage_names(&names)?;
+                return Err(error);
+            }
+        };
         Ok(OsDatabaseStage {
             main_file,
             wal_file,
             allocator_file,
+            mvcc_log_file,
             main_info_file,
             wal_info_file,
             main_temporary,
@@ -2509,10 +2552,12 @@ impl RegistryRoot for OsDataRoot {
         {
             return Ok(OpenDatabaseInspection::Mismatch);
         }
+        let mvcc_log_file = self.open_mvcc_log(expected)?;
         Ok(OpenDatabaseInspection::Matching(OsDatabaseHandle {
             main_file,
             wal_file,
             allocator_file,
+            mvcc_log_file,
             identity: expected.file_key().clone(),
         }))
     }

@@ -3335,6 +3335,49 @@ impl MySqlConnection {
         values: &[MySqlPreparedValue],
         timeout: Option<Duration>,
         affected_rows_mode: MySqlAffectedRowsMode,
+        callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
+    ) -> std::result::Result<MySqlPreparedExecutionResult, MySqlPreparedStatementError> {
+        let writes = self
+            .prepared_statements
+            .lock()
+            .expect("MySQL prepared statement registry mutex poisoned")
+            .statements
+            .get(&statement_id)
+            .is_some_and(|prepared| {
+                !matches!(
+                    prepared.execution_plan,
+                    PreparedExecutionPlan::Select { .. }
+                )
+            });
+        if !writes {
+            return self.execute_prepared_statement_in_its_transaction(
+                statement_id,
+                values,
+                timeout,
+                affected_rows_mode,
+                callback,
+            );
+        }
+        self.in_a_concurrent_statement_transaction(
+            || {
+                self.execute_prepared_statement_in_its_transaction(
+                    statement_id,
+                    values,
+                    timeout,
+                    affected_rows_mode,
+                    callback,
+                )
+            },
+            MySqlPreparedStatementError::Engine,
+        )
+    }
+
+    fn execute_prepared_statement_in_its_transaction(
+        &self,
+        statement_id: u32,
+        values: &[MySqlPreparedValue],
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
         mut callback: impl FnMut(&[MySqlPreparedValue]) -> Result<()>,
     ) -> std::result::Result<MySqlPreparedExecutionResult, MySqlPreparedStatementError> {
         let mut registry = self
@@ -4129,13 +4172,7 @@ impl MySqlConnection {
             {
                 *self.read_only_transaction.lock().unwrap() = self.session_read_only();
                 self.begin_transaction_isolation();
-                self.run_transaction_statement(
-                    Stmt::Begin {
-                        typ: None,
-                        name: None,
-                    },
-                    sql,
-                )?;
+                self.run_transaction_statement(self.engine_begin(), sql)?;
                 return Ok(MySqlTransactionOutcome::default());
             }
             _ => {}
@@ -4160,10 +4197,7 @@ impl MySqlConnection {
             | MySqlTransactionCommand::BeginReadWrite
             | MySqlTransactionCommand::BeginWithConsistentSnapshot => {
                 self.begin_transaction_isolation();
-                Stmt::Begin {
-                    typ: None,
-                    name: None,
-                }
+                self.engine_begin()
             }
             MySqlTransactionCommand::Commit | MySqlTransactionCommand::CommitAndChain => {
                 Stmt::Commit { name: None }
@@ -4186,13 +4220,7 @@ impl MySqlConnection {
         );
         if chains {
             self.run_transaction_statement(statement, sql)?;
-            self.run_transaction_statement(
-                Stmt::Begin {
-                    typ: None,
-                    name: None,
-                },
-                sql,
-            )?;
+            self.run_transaction_statement(self.engine_begin(), sql)?;
             return Ok(MySqlTransactionOutcome::default());
         }
         self.run_transaction_statement(statement, sql)?;
@@ -4261,7 +4289,7 @@ impl MySqlConnection {
             }
             _ => unreachable!("only a savepoint command reaches this"),
         };
-        let unread = !self.inner.has_read_snapshot();
+        let unread = !self.inner.has_read_snapshot() && !self.inner.mvcc_enabled();
         let result = self
             .run_transaction_statement(statement, sql)
             .map_err(no_such_savepoint_error);
@@ -4270,6 +4298,61 @@ impl MySqlConnection {
                 .release_read_snapshot()
                 .map_err(MySqlQueryError::Engine)?;
         }
+        result
+    }
+
+    /// The engine statement a MySQL `BEGIN` runs.
+    ///
+    /// In MVCC mode a plain `BEGIN` writes under the database's one exclusive
+    /// write slot, so writers would still run one at a time; `BEGIN
+    /// CONCURRENT` lets them run side by side.
+    fn engine_begin(&self) -> Stmt {
+        Stmt::Begin {
+            typ: self
+                .inner
+                .mvcc_enabled()
+                .then_some(turso_parser::ast::TransactionType::Concurrent),
+            name: None,
+        }
+    }
+
+    fn engine_begin_sql(&self) -> &'static str {
+        if self.inner.mvcc_enabled() {
+            "BEGIN CONCURRENT"
+        } else {
+            "BEGIN"
+        }
+    }
+
+    /// Runs a write that autocommit makes a transaction of its own inside
+    /// `BEGIN CONCURRENT` in MVCC mode, where the engine would otherwise run
+    /// it under the one exclusive write slot.
+    fn in_a_concurrent_statement_transaction<T, E>(
+        &self,
+        run: impl FnOnce() -> std::result::Result<T, E>,
+        engine_error: impl Fn(LimboError) -> E,
+    ) -> std::result::Result<T, E> {
+        if !self.inner.mvcc_enabled() || !self.inner.get_auto_commit() || !self.session_autocommit()
+        {
+            return run();
+        }
+        self.begin_transaction_isolation();
+        // The statement is a transaction of its own, so a read-only flag an
+        // earlier `START TRANSACTION READ ONLY` left does not hold for it.
+        *self.read_only_transaction.lock().unwrap() = self.session_read_only();
+        self.inner
+            .execute("BEGIN CONCURRENT")
+            .map_err(&engine_error)?;
+        let result = run();
+        let ended = if result.is_ok() {
+            self.inner.execute("COMMIT")
+        } else {
+            Ok(())
+        };
+        if !self.inner.get_auto_commit() {
+            let _ = self.inner.execute("ROLLBACK");
+        }
+        ended.map_err(engine_error)?;
         result
     }
 
@@ -4439,7 +4522,7 @@ impl MySqlConnection {
         // mode even when the session changes it before the transaction ends.
         *self.read_only_transaction.lock().unwrap() = self.session_read_only();
         self.inner
-            .prepare("BEGIN")
+            .prepare(self.engine_begin_sql())
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(MySqlQueryError::Engine)
     }
@@ -9333,6 +9416,18 @@ impl MySqlConnection {
     /// Executes one checked DML statement and returns the selected MySQL
     /// affected-row count.
     pub fn execute_checked_write_with_affected_rows_mode(
+        &self,
+        sql: &str,
+        timeout: Option<Duration>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        self.in_a_concurrent_statement_transaction(
+            || self.execute_checked_write_in_its_transaction(sql, timeout, affected_rows_mode),
+            MySqlQueryError::Engine,
+        )
+    }
+
+    fn execute_checked_write_in_its_transaction(
         &self,
         sql: &str,
         timeout: Option<Duration>,

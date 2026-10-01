@@ -9,6 +9,19 @@ use turso_core::{
 
 use crate::MySqlDialect;
 
+/// The environment variable that opens every database in MVCC mode, where
+/// writers run side by side instead of one at a time. Off unless set to `1`.
+///
+/// Experimental: MVCC gives snapshot isolation with row-level write conflicts,
+/// which is not what the server's isolation levels promise yet.
+pub const EXPERIMENTAL_MVCC_VARIABLE: &str = "TURSO_MYSQL_EXPERIMENTAL_MVCC";
+
+/// Whether databases open in MVCC mode, read once per process.
+pub fn experimental_mvcc_is_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var(EXPERIMENTAL_MVCC_VARIABLE).is_ok_and(|value| value == "1"))
+}
+
 /// Opens a MySQL database from already-open main and WAL descriptors.
 ///
 /// The descriptors are transferred to Core without resolving either a path or
@@ -16,7 +29,7 @@ use crate::MySqlDialect;
 /// [`PreopenedDatabaseIdentity::new`], while `durable_identity` is the value
 /// used by the MySQL schema catalog and must match the registry proof supplied
 /// by the caller. Core retains `guard` until all database connections are gone.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn open_preopened_database_with_wal<G>(
     io: Arc<dyn IO>,
     main_file: std::fs::File,
@@ -24,12 +37,13 @@ pub(crate) fn open_preopened_database_with_wal<G>(
     identity: PreopenedDatabaseIdentity,
     durable_identity: [u8; 16],
     logical_name: &str,
+    mvcc_log_file: Option<std::fs::File>,
     guard: G,
 ) -> Result<Arc<Database>>
 where
     G: Send + Sync + 'static,
 {
-    let database = PreopenedDatabaseWithWal::from_std_files(
+    let mut database = PreopenedDatabaseWithWal::from_std_files(
         main_file,
         identity.clone(),
         PreopenedDatabaseAccess::ReadWrite,
@@ -39,6 +53,10 @@ where
     )?
     .with_durable_identity(durable_identity)
     .with_lifetime_guard(Arc::new(guard));
+    let switch_to_mvcc = mvcc_log_file.is_some();
+    if let Some(file) = mvcc_log_file {
+        database = database.with_logical_log_std_file(file)?;
+    }
 
     let database = Database::open_preopened_with_wal(
         io,
@@ -55,6 +73,11 @@ where
     // it answers know their own name from here rather than from the engine,
     // which has no notion of one.
     crate::catalog_tables::register_catalog_tables(&database, logical_name)?;
+    if switch_to_mvcc && !database.mvcc_enabled() {
+        let connection = database.connect()?;
+        connection.execute("PRAGMA journal_mode = 'mvcc'")?;
+        connection.close()?;
+    }
     Ok(database)
 }
 
@@ -140,6 +163,7 @@ mod tests {
             opaque_identity(),
             identity(1),
             "probe",
+            None,
             (),
         )?;
         let connection = db.connect()?;
@@ -156,6 +180,90 @@ mod tests {
         assert!(connection.experimental_views_enabled());
         assert!(!connection.experimental_vacuum_enabled());
         connection.close()?;
+        Ok(())
+    }
+
+    fn binary_context() -> crate::schema_sql::SchemaSqlSessionContext {
+        use crate::schema_sql::{CharacterSet, Collation, SchemaSqlMode};
+        crate::schema_sql::SchemaSqlSessionContext {
+            sql_mode: SchemaSqlMode {
+                ansi_quotes: false,
+                no_backslash_escapes: false,
+            },
+            character_set_client: CharacterSet::Binary,
+            collation_connection: Collation::Binary,
+            default_character_set: CharacterSet::Binary,
+            default_collation: Collation::Binary,
+        }
+    }
+
+    fn rows_of(connection: &crate::MySqlConnection) -> Result<Vec<Vec<Value>>> {
+        connection
+            .prepare_select("SELECT id FROM records ORDER BY id")?
+            .run_collect_rows()
+    }
+
+    /// A database handed a logical log runs in MVCC mode, where a write left
+    /// in a transaction the session never sees committed would stay invisible
+    /// to every other session and lost on reopen.
+    #[test]
+    fn a_database_given_a_logical_log_commits_rows_every_session_sees() -> Result<()> {
+        let (directory, main, wal) = files();
+        let log = || {
+            FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(directory.path().join("main.db-log"))
+                .unwrap()
+        };
+        let open = |main: std::fs::File, wal: std::fs::File| {
+            open_preopened_database_with_wal(
+                Arc::new(NoPathIo),
+                main,
+                wal,
+                opaque_identity(),
+                identity(9),
+                "probe",
+                Some(log()),
+                (),
+            )
+        };
+        let db = open(main.try_clone().unwrap(), wal.try_clone().unwrap())?;
+        assert!(db.mvcc_enabled());
+        let writer = crate::MySqlConnection::new(db.connect()?, binary_context())?;
+        let reader = crate::MySqlConnection::new(db.connect()?, binary_context())?;
+        writer.execute("CREATE TABLE records (id INT)")?;
+        // The table is not checkpointed yet, so its catalog row names it by a
+        // negative root.
+        let table = turso_mysql_parser::MySqlTableName::parse("records").unwrap();
+        let columns = reader.list_columns(&table).unwrap();
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name(), "id");
+        writer.execute("INSERT INTO records (id) VALUES (1)")?;
+        assert_eq!(rows_of(&reader)?, vec![vec![Value::from_i64(1)]]);
+
+        writer.execute_transaction_command("BEGIN").unwrap();
+        reader.execute_transaction_command("BEGIN").unwrap();
+        writer.execute("INSERT INTO records (id) VALUES (2)")?;
+        reader.execute("INSERT INTO records (id) VALUES (3)")?;
+        writer.execute_transaction_command("COMMIT").unwrap();
+        reader.execute_transaction_command("COMMIT").unwrap();
+        writer.close()?;
+        reader.close()?;
+        drop((writer, reader, db));
+
+        let reopened = open(main, wal)?;
+        let connection = crate::MySqlConnection::new(reopened.connect()?, binary_context())?;
+        assert_eq!(
+            rows_of(&connection)?,
+            vec![
+                vec![Value::from_i64(1)],
+                vec![Value::from_i64(2)],
+                vec![Value::from_i64(3)]
+            ]
+        );
         Ok(())
     }
 
@@ -178,6 +286,7 @@ mod tests {
             opaque_identity(),
             identity(2),
             "probe",
+            None,
             DropGuard(drops.clone()),
         )?;
         let connection = db.connect()?;
@@ -199,6 +308,7 @@ mod tests {
             opaque_identity(),
             [0; 16],
             "probe",
+            None,
             (),
         )
         .unwrap_err();
@@ -217,6 +327,7 @@ mod tests {
             opaque_identity(),
             identity(3),
             "probe",
+            None,
             (),
         )?;
         let second = open_preopened_database_with_wal(
@@ -226,6 +337,7 @@ mod tests {
             opaque_identity(),
             identity(3),
             "probe",
+            None,
             (),
         )?;
         assert!(Arc::ptr_eq(&first, &second));
@@ -246,6 +358,7 @@ mod tests {
             opaque_identity(),
             identity(4),
             "probe",
+            None,
             (),
         )?;
         let pathless_identity = "main.db";
@@ -256,6 +369,7 @@ mod tests {
             opaque_identity(),
             identity(4),
             "probe",
+            None,
             (),
         )
         .unwrap_err();
@@ -269,6 +383,7 @@ mod tests {
             PreopenedDatabaseIdentity::new("different-identity").unwrap(),
             identity(4),
             "probe",
+            None,
             (),
         )
         .unwrap_err();

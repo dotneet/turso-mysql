@@ -100,6 +100,9 @@ services:
       # Where the build service left the binaries: `debug` for the dev profile,
       # the profile's own name otherwise.
       E2E_BIN_DIR: ${E2E_BIN_DIR:-debug}
+      # `1` opens every database in MVCC mode with concurrent writers; see
+      # mysql/frontend/database_open.rs. Off unless set.
+      TURSO_MYSQL_EXPERIMENTAL_MVCC: ${TURSO_MYSQL_EXPERIMENTAL_MVCC:-}
     volumes:
       - cargo-target:/target:ro
       - ./server/boot-turso.sh:/boot-turso.sh:ro

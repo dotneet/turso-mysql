@@ -486,7 +486,7 @@ impl MySqlConnection {
         );
         let rows = self
             .inner
-            .prepare_internal(&sql)
+            .prepare(&sql)
             .map_err(MySqlShowCreateTableError::Engine)?
             .run_collect_rows()
             .map_err(MySqlShowCreateTableError::Engine)?;
@@ -556,7 +556,7 @@ impl MySqlConnection {
         );
         let rows = self
             .inner
-            .prepare_internal(&sql)
+            .prepare(&sql)
             .map_err(MySqlShowCreateTableError::Engine)?
             .run_collect_rows()
             .map_err(MySqlShowCreateTableError::Engine)?;
@@ -633,7 +633,7 @@ impl MySqlConnection {
         );
         let rows = self
             .inner
-            .prepare_internal(&sql)
+            .prepare(&sql)
             .map_err(MySqlColumnMetadataError::Engine)?
             .run_collect_rows()
             .map_err(MySqlColumnMetadataError::Engine)?;
@@ -663,7 +663,8 @@ impl MySqlConnection {
         }
         let root_page = root_page
             .as_int()
-            .filter(|root_page| *root_page > 0)
+            // MVCC names a table not yet checkpointed by a negative root.
+            .filter(|root_page| *root_page > 0 || (*root_page < 0 && self.inner.mvcc_enabled()))
             .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
         if !catalog_name.eq_ignore_ascii_case(table_name)
             || !object_type.eq_ignore_ascii_case("table")
@@ -792,12 +793,14 @@ impl MySqlConnection {
         let core_table = schema
             .get_table(catalog_name)
             .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
-        if core_table
-            .get_root_page()
-            .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
-            != root_page
-            || schema.table_sql(catalog_name) != Some(stored_sql)
-        {
+        // A checkpoint moves an MVCC table to a page of its own, which the
+        // schema learns before the catalog row does.
+        let same_root = self.inner.mvcc_enabled()
+            || core_table
+                .get_root_page()
+                .map_err(|_| MySqlColumnMetadataError::CorruptDefinition)?
+                == root_page;
+        if !same_root || schema.table_sql(catalog_name) != Some(stored_sql) {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         let core_columns = core_table.columns();
@@ -1319,7 +1322,7 @@ impl MySqlConnection {
         );
         let rows = self
             .inner
-            .prepare_internal(&sql)
+            .prepare(&sql)
             .map_err(MySqlColumnMetadataError::Engine)?
             .run_collect_rows()
             .map_err(MySqlColumnMetadataError::Engine)?;

@@ -152,6 +152,14 @@ fn bigint_unsigned_arithmetic_overflow_uses_mysql_numeric_overflow() {
     );
 }
 
+#[test]
+fn a_write_write_conflict_is_a_transaction_given_up_with_1213() {
+    assert_eq!(
+        frontend_error_kind(LimboError::WriteWriteConflict),
+        FrontendErrorKind::SerializationFailure
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn stored_decimal_keeps_65_digits_in_text_and_prepared_rows() {

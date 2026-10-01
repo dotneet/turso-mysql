@@ -835,6 +835,7 @@ impl DatabaseCatalog {
                 let durable_identity = expected.file_key().to_database_identity()?;
                 let main_file = stage.main_file()?;
                 let wal_file = stage.wal_file()?;
+                let mvcc_log_file = stage.mvcc_log_file()?;
                 let allocator = initialize_stage_allocator(
                     io.as_ref(),
                     stage.allocator_file()?,
@@ -848,6 +849,7 @@ impl DatabaseCatalog {
                     identity,
                     durable_identity,
                     &logical_name,
+                    mvcc_log_file,
                     AllocatorDatabaseLifetime {
                         _lifetime: lifetime,
                         _allocator: allocator,
@@ -887,6 +889,7 @@ impl DatabaseCatalog {
         let (handle, lifetime) = lease.into_core_parts();
         let main_file = handle.main_file()?;
         let wal_file = handle.wal_file()?;
+        let mvcc_log_file = handle.mvcc_log_file()?;
         let allocator = reopen_allocator(
             self.io.as_ref(),
             handle.allocator_file()?,
@@ -900,6 +903,7 @@ impl DatabaseCatalog {
             identity,
             durable_identity,
             name.as_str(),
+            mvcc_log_file,
             AllocatorDatabaseLifetime {
                 _lifetime: lifetime,
                 _allocator: allocator.clone(),

@@ -26,6 +26,13 @@ oltp_insert`), `BENCH_THREADS` (`1 8`), `BENCH_TIME` (seconds, 30) and
 `BENCH_TABLE_SIZE` (rows, 100000). The raw sysbench outputs and `summary.md`
 are in `.run/results/bench/`.
 
+`TURSO_MYSQL_EXPERIMENTAL_MVCC=1` on `run.sh --up` starts the turso server with
+every database in the engine's MVCC mode, where writers run side by side
+instead of under one write lock. It is experimental and off by default: MVCC
+gives snapshot isolation with row-level write conflicts answered 1213, which is
+not yet what the server's isolation levels, `SELECT ... FOR UPDATE` and `LOCK
+TABLES` promise. `--up` again without it restarts the server on the same build.
+
 ## Profiling the server under load
 
 While a benchmark runs, sample the server from a privileged container in its

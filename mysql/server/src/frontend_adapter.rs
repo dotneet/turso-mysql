@@ -13813,6 +13813,9 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         // long it waits. The caller rolls it back and answers what MySQL
         // answers for a transaction it has to give up on.
         LimboError::BusySnapshot => FrontendErrorKind::SerializationFailure,
+        // MVCC's first-committer-wins answer to two transactions writing one
+        // row.
+        LimboError::WriteWriteConflict => FrontendErrorKind::SerializationFailure,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::InvalidArgument(message)

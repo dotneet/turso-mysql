@@ -35,6 +35,9 @@ use crate::schema_sql::{
 #[derive(Debug, Default)]
 pub struct MySqlDialect;
 
+/// The table core's MVCC mode keeps its metadata in.
+const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
+
 impl Dialect for MySqlDialect {
     fn name(&self) -> &'static str {
         "mysql"
@@ -264,6 +267,11 @@ impl Dialect for MySqlDialect {
                 ));
             }
             return Ok(input.to_string());
+        }
+        // Switching a database to MVCC creates the engine's own metadata
+        // table, a plain SQLite table no MySQL session writes.
+        if tbl_name.name.as_str() == MVCC_META_TABLE_NAME {
+            return Dialect::format_table_sql(&turso_core::SqliteDialect, input, tbl_name, body);
         }
         Err(LimboError::ParseError(
             "MySQL schema writes require SchemaSqlSessionContext".to_string(),

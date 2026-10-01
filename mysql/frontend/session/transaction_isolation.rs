@@ -111,7 +111,12 @@ impl MySqlConnection {
             isolation.began_transaction = false;
             isolation.current
         };
-        if current == MySqlIsolationLevel::ReadCommitted && !self.inner.get_auto_commit() {
+        // MVCC keeps one snapshot for the whole transaction, so READ
+        // COMMITTED runs as REPEATABLE READ there for now.
+        if current == MySqlIsolationLevel::ReadCommitted
+            && !self.inner.get_auto_commit()
+            && !self.inner.mvcc_enabled()
+        {
             self.inner
                 .release_read_snapshot()
                 .map_err(MySqlQueryError::Engine)?;
@@ -132,7 +137,7 @@ impl MySqlConnection {
     /// Nothing the prepare read reaches the client as rows, so letting it go
     /// cannot leave the transaction acting on data it saw at another moment.
     pub fn prepare_without_starting_the_snapshot<T>(&self, prepare: impl FnOnce() -> T) -> T {
-        let unread = self.transaction_has_not_read();
+        let unread = self.transaction_has_not_read() && !self.inner.mvcc_enabled();
         let prepared = prepare();
         if unread {
             self.inner
@@ -149,6 +154,11 @@ impl MySqlConnection {
     /// Whether the statement about to run takes the snapshot it reads from
     /// itself: the session is in no transaction, or in one that has not read.
     pub fn statement_takes_its_own_snapshot(&self) -> bool {
+        // In MVCC mode `BEGIN CONCURRENT` takes the snapshot, and a conflict
+        // ends the whole transaction, so only a statement of its own runs again.
+        if self.inner.mvcc_enabled() {
+            return self.inner.get_auto_commit();
+        }
         self.inner.get_auto_commit() || !self.inner.has_read_snapshot()
     }
 
@@ -214,6 +224,10 @@ impl MySqlConnection {
             return Ok(MySqlTransactionOutcome {
                 consistent_snapshot_ignored: true,
             });
+        }
+        // `BEGIN CONCURRENT` took the snapshot already.
+        if self.inner.mvcc_enabled() {
+            return Ok(MySqlTransactionOutcome::default());
         }
         self.inner
             .begin_read_snapshot()
