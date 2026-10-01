@@ -123,12 +123,12 @@ fn only_a_statement_without_parameters_or_rows_is_run_as_text() {
 /// An ORM's batch insert is one long statement with a `?` for each value, and
 /// every reading of a statement costs time in proportion to its length. When
 /// it is prepared it is tokenized once, parsed once and read by the engine
-/// once; when it is executed
-/// it is read once more, to number its rows. Before the readings were kept
-/// while a statement is answered, preparing it tokenized it 13 times, parsed
-/// it 9 times and had the engine read it 4.
+/// once; when it is executed it is not read again. Before the readings were
+/// kept while a statement is answered, preparing it tokenized it 13 times,
+/// parsed it 9 times and had the engine read it 4, and executing it read it
+/// once more to look for an upsert clause.
 #[test]
-fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed() {
+fn a_long_batch_insert_is_read_whole_once_when_prepared_and_not_when_executed() {
     let (_directory, mut adapter) = adapter();
     adapter
         .execute_query("create table `users` (`id` bigint unsigned not null auto_increment primary key, `name` varchar(255) not null, `email` varchar(255) not null)")
@@ -167,8 +167,8 @@ fn a_long_batch_insert_is_read_whole_once_when_prepared_and_once_when_executed()
     assert_eq!(
         whole_readings(prepared_at, executed_at, sql.len()),
         turso_mysql_parser::BytesRead {
-            tokenized: 1,
-            parsed: 1,
+            tokenized: 0,
+            parsed: 0,
             parsed_by_the_engine: 0,
             tokenized_as_a_command: 0,
             checked_as_a_counted_insert: 0,

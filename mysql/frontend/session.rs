@@ -3715,7 +3715,11 @@ impl MySqlConnection {
         )? {
             return Ok(MySqlPreparedExecutionResult::Write(result));
         }
-        let stamped = self.moments_an_upsert_stamps(&insert.sql)?;
+        let stamped = if insert.insert.upserts() {
+            self.moments_an_upsert_stamps(&insert.sql)?
+        } else {
+            Vec::new()
+        };
         let reserved =
             self.write_counted_rows(&insert.sql, &bound, &table, values, deadline, |reserved| {
                 self.check_write_deadline(deadline)?;
