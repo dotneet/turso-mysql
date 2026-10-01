@@ -827,9 +827,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy);
@@ -843,9 +842,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -865,9 +863,8 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
-                    self.pager.io.step()?
-                }
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
                 }
@@ -947,9 +944,14 @@ impl Statement {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield | vdbe::StepResult::Sleep { .. } => {
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
                     self.pager.io.step()?;
+                    post_io_func()?;
+                }
+                vdbe::StepResult::Sleep { .. } => {
+                    pre_io_func()?;
+                    self.wait_out_busy_delay()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
@@ -958,6 +960,27 @@ impl Statement {
             }
         };
         Ok(result)
+    }
+
+    /// Waits before a blocking run steps again after the busy handler asked it
+    /// to sleep: until the handler's delay runs out, or sooner when another
+    /// connection releases the lock this one waits for. Without a way to wait
+    /// it pumps IO as for any other suspension, which retries once the delay
+    /// has passed.
+    fn wait_out_busy_delay(&mut self) -> Result<()> {
+        let Some(busy_state) = self.busy_handler_state.as_mut() else {
+            return self.pager.io.step();
+        };
+        let delay = busy_state.get_delay(self.pager.io.current_time_monotonic());
+        if delay.is_zero() {
+            return Ok(());
+        }
+        match self.pager.wait_for_lock_release(delay) {
+            Some(true) => busy_state.retry_now(self.pager.io.current_time_monotonic()),
+            Some(false) => {}
+            None => return self.pager.io.step(),
+        }
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

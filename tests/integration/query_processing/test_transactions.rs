@@ -156,6 +156,61 @@ fn test_busy_wait_returns_sleep_step_result(tmp_db: TempDatabase) {
     assert_eq!(rows, vec![(2,)]);
 }
 
+// A blocking run waiting for the write lock is woken when the holder commits,
+// not when its busy-handler delay next runs out. The default delays retry at
+// 0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228 and 328 ms after the first
+// try, so a commit at 240 ms would leave the waiter sleeping until 328 ms.
+// A waiter that is not woken can never finish before 328 ms, while a woken one
+// can be held up by a busy machine, so one quick finish out of three is enough.
+#[turso_macros::test]
+fn test_blocking_writer_wakes_when_the_write_lock_is_released(tmp_db: TempDatabase) {
+    let conn1 = tmp_db.connect_limbo();
+    conn1
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    let conn2 = tmp_db.connect_limbo();
+    conn2.set_busy_timeout(Duration::from_secs(5));
+
+    let mut waits = Vec::new();
+    for attempt in 0..3 {
+        conn1.execute("BEGIN").unwrap();
+        conn1
+            .execute(format!(
+                "INSERT INTO test (id, value) VALUES ({}, 'first')",
+                2 * attempt + 1
+            ))
+            .unwrap();
+
+        let waiter_conn = conn2.clone();
+        let started = std::time::Instant::now();
+        let waiter = std::thread::spawn(move || {
+            waiter_conn
+                .execute(format!(
+                    "INSERT INTO test (id, value) VALUES ({}, 'second')",
+                    2 * attempt + 2
+                ))
+                .unwrap();
+            std::time::Instant::now()
+        });
+
+        std::thread::sleep(Duration::from_millis(240).saturating_sub(started.elapsed()));
+        conn1.execute("COMMIT").unwrap();
+        let waited = waiter.join().unwrap() - started;
+        waits.push(waited);
+        if waited < Duration::from_millis(320) {
+            break;
+        }
+    }
+
+    assert!(
+        waits.last().unwrap() < &Duration::from_millis(320),
+        "the waiter finished {waits:?} after it began, past the 240 ms commit by more than \
+         its next busy-handler delay would allow if it were woken"
+    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2 * waits.len() as i64,)]);
+}
+
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
 //
 // 1. Both transactions T1 and T2 start at the same time.

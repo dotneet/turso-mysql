@@ -55,6 +55,10 @@ pub struct BusyHandlerState {
     timeout: MonotonicInstant,
     /// For timeout-based handlers: the current iteration index into DELAYS
     iteration: usize,
+    /// For timeout-based handlers: how much of the handler's total time the
+    /// delays handed out so far have used, less what an early retry left
+    /// unslept.
+    spent: Duration,
 }
 
 impl BusyHandlerState {
@@ -74,28 +78,13 @@ impl BusyHandlerState {
         Duration::from_millis(100),
     ];
 
-    /// Cumulative totals for each iteration (for calculating remaining time)
-    const TOTALS: [Duration; 12] = [
-        Duration::from_millis(0),
-        Duration::from_millis(1),
-        Duration::from_millis(3),
-        Duration::from_millis(8),
-        Duration::from_millis(18),
-        Duration::from_millis(33),
-        Duration::from_millis(53),
-        Duration::from_millis(78),
-        Duration::from_millis(103),
-        Duration::from_millis(128),
-        Duration::from_millis(178),
-        Duration::from_millis(228),
-    ];
-
     /// Create a new busy handler state
     pub fn new(now: MonotonicInstant) -> Self {
         Self {
             invocation_count: 0,
             timeout: now,
             iteration: 0,
+            spent: Duration::ZERO,
         }
     }
 
@@ -104,6 +93,18 @@ impl BusyHandlerState {
         self.invocation_count = 0;
         self.timeout = now;
         self.iteration = 0;
+        self.spent = Duration::ZERO;
+    }
+
+    /// Ends the current delay at `now`, because the lock was released before
+    /// it ran out. The part of the delay not waited is not counted against the
+    /// handler's total time, so a waiter woken often does not give up sooner
+    /// than one that slept through every delay.
+    pub fn retry_now(&mut self, now: MonotonicInstant) {
+        if now < self.timeout {
+            self.spent = self.spent.saturating_sub(self.timeout.duration_since(now));
+            self.timeout = now;
+        }
     }
 
     /// Get the current timeout instant
@@ -145,12 +146,7 @@ impl BusyHandlerState {
     fn invoke_timeout_handler(&mut self, max_duration: Duration, now: MonotonicInstant) -> bool {
         let idx = self.iteration.min(11);
         let mut delay = Self::DELAYS[idx];
-        let mut prior = Self::TOTALS[idx];
-
-        // After 12 iterations, each additional iteration adds 100ms
-        if self.iteration >= 12 {
-            prior += delay * (self.iteration as u32 - 11);
-        }
+        let prior = self.spent;
 
         // Check if we've exceeded or would exceed the max duration
         if prior + delay > max_duration {
@@ -162,6 +158,7 @@ impl BusyHandlerState {
 
         self.iteration = self.iteration.saturating_add(1);
         self.invocation_count += 1;
+        self.spent += delay;
         self.timeout = now + delay;
         true
     }
@@ -364,6 +361,29 @@ mod tests {
         assert!(state.invoke(&handler, later));
         // First delay after reset should be 1ms
         assert_eq!(state.timeout(), later + Duration::from_millis(1));
+    }
+
+    #[test]
+    fn an_early_retry_does_not_use_up_the_unslept_part_of_the_delay() {
+        let handler = BusyHandler::Timeout(Duration::from_millis(10));
+        let now = test_instant();
+        let mut state = BusyHandlerState::new(now);
+
+        // Woken at once every time, the handler keeps retrying: only the
+        // time actually waited counts, and none was.
+        for _ in 0..1000 {
+            assert!(state.invoke(&handler, now));
+            state.retry_now(now);
+            assert_eq!(state.get_delay(now), Duration::ZERO);
+        }
+
+        // Without the early retries the same 10 ms run out after four delays
+        // (1 + 2 + 5, then the 2 ms left).
+        let mut slept_through = BusyHandlerState::new(now);
+        for _ in 0..4 {
+            assert!(slept_through.invoke(&handler, now));
+        }
+        assert!(!slept_through.invoke(&handler, now));
     }
 
     #[test]

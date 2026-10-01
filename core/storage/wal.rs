@@ -29,6 +29,7 @@ use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
 use crate::io::{File, IO};
 use crate::storage::database::DatabaseStorage;
+use crate::storage::lock_release::LockReleaseSignal;
 use crate::storage::page_transform::{
     page_codec_completion_error, PageCodecContext, PageLocation, PageTransform,
 };
@@ -610,6 +611,11 @@ trait WalCoordination: Debug + Send + Sync {
     /// Whether a process-local "last connection" close may run shutdown checkpointing.
     fn should_checkpoint_on_close(&self) -> bool;
 
+    /// Counts this process's releases of the write and checkpoint locks.
+    /// Another process's release is not counted, so a waiter on one falls
+    /// back to its busy-handler delay.
+    fn lock_release_signal(&self) -> Arc<LockReleaseSignal>;
+
     #[cfg(test)]
     fn backend_name(&self) -> &'static str;
 
@@ -658,6 +664,14 @@ pub trait Wal: Debug + Send + Sync {
 
     /// Whether shutdown checkpointing is valid when this process closes its last connection.
     fn should_checkpoint_on_close(&self) -> bool;
+
+    /// Waits until another connection of this process releases the write or
+    /// checkpoint lock after this one last tried to begin a transaction, or
+    /// until `timeout` passes. Returns whether a lock was released, or `None`
+    /// where this WAL cannot wait for one.
+    fn wait_for_lock_release(&self, _timeout: std::time::Duration) -> Option<bool> {
+        None
+    }
 
     /// Find the latest frame containing a page.
     ///
@@ -931,7 +945,9 @@ impl InProcessWalCoordination {
     }
 
     fn unlock_write_lock(&self) {
-        self.shared.read().runtime.write_lock.unlock();
+        let shared = self.shared.read();
+        shared.runtime.write_lock.unlock();
+        shared.runtime.lock_released.released();
     }
 
     fn try_checkpoint_lock(&self) -> bool {
@@ -939,7 +955,9 @@ impl InProcessWalCoordination {
     }
 
     fn unlock_checkpoint_lock(&self) {
-        self.shared.read().runtime.checkpoint_lock.unlock();
+        let shared = self.shared.read();
+        shared.runtime.checkpoint_lock.unlock();
+        shared.runtime.lock_released.released();
     }
 }
 
@@ -1414,6 +1432,10 @@ impl WalCoordination for InProcessWalCoordination {
 
     fn should_checkpoint_on_close(&self) -> bool {
         true
+    }
+
+    fn lock_release_signal(&self) -> Arc<LockReleaseSignal> {
+        Arc::clone(&self.shared.read().runtime.lock_released)
     }
 
     #[cfg(test)]
@@ -2444,6 +2466,10 @@ impl WalCoordination for ShmWalCoordination {
         self.authority.is_last_process_mapping()
     }
 
+    fn lock_release_signal(&self) -> Arc<LockReleaseSignal> {
+        self.fallback.lock_release_signal()
+    }
+
     #[cfg(test)]
     fn backend_name(&self) -> &'static str {
         "tshm"
@@ -2811,6 +2837,10 @@ pub struct WalFile {
 
     syncing: Arc<AtomicBool>,
     write_lock_held: AtomicBool,
+    lock_released: Arc<LockReleaseSignal>,
+    /// The release count read before this connection last tried to begin a
+    /// transaction, which a wait for the lock it did not get starts from.
+    lock_releases_before_last_try: AtomicU64,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
@@ -2965,6 +2995,10 @@ pub struct WalSharedRuntime {
     /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
     /// one used.
     pub write_lock: TursoRwLock,
+    /// Wakes connections waiting for `write_lock` or `checkpoint_lock` when
+    /// either is released. Shared by `Arc` so a waiter sleeps without holding
+    /// the lock around this struct.
+    pub lock_released: Arc<LockReleaseSignal>,
 
     /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
     pub checkpoint_lock: TursoRwLock,
@@ -3457,6 +3491,7 @@ impl Wal for WalFile {
         // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
         // up to ~10 seconds before giving up, so we just mirror SQLite's implementation
         // here.
+        self.note_lock_releases_before_trying();
         let mut cnt = 0u32;
         loop {
             tracing::trace!("begin_read_tx: cnt={cnt}");
@@ -3532,6 +3567,7 @@ impl Wal for WalFile {
                 !self.holds_write_lock(),
                 "write lock already held by this connection"
             );
+            self.note_lock_releases_before_trying();
             if !self.coordination.try_begin_write_tx() {
                 return Err(LimboError::Busy);
             }
@@ -3612,6 +3648,13 @@ impl Wal for WalFile {
 
     fn should_checkpoint_on_close(&self) -> bool {
         self.coordination.should_checkpoint_on_close()
+    }
+
+    fn wait_for_lock_release(&self, timeout: std::time::Duration) -> Option<bool> {
+        self.lock_released.wait_for_release_after(
+            self.lock_releases_before_last_try.load(Ordering::Acquire),
+            timeout,
+        )
     }
 
     /// Find the latest frame containing a page.
@@ -4830,9 +4873,12 @@ impl WalFile {
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let now = io.current_time_monotonic();
+        let lock_released = coordination.lock_release_signal();
         Self {
             io,
             coordination,
+            lock_released,
+            lock_releases_before_last_try: AtomicU64::new(0),
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
             max_frame: AtomicU64::new(max_frame),
             ongoing_checkpoint: RwLock::new(OngoingCheckpoint {
@@ -4860,6 +4906,11 @@ impl WalFile {
             io_ctx: RwLock::new(IOContext::default()),
             dirty: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    fn note_lock_releases_before_trying(&self) {
+        self.lock_releases_before_last_try
+            .store(self.lock_released.releases(), Ordering::Release);
     }
 
     #[cfg(test)]
@@ -5888,6 +5939,7 @@ impl WalFileShared {
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
+                lock_released: Arc::default(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(snapshot.checkpoint_epoch),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
@@ -5974,6 +6026,7 @@ impl WalFileShared {
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
+                lock_released: Arc::default(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
@@ -6016,6 +6069,7 @@ impl WalFileShared {
                 read_locks,
                 vacuum_lock: TursoRwLock::new(),
                 write_lock: TursoRwLock::new(),
+                lock_released: Arc::default(),
                 checkpoint_lock: TursoRwLock::new(),
                 epoch: AtomicU32::new(0),
                 overflow_fallback_coverage: Arc::new(SpinLock::new(

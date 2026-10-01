@@ -3566,6 +3566,12 @@ impl Pager {
         wal.holds_write_lock()
     }
 
+    /// Waits up to `timeout` for another connection to release the lock this
+    /// one last failed to take. See [`Wal::wait_for_lock_release`].
+    pub fn wait_for_lock_release(&self, timeout: std::time::Duration) -> Option<bool> {
+        self.wal.as_ref()?.wait_for_lock_release(timeout)
+    }
+
     /// Number of pages the current write transaction has modified. Tests use it
     /// to check that a rolled-back transaction left nothing behind.
     #[cfg(any(test, feature = "test_helper"))]
