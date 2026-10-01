@@ -9,7 +9,9 @@
 //! Every weight below was checked against MySQL 8.4.11's `WEIGHT_STRING()` for
 //! each character of the Basic Multilingual Plane.
 
-use std::{cmp::Ordering, str::Chars};
+use std::{cmp::Ordering, hash::Hasher, str::Chars};
+
+use super::collate::{sort_key_on_stack, STACK_SORT_KEY_LEN};
 
 const DATA: &[u8] = include_bytes!("mysql_uca400_primary.bin");
 const HEADER_LEN: usize = 16;
@@ -61,6 +63,19 @@ pub(crate) fn sort_key(text: &str) -> Vec<u8> {
         .into_iter()
         .flat_map(|weight| weight.to_be_bytes())
         .collect()
+}
+
+pub(crate) fn write_sort_key(text: &str, hasher: &mut impl Hasher) {
+    let mut key = [0; STACK_SORT_KEY_LEN];
+    match sort_key_on_stack(&mut key, PrimaryWeights::new(text)) {
+        Some(mut len) => {
+            while len >= 2 && key[len - 2..len] == SPACE.to_be_bytes() {
+                len -= 2;
+            }
+            hasher.write(&key[..len]);
+        }
+        None => hasher.write(&sort_key(text)),
+    }
 }
 
 /// Match MySQL LIKE one character at a time, without padding. Measured on

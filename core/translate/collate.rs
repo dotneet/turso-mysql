@@ -232,6 +232,32 @@ impl CollationSeq {
             Self::Custom(_) => text.as_bytes().to_vec(),
         }
     }
+
+    pub fn write_hash_key(&self, text: &str, hasher: &mut impl Hasher) {
+        match self {
+            Self::MySqlUca9 => super::mysql_uca9::write_sort_key(text, hasher),
+            Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => {
+                super::mysql_uca400::write_sort_key(text, hasher)
+            }
+            _ => hasher.write(&self.hash_key(text)),
+        }
+    }
+}
+
+pub(super) const STACK_SORT_KEY_LEN: usize = 512;
+
+pub(super) fn sort_key_on_stack(
+    key: &mut [u8; STACK_SORT_KEY_LEN],
+    weights: impl Iterator<Item = u16>,
+) -> Option<usize> {
+    let mut len = 0;
+    for weight in weights {
+        let end = len + 2;
+        key.get_mut(len..end)?
+            .copy_from_slice(&weight.to_be_bytes());
+        len = end;
+    }
+    Some(len)
 }
 
 pub(super) fn shared_prefix_len(lhs: &str, rhs: &str) -> usize {
@@ -700,6 +726,47 @@ mod tests {
             collation.hash_key("Straße"),
             collation.hash_key("strasse  ")
         );
+    }
+
+    #[test]
+    fn write_hash_key_writes_the_hash_key_in_one_piece() {
+        #[derive(Default)]
+        struct WrittenPieces(Vec<Vec<u8>>);
+        impl Hasher for WrittenPieces {
+            fn finish(&self) -> u64 {
+                0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.push(bytes.to_vec());
+            }
+        }
+
+        let long_texts = [255, 256, 257, 400].into_iter().flat_map(|len| {
+            ["a", " ", "ß", "a\u{1}", "😀"].map(|unit| unit.repeat(len) + &" ".repeat(len % 3))
+        });
+        let texts: Vec<String> = test_text::similar_pairs(7, 20_000)
+            .into_iter()
+            .flat_map(|(left, right)| [left, right])
+            .chain(long_texts)
+            .collect();
+        for collation in [
+            CollationSeq::Binary,
+            CollationSeq::NoCase,
+            CollationSeq::MySqlUtf8mb4Bin,
+            CollationSeq::MySqlUca9,
+            CollationSeq::MySqlUca400,
+            CollationSeq::MySqlUtf8mb3Uca400,
+        ] {
+            for text in &texts {
+                let mut pieces = WrittenPieces::default();
+                collation.write_hash_key(text, &mut pieces);
+                assert_eq!(
+                    pieces.0,
+                    vec![collation.hash_key(text)],
+                    "{collation} {text:?}"
+                );
+            }
+        }
     }
 
     #[test]

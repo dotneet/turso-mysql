@@ -5,7 +5,9 @@
 //! license is in `licenses/core/unicode-data-license.md`. No MySQL source tables are copied.
 //! The source files and their SHA-256 hashes are in the generator.
 
-use std::{cmp::Ordering, str::Chars};
+use std::{cmp::Ordering, hash::Hasher, str::Chars};
+
+use super::collate::{sort_key_on_stack, STACK_SORT_KEY_LEN};
 
 const DATA: &[u8] = include_bytes!("mysql_uca9_primary.bin");
 const HEADER_LEN: usize = 20;
@@ -24,6 +26,14 @@ pub(crate) fn sort_key(text: &str) -> Vec<u8> {
         key.extend_from_slice(&weight.to_be_bytes());
     }
     key
+}
+
+pub(crate) fn write_sort_key(text: &str, hasher: &mut impl Hasher) {
+    let mut key = [0; STACK_SORT_KEY_LEN];
+    match sort_key_on_stack(&mut key, PrimaryWeights::new(text)) {
+        Some(len) => hasher.write(&key[..len]),
+        None => hasher.write(&sort_key(text)),
+    }
 }
 
 /// Match MySQL LIKE one Unicode scalar at a time. Collation expansions do not

@@ -5,6 +5,8 @@ use codspeed_criterion_compat::{
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
+use rapidhash::fast::RapidHasher;
+use std::hash::Hasher;
 use std::sync::Arc;
 use std::time::Duration;
 use turso_core::{CollationSeq, Database, MemoryIO, SqliteDialect, Statement, StepResult};
@@ -59,12 +61,31 @@ fn bench_mysql_collation(criterion: &mut Criterion) {
                         .count()
                 })
             });
-            group.bench_function(format!("hash_key/{collation_label}/{text_label}"), |b| {
+            group.bench_function(
+                format!("hash_allocated_key/{collation_label}/{text_label}"),
+                |b| {
+                    b.iter(|| {
+                        texts
+                            .iter()
+                            .map(|text| {
+                                let mut hasher = RapidHasher::default();
+                                hasher.write(&collation.hash_key(text));
+                                hasher.finish()
+                            })
+                            .fold(0, u64::wrapping_add)
+                    })
+                },
+            );
+            group.bench_function(format!("hash/{collation_label}/{text_label}"), |b| {
                 b.iter(|| {
                     texts
                         .iter()
-                        .map(|text| collation.hash_key(text).len())
-                        .sum::<usize>()
+                        .map(|text| {
+                            let mut hasher = RapidHasher::default();
+                            collation.write_hash_key(text, &mut hasher);
+                            hasher.finish()
+                        })
+                        .fold(0, u64::wrapping_add)
                 })
             });
         }

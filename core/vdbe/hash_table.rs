@@ -101,7 +101,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     | CollationSeq::MySqlUca9
                     | CollationSeq::MySqlUca400
                     | CollationSeq::MySqlUtf8mb3Uca400 => {
-                        hasher.write(&collation.hash_key(text.as_str()));
+                        collation.write_hash_key(text.as_str(), &mut hasher);
                     }
                     CollationSeq::Custom(_) => {
                         unreachable!(
