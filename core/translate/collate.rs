@@ -234,6 +234,32 @@ impl CollationSeq {
     }
 }
 
+pub(super) fn shared_prefix_len(lhs: &str, rhs: &str) -> usize {
+    let (left, right) = (lhs.as_bytes(), rhs.as_bytes());
+    let shorter = left.len().min(right.len());
+    let mut len = 0;
+    while len + 8 <= shorter {
+        let a = u64::from_le_bytes(left[len..len + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(right[len..len + 8].try_into().unwrap());
+        if a != b {
+            len += ((a ^ b).trailing_zeros() / 8) as usize;
+            return back_to_shared_char_boundary(lhs, rhs, len);
+        }
+        len += 8;
+    }
+    while len < shorter && left[len] == right[len] {
+        len += 1;
+    }
+    back_to_shared_char_boundary(lhs, rhs, len)
+}
+
+fn back_to_shared_char_boundary(lhs: &str, rhs: &str, mut len: usize) -> usize {
+    while !lhs.is_char_boundary(len) || !rhs.is_char_boundary(len) {
+        len -= 1;
+    }
+    len
+}
+
 fn resolve_collation_name(
     collation: &str,
     symbol_table: Option<&SymbolTable>,
@@ -1256,5 +1282,110 @@ mod tests {
             ))),
         });
         table_references
+    }
+}
+
+#[cfg(test)]
+pub(super) mod test_text {
+    use rand_chacha::{
+        rand_core::{RngCore, SeedableRng},
+        ChaCha8Rng,
+    };
+
+    const TRICKY_CHARACTERS: &[char] = &[
+        'é',
+        'ê',
+        'É',
+        '\u{301}',
+        'ß',
+        'æ',
+        'ı',
+        'İ',
+        'ﬃ',
+        'Ａ',
+        '\u{a0}',
+        '\u{3000}',
+        '\u{200d}',
+        '\u{fdfa}',
+        '\u{fdfd}',
+        '一',
+        '\u{3400}',
+        '가',
+        '😀',
+        '😃',
+        '𐐀',
+        '\u{20000}',
+        '\u{17000}',
+        '\u{10ffff}',
+        '\u{1}',
+        '\0',
+        '\t',
+        ' ',
+        '-',
+        '0',
+        '9',
+        'a',
+        'A',
+        'z',
+    ];
+
+    pub(in crate::translate) fn similar_pairs(seed: u64, count: usize) -> Vec<(String, String)> {
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        (0..count)
+            .map(|_| {
+                let left = random_text(&mut rng);
+                let right = similar_text(&mut rng, &left);
+                (left, right)
+            })
+            .collect()
+    }
+
+    fn random_text(rng: &mut ChaCha8Rng) -> String {
+        let len = (rng.next_u32() % 12) as usize;
+        (0..len).map(|_| random_character(rng)).collect()
+    }
+
+    fn similar_text(rng: &mut ChaCha8Rng, text: &str) -> String {
+        let mut characters: Vec<char> = text.chars().collect();
+        match rng.next_u32() % 8 {
+            0 => text.to_string(),
+            1 => text.to_uppercase(),
+            2 if !characters.is_empty() => {
+                let at = rng.next_u32() as usize % characters.len();
+                characters[at] = random_character(rng);
+                characters.into_iter().collect()
+            }
+            3 => {
+                let keep = rng.next_u32() as usize % (characters.len() + 1);
+                characters.truncate(keep);
+                characters.into_iter().collect()
+            }
+            4 => {
+                let padding = [' ', '\t', '\u{1}', '\u{200d}'];
+                for _ in 0..rng.next_u32() % 4 {
+                    characters.push(padding[rng.next_u32() as usize % padding.len()]);
+                }
+                characters.into_iter().collect()
+            }
+            5 => {
+                let at = rng.next_u32() as usize % (characters.len() + 1);
+                characters.insert(at, random_character(rng));
+                characters.into_iter().collect()
+            }
+            _ => random_text(rng),
+        }
+    }
+
+    fn random_character(rng: &mut ChaCha8Rng) -> char {
+        match rng.next_u32() % 4 {
+            0 => char::from((rng.next_u32() % 128) as u8),
+            1 => TRICKY_CHARACTERS[rng.next_u32() as usize % TRICKY_CHARACTERS.len()],
+            2 => char::from_u32(rng.next_u32() % 0x3000).unwrap_or('x'),
+            _ => loop {
+                if let Some(character) = char::from_u32(rng.next_u32() % 0x11_0000) {
+                    break character;
+                }
+            },
+        }
     }
 }

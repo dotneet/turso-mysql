@@ -13,7 +13,8 @@ const RECORD_LEN: usize = 9;
 
 /// Compare the primary collation weights, ignoring accents and case.
 pub fn compare(lhs: &str, rhs: &str) -> Ordering {
-    PrimaryWeights::new(lhs).cmp(PrimaryWeights::new(rhs))
+    let shared = super::collate::shared_prefix_len(lhs, rhs);
+    PrimaryWeights::new(&lhs[shared..]).cmp(PrimaryWeights::new(&rhs[shared..]))
 }
 
 /// The same primary weights as a byte key for hash joins and grouping.
@@ -77,6 +78,12 @@ impl Iterator for PrimaryWeights<'_> {
                 return Some(weight);
             }
             let codepoint = self.characters.next()? as u32;
+            if let Some(&weight) = ASCII_WEIGHTS.get(codepoint as usize) {
+                if weight != 0 {
+                    return Some(weight);
+                }
+                continue;
+            }
             if let Some((offset, count)) = explicit_weights(codepoint) {
                 self.offset = offset;
                 self.remaining = count;
@@ -88,7 +95,26 @@ impl Iterator for PrimaryWeights<'_> {
     }
 }
 
-fn explicit_weights(codepoint: u32) -> Option<(usize, usize)> {
+const ASCII_WEIGHTS: [u16; 128] = ascii_weights();
+
+const fn ascii_weights() -> [u16; 128] {
+    let mut weights = [0; 128];
+    let mut codepoint = 0;
+    while codepoint < 128 {
+        let Some((offset, count)) = explicit_weights(codepoint as u32) else {
+            panic!("every ASCII character has an entry in the table");
+        };
+        assert!(count <= 1, "no ASCII character has more than one weight");
+        if count == 1 {
+            weights[codepoint] = u16::from_be_bytes([DATA[offset], DATA[offset + 1]]);
+            assert!(weights[codepoint] != 0, "the table holds no zero weight");
+        }
+        codepoint += 1;
+    }
+    weights
+}
+
+const fn explicit_weights(codepoint: u32) -> Option<(usize, usize)> {
     let count = read_u32(8) as usize;
     let weights_start = HEADER_LEN + count * RECORD_LEN;
     let mut lo = 0;
@@ -96,14 +122,15 @@ fn explicit_weights(codepoint: u32) -> Option<(usize, usize)> {
     while lo < hi {
         let middle = lo + (hi - lo) / 2;
         let record = HEADER_LEN + middle * RECORD_LEN;
-        match read_u32(record).cmp(&codepoint) {
-            Ordering::Less => lo = middle + 1,
-            Ordering::Greater => hi = middle,
-            Ordering::Equal => {
-                let offset = read_u32(record + 4) as usize;
-                let len = DATA[record + 8] as usize;
-                return Some((weights_start + offset * 2, len));
-            }
+        let record_codepoint = read_u32(record);
+        if record_codepoint < codepoint {
+            lo = middle + 1;
+        } else if record_codepoint > codepoint {
+            hi = middle;
+        } else {
+            let offset = read_u32(record + 4) as usize;
+            let len = DATA[record + 8] as usize;
+            return Some((weights_start + offset * 2, len));
         }
     }
     None
@@ -148,8 +175,13 @@ fn is_unified_ideograph(codepoint: u32) -> bool {
     false
 }
 
-fn read_u32(offset: usize) -> u32 {
-    u32::from_le_bytes(DATA[offset..offset + 4].try_into().unwrap())
+const fn read_u32(offset: usize) -> u32 {
+    u32::from_le_bytes([
+        DATA[offset],
+        DATA[offset + 1],
+        DATA[offset + 2],
+        DATA[offset + 3],
+    ])
 }
 
 #[cfg(test)]
@@ -163,6 +195,73 @@ mod tests {
         assert_eq!(read_u32(12), 65_049);
         assert_eq!(read_u32(16), 13);
         assert_eq!(DATA.len(), 499_051);
+    }
+
+    #[test]
+    fn every_character_has_the_weights_of_the_table() {
+        for codepoint in 0..=0x10ffff {
+            let Some(character) = char::from_u32(codepoint) else {
+                continue;
+            };
+            let mut bytes = [0; 4];
+            let text = character.encode_utf8(&mut bytes);
+            assert_eq!(
+                PrimaryWeights::new(text).collect::<Vec<_>>(),
+                weights_from_the_table(text),
+                "U+{codepoint:04X}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pair_of_ascii_characters_compares_by_the_weights_of_the_table() {
+        let texts: Vec<String> = std::iter::once(String::new())
+            .chain((0..128u8).map(|byte| char::from(byte).to_string()))
+            .collect();
+        for left in &texts {
+            for right in &texts {
+                assert_eq!(
+                    compare(left, right),
+                    weights_from_the_table(left).cmp(&weights_from_the_table(right)),
+                    "{left:?} / {right:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_texts_compare_and_hash_by_the_weights_of_the_table() {
+        for (left, right) in super::super::collate::test_text::similar_pairs(9, 200_000) {
+            assert_eq!(
+                compare(&left, &right),
+                weights_from_the_table(&left).cmp(&weights_from_the_table(&right)),
+                "{left:?} / {right:?}"
+            );
+            assert_eq!(
+                sort_key(&left),
+                weights_from_the_table(&left)
+                    .into_iter()
+                    .flat_map(u16::to_be_bytes)
+                    .collect::<Vec<_>>(),
+                "{left:?}"
+            );
+        }
+    }
+
+    fn weights_from_the_table(text: &str) -> Vec<u16> {
+        let mut weights = Vec::new();
+        for character in text.chars() {
+            let codepoint = u32::from(character);
+            match explicit_weights(codepoint) {
+                Some((offset, count)) => weights.extend(
+                    DATA[offset..offset + count * 2]
+                        .chunks(2)
+                        .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
+                ),
+                None => weights.extend(implicit_weights(codepoint)),
+            }
+        }
+        weights
     }
 
     #[test]
