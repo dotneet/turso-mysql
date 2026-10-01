@@ -4302,6 +4302,54 @@ fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result
 }
 
 #[test]
+fn kept_statements_still_run_after_a_rollback_to_a_savepoint_and_a_new_table() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-kept-after-savepoints.db", [0x5c; 16])?;
+    connection.execute(
+        "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, u INT UNIQUE)",
+    )?;
+    let insert = |u: i64| {
+        connection
+            .execute_checked_write(&format!("INSERT INTO records (u) VALUES ({u})"), None)
+            .unwrap()
+    };
+    let command = |sql: &str| connection.execute_transaction_command(sql).unwrap();
+    for round in 0..3 {
+        let u = round * 10;
+        command("START TRANSACTION");
+        insert(u + 1);
+        command("SAVEPOINT s");
+        insert(u + 2);
+        command("ROLLBACK TO SAVEPOINT s");
+        insert(u + 3);
+        command("COMMIT");
+        connection.execute(&format!("CREATE TABLE other_{round} (x INT)"))?;
+        insert(u + 4);
+    }
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, u FROM records ORDER BY id")?
+            .run_collect_rows()?,
+        [
+            (1, 1),
+            (3, 3),
+            (4, 4),
+            (5, 11),
+            (7, 13),
+            (8, 14),
+            (9, 21),
+            (11, 23),
+            (12, 24)
+        ]
+        .into_iter()
+        .map(|(id, u)| vec![Value::from_i64(id), Value::from_i64(u)])
+        .collect::<Vec<_>>()
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transactions() -> Result<()>
 {
     let (connection, _allocator, _io) =
