@@ -1422,6 +1422,14 @@ impl WalCoordination for InProcessWalCoordination {
     fn rollback_cache(&self, max_frame: u64) {
         let shared = self.shared.read();
         let mut frame_cache = shared.runtime.frame_cache.lock();
+        if shared
+            .runtime
+            .frame_cache_high_water
+            .load(Ordering::Acquire)
+            <= max_frame
+        {
+            return;
+        }
         frame_cache.retain(|_page_id, frames| {
             while frames.last().is_some_and(|&frame| frame > max_frame) {
                 frames.pop();
@@ -7865,6 +7873,27 @@ pub mod test {
         );
         // Page 7's still-valid lower frame (3) survives; its stale 5 is gone.
         assert_eq!(coordination.find_frame(7, 0, 10, None), Some(3));
+    }
+
+    #[test]
+    fn rollback_cache_keeps_frames_up_to_the_rollback_point_and_drops_the_rest() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = make_test_coordination(&shared);
+        coordination.cache_frame(7, 1);
+        coordination.cache_frame(9, 2);
+        coordination.cache_frame(7, 3);
+
+        coordination.rollback_cache(3);
+        coordination.rollback_cache(10);
+        assert_eq!(coordination.find_frame(7, 0, 10, None), Some(3));
+        assert_eq!(coordination.find_frame(9, 0, 10, None), Some(2));
+
+        coordination.rollback_cache(1);
+        assert_eq!(coordination.find_frame(7, 0, 10, None), Some(1));
+        assert_eq!(coordination.find_frame(9, 0, 10, None), None);
+
+        coordination.cache_frame(9, 2);
+        assert_eq!(coordination.find_frame(9, 0, 10, None), Some(2));
     }
 
     #[test]
