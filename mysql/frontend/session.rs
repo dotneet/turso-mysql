@@ -1428,6 +1428,7 @@ struct PreparedAutoIncrementInsert {
     insert: CheckedAutoIncrementInsert,
     table: AutoIncrementTable,
     parameter_count: usize,
+    last_engine_statement: Mutex<Option<(Stmt, Statement)>>,
 }
 
 /// A prepared `INSERT ... SELECT` into a table that counts its own ids,
@@ -3159,6 +3160,7 @@ impl MySqlConnection {
                 insert,
                 table,
                 parameter_count,
+                last_engine_statement: Mutex::new(None),
             })),
         ))
     }
@@ -3729,29 +3731,57 @@ impl MySqlConnection {
                     .inject_row_ids(&reserved.ids)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
                 self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
-                    let options =
-                        injected_auto_increment_prepare_options(&table, statement.clone());
-                    let mut statement = self.inner.prepare_translated_stmt_with_options(
-                        statement,
-                        &insert.sql,
-                        &options,
-                    )?;
-                    if statement.parameters_count() != insert.parameter_count {
+                    let reusable = stamped.is_empty();
+                    let last = reusable
+                        .then(|| {
+                            insert
+                                .last_engine_statement
+                                .lock()
+                                .expect("prepared counted INSERT statement mutex poisoned")
+                                .take()
+                        })
+                        .flatten()
+                        .filter(|(last_statement, _)| *last_statement == statement);
+                    let (statement, mut engine_statement) = match last {
+                        Some((statement, mut engine_statement)) => {
+                            engine_statement.clear_bindings();
+                            (statement, engine_statement)
+                        }
+                        None => {
+                            let options =
+                                injected_auto_increment_prepare_options(&table, statement.clone());
+                            let engine_statement =
+                                self.inner.prepare_translated_stmt_with_options(
+                                    statement.clone(),
+                                    &insert.sql,
+                                    &options,
+                                )?;
+                            (statement, engine_statement)
+                        }
+                    };
+                    if engine_statement.parameters_count() != insert.parameter_count {
                         return Err(LimboError::InternalError(
                             "prepared AUTO_INCREMENT INSERT changed its parameter count"
                                 .to_string(),
                         ));
                     }
-                    bind_prepared_values(&mut statement, &reserved.bound_values)?;
+                    bind_prepared_values(&mut engine_statement, &reserved.bound_values)?;
                     let result = (|| -> Result<()> {
                         let timeout = self
                             .remaining_write_timeout(deadline)
                             .map_err(Into::<LimboError>::into)?;
-                        run_checked_write_statement(&mut statement, timeout).map_err(|error| {
-                            self.map_unsigned_decimal_write_error(error, Some(&table.name))
-                        })
+                        run_checked_write_statement(&mut engine_statement, timeout).map_err(
+                            |error| self.map_unsigned_decimal_write_error(error, Some(&table.name)),
+                        )
                     })();
-                    let reset_result = statement.reset();
+                    let reset_result = engine_statement.reset();
+                    if reusable && result.is_ok() && reset_result.is_ok() {
+                        *insert
+                            .last_engine_statement
+                            .lock()
+                            .expect("prepared counted INSERT statement mutex poisoned") =
+                            Some((statement, engine_statement));
+                    }
                     result.and(reset_result)
                 })
             });

@@ -4131,6 +4131,94 @@ fn a_counted_table_is_read_from_the_catalog_once_for_each_schema_another_session
 }
 
 #[test]
+fn a_prepared_counted_insert_runs_its_engine_statement_again_when_it_writes_the_same_statement(
+) -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-prepared-counted-reuse.db", [0x5b; 16])?;
+    connection.execute(
+        "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, u INT UNIQUE, label TEXT)",
+    )?;
+    let named = connection
+        .prepare_checked_statement("INSERT INTO records (id, u, label) VALUES (?, ?, ?)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let counted = connection
+        .prepare_checked_statement("INSERT INTO records (u, label) VALUES (?, ?)")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    let run = |statement: u32, values: &[MySqlPreparedValue]| {
+        connection.execute_prepared_statement(
+            statement,
+            values,
+            None,
+            MySqlAffectedRowsMode::Changed,
+        )
+    };
+    let word = |text: &str| MySqlPreparedValue::Text(text.to_string());
+    let kept = |statement: u32| {
+        let registry = connection.prepared_statements.lock().unwrap();
+        let PreparedExecutionPlan::AutoIncrementInsert(insert) =
+            &registry.statements[&statement].execution_plan
+        else {
+            panic!("a counted INSERT is prepared as one");
+        };
+        let kept = insert.last_engine_statement.lock().unwrap().is_some();
+        kept
+    };
+    use MySqlPreparedValue::Integer;
+    for (u, label) in [(1, "a"), (2, "b"), (3, "c")] {
+        run(counted.statement_id, &[Integer(u), word(label)]).unwrap();
+    }
+    connection
+        .execute_checked_write("DELETE FROM records WHERE id = 2", None)
+        .unwrap();
+    run(named.statement_id, &[Integer(2), Integer(20), word("x")]).unwrap();
+    assert!(kept(named.statement_id));
+    run(named.statement_id, &[Integer(2), Integer(21), word("y")]).unwrap_err();
+    assert!(!kept(named.statement_id));
+    connection
+        .execute_checked_write("DELETE FROM records WHERE id = 1", None)
+        .unwrap();
+    run(
+        named.statement_id,
+        &[Integer(1), Integer(10), MySqlPreparedValue::Null],
+    )
+    .unwrap();
+    connection
+        .execute_checked_write("DELETE FROM records WHERE id = 3", None)
+        .unwrap();
+    run(named.statement_id, &[Integer(3), Integer(30), word("z")]).unwrap();
+    assert!(kept(named.statement_id));
+    connection.execute("CREATE TABLE other_records (x INT)")?;
+    connection
+        .execute_checked_write("DELETE FROM records WHERE id = 2", None)
+        .unwrap();
+    run(named.statement_id, &[Integer(2), Integer(22), word("w")]).unwrap();
+    assert!(kept(named.statement_id));
+    run(counted.statement_id, &[Integer(4), word("e")]).unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, u, label FROM records ORDER BY id")?
+            .run_collect_rows()?,
+        [
+            (1, 10, None),
+            (2, 22, Some("w")),
+            (3, 30, Some("z")),
+            (4, 4, Some("e")),
+        ]
+        .into_iter()
+        .map(|(id, u, label)| {
+            vec![
+                Value::from_i64(id),
+                Value::from_i64(u),
+                label.map_or(Value::Null, Value::from_text),
+            ]
+        })
+        .collect::<Vec<_>>()
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-shared-counted-table.db", [0x5a; 16])?;
