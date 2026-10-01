@@ -1314,7 +1314,7 @@ cargo test -p turso_mysql_conformance
 cargo deny check licenses
 make -C mysql/conformance down
 cargo fmt
-cargo clippy --workspace --all-features --all-targets -- --deny=warnings
+cargo clippy --workspace --all-features --all-targets --exclude memory-benchmark -- --deny=warnings
 cargo test -p turso_mysql_parser
 cargo test -p turso_mysql
 cargo test -p turso_mysql_server

@@ -8,7 +8,7 @@ SQLite rewrite in Rust. 40+ crate workspace.
 cargo build                    # build. never build with --release
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
-cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
+cargo clippy --workspace --all-features --all-targets --exclude memory-benchmark -- --deny=warnings  # lint; memory-benchmark sets its own global allocator, so check it alone with -p
 cargo run -q --bin tursodb -- -q # run the interactive cli. never run with --release
 
 make test                      # TCL compat + sqlite3 + extensions + MVCC
