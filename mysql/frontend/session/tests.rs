@@ -4131,6 +4131,19 @@ fn a_counted_table_is_read_from_the_catalog_once_for_each_schema_another_session
 }
 
 #[test]
+fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-shared-counted-table.db", [0x5a; 16])?;
+    connection.execute("CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)")?;
+    let first = connection.load_auto_increment_table("records")?.unwrap();
+    let second = connection.load_auto_increment_table("RECORDS")?.unwrap();
+    assert!(Arc::ptr_eq(&first.definition, &second.definition));
+    assert!(Arc::ptr_eq(&first.stored_sql, &second.stored_sql));
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transactions() -> Result<()>
 {
     let (connection, _allocator, _io) =

@@ -5364,7 +5364,7 @@ impl MySqlConnection {
         let options = PrepareOptions::default().with_assignment_validator(Arc::new(
             CountedTableAssignmentValidator {
                 table_name: counted.name,
-                table_sql: counted.stored_sql,
+                table_sql: counted.stored_sql.to_string(),
                 allocator_column_ordinal: counted.definition.allocator_column_ordinal,
             },
         ));
@@ -9442,7 +9442,7 @@ impl MySqlConnection {
             options =
                 options.with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
                     table_name: table.name.clone(),
-                    table_sql: table.stored_sql.clone(),
+                    table_sql: table.stored_sql.to_string(),
                     allocator_column_ordinal: table.definition.allocator_column_ordinal,
                 }));
         }
@@ -13761,9 +13761,9 @@ struct FrozenSelectParser {
 #[derive(Clone)]
 struct AutoIncrementTable {
     name: String,
-    definition: CheckedAutoIncrementCreateTable,
+    definition: Arc<CheckedAutoIncrementCreateTable>,
     key: AutoIncrementKey,
-    stored_sql: String,
+    stored_sql: Arc<str>,
 }
 
 /// Returns the highest key the allocator may hand out for one table.
@@ -13929,9 +13929,9 @@ fn read_counted_table_from_stored_sql(
     })?;
     Ok(Some(AutoIncrementTable {
         name: definition.table_name.clone(),
-        definition,
+        definition: Arc::new(definition),
         key,
-        stored_sql: sql.to_owned(),
+        stored_sql: Arc::from(sql),
     }))
 }
 
@@ -13978,7 +13978,7 @@ fn injected_auto_increment_prepare_options(
         }))
         .with_assignment_validator(Arc::new(CountedTableAssignmentValidator {
             table_name: table.name.clone(),
-            table_sql: table.stored_sql.clone(),
+            table_sql: table.stored_sql.to_string(),
             allocator_column_ordinal: table.definition.allocator_column_ordinal,
         }))
 }
