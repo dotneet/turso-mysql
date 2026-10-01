@@ -591,7 +591,7 @@ impl MySqlConnection {
             .map(|columns| columns.as_ref().clone())
     }
 
-    pub(crate) fn list_shared_columns(
+    pub fn list_shared_columns(
         &self,
         table: &MySqlTableName,
     ) -> std::result::Result<Arc<Vec<MySqlColumnMetadata>>, MySqlColumnMetadataError> {

@@ -998,3 +998,35 @@ fn laravel_reads_and_changes_a_json_member_named_in_quotes() {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
 }
+
+#[test]
+fn a_prepared_selects_result_metadata_shares_the_tables_kept_columns() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("CREATE TABLE notes (id INT PRIMARY KEY, body VARCHAR(10))")
+        .unwrap();
+    let connection = adapter.session.connection().unwrap().clone();
+    let select = parse_select(
+        "SELECT body FROM notes WHERE id = ?",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    let read = || {
+        table_result_metadata_for_references(
+            &connection,
+            &[("notes".to_owned(), 1)],
+            Some("reports"),
+            select.source_tables(),
+            false,
+            None,
+        )
+        .unwrap()
+        .unwrap()
+    };
+    let (first, second) = (read(), read());
+    assert!(Arc::ptr_eq(
+        &first.tables[0].columns,
+        &second.tables[0].columns
+    ));
+    assert_eq!(first.tables[0].columns[1].name(), "body");
+}

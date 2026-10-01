@@ -7622,7 +7622,7 @@ struct SourceTableColumns {
     table_reference: String,
     branch: usize,
     subquery: bool,
-    columns: Vec<MySqlColumnMetadata>,
+    columns: Arc<Vec<MySqlColumnMetadata>>,
     /// An `information_schema` table's columns, whose shapes are the ones
     /// MySQL reports for them rather than shapes read out of stored DDL. A
     /// table has these or the ones above, never both.
@@ -12014,7 +12014,7 @@ fn table_result_metadata_for_references(
                 table_reference: source.reference().to_owned(),
                 branch: source.branch(),
                 subquery: source.subquery(),
-                columns: Vec::new(),
+                columns: Arc::default(),
                 catalog_columns: catalog_table_columns(catalog),
                 view_columns: Vec::new(),
                 outer: source.outer(),
@@ -12033,19 +12033,19 @@ fn table_result_metadata_for_references(
         let mut view_columns = Vec::new();
         let columns = if table_kind == MySqlTableKind::BaseTable {
             connection
-                .list_columns(source.table())
+                .list_shared_columns(source.table())
                 .map_err(column_metadata_error_kind)?
         } else if let Some(written) =
             written_view_columns(connection, selected_database, source.table(), sql)?
         {
             view_columns = written;
-            Vec::new()
+            Arc::default()
         } else {
             // A view projecting one table's columns reports each the way the
             // table does, under the view's own name. Any other view stays on
             // the generic path, its wire fields not measured.
             match connection.columns_a_view_reads(source.table()) {
-                Ok(columns) => columns,
+                Ok(columns) => Arc::new(columns),
                 Err(_) => return Ok(None),
             }
         };
@@ -12059,7 +12059,9 @@ fn table_result_metadata_for_references(
             (columns, source.projected_columns().to_vec())
         } else {
             (
-                columns_read_through_joined_tables(connection, &listed, joined)?,
+                Arc::new(columns_read_through_joined_tables(
+                    connection, &listed, joined,
+                )?),
                 Vec::new(),
             )
         };
@@ -12215,7 +12217,7 @@ fn written_view_columns(
                 table_reference: at.to_string(),
                 branch: 0,
                 subquery: false,
-                columns,
+                columns: Arc::new(columns),
                 catalog_columns: Vec::new(),
                 view_columns: Vec::new(),
                 projected_columns: Vec::new(),
