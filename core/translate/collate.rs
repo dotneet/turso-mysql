@@ -256,6 +256,26 @@ impl CollationSeq {
 
 pub(super) const STACK_SORT_KEY_LEN: usize = 512;
 
+pub(super) fn ascii_sort_key_on_stack(
+    key: &mut [u8; STACK_SORT_KEY_LEN],
+    text: &str,
+    ascii_weights: &[u16; 128],
+) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if bytes.len() * 2 > key.len() {
+        return None;
+    }
+    let mut len = 0;
+    for &byte in bytes {
+        let weight = ascii_weights[usize::from(byte)];
+        key[len..len + 2].copy_from_slice(&weight.to_be_bytes());
+        if weight != 0 {
+            len += 2;
+        }
+    }
+    Some(len)
+}
+
 pub(super) fn sort_key_on_stack(
     key: &mut [u8; STACK_SORT_KEY_LEN],
     weights: impl Iterator<Item = u16>,
@@ -754,10 +774,14 @@ mod tests {
         let long_texts = [255, 256, 257, 400].into_iter().flat_map(|len| {
             ["a", " ", "ß", "a\u{1}", "😀"].map(|unit| unit.repeat(len) + &" ".repeat(len % 3))
         });
+        let ascii_texts = (0..128u8)
+            .map(|byte| char::from(byte).to_string())
+            .chain(["75233289029-83315713464-\0\t AbC~".to_string()]);
         let texts: Vec<String> = test_text::similar_pairs(7, 20_000)
             .into_iter()
             .flat_map(|(left, right)| [left, right])
             .chain(long_texts)
+            .chain(ascii_texts)
             .collect();
         for collation in [
             CollationSeq::Binary,

@@ -11,7 +11,7 @@
 
 use std::{cmp::Ordering, hash::Hasher, str::Chars};
 
-use super::collate::{sort_key_on_stack, STACK_SORT_KEY_LEN};
+use super::collate::{ascii_sort_key_on_stack, sort_key_on_stack, STACK_SORT_KEY_LEN};
 
 const DATA: &[u8] = include_bytes!("mysql_uca400_primary.bin");
 const HEADER_LEN: usize = 16;
@@ -79,7 +79,12 @@ pub(crate) fn leading_weights(text: &str) -> ([u16; 3], bool) {
 
 pub(crate) fn write_sort_key(text: &str, hasher: &mut impl Hasher) {
     let mut key = [0; STACK_SORT_KEY_LEN];
-    match sort_key_on_stack(&mut key, PrimaryWeights::new(text)) {
+    let len = if text.is_ascii() {
+        ascii_sort_key_on_stack(&mut key, text, &ASCII_WEIGHTS)
+    } else {
+        sort_key_on_stack(&mut key, PrimaryWeights::new(text))
+    };
+    match len {
         Some(mut len) => {
             while len >= 2 && key[len - 2..len] == SPACE.to_be_bytes() {
                 len -= 2;
