@@ -82,6 +82,7 @@ pub struct MySqlConnection {
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     schema_readings: Arc<Mutex<SchemaReadings>>,
     prepared_counted_rows_savepoints: Arc<Mutex<HashMap<&'static str, turso_core::Statement>>>,
+    prepared_transaction_statements: Arc<Mutex<Vec<(Stmt, String, turso_core::Statement)>>>,
     /// The catalog's WAL keeper and this connection's database, when the
     /// connection belongs to a catalog.
     wal_keeper: Option<(WalKeeperHandle, std::sync::Weak<turso_core::Database>)>,
@@ -1658,6 +1659,7 @@ impl MySqlConnection {
             prepared_statement_authority,
             schema_readings: Arc::default(),
             prepared_counted_rows_savepoints: Arc::default(),
+            prepared_transaction_statements: Arc::default(),
             wal_keeper: None,
             database_collation: None,
             database_user: None,
@@ -4266,10 +4268,40 @@ impl MySqlConnection {
         statement: Stmt,
         sql: &str,
     ) -> std::result::Result<(), MySqlQueryError> {
-        self.inner
-            .prepare_translated_stmt(statement, sql)
-            .and_then(|mut statement| statement.run_ignore_rows())
-            .map_err(MySqlQueryError::Engine)
+        const KEPT_TRANSACTION_STATEMENTS: usize = 8;
+        let kept = {
+            let mut kept = self
+                .prepared_transaction_statements
+                .lock()
+                .expect("MySQL transaction statements mutex poisoned");
+            kept.iter()
+                .position(|(kept, kept_sql, _)| *kept == statement && kept_sql == sql)
+                .map(|at| kept.remove(at).2)
+        };
+        let mut engine_statement = match kept {
+            Some(engine_statement) => {
+                self.inner.maybe_update_schema();
+                engine_statement
+            }
+            None => self
+                .inner
+                .prepare_translated_stmt(statement.clone(), sql)
+                .map_err(MySqlQueryError::Engine)?,
+        };
+        engine_statement
+            .run_ignore_rows()
+            .map_err(MySqlQueryError::Engine)?;
+        if engine_statement.reset().is_ok() {
+            let mut kept = self
+                .prepared_transaction_statements
+                .lock()
+                .expect("MySQL transaction statements mutex poisoned");
+            if kept.len() == KEPT_TRANSACTION_STATEMENTS {
+                kept.remove(0);
+            }
+            kept.push((statement, sql.to_owned(), engine_statement));
+        }
+        Ok(())
     }
 
     /// Whether a statement runs read-only: inside a transaction, by that

@@ -4219,6 +4219,61 @@ fn a_prepared_counted_insert_runs_its_engine_statement_again_when_it_writes_the_
 }
 
 #[test]
+fn transaction_commands_run_their_kept_engine_statements_again() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-kept-transactions.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    let other = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT PRIMARY KEY)")?;
+    let insert = |id: i64| {
+        connection
+            .execute_checked_write(&format!("INSERT INTO records (id) VALUES ({id})"), None)
+            .unwrap()
+    };
+    for (id, end) in [
+        (1, "COMMIT"),
+        (2, "ROLLBACK"),
+        (3, "COMMIT"),
+        (4, "ROLLBACK"),
+    ] {
+        connection.execute_transaction_command("BEGIN").unwrap();
+        insert(id);
+        connection.execute_transaction_command(end).unwrap();
+    }
+    other.execute("CREATE TABLE other_records (x INT)")?;
+    other.execute("INSERT INTO other_records (x) VALUES (7)")?;
+    connection.execute_transaction_command("BEGIN").unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT x FROM other_records")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(7)]]
+    );
+    insert(5);
+    connection.execute_transaction_command("COMMIT").unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM records ORDER BY id")?
+            .run_collect_rows()?,
+        [1, 3, 5]
+            .into_iter()
+            .map(|id| vec![Value::from_i64(id)])
+            .collect::<Vec<_>>()
+    );
+    let kept = connection
+        .prepared_transaction_statements
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, sql, _)| sql.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kept, ["ROLLBACK", "BEGIN", "COMMIT"]);
+    other.close()?;
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-shared-counted-table.db", [0x5a; 16])?;
