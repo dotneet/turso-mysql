@@ -4130,6 +4130,59 @@ fn a_counted_table_is_read_from_the_catalog_once_for_each_schema_another_session
     Ok(())
 }
 
+#[test]
+fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transactions() -> Result<()>
+{
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-kept-savepoints.db", [0x59; 16])?;
+    connection.execute(
+        "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, u INT UNIQUE)",
+    )?;
+    let insert = |u: i64| {
+        connection.execute_checked_write(&format!("INSERT INTO records (u) VALUES ({u})"), None)
+    };
+    insert(1).unwrap();
+    insert(1).unwrap_err();
+    insert(2).unwrap();
+    connection.execute_transaction_command("BEGIN").unwrap();
+    insert(3).unwrap();
+    insert(3).unwrap_err();
+    insert(4).unwrap();
+    connection.execute_transaction_command("ROLLBACK").unwrap();
+    connection.execute_transaction_command("BEGIN").unwrap();
+    insert(5).unwrap();
+    insert(5).unwrap_err();
+    connection.execute_transaction_command("COMMIT").unwrap();
+    insert(6).unwrap();
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, u FROM records ORDER BY id")?
+            .run_collect_rows()?,
+        [(1, 1), (3, 2), (7, 5), (9, 6)]
+            .into_iter()
+            .map(|(id, u)| vec![Value::from_i64(id), Value::from_i64(u)])
+            .collect::<Vec<_>>()
+    );
+    let mut kept = connection
+        .prepared_counted_rows_savepoints
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    kept.sort_unstable();
+    assert_eq!(
+        kept,
+        [
+            RELEASE_THE_COUNTED_ROWS_SAVEPOINT,
+            ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT,
+            SET_THE_COUNTED_ROWS_SAVEPOINT
+        ]
+    );
+    connection.close()?;
+    Ok(())
+}
+
 /// A write can leave the WAL holding far more than the engine's own
 /// checkpoint empties, so past a bound it is truncated, but never inside a
 /// transaction.

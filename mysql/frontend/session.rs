@@ -81,6 +81,7 @@ pub struct MySqlConnection {
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     schema_readings: Arc<Mutex<SchemaReadings>>,
+    prepared_counted_rows_savepoints: Arc<Mutex<HashMap<&'static str, turso_core::Statement>>>,
     /// The catalog's WAL keeper and this connection's database, when the
     /// connection belongs to a catalog.
     wal_keeper: Option<(WalKeeperHandle, std::sync::Weak<turso_core::Database>)>,
@@ -1655,6 +1656,7 @@ impl MySqlConnection {
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
             schema_readings: Arc::default(),
+            prepared_counted_rows_savepoints: Arc::default(),
             wal_keeper: None,
             database_collation: None,
             database_user: None,
@@ -10811,7 +10813,7 @@ impl MySqlConnection {
             write(&reserved)?;
             return Ok(reserved);
         };
-        self.run_internal(&format!("SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+        self.run_counted_rows_savepoint_statement(SET_THE_COUNTED_ROWS_SAVEPOINT)?;
         let rollback = || self.roll_back_to_the_counted_rows_savepoint();
         let written = (|| -> Result<std::result::Result<ReservedAutoIncrementRows, LimboError>> {
             let failure = match write(&predicted) {
@@ -10845,14 +10847,39 @@ impl MySqlConnection {
             rollback()?;
         }
         if !self.inner.get_auto_commit() {
-            self.run_internal(&format!("RELEASE SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+            self.run_counted_rows_savepoint_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
         }
         written?
     }
 
     fn roll_back_to_the_counted_rows_savepoint(&self) -> Result<()> {
         if !self.inner.get_auto_commit() {
-            self.run_internal(&format!("ROLLBACK TO SAVEPOINT {COUNTED_ROWS_SAVEPOINT}"))?;
+            self.run_counted_rows_savepoint_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
+        }
+        Ok(())
+    }
+
+    fn run_counted_rows_savepoint_statement(
+        &self,
+        sql: &'static str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let prepared = self
+            .prepared_counted_rows_savepoints
+            .lock()
+            .expect("MySQL counted rows savepoints mutex poisoned")
+            .remove(sql);
+        let mut statement = match prepared {
+            Some(statement) => statement,
+            None => self.inner.prepare(sql).map_err(MySqlQueryError::Engine)?,
+        };
+        statement
+            .run_ignore_rows()
+            .map_err(MySqlQueryError::Engine)?;
+        if statement.reset().is_ok() {
+            self.prepared_counted_rows_savepoints
+                .lock()
+                .expect("MySQL counted rows savepoints mutex poisoned")
+                .insert(sql, statement);
         }
         Ok(())
     }
@@ -13956,7 +13983,11 @@ fn injected_auto_increment_prepare_options(
         }))
 }
 
-const COUNTED_ROWS_SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+const SET_THE_COUNTED_ROWS_SAVEPOINT: &str = "SAVEPOINT \"__turso_auto_increment_values\"";
+const RELEASE_THE_COUNTED_ROWS_SAVEPOINT: &str =
+    "RELEASE SAVEPOINT \"__turso_auto_increment_values\"";
+const ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT: &str =
+    "ROLLBACK TO SAVEPOINT \"__turso_auto_increment_values\"";
 
 /// Whether MySQL finds `error` while it fills a row, before the row takes a
 /// number: a value it cannot hold, a NULL for a `NOT NULL` column, a broken
