@@ -75,11 +75,17 @@ pub struct BytesRead {
     /// Checked as a counted `INSERT`, which renders it and has the engine
     /// read what was rendered.
     pub checked_as_a_counted_insert: usize,
+    /// Rendered for the engine as an `INSERT`, `UPDATE` or `DELETE`.
+    pub translated_as_dml: usize,
 }
 
 /// What this thread has read so far.
 pub fn bytes_read() -> BytesRead {
     BYTES_READ.with(Cell::get)
+}
+
+pub(crate) fn count_translated_dml(sql: &str) {
+    count(|bytes| bytes.translated_as_dml += sql.len());
 }
 
 /// The tokens of `sql` as sqlparser reads them under `dialect`.
@@ -299,6 +305,7 @@ thread_local! {
             parsed_by_the_engine: 0,
             tokenized_as_a_command: 0,
             checked_as_a_counted_insert: 0,
+            translated_as_dml: 0,
         })
     };
     static TOKENS: Kept<TokenDialect, KeptTokens> = const { RefCell::new(Vec::new()) };

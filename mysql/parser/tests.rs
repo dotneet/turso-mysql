@@ -9531,13 +9531,54 @@ fn a_kept_reading_answers_what_reading_afresh_would() {
         assert_eq!(read_everything(), read_afresh);
     }
     assert_eq!(read_everything(), read_afresh);
-    assert_eq!(bytes_read(), first_reading);
+    let readings_that_are_kept = |read: BytesRead| BytesRead {
+        translated_as_dml: 0,
+        ..read
+    };
+    assert_eq!(
+        readings_that_are_kept(bytes_read()),
+        readings_that_are_kept(first_reading)
+    );
     drop(kept);
 
     assert_eq!(read_everything(), read_afresh);
     assert!(bytes_read().tokenized > first_reading.tokenized);
     assert!(bytes_read().parsed > first_reading.parsed);
     assert!(bytes_read().parsed_by_the_engine > first_reading.parsed_by_the_engine);
+}
+
+#[test]
+fn an_insert_of_listed_rows_reads_no_table_through_parse_dml() {
+    let mode = SessionSqlMode::default();
+    for sql in [
+        "INSERT INTO t (a, b) VALUES (1, 'x'), (2, 'y')",
+        "INSERT INTO t (a) VALUES ((SELECT MAX(a) FROM u))",
+        "REPLACE INTO t (a) VALUES (1)",
+        "INSERT IGNORE INTO t (a) VALUES (1)",
+        "INSERT INTO t (a) VALUES (1) ON DUPLICATE KEY UPDATE a = (SELECT 1 FROM u)",
+        "INSERT INTO t SET a = 1, b = 'x'",
+        "INSERT INTO t VALUES (1)",
+        "INSERT INTO t () VALUES ()",
+        "INSERT INTO db.t (a) VALUES (1)",
+    ] {
+        assert!(inserts_listed_rows(sql, mode), "{sql}");
+        assert_eq!(
+            parse_dml(sql, mode)
+                .map(|translated| translated.read_tables().to_vec())
+                .unwrap_or_default(),
+            Vec::new(),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "INSERT INTO t (a) SELECT a FROM u",
+        "UPDATE t SET a = 1",
+        "DELETE FROM t",
+        "SELECT 1",
+        "INSERT INTO t (a) VALUES ('never closed",
+    ] {
+        assert!(!inserts_listed_rows(sql, mode), "{sql}");
+    }
 }
 
 #[test]

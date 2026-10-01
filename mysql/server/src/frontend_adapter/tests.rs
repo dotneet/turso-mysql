@@ -30905,6 +30905,7 @@ fn whole_readings(
         checked_as_a_counted_insert: (after.checked_as_a_counted_insert
             - before.checked_as_a_counted_insert)
             / length,
+        translated_as_dml: (after.translated_as_dml - before.translated_as_dml) / length,
     }
 }
 #[cfg(unix)]

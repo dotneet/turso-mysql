@@ -1758,6 +1758,7 @@ fn a_sysbench_insert_into_a_counted_table_is_tokenized_once() {
             parsed_by_the_engine: 1,
             tokenized_as_a_command: 1,
             checked_as_a_counted_insert: 1,
+            translated_as_dml: 0,
         }
     );
     assert_eq!(

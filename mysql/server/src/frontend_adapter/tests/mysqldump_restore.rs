@@ -470,9 +470,9 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
         .collect::<Vec<_>>()
         .join(",");
 
-    for sql in [
-        format!("INSERT INTO `articles` VALUES {articles}"),
-        format!("INSERT INTO `article_tags` VALUES {tags}"),
+    for (sql, translated_as_dml) in [
+        (format!("INSERT INTO `articles` VALUES {articles}"), 0),
+        (format!("INSERT INTO `article_tags` VALUES {tags}"), 1),
     ] {
         let before = turso_mysql_parser::bytes_read();
         assert_eq!(ok(&mut adapter, &sql).affected_rows, 300);
@@ -484,6 +484,7 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
                 parsed_by_the_engine: 1,
                 tokenized_as_a_command: 1,
                 checked_as_a_counted_insert: 1,
+                translated_as_dml,
             },
             "{}",
             &sql[..40]

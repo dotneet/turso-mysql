@@ -5043,6 +5043,18 @@ pub fn parse_dml(sql: &str, mode: SessionSqlMode) -> Result<TranslatedDml, Parse
     parse_dml_rewriting_on_update(sql, mode, &[])
 }
 
+/// Whether `sql` is an `INSERT` or `REPLACE` that writes rows it lists in
+/// `VALUES` or `SET`, which [`parse_dml`] never answers with a table it reads.
+pub fn inserts_listed_rows(sql: &str, mode: SessionSqlMode) -> bool {
+    match read_one_statement(sql, mode).as_ref() {
+        Ok(Statement::Insert(insert)) => insert
+            .source
+            .as_deref()
+            .is_none_or(|source| matches!(source.body.as_ref(), SetExpr::Values(_))),
+        _ => false,
+    }
+}
+
 /// Parses one checked DML statement, told which of the table's columns an
 /// `UPDATE` rewrites to the moment it runs at.
 ///
@@ -5108,6 +5120,7 @@ fn translate_dml(
     mut render_context: SelectRenderContext<'_>,
     decimal_columns: &[(String, u32)],
 ) -> Result<TranslatedDml, ParseError> {
+    statement_reads::count_translated_dml(sql);
     let unaliased = updated_table_alias::without_the_updated_tables_alias(sql, mode)?;
     let sql = unaliased.as_deref().unwrap_or(sql);
     let statement = parse_one_statement(sql, mode)?;

@@ -5179,6 +5179,9 @@ fn statement_read_tables(sql: &str) -> Vec<MySqlSelectSource> {
     if let Ok(translated) = parse_select(sql, SessionSqlMode::default()) {
         return translated.source_tables().to_vec();
     }
+    if turso_mysql_parser::inserts_listed_rows(sql, SessionSqlMode::default()) {
+        return Vec::new();
+    }
     turso_mysql_parser::parse_dml(sql, SessionSqlMode::default())
         .map(|translated| translated.read_tables().to_vec())
         .unwrap_or_default()
