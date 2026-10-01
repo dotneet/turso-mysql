@@ -4269,6 +4269,22 @@ impl MySqlConnection {
         sql: &str,
     ) -> std::result::Result<(), MySqlQueryError> {
         const KEPT_TRANSACTION_STATEMENTS: usize = 8;
+        let keepable = matches!(
+            statement,
+            Stmt::Begin { .. }
+                | Stmt::Commit { .. }
+                | Stmt::Rollback {
+                    savepoint_name: None,
+                    ..
+                }
+        );
+        if !keepable {
+            return self
+                .inner
+                .prepare_translated_stmt(statement, sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine);
+        }
         let kept = {
             let mut kept = self
                 .prepared_transaction_statements
@@ -4285,7 +4301,15 @@ impl MySqlConnection {
             }
             None => self
                 .inner
-                .prepare_translated_stmt(statement.clone(), sql)
+                .prepare_translated_stmt_with_options(
+                    statement.clone(),
+                    sql,
+                    &PrepareOptions::default().with_reprepare_parser(Arc::new(
+                        FrozenTransactionStatementParser {
+                            statement: statement.clone(),
+                        },
+                    )),
+                )
                 .map_err(MySqlQueryError::Engine)?,
         };
         engine_statement
@@ -14604,6 +14628,16 @@ fn mysql_query_index_error(error: MySqlAlterTableIndexError) -> MySqlQueryError 
 }
 
 impl ReprepareParser for FrozenInjectedAutoIncrementInsertParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        Ok((Some(Cmd::Stmt(self.statement.clone())), sql.len()))
+    }
+}
+
+struct FrozenTransactionStatementParser {
+    statement: Stmt,
+}
+
+impl ReprepareParser for FrozenTransactionStatementParser {
     fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
         Ok((Some(Cmd::Stmt(self.statement.clone())), sql.len()))
     }

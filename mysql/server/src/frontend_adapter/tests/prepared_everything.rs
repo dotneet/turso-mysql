@@ -1030,3 +1030,39 @@ fn a_prepared_selects_result_metadata_shares_the_tables_kept_columns() {
     ));
     assert_eq!(first.tables[0].columns[1].name(), "body");
 }
+
+#[test]
+fn a_transaction_starts_after_one_that_rolled_back_to_its_savepoints() {
+    let (_directory, mut adapter) = adapter();
+    adapter
+        .execute_query("CREATE TABLE `tags` (`id` bigint unsigned AUTO_INCREMENT,`name` varchar(64) NOT NULL,PRIMARY KEY (`id`),UNIQUE INDEX `idx_tags_name` (`name`))")
+        .unwrap();
+    let insert = "INSERT INTO `tags` (`name`) VALUES (?)";
+    adapter.execute_query("START TRANSACTION").unwrap();
+    prepared(&mut adapter, insert, &one_word("a"));
+    adapter.execute_query("ROLLBACK").unwrap();
+    adapter.execute_query("START TRANSACTION").unwrap();
+    prepared(&mut adapter, insert, &one_word("b"));
+    adapter.execute_query("SAVEPOINT sp1").unwrap();
+    prepared(&mut adapter, insert, &one_word("c"));
+    adapter.execute_query("ROLLBACK TO SAVEPOINT sp1").unwrap();
+    adapter.execute_query("SAVEPOINT sp_manual").unwrap();
+    prepared(&mut adapter, insert, &one_word("d"));
+    adapter
+        .execute_query("ROLLBACK TO SAVEPOINT sp_manual")
+        .unwrap();
+    adapter.execute_query("COMMIT").unwrap();
+    adapter
+        .execute_query("START TRANSACTION")
+        .unwrap_or_else(|error| panic!("START TRANSACTION: {error:?}"));
+    prepared(&mut adapter, insert, &one_word("e"));
+    adapter.execute_query("COMMIT").unwrap();
+    let PreparedStatementExecutionResult::ResultSet(names) = prepared(
+        &mut adapter,
+        "SELECT `name` FROM `tags` ORDER BY `name`",
+        &[],
+    ) else {
+        panic!("a SELECT answers rows");
+    };
+    assert_eq!(names.rows.len(), 2);
+}
