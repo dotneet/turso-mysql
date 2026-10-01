@@ -29,6 +29,10 @@ use turso_mysql_server::{
     DEFAULT_MAX_PREPARED_STMT_COUNT,
 };
 
+#[cfg(all(feature = "mimalloc", not(miri)))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(unix)]
 const MAX_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -441,6 +445,17 @@ impl fmt::Display for DaemonError {
             Self::Shutdown => f.write_str("server did not finish shutdown in time"),
         }
     }
+}
+
+#[cfg(all(test, feature = "mimalloc", not(miri)))]
+#[test]
+fn the_server_allocates_through_mimalloc() {
+    extern "C" {
+        fn mi_is_in_heap_region(pointer: *const std::ffi::c_void) -> bool;
+    }
+    let allocated = Box::new(0_u64);
+    let pointer: *const u64 = &*allocated;
+    assert!(unsafe { mi_is_in_heap_region(pointer.cast()) });
 }
 
 #[cfg(all(test, unix))]

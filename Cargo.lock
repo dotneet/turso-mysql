@@ -7587,6 +7587,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "libc",
+ "mimalloc",
  "mysql_async",
  "tempfile",
  "tokio",

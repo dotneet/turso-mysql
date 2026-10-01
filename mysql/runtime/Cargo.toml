@@ -13,8 +13,13 @@ description = "Unix runtime executable for the Turso MySQL server"
 name = "turso-mysql-server"
 path = "src/main.rs"
 
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
+mimalloc = { workspace = true, optional = true }
 turso_mysql_server.workspace = true
 
 [target.'cfg(unix)'.dependencies]
