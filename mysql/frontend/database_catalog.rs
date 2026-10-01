@@ -1388,6 +1388,63 @@ mod tests {
         Ok(())
     }
 
+    /// The keeper copies committed frames into the database file even while
+    /// another session's open write keeps it from emptying the WAL, since the
+    /// copy does not need the write lock.
+    #[test]
+    fn the_keeper_copies_the_wal_while_another_session_writes() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut writing = catalog.new_session(binary_context());
+        writing.select_database("kept").unwrap();
+        let writer = writing.connection().unwrap().clone();
+        let mut holding = catalog.new_session(binary_context());
+        holding.select_database("kept").unwrap();
+        let holder = holding.connection().unwrap().clone();
+        writer.execute("CREATE TABLE records (id INT, label TEXT)")?;
+        let label = "x".repeat(1000);
+        for id in 0..50 {
+            writer.execute(&format!(
+                "INSERT INTO records (id, label) VALUES ({id}, '{label}')"
+            ))?;
+        }
+        let database_file_length = || {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.path().is_file())
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    entry.path().with_file_name(format!("{name}-wal")).exists()
+                })
+                .map(|entry| entry.metadata().unwrap().len())
+                .max()
+                .unwrap()
+        };
+        let before = database_file_length();
+
+        holder
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        holder.execute("INSERT INTO records (id, label) VALUES (50, 'open')")?;
+        writer.truncate_the_wal_past(0)?;
+        let keeper = catalog.wal_keeper.handle();
+        keeper.wait_for_the_requests_before();
+
+        assert_eq!(
+            keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(
+            database_file_length() > before,
+            "the committed rows were not copied into the database file"
+        );
+        holder.execute_transaction_command("ROLLBACK").unwrap();
+        Ok(())
+    }
+
     /// A counted insert that waits for another session's write lock reads the
     /// counter's next number only once it holds the lock, so a number the
     /// other session took meanwhile is not written first and then undone.

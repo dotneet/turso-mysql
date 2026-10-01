@@ -217,15 +217,30 @@ enum Emptied {
 /// Empties one database's WAL over a connection of its own. Another session
 /// reading at the same moment keeps the WAL busy, and a later request tries
 /// again.
+///
+/// The frames are first copied into the database file without the write
+/// lock, so the truncation, which holds it, has little left to copy.
 fn truncate(database: &Arc<Database>) -> Result<Emptied> {
     let connection = database.connect()?;
-    let result = match connection.checkpoint(CheckpointMode::Truncate {
-        upper_bound_inclusive: None,
-    }) {
-        Ok(_) => Ok(Emptied::Yes),
-        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => Ok(Emptied::KeptBusy),
-        Err(error) => Err(error),
-    };
+    let result = copy_then_truncate(&connection);
     connection.close()?;
     result
+}
+
+fn copy_then_truncate(connection: &Arc<turso_core::Connection>) -> Result<Emptied> {
+    for mode in [
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    ] {
+        match connection.checkpoint(mode) {
+            Ok(_) => {}
+            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => return Ok(Emptied::KeptBusy),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Emptied::Yes)
 }
