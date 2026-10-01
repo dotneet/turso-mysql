@@ -305,6 +305,9 @@ impl Error for PreTlsPacketError {}
 
 type RustlsServerConnection = rustls::ServerConnection;
 
+/// How many bytes of response frames are handed to TLS at once.
+const TLS_WRITE_BATCH_BYTES: usize = 64 * 1024;
+
 struct TlsTransport {
     connection: RustlsServerConnection,
     stream: AcceptedTcpStream,
@@ -341,13 +344,21 @@ impl TlsTransport {
         Ok(())
     }
 
-    fn write_plain(&mut self, buffer: &[u8], deadline: Instant) -> io::Result<usize> {
-        let written = self.connection.writer().write(buffer)?;
-        if written == 0 && !buffer.is_empty() {
-            return Err(io::Error::from(io::ErrorKind::WriteZero));
+    /// Hands all of `buffer` to TLS and sends what it makes, sending as it
+    /// goes whenever TLS will take no more until it has.
+    fn write_all_plain(&mut self, buffer: &[u8], deadline: Instant) -> io::Result<()> {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let written = self.connection.writer().write(&buffer[offset..])?;
+            if written == 0 {
+                if !self.connection.wants_write() {
+                    return Err(io::Error::from(io::ErrorKind::WriteZero));
+                }
+                self.write_tls(deadline)?;
+            }
+            offset += written;
         }
-        self.write_tls(deadline)?;
-        Ok(written)
+        self.write_tls(deadline)
     }
 
     fn begin_protocol_work(&self) -> Result<(), RuntimeTcpListenerError> {
@@ -703,22 +714,36 @@ impl RuntimeTcpConnection {
         }
     }
 
+    /// Sends every queued response frame, gathering them into batches of up
+    /// to [`TLS_WRITE_BATCH_BYTES`] so that a result set goes out as a few
+    /// TLS records and `send` calls rather than one of each per row: written
+    /// a frame at a time, the `send` calls alone took over two fifths of the
+    /// server's time in sysbench's `oltp_read_only`.
     fn flush_tls_writes(&mut self, deadline: Instant) -> Result<(), RuntimeTcpConnectionError> {
+        let mut batch = Vec::new();
         loop {
-            let Some(frame) = self.orchestrator.front_write() else {
+            batch.clear();
+            while batch.len() < TLS_WRITE_BATCH_BYTES {
+                let Some(frame) = self.orchestrator.front_write() else {
+                    break;
+                };
+                let length = frame.len();
+                batch.extend_from_slice(frame);
+                self.orchestrator
+                    .advance_write(length)
+                    .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+            }
+            if batch.is_empty() {
                 return Ok(());
-            };
-            let written = match self.transport.as_mut() {
+            }
+            match self.transport.as_mut() {
                 Some(TcpTransport::Tls(tls)) => tls
-                    .write_plain(frame, deadline)
+                    .write_all_plain(&batch, deadline)
                     .map_err(map_tls_write_error)?,
                 Some(TcpTransport::Plain(_)) | None => {
                     return Err(RuntimeTcpConnectionError::UnexpectedTransportState)
                 }
-            };
-            self.orchestrator
-                .advance_write(written)
-                .map_err(RuntimeTcpConnectionError::Orchestrator)?;
+            }
         }
     }
 

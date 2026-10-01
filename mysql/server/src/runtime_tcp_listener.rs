@@ -2224,6 +2224,149 @@ mod tests {
         assert!(runtime.listener.shutdown().drained());
     }
 
+    /// A result set goes out in a few TLS records rather than one per frame:
+    /// written a frame at a time, each column definition and row was a record
+    /// and a `send` of its own, which took over two fifths of the server's time in sysbench's
+    /// `oltp_read_only`.
+    #[test]
+    fn a_result_set_crosses_tls_in_a_few_records() {
+        // A write queue that holds the whole answer, which a smaller one
+        // answers 1235 in place of.
+        let runtime = protocol_runtime_with(
+            RuntimeLimits::new(4, 4, 32 * 1024 * 1024, 4096).expect("test limits"),
+            RuntimeTimeouts::new(
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            )
+            .expect("test timeouts"),
+            turso_mysql::DEFAULT_MAX_PREPARED_STMT_COUNT,
+        );
+        let (client, worker) = start_worker(&runtime.listener);
+        let signed_in = authenticate_over_tls(client);
+        let (connection, socket) = (signed_in.conn, signed_in.sock);
+        let mut client = rustls::StreamOwned::new(connection, RecordCountingStream::new(socket));
+        let codec = packet_codec();
+        let command =
+            |client: &mut rustls::StreamOwned<rustls::ClientConnection, RecordCountingStream>,
+             command: u8,
+             payload: &[u8]| {
+                let mut packet = vec![command];
+                packet.extend_from_slice(payload);
+                client
+                    .write_all(&codec.encode(COMMAND_SEQUENCE_ID, &packet).expect("command"))
+                    .expect("command write");
+            };
+        command(&mut client, COM_INIT_DB, b"testdb");
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("init db OK");
+        command(
+            &mut client,
+            COM_QUERY,
+            b"CREATE TABLE t (id INT PRIMARY KEY)",
+        );
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("create OK");
+        let values = (1..=200)
+            .map(|id| format!("({id})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        command(
+            &mut client,
+            COM_QUERY,
+            format!("INSERT INTO t (id) VALUES {values}").as_bytes(),
+        );
+        ResponseOkPacket::decode(codec, &read_frame(&mut client)).expect("insert OK");
+
+        let records_before = client.sock.records;
+        command(&mut client, COM_QUERY, b"SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            ColumnCountPacket::decode(codec, &read_frame(&mut client))
+                .expect("column count")
+                .column_count,
+            1
+        );
+        ColumnDefinitionPacket::decode(codec, &read_frame(&mut client)).expect("column definition");
+        for id in 1..=200 {
+            let frame = read_frame(&mut client);
+            let row = TextRowPacket::decode(codec, &frame, 1).expect("text row");
+            assert_eq!(row.values, [TextRowValue::Bytes(id.to_string().as_bytes())]);
+        }
+        assert!(matches!(
+            ResultTerminatorPacket::decode(
+                codec,
+                &read_frame(&mut client),
+                REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_SSL | CLIENT_DEPRECATE_EOF,
+            )
+            .expect("result terminator"),
+            ResultTerminatorPacket::Ok(_)
+        ));
+        let records = client.sock.records - records_before;
+        assert!(records <= 4, "203 frames crossed in {records} TLS records");
+
+        command(&mut client, COM_QUIT, b"");
+        drop(client);
+        assert!(worker.join().is_ok());
+        assert!(runtime.listener.shutdown().drained());
+    }
+
+    /// A client socket that counts the TLS records it reads.
+    struct RecordCountingStream {
+        inner: TcpStream,
+        records: usize,
+        /// The bytes of a record header read so far, and the payload bytes
+        /// still to skip once it is whole.
+        header: Vec<u8>,
+        payload_left: usize,
+    }
+
+    impl RecordCountingStream {
+        fn new(inner: TcpStream) -> Self {
+            Self {
+                inner,
+                records: 0,
+                header: Vec::new(),
+                payload_left: 0,
+            }
+        }
+    }
+
+    impl Read for RecordCountingStream {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            let mut bytes = &buffer[..read];
+            while !bytes.is_empty() {
+                if self.payload_left > 0 {
+                    let skipped = self.payload_left.min(bytes.len());
+                    self.payload_left -= skipped;
+                    bytes = &bytes[skipped..];
+                    continue;
+                }
+                let wanted = (5 - self.header.len()).min(bytes.len());
+                self.header.extend_from_slice(&bytes[..wanted]);
+                bytes = &bytes[wanted..];
+                if self.header.len() == 5 {
+                    self.records += 1;
+                    self.payload_left =
+                        usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                    self.header.clear();
+                }
+            }
+            Ok(read)
+        }
+    }
+
+    impl Write for RecordCountingStream {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     /// Measured on MySQL 8.4.11: a command of 0xFFFFFF bytes or more arrives
     /// as full packets and a shorter last one; a row that long goes out the
     /// same way; and a command that reaches `max_allowed_packet` is answered
