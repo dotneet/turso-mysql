@@ -99,6 +99,10 @@ pub struct MySqlConnection {
     /// The transaction command the statement running now ran, if any, which
     /// decides whether its transaction keeps the database from a drop.
     transaction_command_ran: Arc<Mutex<TransactionCommandRan>>,
+    /// How many counted inserts were written with numbers another session
+    /// took first and had to be written again.
+    #[cfg(test)]
+    pub(crate) counted_rows_written_again: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether this is an empty database standing in for one another session
     /// dropped, which the statements reading no table run on.
     stands_in_for_a_dropped_database: bool,
@@ -1665,6 +1669,8 @@ impl MySqlConnection {
             prepared_counted_rows_savepoints: Arc::default(),
             prepared_transaction_statements: Arc::default(),
             wal_keeper: None,
+            #[cfg(test)]
+            counted_rows_written_again: Arc::default(),
             database_collation: None,
             database_user: None,
             metadata_lock_wait: Arc::new(Mutex::new(DEFAULT_METADATA_LOCK_WAIT)),
@@ -10925,12 +10931,29 @@ impl MySqlConnection {
         deadline: Option<turso_core::MonotonicInstant>,
         write: impl Fn(&ReservedAutoIncrementRows) -> Result<()>,
     ) -> Result<ReservedAutoIncrementRows> {
-        let Some(predicted) = self.numbers_the_counter_would_hand_out(bound, table, values)? else {
+        let reserve_first = || -> Result<ReservedAutoIncrementRows> {
             let reserved = self.reserve_insert_row_ids(bound, table, values, deadline)?;
             write(&reserved)?;
-            return Ok(reserved);
+            Ok(reserved)
         };
+        if !self.counter_numbers_can_be_predicted(bound, table) {
+            return reserve_first();
+        }
         self.run_counted_rows_savepoint_statement(SET_THE_COUNTED_ROWS_SAVEPOINT)?;
+        let predicted = match self
+            .hold_the_write_lock_on(table)
+            .and_then(|()| self.numbers_the_counter_would_hand_out(bound, table, values))
+        {
+            Ok(Some(predicted)) => predicted,
+            Ok(None) => {
+                self.leave_the_counted_rows_savepoint()?;
+                return reserve_first();
+            }
+            Err(error) => {
+                self.leave_the_counted_rows_savepoint()?;
+                return Err(error);
+            }
+        };
         let rollback = || self.roll_back_to_the_counted_rows_savepoint();
         let written = (|| -> Result<std::result::Result<ReservedAutoIncrementRows, LimboError>> {
             let failure = match write(&predicted) {
@@ -10954,6 +10977,9 @@ impl MySqlConnection {
                     Some(error) => Err(error),
                 });
             }
+            #[cfg(test)]
+            self.counted_rows_written_again
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if failure.is_none() {
                 rollback()?;
             }
@@ -10967,6 +10993,38 @@ impl MySqlConnection {
             self.run_counted_rows_savepoint_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
         }
         written?
+    }
+
+    /// Under contention the numbers the counter would hand out next are the
+    /// same for every waiting session, so they are read once this session
+    /// holds the write lock: every other session's counted insert is then
+    /// either finished or not yet begun. Measured with eight sysbench
+    /// sessions inserting, reading them before waiting for the lock made
+    /// most inserts fail on another session's key and be written twice
+    /// while holding the lock.
+    fn hold_the_write_lock_on(&self, table: &AutoIncrementTable) -> Result<()> {
+        let schema = self.inner.current_schema();
+        let column = schema
+            .get_table(&table.name)
+            .and_then(|stored| stored.columns().first()?.name.clone())
+            .ok_or_else(|| {
+                LimboError::InternalError("a counted table has no columns".to_string())
+            })?;
+        drop(schema);
+        self.run_internal(&format!(
+            "UPDATE {table} SET {column} = {column} WHERE 0",
+            table = quoted_engine_name(&table.name),
+            column = quoted_engine_name(&column),
+        ))
+        .map_err(Into::into)
+    }
+
+    fn leave_the_counted_rows_savepoint(&self) -> Result<()> {
+        if !self.inner.get_auto_commit() {
+            self.run_counted_rows_savepoint_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
+            self.run_counted_rows_savepoint_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
+        }
+        Ok(())
     }
 
     fn roll_back_to_the_counted_rows_savepoint(&self) -> Result<()> {
@@ -11014,18 +11072,7 @@ impl MySqlConnection {
         table: &AutoIncrementTable,
         values: &[Value],
     ) -> Result<Option<ReservedAutoIncrementRows>> {
-        if bound.rowwise_conflicts()
-            || bound
-                .row_values()
-                .iter()
-                .any(|value| *value != AutoIncrementRowValue::Generated)
-            || self
-                .inner
-                .current_schema()
-                .get_triggers_for_table(&table.name)
-                .next()
-                .is_some()
-        {
+        if !self.counter_numbers_can_be_predicted(bound, table) {
             return Ok(None);
         }
         let capability = self.auto_increment.as_ref().ok_or_else(|| {
@@ -11053,6 +11100,24 @@ impl MySqlConnection {
         let row_values = self.auto_increment_row_values(bound, table, values)?;
         self.row_ids_after(bound, table, values, row_values, high_water)
             .map(Some)
+    }
+
+    fn counter_numbers_can_be_predicted(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+    ) -> bool {
+        !bound.rowwise_conflicts()
+            && bound
+                .row_values()
+                .iter()
+                .all(|value| *value == AutoIncrementRowValue::Generated)
+            && self
+                .inner
+                .current_schema()
+                .get_triggers_for_table(&table.name)
+                .next()
+                .is_none()
     }
 
     /// Whether the first row of a counted insert that failed while a row was

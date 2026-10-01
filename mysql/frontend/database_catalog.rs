@@ -1388,6 +1388,57 @@ mod tests {
         Ok(())
     }
 
+    /// A counted insert that waits for another session's write lock reads the
+    /// counter's next number only once it holds the lock, so a number the
+    /// other session took meanwhile is not written first and then undone.
+    #[test]
+    fn a_counted_insert_waiting_for_the_write_lock_writes_its_row_once() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut holding = catalog.new_session(binary_context());
+        holding.select_database("kept").unwrap();
+        let holder = holding.connection().unwrap().clone();
+        let mut waiting = catalog.new_session(binary_context());
+        waiting.select_database("kept").unwrap();
+        let waiter = waiting.connection().unwrap().clone();
+        holder.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        holder.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+
+        holder
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        holder.execute("INSERT INTO notes (id, body) VALUES (1, 'holds the lock')")?;
+        let inserting = std::thread::spawn({
+            let waiter = waiter.clone();
+            move || waiter.execute("INSERT INTO users (name) VALUES ('waited')")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        holder.execute("INSERT INTO users (name) VALUES ('first')")?;
+        holder.execute_transaction_command("COMMIT").unwrap();
+        inserting.join().unwrap()?;
+
+        assert_eq!(
+            waiter
+                .counted_rows_written_again
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            waiter
+                .prepare_select("SELECT id, name FROM users ORDER BY id")?
+                .run_collect_rows()?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("first")],
+                vec![Value::from_i64(2), Value::from_text("waited")],
+            ]
+        );
+        Ok(())
+    }
+
     /// Only a closed engine connection runs the closing checkpoint, so a
     /// session that ends has to close its connection, or the WAL stays as
     /// large as the last write made it and the next open reads all of it.
