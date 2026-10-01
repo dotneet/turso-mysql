@@ -170,15 +170,20 @@ pub(crate) fn admin_tokens(
     versioned_comments: VersionedComments,
     read: impl FnOnce() -> Result<Vec<AdminToken>, ParseError>,
 ) -> Result<Rc<Vec<AdminToken>>, ParseError> {
-    let read_alike_by_every_setting = !sql.contains("/*!");
-    let kept_as = if read_alike_by_every_setting {
-        VersionedComments::Kept
-    } else {
-        versioned_comments
-    };
-    answer(&ADMIN_TOKENS, (mode, kept_as), sql, || {
+    let read_counted = || {
         count(|bytes| bytes.tokenized_as_a_command += sql.len());
         read().map(Rc::new)
+    };
+    answer(&ADMIN_TOKENS, (mode, versioned_comments), sql, || {
+        if versioned_comments != VersionedComments::Kept && !sql.contains("/*!") {
+            return answer(
+                &ADMIN_TOKENS,
+                (mode, VersionedComments::Kept),
+                sql,
+                read_counted,
+            );
+        }
+        read_counted()
     })
 }
 
