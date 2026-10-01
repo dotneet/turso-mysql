@@ -115,9 +115,12 @@ struct SchemaReadings {
     schema: Option<Arc<turso_core::schema::Schema>>,
     tables: Option<Vec<MySqlTable>>,
     columns: HashMap<String, Vec<MySqlColumnMetadata>>,
+    counted_tables_by_lowercase_name: HashMap<String, Option<AutoIncrementTable>>,
     /// How many times a table's columns were read rather than found here.
     #[cfg(test)]
     column_reads: usize,
+    #[cfg(test)]
+    counted_table_catalog_reads: usize,
 }
 
 impl SchemaReadings {
@@ -152,6 +155,33 @@ impl SchemaReadings {
         }
     }
 
+    fn counted_table(
+        &self,
+        schema: &Arc<turso_core::schema::Schema>,
+        name: &str,
+    ) -> Option<Option<AutoIncrementTable>> {
+        self.reads(schema).and_then(|kept| {
+            kept.counted_tables_by_lowercase_name
+                .get(&name.to_ascii_lowercase())
+                .cloned()
+        })
+    }
+
+    fn keep_counted_table(
+        &mut self,
+        schema: Arc<turso_core::schema::Schema>,
+        name: &str,
+        table: &Option<AutoIncrementTable>,
+    ) {
+        let kept = self.for_schema(schema);
+        kept.counted_tables_by_lowercase_name
+            .insert(name.to_ascii_lowercase(), table.clone());
+        #[cfg(test)]
+        {
+            kept.counted_table_catalog_reads += 1;
+        }
+    }
+
     fn reads(&self, schema: &Arc<turso_core::schema::Schema>) -> Option<&Self> {
         self.schema
             .as_ref()
@@ -163,6 +193,7 @@ impl SchemaReadings {
         if self.reads(&schema).is_none() {
             self.tables = None;
             self.columns.clear();
+            self.counted_tables_by_lowercase_name.clear();
             self.schema = Some(schema);
         }
         self
@@ -11128,6 +11159,30 @@ impl MySqlConnection {
     }
 
     fn load_auto_increment_table(&self, target: &str) -> Result<Option<AutoIncrementTable>> {
+        self.inner.maybe_update_schema();
+        let schema = self.inner.current_schema();
+        if let Some(table) = self
+            .schema_readings
+            .lock()
+            .expect("MySQL schema readings mutex poisoned")
+            .counted_table(&schema, target)
+        {
+            return Ok(table);
+        }
+        let table = self.read_auto_increment_table_from_the_catalog(target)?;
+        if Arc::ptr_eq(&schema, &self.inner.current_schema()) {
+            self.schema_readings
+                .lock()
+                .expect("MySQL schema readings mutex poisoned")
+                .keep_counted_table(schema, target, &table);
+        }
+        Ok(table)
+    }
+
+    fn read_auto_increment_table_from_the_catalog(
+        &self,
+        target: &str,
+    ) -> Result<Option<AutoIncrementTable>> {
         let rows = self
             .inner
             .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?

@@ -4047,6 +4047,89 @@ fn a_tables_columns_are_read_once_for_each_schema() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_counted_table_is_read_from_the_catalog_once_for_each_schema_another_session_changes(
+) -> Result<()> {
+    let path = "mysql-session-counted-table-cache.db";
+    let identity = [0x58; 16];
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let database = open_database_with_identity(Arc::clone(&io), path, OpenFlags::Create, identity)?;
+    let allocator = DurableRangeAllocator::open(
+        io.as_ref(),
+        &format!("{path}.auto-increment"),
+        AllocatorDatabaseIdentity::new(identity)?,
+        AllocatorOpenMode::Create,
+        FileSyncType::Fsync,
+    )?;
+    let mut initialization = allocator.initialize()?;
+    io.block(|| initialization.step())?;
+    let session = |database: &Arc<Database>| {
+        MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
+            database.connect()?,
+            binary_context(),
+            allocator.clone(),
+            Arc::clone(&io),
+            MySqlPreparedStatementAuthority::default(),
+        )
+    };
+    let inserting = session(&database)?;
+    let other = session(&database)?;
+    let catalog_reads = || {
+        inserting
+            .schema_readings
+            .lock()
+            .unwrap()
+            .counted_table_catalog_reads
+    };
+    let ddl = "CREATE TABLE records (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, label TEXT)";
+    inserting.execute(ddl)?;
+    for label in ["a", "b", "c"] {
+        inserting
+            .execute_checked_write(
+                &format!("INSERT INTO records (label) VALUES ('{label}')"),
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(inserting.last_insert_id(), 3);
+    assert_eq!(catalog_reads(), 1);
+
+    let drop = turso_mysql_parser::parse_optional_drop_table(
+        "DROP TABLE records",
+        SessionSqlMode::default(),
+    )
+    .unwrap()
+    .expect("DROP TABLE must be recognized");
+    other
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    other.execute(ddl)?;
+    inserting
+        .execute_checked_write("INSERT INTO records (label) VALUES ('d')", None)
+        .unwrap();
+    assert_eq!(inserting.last_insert_id(), 1);
+    assert_eq!(catalog_reads(), 2);
+
+    other
+        .drop_table(&drop)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    other.execute("CREATE TABLE records (id INT PRIMARY KEY, label TEXT)")?;
+    let written = inserting
+        .execute_checked_write("INSERT INTO records (id, label) VALUES (7, 'e')", None)
+        .unwrap();
+    assert_eq!(written.last_insert_id, 0);
+    assert_eq!(catalog_reads(), 3);
+    assert_eq!(
+        inserting
+            .prepare_select("SELECT id, label FROM records")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(7), Value::from_text("e")]]
+    );
+    other.close()?;
+    inserting.close()?;
+    Ok(())
+}
+
 /// A write can leave the WAL holding far more than the engine's own
 /// checkpoint empties, so past a bound it is truncated, but never inside a
 /// transaction.
