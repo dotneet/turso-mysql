@@ -1664,3 +1664,49 @@ fn a_counted_table_takes_an_engine_written_in_an_executable_comment() {
         )
         .is_err());
 }
+
+/// Measured on MySQL 8.4.11: `COMMIT` and `ROLLBACK`, with or without `AND
+/// CHAIN`, are prepared and run as written, and `BEGIN`, `START TRANSACTION`
+/// and the savepoint statements answer 1295 at prepare. sysbench prepares
+/// `BEGIN` and runs it as text when it gets 1295; any other refusal ended
+/// every transactional workload before its first transaction.
+#[test]
+fn commit_is_prepared_and_begin_answers_1295() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE t (id INTEGER NOT NULL AUTO_INCREMENT, v INTEGER, PRIMARY KEY (id))",
+    );
+    for sql in [
+        "BEGIN",
+        "START TRANSACTION",
+        "SAVEPOINT a",
+        "RELEASE SAVEPOINT a",
+        "ROLLBACK TO SAVEPOINT a",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_stmt_prepare(sql),
+                Err(FrontendErrorKind::NotPreparable)
+            ),
+            "{sql}"
+        );
+    }
+    let commit = adapter.execute_stmt_prepare("COMMIT").unwrap();
+    assert!(commit.parameters.is_empty() && commit.columns.is_empty());
+    run(&mut adapter, "BEGIN");
+    run(&mut adapter, "INSERT INTO t (v) VALUES (7)");
+    assert_ne!(adapter.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    adapter
+        .execute_stmt_execute(commit.statement_id, &[0, 0])
+        .unwrap();
+    assert_eq!(adapter.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    assert_eq!(rows(&mut adapter, "SELECT v FROM t"), vec![some(&["7"])]);
+    let rollback = adapter.execute_stmt_prepare("ROLLBACK").unwrap();
+    run(&mut adapter, "BEGIN");
+    run(&mut adapter, "INSERT INTO t (v) VALUES (8)");
+    adapter
+        .execute_stmt_execute(rollback.statement_id, &[0, 0])
+        .unwrap();
+    assert_eq!(rows(&mut adapter, "SELECT v FROM t"), vec![some(&["7"])]);
+}

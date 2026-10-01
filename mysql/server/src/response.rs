@@ -420,6 +420,8 @@ pub enum FrontendErrorKind {
     SerializationFailure,
     /// A level for the next transaction was set inside a transaction.
     TransactionCharacteristicsInProgress,
+    /// A statement MySQL will not prepare, `BEGIN` or `SAVEPOINT` say.
+    NotPreparable,
     /// A statement named one table twice.
     NotUniqueTable,
     /// A named lock was named with nothing, or with `NULL`.
@@ -536,6 +538,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         ),
         // Measured on MySQL 8.4.11: 1568, SQLSTATE 25001, for `SET TRANSACTION`
         // with no scope word inside a transaction.
+        FrontendErrorKind::NotPreparable => (
+            1295,
+            *b"HY000",
+            b"This command is not supported in the prepared statement protocol yet".as_slice(),
+        ),
         FrontendErrorKind::TransactionCharacteristicsInProgress => (
             1568,
             *b"25001",
@@ -2695,6 +2702,7 @@ mod tests {
                 1568,
                 *b"25001",
             ),
+            (FrontendErrorKind::NotPreparable, 1295, *b"HY000"),
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),

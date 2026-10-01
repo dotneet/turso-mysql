@@ -3148,6 +3148,26 @@ where
         refuse_a_prepared_statement_under_latin1(&self.session_variables)?;
         self.session_variables
             .set_database_collation(self.session.selected_database_collation());
+        // Measured on MySQL 8.4.11: `COMMIT` and `ROLLBACK` are prepared and
+        // run as written, while `BEGIN`, `START TRANSACTION` and the savepoint
+        // statements answer 1295 — which sysbench takes as its sign to run
+        // them as text instead.
+        if let Some(command) = turso_mysql_parser::parse_optional_transaction_command(
+            sql,
+            self.session.session_sql_mode(),
+        )
+        .map_err(|_| FrontendErrorKind::Syntax)?
+        {
+            return match command {
+                turso_mysql_parser::MySqlTransactionCommand::Commit
+                | turso_mysql_parser::MySqlTransactionCommand::Rollback
+                | turso_mysql_parser::MySqlTransactionCommand::CommitAndChain
+                | turso_mysql_parser::MySqlTransactionCommand::RollbackAndChain => {
+                    self.prepare_text_statement(sql, RunAsText::NoRows(sql.to_owned()), Vec::new())
+                }
+                _ => Err(FrontendErrorKind::NotPreparable),
+            };
+        }
         if let Some(query) =
             parse_optional_laravel_information_schema_query(sql, self.session.session_sql_mode())
                 .map_err(|_| FrontendErrorKind::Syntax)?
