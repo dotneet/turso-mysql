@@ -99,12 +99,14 @@ fn normalized_first_key(
             ((1u64 << NORM_CLASS_SHIFT) | (monotone >> 3), exact)
         }
         ValueRef::Text(t) => {
-            if !matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
-                // Non-binary collation: constant key, always full comparison.
-                (2u64 << NORM_CLASS_SHIFT, false)
-            } else {
+            if matches!(key.collation, CollationSeq::Unset | CollationSeq::Binary) {
                 let bytes = t.value.as_bytes();
                 (normalized_prefix(2, bytes), bytes.len() <= 7)
+            } else if let Some((weights, all_weights)) = key.collation.leading_weights(t.as_str()) {
+                (normalized_weights(2, weights), all_weights)
+            } else {
+                // Non-binary collation: constant key, always full comparison.
+                (2u64 << NORM_CLASS_SHIFT, false)
             }
         }
         ValueRef::Blob(b) => (normalized_prefix(3, b), b.len() <= 7),
@@ -130,6 +132,13 @@ fn normalized_prefix(class: u64, bytes: &[u8]) -> u64 {
     prefix[..n].copy_from_slice(&bytes[..n]);
     let p56 = u64::from_be_bytes(prefix) >> 8;
     (class << NORM_CLASS_SHIFT) | (p56 << 5) | (bytes.len().min(8) as u64)
+}
+
+fn normalized_weights(class: u64, weights: [u16; 3]) -> u64 {
+    let packed = weights
+        .into_iter()
+        .fold(0u64, |packed, weight| (packed << 16) | u64::from(weight));
+    (class << NORM_CLASS_SHIFT) | (packed << 13)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1198,10 +1207,10 @@ mod tests {
                 }
                 5 => Value::from_f64(if rng.next_u64() % 2 == 0 { 0.0 } else { -0.0 }),
                 6..=8 => {
-                    let alphabet = [b'a', b'b', b'\0'];
+                    let alphabet = ['a', 'b', '\0', 'A', 'á', 'ß', 's', ' ', '\t', '\u{1}', '😀'];
                     let len = (rng.next_u64() % 10) as usize;
                     let s: String = (0..len)
-                        .map(|_| alphabet[(rng.next_u64() % 3) as usize] as char)
+                        .map(|_| alphabet[(rng.next_u64() % alphabet.len() as u64) as usize])
                         .collect();
                     Value::build_text(s)
                 }
@@ -1220,7 +1229,11 @@ mod tests {
             } else {
                 SortOrder::Desc
             },
-            collation: CollationSeq::Binary,
+            collation: [
+                CollationSeq::Binary,
+                CollationSeq::MySqlUca9,
+                CollationSeq::MySqlUca400,
+            ][(rng.next_u64() % 3) as usize],
             nulls_order: match rng.next_u64() % 3 {
                 0 => None,
                 1 => Some(NullsOrder::First),

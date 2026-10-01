@@ -233,6 +233,16 @@ impl CollationSeq {
         }
     }
 
+    pub(crate) fn leading_weights(&self, text: &str) -> Option<([u16; 3], bool)> {
+        match self {
+            Self::MySqlUca9 => Some(super::mysql_uca9::leading_weights(text)),
+            Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => {
+                Some(super::mysql_uca400::leading_weights(text))
+            }
+            _ => None,
+        }
+    }
+
     pub fn write_hash_key(&self, text: &str, hasher: &mut impl Hasher) {
         match self {
             Self::MySqlUca9 => super::mysql_uca9::write_sort_key(text, hasher),

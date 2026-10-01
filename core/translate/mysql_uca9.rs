@@ -28,6 +28,18 @@ pub(crate) fn sort_key(text: &str) -> Vec<u8> {
     key
 }
 
+pub(crate) fn leading_weights(text: &str) -> ([u16; 3], bool) {
+    let mut weights = PrimaryWeights::new(text);
+    let mut leading = [0; 3];
+    for slot in &mut leading {
+        let Some(weight) = weights.next() else {
+            return (leading, true);
+        };
+        *slot = weight;
+    }
+    (leading, weights.next().is_none())
+}
+
 pub(crate) fn write_sort_key(text: &str, hasher: &mut impl Hasher) {
     let mut key = [0; STACK_SORT_KEY_LEN];
     match sort_key_on_stack(&mut key, PrimaryWeights::new(text)) {
@@ -215,11 +227,13 @@ mod tests {
             };
             let mut bytes = [0; 4];
             let text = character.encode_utf8(&mut bytes);
+            let weights = weights_from_the_table(text);
             assert_eq!(
                 PrimaryWeights::new(text).collect::<Vec<_>>(),
-                weights_from_the_table(text),
+                weights,
                 "U+{codepoint:04X}"
             );
+            assert!(!weights.contains(&0), "U+{codepoint:04X}");
         }
     }
 

@@ -65,6 +65,18 @@ pub(crate) fn sort_key(text: &str) -> Vec<u8> {
         .collect()
 }
 
+pub(crate) fn leading_weights(text: &str) -> ([u16; 3], bool) {
+    let mut weights = PrimaryWeights::new(text);
+    let mut leading = [SPACE; 3];
+    for slot in &mut leading {
+        let Some(weight) = weights.next() else {
+            return (leading, true);
+        };
+        *slot = weight;
+    }
+    (leading, weights.next().is_none())
+}
+
 pub(crate) fn write_sort_key(text: &str, hasher: &mut impl Hasher) {
     let mut key = [0; STACK_SORT_KEY_LEN];
     match sort_key_on_stack(&mut key, PrimaryWeights::new(text)) {
