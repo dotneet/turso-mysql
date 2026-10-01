@@ -393,7 +393,12 @@ fn update_pragma(
                 Expr::Literal(Literal::Keyword(ref kw)) => kw.clone(),
                 _ => parse_string(&value)?,
             };
-            if connection.db.is_preopened() && mode_str.eq_ignore_ascii_case("mvcc") {
+            // A pre-opened database has no path to find a logical log by, so
+            // it can switch only when its capability carried one.
+            if connection.db.is_preopened()
+                && connection.db.durable_storage.is_none()
+                && mode_str.eq_ignore_ascii_case("mvcc")
+            {
                 bail_parse_error!("pre-opened main/WAL capabilities do not support MVCC");
             }
 

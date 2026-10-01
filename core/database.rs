@@ -432,6 +432,7 @@ pub struct PreopenedDatabaseWithWal {
     access: PreopenedDatabaseAccess,
     durable_identity: Option<[u8; 16]>,
     lifetime_guard: Option<Arc<dyn DatabaseLifetimeGuard>>,
+    logical_log_file: Option<Arc<dyn File>>,
 }
 
 impl PreopenedDatabaseWithWal {
@@ -467,6 +468,7 @@ impl PreopenedDatabaseWithWal {
             access: main_access,
             durable_identity: None,
             lifetime_guard: None,
+            logical_log_file: None,
         };
         capability.validate()?;
         Ok(capability)
@@ -523,6 +525,28 @@ impl PreopenedDatabaseWithWal {
     pub fn with_lifetime_guard(mut self, guard: Arc<dyn DatabaseLifetimeGuard>) -> Self {
         self.lifetime_guard = Some(guard);
         self
+    }
+
+    /// Supplies the descriptor an MVCC database keeps its logical log in.
+    ///
+    /// Without one the capability opens only WAL databases, since there is no
+    /// path to find the log by.
+    pub fn with_logical_log_std_file(self, file: std::fs::File) -> Result<Self> {
+        let flags = self.access.open_flags();
+        let file = io::file_from_std(file, format!("{}-log", self.identity.0), flags)?;
+        self.with_logical_log_file(file)
+    }
+
+    /// [`Self::with_logical_log_std_file`] for a descriptor already wrapped.
+    pub fn with_logical_log_file(mut self, file: Arc<dyn File>) -> Result<Self> {
+        let file_id = file.file_id()?;
+        if file_id == self.main_file_id || file_id == self.wal_file_id {
+            return Err(LimboError::InvalidArgument(
+                "the pre-opened logical log must be a file of its own".to_string(),
+            ));
+        }
+        self.logical_log_file = Some(file);
+        Ok(self)
     }
 
     fn validate(&self) -> Result<()> {
@@ -2023,6 +2047,13 @@ impl Database {
             }
         }
 
+        let durable_storage = database.logical_log_file.clone().map(|file| {
+            Arc::new(crate::mvcc::persistent_storage::Storage::new(
+                file,
+                io.clone(),
+                None,
+            )) as Arc<dyn crate::mvcc::persistent_storage::DurableStorage>
+        });
         let mut state = OpenDbAsyncState::new();
         state.registry_key = Some(key.clone());
         loop {
@@ -2037,7 +2068,7 @@ impl Database {
                 flags,
                 options.db_opts,
                 options.encryption.clone(),
-                options.durable_storage.clone(),
+                durable_storage.clone(),
                 options.page_codec.clone(),
                 options.allocators.clone(),
                 options.dialect.clone(),
@@ -2983,7 +3014,10 @@ impl Database {
                         )
                         .into());
                     }
-                    if self.preopened_main_file && matches!(read_version, Version::Mvcc) {
+                    if self.preopened_main_file
+                        && matches!(read_version, Version::Mvcc)
+                        && self.durable_storage.is_none()
+                    {
                         return Err(LimboError::InvalidArgument(
                             "a pre-opened main/WAL capability does not support MVCC databases"
                                 .to_string(),
@@ -5424,6 +5458,78 @@ mod database_tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn preopened_main_wal_and_log_descriptors_run_mvcc_without_path_lookup() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-mvcc-log-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-mvcc-log-wal", OpenFlags::Create, false)
+            .unwrap();
+        let log = storage_io
+            .open_file("preopened-mvcc-log-log", OpenFlags::Create, false)
+            .unwrap();
+        let open = || {
+            Database::open_preopened_with_wal(
+                Arc::new(NoPathIo),
+                preopened_database_with_wal(main.clone(), wal.clone())
+                    .with_logical_log_file(log.clone())
+                    .unwrap(),
+                OpenOptions::new(Arc::new(SqliteDialect)),
+            )
+            .unwrap()
+        };
+        let db = open();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("PRAGMA journal_mode=mvcc").unwrap();
+        assert!(db.mvcc_enabled());
+        let other = db.connect().unwrap();
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        other.execute("BEGIN CONCURRENT").unwrap();
+        conn.execute("INSERT INTO t VALUES(1)").unwrap();
+        other.execute("INSERT INTO t VALUES(2)").unwrap();
+        conn.execute("COMMIT").unwrap();
+        other.execute("COMMIT").unwrap();
+        assert!(log.size().unwrap() > 0);
+        conn.close().unwrap();
+        other.close().unwrap();
+        drop((conn, other, db));
+
+        let reopened = open();
+        assert!(reopened.mvcc_enabled());
+        let reopened_conn = reopened.connect().unwrap();
+        let mut statement = reopened_conn
+            .query("SELECT x FROM t ORDER BY x")
+            .unwrap()
+            .unwrap();
+        let mut rows = Vec::new();
+        statement
+            .run_with_row_callback(|row| {
+                rows.push(row.get_value(0).to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(rows, ["1", "2"]);
+    }
+
+    #[test]
+    fn preopened_logical_log_must_not_be_the_main_or_wal_file() {
+        let storage_io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let main = storage_io
+            .open_file("preopened-log-alias-main", OpenFlags::Create, true)
+            .unwrap();
+        let wal = storage_io
+            .open_file("preopened-log-alias-wal", OpenFlags::Create, false)
+            .unwrap();
+        for alias in [main.clone(), wal.clone()] {
+            assert!(preopened_database_with_wal(main.clone(), wal.clone())
+                .with_logical_log_file(alias)
+                .is_err());
+        }
     }
 
     #[test]
