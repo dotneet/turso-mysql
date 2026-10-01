@@ -339,6 +339,18 @@ pub trait Dialect: Send + Sync + 'static {
         }
     }
 
+    /// Produce durable SQL for a table the engine rebuilt itself, as ADD and
+    /// DROP COLUMN do. `engine_sql` is the engine's own `CREATE TABLE` text for
+    /// the rebuilt table; a frontend dialect formats it as any other rewrite.
+    fn format_rebuilt_table_sql(
+        &self,
+        previous_sql: &str,
+        engine_sql: &str,
+    ) -> crate::Result<String> {
+        let stmt = sqlite::parse_table_sql_ast(engine_sql)?;
+        self.format_rewritten_schema_sql(SchemaSqlKind::Table, previous_sql, &stmt)
+    }
+
     /// Produce durable SQL after an engine schema rewrite.
     ///
     /// `previous_sql` is the exact text currently stored in `sqlite_schema`.

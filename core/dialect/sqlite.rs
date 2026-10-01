@@ -73,6 +73,17 @@ impl super::Dialect for SqliteDialect {
         }
     }
 
+    /// Keeps the engine's text as it is: upstream Turso stores exactly that
+    /// after ADD and DROP COLUMN, and rebuilding it from the AST would space
+    /// it differently (`REFERENCES t (a)` for `REFERENCES t(a)`).
+    fn format_rebuilt_table_sql(
+        &self,
+        _previous_sql: &str,
+        engine_sql: &str,
+    ) -> crate::Result<String> {
+        Ok(engine_sql.to_string())
+    }
+
     fn register_catalog(
         &self,
         schema: &mut Schema,

@@ -575,6 +575,29 @@ pub(crate) fn format_rewritten_schema_sql(
     }
 }
 
+/// Stored SQL for a table the engine rebuilt itself; see
+/// [`crate::dialect::Dialect::format_rebuilt_table_sql`].
+pub(crate) fn format_rebuilt_table_sql(
+    program: &ProgramBuilder,
+    connection: &crate::Connection,
+    previous_sql: &str,
+    engine_sql: &str,
+) -> Result<String> {
+    match program.schema_sql_formatter() {
+        Some(formatter) => {
+            let stmt = crate::dialect::sqlite::parse_table_sql_ast(engine_sql)?;
+            formatter.format_rewritten_schema_sql(
+                crate::dialect::SchemaSqlKind::Table,
+                previous_sql,
+                &stmt,
+            )
+        }
+        None => connection
+            .dialect()
+            .format_rebuilt_table_sql(previous_sql, engine_sql),
+    }
+}
+
 fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
     match stmt {
         ast::Stmt::AlterTable(_) => "alter_table",

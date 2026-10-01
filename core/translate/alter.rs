@@ -1167,13 +1167,11 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let rewritten_stmt = crate::dialect::sqlite::parse_table_sql_ast(&btree.to_sql())?;
-            let rewritten_sql = crate::translate::format_rewritten_schema_sql(
+            let rewritten_sql = crate::translate::format_rebuilt_table_sql(
                 program,
                 connection,
-                crate::dialect::SchemaSqlKind::Table,
                 &previous_table_sql,
-                &rewritten_stmt,
+                &btree.to_sql(),
             )?;
             let sql = escape_sql_string_literal(&rewritten_sql);
 
@@ -1624,13 +1622,11 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let rewritten_stmt = crate::dialect::sqlite::parse_table_sql_ast(&btree.to_sql())?;
-            let rewritten_sql = crate::translate::format_rewritten_schema_sql(
+            let rewritten_sql = crate::translate::format_rebuilt_table_sql(
                 program,
                 connection,
-                crate::dialect::SchemaSqlKind::Table,
                 &previous_table_sql,
-                &rewritten_stmt,
+                &btree.to_sql(),
             )?;
             let escaped = escape_sql_string_literal(&rewritten_sql);
             let escaped_table_name = escape_sql_string_literal(table_name);
