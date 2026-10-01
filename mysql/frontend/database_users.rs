@@ -21,6 +21,8 @@ pub const DEFAULT_METADATA_LOCK_WAIT: Duration = Duration::from_secs(31_536_000)
 pub(crate) struct DatabaseUsers {
     state: Mutex<UsersState>,
     changed: Condvar,
+    #[cfg(test)]
+    wakeups: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Default)]
@@ -67,7 +69,7 @@ impl DatabaseUsers {
                     let mut state = self.lock();
                     state.dropping = false;
                     drop(state);
-                    self.changed.notify_all();
+                    self.wake_the_waiters();
                     return Err(error);
                 }
             };
@@ -105,6 +107,13 @@ impl DatabaseUsers {
             .lock()
             .expect("MySQL database users mutex poisoned")
     }
+
+    fn wake_the_waiters(&self) {
+        #[cfg(test)]
+        self.wakeups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.changed.notify_all();
+    }
 }
 
 /// A `DROP DATABASE` that has waited for every user and keeps new ones out.
@@ -125,7 +134,7 @@ impl DropInProgress<'_> {
         state.dropping = false;
         drop(state);
         self.finished = true;
-        self.users.changed.notify_all();
+        self.users.wake_the_waiters();
     }
 }
 
@@ -137,7 +146,7 @@ impl Drop for DropInProgress<'_> {
         let mut state = self.users.lock();
         state.dropping = false;
         drop(state);
-        self.users.changed.notify_all();
+        self.users.wake_the_waiters();
     }
 }
 
@@ -268,9 +277,12 @@ impl DatabaseUser {
             .using
             .checked_sub(1)
             .expect("a counted MySQL database user was counted once");
+        let a_drop_waits_for_the_users = state.dropping;
         drop(state);
         *using = Use::Not;
-        self.users.changed.notify_all();
+        if a_drop_waits_for_the_users {
+            self.users.wake_the_waiters();
+        }
     }
 
     /// A user of the same database that counts apart from this one, for
@@ -424,6 +436,17 @@ mod tests {
         idle.start_using(A_LONG_WAIT).unwrap();
         idle.stop_using_unless_the_transaction_keeps_it();
         assert!(users.wait_to_drop(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn a_statement_ending_with_no_drop_waiting_wakes_nobody() {
+        let users = Arc::new(DatabaseUsers::default());
+        let busy = user(&users);
+        for _ in 0..3 {
+            busy.start_using(A_LONG_WAIT).unwrap();
+            busy.stop_using();
+        }
+        assert_eq!(users.wakeups.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]
