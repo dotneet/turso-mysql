@@ -852,6 +852,19 @@ pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
 
+/// Forget the shared `Database` registered for the file at `path`, so the
+/// next open of it builds a new one even while the old one is still held.
+///
+/// Tests reopen a database this way. Clearing the whole registry instead
+/// would also cut off the databases that other tests running at the same
+/// time share between their connections.
+#[cfg(test)]
+pub(crate) fn forget_registered_database(path: &str) {
+    if let Ok(file_id) = io::get_file_id(path) {
+        DATABASE_MANAGER.lock().remove(&DatabaseKey::File(file_id));
+    }
+}
+
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 ///

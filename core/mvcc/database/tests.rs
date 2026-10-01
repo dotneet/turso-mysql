@@ -3,6 +3,7 @@ use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::alloc::{TursoAllocator, TursoIteratorExt, TursoTryWithCapacityExt};
+use crate::database::forget_registered_database;
 use crate::io::{PlatformIO, IO};
 use crate::mvcc::clock::MvccClock;
 use crate::mvcc::cursor::{CursorYieldPoint, MvccCursorType};
@@ -2018,15 +2019,10 @@ impl MvccTestDbNoConn {
     /// Like `restart`, but returns the error instead of panicking.
     /// Useful for testing wrong-key scenarios.
     pub fn restart_result(&mut self) -> crate::Result<()> {
-        // First let's clear any entries in database manager in order to force restart.
-        // If not, we will load the same database instance again.
-        {
-            let mut manager = DATABASE_MANAGER.lock();
-            manager.clear();
-        }
-        // Now open again.
-        let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
+        // Without this the open below would hand back the database still held.
+        forget_registered_database(path);
+        let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file_with_flags(
             io,
             path,
@@ -2144,8 +2140,7 @@ fn wal_path_for_db(path: &str) -> std::path::PathBuf {
 
 fn force_close_for_artifact_tamper(db: &mut MvccTestDbNoConn) {
     db.db.take();
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
+    forget_registered_database(db.path.as_ref().unwrap());
 }
 
 fn read_db_page_size(path: &str) -> usize {
@@ -3053,10 +3048,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
     let log_path = std::path::Path::new(&db_path_str).with_extension("db-log");
     overwrite_file_with_junk(&log_path, LOG_HDR_SIZE / 2, 0xAB);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path_str);
     {
         let io = Arc::new(PlatformIO::new().unwrap());
         let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
@@ -3065,10 +3057,7 @@ fn test_bootstrap_repairs_torn_short_log_before_metadata_init() {
         conn.close().unwrap();
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path_str);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path_str, Arc::new(SqliteDialect)).unwrap();
     let conn = db.connect().unwrap();
@@ -3355,10 +3344,7 @@ fn test_bootstrap_recovers_committed_wal_without_log_file() {
         advance_checkpoint_until_wal_has_commit_frame(mvcc_store, &conn);
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
 
     let log_path = std::path::Path::new(&db_path).with_extension("db-log");
     std::fs::remove_file(&log_path).unwrap();
@@ -3398,10 +3384,7 @@ fn test_full_checkpoint_reopen_recovers_truncate_mode() {
         conn.execute("PRAGMA wal_checkpoint(FULL)").unwrap();
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     let db = Database::open_file(io, &db_path, Arc::new(SqliteDialect))
@@ -3501,10 +3484,7 @@ fn test_bootstrap_rejects_torn_log_header_with_committed_wal() {
 
     overwrite_log_header_byte(&db_path, 0, 0x00);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
@@ -3542,10 +3522,7 @@ fn test_bootstrap_rejects_corrupt_log_header_without_wal() {
         overwrite_file_with_junk(&wal_path, 0, 0x00);
     }
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
 
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
@@ -3613,10 +3590,7 @@ fn test_bootstrap_ignores_wal_frames_without_commit_marker() {
     }
 
     rewrite_wal_frames_as_non_commit(&wal_path);
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     let db2 =
         Database::open_file(io, &db_path, Arc::new(SqliteDialect)).expect("open should succeed");
@@ -3878,11 +3852,8 @@ fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_clos
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect() {
@@ -3964,10 +3935,7 @@ fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
         "expected metadata WAL frame to be mutated into missing-row shape"
     );
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect() {
@@ -4002,11 +3970,8 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
         "expected at least one metadata WAL frame to be mutated"
     );
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .is_ok_and(|db2| db2.connect().is_ok())
@@ -4035,11 +4000,8 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        // Ensure cold open after artifact tamper.
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Ensure cold open after artifact tamper.
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     if Database::open_file(io, &db_path, Arc::new(SqliteDialect))
         .is_ok_and(|db2| db2.connect().is_ok())
@@ -4073,10 +4035,7 @@ fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
     let _ = std::fs::remove_file(&wal_path);
     overwrite_file_with_junk(&wal_path, 0, 0);
 
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(&db_path);
     let io = Arc::new(PlatformIO::new().unwrap());
     match Database::open_file(io, &db_path, Arc::new(SqliteDialect)) {
         Ok(db2) => match db2.connect() {
@@ -6974,9 +6933,9 @@ use crate::mvcc::database::{MvStore, Row, RowID};
 use crate::schema::IndexColumn;
 use crate::types::Text;
 use crate::Value;
+use crate::ValueRef;
 use crate::{Database, StepResult};
 use crate::{MemoryIO, Statement};
-use crate::{ValueRef, DATABASE_MANAGER};
 // Simple atomic clock implementation for testing
 
 fn setup_test_db() -> (MvccTestDb, u64, MVTableId, i64) {
@@ -16000,11 +15959,8 @@ fn test_autoincrement_insert_works_for_preexisting_table() {
         conn.close().unwrap();
     }
 
-    // Clear the database manager to force a fresh open
-    {
-        let mut manager = crate::DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    // Forget the open database to force a fresh open
+    forget_registered_database(path_str);
 
     // Phase 2: Reopen in MVCC mode — INSERT should work
     {
@@ -20265,7 +20221,7 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        forget_registered_database(&path_str);
     }
 
     // Step 3: re-open with the busy-on-log_tx storage wrapper.
@@ -20525,7 +20481,7 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        forget_registered_database(&path_str);
     }
 
     let log_path = path.with_extension("db-log");
@@ -21117,10 +21073,8 @@ fn test_autoincrement_in_attached_mvcc_database() {
 
     // Phase 2: restart main, re-attach, insert — id must be 4
     drop(db.db.take());
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(db.path.as_ref().unwrap());
+    forget_registered_database(&aux_path_str);
     db.restart();
 
     {
@@ -21183,10 +21137,8 @@ fn test_create_sequence_in_attached_mvcc_database() {
 
     // Phase 2: restart, re-attach, nextval must resume from 4
     drop(db.db.take());
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-    }
+    forget_registered_database(db.path.as_ref().unwrap());
+    forget_registered_database(&aux_path_str);
     db.restart();
 
     {
@@ -22707,7 +22659,7 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
         conn.close().unwrap();
-        DATABASE_MANAGER.lock().clear();
+        forget_registered_database(&path_str);
     }
 
     let log_path = path.with_extension("db-log");
