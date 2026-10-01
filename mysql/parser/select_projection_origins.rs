@@ -2,7 +2,7 @@
 
 use sqlparser::ast::{Expr, Select, SelectItem, SetExpr, SetQuantifier, Statement, Value};
 
-use crate::{parse_one_statement, ParseError, SessionSqlMode};
+use crate::{read_one_statement, ParseError, SessionSqlMode};
 
 /// The source of one explicitly written SELECT result expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +26,8 @@ pub fn select_projection_origins(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<Vec<MySqlSelectProjectionOrigin>>, ParseError> {
-    let Statement::Query(query) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Query(query) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Err(ParseError::ExpectedSelect);
     };
     let branches = match query.body.as_ref() {
@@ -65,7 +66,8 @@ fn compound_branches(expr: &SetExpr) -> Result<Vec<&Select>, ParseError> {
 /// every row the way `UNION ALL` does. A query that is not compound drops
 /// nothing.
 pub fn compound_drops_repeated_rows(sql: &str, mode: SessionSqlMode) -> Result<bool, ParseError> {
-    let Statement::Query(query) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Query(query) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Err(ParseError::ExpectedSelect);
     };
     Ok(match query.body.as_ref() {

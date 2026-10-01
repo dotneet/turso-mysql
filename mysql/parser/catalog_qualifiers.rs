@@ -12,7 +12,7 @@ use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::tokenizer::Token;
 
 use super::{
-    current_database::byte_offset_of, mentions_ignoring_case, parse_one_statement, ParseError,
+    current_database::byte_offset_of, mentions_ignoring_case, read_one_statement, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -29,7 +29,8 @@ pub fn leave_out_the_catalog_table_in_its_columns(
     if !mentions_ignoring_case(sql, "information_schema") {
         return Ok(None);
     }
-    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Query(query)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let SetExpr::Select(select) = query.body.as_ref() else {

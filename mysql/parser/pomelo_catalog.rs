@@ -71,7 +71,7 @@ pub fn parse_optional_pomelo_information_schema_query(
     {
         return Ok(None);
     }
-    let mut tokens = tokenize_information_schema_query(sql, mode)?;
+    let mut tokens = std::rc::Rc::unwrap_or_clone(tokenize_information_schema_query(sql, mode)?);
     while matches!(tokens.last(), Some(Token::Whitespace(_))) {
         tokens.pop();
     }

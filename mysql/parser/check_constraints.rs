@@ -9,8 +9,8 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Token;
 
 use super::{
-    parse_one_statement, render_table_written_again, unsupported, MySqlTableRewrite, ParseError,
-    SessionMySqlDialect, SessionSqlMode,
+    parse_one_statement, read_one_statement, render_table_written_again, unsupported,
+    MySqlTableRewrite, ParseError, SessionMySqlDialect, SessionSqlMode,
 };
 
 /// One `CHECK` constraint of a stored table.
@@ -60,10 +60,12 @@ pub fn check_constraints_of(
     stored_ddl: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<MySqlCheckConstraint>, ParseError> {
-    let Statement::CreateTable(table) = parse_one_statement(stored_ddl, mode)? else {
+    let read_statement = read_one_statement(stored_ddl, mode);
+    let Statement::CreateTable(table) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateTable);
     };
-    Ok(named_checks(&table)
+    Ok(named_checks(table)
         .into_iter()
         .map(|(name, expr)| MySqlCheckConstraint {
             name,
@@ -81,7 +83,8 @@ pub fn refuse_checks_numbered_out_of_order(
     create_sql: &str,
     mode: SessionSqlMode,
 ) -> Result<(), ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(create_sql, mode) else {
+    let read_statement = read_one_statement(create_sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(());
     };
     let last_column_check = table
@@ -132,7 +135,8 @@ pub fn table_with_a_check_changed(
     let change = match dropped_check_name(alter_sql, mode) {
         Some(name) => CheckAlteration::Drop(name, true),
         None => {
-            let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
+            let read_statement = read_one_statement(alter_sql, mode);
+            let Ok(Statement::AlterTable(alter)) = read_statement.as_ref() else {
                 return Ok(None);
             };
             match alter.operations.as_slice() {
@@ -262,8 +266,9 @@ fn dropped_check(sql: &str, mode: SessionSqlMode) -> Option<(String, String)> {
     let dialect = SessionMySqlDialect::new(mode);
     let tokens = statement_reads::tokens(&dialect, sql).ok()?;
     let mut words = tokens
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF))
+        .cloned();
     let keyword = |token: Option<Token>, expected: &str| {
         matches!(token, Some(Token::Word(word))
             if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))

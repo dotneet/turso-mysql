@@ -20,7 +20,7 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Token;
 
 use super::{
-    a_column_of_words, byte_offset_of_location, parse_one_statement, unsupported, ParseError,
+    a_column_of_words, byte_offset_of_location, read_one_statement, unsupported, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -152,7 +152,9 @@ pub fn table_options_of(
     create_sql: &str,
     mode: SessionSqlMode,
 ) -> Result<MySqlTableOptions, ParseError> {
-    let Statement::CreateTable(table) = parse_one_statement(create_sql, mode)? else {
+    let read_statement = read_one_statement(create_sql, mode);
+    let Statement::CreateTable(table) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateTable);
     };
     Ok(super::check_table_options(&table.table_options)?.kept())
@@ -304,8 +306,9 @@ fn one_table_option(
     let dialect = SessionMySqlDialect::new(mode);
     let tokens = statement_reads::tokens(&dialect, sql).ok()?;
     let mut words = tokens
-        .into_iter()
-        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF))
+        .cloned();
     let named = |token: Option<&Token>, expected: &str| {
         matches!(token, Some(Token::Word(word))
             if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
@@ -352,7 +355,8 @@ pub fn create_table_with_the_database_collation(
     if database_collation == MySqlTableCollation::default() {
         return Ok(None);
     }
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if table.like.is_some() || table.clone.is_some() {
@@ -407,7 +411,8 @@ pub fn create_table_with_its_collation_on_each_text_column(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<String>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let collation = match &table.table_options {
@@ -441,7 +446,8 @@ pub fn alter_table_with_its_collation_on_each_text_column(
     if collation == MySqlTableCollation::default() {
         return Ok(None);
     }
-    let Ok(Statement::AlterTable(alter)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::AlterTable(alter)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let names = alter

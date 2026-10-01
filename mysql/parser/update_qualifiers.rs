@@ -11,7 +11,7 @@ use sqlparser::ast::{ObjectNamePart, Statement, TableFactor};
 use sqlparser::tokenizer::Token;
 
 use super::{
-    current_database::byte_offset_of, mentions_ignoring_case, parse_one_statement, ParseError,
+    current_database::byte_offset_of, mentions_ignoring_case, read_one_statement, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -29,7 +29,8 @@ pub fn leave_out_the_table_in_an_update(
     if !mentions_ignoring_case(sql, "update") || mentions_ignoring_case(sql, "select") {
         return Ok(None);
     }
-    let Ok(Statement::Update(update)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Update(update)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if update.from.is_some() || !update.table.joins.is_empty() {

@@ -1,5 +1,5 @@
 use super::{
-    parse_one_statement, parse_select, unsupported, MySqlTableName, ParseError, SessionSqlMode,
+    parse_select, read_one_statement, unsupported, MySqlTableName, ParseError, SessionSqlMode,
 };
 use sqlparser::ast::{Expr, ObjectNamePart, SelectItem, Statement};
 
@@ -82,7 +82,8 @@ pub fn parse_optional_create_table_as_select(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlCreateTableAsSelect>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let Some(query) = table.query.as_ref() else {

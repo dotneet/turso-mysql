@@ -27,13 +27,15 @@ pub fn view_written_as_mysql_prints_it(
 ) -> Result<Option<String>, ParseError> {
     let dump_ddl = parse_optional_mysqldump_ddl(sql)?;
     let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
-    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::CreateView(view) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Ok(None);
     };
     if !kept_as_mysql_prints_it(&view.query) {
         return Ok(None);
     }
-    refuse_view_options(&view)?;
+    refuse_view_options(view)?;
     let [ObjectNamePart::Identifier(name)] = view.name.0.as_slice() else {
         return unsupported("qualified view name");
     };
@@ -58,7 +60,8 @@ pub fn view_written_as_mysql_prints_it(
 pub fn created_view_name(sql: &str, mode: SessionSqlMode) -> Option<MySqlTableName> {
     let dump_ddl = parse_optional_mysqldump_ddl(sql).ok()?;
     let sql = dump_ddl.as_ref().map_or(sql, MySqlDumpDdl::normalized_sql);
-    let Ok(Statement::CreateView(view)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateView(view)) = read_statement.as_ref() else {
         return None;
     };
     let [ObjectNamePart::Identifier(name)] = view.name.0.as_slice() else {
@@ -91,7 +94,9 @@ pub fn mysql_create_view_ddl(
 /// Reads the `SELECT` of a view kept in the text MySQL prints, written the
 /// way the `SELECT` translator reads it, which is what the view runs.
 pub fn translated_view_select(sql: &str, mode: SessionSqlMode) -> Result<String, ParseError> {
-    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::CreateView(view) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateView);
     };
     view_body(&view.query, mode, None, Written::ForTheTranslator)
@@ -103,7 +108,9 @@ pub fn render_show_create_written_view_mysql(
     mode: SessionSqlMode,
     username: &str,
 ) -> Result<String, ParseError> {
-    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::CreateView(view) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateView);
     };
     let [ObjectNamePart::Identifier(name)] = view.name.0.as_slice() else {
@@ -132,7 +139,9 @@ pub fn written_view_definition(
     mode: SessionSqlMode,
     database: &str,
 ) -> Result<(String, bool), ParseError> {
-    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::CreateView(view) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateView);
     };
     let definition = view_body(
@@ -161,7 +170,8 @@ pub fn written_view_definition(
 /// table first, which changes the columns it reports, and whether it does
 /// depends on the plan.
 pub fn select_reads_rows_as_they_come(sql: &str, mode: SessionSqlMode) -> bool {
-    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Query(query)) = read_statement.as_ref() else {
         return false;
     };
     if query.with.is_some()
@@ -320,7 +330,9 @@ pub fn written_view_columns(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<MySqlWrittenView, ParseError> {
-    let Statement::CreateView(view) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::CreateView(view) = read_statement.as_ref().as_ref().map_err(Clone::clone)?
+    else {
         return Err(ParseError::ExpectedCreateView);
     };
     let (select, from) = view_select(&view.query)?;

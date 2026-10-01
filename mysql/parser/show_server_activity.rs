@@ -9,7 +9,7 @@ use sqlparser::ast::{
 
 use super::{
     admin_command_ends, consume_admin_like_pattern, consume_admin_word,
-    like_pattern::MySqlLikePattern, parse_one_statement, skip_admin_comments,
+    like_pattern::MySqlLikePattern, read_one_statement, skip_admin_comments,
     tokenize_admin_command, MySqlVariableScope, ParseError, SessionSqlMode,
 };
 
@@ -114,7 +114,8 @@ pub fn parse_optional_status_counter_read(
     const REFUSED: ParseError = ParseError::Unsupported {
         feature: "a read of a performance_schema status table other than one counter's value",
     };
-    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Query(query)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let SetExpr::Select(select) = query.body.as_ref() else {

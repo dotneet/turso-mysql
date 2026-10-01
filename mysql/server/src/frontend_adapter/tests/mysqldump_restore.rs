@@ -479,10 +479,10 @@ fn a_dumps_long_insert_is_read_whole_only_a_few_times() {
         assert_eq!(
             whole_readings(before, turso_mysql_parser::bytes_read(), sql.len()),
             turso_mysql_parser::BytesRead {
-                tokenized: 3,
+                tokenized: 2,
                 parsed: 2,
                 parsed_by_the_engine: 1,
-                tokenized_as_a_command: 3,
+                tokenized_as_a_command: 1,
                 checked_as_a_counted_insert: 1,
             },
             "{}",

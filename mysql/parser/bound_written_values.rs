@@ -8,7 +8,7 @@
 //! the caller works out from the cast each stands in.
 
 use super::{
-    byte_offset_of_location, parse_one_statement, written_value, ParseError, SessionMySqlDialect,
+    byte_offset_of_location, read_one_statement, written_value, ParseError, SessionMySqlDialect,
     SessionSqlMode,
 };
 use crate::statement_reads;
@@ -84,7 +84,8 @@ pub fn parse_optional_bound_written_values(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<BoundWrittenValues>, ParseError> {
-    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Query(query)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if query.with.is_some()

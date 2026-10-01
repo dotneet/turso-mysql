@@ -7,6 +7,7 @@
 use super::database_options::consume_database_options;
 use super::*;
 use crate::statement_reads;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransactionTokenKind {
@@ -391,7 +392,7 @@ enum AdminStatementKind {
 pub(crate) fn tokenize_admin_command(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Vec<AdminToken>, ParseError> {
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
     tokenize_admin_text(sql, mode, VersionedComments::Kept)
 }
 
@@ -400,14 +401,14 @@ pub(crate) fn tokenize_admin_command(
 pub(crate) fn tokenize_versioned_admin_command(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Vec<AdminToken>, ParseError> {
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
     tokenize_admin_text(sql, mode, VersionedComments::Expanded)
 }
 
 pub(crate) fn tokenize_lock_tables_command(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Vec<AdminToken>, ParseError> {
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
     tokenize_admin_text(sql, mode, VersionedComments::MysqldumpLocal)
 }
 
@@ -433,7 +434,7 @@ fn tokenize_admin_text(
     sql: &str,
     mode: SessionSqlMode,
     versioned_comments: VersionedComments,
-) -> Result<Vec<AdminToken>, ParseError> {
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
     statement_reads::admin_tokens(sql, mode, versioned_comments, || {
         read_admin_text(sql, mode, versioned_comments)
     })

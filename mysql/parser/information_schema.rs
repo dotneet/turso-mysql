@@ -10,7 +10,7 @@ use crate::statement_reads;
 pub(crate) fn tokenize_information_schema_query(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Vec<Token>, ParseError> {
+) -> Result<std::rc::Rc<Vec<Token>>, ParseError> {
     statement_reads::tokens(&SessionMySqlDialect::without_executable_comments(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))
 }

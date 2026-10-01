@@ -7,7 +7,7 @@
 //! Only the frontend knows each column's type, so this reads the statement's
 //! literals out and leaves the frontend to hold them to their columns.
 
-use crate::{parse_one_statement, ParseError, SessionSqlMode};
+use crate::{read_one_statement, ParseError, SessionSqlMode};
 use sqlparser::ast::{
     AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
     ObjectNamePart, OnInsert, SetExpr, Statement, TableFactor, TableObject, UnaryOperator, Value,
@@ -53,7 +53,8 @@ pub fn literals_written_into_columns(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<WrittenLiterals>, ParseError> {
-    let (tables, columns) = match parse_one_statement(sql, mode)? {
+    let read_statement = read_one_statement(sql, mode);
+    let (tables, columns) = match read_statement.as_ref().as_ref().map_err(Clone::clone)? {
         Statement::Insert(insert) => {
             let TableObject::TableName(table) = &insert.table else {
                 return Ok(None);

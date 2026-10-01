@@ -13,7 +13,7 @@ use sqlparser::tokenizer::Token;
 use crate::current_database::byte_offset_of;
 use crate::statement_reads;
 
-use super::{parse_one_statement, ParseError, SessionMySqlDialect, SessionSqlMode};
+use super::{read_one_statement, ParseError, SessionMySqlDialect, SessionSqlMode};
 
 /// Writes a one-table `UPDATE` without the alias it gives its table, or
 /// answers `None` when there is no alias to take out.
@@ -29,7 +29,8 @@ pub(crate) fn without_the_updated_tables_alias(
     if !starts_with_update(sql) {
         return Ok(None);
     }
-    let Ok(Statement::Update(update)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Update(update)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if !update.table.joins.is_empty() || update.from.is_some() {

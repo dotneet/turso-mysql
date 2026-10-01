@@ -12,7 +12,7 @@ use sqlparser::ast::{SetExpr, Statement, TableFactor};
 use sqlparser::tokenizer::Token;
 
 use super::{
-    current_database::byte_offset_of, mentions_ignoring_case, parse_one_statement, ParseError,
+    current_database::byte_offset_of, mentions_ignoring_case, read_one_statement, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -41,7 +41,8 @@ pub fn leave_out_from_dual(sql: &str, mode: SessionSqlMode) -> Result<Option<Str
     let [(start, end)] = places.as_slice() else {
         return Ok(None);
     };
-    let Ok(Statement::Query(query)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Query(query)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let SetExpr::Select(select) = query.body.as_ref() else {
@@ -63,7 +64,8 @@ pub fn leave_out_from_dual(sql: &str, mode: SessionSqlMode) -> Result<Option<Str
 /// Whether `sql` is an `INSERT` or `REPLACE` of written rows and nothing
 /// else — no `SELECT` as its source and no `ON DUPLICATE KEY UPDATE`.
 pub fn inserts_written_values_only(sql: &str, mode: SessionSqlMode) -> bool {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return false;
     };
     insert.on.is_none()

@@ -12,7 +12,7 @@ use sqlparser::ast::{DataType, Statement};
 use sqlparser::tokenizer::Token;
 
 use super::{
-    current_database::byte_offset_of, mentions_ignoring_case, parse_one_statement, ParseError,
+    current_database::byte_offset_of, mentions_ignoring_case, read_one_statement, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -28,7 +28,8 @@ pub fn write_serial_out(sql: &str, mode: SessionSqlMode) -> Result<Option<String
     if !mentions_ignoring_case(sql, "serial") {
         return Ok(None);
     }
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let declared = table

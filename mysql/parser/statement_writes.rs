@@ -40,8 +40,9 @@ pub fn what_a_statement_writes(sql: &str, mode: SessionSqlMode) -> StatementWrit
         return StatementWrites::Unknown;
     };
     let mut tokens = tokens
-        .into_iter()
+        .iter()
         .filter(|token| !matches!(token, AdminToken::Comment))
+        .cloned()
         .collect::<Vec<_>>();
     while tokens.last() == Some(&AdminToken::Semicolon) {
         tokens.pop();

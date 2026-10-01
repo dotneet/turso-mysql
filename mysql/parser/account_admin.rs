@@ -74,7 +74,9 @@ pub fn parse_optional_account_admin_command(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlAccountAdminCommand>, ParseError> {
-    let mut tokens = AccountAdminTokens(tokenize_admin_command(sql, mode)?);
+    let mut tokens = AccountAdminTokens(std::rc::Rc::unwrap_or_clone(tokenize_admin_command(
+        sql, mode,
+    )?));
     let first = skip_admin_comments(&tokens.0, 0);
     let kind = match tokens.0.get(first) {
         Some(AdminToken::Word(word)) if word.eq_ignore_ascii_case("CREATE") => {

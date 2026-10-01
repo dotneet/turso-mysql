@@ -49,6 +49,7 @@ impl Drop for KeptReads {
         });
         if keepers == 0 {
             TOKENS.with(|kept| kept.borrow_mut().clear());
+            PLAIN_TOKENS.with(|kept| kept.borrow_mut().clear());
             STATEMENTS.with(|kept| kept.borrow_mut().clear());
             ENGINE_STATEMENTS.with(|kept| kept.borrow_mut().clear());
             ADMIN_TOKENS.with(|kept| kept.borrow_mut().clear());
@@ -96,19 +97,25 @@ pub(crate) fn tokens_with_location(
 pub(crate) fn tokens(
     dialect: &SessionMySqlDialect,
     sql: &str,
-) -> Result<Vec<Token>, TokenizerError> {
-    with_tokens(TokenDialect::Session(*dialect), sql, plain_tokens)
+) -> Result<Rc<Vec<Token>>, TokenizerError> {
+    plain_tokens(TokenDialect::Session(*dialect), sql)
 }
 
 /// The tokens of `sql` as sqlparser's own MySQL dialect reads them.
-pub(crate) fn tokens_of_plain_mysql(sql: &str) -> Result<Vec<Token>, TokenizerError> {
-    with_tokens(TokenDialect::PlainMySql, sql, plain_tokens)
+pub(crate) fn tokens_of_plain_mysql(sql: &str) -> Result<Rc<Vec<Token>>, TokenizerError> {
+    plain_tokens(TokenDialect::PlainMySql, sql)
 }
 
-fn plain_tokens(
-    tokens: Result<&[TokenWithSpan], TokenizerError>,
-) -> Result<Vec<Token>, TokenizerError> {
-    tokens.map(|tokens| tokens.iter().map(|token| token.token.clone()).collect())
+fn plain_tokens(dialect: TokenDialect, sql: &str) -> Result<Rc<Vec<Token>>, TokenizerError> {
+    answer(&PLAIN_TOKENS, dialect, sql, || {
+        with_tokens(dialect, sql, |tokens| match tokens {
+            Ok(tokens) => Ok(Rc::new(
+                tokens.iter().map(|token| token.token.clone()).collect(),
+            )),
+            Err(error) => Err((error.message, error.location)),
+        })
+    })
+    .map_err(|(message, location)| TokenizerError { message, location })
 }
 
 /// The one statement `read` makes of `sql`, answered from the last time this
@@ -117,10 +124,10 @@ pub(crate) fn statement(
     sql: &str,
     mode: SessionSqlMode,
     read: impl FnOnce() -> Result<Statement, ParseError>,
-) -> Result<Statement, ParseError> {
+) -> Rc<Result<Statement, ParseError>> {
     answer(&STATEMENTS, mode, sql, || {
         count(|bytes| bytes.parsed += sql.len());
-        read()
+        Rc::new(read())
     })
 }
 
@@ -156,10 +163,16 @@ pub(crate) fn admin_tokens(
     mode: SessionSqlMode,
     versioned_comments: VersionedComments,
     read: impl FnOnce() -> Result<Vec<AdminToken>, ParseError>,
-) -> Result<Vec<AdminToken>, ParseError> {
-    answer(&ADMIN_TOKENS, (mode, versioned_comments), sql, || {
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
+    let read_alike_by_every_setting = !sql.contains("/*!");
+    let kept_as = if read_alike_by_every_setting {
+        VersionedComments::Kept
+    } else {
+        versioned_comments
+    };
+    answer(&ADMIN_TOKENS, (mode, kept_as), sql, || {
         count(|bytes| bytes.tokenized_as_a_command += sql.len());
-        read()
+        read().map(Rc::new)
     })
 }
 
@@ -274,6 +287,8 @@ fn the_other_setting(dialect: TokenDialect) -> Option<TokenDialect> {
 const KEPT_TEXTS: usize = 8;
 
 type Kept<K, V> = RefCell<Vec<(K, String, V)>>;
+type KeptPlainTokens = Result<Rc<Vec<Token>>, (String, Location)>;
+type KeptAdminTokens = Result<Rc<Vec<AdminToken>>, ParseError>;
 
 thread_local! {
     static KEEPERS: Cell<usize> = const { Cell::new(0) };
@@ -287,12 +302,13 @@ thread_local! {
         })
     };
     static TOKENS: Kept<TokenDialect, KeptTokens> = const { RefCell::new(Vec::new()) };
-    static STATEMENTS: Kept<SessionSqlMode, Result<Statement, ParseError>> =
+    static PLAIN_TOKENS: Kept<TokenDialect, KeptPlainTokens> = const { RefCell::new(Vec::new()) };
+    static STATEMENTS: Kept<SessionSqlMode, Rc<Result<Statement, ParseError>>> =
         const { RefCell::new(Vec::new()) };
     static ENGINE_STATEMENTS: Kept<(), EngineReading> = const { RefCell::new(Vec::new()) };
     static COUNTED_INSERTS: Kept<(SessionSqlMode, CountedValues), Result<CheckedAutoIncrementInsert, ParseError>> =
         const { RefCell::new(Vec::new()) };
-    static ADMIN_TOKENS: Kept<(SessionSqlMode, VersionedComments), Result<Vec<AdminToken>, ParseError>> =
+    static ADMIN_TOKENS: Kept<(SessionSqlMode, VersionedComments), KeptAdminTokens> =
         const { RefCell::new(Vec::new()) };
 }
 

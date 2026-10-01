@@ -46,8 +46,9 @@ pub fn parse_optional_create_table_like(
         return Ok(None);
     };
     let mut words = tokens
-        .into_iter()
+        .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF))
+        .cloned()
         .peekable();
     let keyword = |token: Option<&Token>, expected: &str| {
         matches!(token, Some(Token::Word(word))

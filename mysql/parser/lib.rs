@@ -2881,10 +2881,11 @@ pub fn parse_optional_create_table_with_keys(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlCreateTableWithKeys>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
-    reject_json_defaults_and_keys(&table)?;
+    reject_json_defaults_and_keys(table)?;
     let mut remaining = table.clone();
     let keyed_column = unique_written_on_the_primary_key(&mut remaining)?;
     if keyed_column.is_none()
@@ -4011,7 +4012,8 @@ pub fn parse_optional_created_table(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlCreatedTable>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let [ObjectNamePart::Identifier(name)] = table.name.0.as_slice() else {
@@ -4041,7 +4043,8 @@ pub fn columns_rewritten_on_update(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<String>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(Vec::new());
     };
     Ok(table
@@ -4066,7 +4069,8 @@ pub fn column_comments(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Vec<(String, String)>, ParseError> {
-    let Ok(Statement::CreateTable(table)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::CreateTable(table)) = read_statement.as_ref() else {
         return Ok(Vec::new());
     };
     Ok(table
@@ -4113,7 +4117,8 @@ pub struct MySqlTableRewrite {
 
 /// The unqualified table one `ALTER TABLE` names, where it names one.
 pub fn alter_table_target(sql: &str, mode: SessionSqlMode) -> Option<String> {
-    let Ok(Statement::AlterTable(alter)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::AlterTable(alter)) = read_statement.as_ref() else {
         return None;
     };
     match alter.name.0.as_slice() {
@@ -4137,7 +4142,8 @@ pub fn table_with_a_column_placed(
     alter_sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlColumnPlacement>, ParseError> {
-    let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
+    let read_statement = read_one_statement(alter_sql, mode);
+    let Ok(Statement::AlterTable(alter)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if alter.operations.len() > 1 {
@@ -4380,7 +4386,8 @@ pub fn alter_column_default_restated(
     alter_sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlColumnDefaultChange>, ParseError> {
-    let Ok(Statement::AlterTable(alter)) = parse_one_statement(alter_sql, mode) else {
+    let read_statement = read_one_statement(alter_sql, mode);
+    let Ok(Statement::AlterTable(alter)) = read_statement.as_ref() else {
         return Ok(None);
     };
     let changes =
@@ -4400,7 +4407,8 @@ pub fn alter_column_default_restated(
     let Some(changes) = changes.filter(|changes| !changes.is_empty()) else {
         return Ok(None);
     };
-    let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
+    let read_statement = read_one_statement(stored_ddl, mode);
+    let Ok(Statement::CreateTable(stored)) = read_statement.as_ref() else {
         return Err(ParseError::ExpectedCreateTable);
     };
     let mut restated = Vec::with_capacity(changes.len());
@@ -4930,10 +4938,11 @@ fn parse_select_inner(
     knows_the_kinds_of_joined_columns: bool,
 ) -> Result<TranslatedSelect, ParseError> {
     let sql = &*without_utf8mb4_introducers(sql, mode)?;
-    let statement = parse_one_statement(sql, mode)?;
-    let Statement::Query(mut query) = statement else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Query(query) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Err(ParseError::ExpectedSelect);
     };
+    let mut query = query.clone();
     translate::name_the_columns_grouped_by_place(&mut query)?;
     translate::leave_the_one_table_out(&mut query);
     let tokens = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql)
@@ -5207,7 +5216,8 @@ pub fn parse_insert_select_knowing_its_select(
     mode: SessionSqlMode,
     select: &TranslatedSelect,
 ) -> Result<TranslatedDml, ParseError> {
-    let Statement::Insert(insert) = parse_one_statement(sql, mode)? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Insert(insert) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Err(ParseError::ExpectedDml);
     };
     if insert
@@ -5217,7 +5227,7 @@ pub fn parse_insert_select_knowing_its_select(
     {
         return unsupported("INSERT without a SELECT");
     }
-    let rendered = translate_insert(&insert, sql, mode, &[], Some(select))?;
+    let rendered = translate_insert(insert, sql, mode, &[], Some(select))?;
     Ok(TranslatedDml {
         sqlite_sql: rendered.sqlite_sql,
         checked_update: None,
@@ -5281,8 +5291,8 @@ fn parse_checked_auto_increment_insert(
     accepts_value: fn(&Expr) -> bool,
 ) -> Result<CheckedAutoIncrementInsert, ParseError> {
     validate_auto_increment_insert_token_shape(sql, mode)?;
-    let statement = parse_one_statement(sql, mode)?;
-    let Statement::Insert(insert) = &statement else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Insert(insert) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Err(ParseError::ExpectedDml);
     };
 
@@ -5554,8 +5564,8 @@ pub fn parse_insert_values_written_into(
             [ObjectNamePart::Identifier(ident)] if ident.value.eq_ignore_ascii_case(column)
         )
     };
-    let statement = parse_one_statement(sql, mode)?;
-    let Statement::Insert(insert) = &statement else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Insert(insert) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Ok(None);
     };
     // MySQL's `INSERT ... SET id = 1` names its columns and values in one place
@@ -5624,14 +5634,14 @@ pub fn parse_auto_increment_insert_target(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<String>, ParseError> {
-    let statement = parse_one_statement(sql, mode)?;
-    let Statement::Insert(insert) = statement else {
+    let read_statement = read_one_statement(sql, mode);
+    let Statement::Insert(insert) = read_statement.as_ref().as_ref().map_err(Clone::clone)? else {
         return Ok(None);
     };
-    let sqlparser::ast::TableObject::TableName(table) = insert.table else {
+    let sqlparser::ast::TableObject::TableName(table) = &insert.table else {
         return unsupported("INSERT table source");
     };
-    Ok(Some(insert_name(&table)?.as_str().to_owned()))
+    Ok(Some(insert_name(table)?.as_str().to_owned()))
 }
 
 /// What the frontend holds one `INSERT ... ON DUPLICATE KEY UPDATE` to before
@@ -5640,9 +5650,10 @@ pub fn parse_optional_upsert(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<CheckedUpsert>, ParseError> {
-    match parse_one_statement(sql, mode)? {
-        Statement::Insert(insert) => translate::checked_upsert(&insert),
-        _ => Ok(None),
+    match read_one_statement(sql, mode).as_ref() {
+        Ok(Statement::Insert(insert)) => translate::checked_upsert(insert),
+        Ok(_) => Ok(None),
+        Err(error) => Err(error.clone()),
     }
 }
 
@@ -5694,8 +5705,8 @@ pub enum OfferedValue {
 /// however many rows the statement offers — when the statement is prepared,
 /// and not again when it is executed.
 pub fn count_offered_row_calls(sql: &str, mode: SessionSqlMode) -> usize {
-    match parse_one_statement(sql, mode) {
-        Ok(Statement::Insert(insert)) => translate::offered_row_calls(&insert),
+    match read_one_statement(sql, mode).as_ref() {
+        Ok(Statement::Insert(insert)) => translate::offered_row_calls(insert),
         _ => 0,
     }
 }
@@ -6328,6 +6339,13 @@ pub fn parse_schema_ddl_ast(sql: &str, mode: SessionSqlMode) -> Result<Stmt, Par
 }
 
 fn parse_one_statement(sql: &str, mode: SessionSqlMode) -> Result<Statement, ParseError> {
+    std::rc::Rc::unwrap_or_clone(read_one_statement(sql, mode))
+}
+
+fn read_one_statement(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> std::rc::Rc<Result<Statement, ParseError>> {
     statement_reads::statement(sql, mode, || {
         let dialect = SessionMySqlDialect::new(mode);
         let tokens = statement_reads::tokens_with_location(&dialect, sql)

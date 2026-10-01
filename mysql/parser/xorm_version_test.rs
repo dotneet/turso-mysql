@@ -29,8 +29,9 @@ pub fn xorm_mariadb_test_span(sql: &str, mode: SessionSqlMode) -> Option<std::op
     let tokens = |text: &str| {
         statement_reads::tokens(&dialect, text).ok().map(|tokens| {
             tokens
-                .into_iter()
+                .iter()
                 .filter(|token| !matches!(token, Token::Whitespace(_)))
+                .cloned()
                 .collect::<Vec<_>>()
         })
     };

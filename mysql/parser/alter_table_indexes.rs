@@ -1,6 +1,6 @@
 use super::{
-    inline_index_columns, parse_one_statement, unsupported, MySqlTableName, ParseError,
-    SessionSqlMode,
+    inline_index_columns, mentions_ignoring_case, parse_one_statement, unsupported, MySqlTableName,
+    ParseError, SessionSqlMode,
 };
 use crate::statement_reads;
 use sqlparser::ast::{AlterTableOperation, ObjectNamePart, Statement, TableConstraint};
@@ -117,6 +117,9 @@ pub fn parse_optional_alter_table_indexes(
 /// a rename beside some other operation among them, which is left to fail
 /// where it is read.
 fn renamed_indexes(sql: &str) -> Result<Option<MySqlAlterTableIndexes>, ParseError> {
+    if !mentions_ignoring_case(sql, "RENAME") {
+        return Ok(None);
+    }
     let Ok(tokens) = statement_reads::tokens_of_plain_mysql(sql) else {
         return Ok(None);
     };
@@ -179,6 +182,9 @@ fn renamed_indexes(sql: &str) -> Result<Option<MySqlAlterTableIndexes>, ParseErr
 /// this one. Answers `None` for any other statement, and for a name qualified
 /// by its database, which is left to be refused where it is read.
 pub fn renamed_tables(sql: &str) -> Option<Vec<(MySqlTableName, MySqlTableName)>> {
+    if !mentions_ignoring_case(sql, "RENAME") {
+        return None;
+    }
     let tokens = statement_reads::tokens_of_plain_mysql(sql).ok()?;
     let mut words = tokens.iter().filter(|token| {
         !matches!(token, Token::Whitespace(_)) && !matches!(token, Token::SemiColon)
@@ -222,6 +228,9 @@ pub fn renamed_tables(sql: &str) -> Option<Vec<(MySqlTableName, MySqlTableName)>
 /// both. Answers nothing for any other statement, including the engine's own
 /// `DROP INDEX name`, which names no table to move.
 fn drop_index_spelled_as_alter_table(sql: &str) -> Option<String> {
+    if !mentions_ignoring_case(sql, "DROP") {
+        return None;
+    }
     let tokens = statement_reads::tokens_of_plain_mysql(sql).ok()?;
     let mut words = tokens.iter().filter(|token| {
         !matches!(token, Token::Whitespace(_)) && !matches!(token, Token::SemiColon)
@@ -259,7 +268,11 @@ fn drop_index_spelled_as_alter_table(sql: &str) -> Option<String> {
 /// left alone — only the word right after a `DROP` is one MySQL means as the
 /// keyword. Answers nothing when the statement has no `DROP KEY` to swap.
 pub(crate) fn drop_key_spelled_as_drop_index(sql: &str) -> Option<String> {
-    let mut tokens = statement_reads::tokens_of_plain_mysql(sql).ok()?;
+    if !mentions_ignoring_case(sql, "KEY") {
+        return None;
+    }
+    let mut tokens =
+        std::rc::Rc::unwrap_or_clone(statement_reads::tokens_of_plain_mysql(sql).ok()?);
     let mut swapped = false;
     let mut after_a_drop = false;
     for token in &mut tokens {

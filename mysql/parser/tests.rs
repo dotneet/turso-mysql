@@ -9540,6 +9540,26 @@ fn a_kept_reading_answers_what_reading_afresh_would() {
     assert!(bytes_read().parsed_by_the_engine > first_reading.parsed_by_the_engine);
 }
 
+#[test]
+fn every_recognizer_shares_one_kept_reading_instead_of_copying_it() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO kept_reads (a, b) VALUES (1, 'one')";
+    let dialect = SessionMySqlDialect::new(mode);
+    let _kept = keep_reads();
+    assert!(std::rc::Rc::ptr_eq(
+        &read_one_statement(sql, mode),
+        &read_one_statement(sql, mode)
+    ));
+    assert!(std::rc::Rc::ptr_eq(
+        &statement_reads::tokens(&dialect, sql).unwrap(),
+        &statement_reads::tokens(&dialect, sql).unwrap()
+    ));
+    assert!(std::rc::Rc::ptr_eq(
+        &crate::admin_command::tokenize_admin_command(sql, mode).unwrap(),
+        &crate::admin_command::tokenize_admin_command(sql, mode).unwrap()
+    ));
+}
+
 /// The session's two settings for `/*!NNNNN ... */` comments read a text with
 /// none in it as the same tokens, so it is tokenized once for both; a text
 /// holding one is tokenized under each, and each reads it as it would afresh.

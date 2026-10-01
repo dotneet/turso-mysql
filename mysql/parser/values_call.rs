@@ -11,7 +11,7 @@ use sqlparser::ast::{ObjectNamePart, Statement, TableObject};
 use sqlparser::tokenizer::Token;
 
 use super::{
-    current_database::byte_offset_of, mentions_ignoring_case, parse_one_statement, ParseError,
+    current_database::byte_offset_of, mentions_ignoring_case, read_one_statement, ParseError,
     SessionMySqlDialect, SessionSqlMode,
 };
 
@@ -27,7 +27,8 @@ pub fn leave_out_the_table_in_values_calls(
     if !mentions_ignoring_case(sql, "values") || !mentions_ignoring_case(sql, "duplicate") {
         return Ok(None);
     }
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if insert.on.is_none() {

@@ -1,5 +1,5 @@
 use super::{
-    parse_one_statement, unsupported, MySqlTableName, ParseError, SessionMySqlDialect,
+    read_one_statement, unsupported, MySqlTableName, ParseError, SessionMySqlDialect,
     SessionSqlMode,
 };
 use crate::statement_reads;
@@ -48,7 +48,8 @@ fn insert_select_projection(
     allow_filter: bool,
     allow_arithmetic: bool,
 ) -> Option<MySqlDirectInsertSelectProjection> {
-    let Statement::Insert(insert) = parse_one_statement(sql, mode).ok()? else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return None;
     };
     if insert.on.is_some() || insert.ignore || insert.replace_into {
@@ -220,7 +221,8 @@ pub fn parse_optional_insert_select_without_columns(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlInsertSelectWithoutColumns>, ParseError> {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if !insert.columns.is_empty() {
@@ -280,7 +282,8 @@ pub fn parse_optional_insert_select(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlInsertSelect>, ParseError> {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if insert.columns.is_empty() || !insert.assignments.is_empty() {
@@ -326,7 +329,8 @@ pub fn insert_select_source_sql(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<String>, ParseError> {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if insert.columns.is_empty() || !insert.assignments.is_empty() {
@@ -407,7 +411,8 @@ pub fn parse_optional_insert_values_without_columns(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<MySqlInsertValuesWithoutColumns>, ParseError> {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if !insert.columns.is_empty() || !insert.assignments.is_empty() {
@@ -505,7 +510,8 @@ pub fn parse_optional_insert_set_as_values(
     sql: &str,
     mode: SessionSqlMode,
 ) -> Result<Option<String>, ParseError> {
-    let Ok(Statement::Insert(insert)) = parse_one_statement(sql, mode) else {
+    let read_statement = read_one_statement(sql, mode);
+    let Ok(Statement::Insert(insert)) = read_statement.as_ref() else {
         return Ok(None);
     };
     if insert.assignments.is_empty() {

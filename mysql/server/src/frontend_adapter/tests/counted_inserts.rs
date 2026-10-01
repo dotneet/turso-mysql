@@ -1736,3 +1736,32 @@ fn an_insert_into_a_counted_table_parses_its_definition_once() {
         vec![some(&["1"]), some(&["2"])]
     );
 }
+
+#[test]
+fn a_sysbench_insert_into_a_counted_table_is_tokenized_once() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE sbtest1(\n  id INTEGER NOT NULL AUTO_INCREMENT,\n  k INTEGER DEFAULT '0' NOT NULL,\n  c CHAR(120) DEFAULT '' NOT NULL,\n  pad CHAR(60) DEFAULT '' NOT NULL,\n  PRIMARY KEY (id)\n) /*! ENGINE = innodb */ ",
+    );
+    run(&mut adapter, "CREATE INDEX k_1 ON sbtest1(k)");
+    let c = "83868641912-28773972837-60736120486-75162659906-27563526494-20381887404-41576422241-93426793964-56405065102-33518432330";
+    let pad = "67847967377-48000963322-62604785301-91415491898-96926520291";
+    let insert = format!("INSERT INTO sbtest1 (id, k, c, pad) VALUES (0, 50147, '{c}', '{pad}')");
+    let before = turso_mysql_parser::bytes_read();
+    run(&mut adapter, &insert);
+    assert_eq!(
+        whole_readings(before, turso_mysql_parser::bytes_read(), insert.len()),
+        turso_mysql_parser::BytesRead {
+            tokenized: 1,
+            parsed: 1,
+            parsed_by_the_engine: 1,
+            tokenized_as_a_command: 1,
+            checked_as_a_counted_insert: 1,
+        }
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, k FROM sbtest1"),
+        vec![some(&["1", "50147"])]
+    );
+}
