@@ -587,6 +587,14 @@ impl MySqlConnection {
         &self,
         table: &MySqlTableName,
     ) -> std::result::Result<Vec<MySqlColumnMetadata>, MySqlColumnMetadataError> {
+        self.list_shared_columns(table)
+            .map(|columns| columns.as_ref().clone())
+    }
+
+    pub(crate) fn list_shared_columns(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<Arc<Vec<MySqlColumnMetadata>>, MySqlColumnMetadataError> {
         // A schema another session committed is taken up here the way the
         // engine takes it up before it compiles a statement.
         self.inner.maybe_update_schema();
@@ -599,7 +607,7 @@ impl MySqlConnection {
         {
             return Ok(columns);
         }
-        let columns = self.read_columns(table)?;
+        let columns = Arc::new(self.read_columns(table)?);
         // Reading may have taken up a newer schema; what it read then belongs
         // to that one, not to the one looked up above.
         if Arc::ptr_eq(&schema, &self.inner.current_schema()) {

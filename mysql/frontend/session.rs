@@ -116,7 +116,7 @@ pub struct MySqlConnection {
 struct SchemaReadings {
     schema: Option<Arc<turso_core::schema::Schema>>,
     tables: Option<Vec<MySqlTable>>,
-    columns: HashMap<String, Vec<MySqlColumnMetadata>>,
+    columns: HashMap<String, Arc<Vec<MySqlColumnMetadata>>>,
     counted_tables_by_lowercase_name: HashMap<String, Option<AutoIncrementTable>>,
     /// How many times a table's columns were read rather than found here.
     #[cfg(test)]
@@ -134,7 +134,7 @@ impl SchemaReadings {
         &self,
         schema: &Arc<turso_core::schema::Schema>,
         table: &str,
-    ) -> Option<Vec<MySqlColumnMetadata>> {
+    ) -> Option<Arc<Vec<MySqlColumnMetadata>>> {
         self.reads(schema)
             .and_then(|kept| kept.columns.get(table).cloned())
     }
@@ -147,10 +147,10 @@ impl SchemaReadings {
         &mut self,
         schema: Arc<turso_core::schema::Schema>,
         table: &str,
-        columns: &[MySqlColumnMetadata],
+        columns: &Arc<Vec<MySqlColumnMetadata>>,
     ) {
         let kept = self.for_schema(schema);
-        kept.columns.insert(table.to_owned(), columns.to_vec());
+        kept.columns.insert(table.to_owned(), Arc::clone(columns));
         #[cfg(test)]
         {
             kept.column_reads += 1;
@@ -2182,11 +2182,11 @@ impl MySqlConnection {
                         .iter()
                         .map(MySqlSelectSource::table),
                 ) {
-                    let columns =
-                        self.list_columns(source)
-                            .map_err(|_| MySqlParseError::Unsupported {
-                                feature: "INSERT SELECT table metadata",
-                            })?;
+                    let columns = self.list_shared_columns(source).map_err(|_| {
+                        MySqlParseError::Unsupported {
+                            feature: "INSERT SELECT table metadata",
+                        }
+                    })?;
                     if columns.iter().any(|column| column.decimal_size().is_some()) {
                         has_decimal = true;
                     }
@@ -2230,7 +2230,7 @@ impl MySqlConnection {
             .current_schema()
             .get_btree_table(table.as_str())
             .map(|stored| (table.as_str().to_owned(), stored.to_sql()));
-        let Ok(columns) = self.list_columns(&table) else {
+        let Ok(columns) = self.list_shared_columns(&table) else {
             refuse_an_unknown_fallback(&translated)?;
             return Ok((translated, DmlColumnTypes::default(), table_definition));
         };
@@ -2337,7 +2337,7 @@ impl MySqlConnection {
             let Ok(table) = MySqlTableName::parse(&table) else {
                 continue;
             };
-            let Ok(columns) = self.list_columns(&table) else {
+            let Ok(columns) = self.list_shared_columns(&table) else {
                 continue;
             };
             for (written_column, literal) in &written {
@@ -2413,7 +2413,7 @@ impl MySqlConnection {
                 feature: "INSERT DEFAULT in some rows only",
             });
         }
-        let Ok(columns) = self.list_columns(&table) else {
+        let Ok(columns) = self.list_shared_columns(&table) else {
             return Ok(());
         };
         if !moments_the_clause_leaves(&columns, &upsert.assigned).is_empty()
@@ -2552,10 +2552,10 @@ impl MySqlConnection {
         else {
             return false;
         };
-        let Ok(source_columns) = self.list_columns(source.table()) else {
+        let Ok(source_columns) = self.list_shared_columns(source.table()) else {
             return false;
         };
-        let Ok(target_columns) = self.list_columns(&target.table) else {
+        let Ok(target_columns) = self.list_shared_columns(&target.table) else {
             return false;
         };
         let projected = match projection {
@@ -2619,8 +2619,8 @@ impl MySqlConnection {
             return false;
         };
         let (Ok(source_columns), Ok(target_columns)) = (
-            self.list_columns(source.table()),
-            self.list_columns(&target.table),
+            self.list_shared_columns(source.table()),
+            self.list_shared_columns(&target.table),
         ) else {
             return false;
         };
@@ -2769,7 +2769,7 @@ impl MySqlConnection {
                     .as_ref()
                     .expect("a checked INSERT has a target");
                 let writes_timestamp = self
-                    .list_columns(target.table())
+                    .list_shared_columns(target.table())
                     .map_err(|error| {
                         MySqlPreparedStatementError::Prepare(MySqlQueryError::Unsupported(
                             error.to_string(),
@@ -2851,7 +2851,7 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(update.table_name())
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let columns = self
-            .list_columns(&table)
+            .list_shared_columns(&table)
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         operands
             .iter()
@@ -2944,7 +2944,7 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(table_name)
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()))?;
         let metadata = self
-            .list_columns(&table)
+            .list_shared_columns(&table)
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if matches!(statement, Stmt::Insert { .. })
             && metadata.iter().any(|column| {
@@ -3058,7 +3058,7 @@ impl MySqlConnection {
         }
         for source in translated.read_tables() {
             let columns = self
-                .list_columns(source.table())
+                .list_shared_columns(source.table())
                 .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
             if columns
                 .iter()
@@ -3083,7 +3083,7 @@ impl MySqlConnection {
             return Ok(Vec::new());
         };
         let columns = self
-            .list_columns(&insert.table)
+            .list_shared_columns(&insert.table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let mut parameters = Vec::new();
         for row in &insert.rows {
@@ -4633,9 +4633,11 @@ impl MySqlConnection {
         let readings = turso_mysql_parser::written_view_columns(written, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         if readings.grouped() {
-            let columns = self.list_columns(readings.table()).map_err(|error| {
-                LimboError::ParseError(format!("CREATE VIEW source columns: {error:?}"))
-            })?;
+            let columns = self
+                .list_shared_columns(readings.table())
+                .map_err(|error| {
+                    LimboError::ParseError(format!("CREATE VIEW source columns: {error:?}"))
+                })?;
             Self::refuse_readings_not_measured(&readings, &columns).map_err(|_| {
                 LimboError::ParseError(
                     "a view grouping its rows reads only COUNT, and MIN or MAX of a whole number or a VARCHAR"
@@ -5904,7 +5906,7 @@ impl MySqlConnection {
         let source = MySqlTableName::parse(checked.source_table())
             .map_err(|_| MySqlCreateTableAsSelectError::MissingTable)?;
         let held = self
-            .list_columns(&source)
+            .list_shared_columns(&source)
             .map_err(|_| MySqlCreateTableAsSelectError::MissingTable)?;
         let nullable = |column_name: &str| {
             held.iter()
@@ -6463,7 +6465,7 @@ impl MySqlConnection {
     fn index_targets_json(&self, table: &str, indexed_columns: &[String]) -> Result<bool> {
         let table = MySqlTableName::parse(table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let columns = match self.list_columns(&table) {
+        let columns = match self.list_shared_columns(&table) {
             Ok(columns) => columns,
             Err(MySqlColumnMetadataError::TableNotFound) => return Ok(false),
             Err(error) => {
@@ -6524,7 +6526,7 @@ impl MySqlConnection {
             return Ok(None);
         };
         let columns = self
-            .list_columns(checked.table())
+            .list_shared_columns(checked.table())
             .map_err(|_| MySqlQueryError::Unsupported("INSERT VALUES table metadata".to_owned()))?
             .iter()
             .map(|column| mysql_quoted(column.name()))
@@ -6556,7 +6558,7 @@ impl MySqlConnection {
             return Ok(None);
         };
         let columns = self
-            .list_columns(checked.table())
+            .list_shared_columns(checked.table())
             .map_err(|_| MySqlQueryError::Unsupported("INSERT SELECT table metadata".to_owned()))?
             .iter()
             .map(|column| mysql_quoted(column.name()))
@@ -7119,7 +7121,7 @@ impl MySqlConnection {
                 .source_tables()
                 .iter()
                 .try_fold(false, |seen, source| {
-                    self.list_columns(source.table())
+                    self.list_shared_columns(source.table())
                         .map(|columns| {
                             seen || columns
                                 .iter()
@@ -7181,11 +7183,12 @@ impl MySqlConnection {
     ) -> FrozenSelectParser {
         let mode = self.parser_mode();
         let reads_type_specific_column = translated.source_tables().iter().any(|source| {
-            self.list_columns(source.table()).is_ok_and(|columns| {
-                columns
-                    .iter()
-                    .any(|column| column.decimal_size().is_some() || column.type_name() == "JSON")
-            })
+            self.list_shared_columns(source.table())
+                .is_ok_and(|columns| {
+                    columns.iter().any(|column| {
+                        column.decimal_size().is_some() || column.type_name() == "JSON"
+                    })
+                })
         });
         let typed_statement =
             (typed_rendering && reads_type_specific_column).then(|| statement.clone());
@@ -7501,7 +7504,9 @@ impl MySqlConnection {
         }
         let table_name = MySqlTableName::parse(table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let columns = self.list_columns(&table_name).map_err(|_| refused())?;
+        let columns = self
+            .list_shared_columns(&table_name)
+            .map_err(|_| refused())?;
         let never_null = |name: &str| {
             columns
                 .iter()
@@ -7543,16 +7548,18 @@ impl MySqlConnection {
         }
         let table = MySqlTableName::parse(table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let columns = self.list_columns(&table).map_err(|error| match error {
-            MySqlColumnMetadataError::Engine(error) => error,
-            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
-            MySqlColumnMetadataError::CorruptDefinition => {
-                LimboError::Corrupt("invalid SELECT table metadata".to_string())
-            }
-            MySqlColumnMetadataError::UnsupportedDefinition => {
-                LimboError::ParseError("unsupported SELECT table metadata".to_string())
-            }
-        })?;
+        let columns = self
+            .list_shared_columns(&table)
+            .map_err(|error| match error {
+                MySqlColumnMetadataError::Engine(error) => error,
+                MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+                MySqlColumnMetadataError::CorruptDefinition => {
+                    LimboError::Corrupt("invalid SELECT table metadata".to_string())
+                }
+                MySqlColumnMetadataError::UnsupportedDefinition => {
+                    LimboError::ParseError("unsupported SELECT table metadata".to_string())
+                }
+            })?;
         let column = columns
             .iter()
             .find(|column| column.name().eq_ignore_ascii_case(column_name))
@@ -7610,11 +7617,11 @@ impl MySqlConnection {
     ) -> std::result::Result<turso_mysql_parser::TranslatedSelect, MySqlQueryError> {
         let mode = self.parser_mode();
         let has_decimal_source = translated.source_tables().iter().any(|source| {
-            self.list_columns(source.table())
+            self.list_shared_columns(source.table())
                 .is_ok_and(|columns| columns.iter().any(|column| column.decimal_size().is_some()))
         });
         let has_json_source = translated.source_tables().iter().any(|source| {
-            self.list_columns(source.table())
+            self.list_shared_columns(source.table())
                 .is_ok_and(|columns| columns.iter().any(|column| column.type_name() == "JSON"))
         });
         if translated
@@ -7661,7 +7668,7 @@ impl MySqlConnection {
                         "compound SELECT source column types cannot be checked".to_string(),
                     ));
                 }
-                let columns = self.list_columns(source.table()).map_err(|error| {
+                let columns = self.list_shared_columns(source.table()).map_err(|error| {
                     MySqlQueryError::Unsupported(format!(
                         "cannot resolve compound SELECT column types: {error}"
                     ))
@@ -7716,7 +7723,7 @@ impl MySqlConnection {
                         "SELECT source column types cannot be checked".to_string(),
                     ));
                 }
-                let columns = self.list_columns(source.table()).map_err(|error| {
+                let columns = self.list_shared_columns(source.table()).map_err(|error| {
                     MySqlQueryError::Unsupported(format!(
                         "cannot resolve SELECT arithmetic column types: {error}"
                     ))
@@ -7739,7 +7746,7 @@ impl MySqlConnection {
                 .all(|source| !source.subquery() && source.projected_columns().is_empty())
                 && translated.source_table().is_some_and(|source| {
                     MySqlTableName::parse(source).ok().is_some_and(|table| {
-                        self.list_columns(&table).is_ok_and(|columns| {
+                        self.list_shared_columns(&table).is_ok_and(|columns| {
                             columns.iter().any(|column| column.decimal_size().is_some())
                         })
                     })
@@ -7875,7 +7882,7 @@ impl MySqlConnection {
             }
             return Ok(translated);
         }
-        let Ok(table_own_columns) = self.list_columns(&table) else {
+        let Ok(table_own_columns) = self.list_shared_columns(&table) else {
             return Ok(translated);
         };
         let mut columns =
@@ -8162,13 +8169,15 @@ impl MySqlConnection {
             }
             translated.source_tables().iter().any(|source| {
                 !source.subquery()
-                    && self.list_columns(source.table()).is_ok_and(|columns| {
-                        columns.iter().any(|column| {
-                            (column.type_name() == "BIGINT UNSIGNED"
-                                || column.decimal_size().is_some())
-                                && column.name().eq_ignore_ascii_case(comparison.column_name())
+                    && self
+                        .list_shared_columns(source.table())
+                        .is_ok_and(|columns| {
+                            columns.iter().any(|column| {
+                                (column.type_name() == "BIGINT UNSIGNED"
+                                    || column.decimal_size().is_some())
+                                    && column.name().eq_ignore_ascii_case(comparison.column_name())
+                            })
                         })
-                    })
             })
         })
     }
@@ -8188,12 +8197,16 @@ impl MySqlConnection {
                 )
                 && translated.source_tables().iter().any(|source| {
                     !source.subquery()
-                        && self.list_columns(source.table()).is_ok_and(|columns| {
-                            columns.iter().any(|column| {
-                                is_text_type(column.type_name())
-                                    && column.name().eq_ignore_ascii_case(comparison.column_name())
+                        && self
+                            .list_shared_columns(source.table())
+                            .is_ok_and(|columns| {
+                                columns.iter().any(|column| {
+                                    is_text_type(column.type_name())
+                                        && column
+                                            .name()
+                                            .eq_ignore_ascii_case(comparison.column_name())
+                                })
                             })
-                        })
                 })
         })
     }
@@ -8248,7 +8261,7 @@ impl MySqlConnection {
         translated: &turso_mysql_parser::TranslatedSelect,
     ) -> std::result::Result<(), MySqlQueryError> {
         for (table, name) in translated.bare_names_in_result_subqueries() {
-            let columns = self.list_columns(table).map_err(|error| {
+            let columns = self.list_shared_columns(table).map_err(|error| {
                 MySqlQueryError::Unsupported(format!(
                     "cannot read the columns a subquery reads: {error}"
                 ))
@@ -8939,9 +8952,9 @@ impl MySqlConnection {
         table: &MySqlTableName,
         comparison: &CheckedSelectComparison,
     ) -> Result<Option<(String, Option<u8>)>> {
-        Ok(self
-            .compared_column_metadata(table, comparison.column_name())?
-            .map(|column| (column.type_name().to_owned(), column.temporal_precision())))
+        self.read_compared_column(table, comparison.column_name(), |column| {
+            (column.type_name().to_owned(), column.temporal_precision())
+        })
     }
 
     /// Reads one column of a pair compared with each other, from the nearest
@@ -8980,16 +8993,27 @@ impl MySqlConnection {
         table: &MySqlTableName,
         name: &str,
     ) -> Result<Option<MySqlColumnMetadata>> {
-        let columns = self.list_columns(table).map_err(|error| match error {
-            MySqlColumnMetadataError::Engine(error) => error,
-            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
-            MySqlColumnMetadataError::CorruptDefinition => {
-                LimboError::Corrupt("invalid SELECT table metadata".to_string())
-            }
-            MySqlColumnMetadataError::UnsupportedDefinition => {
-                LimboError::ParseError("unsupported SELECT table metadata".to_string())
-            }
-        })?;
+        self.read_compared_column(table, name, MySqlColumnMetadata::clone)
+    }
+
+    fn read_compared_column<T>(
+        &self,
+        table: &MySqlTableName,
+        name: &str,
+        read: impl FnOnce(&MySqlColumnMetadata) -> T,
+    ) -> Result<Option<T>> {
+        let columns = self
+            .list_shared_columns(table)
+            .map_err(|error| match error {
+                MySqlColumnMetadataError::Engine(error) => error,
+                MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+                MySqlColumnMetadataError::CorruptDefinition => {
+                    LimboError::Corrupt("invalid SELECT table metadata".to_string())
+                }
+                MySqlColumnMetadataError::UnsupportedDefinition => {
+                    LimboError::ParseError("unsupported SELECT table metadata".to_string())
+                }
+            })?;
         let mut matching = columns
             .iter()
             .filter(|column| column.name().eq_ignore_ascii_case(name));
@@ -9001,7 +9025,7 @@ impl MySqlConnection {
                 "duplicate SELECT comparison column metadata".to_string(),
             ));
         }
-        Ok(Some(column.clone()))
+        Ok(Some(read(column)))
     }
 
     fn validate_dml_ordered_columns(
@@ -9017,16 +9041,18 @@ impl MySqlConnection {
         })?;
         let table = MySqlTableName::parse(source_table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
-        let columns = self.list_columns(&table).map_err(|error| match error {
-            MySqlColumnMetadataError::Engine(error) => error,
-            MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
-            MySqlColumnMetadataError::CorruptDefinition => {
-                LimboError::Corrupt("invalid DML table metadata".to_string())
-            }
-            MySqlColumnMetadataError::UnsupportedDefinition => {
-                LimboError::ParseError("unsupported DML table metadata".to_string())
-            }
-        })?;
+        let columns = self
+            .list_shared_columns(&table)
+            .map_err(|error| match error {
+                MySqlColumnMetadataError::Engine(error) => error,
+                MySqlColumnMetadataError::TableNotFound => LimboError::SchemaUpdated,
+                MySqlColumnMetadataError::CorruptDefinition => {
+                    LimboError::Corrupt("invalid DML table metadata".to_string())
+                }
+                MySqlColumnMetadataError::UnsupportedDefinition => {
+                    LimboError::ParseError("unsupported DML table metadata".to_string())
+                }
+            })?;
         for col_name in ordered_columns {
             let mut matching = columns
                 .iter()
@@ -9872,7 +9898,7 @@ impl MySqlConnection {
         let Ok(table) = MySqlTableName::parse(table_name) else {
             return error;
         };
-        let Ok(columns) = self.list_columns(&table) else {
+        let Ok(columns) = self.list_shared_columns(&table) else {
             return error;
         };
         let Some(column_index) = columns
@@ -10518,7 +10544,7 @@ impl MySqlConnection {
         let table = MySqlTableName::parse(&upsert.table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let columns = self
-            .list_columns(&table)
+            .list_shared_columns(&table)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         Ok(moments_the_clause_leaves(&columns, &upsert.assigned))
     }
@@ -11532,7 +11558,7 @@ impl MySqlConnection {
         let Ok(table) = MySqlTableName::parse(target.as_str()) else {
             return Ok(());
         };
-        let Ok(columns) = self.list_columns(&table) else {
+        let Ok(columns) = self.list_shared_columns(&table) else {
             return Ok(());
         };
         let Some(before) = columns

@@ -4219,6 +4219,21 @@ fn a_prepared_counted_insert_runs_its_engine_statement_again_when_it_writes_the_
 }
 
 #[test]
+fn a_tables_kept_columns_are_handed_out_without_copying_them() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-shared-columns.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT, label VARCHAR(10))")?;
+    let table = MySqlTableName::parse("records").unwrap();
+    let first = connection.list_shared_columns(&table).unwrap();
+    let second = connection.list_shared_columns(&table).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(connection.list_columns(&table).unwrap(), *first);
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn transaction_commands_run_their_kept_engine_statements_again() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let db = open_database(io, "mysql-session-kept-transactions.db", OpenFlags::Create)?;
