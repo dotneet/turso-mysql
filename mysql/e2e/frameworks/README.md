@@ -26,6 +26,9 @@ mysql/e2e/frameworks/run.sh --down            # stop and remove the servers
 `--up` rebuilds the server from the checkout, so after a server change run
 `--up` again before `--dev`.
 
+For benchmarks against MySQL — sysbench on an optimized build of the server,
+and `perf` on the server while one runs — see [bench/README.md](bench/README.md).
+
 To run a second copy of the harness at the same time (from another checkout
 or worktree), give it its own names; otherwise the two share containers, the
 network and the server build cache, and the cache then holds a build of the

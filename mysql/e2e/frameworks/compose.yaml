@@ -55,6 +55,9 @@ services:
       # The checkout's rust-toolchain.toml names the "1.88" channel, which
       # rustup would download again next to the image's 1.88.0.
       RUSTUP_TOOLCHAIN: 1.88.0
+      # `dev` everywhere but benchmarks, which build `bench-profile` (release
+      # with debug info) into a volume of their own; see bench/README.md.
+      E2E_CARGO_PROFILE: ${E2E_CARGO_PROFILE:-dev}
     volumes:
       - ../../..:/src:ro
       - cargo-registry:/usr/local/cargo/registry
@@ -66,9 +69,9 @@ services:
       - sh
       - -ec
       - |
-        cargo build --locked -p turso_mysql_runtime --bin turso-mysql-server
-        cargo build --locked -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
-        cargo build --locked -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
+        cargo build --locked --profile "$${E2E_CARGO_PROFILE}" -p turso_mysql_runtime --bin turso-mysql-server
+        cargo build --locked --profile "$${E2E_CARGO_PROFILE}" -p turso_mysql_checkpoint_authority --bin turso-mysql-checkpoint-authority
+        cargo build --locked --profile "$${E2E_CARGO_PROFILE}" -p turso_mysql_offline_provisioner --bin turso-mysql-offline-provision
 
   # Static SQL-logging TLS proxy that every app runs next to itself.
   sqlproxy-build:
@@ -94,6 +97,9 @@ services:
     environment:
       E2E_PASSWORD: ${E2E_PASSWORD:-}
       E2E_DATABASES: ${E2E_DATABASES:-}
+      # Where the build service left the binaries: `debug` for the dev profile,
+      # the profile's own name otherwise.
+      E2E_BIN_DIR: ${E2E_BIN_DIR:-debug}
     volumes:
       - cargo-target:/target:ro
       - ./server/boot-turso.sh:/boot-turso.sh:ro
@@ -132,6 +138,25 @@ services:
       interval: 2s
       timeout: 5s
       retries: 90
+
+  # sysbench straight against both servers, without the logging proxy.
+  bench:
+    profiles: [bench]
+    build: ./bench
+    image: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-bench:local
+    networks: [net]
+    environment:
+      E2E_PASSWORD: ${E2E_PASSWORD:-}
+      BENCH_TARGETS: ${BENCH_TARGETS:-turso mysql}
+      BENCH_WORKLOADS: ${BENCH_WORKLOADS:-}
+      BENCH_THREADS: ${BENCH_THREADS:-}
+      BENCH_TIME: ${BENCH_TIME:-}
+      BENCH_TABLE_SIZE: ${BENCH_TABLE_SIZE:-}
+    volumes:
+      - .:/e2e/src:ro
+      - ${E2E_RUN_DIR:-./.run}/results:/results
+      - ${E2E_RUN_DIR:-./.run}/tls:/e2e/tls:ro
+    entrypoint: ["/e2e/src/bench/run.sh"]
 
   # Recreates databases straight on a server, outside any app.
   dbadmin:

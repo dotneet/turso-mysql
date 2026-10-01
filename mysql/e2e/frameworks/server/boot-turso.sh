@@ -9,7 +9,7 @@ readonly service_uid=41001
 readonly client_uid=41002
 readonly shared_gid=41003
 readonly authority_id='turso-e2e'
-readonly bin=/target/debug
+readonly bin=/target/${E2E_BIN_DIR:-debug}
 # Short paths: Unix socket paths are capped at 103 bytes.
 readonly root=/run/t
 readonly state="${root}/s"

@@ -7,6 +7,7 @@
 #   mysql/e2e/frameworks/run.sh --up            # build and start the servers only
 #   mysql/e2e/frameworks/run.sh --dev laravel   # rerun one app on running servers
 #   mysql/e2e/frameworks/run.sh --down          # stop the servers
+#   mysql/e2e/frameworks/run.sh --bench         # sysbench on running servers (bench/README.md)
 #
 # E2E_KEEP=1 leaves the servers running after a full run.
 #
@@ -29,13 +30,30 @@ prefix="${COMPOSE_PROJECT_NAME}"
 # The build cache records which source it was built from, so a copy built from
 # another checkout must not share it (cargo would skip rebuilding changed crates).
 export E2E_CARGO_TARGET_VOLUME="${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}"
+# The cargo profile the server is built with; the binaries land in `debug` for
+# the dev profile and in a directory named after any other.
+export E2E_CARGO_PROFILE="${E2E_CARGO_PROFILE:-dev}"
+if [[ "${E2E_CARGO_PROFILE}" == dev ]]; then
+  export E2E_BIN_DIR=debug
+else
+  export E2E_BIN_DIR="${E2E_CARGO_PROFILE}"
+fi
 # One database per app, plus the extra ones some apps need.
-export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize drizzle spring spring_ssp efcore sqlx dbtools giteatest"
+export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails sqlalchemy gorm dump_src dump_dst sequelize drizzle spring spring_ssp efcore sqlx dbtools giteatest sbtest"
 
 main() {
   case "${1:-}" in
     --up) up ;;
     --down) down ;;
+    --bench)
+      use_running_servers
+      mkdir -p "${E2E_RUN_DIR}/results"
+      for target in ${BENCH_TARGETS:-turso mysql}; do
+        compose --profile apps run --rm --name "${prefix}-dbadmin-bench-${target}" dbadmin "${target}" sbtest >/dev/null
+      done
+      compose --profile bench build bench >/dev/null
+      compose --profile bench run --rm --name "${prefix}-bench" bench
+      ;;
     --dev)
       shift
       use_running_servers
