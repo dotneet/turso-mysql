@@ -1639,3 +1639,28 @@ fn an_update_leaving_a_counted_row_as_it_stands_changes_nothing() {
         (1, 0)
     );
 }
+
+/// sysbench creates its table with the engine in an executable comment, which
+/// MySQL 8.4.11 runs as the words it holds. A comment naming a later version,
+/// which MySQL would not run, is refused rather than read.
+#[test]
+fn a_counted_table_takes_an_engine_written_in_an_executable_comment() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE sbtest1(\n  id INTEGER NOT NULL AUTO_INCREMENT,\n  k INTEGER DEFAULT '0' NOT NULL,\n  c CHAR(120) DEFAULT '' NOT NULL,\n  pad CHAR(60) DEFAULT '' NOT NULL,\n  PRIMARY KEY (id)\n) /*! ENGINE = innodb */ ",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO sbtest1 (c, pad) VALUES ('a', 'b'), ('c', 'd')",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, k, c FROM sbtest1 ORDER BY id"),
+        vec![some(&["1", "0", "a"]), some(&["2", "0", "c"])]
+    );
+    assert!(adapter
+        .execute_query(
+            "CREATE TABLE later (id INTEGER NOT NULL AUTO_INCREMENT, PRIMARY KEY (id)) /*!90000 ENGINE = innodb */"
+        )
+        .is_err());
+}

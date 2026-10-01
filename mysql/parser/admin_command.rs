@@ -557,6 +557,12 @@ fn read_admin_text(
     Ok(tokens)
 }
 
+/// Says whether MySQL 8.4.11 runs the text of `/*<comment>*/`, given the
+/// comment's text after `/*` (`!` and an optional five-digit version first).
+pub(crate) fn this_version_runs(comment: &str) -> bool {
+    versioned_comment_body(&format!("/*{comment}*/"), 0).is_some()
+}
+
 /// Returns where the text of a versioned comment starting at `cursor` begins,
 /// when it is one this server's version runs.
 ///

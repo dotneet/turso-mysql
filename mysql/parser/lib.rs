@@ -4612,18 +4612,30 @@ pub fn parse_auto_increment_create_table(
     translate_auto_increment_create_table(&table, mode)
 }
 
+/// Holds a counted table's definition to the one shape the allocator path
+/// takes, reading it as MySQL runs it.
+///
+/// sysbench writes its table `CREATE TABLE sbtest1(...) /*! ENGINE = innodb */`,
+/// which MySQL 8.4.11 runs as the words in the comment. The statement parser
+/// reads every executable comment that way whatever version it names, so one
+/// naming a version past this one, which MySQL would not run, is refused here
+/// rather than read; the rest are checked as the words they hold, which keeps
+/// a comment from hiding an `AUTO_INCREMENT` from this check.
 fn validate_auto_increment_token_shape(sql: &str, mode: SessionSqlMode) -> Result<(), ParseError> {
-    let dialect = SessionMySqlDialect::without_executable_comments(mode);
-    let tokens = statement_reads::tokens(&dialect, sql)
-        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
-    if tokens.iter().any(|token| {
+    let written =
+        statement_reads::tokens(&SessionMySqlDialect::without_executable_comments(mode), sql)
+            .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    if written.iter().any(|token| {
         matches!(
             token,
-            Token::Whitespace(Whitespace::MultiLineComment(comment)) if comment.starts_with('!')
+            Token::Whitespace(Whitespace::MultiLineComment(comment))
+                if comment.starts_with('!') && !admin_command::this_version_runs(comment)
         )
     }) {
-        return unsupported("executable comment in AUTO_INCREMENT definition");
+        return unsupported("executable comment for a later version in AUTO_INCREMENT definition");
     }
+    let tokens = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql)
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let tokens = tokens
         .iter()
         .filter(|token| !matches!(token, Token::Whitespace(_)))
