@@ -1335,6 +1335,59 @@ mod tests {
         Ok(())
     }
 
+    /// A WAL another session's snapshot keeps busy is tried once and then
+    /// left alone for a while, however often sessions ask: each try takes
+    /// the database's write lock.
+    #[test]
+    fn the_keeper_leaves_a_wal_kept_busy_alone_for_a_while() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut writing = catalog.new_session(binary_context());
+        writing.select_database("kept").unwrap();
+        let writer = writing.connection().unwrap().clone();
+        let mut reading = catalog.new_session(binary_context());
+        reading.select_database("kept").unwrap();
+        let reader = reading.connection().unwrap().clone();
+        writer.execute("CREATE TABLE records (id INT, label TEXT)")?;
+        for id in 0..20 {
+            writer.execute(&format!(
+                "INSERT INTO records (id, label) VALUES ({id}, 'x')"
+            ))?;
+        }
+        reader
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        reader
+            .prepare_select("SELECT COUNT(*) FROM records")?
+            .run_collect_rows()?;
+        writer.execute("INSERT INTO records (id, label) VALUES (20, 'x')")?;
+
+        let keeper = catalog.wal_keeper.handle();
+        let attempts = || keeper.attempts.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..5 {
+            writer.truncate_the_wal_past(0)?;
+            keeper.wait_for_the_requests_before();
+        }
+        assert_eq!(attempts(), 1);
+        assert_eq!(
+            keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        reader.execute_transaction_command("COMMIT").unwrap();
+        std::thread::sleep(crate::wal_keeper::PAUSE_AFTER_A_BUSY_WAL);
+        writer.truncate_the_wal_past(0)?;
+        keeper.wait_for_the_requests_before();
+        assert_eq!(attempts(), 2);
+        assert_eq!(
+            keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        Ok(())
+    }
+
     /// Only a closed engine connection runs the closing checkpoint, so a
     /// session that ends has to close its connection, or the WAL stays as
     /// large as the last write made it and the next open reads all of it.

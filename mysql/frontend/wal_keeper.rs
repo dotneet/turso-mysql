@@ -11,6 +11,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use turso_core::{CheckpointMode, Database, LimboError, Result};
 
@@ -32,6 +33,9 @@ pub(crate) struct WalKeeperHandle {
     /// How many WALs the thread has emptied.
     #[cfg(test)]
     pub(crate) truncated: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many times the thread has tried to empty one.
+    #[cfg(test)]
+    pub(crate) attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 enum Request {
@@ -53,6 +57,8 @@ impl WalKeeper {
             failure: Arc::default(),
             #[cfg(test)]
             truncated: Arc::default(),
+            #[cfg(test)]
+            attempts: Arc::default(),
         };
         let thread = std::thread::Builder::new()
             .name("turso-mysql-wal-keeper".to_owned())
@@ -119,7 +125,19 @@ impl WalKeeperHandle {
     }
 }
 
+/// How long a WAL that sessions kept busy is left alone before the keeper
+/// tries it again.
+///
+/// Emptying a WAL takes the database's write lock, and finds out only then
+/// whether a session's snapshot still needs the frames. Under a steady load
+/// one always does, and every statement that ends with the WAL past its bound
+/// asks again, so the keeper tried back to back: measured with eight
+/// sysbench sessions inserting, it held the write lock for 25 to 50% of the
+/// time, about 1,200 attempts a second, nearly all of them refused.
+pub(crate) const PAUSE_AFTER_A_BUSY_WAL: Duration = Duration::from_millis(50);
+
 fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
+    let mut left_busy: Vec<(Weak<Database>, Instant)> = Vec::new();
     while let Ok(request) = received.recv() {
         // Every statement past the bound asks until the WAL is emptied, so
         // the requests that piled up meanwhile are read together and each
@@ -140,8 +158,17 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
                 Request::Stop => stop = true,
             }
         }
-        for (database, user) in databases {
-            let Some(database) = database.upgrade() else {
+        left_busy.retain(|(database, at)| {
+            database.strong_count() > 0 && at.elapsed() < PAUSE_AFTER_A_BUSY_WAL
+        });
+        for (weak_database, user) in databases {
+            if left_busy
+                .iter()
+                .any(|(busy, _)| busy.ptr_eq(&weak_database))
+            {
+                continue;
+            }
+            let Some(database) = weak_database.upgrade() else {
                 continue;
             };
             if user
@@ -150,15 +177,20 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
             {
                 continue;
             }
+            #[cfg(test)]
+            handle
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let truncated = truncate(&database);
             drop(user);
             match truncated {
-                Ok(()) => {
+                Ok(Emptied::Yes) => {
                     #[cfg(test)]
                     handle
                         .truncated
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
+                Ok(Emptied::KeptBusy) => left_busy.push((weak_database, Instant::now())),
                 Err(error) => {
                     *handle
                         .failure
@@ -177,15 +209,21 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
     }
 }
 
+enum Emptied {
+    Yes,
+    KeptBusy,
+}
+
 /// Empties one database's WAL over a connection of its own. Another session
 /// reading at the same moment keeps the WAL busy, and a later request tries
 /// again.
-fn truncate(database: &Arc<Database>) -> Result<()> {
+fn truncate(database: &Arc<Database>) -> Result<Emptied> {
     let connection = database.connect()?;
     let result = match connection.checkpoint(CheckpointMode::Truncate {
         upper_bound_inclusive: None,
     }) {
-        Ok(_) | Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => Ok(()),
+        Ok(_) => Ok(Emptied::Yes),
+        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => Ok(Emptied::KeptBusy),
         Err(error) => Err(error),
     };
     connection.close()?;
