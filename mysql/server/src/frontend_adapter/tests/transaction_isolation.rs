@@ -434,3 +434,16 @@ fn serializable_refuses_one_of_two_transactions_that_each_write_what_the_other_r
         ("1".to_owned(), "0".to_owned())
     );
 }
+
+#[test]
+fn a_transaction_reads_after_another_session_created_a_table() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut two, "CREATE TABLE d (id INT NOT NULL PRIMARY KEY)");
+    run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
+    run(&mut one, "COMMIT");
+}
