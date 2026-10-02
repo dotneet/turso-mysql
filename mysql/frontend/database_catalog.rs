@@ -895,8 +895,8 @@ impl DatabaseCatalog {
                     expected.file_key().as_str(),
                     durable_identity,
                 )?;
-                open_preopened_database_with_wal(
-                    io,
+                let database = open_preopened_database_with_wal(
+                    Arc::clone(&io),
                     main_file,
                     wal_file,
                     identity,
@@ -905,10 +905,12 @@ impl DatabaseCatalog {
                     mvcc_log_file,
                     AllocatorDatabaseLifetime {
                         _lifetime: lifetime,
-                        _allocator: allocator,
+                        _allocator: allocator.clone(),
                     },
                 )
-                .map_err(|_| RegistryError::Backend)
+                .map_err(|_| RegistryError::Backend)?;
+                let_commits_log_counter_marks(&database, &allocator, io.as_ref())?;
+                Ok(database)
             },
         )
     }
@@ -963,6 +965,7 @@ impl DatabaseCatalog {
             },
         )
         .map_err(|_| RegistryError::Backend)?;
+        let_commits_log_counter_marks(&database, &allocator, self.io.as_ref())?;
         Ok((database, allocator))
     }
 
@@ -1064,6 +1067,19 @@ impl DatabaseCatalog {
         self.registry.remove_the_mvcc_log(requested_name)?;
         Ok(MySqlMvccToWal::Converted)
     }
+}
+
+fn let_commits_log_counter_marks(
+    database: &Database,
+    allocator: &DurableRangeAllocator,
+    io: &dyn IO,
+) -> Result<(), RegistryError> {
+    let Some(store) = database.get_mv_store().as_ref().cloned() else {
+        return Ok(());
+    };
+    store
+        .log_counter_marks_in_commits(allocator, io)
+        .map_err(|_| RegistryError::Backend)
 }
 
 fn initialize_stage_allocator(
@@ -2720,6 +2736,74 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn under_mvcc_numbers_taken_before_the_server_is_killed_are_not_taken_again() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        let catalog = an_mvcc_database_with_a_counted_table(directory.path())?;
+        let mut first = catalog.new_session(binary_context());
+        first.select_database("kept").unwrap();
+        first
+            .connection()
+            .unwrap()
+            .execute("INSERT INTO users (name) VALUES ('ann'), ('bob')")?;
+        let mut left_open = catalog.new_session(binary_context());
+        left_open.select_database("kept").unwrap();
+        let open = left_open.connection().unwrap();
+        open.execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        open.execute("INSERT INTO users (name) VALUES ('cy')")?;
+        assert_eq!(open.last_insert_id(), 3);
+        let killed = contents_of(directory.path());
+
+        drop((first, left_open, catalog));
+        put_back(directory.path(), killed);
+        assert_eq!(next_user_id_in(directory.path())?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn under_mvcc_a_committed_number_outlives_a_power_loss_of_the_counter_records() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        let catalog = an_mvcc_database_with_a_counted_table(directory.path())?;
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let connection = session.connection().unwrap();
+        connection.execute("INSERT INTO users (name) VALUES ('ann'), ('bob')")?;
+        connection
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        connection.execute("INSERT INTO users (name) VALUES ('cy')")?;
+        connection.execute_transaction_command("ROLLBACK").unwrap();
+        connection.execute("INSERT INTO users (name) VALUES ('dee')")?;
+        assert_eq!(connection.last_insert_id(), 4);
+        connection.execute("DELETE FROM users WHERE id = 4")?;
+        let mut lost_power = contents_of(directory.path());
+        let counter = lost_power
+            .keys()
+            .find(|path| {
+                path.to_string_lossy()
+                    .ends_with(".turso-mysql-auto-increment")
+            })
+            .cloned()
+            .unwrap();
+        lost_power.get_mut(&counter).unwrap().truncate(32);
+
+        drop((session, catalog));
+        put_back(directory.path(), lost_power);
+        assert_eq!(next_user_id_in(directory.path())?, 5);
+        assert_eq!(
+            users_in(directory.path())?,
+            vec![
+                vec![Value::from_i64(1), Value::from_text("ann")],
+                vec![Value::from_i64(2), Value::from_text("bob")],
+                vec![Value::from_i64(5), Value::from_text("eve")],
+            ]
+        );
+        Ok(())
+    }
+
     /// Writes rows into a database the catalog opens in MVCC: the catalog
     /// hands the engine a log it finds there whatever the switch says.
     fn an_mvcc_database_with_rows(directory: &Path) -> CoreResult<()> {
@@ -2798,5 +2882,69 @@ mod tests {
             vec![Value::from_i64(2), Value::from_text("bob")],
             vec![Value::from_i64(4), Value::from_text("dee")],
         ]
+    }
+
+    fn an_mvcc_database_with_a_counted_table(
+        directory: &Path,
+    ) -> CoreResult<Arc<MySqlDatabaseCatalog>> {
+        let catalog = MySqlDatabaseCatalog::open(directory).unwrap();
+        catalog.create("kept").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mvcc_log_of(directory))
+            .unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let connection = session.connection().unwrap();
+        assert!(connection.inner().mvcc_enabled());
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+        )?;
+        Ok(catalog)
+    }
+
+    fn next_user_id_in(directory: &Path) -> CoreResult<u64> {
+        let catalog = MySqlDatabaseCatalog::open(directory).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let connection = session.connection().unwrap();
+        connection.execute("INSERT INTO users (name) VALUES ('eve')")?;
+        Ok(connection.last_insert_id())
+    }
+
+    fn contents_of(directory: &Path) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .map(|path| {
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    fn put_back(
+        directory: &Path,
+        contents: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() && !contents.contains_key(&path) {
+                fs::remove_file(&path).unwrap();
+            }
+        }
+        for (path, bytes) in contents {
+            use std::io::Write as _;
+            fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
+        }
     }
 }

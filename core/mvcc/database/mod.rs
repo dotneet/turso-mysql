@@ -15,6 +15,7 @@ use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
+use crate::storage::auto_increment::{AutoIncrementKey, CommitLoggedMarks, DurableRangeAllocator};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
@@ -51,7 +52,7 @@ use crate::{
 use crate::{Connection, Pager, SyncMode};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
-use std::collections::{BTreeSet, HashMap as StdHashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap as StdHashMap};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -1793,6 +1794,7 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     wrote_logical_log: bool,
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
+    logged_counter_marks: Vec<(AutoIncrementKey, u64)>,
     _phantom: PhantomData<Clock>,
 }
 
@@ -1907,6 +1909,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             group_batch: None,
             wrote_logical_log: false,
             sync_mode,
+            logged_counter_marks: Vec::new(),
             _phantom: PhantomData,
         })
     }
@@ -2833,6 +2836,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             return Ok(TransitionResult::Continue);
         }
 
+        let logged_counter_marks = match mvcc_store.counter_marks() {
+            Some(counter_marks) if ctx.log_record.op_count > 0 => {
+                let marks = counter_marks.marks_to_log();
+                for (key, high_water) in &marks {
+                    mvcc_store.storage.serialize_counter_mark(
+                        &mut ctx.log_record,
+                        key.to_bytes(),
+                        *high_water,
+                    )?;
+                }
+                marks
+            }
+            _ => Vec::new(),
+        };
+
         if let Some(header) = ctx.pending_header.take() {
             mvcc_store
                 .storage
@@ -2846,6 +2864,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             &mut ctx.log_record,
             LogRecord::empty(end_ts, mvcc_store.logical_log_allocator()),
         );
+        self.logged_counter_marks = logged_counter_marks;
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
@@ -2953,7 +2972,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     }
                     ParsedOp::UpsertIndex { .. }
                     | ParsedOp::DeleteIndex { .. }
-                    | ParsedOp::UpdateHeader { .. } => {}
+                    | ParsedOp::UpdateHeader { .. }
+                    | ParsedOp::CounterMark { .. } => {}
                 }
             }
 
@@ -3751,6 +3771,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+                if !self.logged_counter_marks.is_empty() {
+                    if let Some(counter_marks) = mvcc_store.counter_marks() {
+                        counter_marks.logged(&self.logged_counter_marks);
+                    }
+                }
 
                 // Hand off to the chunked rewriter. Between chunks readers
                 // resolve any unwritten TxID refs via `txs[tx_id]` which now
@@ -4634,7 +4659,11 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     experimental_mvcc_passive_checkpoint: bool,
     row_locks: RowLocks,
     metadata_locks: MetadataLocks,
+    counter_marks: RwLock<Option<Arc<CommitLoggedMarks>>>,
+    recovered_counter_marks: Mutex<BTreeMap<[u8; 16], u64>>,
 }
+
+const RECOVERED_COUNTER_MARK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl<Clock: LogicalClock> MvStore<Clock> {
     /// Creates a new database backed by the default [`TursoAllocator`].
@@ -4762,6 +4791,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             experimental_mvcc_passive_checkpoint,
             row_locks: RowLocks::default(),
             metadata_locks: MetadataLocks::default(),
+            counter_marks: RwLock::new(None),
+            recovered_counter_marks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -8259,6 +8290,72 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .store(wait, Ordering::SeqCst);
     }
 
+    pub fn log_counter_marks_in_commits(
+        &self,
+        allocator: &DurableRangeAllocator,
+        io: &dyn crate::IO,
+    ) -> Result<()> {
+        let logged_marks = allocator.let_commits_log_marks()?;
+        let current = self.counter_marks();
+        match current {
+            Some(current) if !Arc::ptr_eq(&current, &logged_marks) => {
+                return Err(LimboError::InvalidArgument(
+                    "the database's commits already log another sidecar's marks".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                io.wait_for_completion(logged_marks.sync_sidecar()?)?;
+                *self.counter_marks.write() = Some(logged_marks);
+            }
+        }
+        self.write_recovered_counter_marks(allocator, io)
+    }
+
+    fn write_recovered_counter_marks(
+        &self,
+        allocator: &DurableRangeAllocator,
+        io: &dyn crate::IO,
+    ) -> Result<()> {
+        let recovered = self.recovered_counter_marks.lock().clone();
+        for (key, high_water) in recovered {
+            let key = AutoIncrementKey::new(key)?;
+            let deadline = std::time::Instant::now() + RECOVERED_COUNTER_MARK_WAIT;
+            loop {
+                let finished = allocator.operations_finished();
+                let mut advance = allocator.advance_past(key, high_water)?;
+                match io.block(|| advance.step()) {
+                    Ok(_) => break,
+                    Err(LimboError::Busy) if std::time::Instant::now() < deadline => {
+                        allocator.wait_for_an_operation_to_finish(
+                            finished,
+                            std::time::Duration::from_millis(1),
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut pending = self.recovered_counter_marks.lock();
+            if pending.get(&key.to_bytes()) == Some(&high_water) {
+                pending.remove(&key.to_bytes());
+            }
+        }
+        Ok(())
+    }
+
+    fn counter_marks(&self) -> Option<Arc<CommitLoggedMarks>> {
+        self.counter_marks.read().clone()
+    }
+
+    pub(crate) fn sync_counter_sidecar_for_checkpoint(&self) -> Result<Option<Completion>> {
+        if !self.recovered_counter_marks.lock().is_empty() {
+            return Err(LimboError::Busy);
+        }
+        self.counter_marks()
+            .map(|logged_marks| logged_marks.sync_sidecar())
+            .transpose()
+    }
+
     pub(crate) fn begin_writing_in_concurrent_tx(&self, tx_id: TxID) -> Result<()> {
         if !self.writers_wait_for_exclusive_tx.load(Ordering::SeqCst) {
             return Ok(());
@@ -10321,7 +10418,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             | ParsedOp::DeleteTable { commit_ts, .. }
             | ParsedOp::UpsertIndex { commit_ts, .. }
             | ParsedOp::DeleteIndex { commit_ts, .. }
-            | ParsedOp::UpdateHeader { commit_ts, .. } => *commit_ts,
+            | ParsedOp::UpdateHeader { commit_ts, .. }
+            | ParsedOp::CounterMark { commit_ts, .. } => *commit_ts,
         };
         'frame: {
             let frame_commit_ts = parsed_op_commit_ts(
@@ -10840,6 +10938,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             // Recovery applies only post-boundary header ops; the same value is later
                             // staged to pager page-1 during checkpoint.
                             self.global_header.write().replace(header);
+                        }
+                        StreamingResult::CounterMark { key, high_water } => {
+                            let mut recovered = self.recovered_counter_marks.lock();
+                            let mark = recovered.entry(key).or_insert(high_water);
+                            *mark = (*mark).max(high_water);
                         }
                         StreamingResult::Eof => {
                             unreachable!("next_frame does not return EOF records");

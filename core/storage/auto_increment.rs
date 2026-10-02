@@ -1,12 +1,21 @@
 //! Durable, dialect-neutral allocation of monotonically increasing row-id ranges.
 //!
 //! The allocator owns a small append-only sidecar file. A range becomes visible
-//! only after its record has been synced. Callers therefore must not wrap this
-//! operation in a user transaction: a rolled-back statement intentionally burns
-//! its range.
-//! A final partial record is an unacknowledged torn append and is overwritten at
-//! the next record boundary. A malformed full record is corruption and stops
-//! allocation.
+//! only after its record has been written, and by default synced. Callers
+//! therefore must not wrap this operation in a user transaction: a rolled-back
+//! statement intentionally burns its range.
+//!
+//! An MVCC database can instead write the marks into its own commits (see
+//! [`DurableRangeAllocator::let_commits_log_marks`]). A record is then only
+//! written, which a crash of the process does not lose, and a commit writes
+//! every mark written since into its logical-log frame, so the mark of a
+//! number a committed row holds is durable exactly when that row is. A
+//! checkpoint syncs the sidecar before it drops those frames from the log.
+//!
+//! A record that fails its check ends the log: everything from it on is an
+//! append that was never synced and that a power loss left torn, and the next
+//! write truncates it away. A checked record whose mark does not rise is
+//! corruption and stops allocation.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -83,6 +92,10 @@ impl AutoIncrementKey {
         }
         Ok(Self(bytes))
     }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
 }
 
 /// A range that was made durable by [`DurableRangeAllocator`].
@@ -140,6 +153,7 @@ struct AllocatorShared {
     /// reservation read and checked every record ever written, which made
     /// each insert into a counted table slower than the last.
     scanned: Mutex<Option<ScannedLog>>,
+    commits: Mutex<Weak<CommitLoggedMarks>>,
 }
 
 /// The high-water marks of every key in the log's first `complete_len` bytes
@@ -194,6 +208,7 @@ impl DurableRangeAllocator {
             operations_finished: LockReleaseSignal::default(),
             poisoned: AtomicBool::new(false),
             scanned: Mutex::new(None),
+            commits: Mutex::new(Weak::new()),
         });
         open_allocators.insert(identity, Arc::downgrade(&shared));
         Ok(Self { shared })
@@ -279,6 +294,7 @@ impl DurableRangeAllocator {
                 operations_finished: LockReleaseSignal::default(),
                 poisoned: AtomicBool::new(false),
                 scanned: Mutex::new(None),
+                commits: Mutex::new(Weak::new()),
             }),
         }
     }
@@ -416,6 +432,25 @@ impl DurableRangeAllocator {
             holds_lock: false,
             retain_lock: false,
         })
+    }
+
+    pub fn let_commits_log_marks(&self) -> Result<Arc<CommitLoggedMarks>> {
+        self.ensure_usable()?;
+        let mut commits = self
+            .shared
+            .commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(logged_marks) = commits.upgrade() {
+            return Ok(logged_marks);
+        }
+        let logged_marks = Arc::new(CommitLoggedMarks {
+            file: self.shared.file.clone(),
+            sync_type: self.shared.sync_type,
+            not_yet_logged: Mutex::new(BTreeMap::new()),
+        });
+        *commits = Arc::downgrade(&logged_marks);
+        Ok(logged_marks)
     }
 
     pub fn last_seen_high_water(&self, key: AutoIncrementKey) -> Result<Option<u64>> {
@@ -882,6 +917,16 @@ enum ReservationState {
         range: ReservedRange,
         append_offset: u64,
     },
+    TruncatingTornTail {
+        completion: Completion,
+        log_end: u64,
+        high_water: u64,
+    },
+    SyncingTruncatedTail {
+        completion: Completion,
+        log_end: u64,
+        high_water: u64,
+    },
     SyncingExisting {
         completion: Completion,
         high_water: u64,
@@ -924,6 +969,16 @@ impl RangeReservation {
                 range,
                 append_offset,
             } => self.finish_sync(completion, range, append_offset),
+            ReservationState::TruncatingTornTail {
+                completion,
+                log_end,
+                high_water,
+            } => self.finish_truncate_torn_tail(completion, log_end, high_water),
+            ReservationState::SyncingTruncatedTail {
+                completion,
+                log_end,
+                high_water,
+            } => self.finish_sync_truncated_tail(completion, log_end, high_water),
             ReservationState::SyncingExisting {
                 completion,
                 high_water,
@@ -1188,7 +1243,6 @@ impl RangeReservation {
     }
 
     /// Checks the records read past `scanned_from`, keeps every mark the log
-    /// now holds, and goes on from this key's.
     fn finish_scan(
         &mut self,
         records: Vec<u8>,
@@ -1204,15 +1258,93 @@ impl RangeReservation {
                 "auto-increment log was read past records nobody checked".to_owned(),
             ));
         };
-        if let Err(error) = scan_records(&records, &mut high_waters) {
-            return self.fail(error);
-        }
+        let checked_len = match scan_records(&records, &mut high_waters) {
+            Ok(checked_len) => checked_len,
+            Err(error) => return self.fail(error),
+        };
         let high_water = high_waters.get(&self.key).copied().unwrap_or(0);
+        let complete_len = scanned_from + checked_len as u64;
         *self.scanned() = Some(ScannedLog {
-            complete_len: append_offset - HEADER_LEN as u64,
+            complete_len,
             high_waters,
         });
-        self.begin_write(append_offset, high_water)
+        let log_end = HEADER_LEN as u64 + complete_len;
+        let only_reads = matches!(self.kind, ReservationKind::Peek) && !self.retain_lock;
+        if log_end < append_offset && !only_reads {
+            return self.begin_truncate_torn_tail(log_end, high_water);
+        }
+        self.begin_write(log_end, high_water)
+    }
+
+    fn begin_truncate_torn_tail(
+        &mut self,
+        log_end: u64,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let completion = match self
+            .shared
+            .file
+            .truncate(log_end, Completion::new_trunc(|_| {}))
+        {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::TruncatingTornTail {
+            completion: completion.clone(),
+            log_end,
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_truncate_torn_tail(
+        &mut self,
+        completion: Completion,
+        log_end: u64,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::TruncatingTornTail {
+                completion: completion.clone(),
+                log_end,
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        let completion = Completion::new_sync(|_| {});
+        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::SyncingTruncatedTail {
+            completion: completion.clone(),
+            log_end,
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_sync_truncated_tail(
+        &mut self,
+        completion: Completion,
+        log_end: u64,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::SyncingTruncatedTail {
+                completion: completion.clone(),
+                log_end,
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        self.begin_write(log_end, high_water)
     }
 
     fn begin_write(&mut self, append_offset: u64, high_water: u64) -> IOResultOr<ReservedRange> {
@@ -1240,6 +1372,12 @@ impl RangeReservation {
                 high_water: requested,
             } => {
                 if *requested <= high_water {
+                    if self.commits_logging_marks().is_some() {
+                        return self.finish(ReservedRange {
+                            first: high_water,
+                            last: high_water,
+                        });
+                    }
                     return self.begin_sync_existing(high_water);
                 }
                 ReservedRange {
@@ -1339,6 +1477,10 @@ impl RangeReservation {
         if short_write.load(Ordering::Acquire) {
             return self.fail(CompletionError::ShortWrite.into());
         }
+        if let Some(commits) = self.commits_logging_marks() {
+            commits.written(self.key, range.last);
+            return self.finish_record(range, append_offset);
+        }
 
         let completion = Completion::new_sync(|_| {});
         let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
@@ -1370,8 +1512,16 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
-        // The record is durable at the end of what was checked, so it joins
-        // it; anywhere else, the next operation reads the log again.
+        self.finish_record(range, append_offset)
+    }
+
+    fn finish_record(
+        &mut self,
+        range: ReservedRange,
+        append_offset: u64,
+    ) -> IOResultOr<ReservedRange> {
+        // The record is in the log at the end of what was checked, so it
+        // joins it; anywhere else, the next operation reads the log again.
         let mut scanned = self.scanned();
         match scanned.as_mut() {
             Some(log) if HEADER_LEN as u64 + log.complete_len == append_offset => {
@@ -1473,6 +1623,14 @@ impl Drop for RangeReservation {
 }
 
 impl RangeReservation {
+    fn commits_logging_marks(&self) -> Option<Arc<CommitLoggedMarks>> {
+        self.shared
+            .commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
+    }
+
     fn scanned(&self) -> std::sync::MutexGuard<'_, Option<ScannedLog>> {
         self.shared
             .scanned
@@ -1516,6 +1674,57 @@ impl RangeReservation {
             self.state,
             ReservationState::Start | ReservationState::Leased | ReservationState::Finished
         )
+    }
+}
+
+pub struct CommitLoggedMarks {
+    file: Arc<dyn File>,
+    sync_type: FileSyncType,
+    not_yet_logged: Mutex<BTreeMap<AutoIncrementKey, u64>>,
+}
+
+impl std::fmt::Debug for CommitLoggedMarks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitLoggedMarks")
+            .field("not_yet_logged", &*self.not_yet_logged())
+            .finish()
+    }
+}
+
+impl CommitLoggedMarks {
+    pub fn marks_to_log(&self) -> Vec<(AutoIncrementKey, u64)> {
+        self.not_yet_logged()
+            .iter()
+            .map(|(key, high_water)| (*key, *high_water))
+            .collect()
+    }
+
+    pub fn logged(&self, marks: &[(AutoIncrementKey, u64)]) {
+        let mut not_yet_logged = self.not_yet_logged();
+        for (key, high_water) in marks {
+            if not_yet_logged
+                .get(key)
+                .is_some_and(|written| written <= high_water)
+            {
+                not_yet_logged.remove(key);
+            }
+        }
+    }
+
+    pub fn sync_sidecar(&self) -> Result<Completion> {
+        self.file.sync(Completion::new_sync(|_| {}), self.sync_type)
+    }
+
+    fn written(&self, key: AutoIncrementKey, high_water: u64) {
+        let mut not_yet_logged = self.not_yet_logged();
+        let mark = not_yet_logged.entry(key).or_insert(high_water);
+        *mark = (*mark).max(high_water);
+    }
+
+    fn not_yet_logged(&self) -> std::sync::MutexGuard<'_, BTreeMap<AutoIncrementKey, u64>> {
+        self.not_yet_logged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1598,15 +1807,16 @@ fn complete_log_len(file_size: u64) -> u64 {
 }
 
 /// Checks each record in `bytes` and keeps its mark in `high_waters`, each
-/// key's marks having to rise.
-fn scan_records(bytes: &[u8], high_waters: &mut BTreeMap<AutoIncrementKey, u64>) -> Result<()> {
+fn scan_records(bytes: &[u8], high_waters: &mut BTreeMap<AutoIncrementKey, u64>) -> Result<usize> {
     if !bytes.len().is_multiple_of(RECORD_LEN) {
         return Err(LimboError::Corrupt(
             "auto-increment log read did not end at a record boundary".to_owned(),
         ));
     }
-    for record in bytes.chunks_exact(RECORD_LEN) {
-        let (key, high_water) = decode_record(record)?;
+    for (index, record) in bytes.chunks_exact(RECORD_LEN).enumerate() {
+        let Ok((key, high_water)) = decode_record(record) else {
+            return Ok(index * RECORD_LEN);
+        };
         if high_water == 0 {
             return Err(LimboError::Corrupt(
                 "auto-increment log contains a zero high-water mark".to_owned(),
@@ -1619,7 +1829,7 @@ fn scan_records(bytes: &[u8], high_waters: &mut BTreeMap<AutoIncrementKey, u64>)
             ));
         }
     }
-    Ok(())
+    Ok(bytes.len())
 }
 
 fn encode_record(key: AutoIncrementKey, high_water: u64) -> [u8; RECORD_LEN] {
@@ -1806,10 +2016,10 @@ mod tests {
         io.wait_for_completion(completion).unwrap();
     }
 
-    /// A memory IO counting the bytes every file read asks for.
     struct ReadCountingIo {
         inner: MemoryIO,
         bytes_read: Arc<std::sync::atomic::AtomicU64>,
+        syncs: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl ReadCountingIo {
@@ -1817,7 +2027,12 @@ mod tests {
             Self {
                 inner: MemoryIO::new(),
                 bytes_read: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
+        }
+
+        fn syncs(&self) -> u64 {
+            self.syncs.load(Ordering::Acquire)
         }
     }
 
@@ -1836,6 +2051,7 @@ mod tests {
             Ok(Arc::new(ReadCountingFile {
                 inner: self.inner.open_file(path, flags, direct)?,
                 bytes_read: self.bytes_read.clone(),
+                syncs: self.syncs.clone(),
             }))
         }
 
@@ -1851,6 +2067,7 @@ mod tests {
     struct ReadCountingFile {
         inner: Arc<dyn File>,
         bytes_read: Arc<std::sync::atomic::AtomicU64>,
+        syncs: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl File for ReadCountingFile {
@@ -1882,6 +2099,7 @@ mod tests {
         }
 
         fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.syncs.fetch_add(1, Ordering::AcqRel);
             self.inner.sync(completion, sync_type)
         }
 
@@ -1892,6 +2110,79 @@ mod tests {
         fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
             self.inner.truncate(len, completion)
         }
+    }
+
+    #[test]
+    fn while_commits_log_the_marks_a_record_is_written_without_a_sync() {
+        let io = ReadCountingIo::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+        let syncs_before = io.syncs();
+
+        let commits = allocator.let_commits_log_marks().unwrap();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 2).last(), 3);
+        assert_eq!(advance_past(&io, &allocator, KEY_A, 2).last(), 3);
+        assert_eq!(advance_past(&io, &allocator, KEY_B, 7).last(), 7);
+        assert_eq!(io.syncs(), syncs_before);
+        assert_eq!(commits.marks_to_log(), vec![(KEY_A, 3), (KEY_B, 7)]);
+
+        commits.logged(&[(KEY_A, 3)]);
+        assert_eq!(commits.marks_to_log(), vec![(KEY_B, 7)]);
+        assert!(Arc::ptr_eq(
+            &commits,
+            &allocator.let_commits_log_marks().unwrap()
+        ));
+
+        drop(commits);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 4);
+        assert_eq!(io.syncs(), syncs_before + 1);
+    }
+
+    #[test]
+    fn a_commit_forgets_only_the_marks_it_logged() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        let commits = allocator.let_commits_log_marks().unwrap();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 3).last(), 3);
+        let logged_marks = commits.marks_to_log();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 2).last(), 5);
+        commits.logged(&logged_marks);
+        assert_eq!(commits.marks_to_log(), vec![(KEY_A, 5)]);
+    }
+
+    #[test]
+    fn a_record_that_fails_its_check_ends_the_log_and_a_write_truncates_the_rest() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 2).last(), 2);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 3);
+        drop(allocator);
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let second_record = (HEADER_LEN + RECORD_LEN) as u64;
+        write_bytes(&io, file.clone(), second_record, vec![0; RECORD_LEN]);
+        write_bytes(
+            &io,
+            file.clone(),
+            second_record + RECORD_LEN as u64,
+            encode_record(KEY_A, 1).to_vec(),
+        );
+        let torn_size = file.size().unwrap();
+
+        let reopened = open_allocator(&io);
+        assert_eq!(peek_high_water(&io, &reopened, KEY_A), 2);
+        assert_eq!(file.size().unwrap(), torn_size);
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 3);
+        assert_eq!(file.size().unwrap(), second_record + RECORD_LEN as u64);
+        drop(reopened);
+
+        let reopened = open_allocator(&io);
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 4);
     }
 
     struct HandleIdentityIo {

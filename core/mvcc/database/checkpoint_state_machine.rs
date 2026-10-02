@@ -77,6 +77,9 @@ pub enum CheckpointState {
     BuildLocalSchemaView,
     CollectTableRows,
     CollectIndexRows,
+    SyncCounterSidecar {
+        begin_pager_txn: bool,
+    },
     BeginPagerTxn,
     WriteRow {
         write_set_index: usize,
@@ -191,6 +194,7 @@ pub struct LockStates {
 pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
     /// The current state of the state machine
     state: CheckpointState,
+    counter_sidecar_sync: Option<Completion>,
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
     /// released if the state machine fails.
     lock_states: LockStates,
@@ -846,6 +850,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             index_write_set: crate::alloc::vec![],
             index_id_to_index,
             checkpoint_result: None,
+            counter_sidecar_sync: None,
             update_transaction_state,
             sync_mode,
             mode,
@@ -2211,12 +2216,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 self.mvstore.storage.on_checkpoint_start()?;
 
-                if self.write_set.is_empty() && self.index_write_set.is_empty() {
-                    // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
-                    self.state = CheckpointState::CheckpointWal;
-                } else {
-                    self.state = CheckpointState::BeginPagerTxn;
+                self.state = CheckpointState::SyncCounterSidecar {
+                    begin_pager_txn: !self.write_set.is_empty() || !self.index_write_set.is_empty(),
+                };
+                Ok(TransitionResult::Continue)
+            }
+            CheckpointState::SyncCounterSidecar { begin_pager_txn } => {
+                let begin_pager_txn = *begin_pager_txn;
+                if self.sync_mode != SyncMode::Off {
+                    match self.counter_sidecar_sync.take() {
+                        None => {
+                            if let Some(completion) =
+                                self.mvstore.sync_counter_sidecar_for_checkpoint()?
+                            {
+                                self.counter_sidecar_sync = Some(completion.clone());
+                                return Ok(TransitionResult::Io(IOCompletions(completion)));
+                            }
+                        }
+                        Some(completion) => {
+                            if !completion.finished() {
+                                self.counter_sidecar_sync = Some(completion.clone());
+                                return Ok(TransitionResult::Io(IOCompletions(completion)));
+                            }
+                            if let Some(error) = completion.get_error() {
+                                return Err(error.into());
+                            }
+                        }
+                    }
                 }
+                self.state = if begin_pager_txn {
+                    CheckpointState::BeginPagerTxn
+                } else {
+                    CheckpointState::CheckpointWal
+                };
                 Ok(TransitionResult::Continue)
             }
             CheckpointState::BeginPagerTxn => {

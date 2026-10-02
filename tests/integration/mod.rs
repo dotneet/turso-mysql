@@ -17,6 +17,7 @@ mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
 mod mvcc;
+mod mvcc_counter_marks;
 mod mvcc_row_locks;
 mod mvcc_table_metadata_locks;
 mod pragma;

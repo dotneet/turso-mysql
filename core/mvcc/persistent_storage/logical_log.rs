@@ -112,6 +112,11 @@
 //! - `OP_DELETE_TABLE`: `rowid_varint`
 //! - `OP_UPSERT_INDEX`: serialized index key record
 //! - `OP_DELETE_INDEX`: serialized index key record
+//! - `OP_UPDATE_HEADER`: serialized `DatabaseHeader` (flags and table_id zero)
+//! - `OP_COUNTER_MARK`: `counter_key(16) || high_water(8, le u64)` (flags and
+//!   table_id zero). The high-water mark of an AUTO_INCREMENT counter whose
+//!   sidecar wrote it without a sync; see `storage::auto_increment`. Recovery
+//!   collects the highest mark of each counter from every valid frame.
 //!
 //! `OP_FLAG_BTREE_RESIDENT` means the row existed in the B-tree before MVCC started tracking it.
 //! Recovery preserves this bit because checkpoint/GC logic depends on it.
@@ -318,6 +323,8 @@ const OP_UPSERT_INDEX: u8 = 2;
 const OP_DELETE_INDEX: u8 = 3;
 /// Frame-local database-header mutation (payload = serialized `DatabaseHeader`).
 const OP_UPDATE_HEADER: u8 = 4;
+const OP_COUNTER_MARK: u8 = 5;
+const COUNTER_MARK_PAYLOAD_SIZE: usize = 24;
 
 const OP_FLAG_BTREE_RESIDENT: u8 = 1 << 0;
 const OP_FLAG_PORTABLE_EXTENSION: u8 = 1 << 1;
@@ -1336,11 +1343,11 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             }
             Some(MVTableId::from(table_id_i32 as i64))
         }
-        OP_UPDATE_HEADER => {
+        OP_UPDATE_HEADER | OP_COUNTER_MARK => {
             if flags != 0 || table_id_i32 != 0 {
-                return Err(LimboError::Corrupt(
-                    "Invalid UPDATE_HEADER flags/table_id".into(),
-                ));
+                return Err(LimboError::Corrupt(format!(
+                    "Invalid flags/table_id for op tag {tag}"
+                )));
             }
             None
         }
@@ -1453,6 +1460,7 @@ fn try_parse_one_op_from_buf(buf: &[u8], commit_ts: u64) -> Result<Option<(Parse
             }
             ParsedOp::UpdateHeader { header, commit_ts }
         }
+        OP_COUNTER_MARK => decode_counter_mark(payload, commit_ts)?,
         _ => unreachable!("tag validated above"),
     };
 
@@ -1487,6 +1495,10 @@ pub enum StreamingResult {
     UpdateHeader {
         header: DatabaseHeader,
         commit_ts: u64,
+    },
+    CounterMark {
+        key: [u8; 16],
+        high_water: u64,
     },
     Eof,
 }
@@ -1985,7 +1997,7 @@ impl StreamingLogicalLogReader {
 
         match buf[0] {
             OP_UPSERT_TABLE | OP_DELETE_TABLE | OP_UPSERT_INDEX | OP_DELETE_INDEX
-            | OP_UPDATE_HEADER => {}
+            | OP_UPDATE_HEADER | OP_COUNTER_MARK => {}
             tag => return Err(LimboError::Corrupt(format!("Unknown op tag: {tag}"))),
         }
 
@@ -2435,11 +2447,12 @@ impl StreamingLogicalLogReader {
                     }
                     Some(MVTableId::from(table_id_i32 as i64))
                 }
-                OP_UPDATE_HEADER => {
+                OP_UPDATE_HEADER | OP_COUNTER_MARK => {
                     if flags != 0 || table_id_i32 != 0 {
                         return Err(LimboError::Corrupt(format!(
-                            "OP_UPDATE_HEADER has non-zero flags={flags:#x} or table_id={table_id_i32}"
-                        )).into());
+                            "op tag {tag} has non-zero flags={flags:#x} or table_id={table_id_i32}"
+                        ))
+                        .into());
                     }
                     None
                 }
@@ -2593,6 +2606,7 @@ impl StreamingLogicalLogReader {
                     }
                     ParsedOp::UpdateHeader { header, commit_ts }
                 }
+                OP_COUNTER_MARK => decode_counter_mark(&payload, commit_ts)?,
                 _ => {
                     return Err(
                         LimboError::Corrupt(format!("unknown op tag {tag} in payload")).into(),
@@ -3418,6 +3432,9 @@ impl StreamingLogicalLogReader {
             ParsedOp::UpdateHeader { header, commit_ts } => {
                 Ok(StreamingResult::UpdateHeader { header, commit_ts })
             }
+            ParsedOp::CounterMark {
+                key, high_water, ..
+            } => Ok(StreamingResult::CounterMark { key, high_water }),
         }
     }
 
@@ -3764,6 +3781,35 @@ pub(crate) enum ParsedOp {
         header: DatabaseHeader,
         commit_ts: u64,
     },
+    CounterMark {
+        key: [u8; 16],
+        high_water: u64,
+        commit_ts: u64,
+    },
+}
+
+fn decode_counter_mark(payload: &[u8], commit_ts: u64) -> Result<ParsedOp> {
+    if payload.len() != COUNTER_MARK_PAYLOAD_SIZE {
+        return Err(LimboError::Corrupt(format!(
+            "OP_COUNTER_MARK payload len {} != {COUNTER_MARK_PAYLOAD_SIZE}",
+            payload.len()
+        )));
+    }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&payload[..16]);
+    let mut high_water = [0u8; 8];
+    high_water.copy_from_slice(&payload[16..]);
+    let high_water = u64::from_le_bytes(high_water);
+    if key == [0u8; 16] || high_water == 0 {
+        return Err(LimboError::Corrupt(
+            "OP_COUNTER_MARK has a zero key or a zero mark".to_string(),
+        ));
+    }
+    Ok(ParsedOp::CounterMark {
+        key,
+        high_water,
+        commit_ts,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

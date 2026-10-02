@@ -39,6 +39,19 @@ pub trait DurableStorage: Send + Sync + Debug {
         header: &DatabaseHeader,
     ) -> Result<()>;
 
+    fn serialize_counter_mark(
+        &self,
+        log_record: &mut LogRecord,
+        key: [u8; 16],
+        high_water: u64,
+    ) -> Result<()> {
+        LogSerializer::new(&mut log_record.buf).serialize_counter_mark_entry(key, high_water)?;
+        log_record.op_count = log_record.op_count.checked_add(1).ok_or_else(|| {
+            LimboError::InternalError("logical log op_count exceeds u32".to_string())
+        })?;
+        Ok(())
+    }
+
     /// Write a transaction to the logical log without advancing the writer offset.
     ///
     /// If `on_serialization_complete` is provided, it is called with shared

@@ -389,6 +389,25 @@ impl<'a, B: LogBufferExt + ?Sized> LogSerializer<'a, B> {
     }
 
     #[inline(always)]
+    pub(crate) fn serialize_counter_mark_entry(
+        &mut self,
+        key: [u8; 16],
+        high_water: u64,
+    ) -> Result<()> {
+        log_write!(
+            self,
+            [
+                OP_COUNTER_MARK,
+                0,
+                0i32.to_le_bytes(),
+                SqliteVarint(COUNTER_MARK_PAYLOAD_SIZE as u64),
+                key,
+                high_water.to_le_bytes(),
+            ]
+        )
+    }
+
+    #[inline(always)]
     pub(crate) fn serialize_tx_trailer(&mut self, crc: u32) -> Result<()> {
         log_write!(self, [crc.to_le_bytes(), END_MAGIC.to_le_bytes()])
     }

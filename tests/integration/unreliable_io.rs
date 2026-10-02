@@ -265,6 +265,10 @@ struct UnreliableFile {
 }
 
 impl File for UnreliableFile {
+    fn file_id(&self) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id()
+    }
+
     fn lock_file(&self, exclusive: bool) -> turso_core::Result<()> {
         self.inner.lock_file(exclusive)
     }
