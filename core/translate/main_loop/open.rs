@@ -473,6 +473,13 @@ impl OpenLoop {
                                     null_matching_mask: Default::default(),
                                 });
                                 program.preassign_label_to_next_insn(loop_start);
+                                program.mark_row_lock_point(RowLockPoint::ChecksTheRangeEnd {
+                                    cursor_id: idx_cursor,
+                                    equality: true,
+                                    unique_equality: index.as_ref().is_some_and(|index| {
+                                        index.unique && index.columns.len() == 1
+                                    }),
+                                });
                                 program.emit_insn(Insn::IdxGT {
                                     cursor_id: idx_cursor,
                                     start_reg: seek_reg,

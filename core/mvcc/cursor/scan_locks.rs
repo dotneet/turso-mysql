@@ -1,4 +1,4 @@
-use super::{CursorPosition, CursorRowLocks, MvccCursorType, MvccLazyCursor};
+use super::{CursorPosition, CursorRowLocks, MvccCursorType, MvccLazyCursor, RangeEndCheck};
 use crate::alloc::ConcurrentAllocator;
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
@@ -100,7 +100,7 @@ pub(super) enum Arrived {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordLock {
+pub(crate) enum RecordLock {
     Taken,
     HeldByAnother,
 }
@@ -209,20 +209,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     pub(super) fn lock_the_pending_row_before_reading_it(&mut self) -> IOResultOr<()> {
-        return_if_io!(self.lock_the_pending_row());
+        let taken = return_if_io!(self.lock_the_pending_row());
+        turso_assert!(
+            taken == RecordLock::Taken,
+            "a row another transaction holds is skipped at its range end check, before it is read"
+        );
         Ok(IOResult::Done(()))
     }
 
-    pub(crate) fn passed_the_range_end_check(&mut self, unique_equality: bool) -> IOResultOr<()> {
+    pub(crate) fn passed_the_range_end_check(
+        &mut self,
+        unique_equality: bool,
+    ) -> IOResultOr<RecordLock> {
         let Some(pending) = self.scan.pending.as_mut() else {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(RecordLock::Taken));
         };
         if unique_equality {
             pending.below = Below::Nothing;
             self.scan.unique_match = true;
         }
-        return_if_io!(self.lock_the_pending_row());
-        Ok(IOResult::Done(()))
+        self.lock_the_pending_row()
     }
 
     pub(crate) fn reached_the_range_end(&mut self, end: &RangeEnd<'_>) -> IOResultOr<()> {
@@ -232,8 +238,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         let row_locks = self.row_locks_in_force();
         let row = pending.row.clone();
         let repeatable = row_locks.level == RowLockLevel::RepeatableRead;
-        match (repeatable, pending.direction) {
-            (true, IterationDirection::Forwards) => {
+        match pending.direction {
+            IterationDirection::Backwards => {
+                turso_assert!(
+                    end.equality,
+                    "a descending scan checks its range end before locking only for one value"
+                );
+            }
+            IterationDirection::Forwards if repeatable => {
                 let ended_on_the_previous_row = self
                     .scan
                     .previous
@@ -243,37 +255,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     self.scan.unique_match || (row_locks.primary && ended_on_the_previous_row);
                 if !nothing_more {
                     let (low, start) = return_if_io!(self.gap_below_the_pending_row());
-                    if row_locks.primary || end.equality {
-                        self.lock_the_gap(low, Some(row.clone()), |key| match start.place(key) {
-                            GapKey::Met if !(end.holds)(key) => GapKey::AboveTheScan,
-                            place => place,
-                        })?;
-                    } else {
-                        self.lock_the_gap(low, Some(row.clone()), |key| start.place(key))?;
-                        self.lock_the_record_or_wait(&row, false)?;
-                    }
-                }
-            }
-            (true, IterationDirection::Backwards) => {
-                if !end.equality {
-                    self.lock_the_record_or_wait(&row, false)?;
-                    let low = return_if_io!(self.neighbor_of(
-                        &row,
-                        SeekOp::LT,
-                        AfterTheSearch::ReturnTo(row.clone(), SeekOp::LE { eq_only: false }),
-                    ));
-                    self.lock_the_gap(low, Some(row.clone()), |_| GapKey::BelowTheScan)?;
-                }
-            }
-            (false, direction) => {
-                if direction == IterationDirection::Forwards {
-                    let (low, start) = return_if_io!(self.gap_below_the_pending_row());
                     self.lock_the_gap(low, Some(row.clone()), |key| match start.place(key) {
-                        GapKey::Met if end.equality && !(end.holds)(key) => GapKey::AboveTheScan,
+                        GapKey::Met if !(end.holds)(key) => GapKey::AboveTheScan,
                         place => place,
                     })?;
                 }
-                if !end.equality {
+            }
+            IterationDirection::Forwards => {
+                let (low, start) = return_if_io!(self.gap_below_the_pending_row());
+                self.lock_the_gap(low, Some(row.clone()), |key| match start.place(key) {
+                    GapKey::Met if end.equality && !(end.holds)(key) => GapKey::AboveTheScan,
+                    place => place,
+                })?;
+                if !end.equality && !pending.reads_past_a_held_row {
                     self.try_the_record_without_keeping_it(&row)?;
                 }
             }
@@ -634,7 +628,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             below,
             reads_past_a_held_row,
         });
-        if row_locks.range_end_checked && row_locks.policy == RowLockWaitPolicy::Wait {
+        let range_end_checked_before_locking = match row_locks.range_end_check {
+            RangeEndCheck::None => false,
+            RangeEndCheck::Equality => true,
+            RangeEndCheck::Range => row_locks.primary && direction == IterationDirection::Forwards,
+        };
+        if range_end_checked_before_locking {
             return Ok(IOResult::Done(Arrived::OnARow));
         }
         match return_if_io!(self.lock_the_pending_row()) {
@@ -645,19 +644,36 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     fn lock_the_pending_row(&mut self) -> IOResultOr<RecordLock> {
         let pending = self.scan.pending.clone().expect("a row waits for its lock");
-        if pending.direction == IterationDirection::Forwards
-            && !matches!(pending.below, Below::Nothing)
-        {
-            let (low, start) = return_if_io!(self.gap_below_the_pending_row());
-            let skips = self.row_locks_in_force().policy == RowLockWaitPolicy::SkipLocked;
-            self.lock_the_gap(low, Some(pending.row.clone()), |key| {
-                match start.place(key) {
-                    GapKey::Met if skips => GapKey::Ignored,
-                    place => place,
-                }
-            })?;
-        }
         let taken = self.lock_the_record(&pending.row, true, pending.reads_past_a_held_row)?;
+        if taken == RecordLock::Taken {
+            let row_locks = self.row_locks_in_force();
+            match pending.direction {
+                IterationDirection::Forwards if !matches!(pending.below, Below::Nothing) => {
+                    let (low, start) = return_if_io!(self.gap_below_the_pending_row());
+                    let skips = row_locks.policy == RowLockWaitPolicy::SkipLocked;
+                    self.lock_the_gap(low, Some(pending.row.clone()), |key| {
+                        match start.place(key) {
+                            GapKey::Met if skips => GapKey::Ignored,
+                            place => place,
+                        }
+                    })?;
+                }
+                IterationDirection::Backwards
+                    if row_locks.level == RowLockLevel::RepeatableRead =>
+                {
+                    let low = return_if_io!(self.neighbor_of(
+                        &pending.row,
+                        SeekOp::LT,
+                        AfterTheSearch::ReturnTo(
+                            pending.row.clone(),
+                            SeekOp::LE { eq_only: false }
+                        ),
+                    ));
+                    self.lock_the_gap(low, Some(pending.row.clone()), |_| GapKey::BelowTheScan)?;
+                }
+                IterationDirection::Forwards | IterationDirection::Backwards => {}
+            }
+        }
         self.scan.pending = None;
         Ok(IOResult::Done(taken))
     }
@@ -701,15 +717,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             place,
             row_locks.level == RowLockLevel::RepeatableRead,
         )
-    }
-
-    fn lock_the_record_or_wait(&mut self, row: &RowKey, with_the_table_row: bool) -> Result<()> {
-        match self.lock_the_record(row, with_the_table_row, false)? {
-            RecordLock::Taken => Ok(()),
-            RecordLock::HeldByAnother => {
-                unreachable!("a lock that waits never leaves a held row behind")
-            }
-        }
     }
 
     fn try_the_record_without_keeping_it(&mut self, row: &RowKey) -> Result<()> {

@@ -1,20 +1,23 @@
 use std::any::Any;
 use std::cmp::Ordering;
 
-use crate::mvcc::cursor::RangeEnd;
+use crate::mvcc::cursor::{RangeEnd, RecordLock};
 use crate::mvcc::database::RowKey;
 use crate::numeric::Numeric;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::types::{compare_record, Cursor, IOResult, IOResultOr, IndexInfo, Value};
 use crate::vdbe::execute::InsnResult;
-use crate::vdbe::{CursorID, Insn, InsnFunctionStepResult, Program, ProgramState, RowLockPoint};
-use crate::{LimboError, MvCursor, Result};
+use crate::vdbe::{
+    CursorID, Insn, InsnFunctionStepResult, InsnReference, Program, ProgramState, RowLockPoint,
+};
+use crate::{return_if_io, LimboError, MvCursor, Result};
 
 pub(crate) enum RowLockWork {
     PassedTheRangeEnd {
         cursor_id: CursorID,
         unique_equality: bool,
+        skipped_rows_go_to: InsnReference,
     },
     ReachedTheRangeEnd {
         cursor_id: CursorID,
@@ -34,7 +37,11 @@ pub(crate) fn step_with_row_locks(
 ) -> InsnResult {
     if let Some(work) = state.row_lock_work.take() {
         match do_the_work(state, &work) {
-            Ok(IOResult::Done(())) => {}
+            Ok(IOResult::Done(RowAfterTheWork::Kept)) => {}
+            Ok(IOResult::Done(RowAfterTheWork::Skipped(pc))) => {
+                state.pc = pc;
+                return Ok(InsnFunctionStepResult::Step);
+            }
             Ok(IOResult::IO(io)) => {
                 state.row_lock_work = Some(work);
                 return Ok(state.suspend_on_io(io));
@@ -51,37 +58,53 @@ pub(crate) fn step_with_row_locks(
     result
 }
 
-fn do_the_work(state: &mut ProgramState, work: &RowLockWork) -> IOResultOr<()> {
+enum RowAfterTheWork {
+    Kept,
+    Skipped(InsnReference),
+}
+
+fn do_the_work(state: &mut ProgramState, work: &RowLockWork) -> IOResultOr<RowAfterTheWork> {
     match work {
         RowLockWork::PassedTheRangeEnd {
             cursor_id,
             unique_equality,
-        } => match mvcc_cursor(state, *cursor_id) {
-            Some(cursor) => cursor.passed_the_range_end_check(*unique_equality),
-            None => Ok(IOResult::Done(())),
-        },
+            skipped_rows_go_to,
+        } => {
+            let Some(cursor) = mvcc_cursor(state, *cursor_id) else {
+                return Ok(IOResult::Done(RowAfterTheWork::Kept));
+            };
+            match return_if_io!(cursor.passed_the_range_end_check(*unique_equality)) {
+                RecordLock::Taken => Ok(IOResult::Done(RowAfterTheWork::Kept)),
+                RecordLock::HeldByAnother => Ok(IOResult::Done(RowAfterTheWork::Skipped(
+                    *skipped_rows_go_to,
+                ))),
+            }
+        }
         RowLockWork::ReachedTheRangeEnd {
             cursor_id,
             equality,
             bound,
         } => {
             let Some(cursor) = mvcc_cursor(state, *cursor_id) else {
-                return Ok(IOResult::Done(()));
+                return Ok(IOResult::Done(RowAfterTheWork::Kept));
             };
             let index_info = cursor.index_info_of_the_scan();
             let holds = |key: &RowKey| bound.holds(key, index_info.as_deref());
             let is_the_last_key_inside =
                 |key: &RowKey| bound.is_the_last_key_inside(key, index_info.as_deref());
-            cursor.reached_the_range_end(&RangeEnd {
+            return_if_io!(cursor.reached_the_range_end(&RangeEnd {
                 equality: *equality,
                 is_the_last_key_inside: &is_the_last_key_inside,
                 holds: &holds,
-            })
+            }));
+            Ok(IOResult::Done(RowAfterTheWork::Kept))
         }
-        RowLockWork::FoundADuplicate { cursor_id } => match mvcc_cursor(state, *cursor_id) {
-            Some(cursor) => cursor.lock_the_duplicate(),
-            None => Ok(IOResult::Done(())),
-        },
+        RowLockWork::FoundADuplicate { cursor_id } => {
+            if let Some(cursor) = mvcc_cursor(state, *cursor_id) {
+                return_if_io!(cursor.lock_the_duplicate());
+            }
+            Ok(IOResult::Done(RowAfterTheWork::Kept))
+        }
     }
 }
 
@@ -157,12 +180,42 @@ fn after_the_instruction(program: &Program, state: &mut ProgramState, insn: &Ins
                     RowLockWork::PassedTheRangeEnd {
                         cursor_id,
                         unique_equality,
+                        skipped_rows_go_to: where_skipped_rows_go(program, insn, pc, cursor_id),
                     }
                 });
             }
             RowLockPoint::RowsMatched { .. } => {}
         }
     }
+}
+
+fn where_skipped_rows_go(
+    program: &Program,
+    range_end_check: &Insn,
+    pc: usize,
+    cursor_id: CursorID,
+) -> InsnReference {
+    let next_row = program.insns[pc + 1..]
+        .iter()
+        .position(|(insn, _)| {
+            matches!(
+                insn,
+                Insn::Next { cursor_id: moved, .. } | Insn::Prev { cursor_id: moved, .. }
+                    if *moved == cursor_id
+            )
+        })
+        .map(|offset| (pc + 1 + offset) as InsnReference);
+    next_row.unwrap_or_else(|| match range_end_check {
+        Insn::Gt { target_pc, .. }
+        | Insn::Ge { target_pc, .. }
+        | Insn::Lt { target_pc, .. }
+        | Insn::Le { target_pc, .. }
+        | Insn::IdxGT { target_pc, .. }
+        | Insn::IdxGE { target_pc, .. }
+        | Insn::IdxLT { target_pc, .. }
+        | Insn::IdxLE { target_pc, .. } => target_pc.as_offset_int(),
+        _ => unreachable!("a range end is checked by a comparison: {range_end_check:?}"),
+    })
 }
 
 type StopsAt = fn(Ordering) -> bool;

@@ -27,7 +27,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 
 mod scan_locks;
-pub(crate) use scan_locks::RangeEnd;
+pub(crate) use scan_locks::{RangeEnd, RecordLock};
 
 #[derive(Clone)]
 enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
@@ -569,10 +569,17 @@ pub(crate) struct CursorRowLocks {
     pub(crate) table_of_index: Option<MVTableId>,
     pub(crate) level: RowLockLevel,
     pub(crate) primary: bool,
-    pub(crate) range_end_checked: bool,
+    pub(crate) range_end_check: RangeEndCheck,
     pub(crate) releases_unmatched_rows: bool,
     pub(crate) reads_past_held_rows: bool,
     pub(crate) duplicate_mode: RowLockMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RangeEndCheck {
+    None,
+    Range,
+    Equality,
 }
 
 pub enum NextRowidResult {

@@ -6,7 +6,7 @@ use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
-use crate::mvcc::cursor::{CursorRowLocks, MvccCursorType, NextRowidResult};
+use crate::mvcc::cursor::{CursorRowLocks, MvccCursorType, NextRowidResult, RangeEndCheck};
 use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, LockingRead, MetadataLockMode,
     MetadataLockRequest, RowLockLevel, RowLockMode, RowLockWaitPolicy, TxID,
@@ -17331,9 +17331,7 @@ fn row_locks_for_cursor(
                 .iter()
                 .any(|(_, point)| wanted(point, cursor_id))
     };
-    let range_end_checked = marked(
-        |point, cursor_id| matches!(point, crate::vdbe::RowLockPoint::ChecksTheRangeEnd { cursor_id: checked, .. } if *checked == cursor_id),
-    );
+    let range_end_check = range_end_check_of(program, cursor_id, hooks);
     let read_committed = level == RowLockLevel::ReadCommitted;
     let releases_unmatched_rows = read_committed
         && marked(
@@ -17357,11 +17355,34 @@ fn row_locks_for_cursor(
         table_of_index,
         level,
         primary,
-        range_end_checked,
+        range_end_check,
         releases_unmatched_rows,
         reads_past_held_rows,
         duplicate_mode,
     })
+}
+
+fn range_end_check_of(program: &Program, cursor_id: CursorID, hooks: bool) -> RangeEndCheck {
+    let mut equalities = program
+        .row_lock_points
+        .iter()
+        .filter_map(|(_, point)| match point {
+            crate::vdbe::RowLockPoint::ChecksTheRangeEnd {
+                cursor_id: checked,
+                equality,
+                ..
+            } if *checked == cursor_id => Some(*equality),
+            _ => None,
+        })
+        .peekable();
+    if !hooks || equalities.peek().is_none() {
+        return RangeEndCheck::None;
+    }
+    if equalities.all(|equality| equality) {
+        RangeEndCheck::Equality
+    } else {
+        RangeEndCheck::Range
+    }
 }
 
 fn index_is_the_primary_key(

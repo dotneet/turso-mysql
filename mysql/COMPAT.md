@@ -3753,12 +3753,20 @@ its secondary indexes. A read of one key of a unique index or the primary key th
 row locks that row alone; one that finds none locks the gap the key would be in, the gap
 after the last row when the key is past it. A range read locks each row it reads and the gap
 below it, from the row before the range on; where it stops, past the last row in range, it
-locks only the gap below that row on the primary key, the row and its gap on a secondary
-index, and the gap alone when the read is one value of a secondary index; a read up to a
+locks only the gap below that row on the primary key, the row and its gap (and its table row
+for an exclusive lock) on a secondary index, and the gap alone when the read is one value of a
+secondary index. A read through the primary key, or of one value of an index, sees that it has
+stopped before it locks, so `SKIP LOCKED` and `NOWAIT` lock only that gap and neither skip nor
+refuse a row another transaction holds there; a secondary index range locks the row it stops
+on first, so `NOWAIT` answers 3572 when another transaction holds it and `SKIP LOCKED` reads
+past it to the next row and locks that one before it stops. An `IN` list read through an index
+locks the way a read of each of its values does. A read up to a
 primary key value it found (`id <= 20`) stops there and locks nothing past it, and a read that
 starts at a primary key value it found (`id >= 20`) locks no gap below it. A read through no
 index locks every row and the gap after the last one. A descending read locks the gap above
-the row it starts on, and where it stops the row and the gap below it. A secondary index read
+the row it starts on, each row it reads with the gap below it, so one stopped by its `LIMIT`
+keeps inserts out of the gap below its last row, and where it stops the row and the gap below
+it. A secondary index read
 locks the rows it matches as well, in the same mode. A locking read, an `UPDATE` or a `DELETE`
 that meets a row another open transaction inserted into its range waits for that transaction,
 under `READ COMMITTED` too; one that stops before such a row does not. An `INSERT` that finds

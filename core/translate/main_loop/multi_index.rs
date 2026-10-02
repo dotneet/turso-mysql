@@ -1,5 +1,6 @@
 use super::*;
 use crate::translate::plan::{MultiIndexBranch, MultiIndexBranchAccess};
+use crate::vdbe::RowLockPoint;
 
 #[expect(clippy::too_many_arguments)]
 fn emit_multi_index_rowset_update(
@@ -289,6 +290,14 @@ fn emit_in_seek_multi_index_branch(
             null_matching_mask: Default::default(),
         });
         program.preassign_label_to_next_insn(branch_loop_start);
+        program.mark_row_lock_point(RowLockPoint::ChecksTheRangeEnd {
+            cursor_id: branch_cursor_id,
+            equality: true,
+            unique_equality: branch
+                .index
+                .as_ref()
+                .is_some_and(|index| index.unique && index.columns.len() == 1),
+        });
         program.emit_insn(Insn::IdxGT {
             cursor_id: branch_cursor_id,
             start_reg: seek_reg,
