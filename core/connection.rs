@@ -707,6 +707,7 @@ pub struct Connection {
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
+    pub(super) row_locks_read_committed: AtomicBool,
     /// True when sqlite3_interrupt()-style cancellation is pending for active root statements.
     pub(super) interrupt_requested: AtomicBool,
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -5509,6 +5510,21 @@ impl Connection {
         match &*self.busy_handler.read() {
             BusyHandler::Timeout(d) => *d,
             _ => Duration::ZERO,
+        }
+    }
+
+    pub fn set_row_lock_level(&self, level: crate::RowLockLevel) {
+        self.row_locks_read_committed.store(
+            level == crate::RowLockLevel::ReadCommitted,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub fn row_lock_level(&self) -> crate::RowLockLevel {
+        if self.row_locks_read_committed.load(Ordering::SeqCst) {
+            crate::RowLockLevel::ReadCommitted
+        } else {
+            crate::RowLockLevel::RepeatableRead
         }
     }
 

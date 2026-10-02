@@ -34,6 +34,7 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+mod row_lock_hooks;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -929,6 +930,8 @@ pub struct ProgramState {
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
     pub(crate) locking_read: Option<crate::mvcc::database::LockingRead>,
+    pub(crate) steps_with_row_locks: bool,
+    pub(crate) row_lock_work: Option<row_lock_hooks::RowLockWork>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1106,6 +1109,8 @@ impl ProgramState {
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
             locking_read: None,
+            steps_with_row_locks: false,
+            row_lock_work: None,
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1205,6 +1210,7 @@ impl ProgramState {
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
         self.pc = 0;
+        self.row_lock_work = None;
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -1893,8 +1899,24 @@ impl ExplainState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowLockPoint {
+    ReadsTheRangeEnd {
+        cursor_id: CursorID,
+    },
+    ChecksTheRangeEnd {
+        cursor_id: CursorID,
+        equality: bool,
+        unique_equality: bool,
+    },
+    RowsMatched {
+        cursor_id: CursorID,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct PreparedProgram {
+    pub(crate) row_lock_points: Vec<(InsnReference, RowLockPoint)>,
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
     // ProgramBuilder
@@ -2345,8 +2367,10 @@ impl Program {
             crate::functions::datetime::step_reading_the_clock_once(&mut clock_reading, || {
                 if enable_tracing || vdbe_trace {
                     dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+                } else if state.steps_with_row_locks {
+                    dispatch_loop::<false, true>(self, state, pager, waker, false, false)
                 } else {
-                    dispatch_loop::<false>(self, state, pager, waker, false, false)
+                    dispatch_loop::<false, false>(self, state, pager, waker, false, false)
                 }
             });
         // SQLite reads the clock afresh for each `sqlite3_step()`, which ends
@@ -2379,11 +2403,29 @@ impl Program {
             enable_tracing: bool,
             vdbe_trace: bool,
         ) -> ProgramStep {
-            dispatch_loop::<true>(program, state, pager, waker, enable_tracing, vdbe_trace)
+            if state.steps_with_row_locks {
+                dispatch_loop::<true, true>(
+                    program,
+                    state,
+                    pager,
+                    waker,
+                    enable_tracing,
+                    vdbe_trace,
+                )
+            } else {
+                dispatch_loop::<true, false>(
+                    program,
+                    state,
+                    pager,
+                    waker,
+                    enable_tracing,
+                    vdbe_trace,
+                )
+            }
         }
 
         #[inline(always)]
-        fn dispatch_loop<const TRACE: bool>(
+        fn dispatch_loop<const TRACE: bool, const ROW_LOCKS: bool>(
             program: &Program,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
@@ -2453,26 +2495,30 @@ impl Program {
                             }
                         };
                     }
-                    let result = match insn {
-                        Insn::Next { .. } => step_inline!(execute::op_next),
-                        Insn::ResultRow { .. } => step_inline!(execute::op_result_row),
-                        Insn::Column { .. } => step_inline!(execute::op_column),
-                        Insn::ColumnRange { .. } => step_inline!(execute::op_column_range),
-                        Insn::RowId { .. } => step_inline!(execute::op_row_id),
-                        Insn::Prev { .. } => step_inline!(execute::op_prev),
-                        Insn::Eq { .. } => step_inline!(execute::op_eq),
-                        Insn::Ne { .. } => step_inline!(execute::op_ne),
-                        Insn::Lt { .. } => step_inline!(execute::op_lt),
-                        Insn::Le { .. } => step_inline!(execute::op_le),
-                        Insn::Gt { .. } => step_inline!(execute::op_gt),
-                        Insn::Ge { .. } => step_inline!(execute::op_ge),
-                        Insn::If { .. } => step_inline!(execute::op_if),
-                        Insn::IfNot { .. } => step_inline!(execute::op_if_not),
-                        Insn::Goto { .. } => step_inline!(execute::op_goto),
-                        Insn::Gosub { .. } => step_inline!(execute::op_gosub),
-                        Insn::Return { .. } => step_inline!(execute::op_return),
-                        Insn::Integer { .. } => step_inline!(execute::op_integer),
-                        _ => insn.to_function()(program, state, insn, pager),
+                    let result = if ROW_LOCKS {
+                        row_lock_hooks::step_with_row_locks(program, state, insn, pager)
+                    } else {
+                        match insn {
+                            Insn::Next { .. } => step_inline!(execute::op_next),
+                            Insn::ResultRow { .. } => step_inline!(execute::op_result_row),
+                            Insn::Column { .. } => step_inline!(execute::op_column),
+                            Insn::ColumnRange { .. } => step_inline!(execute::op_column_range),
+                            Insn::RowId { .. } => step_inline!(execute::op_row_id),
+                            Insn::Prev { .. } => step_inline!(execute::op_prev),
+                            Insn::Eq { .. } => step_inline!(execute::op_eq),
+                            Insn::Ne { .. } => step_inline!(execute::op_ne),
+                            Insn::Lt { .. } => step_inline!(execute::op_lt),
+                            Insn::Le { .. } => step_inline!(execute::op_le),
+                            Insn::Gt { .. } => step_inline!(execute::op_gt),
+                            Insn::Ge { .. } => step_inline!(execute::op_ge),
+                            Insn::If { .. } => step_inline!(execute::op_if),
+                            Insn::IfNot { .. } => step_inline!(execute::op_if_not),
+                            Insn::Goto { .. } => step_inline!(execute::op_goto),
+                            Insn::Gosub { .. } => step_inline!(execute::op_gosub),
+                            Insn::Return { .. } => step_inline!(execute::op_return),
+                            Insn::Integer { .. } => step_inline!(execute::op_integer),
+                            _ => insn.to_function()(program, state, insn, pager),
+                        }
                     };
                     // The two outcomes of every row are tested here, one compare
                     // each; the rest settles out of line.

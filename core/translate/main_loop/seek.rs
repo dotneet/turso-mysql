@@ -1,6 +1,7 @@
 use super::*;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
+use crate::vdbe::RowLockPoint;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
@@ -299,6 +300,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         index.columns[0].effective_nulls_order() == NullsOrder::Last
                     }) {
                         self.program.emit_null(self.start_reg, None);
+                        self.mark_the_range_end_check();
                         self.program.emit_insn(Insn::IdxGE {
                             cursor_id: self.seek_cursor_id,
                             start_reg: self.start_reg,
@@ -312,6 +314,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         index.columns[0].effective_nulls_order() == NullsOrder::First
                     }) {
                         self.program.emit_null(self.start_reg, None);
+                        self.mark_the_range_end_check();
                         self.program.emit_insn(Insn::IdxLE {
                             cursor_id: self.seek_cursor_id,
                             start_reg: self.start_reg,
@@ -371,6 +374,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let mut affinity = None;
         if !self.is_index {
             rowid_reg = Some(self.program.alloc_register());
+            self.program
+                .mark_row_lock_point(RowLockPoint::ReadsTheRangeEnd {
+                    cursor_id: self.seek_cursor_id,
+                });
             self.program.emit_insn(Insn::RowId {
                 cursor_id: self.seek_cursor_id,
                 dest: rowid_reg.unwrap(),
@@ -394,6 +401,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             };
         }
 
+        self.mark_the_range_end_check();
         match (self.is_index, self.seek_def.end.op) {
             (true, SeekOp::GE { .. }) => self.program.emit_insn(Insn::IdxGE {
                 cursor_id: self.seek_cursor_id,
@@ -457,6 +465,24 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             }),
         }
         Ok(())
+    }
+
+    fn mark_the_range_end_check(&mut self) {
+        let equality = !self.seek_def.prefix.is_empty()
+            && matches!(self.seek_def.start.last_component, SeekKeyComponent::None)
+            && matches!(self.seek_def.end.last_component, SeekKeyComponent::None)
+            && (0..self.seek_def.prefix.len())
+                .all(|i| !self.seek_def.is_null_matching_key_component(i));
+        let unique_equality = equality
+            && self.seek_index.is_some_and(|index| {
+                index.unique && self.seek_def.prefix.len() >= index.columns.len()
+            });
+        self.program
+            .mark_row_lock_point(RowLockPoint::ChecksTheRangeEnd {
+                cursor_id: self.seek_cursor_id,
+                equality,
+                unique_equality,
+            });
     }
 
     pub(super) fn emit(mut self, loop_start: BranchOffset, use_bloom_filter: bool) -> Result<()> {

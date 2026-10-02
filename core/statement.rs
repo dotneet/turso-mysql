@@ -342,6 +342,7 @@ pub struct Statement {
 struct RowLockWait {
     waiter: Option<u64>,
     holders: Vec<u64>,
+    releases_seen: u64,
     deadline: std::time::Instant,
     end: Option<RowLockWaitEnd>,
 }
@@ -442,6 +443,10 @@ impl Statement {
 
     pub fn lock_rows_it_reads(&mut self, locking_read: LockingRead) {
         self.locking_read = Some(locking_read);
+    }
+
+    pub fn read_without_locking_rows(&mut self) {
+        self.locking_read = None;
     }
 
     pub fn run_to_lock_rows(&mut self) -> Result<()> {
@@ -719,6 +724,7 @@ impl Statement {
                 }
             }
             self.state.locking_read = self.locking_read.clone();
+            self.state.steps_with_row_locks = self.locks_rows_it_reads();
             self.start_reading_latest_rows();
         }
 
@@ -1078,6 +1084,7 @@ impl Statement {
                 wait.end = Some(mv_store.wait_for_row_lock_holders(
                     wait.waiter,
                     &wait.holders,
+                    wait.releases_seen,
                     wait.deadline,
                     || connection.is_interrupted(),
                 ));
@@ -1127,6 +1134,7 @@ impl Statement {
             .as_ref()
             .cloned()
             .expect("only an MVCC database reports a row lock");
+        let releases_seen = mv_store.row_lock_releases_before_the_end(&holders);
         let waiter = connection.get_mv_tx_id();
         if let Some(waiter) = waiter {
             if mv_store.start_row_lock_wait(waiter, &holders) == Some(waiter) {
@@ -1139,6 +1147,7 @@ impl Statement {
         self.row_lock_wait = Some(RowLockWait {
             waiter,
             holders,
+            releases_seen,
             deadline,
             end: None,
         });
@@ -1165,10 +1174,13 @@ impl Statement {
             Some(end) => end,
             None => {
                 let now = std::time::Instant::now();
-                let end =
-                    mv_store.wait_for_row_lock_holders(wait.waiter, &wait.holders, now, || {
-                        connection.is_interrupted()
-                    });
+                let end = mv_store.wait_for_row_lock_holders(
+                    wait.waiter,
+                    &wait.holders,
+                    wait.releases_seen,
+                    now,
+                    || connection.is_interrupted(),
+                );
                 if end == RowLockWaitEnd::TimedOut && now < wait.deadline {
                     if let Some(waker) = waker {
                         waker.wake_by_ref();
@@ -1321,16 +1333,23 @@ impl Statement {
         connection.set_cdc_transaction_id(-1);
     }
 
+    fn locks_rows_it_reads(&self) -> bool {
+        let mv_store = self.program.connection.mv_store();
+        mv_store
+            .as_ref()
+            .is_some_and(|mv_store| mv_store.row_locks_enabled())
+            && (self.program.change_cnt_on || self.locking_read.is_some())
+    }
+
     fn start_reading_latest_rows(&mut self) {
+        if !self.locks_rows_it_reads() {
+            return;
+        }
         let connection = &self.program.connection;
         let mv_store = connection.mv_store();
         let Some(mv_store) = mv_store.as_ref() else {
             return;
         };
-        let locks_rows = self.program.change_cnt_on || self.locking_read.is_some();
-        if !mv_store.row_locks_enabled() || !locks_rows {
-            return;
-        }
         let Some(tx_id) = connection.get_mv_tx_id() else {
             return;
         };

@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::{Duration, Instant};
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use super::{RowID, TxID};
+use super::{MVTableId, RowID, RowKey, TxID};
 use crate::storage::lock_release::LockReleaseSignal;
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Mutex;
@@ -12,6 +13,13 @@ use crate::sync::Mutex;
 pub enum RowLockMode {
     Shared,
     Exclusive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowLockLevel {
+    ReadCommitted,
+    #[default]
+    RepeatableRead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +63,10 @@ impl std::fmt::Debug for RowLocks {
 struct LockTable {
     rows: BTreeMap<RowID, Holders>,
     unique_keys: BTreeMap<RowID, TxID>,
+    inserted: BTreeMap<RowID, TxID>,
+    gaps: BTreeMap<GapEnd, Vec<Gap>>,
     held: HashMap<TxID, Vec<HeldLock>>,
+    released_before_the_end: HashMap<TxID, u64>,
     waits_for: HashMap<TxID, Vec<TxID>>,
     deadlock_victims: HashSet<TxID>,
 }
@@ -63,6 +74,65 @@ struct LockTable {
 enum HeldLock {
     Row(RowID),
     UniqueKey(RowID),
+    Inserted(RowID),
+    Gap(GapEnd),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GapEnd {
+    table_id: MVTableId,
+    high: Option<RowKey>,
+}
+
+impl Ord for GapEnd {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.table_id
+            .cmp(&other.table_id)
+            .then_with(|| match (&self.high, &other.high) {
+                (Some(mine), Some(theirs)) => mine.cmp(theirs),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            })
+    }
+}
+
+impl PartialOrd for GapEnd {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct Gap {
+    low: Option<RowKey>,
+    holder: TxID,
+}
+
+impl Gap {
+    fn starts_below(&self, key: &RowKey) -> bool {
+        self.low.as_ref().is_none_or(|low| low < key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowLockAttempt {
+    Locked { newly_held: bool },
+    HeldBy(Vec<TxID>),
+    ChangedSinceRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GapKey {
+    Met,
+    BelowTheScan,
+    AboveTheScan,
+    Ignored,
+}
+
+pub(crate) struct GapBetween {
+    pub(crate) table_id: MVTableId,
+    pub(crate) low: Option<RowKey>,
+    pub(crate) high: Option<RowKey>,
 }
 
 #[derive(Default)]
@@ -82,21 +152,30 @@ impl RowLocks {
         self.enabled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn lock(&self, tx_id: TxID, row: &RowID, mode: RowLockMode) -> Vec<TxID> {
+    pub(crate) fn lock(
+        &self,
+        tx_id: TxID,
+        row: &RowID,
+        mode: RowLockMode,
+    ) -> Result<bool, Vec<TxID>> {
         let mut table = self.table.lock();
         let holders = table.rows.entry(row.clone()).or_default();
         let conflicting = holders.others_in_the_way(tx_id, mode);
         if !conflicting.is_empty() {
-            return conflicting;
+            if holders.is_empty() {
+                table.rows.remove(row);
+            }
+            return Err(conflicting);
         }
-        if holders.add(tx_id, mode) {
+        let newly_held = holders.add(tx_id, mode);
+        if newly_held {
             table
                 .held
                 .entry(tx_id)
                 .or_default()
                 .push(HeldLock::Row(row.clone()));
         }
-        conflicting
+        Ok(newly_held)
     }
 
     pub(crate) fn holders_in_the_way_of_a_write(&self, tx_id: TxID, row: &RowID) -> Vec<TxID> {
@@ -125,6 +204,96 @@ impl RowLocks {
         }
     }
 
+    pub(crate) fn unlock(&self, tx_id: TxID, row: &RowID) {
+        let mut table = self.table.lock();
+        let now_free = table.rows.get_mut(row).is_some_and(|holders| {
+            holders.remove(tx_id);
+            holders.is_empty()
+        });
+        if now_free {
+            table.rows.remove(row);
+        }
+        if let Some(held) = table.held.get_mut(&tx_id) {
+            if let Some(position) = held
+                .iter()
+                .rposition(|lock| matches!(lock, HeldLock::Row(held_row) if held_row == row))
+            {
+                held.swap_remove(position);
+            }
+        }
+        *table.released_before_the_end.entry(tx_id).or_default() += 1;
+        drop(table);
+        self.transaction_ended.released();
+    }
+
+    pub(crate) fn releases_before_the_end(&self, holders: &[TxID]) -> u64 {
+        let table = self.table.lock();
+        holders
+            .iter()
+            .map(|holder| {
+                table
+                    .released_before_the_end
+                    .get(holder)
+                    .copied()
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    pub(crate) fn lock_insert(&self, tx_id: TxID, key: &RowID) -> Vec<TxID> {
+        let mut table = self.table.lock();
+        let holders = table.gap_holders_around(tx_id, key);
+        if !holders.is_empty() {
+            return holders;
+        }
+        if !table.inserted.contains_key(key) {
+            table.inserted.insert(key.clone(), tx_id);
+            table
+                .held
+                .entry(tx_id)
+                .or_default()
+                .push(HeldLock::Inserted(key.clone()));
+        }
+        holders
+    }
+
+    pub(crate) fn lock_gap(
+        &self,
+        tx_id: TxID,
+        gap: GapBetween,
+        place: impl Fn(&RowKey) -> GapKey,
+        keeps_the_gap: bool,
+    ) -> Vec<TxID> {
+        let mut table = self.table.lock();
+        let mut low = gap.low;
+        let mut high = gap.high;
+        let mut met = Vec::new();
+        for (key, inserter) in table.inserted_between(gap.table_id, low.clone(), high.clone()) {
+            if inserter == tx_id {
+                continue;
+            }
+            match place(&key.row_id) {
+                GapKey::Met => {
+                    if !met.contains(&inserter) {
+                        met.push(inserter);
+                    }
+                }
+                GapKey::BelowTheScan => low = Some(key.row_id.clone()),
+                GapKey::AboveTheScan => {
+                    if high.as_ref().is_none_or(|high| &key.row_id < high) {
+                        high = Some(key.row_id.clone());
+                    }
+                }
+                GapKey::Ignored => {}
+            }
+        }
+        if !met.is_empty() || !keeps_the_gap {
+            return met;
+        }
+        table.add_gap(tx_id, gap.table_id, low, high);
+        met
+    }
+
     pub(crate) fn release(&self, tx_id: TxID) {
         let mut table = self.table.lock();
         for lock in table.held.remove(&tx_id).unwrap_or_default() {
@@ -141,8 +310,17 @@ impl RowLocks {
                 HeldLock::UniqueKey(key) => {
                     table.unique_keys.remove(&key);
                 }
+                HeldLock::Inserted(key) => {
+                    if table.inserted.get(&key) == Some(&tx_id) {
+                        table.inserted.remove(&key);
+                    }
+                }
+                HeldLock::Gap(end) => {
+                    table.remove_gap(tx_id, &end);
+                }
             }
         }
+        table.released_before_the_end.remove(&tx_id);
         table.waits_for.remove(&tx_id);
         table.deadlock_victims.remove(&tx_id);
         drop(table);
@@ -233,6 +411,117 @@ impl RowLocks {
 }
 
 impl LockTable {
+    fn inserted_between(
+        &self,
+        table_id: MVTableId,
+        low: Option<RowKey>,
+        high: Option<RowKey>,
+    ) -> Vec<(RowID, TxID)> {
+        let start = match low {
+            Some(low) => Bound::Excluded(RowID::new(table_id, low)),
+            None => Bound::Included(RowID::new(table_id, RowKey::Int(i64::MIN))),
+        };
+        self.inserted
+            .range((start, Bound::Unbounded))
+            .take_while(|(key, _)| {
+                key.table_id == table_id && high.as_ref().is_none_or(|high| &key.row_id < high)
+            })
+            .map(|(key, inserter)| (key.clone(), *inserter))
+            .collect()
+    }
+
+    fn gap_holders_around(&self, tx_id: TxID, key: &RowID) -> Vec<TxID> {
+        let after_the_key = GapEnd {
+            table_id: key.table_id,
+            high: Some(key.row_id.clone()),
+        };
+        let mut holders = Vec::new();
+        for (end, gaps) in self
+            .gaps
+            .range((Bound::Excluded(after_the_key), Bound::Unbounded))
+        {
+            if end.table_id != key.table_id {
+                break;
+            }
+            for gap in gaps {
+                if gap.holder != tx_id
+                    && gap.starts_below(&key.row_id)
+                    && !holders.contains(&gap.holder)
+                {
+                    holders.push(gap.holder);
+                }
+            }
+        }
+        holders
+    }
+
+    fn add_gap(
+        &mut self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        low: Option<RowKey>,
+        high: Option<RowKey>,
+    ) {
+        let low = self.join_the_gap_below(tx_id, table_id, low);
+        let end = GapEnd { table_id, high };
+        let gaps = self.gaps.entry(end.clone()).or_default();
+        if let Some(held) = gaps.iter_mut().find(|gap| gap.holder == tx_id) {
+            let wider = match (&held.low, &low) {
+                (Some(held_low), Some(low)) => low < held_low,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if wider {
+                held.low = low;
+            }
+            return;
+        }
+        gaps.push(Gap { low, holder: tx_id });
+        self.held.entry(tx_id).or_default().push(HeldLock::Gap(end));
+    }
+
+    fn join_the_gap_below(
+        &mut self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        low: Option<RowKey>,
+    ) -> Option<RowKey> {
+        let record = low?;
+        let record_id = RowID::new(table_id, record.clone());
+        let holds_the_record = self.rows.get(&record_id).is_some_and(|holders| {
+            holders.exclusive == Some(tx_id) || holders.shared.contains(&tx_id)
+        });
+        if !holds_the_record {
+            return Some(record);
+        }
+        let below = GapEnd {
+            table_id,
+            high: Some(record.clone()),
+        };
+        let Some(joined_low) = self.remove_gap(tx_id, &below) else {
+            return Some(record);
+        };
+        if let Some(held) = self.held.get_mut(&tx_id) {
+            if let Some(position) = held
+                .iter()
+                .rposition(|lock| matches!(lock, HeldLock::Gap(end) if *end == below))
+            {
+                held.swap_remove(position);
+            }
+        }
+        joined_low
+    }
+
+    fn remove_gap(&mut self, tx_id: TxID, end: &GapEnd) -> Option<Option<RowKey>> {
+        let gaps = self.gaps.get_mut(end)?;
+        let position = gaps.iter().position(|gap| gap.holder == tx_id)?;
+        let removed = gaps.swap_remove(position);
+        if gaps.is_empty() {
+            self.gaps.remove(end);
+        }
+        Some(removed.low)
+    }
+
     fn cycle_through(&self, waiter: TxID, holders: &[TxID]) -> Vec<TxID> {
         let mut visited = HashSet::default();
         let mut path = Vec::new();

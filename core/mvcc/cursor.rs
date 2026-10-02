@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowLockMode, RowLockWaitPolicy,
-    RowVersions, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowLockLevel, RowLockMode,
+    RowLockWaitPolicy, RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -25,6 +25,9 @@ use std::fmt::Debug;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
+
+mod scan_locks;
+pub(crate) use scan_locks::RangeEnd;
 
 #[derive(Clone)]
 enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
@@ -556,7 +559,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
     row_locks: Option<CursorRowLocks>,
-    moving_past_held_rows: Option<IterationDirection>,
+    scan: scan_locks::ScanLocks,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -564,12 +567,12 @@ pub(crate) struct CursorRowLocks {
     pub(crate) mode: RowLockMode,
     pub(crate) policy: RowLockWaitPolicy,
     pub(crate) table_of_index: Option<MVTableId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowLockResult {
-    Locked,
-    HeldByAnother,
+    pub(crate) level: RowLockLevel,
+    pub(crate) primary: bool,
+    pub(crate) range_end_checked: bool,
+    pub(crate) releases_unmatched_rows: bool,
+    pub(crate) reads_past_held_rows: bool,
+    pub(crate) duplicate_mode: RowLockMode,
 }
 
 pub enum NextRowidResult {
@@ -637,12 +640,27 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             row_locks: None,
-            moving_past_held_rows: None,
+            scan: scan_locks::ScanLocks::default(),
         })
     }
 
     pub(crate) fn lock_rows_it_reads(&mut self, row_locks: CursorRowLocks) {
         self.row_locks = Some(row_locks);
+    }
+
+    pub(crate) fn position_to_write(&mut self, writes: bool) {
+        self.scan.positions_to_write = writes;
+    }
+
+    pub(crate) fn read_the_range_end(&mut self, reads: bool) {
+        self.scan.reads_the_range_end = reads;
+    }
+
+    pub(crate) fn index_info_of_the_scan(&self) -> Option<Arc<IndexInfo>> {
+        match &self.mv_cursor_type {
+            MvccCursorType::Index(index_info) => Some(index_info.clone()),
+            MvccCursorType::Table => None,
+        }
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -1291,32 +1309,32 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
     fn last(&mut self) -> IOResultOr<()> {
-        if let Some(direction) = self.moving_past_held_rows {
-            return self.lock_the_row_or_move_past_it(direction);
+        if self.locks_this_move() {
+            return self.start_over_and_lock(IterationDirection::Backwards);
         }
-        return_if_io!(self.last_row());
-        self.lock_the_row_or_move_past_it(IterationDirection::Backwards)
+        self.last_row()
     }
 
     fn next(&mut self) -> IOResultOr<()> {
-        if let Some(direction) = self.moving_past_held_rows {
-            return self.lock_the_row_or_move_past_it(direction);
+        if self.locks_this_move() {
+            return self.step_and_lock(IterationDirection::Forwards);
         }
-        return_if_io!(self.next_row());
-        self.lock_the_row_or_move_past_it(IterationDirection::Forwards)
+        self.next_row()
     }
 
     fn prev(&mut self) -> IOResultOr<()> {
-        if let Some(direction) = self.moving_past_held_rows {
-            return self.lock_the_row_or_move_past_it(direction);
+        if self.locks_this_move() {
+            return self.step_and_lock(IterationDirection::Backwards);
         }
-        return_if_io!(self.prev_row());
-        self.lock_the_row_or_move_past_it(IterationDirection::Backwards)
+        self.prev_row()
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
+        }
+        if self.has_a_pending_row_lock() {
+            return_if_io!(self.lock_the_pending_row_before_reading_it());
         }
         let rowid = match self.get_current_pos() {
             CursorPosition::Loaded {
@@ -1351,6 +1369,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        if self.has_a_pending_row_lock() {
+            return_if_io!(self.lock_the_pending_row_before_reading_it());
+        }
         self.current_row()
     }
 
@@ -1360,25 +1381,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        if let Some(direction) = self.moving_past_held_rows {
-            return self.move_past_held_rows_after_a_seek(direction);
+        if self.locks_this_move() {
+            return self.seek_and_lock(seek_key, op);
         }
-        let found = return_if_io!(self.seek_row(seek_key, op));
-        if found != SeekResult::Found {
-            return Ok(IOResult::Done(found));
-        }
-        if self.lock_the_row()? == RowLockResult::Locked {
-            return Ok(IOResult::Done(found));
-        }
-        if op.eq_only() {
-            self.current_pos = match op.iteration_direction() {
-                IterationDirection::Forwards => CursorPosition::End,
-                IterationDirection::Backwards => CursorPosition::BeforeFirst,
-            };
-            return Ok(IOResult::Done(SeekResult::NotFound));
-        }
-        self.moving_past_held_rows = Some(op.iteration_direction());
-        self.move_past_held_rows_after_a_seek(op.iteration_direction())
+        self.seek_row(seek_key, op)
     }
 
     /// Insert a row into the table or index.
@@ -1565,13 +1571,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
-        let exists = return_if_io!(self.row_exists(key));
-        if !exists {
-            return Ok(IOResult::Done(false));
+        if self.locks_this_move() {
+            return self.probe_and_lock(key);
         }
-        Ok(IOResult::Done(
-            self.lock_the_row()? == RowLockResult::Locked,
-        ))
+        self.row_exists(key)
     }
 
     fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
@@ -1638,11 +1641,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
-        if let Some(direction) = self.moving_past_held_rows {
-            return self.lock_the_row_or_move_past_it(direction);
+        if self.locks_this_move() {
+            return self.start_over_and_lock(IterationDirection::Forwards);
         }
-        return_if_io!(self.rewind_rows());
-        self.lock_the_row_or_move_past_it(IterationDirection::Forwards)
+        self.rewind_rows()
     }
 
     fn has_record(&self) -> bool {
@@ -2394,64 +2396,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             // Not found in B-tree either
             self.state = None;
             Ok(IOResult::Done(false))
-        }
-    }
-
-    fn lock_the_row_or_move_past_it(&mut self, direction: IterationDirection) -> IOResultOr<()> {
-        loop {
-            if self.moving_past_held_rows.is_none() {
-                if self.lock_the_row()? == RowLockResult::Locked {
-                    return Ok(IOResult::Done(()));
-                }
-                self.moving_past_held_rows = Some(direction);
-            }
-            match direction {
-                IterationDirection::Forwards => return_if_io!(self.next_row()),
-                IterationDirection::Backwards => return_if_io!(self.prev_row()),
-            }
-            self.moving_past_held_rows = None;
-        }
-    }
-
-    fn move_past_held_rows_after_a_seek(
-        &mut self,
-        direction: IterationDirection,
-    ) -> IOResultOr<SeekResult> {
-        return_if_io!(self.lock_the_row_or_move_past_it(direction));
-        if matches!(self.current_pos, CursorPosition::Loaded { .. }) {
-            Ok(IOResult::Done(SeekResult::Found))
-        } else {
-            Ok(IOResult::Done(SeekResult::NotFound))
-        }
-    }
-
-    fn lock_the_row(&mut self) -> Result<RowLockResult> {
-        let Some(row_locks) = self.row_locks else {
-            return Ok(RowLockResult::Locked);
-        };
-        if self.get_null_flag() {
-            return Ok(RowLockResult::Locked);
-        }
-        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
-            return Ok(RowLockResult::Locked);
-        };
-        let row_id = row_id.clone();
-        let mut held = self
-            .db
-            .lock_row_for_read(self.tx_id, &row_id, row_locks.mode)?;
-        if held.is_none() && row_locks.mode == RowLockMode::Exclusive {
-            if let Some(table_row) = self.table_row_of_index_entry(&row_id, row_locks) {
-                held = self
-                    .db
-                    .lock_row_for_read(self.tx_id, &table_row, row_locks.mode)?;
-            }
-        }
-        match (held, row_locks.policy) {
-            (None, _) => Ok(RowLockResult::Locked),
-            (Some(_), RowLockWaitPolicy::SkipLocked) => Ok(RowLockResult::HeldByAnother),
-            (Some(holders), RowLockWaitPolicy::Wait | RowLockWaitPolicy::NoWait) => {
-                Err(LimboError::RowLocked(holders))
-            }
         }
     }
 

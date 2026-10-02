@@ -9,7 +9,7 @@ use crate::io::TempFile;
 use crate::mvcc::cursor::{CursorRowLocks, MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
     BootstrapState, CheckpointReadLockState, CheckpointStateMachine, LockingRead, MetadataLockMode,
-    MetadataLockRequest, RowLockMode, RowLockWaitPolicy, TxID,
+    MetadataLockRequest, RowLockLevel, RowLockMode, RowLockWaitPolicy, TxID,
 };
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
@@ -1397,7 +1397,8 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
-    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
+    let row_locks =
+        row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type, *cursor_id);
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -14517,7 +14518,8 @@ pub fn op_open_write(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
+    let row_locks =
+        row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type, *cursor_id);
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
         CursorType::BTreeIndex(index) => Some(index),
@@ -17083,7 +17085,13 @@ pub fn op_open_dup(
         .cursor_ref
         .get(*original_cursor_id)
         .expect("cursor_id should exist in cursor_ref");
-    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
+    let row_locks = row_locks_for_cursor(
+        program,
+        state,
+        mv_store.as_ref(),
+        cursor_type,
+        *new_cursor_id,
+    );
     match cursor_type {
         CursorType::BTreeTable(table) => {
             if !table.has_rowid && program.connection.get_mv_tx_id().is_some() {
@@ -17260,6 +17268,7 @@ fn row_locks_for_cursor(
     state: &ProgramState,
     mv_store: Option<&Arc<MvStore>>,
     cursor_type: &CursorType,
+    cursor_id: CursorID,
 ) -> Option<CursorRowLocks> {
     let mv_store = mv_store?;
     if !mv_store.row_locks_enabled() {
@@ -17273,6 +17282,8 @@ fn row_locks_for_cursor(
     if crate::schema::is_system_table(table_name) {
         return None;
     }
+    let level = program.connection.row_lock_level();
+    let writes_the_table = program_writes_table(program, table_name);
     let (mode, policy) = match &state.locking_read {
         Some(locking_read) => {
             let locked = locking_read
@@ -17284,29 +17295,121 @@ fn row_locks_for_cursor(
             }
             (locking_read.mode, locking_read.policy)
         }
-        None if program.change_cnt_on => {
-            let mode = if program_writes_table(program, table_name) {
-                RowLockMode::Exclusive
-            } else {
-                RowLockMode::Shared
-            };
-            (mode, RowLockWaitPolicy::Wait)
+        None if program.change_cnt_on && writes_the_table => {
+            (RowLockMode::Exclusive, RowLockWaitPolicy::Wait)
+        }
+        None if program.change_cnt_on && level == RowLockLevel::RepeatableRead => {
+            (RowLockMode::Shared, RowLockWaitPolicy::Wait)
         }
         None => return None,
     };
+    let schema = program.connection.schema.read();
+    let table = schema.get_btree_table(table_name);
     let table_of_index = match cursor_type {
-        CursorType::BTreeIndex(index) => program
-            .connection
-            .schema
-            .read()
-            .get_btree_table(&index.table_name)
+        CursorType::BTreeIndex(_) => table
+            .as_ref()
             .map(|table| mv_store.get_table_id_from_root_page(table.root_page)),
         _ => None,
+    };
+    let primary = match cursor_type {
+        CursorType::BTreeIndex(index) => table
+            .as_ref()
+            .is_some_and(|table| index_is_the_primary_key(index, table)),
+        _ => true,
+    };
+    let hooks = state.steps_with_row_locks;
+    let marked = |wanted: fn(&crate::vdbe::RowLockPoint, CursorID) -> bool| {
+        hooks
+            && program
+                .row_lock_points
+                .iter()
+                .any(|(_, point)| wanted(point, cursor_id))
+    };
+    let range_end_checked = marked(
+        |point, cursor_id| matches!(point, crate::vdbe::RowLockPoint::ChecksTheRangeEnd { cursor_id: checked, .. } if *checked == cursor_id),
+    );
+    let read_committed = level == RowLockLevel::ReadCommitted;
+    let releases_unmatched_rows = read_committed
+        && marked(
+            |point, cursor_id| matches!(point, crate::vdbe::RowLockPoint::RowsMatched { cursor_id: matched } if *matched == cursor_id),
+        );
+    let updates_the_table = program_updates_table(program, table_name);
+    let reads_past_held_rows = read_committed
+        && state.locking_read.is_none()
+        && writes_the_table
+        && updates_the_table
+        && primary
+        && !program_scans_a_secondary_index_of(program, table_name, &schema);
+    let duplicate_mode = if updates_the_table {
+        RowLockMode::Exclusive
+    } else {
+        RowLockMode::Shared
     };
     Some(CursorRowLocks {
         mode,
         policy,
         table_of_index,
+        level,
+        primary,
+        range_end_checked,
+        releases_unmatched_rows,
+        reads_past_held_rows,
+        duplicate_mode,
+    })
+}
+
+fn index_is_the_primary_key(
+    index: &crate::schema::Index,
+    table: &crate::schema::BTreeTable,
+) -> bool {
+    index.unique
+        && !table.primary_key_columns.is_empty()
+        && index.columns.len() == table.primary_key_columns.len()
+        && index
+            .columns
+            .iter()
+            .zip(&table.primary_key_columns)
+            .all(|(column, (name, _))| column.name.eq_ignore_ascii_case(name))
+}
+
+fn program_updates_table(program: &Program, table_name: &str) -> bool {
+    program.insns.iter().any(|(insn, _)| {
+        let Insn::Insert {
+            flag,
+            table_name: written,
+            ..
+        } = insn
+        else {
+            return false;
+        };
+        flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) && written.eq_ignore_ascii_case(table_name)
+    })
+}
+
+fn program_scans_a_secondary_index_of(
+    program: &Program,
+    table_name: &str,
+    schema: &Schema,
+) -> bool {
+    let Some(table) = schema.get_btree_table(table_name) else {
+        return false;
+    };
+    program.insns.iter().any(|(insn, _)| {
+        let scanned = match insn {
+            Insn::SeekGE { cursor_id, .. }
+            | Insn::SeekGT { cursor_id, .. }
+            | Insn::SeekLE { cursor_id, .. }
+            | Insn::SeekLT { cursor_id, .. }
+            | Insn::Rewind { cursor_id, .. }
+            | Insn::Last { cursor_id, .. } => *cursor_id,
+            _ => return false,
+        };
+        matches!(
+            &program.cursor_ref[scanned].1,
+            CursorType::BTreeIndex(index)
+                if index.table_name.eq_ignore_ascii_case(table_name)
+                    && !index_is_the_primary_key(index, &table)
+        )
     })
 }
 

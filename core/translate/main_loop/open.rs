@@ -5,6 +5,7 @@ use crate::translate::{
     plan::{self, SubqueryEvalPhase},
     subquery::{materialized_from_clause_subquery_storage, MaterializedFromClauseSubqueryStorage},
 };
+use crate::vdbe::RowLockPoint;
 
 fn emit_materialized_subquery_result_columns(
     program: &mut ProgramBuilder,
@@ -633,6 +634,9 @@ impl OpenLoop {
                 subqueries,
             )
             .emit()?;
+            for cursor_id in [table_cursor_id, index_cursor_id].into_iter().flatten() {
+                program.mark_row_lock_point(RowLockPoint::RowsMatched { cursor_id });
+            }
 
             // ANTI-JOIN: all conditions passed means a match was found.
             // Skip the outer row by jumping to the outer loop's Next.

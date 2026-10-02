@@ -42,7 +42,7 @@ impl TableRefIdCounter {
 
 use super::{
     affinity::Affinity, explain::ExplainInfo, BranchOffset, CursorID, Insn, InsnReference,
-    PrepareContext, PreparedProgram, Program,
+    PrepareContext, PreparedProgram, Program, RowLockPoint,
 };
 use crate::translate::eqp::{EqpCteMaterialization, EqpDetail};
 use crate::translate::plan::BitSet;
@@ -247,6 +247,7 @@ pub struct ProgramBuilder {
     explain: ExplainInfo,
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
+    row_lock_points: Vec<(BranchOffset, RowLockPoint)>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -716,6 +717,7 @@ impl ProgramBuilder {
             explain: ExplainInfo::default(),
             parameters: Parameters::new(),
             result_columns: Vec::new(),
+            row_lock_points: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -1558,6 +1560,29 @@ impl ProgramBuilder {
         BranchOffset::Offset(self.insns.len() as InsnReference)
     }
 
+    pub(crate) fn mark_row_lock_point(&mut self, point: RowLockPoint) {
+        let label = self.allocate_label();
+        self.preassign_label_to_next_insn(label);
+        self.row_lock_points.push((label, point));
+    }
+
+    fn resolved_row_lock_points(&self) -> Vec<(InsnReference, RowLockPoint)> {
+        let mut points: Vec<_> = self
+            .row_lock_points
+            .iter()
+            .map(|(label, point)| {
+                let BranchOffset::Label(label) = label else {
+                    unreachable!("a row lock point is marked with a label");
+                };
+                let anchor = self.label_to_resolved_offset[*label as usize]
+                    .expect("a row lock point label is assigned when it is marked");
+                (anchor + 1, *point)
+            })
+            .collect();
+        points.sort_by_key(|(pc, _)| *pc);
+        points
+    }
+
     pub fn allocate_label(&mut self) -> BranchOffset {
         let label_n = self.label_to_resolved_offset.len();
         self.label_to_resolved_offset.push(None);
@@ -2316,6 +2341,7 @@ impl ProgramBuilder {
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<PreparedProgram> {
+        let row_lock_points = self.resolved_row_lock_points();
         self.resolve_labels()?;
 
         // Fill in the is_index field on Next and Prev, now that we know all cursor types
@@ -2350,6 +2376,7 @@ impl ProgramBuilder {
             && self.may_abort();
 
         let prepared = PreparedProgram {
+            row_lock_points,
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,

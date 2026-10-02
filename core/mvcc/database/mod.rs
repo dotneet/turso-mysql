@@ -73,8 +73,8 @@ pub use metadata_locks::{MetadataLockMode, MetadataLockRequest};
 pub(crate) use metadata_locks::{MetadataLockWaitEnd, MetadataLocks};
 
 mod row_locks;
-pub use row_locks::{LockingRead, RowLockMode, RowLockWaitPolicy};
-pub(crate) use row_locks::{RowLockWaitEnd, RowLocks};
+pub(crate) use row_locks::{GapBetween, GapKey, RowLockAttempt, RowLockWaitEnd, RowLocks};
+pub use row_locks::{LockingRead, RowLockLevel, RowLockMode, RowLockWaitPolicy};
 
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
@@ -5483,6 +5483,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             Some(index_id) => {
                 if self.row_locks.enabled() {
                     self.refuse_an_index_key_another_transaction_holds(tx_id, &id)?;
+                    self.refuse_an_insert_into_a_locked_gap(tx_id, &id)?;
                 }
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
@@ -5514,6 +5515,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Conflicts are detected at commit time using end_ts comparison.
                 // This allows multiple transactions to insert the same rowid,
                 // with first-committer-wins semantics.
+                if self.row_locks.enabled() {
+                    self.refuse_an_insert_into_a_locked_gap(tx_id, &id)?;
+                }
 
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
@@ -5837,6 +5841,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 Ok(false)
             }
+        }
+    }
+
+    fn refuse_an_insert_into_a_locked_gap(&self, tx_id: TxID, id: &RowID) -> Result<()> {
+        if id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID || self.rewrites_a_row_it_deleted(tx_id, id) {
+            return Ok(());
+        }
+        let holders = self.row_locks.lock_insert(tx_id, id);
+        if holders.is_empty() {
+            return Ok(());
+        }
+        Err(LimboError::RowLocked(holders))
+    }
+
+    fn rewrites_a_row_it_deleted(&self, tx_id: TxID, id: &RowID) -> bool {
+        let deleted_by_it = |versions: &[RowVersion]| {
+            versions
+                .iter()
+                .any(|version| version.end() == Some(TxTimestampOrID::TxID(tx_id)))
+        };
+        match &id.row_id {
+            RowKey::Int(_) => self
+                .rows
+                .get(id)
+                .is_some_and(|versions| deleted_by_it(&versions.value().read())),
+            RowKey::Record(key) => self.index_rows.get(&id.table_id).is_some_and(|index| {
+                index
+                    .value()
+                    .get(key.as_ref())
+                    .is_some_and(|versions| deleted_by_it(&versions.value().read()))
+            }),
         }
     }
 
@@ -7122,7 +7157,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         id: &RowID,
         mode: RowLockMode,
-    ) -> Result<Option<Vec<TxID>>> {
+    ) -> Result<RowLockAttempt> {
         let tx = self
             .txs
             .get(&tx_id)
@@ -7139,11 +7174,80 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 })
             }),
         };
-        if changed_since_read || !holders.is_empty() {
-            return Ok(Some(holders));
+        if changed_since_read {
+            return Ok(RowLockAttempt::ChangedSinceRead);
         }
-        let holders = self.row_locks.lock(tx_id, id, mode);
-        Ok((!holders.is_empty()).then_some(holders))
+        if !holders.is_empty() {
+            return Ok(RowLockAttempt::HeldBy(holders));
+        }
+        Ok(match self.row_locks.lock(tx_id, id, mode) {
+            Ok(newly_held) => RowLockAttempt::Locked { newly_held },
+            Err(holders) => RowLockAttempt::HeldBy(holders),
+        })
+    }
+
+    pub(crate) fn unlock_row(&self, tx_id: TxID, id: &RowID) {
+        self.row_locks.unlock(tx_id, id);
+    }
+
+    pub(crate) fn lock_gap(
+        &self,
+        tx_id: TxID,
+        gap: GapBetween,
+        place: impl Fn(&RowKey) -> GapKey,
+        keeps_the_gap: bool,
+    ) -> Result<()> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let changed_since_read = self.rows_committed_after_the_read_between(tx.value(), &gap)?;
+        let holders = self.row_locks.lock_gap(tx_id, gap, place, keeps_the_gap);
+        if changed_since_read || !holders.is_empty() {
+            return Err(LimboError::RowLocked(holders));
+        }
+        Ok(())
+    }
+
+    fn rows_committed_after_the_read_between(
+        &self,
+        tx: &Transaction<A>,
+        gap: &GapBetween,
+    ) -> Result<bool> {
+        let below_the_high = |key: &RowKey| gap.high.as_ref().is_none_or(|high| key < high);
+        let mut ignored_writers = Vec::new();
+        if let Some(index) = self.index_rows.get(&gap.table_id) {
+            let start = match &gap.low {
+                Some(RowKey::Record(low)) => std::ops::Bound::Excluded(low.as_ref()),
+                Some(RowKey::Int(_)) => panic!("a gap in an index has an index key below it"),
+                None => std::ops::Bound::Unbounded,
+            };
+            for entry in index
+                .value()
+                .range::<SortableIndexKey, _>((start, std::ops::Bound::Unbounded))
+            {
+                if !below_the_high(&RowKey::Record(entry.key().clone())) {
+                    break;
+                }
+                if self.add_writers_of(tx, &entry.value().read(), &mut ignored_writers) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let start = match &gap.low {
+            Some(low) => std::ops::Bound::Excluded(RowID::new(gap.table_id, low.clone())),
+            None => std::ops::Bound::Included(RowID::new(gap.table_id, RowKey::Int(i64::MIN))),
+        };
+        for entry in self.rows.range((start, std::ops::Bound::Unbounded)) {
+            if entry.key().table_id != gap.table_id || !below_the_high(&entry.key().row_id) {
+                break;
+            }
+            if self.add_writers_of(tx, &entry.value().read(), &mut ignored_writers) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn start_row_lock_wait(&self, waiter: TxID, holders: &[TxID]) -> Option<TxID> {
@@ -7151,17 +7255,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .start_waiting(waiter, holders, |tx_id| self.deadlock_weight(tx_id))
     }
 
+    pub(crate) fn row_lock_releases_before_the_end(&self, holders: &[TxID]) -> u64 {
+        self.row_locks.releases_before_the_end(holders)
+    }
+
     pub(crate) fn wait_for_row_lock_holders(
         &self,
         waiter: Option<TxID>,
         holders: &[TxID],
+        releases_seen: u64,
         deadline: std::time::Instant,
         interrupted: impl Fn() -> bool,
     ) -> RowLockWaitEnd {
         self.row_locks.wait(
             waiter,
             deadline,
-            || holders.iter().any(|holder| self.txs.contains_key(holder)),
+            || {
+                holders.iter().any(|holder| self.txs.contains_key(holder))
+                    && self.row_locks.releases_before_the_end(holders) == releases_seen
+            },
             interrupted,
         )
     }

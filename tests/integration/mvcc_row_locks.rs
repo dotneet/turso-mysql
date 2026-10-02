@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::common::{ExecRows, TempDatabase};
 use turso_core::{
-    Connection, DatabaseOpts, LimboError, LockingRead, RowLockMode, RowLockWaitPolicy,
+    Connection, DatabaseOpts, LimboError, LockingRead, RowLockLevel, RowLockMode, RowLockWaitPolicy,
 };
 
 const LONG_ENOUGH_TO_SEE_A_WAIT: Duration = Duration::from_millis(300);
@@ -413,4 +413,486 @@ fn locked_balances(
         .into_iter()
         .map(|row| (row[0].as_int().unwrap(), row[1].as_int().unwrap()))
         .collect())
+}
+
+#[test]
+fn a_range_locking_read_keeps_inserts_out_of_the_gaps_it_read() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id > 15 AND id < 35",
+            RowLockMode::Exclusive
+        ),
+        [20, 30]
+    );
+
+    assert!(waits(&db, "INSERT INTO t VALUES (11, 0, 11, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (25, 0, 25, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (36, 0, 36, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (5, 0, 5, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (45, 0, 45, 0)"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 30"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+    reader.execute("COMMIT").unwrap();
+    assert!(!waits(&db, "INSERT INTO t VALUES (25, 0, 25, 0)"));
+}
+
+#[test]
+fn a_locking_read_of_one_unique_key_locks_only_its_row() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id = 20",
+            RowLockMode::Exclusive
+        ),
+        [20]
+    );
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE u = 30",
+            RowLockMode::Exclusive
+        ),
+        [30]
+    );
+    assert!(!waits(&db, "INSERT INTO t VALUES (19, 0, 19, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (21, 0, 21, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (22, 0, 31, 0)"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 20"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 30"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_locking_read_of_a_missing_key_locks_the_gap_it_would_be_in() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert!(locked_ids(
+        &reader,
+        "SELECT id FROM t WHERE id = 25",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    assert!(locked_ids(
+        &reader,
+        "SELECT id FROM t WHERE k = 30",
+        RowLockMode::Shared
+    )
+    .is_empty());
+    assert!(locked_ids(
+        &reader,
+        "SELECT id FROM t WHERE id = 50",
+        RowLockMode::Shared
+    )
+    .is_empty());
+
+    assert!(waits(&db, "INSERT INTO t VALUES (21, 0, 21, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (29, 0, 29, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (5, 35, 5, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (60, 0, 60, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (31, 0, 31, 0)"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 30"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn two_transactions_that_locked_one_gap_and_insert_into_it_deadlock() {
+    let db = database_with_gaps_to_lock();
+    let first = session(&db);
+    let second = session(&db);
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    assert!(locked_ids(
+        &first,
+        "SELECT id FROM t WHERE id = 25",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    assert!(locked_ids(
+        &second,
+        "SELECT id FROM t WHERE id = 26",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+
+    let waiting = run_in_the_background(first, "INSERT INTO t VALUES (25, 0, 25, 0)");
+    assert!(still_waits(&waiting));
+    let closing = second.execute("INSERT INTO t VALUES (26, 0, 26, 0)");
+    assert!(
+        matches!(closing, Err(LimboError::WriteWriteConflict)),
+        "{closing:?}"
+    );
+    let (first, result) = waiting.join().unwrap();
+    result.unwrap();
+    first.execute("COMMIT").unwrap();
+    let ids: Vec<(i64,)> = first.exec_rows("SELECT id FROM t WHERE id BETWEEN 21 AND 29");
+    assert_eq!(ids, [(25,)]);
+}
+
+#[test]
+fn a_full_scan_locks_the_gap_after_the_last_row() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(&reader, "SELECT id FROM t WHERE v = 2", RowLockMode::Shared),
+        [20]
+    );
+    assert!(waits(&db, "INSERT INTO t VALUES (100, 0, 100, 0)"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_secondary_index_scan_locks_its_gaps_and_the_rows_it_matched() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE k = 20 ORDER BY id",
+            RowLockMode::Exclusive
+        ),
+        [20, 30]
+    );
+    assert!(waits(&db, "INSERT INTO t VALUES (25, 20, 25, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (26, 15, 26, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (27, 35, 27, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (28, 45, 28, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (29, 5, 29, 0)"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 30"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_primary_key_index_scan_locks_gaps_the_way_a_rowid_scan_does() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM p WHERE id > 15 AND id < 35",
+            RowLockMode::Exclusive
+        ),
+        [20, 30]
+    );
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM p WHERE id = 70",
+            RowLockMode::Exclusive
+        ),
+        [70]
+    );
+    assert!(waits(&db, "INSERT INTO p VALUES (11, 0)"));
+    assert!(waits(&db, "INSERT INTO p VALUES (36, 0)"));
+    assert!(!waits(&db, "INSERT INTO p VALUES (45, 0)"));
+    assert!(!waits(&db, "INSERT INTO p VALUES (71, 0)"));
+    assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 40"));
+    assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 70"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_locking_read_waits_for_a_row_another_transaction_inserted_into_its_range() {
+    let db = database_with_gaps_to_lock();
+    let inserter = session(&db);
+    inserter.execute("BEGIN CONCURRENT").unwrap();
+    inserter
+        .execute("INSERT INTO t VALUES (25, 25, 25, 25)")
+        .unwrap();
+    for level in [RowLockLevel::RepeatableRead, RowLockLevel::ReadCommitted] {
+        assert!(locking_read_waits(
+            &db,
+            level,
+            "SELECT id FROM t WHERE id > 15 AND id < 35"
+        ));
+        assert!(locking_read_waits(
+            &db,
+            level,
+            "SELECT id FROM t WHERE id = 25"
+        ));
+        assert!(!locking_read_waits(
+            &db,
+            level,
+            "SELECT id FROM t WHERE id > 26"
+        ));
+    }
+    assert!(!locking_read_waits(
+        &db,
+        RowLockLevel::RepeatableRead,
+        "SELECT id FROM t WHERE id < 25"
+    ));
+    assert!(!waits(&db, "INSERT INTO t VALUES (22, 0, 22, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (99, 0, 25, 0)"));
+    inserter.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn read_committed_locks_no_gaps_and_lets_go_of_rows_that_did_not_match() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.set_row_lock_level(RowLockLevel::ReadCommitted);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id > 15 AND id < 35",
+            RowLockMode::Exclusive
+        ),
+        [20, 30]
+    );
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE v = 4",
+            RowLockMode::Exclusive
+        ),
+        [40]
+    );
+    assert!(!waits(&db, "INSERT INTO t VALUES (25, 0, 25, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (100, 0, 100, 0)"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 20"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_read_committed_update_skips_a_held_row_whose_committed_version_does_not_match() {
+    let db = database_with_gaps_to_lock();
+    let holder = session(&db);
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder.execute("UPDATE t SET v = 33 WHERE id = 30").unwrap();
+
+    let updater = session(&db);
+    updater.set_row_lock_level(RowLockLevel::ReadCommitted);
+    updater.set_busy_timeout(Duration::from_millis(200));
+    updater.execute("BEGIN CONCURRENT").unwrap();
+    updater.execute("UPDATE t SET v = 9 WHERE v = 2").unwrap();
+    updater
+        .execute("UPDATE t SET v = 9 WHERE id > 15 AND id < 35 AND v = 1")
+        .unwrap();
+    assert!(matches!(
+        updater.execute("UPDATE t SET v = 9 WHERE v = 3"),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        updater.execute("DELETE FROM t WHERE v = 1"),
+        Err(LimboError::Busy)
+    ));
+    updater.execute("COMMIT").unwrap();
+    holder.execute("COMMIT").unwrap();
+    let values: Vec<(i64, i64)> = holder.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(values, [(10, 1), (20, 9), (30, 33), (40, 4)]);
+}
+
+#[test]
+fn a_read_up_to_a_key_it_found_does_not_lock_the_gap_past_it() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id <= 20",
+            RowLockMode::Exclusive
+        ),
+        [10, 20]
+    );
+    assert!(!waits(&db, "INSERT INTO t VALUES (25, 0, 25, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (15, 0, 15, 0)"));
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM p WHERE id <= 25",
+            RowLockMode::Exclusive
+        ),
+        [10, 20]
+    );
+    assert!(waits(&db, "INSERT INTO p VALUES (26, 0)"));
+    assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 30"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_descending_read_locks_the_gap_above_where_it_started_and_below_where_it_stopped() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id >= 20 AND id < 40 ORDER BY id DESC",
+            RowLockMode::Exclusive
+        ),
+        [30, 20]
+    );
+    assert!(waits(&db, "INSERT INTO t VALUES (35, 0, 35, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (15, 0, 15, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (5, 0, 5, 0)"));
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (45, 0, 45, 0)"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn an_insert_that_finds_a_duplicate_key_locks_the_row_it_found_even_under_read_committed() {
+    let db = database_with_gaps_to_lock();
+    let inserter = session(&db);
+    inserter.set_row_lock_level(RowLockLevel::ReadCommitted);
+    inserter.execute("BEGIN CONCURRENT").unwrap();
+    for duplicate in [
+        "INSERT INTO t VALUES (10, 0, 99, 0)",
+        "INSERT INTO t VALUES (99, 0, 30, 0)",
+        "INSERT INTO p VALUES (20, 0)",
+    ] {
+        let result = inserter.execute(duplicate);
+        assert!(
+            matches!(result, Err(LimboError::Constraint(_))),
+            "{duplicate}: {result:?}"
+        );
+    }
+    assert!(!inserter.get_auto_commit());
+
+    assert!(waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (5, 0, 5, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (98, 0, 25, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (97, 0, 35, 0)"));
+    assert!(waits(&db, "DELETE FROM t WHERE id = 30"));
+    assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 20"));
+    assert!(!waits(&db, "INSERT INTO p VALUES (15, 0)"));
+    assert!(!waits(&db, "INSERT INTO p VALUES (25, 0)"));
+    inserter.execute("COMMIT").unwrap();
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+}
+
+#[test]
+fn a_read_from_a_primary_key_it_found_locks_no_gap_below_it() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id >= 20 AND id < 30",
+            RowLockMode::Exclusive
+        ),
+        [20]
+    );
+    assert!(!waits(&db, "INSERT INTO t VALUES (15, 0, 15, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (25, 0, 25, 0)"));
+    assert_eq!(
+        locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id >= 15 AND id < 20",
+            RowLockMode::Exclusive
+        ),
+        Vec::<i64>::new()
+    );
+    assert!(waits(&db, "INSERT INTO t VALUES (15, 0, 15, 0)"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_read_committed_update_through_a_secondary_index_waits_for_a_held_row() {
+    let db = database_with_gaps_to_lock();
+    let holder = session(&db);
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    holder.execute("UPDATE t SET v = 33 WHERE id = 30").unwrap();
+
+    let updater = session(&db);
+    updater.set_row_lock_level(RowLockLevel::ReadCommitted);
+    updater.set_busy_timeout(Duration::from_millis(200));
+    updater.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        updater.execute("UPDATE t SET v = 9 WHERE k = 20 AND v = 2"),
+        Err(LimboError::Busy)
+    ));
+    updater.execute("ROLLBACK").unwrap();
+    holder.execute("ROLLBACK").unwrap();
+}
+
+fn database_with_gaps_to_lock() -> TempDatabase {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INT, u INT, v INT)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t (k)").unwrap();
+    conn.execute("CREATE UNIQUE INDEX t_u ON t (u)").unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (10, 10, 10, 1), (20, 20, 20, 2), (30, 20, 30, 3), (40, 40, 40, 4)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute("INSERT INTO p VALUES (10, 1), (20, 2), (30, 3), (40, 4), (70, 7)")
+        .unwrap();
+    db
+}
+
+fn locked_ids(conn: &Arc<Connection>, sql: &str, mode: RowLockMode) -> Vec<i64> {
+    let mut statement = conn.prepare(sql).unwrap();
+    let table = if sql.contains(" FROM p") { "p" } else { "t" };
+    statement.lock_rows_it_reads(LockingRead {
+        mode,
+        policy: RowLockWaitPolicy::Wait,
+        tables: vec![table.to_string()],
+    });
+    statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect()
+}
+
+fn waits(db: &TempDatabase, sql: &str) -> bool {
+    let probe = db.connect_limbo();
+    probe.set_busy_timeout(Duration::from_millis(200));
+    probe.execute("BEGIN CONCURRENT").unwrap();
+    let result = probe.execute(sql);
+    probe.execute("ROLLBACK").unwrap();
+    match result {
+        Ok(()) => false,
+        Err(LimboError::Busy) => true,
+        Err(err) => panic!("{sql}: {err:?}"),
+    }
+}
+
+fn locking_read_waits(db: &TempDatabase, level: RowLockLevel, sql: &str) -> bool {
+    let probe = db.connect_limbo();
+    probe.set_busy_timeout(Duration::from_millis(200));
+    probe.set_row_lock_level(level);
+    probe.execute("BEGIN CONCURRENT").unwrap();
+    let mut statement = probe.prepare(sql).unwrap();
+    statement.lock_rows_it_reads(LockingRead {
+        mode: RowLockMode::Exclusive,
+        policy: RowLockWaitPolicy::Wait,
+        tables: vec!["t".to_string()],
+    });
+    let result = statement.run_collect_rows();
+    drop(statement);
+    probe.execute("ROLLBACK").unwrap();
+    match result {
+        Ok(_) => false,
+        Err(LimboError::Busy) => true,
+        Err(err) => panic!("{sql}: {err:?}"),
+    }
 }
