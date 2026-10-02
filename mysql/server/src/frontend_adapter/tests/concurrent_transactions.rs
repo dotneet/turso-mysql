@@ -1584,6 +1584,47 @@ fn an_upsert_refused_with_1452_keeps_the_gaps_of_the_entries_it_moved_before_the
 }
 
 #[test]
+fn an_update_ignore_skip_keeps_the_gaps_of_the_entries_it_would_have_moved() {
+    for (level, keeps_the_gaps) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        let Ok(CommandExecutionResult::Ok(skipped)) = one.execute_query(
+            "UPDATE IGNORE keyed_children SET a = 26, parent_id = 99, b = 260 WHERE id = 2",
+        ) else {
+            panic!("{level}: UPDATE IGNORE must skip the row");
+        };
+        assert_eq!((skipped.affected_rows, skipped.warnings), (0, 1), "{level}");
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        let inserted = two
+            .execute_query(
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (20, 27, 10, 400)",
+            )
+            .map(|_| ());
+        if keeps_the_gaps {
+            assert_eq!(inserted, Err(FrontendErrorKind::DatabaseBusy), "{level}");
+        } else {
+            assert_eq!(inserted, Ok(()), "{level}");
+        }
+        run(
+            &mut two,
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 40, 10, 255)",
+        );
+        run(&mut one, "ROLLBACK");
+    }
+}
+
+#[test]
 fn a_counted_child_insert_ignore_skips_keeps_the_end_of_the_table_only_under_repeatable_read() {
     for (level, keeps_the_gap) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
         let Some(TwoSessions {

@@ -9,8 +9,10 @@ use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
 use turso_core::{
-    CheckpointMode, Connection, LimboError, Numeric, RefusedRow, Row, Statement, Value,
+    CheckpointMode, Connection, LimboError, Numeric, PrepareOptions, RefusedRow, Row, Statement,
+    Value,
 };
+use turso_parser::{ast::Cmd, parser::Parser};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -2163,5 +2165,61 @@ fn assert_foreign_keys_checked_row_by_row_note_each_refused_row(
             "{sql}"
         );
     }
+    Ok(())
+}
+
+#[turso_macros::test]
+fn rows_a_foreign_key_refuses_are_skipped_under_update_or_ignore_and_a_skipping_delete(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_rows_a_foreign_key_refuses_are_skipped(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn rows_a_foreign_key_refuses_are_skipped_under_update_or_ignore_and_a_skipping_delete_under_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_rows_a_foreign_key_refuses_are_skipped(&tmp_db.connect_limbo())
+}
+
+fn assert_rows_a_foreign_key_refuses_are_skipped(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.set_foreign_keys_checked_row_by_row(true);
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id))")?;
+    conn.execute("CREATE INDEX c_pid ON c (pid)")?;
+    conn.execute("INSERT INTO p VALUES (1), (2), (3)")?;
+    conn.execute("INSERT INTO c VALUES (1, 1), (2, 1), (3, 2)")?;
+
+    conn.execute("UPDATE OR IGNORE c SET pid = CASE WHEN id = 2 THEN 9 ELSE 3 END")?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, pid FROM c ORDER BY id");
+    assert_eq!(rows, [(1, 3), (2, 1), (3, 3)]);
+    assert_eq!(conn.take_foreign_key_refusals().len(), 1);
+
+    let skipping_delete = |sql: &str| -> anyhow::Result<()> {
+        let Some(Cmd::Stmt(stmt)) = Parser::new(sql.as_bytes()).next_cmd()? else {
+            panic!("{sql} is one statement");
+        };
+        conn.prepare_translated_stmt_with_options(
+            stmt,
+            sql,
+            &PrepareOptions::default().with_rows_foreign_keys_refuse_skipped(true),
+        )?
+        .run_ignore_rows()?;
+        Ok(())
+    };
+    skipping_delete("DELETE FROM p")?;
+    let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM p ORDER BY id");
+    assert_eq!(ids, [(1,), (3,)]);
+    let refused = conn.take_foreign_key_refusals();
+    assert_eq!(refused.len(), 2);
+    assert!(refused
+        .iter()
+        .all(|refusal| refusal.refused_row == RefusedRow::ParentRowWithChildren));
+
+    assert!(matches!(
+        conn.execute("DELETE FROM p"),
+        Err(LimboError::ForeignKeyConstraint(_))
+    ));
     Ok(())
 }

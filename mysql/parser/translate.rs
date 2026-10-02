@@ -5077,13 +5077,24 @@ pub(crate) fn translate_update(
     update: &Update,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, Vec<MySqlSelectSource>, CheckedUpdate), ParseError> {
+    let ignores = match update.or {
+        None => false,
+        Some(sqlparser::ast::SqliteOnConflict::Ignore) => true,
+        Some(_) => return unsupported("UPDATE option"),
+    };
     if !update.optimizer_hints.is_empty()
         || update.from.is_some()
         || update.returning.is_some()
         || update.output.is_some()
-        || update.or.is_some()
     {
         return unsupported("UPDATE option");
+    }
+    if ignores
+        && update.assignments.iter().any(|assignment| {
+            matches!(&assignment.value, Expr::Value(value) if matches!(value.value, Value::Null))
+        })
+    {
+        return unsupported("UPDATE IGNORE writing NULL");
     }
     // MySQL updates the rows a join finds, naming the table to change through
     // the columns the SET names.
@@ -5094,9 +5105,17 @@ pub(crate) fn translate_update(
         if !render_context.rewritten_on_update.is_empty() {
             return unsupported("joined UPDATE on a table with an ON UPDATE column");
         }
+        if ignores {
+            return unsupported("joined UPDATE IGNORE");
+        }
         return translate_joined_update(update, render_context);
     }
     let checked = checked_update(update)?;
+    let verb = if ignores {
+        "UPDATE OR IGNORE"
+    } else {
+        "UPDATE"
+    };
     let table = render_update_table(&update.table.relation)?;
     if update.assignments.is_empty() {
         return unsupported("UPDATE without assignments");
@@ -5175,14 +5194,14 @@ pub(crate) fn translate_update(
         };
         Ok((
             format!(
-                "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
+                "{verb} {table} SET {} WHERE _rowid_ IN (SELECT _rowid_ FROM {table}{sub_where} ORDER BY {order_by_sql}{limit_sql})",
                 assignments.join(", ")
             ),
             dml_subquery_tables(checked.table_name(), render_context)?,
             checked,
         ))
     } else {
-        let mut normalized = format!("UPDATE {table} SET {}", assignments.join(", "));
+        let mut normalized = format!("{verb} {table} SET {}", assignments.join(", "));
         if let Some(selection) = &update.selection {
             normalized.push_str(" WHERE ");
             normalized.push_str(&render_dml_predicate(selection, render_context)?);

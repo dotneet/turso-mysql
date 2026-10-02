@@ -3005,7 +3005,17 @@ measured on 8.4.11 and matched after a column is added to the table it copies fr
 instead of failing the statement — the engine's own `OR IGNORE`. Measured on
 8.4.11 over a table already holding row 1: inserting row 1 again leaves the
 stored row alone and counts 0, and a two-row statement where only the second is
-new counts 1. The engine answers the same for both.
+new counts 1. The engine answers the same for both. MySQL also raises warning
+1062, ``Duplicate entry '1' for key 't.PRIMARY'``, for each row it skips that
+way, and none is raised here; a row skipped for a foreign key does raise its
+warning (see below).
+
+`UPDATE IGNORE` is taken the same way, as the engine's `UPDATE OR IGNORE`:
+measured on 8.4.11 and matched, a row whose new key collides is left as it
+stood and the rows after it are updated — `SET u = u + 1` over 1, 2, 3 leaves
+1, 2, 4 — and so is one a foreign key refuses (see below). It is refused over
+a join, and a `NULL` written with it is refused as `INSERT IGNORE`'s is.
+`DELETE IGNORE` is taken as well; a foreign key is what it ignores.
 
 What MySQL's IGNORE also does is coerce a value it would otherwise refuse, and
 that is not done here. Measured: `INSERT IGNORE` of 99999999999999 into an `INT`
@@ -6084,6 +6094,15 @@ MVCC under `REPEATABLE READ` a skipped row keeps the gaps a refused row keeps,
 until the transaction ends. A row written later in the same statement into one
 of those gaps leaves it locked on both sides of the new row, as InnoDB's gap
 splits around it.
+
+`UPDATE IGNORE` and `DELETE IGNORE` are taken too, prepared or not, and skip
+in the same way a child row naming no parent (1452) and a parent row a child
+still names (1451), each with its warning, going on with the rows after it.
+Measured on 8.4.11 and matched: a skipped row is matched and not changed, so
+it counts nothing in the affected rows; an `UPDATE IGNORE` skip keeps the gaps
+a refused `UPDATE` keeps; and a `DELETE IGNORE` skip keeps the lock its check
+took on the child. `UPDATE OR IGNORE`, which is the engine's spelling and not
+MySQL's, answers 1064 as MySQL does.
 
 Some differences remain. A secondary key's entry here ends with the rowid, not
 with the primary key, so an `UPDATE` that changes a primary key that is not

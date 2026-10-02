@@ -2155,6 +2155,9 @@ fn emit_update_insns<'a>(
     // handling: table scans see OLD values, while the NEW parent/child keys
     // live in registers until the rewrite.
     let mut deferred_new_key_plans = Vec::new();
+    if program.checks_foreign_keys_row_by_row && or_conflict == ResolveType::Ignore {
+        program.skip_a_row_a_foreign_key_refuses = Some(skip_row_label);
+    }
     if connection.foreign_keys_enabled() {
         let rowid_new_reg = effective_rowid_reg;
         if let Some(table_btree) = target_table.table.btree() {
@@ -2252,6 +2255,8 @@ fn emit_update_insns<'a>(
             }
         }
     }
+
+    program.skip_a_row_a_foreign_key_refuses = None;
 
     // ---- Phase 2: Delete old index entries ----
     // All constraint checks passed. Now safe to mutate indexes.

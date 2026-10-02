@@ -497,3 +497,92 @@ fn the_key_a_foreign_key_asks_for_is_made_where_its_clause_stands() {
         );
     }
 }
+
+fn parent_warning(constraint: &str) -> (String, String) {
+    (
+        "1451".to_owned(),
+        format!("{PARENT_ROW_WITH_CHILDREN} ({constraint})"),
+    )
+}
+
+#[test]
+fn update_ignore_and_delete_ignore_skip_the_rows_a_foreign_key_refuses() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT PRIMARY KEY)",
+        "CREATE TABLE c (id INT AUTO_INCREMENT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES p (id))",
+        "INSERT INTO p VALUES (1), (2)",
+        "INSERT INTO c (pid) VALUES (1), (1), (2), (2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        written(&mut adapter, "UPDATE IGNORE c SET pid = 9"),
+        (0, 0, 4)
+    );
+    assert_eq!(warnings(&mut adapter), vec![child_warning(C_IBFK_1); 4]);
+    assert_eq!(
+        written(
+            &mut adapter,
+            "UPDATE IGNORE c SET pid = CASE WHEN id = 2 THEN 9 ELSE 2 END"
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(warnings(&mut adapter), [child_warning(C_IBFK_1)]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, pid FROM c ORDER BY id"),
+        [["1", "2"], ["2", "1"], ["3", "2"], ["4", "2"]]
+    );
+
+    assert_eq!(
+        written(&mut adapter, "DELETE IGNORE FROM p WHERE id = 1"),
+        (0, 0, 1)
+    );
+    assert_eq!(warnings(&mut adapter), [parent_warning(C_IBFK_1)]);
+    assert_eq!(
+        written(&mut adapter, "UPDATE IGNORE p SET id = id + 10"),
+        (0, 0, 2)
+    );
+    assert_eq!(warnings(&mut adapter), vec![parent_warning(C_IBFK_1); 2]);
+    run(&mut adapter, "DELETE FROM c WHERE id = 2");
+    let statement = adapter
+        .execute_stmt_prepare("DELETE IGNORE FROM p WHERE id > ?")
+        .unwrap();
+    let Ok(PreparedStatementExecutionResult::Ok(deleted)) =
+        adapter.execute_stmt_execute(statement.statement_id, &integers(&[0]))
+    else {
+        panic!("the prepared DELETE IGNORE must skip the refused row");
+    };
+    assert_eq!((deleted.affected_rows, deleted.warnings), (1, 1));
+    assert_eq!(warnings(&mut adapter), [parent_warning(C_IBFK_1)]);
+    assert_eq!(rows(&mut adapter, "SELECT id FROM p"), [["2"]]);
+
+    assert_eq!(
+        refused(&mut adapter, "DELETE FROM p").0,
+        FrontendErrorKind::ParentRowReferenced
+    );
+    assert_eq!(
+        refused(&mut adapter, "UPDATE OR IGNORE c SET pid = 1").0,
+        FrontendErrorKind::Syntax
+    );
+}
+
+#[test]
+fn update_ignore_skips_a_row_whose_key_collides() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE t (id INT PRIMARY KEY, u INT, UNIQUE KEY (u))",
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(written(&mut adapter, "UPDATE IGNORE t SET u = u + 1").0, 1);
+    assert_eq!(
+        written(&mut adapter, "UPDATE IGNORE t SET id = id + 1").0,
+        1
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, u FROM t ORDER BY id"),
+        [["1", "1"], ["2", "2"], ["4", "4"]]
+    );
+}

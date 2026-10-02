@@ -250,6 +250,8 @@ pub struct ProgramBuilder {
     row_lock_points: Vec<(BranchOffset, RowLockPoint)>,
     pub(crate) changes_rows_for_a_foreign_key: bool,
     pub(crate) checks_foreign_keys_row_by_row: bool,
+    pub(crate) skips_rows_foreign_keys_refuse: bool,
+    pub(crate) skip_a_row_a_foreign_key_refuses: Option<BranchOffset>,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -722,6 +724,8 @@ impl ProgramBuilder {
             row_lock_points: Vec::new(),
             changes_rows_for_a_foreign_key: false,
             checks_foreign_keys_row_by_row: false,
+            skips_rows_foreign_keys_refuse: false,
+            skip_a_row_a_foreign_key_refuses: None,
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,

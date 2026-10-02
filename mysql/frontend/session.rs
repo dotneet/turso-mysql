@@ -2905,7 +2905,11 @@ impl MySqlConnection {
         if translated.copies_a_select_rendered_knowing_its_types() {
             frozen.typed_copy = Some(statement.clone());
         }
-        let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(frozen))
+            .with_rows_foreign_keys_refuse_skipped(turso_mysql_parser::deletes_ignoring_errors(
+                sql, mode,
+            ));
         let statement = self
             .inner
             .prepare_translated_stmt_with_options(statement, sql, &options)
@@ -7812,7 +7816,11 @@ impl MySqlConnection {
                 if shifted {
                     frozen.shifted_timestamp_insert = Some(stmt.clone());
                 }
-                let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
+                let options = PrepareOptions::default()
+                    .with_reprepare_parser(Arc::new(frozen))
+                    .with_rows_foreign_keys_refuse_skipped(
+                        turso_mysql_parser::deletes_ignoring_errors(sql, mode),
+                    );
                 self.inner
                     .prepare_translated_stmt_with_options(stmt, sql, &options)
             }
@@ -10094,7 +10102,11 @@ impl MySqlConnection {
         if translated.copies_a_select_rendered_knowing_its_types() {
             frozen.typed_copy = Some(statement.clone());
         }
-        let mut options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
+        let mut options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(frozen))
+            .with_rows_foreign_keys_refuse_skipped(turso_mysql_parser::deletes_ignoring_errors(
+                sql, mode,
+            ));
         if let Some(table) = counted {
             options =
                 options.with_assignment_validator(Arc::new(CountedTableAssignmentValidator {

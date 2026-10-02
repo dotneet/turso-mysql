@@ -258,6 +258,7 @@ pub struct PrepareOptions {
     pub(crate) reprepare_parser: Option<Arc<dyn ReprepareParser>>,
     pub(crate) schema_sql_formatter: Option<Arc<dyn crate::SchemaSqlFormatter>>,
     pub(crate) assignment_validator: Option<Arc<dyn AssignmentValidator>>,
+    pub(crate) skips_rows_foreign_keys_refuse: bool,
 }
 
 impl PrepareOptions {
@@ -288,6 +289,11 @@ impl PrepareOptions {
         assignment_validator: Arc<dyn AssignmentValidator>,
     ) -> Self {
         self.assignment_validator = Some(assignment_validator);
+        self
+    }
+
+    pub fn with_rows_foreign_keys_refuse_skipped(mut self, skipped: bool) -> Self {
+        self.skips_rows_foreign_keys_refuse = skipped;
         self
     }
 

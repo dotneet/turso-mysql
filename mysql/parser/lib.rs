@@ -6513,7 +6513,7 @@ fn read_one_statement(
         let tokens = statement_reads::tokens_with_location(&dialect, sql)
             .map_err(|error| ParseError::Sqlparser(ParserError::from(error).to_string()))?;
         let tokens = count_a_column_in_parentheses_as_the_column(
-            spell_lock_in_share_mode_as_for_share(tokens),
+            spell_lock_in_share_mode_as_for_share(read_ignore_after_update_or_delete(tokens)),
         );
         let mut statements = Parser::new(&dialect)
             .with_tokens_with_locations(tokens)
@@ -6525,6 +6525,60 @@ fn read_one_statement(
             _ => Err(ParseError::ExpectedOneStatement { actual }),
         }
     })
+}
+
+fn read_ignore_after_update_or_delete(mut tokens: Vec<TokenWithSpan>) -> Vec<TokenWithSpan> {
+    let words = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, token)| !matches!(token.token, Token::Whitespace(_)))
+        .map(|(at, _)| at)
+        .collect::<Vec<_>>();
+    let [verb, next, ..] = words.as_slice() else {
+        return tokens;
+    };
+    let (verb, next) = (*verb, *next);
+    if is_unquoted_word(&tokens[verb].token, "UPDATE") {
+        if is_unquoted_word(&tokens[next].token, "IGNORE") {
+            let span = tokens[next].span;
+            tokens.insert(
+                next,
+                TokenWithSpan {
+                    token: Token::Whitespace(Whitespace::Space),
+                    span,
+                },
+            );
+            tokens.insert(
+                next,
+                TokenWithSpan {
+                    token: Token::make_keyword("OR"),
+                    span,
+                },
+            );
+        } else if is_unquoted_word(&tokens[next].token, "OR") {
+            tokens[next].token = Token::Comma;
+        }
+    } else if is_unquoted_word(&tokens[verb].token, "DELETE")
+        && is_unquoted_word(&tokens[next].token, "IGNORE")
+    {
+        tokens[next].token = Token::Whitespace(Whitespace::Space);
+    }
+    tokens
+}
+
+pub fn deletes_ignoring_errors(sql: &str, mode: SessionSqlMode) -> bool {
+    let dialect = SessionMySqlDialect::new(mode);
+    let Ok(tokens) = statement_reads::tokens_with_location(&dialect, sql) else {
+        return false;
+    };
+    let mut words = tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Whitespace(_)));
+    matches!(
+        (words.next(), words.next()),
+        (Some(verb), Some(next))
+            if is_unquoted_word(&verb.token, "DELETE") && is_unquoted_word(&next.token, "IGNORE")
+    )
 }
 
 /// `LOCK IN SHARE MODE` is MySQL's older spelling of `FOR SHARE`, and

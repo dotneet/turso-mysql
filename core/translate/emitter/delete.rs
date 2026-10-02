@@ -554,6 +554,12 @@ fn emit_delete_insns<'a>(
         None
     };
 
+    let next_row = t_ctx
+        .labels_main_loop
+        .first()
+        .expect("loop labels to exist")
+        .next;
+    skip_the_rows_foreign_keys_refuse_to(program, next_row);
     emit_delete_row_common(
         connection,
         program,
@@ -570,6 +576,7 @@ fn emit_delete_insns<'a>(
         resolver,
         returning_buffer,
     )?;
+    program.skip_a_row_a_foreign_key_refuses = None;
 
     // Delete from the iteration index after deleting from the main table,
     // using the key values captured above.
@@ -958,6 +965,7 @@ fn emit_delete_insns_when_triggers_present(
         target_pc: skip_not_found_label,
     });
 
+    skip_the_rows_foreign_keys_refuse_to(program, skip_not_found_label);
     emit_delete_row_common(
         connection,
         program,
@@ -974,6 +982,7 @@ fn emit_delete_insns_when_triggers_present(
         resolver,
         returning_buffer,
     )?;
+    program.skip_a_row_a_foreign_key_refuses = None;
 
     // Fire AFTER DELETE triggers
     if let Some(btree_table) = unsafe { &*table_reference }.btree() {
@@ -1018,4 +1027,13 @@ fn emit_delete_insns_when_triggers_present(
     program.preassign_label_to_next_insn(skip_not_found_label);
 
     Ok(())
+}
+
+fn skip_the_rows_foreign_keys_refuse_to(
+    program: &mut ProgramBuilder,
+    next_row: crate::vdbe::BranchOffset,
+) {
+    if program.checks_foreign_keys_row_by_row && program.skips_rows_foreign_keys_refuse {
+        program.skip_a_row_a_foreign_key_refuses = Some(next_row);
+    }
 }

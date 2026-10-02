@@ -112,6 +112,7 @@ pub fn translate(
     program.set_mvcc_enabled(connection.mvcc_enabled());
     program.set_schema_sql_formatter(prepare_options.schema_sql_formatter.clone());
     program.set_prepared_with_assignment_validator(prepare_options.assignment_validator.is_some());
+    program.skips_rows_foreign_keys_refuse = prepare_options.skips_rows_foreign_keys_refuse;
 
     program.prologue();
     let mut resolver = Resolver::new(

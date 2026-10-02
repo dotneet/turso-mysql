@@ -5650,7 +5650,6 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
         "DELETE FROM numbers RETURNING id",
         "DELETE LOW_PRIORITY FROM numbers",
         "DELETE QUICK FROM numbers",
-        "DELETE IGNORE FROM numbers",
         "DELETE /*+ NO_INDEX(numbers) */ FROM numbers",
     ] {
         assert!(parse_dml(sql, SessionSqlMode::default()).is_err(), "{sql}");
@@ -6612,6 +6611,47 @@ fn an_insert_select_takes_the_select_the_frontend_rendered_knowing_its_types() {
         insert_select_source_sql("INSERT INTO dst SELECT n FROM src", mode).unwrap(),
         None
     );
+}
+
+#[test]
+fn translates_update_ignore_and_delete_ignore() {
+    let mode = SessionSqlMode::default();
+    for (sql, normalized) in [
+        (
+            "UPDATE IGNORE users SET name = 'a' WHERE id = 1",
+            "UPDATE OR IGNORE \"users\" SET \"name\" = 'a' WHERE (\"id\" = 1)",
+        ),
+        (
+            "update /* x */ ignore users set name = 'a'",
+            "UPDATE OR IGNORE \"users\" SET \"name\" = 'a'",
+        ),
+        (
+            "DELETE IGNORE FROM users WHERE id = 1",
+            "DELETE FROM \"users\" WHERE (\"id\" = 1)",
+        ),
+    ] {
+        let translated = parse_dml(sql, mode).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    assert!(deletes_ignoring_errors("DELETE IGNORE FROM users", mode));
+    assert!(deletes_ignoring_errors(
+        "delete /* x */ ignore from users",
+        mode
+    ));
+    assert!(!deletes_ignoring_errors("DELETE FROM users", mode));
+    assert!(!deletes_ignoring_errors(
+        "UPDATE IGNORE users SET name = 'a'",
+        mode
+    ));
+    assert!(matches!(
+        parse_dml("UPDATE OR IGNORE users SET name = 'a'", mode),
+        Err(ParseError::Sqlparser(_))
+    ));
+    assert!(matches!(
+        parse_dml("UPDATE IGNORE users SET name = NULL", mode),
+        Err(ParseError::Unsupported { .. })
+    ));
 }
 
 #[test]

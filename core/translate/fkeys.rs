@@ -1407,6 +1407,13 @@ fn emit_fk_child_violation(
             &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
         )?;
         emit_foreign_key_refused(program, fk_ref, RefusedRow::ChildRowWithoutParent);
+        if let Some(next_row) = program.skip_a_row_a_foreign_key_refuses {
+            program.emit_insn(Insn::KeepTheGapsOfRefusedWrites);
+            program.emit_insn(Insn::Goto {
+                target_pc: next_row,
+            });
+            return Ok(());
+        }
     }
     emit_fk_violation(program, &fk_ref.fk)
 }
@@ -1682,6 +1689,12 @@ fn emit_fk_parent_violation(
     let fk = &fk_ref.fk;
     if program.checks_foreign_keys_row_by_row && !fk.deferred {
         emit_foreign_key_refused(program, fk_ref, RefusedRow::ParentRowWithChildren);
+        if let Some(next_row) = program.skip_a_row_a_foreign_key_refuses {
+            program.emit_insn(Insn::Goto {
+                target_pc: next_row,
+            });
+            return Ok(());
+        }
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
             description: FOREIGN_KEY_PARENT_ROW_REFERENCED.to_string(),
