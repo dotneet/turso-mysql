@@ -422,3 +422,45 @@ fn a_write_that_waited_behind_an_alter_writes_on_the_new_definition() {
         ]
     );
 }
+
+#[test]
+fn a_wait_cycle_through_a_row_lock_and_a_metadata_lock_times_out_with_1205_instead_of_1213() {
+    let Some(Sessions {
+        _directory,
+        mut one,
+        mut two,
+        three,
+    }) = sessions()
+    else {
+        return;
+    };
+    run(&mut one, "SET SESSION lock_wait_timeout = 1");
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE t SET v = 10 WHERE id = 1");
+    run(&mut two, "BEGIN");
+    assert_eq!(count(&mut two, "u").unwrap(), "2");
+    let altering = in_the_background(three, "ALTER TABLE u ADD COLUMN c INT");
+    assert!(still_waiting(&altering));
+    let updating = in_the_background(two, "UPDATE t SET v = 20 WHERE id = 1");
+    assert!(still_waiting(&updating));
+
+    let started = std::time::Instant::now();
+    assert_eq!(count(&mut one, "u"), Err(FrontendErrorKind::DatabaseBusy));
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    assert!(in_transaction(&one));
+    assert!(!updating.is_finished());
+    run(&mut one, "COMMIT");
+
+    let (mut two, updated) = updating.join().unwrap();
+    assert_eq!(updated, Ok(()));
+    assert!(still_waiting(&altering));
+    run(&mut two, "COMMIT");
+    let (_three, altered) = altering.join().unwrap();
+    assert_eq!(altered, Ok(()));
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        one.execute_query("SELECT v FROM t WHERE id = 1")
+    else {
+        panic!("the row must read back");
+    };
+    assert_eq!(result.rows, [[Some(b"20".to_vec())]]);
+}

@@ -3842,7 +3842,14 @@ new `LOCK TABLES ... READ`, as MySQL's waiting requests do. A wait lasts `lock_w
 out, undoing that statement alone: the transaction and what it wrote stay. A transaction that
 read a table and then asks to write it while a definition change waits for that table ends in
 1213 and is rolled back, the definition change going ahead, as MySQL chooses a DML waiter
-over a DDL one. A statement that waited for a definition change runs on the new definition.
+over a DDL one: in a cycle of metadata lock waits the one given up is the waiter MySQL weighs
+least — a statement that reads or writes a table weighs less than a definition change or a
+`LOCK TABLES` — and between
+equals the one whose wait closed the cycle, however many rows each wrote. A cycle of waits
+that runs through both a metadata lock and a row lock is no deadlock, since MySQL's two
+detectors each see only their half: the metadata lock waiter answers 1205 once
+`lock_wait_timeout` runs out and the transaction stays, and the row lock waiter waits on for
+`innodb_lock_wait_timeout`. A statement that waited for a definition change runs on the new definition.
 A transaction that took its read view before another session changed a table's definition
 answers 1412, `Table definition has changed, please retry transaction`, when it reads that
 table, and keeps going; one that has not taken its read view yet, or reads at `READ
@@ -3851,10 +3858,7 @@ its locks in a transaction of its own until `UNLOCK TABLES`, so the statements i
 still commit together there, and `START TRANSACTION`, `COMMIT` and `ROLLBACK` stay refused
 while tables are locked.
 
-What MySQL does that this does not: a cycle of waits that runs through both a metadata lock
-and a row lock is found here at once and the lightest transaction in it answers 1213, where
-MySQL's two deadlock detectors each see only their half, so measured on 8.4.11 the
-metadata-lock waiter in such a cycle answers 1205 once `lock_wait_timeout` runs out. MySQL
+What MySQL does that this does not: MySQL
 answers 1100 to a session under `LOCK TABLES` that touches a table it did not lock; this lets
 it. An `ALTER TABLE` holds the exclusive lock for all of its run, where MySQL's in-place
 `ALTER` lets other sessions read and write the table while it copies; the wait for other

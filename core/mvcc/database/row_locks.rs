@@ -37,6 +37,12 @@ pub struct LockingRead {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitKind {
+    RowLock,
+    MetadataLock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowLockWaitEnd {
     HoldersEnded,
     TimedOut,
@@ -67,7 +73,7 @@ struct LockTable {
     gaps: BTreeMap<GapEnd, Vec<Gap>>,
     held: HashMap<TxID, Vec<HeldLock>>,
     released_before_the_end: HashMap<TxID, u64>,
-    waits_for: HashMap<TxID, Vec<TxID>>,
+    waits_for: HashMap<TxID, (WaitKind, Vec<TxID>)>,
     deadlock_victims: HashSet<TxID>,
 }
 
@@ -330,32 +336,27 @@ impl RowLocks {
     pub(crate) fn start_waiting(
         &self,
         waiter: TxID,
+        kind: WaitKind,
         holders: &[TxID],
-        written: impl Fn(TxID) -> u64,
+        weight: impl Fn(TxID) -> u64,
     ) -> Option<TxID> {
         let mut table = self.table.lock();
-        let cycle = table.cycle_through(waiter, holders);
+        let cycle = table.cycle_through(waiter, kind, holders);
         if cycle.is_empty() {
-            table.waits_for.insert(waiter, holders.to_vec());
+            table.waits_for.insert(waiter, (kind, holders.to_vec()));
             return None;
         }
-        let weight =
-            |tx_id: TxID| written(tx_id) + table.held.get(&tx_id).map_or(0, Vec::len) as u64;
-        let waiter_weight = weight(waiter);
-        let lightest = cycle
-            .iter()
-            .copied()
-            .filter(|member| *member != waiter)
-            .map(|member| (weight(member), member))
-            .min();
-        let victim = match lightest {
-            Some((other_weight, other)) if other_weight < waiter_weight => other,
-            _ => waiter,
+        let victim = match kind {
+            WaitKind::RowLock => table.lightest_by_rows(waiter, &cycle, weight),
+            WaitKind::MetadataLock => std::iter::once(waiter)
+                .chain(cycle.iter().copied())
+                .min_by_key(|member| weight(*member))
+                .expect("a cycle has the waiter in it"),
         };
         if victim == waiter {
             return Some(victim);
         }
-        table.waits_for.insert(waiter, holders.to_vec());
+        table.waits_for.insert(waiter, (kind, holders.to_vec()));
         table.deadlock_victims.insert(victim);
         drop(table);
         self.transaction_ended.released();
@@ -522,11 +523,32 @@ impl LockTable {
         Some(removed.low)
     }
 
-    fn cycle_through(&self, waiter: TxID, holders: &[TxID]) -> Vec<TxID> {
+    fn lightest_by_rows(
+        &self,
+        waiter: TxID,
+        cycle: &[TxID],
+        written: impl Fn(TxID) -> u64,
+    ) -> TxID {
+        let weight =
+            |tx_id: TxID| written(tx_id) + self.held.get(&tx_id).map_or(0, Vec::len) as u64;
+        let waiter_weight = weight(waiter);
+        let lightest = cycle
+            .iter()
+            .copied()
+            .filter(|member| *member != waiter)
+            .map(|member| (weight(member), member))
+            .min();
+        match lightest {
+            Some((other_weight, other)) if other_weight < waiter_weight => other,
+            _ => waiter,
+        }
+    }
+
+    fn cycle_through(&self, waiter: TxID, kind: WaitKind, holders: &[TxID]) -> Vec<TxID> {
         let mut visited = HashSet::default();
         let mut path = Vec::new();
         for holder in holders {
-            if self.reaches(*holder, waiter, &mut visited, &mut path) {
+            if self.reaches(*holder, waiter, kind, &mut visited, &mut path) {
                 return path;
             }
         }
@@ -537,6 +559,7 @@ impl LockTable {
         &self,
         from: TxID,
         target: TxID,
+        kind: WaitKind,
         visited: &mut HashSet<TxID>,
         path: &mut Vec<TxID>,
     ) -> bool {
@@ -547,9 +570,13 @@ impl LockTable {
             return false;
         }
         path.push(from);
-        for next in self.waits_for.get(&from).into_iter().flatten() {
-            if self.reaches(*next, target, visited, path) {
-                return true;
+        if let Some((waits_on, holders)) = self.waits_for.get(&from) {
+            if *waits_on == kind {
+                for next in holders {
+                    if self.reaches(*next, target, kind, visited, path) {
+                        return true;
+                    }
+                }
             }
         }
         path.pop();

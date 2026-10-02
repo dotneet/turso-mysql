@@ -73,7 +73,9 @@ pub use metadata_locks::{MetadataLockMode, MetadataLockRequest};
 pub(crate) use metadata_locks::{MetadataLockWaitEnd, MetadataLocks};
 
 mod row_locks;
-pub(crate) use row_locks::{GapBetween, GapKey, RowLockAttempt, RowLockWaitEnd, RowLocks};
+pub(crate) use row_locks::{
+    GapBetween, GapKey, RowLockAttempt, RowLockWaitEnd, RowLocks, WaitKind,
+};
 pub use row_locks::{LockingRead, RowLockLevel, RowLockMode, RowLockWaitPolicy};
 
 #[cfg(feature = "conn_raw_api")]
@@ -7252,7 +7254,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub(crate) fn start_row_lock_wait(&self, waiter: TxID, holders: &[TxID]) -> Option<TxID> {
         self.row_locks
-            .start_waiting(waiter, holders, |tx_id| self.deadlock_weight(tx_id))
+            .start_waiting(waiter, WaitKind::RowLock, holders, |tx_id| {
+                self.rows_written_by(tx_id)
+            })
     }
 
     pub(crate) fn row_lock_releases_before_the_end(&self, holders: &[TxID]) -> u64 {
@@ -7280,15 +7284,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub(crate) fn stop_row_lock_wait(&self, waiter: TxID) {
         self.row_locks.stop_waiting(waiter);
-    }
-
-    fn deadlock_weight(&self, tx_id: TxID) -> u64 {
-        let definition_lock_weight = if self.metadata_locks.waits_for_a_definition_lock(tx_id) {
-            1 << 40
-        } else {
-            0
-        };
-        definition_lock_weight + self.rows_written_by(tx_id)
     }
 
     fn rows_written_by(&self, tx_id: TxID) -> u64 {
@@ -7325,7 +7320,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 self.row_locks.stop_waiting(owner);
                 return MetadataLockWaitEnd::Granted;
             }
-            if self.start_row_lock_wait(owner, &in_the_way) == Some(owner) {
+            if self.start_metadata_lock_wait(owner, &in_the_way) == Some(owner) {
                 return MetadataLockWaitEnd::ChosenAsDeadlockVictim;
             }
             let end = self.row_locks.wait(
@@ -7343,6 +7338,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 RowLockWaitEnd::Interrupted => return MetadataLockWaitEnd::Interrupted,
             }
         }
+    }
+
+    fn start_metadata_lock_wait(&self, owner: TxID, in_the_way: &[TxID]) -> Option<TxID> {
+        self.row_locks
+            .start_waiting(owner, WaitKind::MetadataLock, in_the_way, |owner| {
+                self.metadata_locks.deadlock_weight(owner)
+            })
     }
 
     pub(crate) fn stop_waiting_for_table_metadata(&self, owner: TxID, table: &str) {

@@ -222,11 +222,13 @@ fn a_writer_waiting_for_a_table_another_session_redefines_runs_on_the_new_defini
 }
 
 #[test]
-fn a_cycle_through_a_row_lock_and_a_waiting_definition_lock_rolls_back_the_lightest_transaction() {
+fn a_wait_cycle_through_a_row_lock_and_a_metadata_lock_is_no_deadlock_and_the_table_wait_times_out()
+{
     let db = database_with_table_locks();
     let row_holder = session(&db);
     let row_waiter = session(&db);
     let definer = session(&db);
+    row_holder.set_metadata_lock_wait(Duration::from_secs(1));
     row_holder.execute("BEGIN CONCURRENT").unwrap();
     row_holder
         .execute("UPDATE t SET v = 11 WHERE id = 1")
@@ -242,18 +244,66 @@ fn a_cycle_through_a_row_lock_and_a_waiting_definition_lock_rolls_back_the_light
     });
     assert!(still_waits(&defining));
 
-    let reading = in_the_background(row_holder, |conn| count(conn, "u"));
+    let started = Instant::now();
+    assert!(matches!(count(&row_holder, "u"), Err(LimboError::Busy)));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(!row_holder.get_auto_commit());
+    assert!(!row_waiting.is_finished());
+    assert!(!defining.is_finished());
+
+    row_holder.execute("COMMIT").unwrap();
     let (row_waiter, waited) = row_waiting.join().unwrap();
-    assert!(
-        matches!(waited, Err(LimboError::WriteWriteConflict)),
-        "{waited:?}"
-    );
-    assert!(row_waiter.get_auto_commit());
+    waited.unwrap();
+    assert!(still_waits(&defining));
+    row_waiter.execute("COMMIT").unwrap();
     let (definer, defined) = defining.join().unwrap();
     defined.unwrap();
-    assert!(still_waits(&reading));
     definer.release_metadata_locks_outside_a_transaction();
-    let (row_holder, read) = reading.join().unwrap();
+    let rows: Vec<(i64,)> = row_waiter.exec_rows("SELECT v FROM t WHERE id = 1");
+    assert_eq!(rows, [(12,)]);
+}
+
+#[test]
+fn a_metadata_lock_cycle_gives_up_the_reader_that_closes_it_however_many_rows_it_wrote() {
+    let db = database_with_table_locks();
+    let writer = session(&db);
+    let reader = session(&db);
+    let t_definer = session(&db);
+    let u_definer = session(&db);
+    writer
+        .execute("CREATE TABLE w (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO w VALUES (1), (2)").unwrap();
+    assert_eq!(count(&writer, "t").unwrap(), 2);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(count(&reader, "u").unwrap(), 2);
+    let t_defining = in_the_background(t_definer, |conn| {
+        conn.lock_tables_metadata(&[("t", MetadataLockMode::Exclusive)])
+    });
+    assert!(still_waits(&t_defining));
+    let reading = in_the_background(reader, |conn| count(conn, "t"));
+    assert!(still_waits(&reading));
+    let u_defining = in_the_background(u_definer, |conn| {
+        conn.lock_tables_metadata(&[("u", MetadataLockMode::Exclusive)])
+    });
+    assert!(still_waits(&u_defining));
+
+    assert!(matches!(
+        count(&writer, "u"),
+        Err(LimboError::WriteWriteConflict)
+    ));
+    assert!(writer.get_auto_commit());
+    assert_eq!(count(&writer, "w").unwrap(), 0);
+    let (t_definer, t_defined) = t_defining.join().unwrap();
+    t_defined.unwrap();
+    assert!(still_waits(&reading));
+    t_definer.release_metadata_locks_outside_a_transaction();
+    let (reader, read) = reading.join().unwrap();
     assert_eq!(read.unwrap(), 2);
-    row_holder.execute("COMMIT").unwrap();
+    assert!(still_waits(&u_defining));
+    reader.execute("COMMIT").unwrap();
+    let (u_definer, u_defined) = u_defining.join().unwrap();
+    u_defined.unwrap();
+    u_definer.release_metadata_locks_outside_a_transaction();
 }

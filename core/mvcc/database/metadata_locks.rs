@@ -28,6 +28,9 @@ pub(crate) enum MetadataLockWaitEnd {
     Interrupted,
 }
 
+const TABLE_USE_DEADLOCK_WEIGHT: u64 = 10;
+const DEFINITION_CHANGE_DEADLOCK_WEIGHT: u64 = 100;
+
 #[derive(Default)]
 pub(crate) struct MetadataLocks {
     state: Mutex<LockState>,
@@ -158,7 +161,15 @@ impl MetadataLocks {
         }
     }
 
-    pub(crate) fn waits_for_a_definition_lock(&self, owner: TxID) -> bool {
+    pub(crate) fn deadlock_weight(&self, owner: TxID) -> u64 {
+        if self.waits_for_a_definition_lock(owner) {
+            DEFINITION_CHANGE_DEADLOCK_WEIGHT
+        } else {
+            TABLE_USE_DEADLOCK_WEIGHT
+        }
+    }
+
+    fn waits_for_a_definition_lock(&self, owner: TxID) -> bool {
         let state = self.state.lock();
         state
             .tables_of_owner
@@ -294,7 +305,7 @@ impl MetadataLockMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataLockMode::*, MetadataLocks};
+    use super::{MetadataLockMode::*, MetadataLocks, TABLE_USE_DEADLOCK_WEIGHT};
 
     #[test]
     fn readers_and_writers_share_a_table_and_a_definition_change_waits_for_both() {
@@ -316,7 +327,7 @@ mod tests {
         assert_eq!(locks.lock(1, "t", SharedWrite), [2]);
         assert!(locks.release(1));
         assert!(locks.lock(2, "t", Exclusive).is_empty());
-        assert!(!locks.waits_for_a_definition_lock(2));
+        assert_eq!(locks.deadlock_weight(2), TABLE_USE_DEADLOCK_WEIGHT);
         assert_eq!(locks.lock(3, "t", SharedRead), [2]);
     }
 
