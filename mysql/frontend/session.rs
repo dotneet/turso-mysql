@@ -266,6 +266,7 @@ impl Drop for CloseOnLastDrop {
         // fails leaves the WAL for the next open, which recovers it.
         let _ = self.connection.close();
         user.stop_using();
+        user.note_a_transaction_ended();
     }
 }
 
@@ -1884,6 +1885,7 @@ impl MySqlConnection {
         };
         if self.inner.get_auto_commit() {
             user.stop_using();
+            user.note_a_transaction_ended();
             return;
         }
         let ran = std::mem::take(&mut *self.transaction_command_ran.lock().unwrap());
@@ -1895,6 +1897,38 @@ impl MySqlConnection {
             }
             TransactionCommandRan::None => user.stop_using_unless_the_transaction_keeps_it(),
         }
+    }
+
+    /// How many transactions on this connection's database have ended, for
+    /// [`Self::wait_for_another_transaction_to_end`].
+    pub fn transactions_ended_on_the_database(&self) -> u64 {
+        self.database_user
+            .as_ref()
+            .map_or(0, |user| user.transactions_ended())
+    }
+
+    /// Waits for a transaction on this connection's database to end after
+    /// `ended_before` was read, for a statement that met another
+    /// transaction's write and runs again once that one is over. Answers
+    /// false when `deadline` passes first.
+    pub fn wait_for_another_transaction_to_end(
+        &self,
+        ended_before: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
+        match &self.database_user {
+            Some(user) => user.wait_for_a_transaction_to_end(ended_before, deadline),
+            None => {
+                std::thread::sleep(Duration::from_millis(1));
+                deadline.is_none_or(|deadline| std::time::Instant::now() < deadline)
+            }
+        }
+    }
+
+    /// How long a statement waits for a lock another session holds, which is
+    /// MySQL's `innodb_lock_wait_timeout`.
+    pub fn lock_wait(&self) -> Duration {
+        self.inner.get_busy_timeout()
     }
 
     fn the_transaction_read_the_database(&self) -> bool {

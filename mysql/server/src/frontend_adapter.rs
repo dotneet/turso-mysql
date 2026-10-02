@@ -7181,15 +7181,19 @@ fn may_create_a_view_or_trigger(sql: &str) -> bool {
 /// session's row answers 1062 only if that row takes its key. Nothing the
 /// failed run read reached the client, and a stale snapshot has never
 /// written, so running the statement again from the start is the same as
-/// running it after the other session committed. Every run again follows
-/// another session's commit.
+/// running it after the other session committed. Every run again waits for
+/// another transaction on the database to end, and once the session's
+/// `innodb_lock_wait_timeout` passes the statement answers 1205, as a MySQL
+/// statement waiting for another transaction's row lock does.
 fn run_client_statement<T>(
     connection: &MySqlConnection,
     mut run: impl FnMut() -> Result<T, FrontendErrorKind>,
 ) -> Result<T, FrontendErrorKind> {
     let takes_its_own_snapshot = connection.statement_takes_its_own_snapshot();
     let began_in_a_transaction = !connection.is_auto_commit();
+    let deadline = std::time::Instant::now().checked_add(connection.lock_wait());
     loop {
+        let ended_before = connection.transactions_ended_on_the_database();
         let result = run();
         if !takes_its_own_snapshot
             || !matches!(result, Err(FrontendErrorKind::SerializationFailure))
@@ -7199,6 +7203,9 @@ fn run_client_statement<T>(
         connection
             .start_a_stale_statement_again(began_in_a_transaction)
             .map_err(frontend_query_error)?;
+        if !connection.wait_for_another_transaction_to_end(ended_before, deadline) {
+            return Err(FrontendErrorKind::DatabaseBusy);
+        }
     }
 }
 

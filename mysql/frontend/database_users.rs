@@ -21,6 +21,10 @@ pub const DEFAULT_METADATA_LOCK_WAIT: Duration = Duration::from_secs(31_536_000)
 pub(crate) struct DatabaseUsers {
     state: Mutex<UsersState>,
     changed: Condvar,
+    /// How many transactions on the database have ended, which a statement
+    /// that met another transaction's uncommitted write waits on to change.
+    transactions_ended: Mutex<u64>,
+    a_transaction_ended: Condvar,
     #[cfg(test)]
     wakeups: std::sync::atomic::AtomicUsize,
 }
@@ -293,6 +297,56 @@ impl DatabaseUser {
 
     pub(crate) fn database_was_dropped(&self) -> bool {
         self.users.lock().dropped
+    }
+
+    pub(crate) fn transactions_ended(&self) -> u64 {
+        *self.lock_transactions_ended()
+    }
+
+    pub(crate) fn note_a_transaction_ended(&self) {
+        let mut ended = self.lock_transactions_ended();
+        *ended = ended.wrapping_add(1);
+        drop(ended);
+        self.users.a_transaction_ended.notify_all();
+    }
+
+    /// Waits until a transaction on the database ends after `ended_before`
+    /// was read from [`DatabaseUser::transactions_ended`], answering false
+    /// once `deadline` passes first.
+    pub(crate) fn wait_for_a_transaction_to_end(
+        &self,
+        ended_before: u64,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let mut ended = self.lock_transactions_ended();
+        while *ended == ended_before {
+            ended = match deadline {
+                None => self
+                    .users
+                    .a_transaction_ended
+                    .wait(ended)
+                    .expect("MySQL ended transactions mutex poisoned"),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    self.users
+                        .a_transaction_ended
+                        .wait_timeout(ended, left)
+                        .expect("MySQL ended transactions mutex poisoned")
+                        .0
+                }
+            };
+        }
+        true
+    }
+
+    fn lock_transactions_ended(&self) -> MutexGuard<'_, u64> {
+        self.users
+            .transactions_ended
+            .lock()
+            .expect("MySQL ended transactions mutex poisoned")
     }
 
     fn lock_using(&self) -> MutexGuard<'_, Use> {

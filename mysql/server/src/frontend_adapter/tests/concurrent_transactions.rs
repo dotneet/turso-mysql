@@ -352,6 +352,48 @@ fn two_sessions_inserting_counted_rows_at_once_both_write_every_row() {
     assert_eq!(names(&mut one).len(), 2 * ROUNDS);
 }
 
+/// Measured on MySQL 8.4.11 with `innodb_lock_wait_timeout = 1`: an update
+/// of a row another open transaction updated waits for that transaction,
+/// answers 1205 after about a second, and once the transaction commits the
+/// same update goes through.
+#[test]
+fn an_update_of_a_row_another_transaction_holds_waits_and_gives_up_with_1205() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "INSERT INTO tags (id, name) VALUES (1, 'news')");
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE tags SET name = 'held' WHERE id = 1");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        two.execute_query("UPDATE tags SET name = 'waited' WHERE id = 1")
+            .err(),
+        Some(FrontendErrorKind::DatabaseBusy)
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(900)
+            && waited < std::time::Duration::from_secs(10),
+        "{waited:?}"
+    );
+
+    let waiting = std::thread::spawn(move || {
+        let result = two
+            .execute_query("UPDATE tags SET name = 'waited' WHERE id = 1")
+            .map(|_| ());
+        (two, result)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    run(&mut one, "COMMIT");
+    let (mut two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(names(&mut two), ["waited"]);
+}
+
 /// Measured on MySQL 8.4.11: an update of a row another transaction changed
 /// waits for that transaction, then changes the row it committed, though the
 /// waiting transaction's own reads keep the snapshot they took.
