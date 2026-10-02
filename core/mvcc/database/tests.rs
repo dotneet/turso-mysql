@@ -21725,8 +21725,8 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
         "writer should commit in the exclusive-acquire CAS window"
     );
     assert!(
-        matches!(result, Err(crate::LimboError::Busy)),
-        "stale DDL transaction should release exclusive and return Busy after post-CAS recheck: {result:?}"
+        matches!(result, Err(crate::LimboError::BusySnapshot)),
+        "stale DDL transaction should release exclusive and return BusySnapshot after post-CAS recheck: {result:?}"
     );
     assert!(
         !mvcc_store.is_exclusive_tx(&ddl_tx_id),

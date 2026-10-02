@@ -7620,6 +7620,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// Acquires the exclusive transaction lock to the given transaction ID.
+    ///
+    /// Fails with `Busy` while another transaction holds the lock or is
+    /// committing, which waiting can get past, and with `BusySnapshot` when
+    /// another transaction committed after this one's begin timestamp, which
+    /// no amount of waiting changes. That is the error a WAL transaction gets
+    /// for upgrading a stale read snapshot; the VDBE retries it only for a
+    /// transaction it began itself, which takes a new timestamp on retry.
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
@@ -7646,7 +7653,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if tx.begin_ts() < self.last_committed_tx_ts.load(Ordering::Acquire) {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
-                return Err(LimboError::Busy);
+                return Err(LimboError::BusySnapshot);
             }
         }
         #[cfg(any(test, injected_yields))]
@@ -7696,7 +7703,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let tx = tx.value();
                     if tx.begin_ts() < self.last_committed_tx_ts.load(Ordering::Acquire) {
                         self.release_exclusive_tx(tx_id);
-                        return Err(LimboError::Busy);
+                        return Err(LimboError::BusySnapshot);
                     }
                 }
                 Ok(())

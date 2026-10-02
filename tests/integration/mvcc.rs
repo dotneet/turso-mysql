@@ -1877,6 +1877,39 @@ fn test_a_snapshot_does_not_refresh_with_passive_checkpoints() {
     conn.execute("ROLLBACK").unwrap();
 }
 
+#[test]
+fn test_a_transaction_that_read_before_another_commit_cannot_take_the_exclusive_slot() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, 0), (2, 0)")
+        .unwrap();
+    let stale = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+    stale.set_busy_timeout(std::time::Duration::from_secs(30));
+
+    stale.execute("BEGIN").unwrap();
+    let read: Vec<(i64,)> = stale.exec_rows("SELECT n FROM t WHERE id = 2");
+    assert_eq!(read, vec![(0,)]);
+    writer.execute("UPDATE t SET n = 5 WHERE id = 2").unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        stale.execute("UPDATE t SET n = 1 WHERE id = 1"),
+        Err(LimboError::BusySnapshot)
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    stale.execute("ROLLBACK").unwrap();
+
+    stale.execute("BEGIN").unwrap();
+    stale.execute("UPDATE t SET n = 1 WHERE id = 1").unwrap();
+    stale.execute("COMMIT").unwrap();
+    let committed: Vec<(i64, i64)> = writer.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(committed, vec![(1, 1), (2, 5)]);
+}
+
 fn mvcc_database() -> TempDatabase {
     TempDatabase::builder().with_mvcc(true).build()
 }
