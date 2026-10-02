@@ -4321,6 +4321,51 @@ fn transaction_commands_run_their_kept_engine_statements_again() -> Result<()> {
 }
 
 #[test]
+fn autocommit_writes_under_mvcc_run_kept_begin_and_commit_statements() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-kept-concurrent.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.inner.execute("PRAGMA journal_mode = 'mvcc'")?;
+    assert!(connection.inner.mvcc_enabled());
+    let other = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.execute("CREATE TABLE records (id INT PRIMARY KEY)")?;
+    let insert = |id: i64| {
+        connection
+            .execute_checked_write(&format!("INSERT INTO records (id) VALUES ({id})"), None)
+            .unwrap()
+    };
+    insert(1);
+    insert(2);
+    other.execute("CREATE TABLE other_records (x INT)")?;
+    insert(3);
+    assert!(connection
+        .execute_checked_write("INSERT INTO records (id) VALUES (3)", None)
+        .is_err());
+    insert(4);
+
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id FROM records ORDER BY id")?
+            .run_collect_rows()?,
+        [1, 2, 3, 4]
+            .into_iter()
+            .map(|id| vec![Value::from_i64(id)])
+            .collect::<Vec<_>>()
+    );
+    let kept = connection
+        .prepared_transaction_statements
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, sql, _)| sql.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kept, ["BEGIN CONCURRENT", "COMMIT"]);
+    other.close()?;
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn a_kept_counted_table_is_handed_out_without_copying_its_definition() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-shared-counted-table.db", [0x5a; 16])?;

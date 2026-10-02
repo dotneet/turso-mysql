@@ -4570,12 +4570,11 @@ impl MySqlConnection {
         // The statement is a transaction of its own, so a read-only flag an
         // earlier `START TRANSACTION READ ONLY` left does not hold for it.
         *self.read_only_transaction.lock().unwrap() = self.session_read_only();
-        self.inner
-            .execute("BEGIN CONCURRENT")
+        self.run_engine_transaction_statement(self.engine_begin(), "BEGIN CONCURRENT")
             .map_err(&engine_error)?;
         let result = run();
         let ended = if result.is_ok() {
-            self.inner.execute("COMMIT")
+            self.run_engine_transaction_statement(Stmt::Commit { name: None }, "COMMIT")
         } else {
             Ok(())
         };
@@ -4584,6 +4583,14 @@ impl MySqlConnection {
         }
         ended.map_err(engine_error)?;
         result
+    }
+
+    fn run_engine_transaction_statement(&self, statement: Stmt, sql: &str) -> Result<()> {
+        match self.run_transaction_statement(statement, sql) {
+            Ok(()) => Ok(()),
+            Err(MySqlQueryError::Engine(error)) => Err(error),
+            Err(error) => unreachable!("a transaction statement fails only in the engine: {error}"),
+        }
     }
 
     fn run_transaction_statement(
