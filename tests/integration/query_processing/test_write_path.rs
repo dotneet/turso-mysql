@@ -2223,3 +2223,46 @@ fn assert_rows_a_foreign_key_refuses_are_skipped(conn: &Arc<Connection>) -> anyh
     ));
     Ok(())
 }
+
+#[turso_macros::test]
+fn a_child_whose_parent_table_is_missing_refuses_only_rows_naming_a_parent(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_a_child_whose_parent_table_is_missing(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn a_child_whose_parent_table_is_missing_refuses_only_rows_naming_a_parent_under_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_a_child_whose_parent_table_is_missing(&tmp_db.connect_limbo())
+}
+
+fn assert_a_child_whose_parent_table_is_missing(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.set_foreign_keys_checked_row_by_row(true);
+    conn.execute(
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, a INT REFERENCES nope (id), b INT)",
+    )?;
+    conn.execute("INSERT INTO c VALUES (1, 7, 0)")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("INSERT INTO c VALUES (2, NULL, 0)")?;
+    conn.execute("UPDATE c SET b = 1")?;
+    conn.execute("UPDATE c SET a = NULL WHERE id = 1")?;
+    for sql in [
+        "INSERT INTO c VALUES (3, 4, 0)",
+        "UPDATE c SET a = 5 WHERE id = 1",
+    ] {
+        assert!(
+            matches!(conn.execute(sql), Err(LimboError::ForeignKeyConstraint(_))),
+            "{sql}"
+        );
+        let refused = conn.take_foreign_key_refusals();
+        assert_eq!(refused.len(), 1, "{sql}");
+        assert_eq!(refused[0].foreign_key.parent_table, "nope", "{sql}");
+    }
+    conn.execute("INSERT OR IGNORE INTO c VALUES (3, 4, 0)")?;
+    conn.execute("DELETE FROM c WHERE id = 2")?;
+    let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT id, IFNULL(a, -1), b FROM c");
+    assert_eq!(rows, [(1, -1, 1)]);
+    Ok(())
+}

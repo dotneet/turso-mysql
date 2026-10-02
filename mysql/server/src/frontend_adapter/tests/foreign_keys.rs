@@ -875,3 +875,43 @@ fn a_foreign_key_alter_table_adds_replaces_the_index_another_foreign_key_asked_f
         assert_eq!(keys_printed(&mut adapter, table), keys, "{table}");
     }
 }
+
+#[test]
+fn a_child_whose_parent_table_is_missing_takes_every_row_naming_no_parent() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "SET foreign_key_checks = 0",
+        "CREATE TABLE c (id INT PRIMARY KEY, a INT, b INT, FOREIGN KEY (a) REFERENCES nope (id))",
+        "INSERT INTO c VALUES (1, 7, 0)",
+        "SET foreign_key_checks = 1",
+        "INSERT INTO c VALUES (2, NULL, 0)",
+        "UPDATE c SET b = 1",
+        "UPDATE c SET a = NULL WHERE id = 1",
+        "DELETE FROM c WHERE id = 2",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let constraint = "`d`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`a`) REFERENCES `nope` (`id`)";
+    for sql in [
+        "INSERT INTO c VALUES (3, 4, 0)",
+        "UPDATE c SET a = 5 WHERE id = 1",
+    ] {
+        assert_eq!(
+            refused(&mut adapter, sql),
+            (
+                FrontendErrorKind::ForeignKeyViolation,
+                format!("{CHILD_ROW_WITHOUT_PARENT} ({constraint})")
+            ),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        written(&mut adapter, "INSERT IGNORE INTO c VALUES (4, 4, 0)"),
+        (0, 0, 1)
+    );
+    assert_eq!(warnings(&mut adapter), [child_warning(constraint)]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, a, b FROM c"),
+        [["1", "NULL", "1"]]
+    );
+}

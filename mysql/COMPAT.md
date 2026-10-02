@@ -6170,6 +6170,13 @@ the whole of the primary key or of a unique key, in that key's order; and last
 without regard to case. A key referencing its own table is checked against the
 keys the statement makes.
 
+A foreign key made while `foreign_key_checks` was off may reference a table
+that is not there. Measured on 8.4.11 and matched: a row naming no parent through
+it, its columns NULL, is written, updated and deleted as any other, and one
+naming a parent is refused with 1452 naming the key, or skipped by `IGNORE`.
+Every write to such a table was refused here, the engine failing to find the
+table the key references.
+
 An inline `REFERENCES` on a column is read and written nowhere, which is what
 MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`
 stores a child row naming a parent that does not exist, and `SHOW CREATE

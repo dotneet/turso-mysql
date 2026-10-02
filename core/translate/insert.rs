@@ -4085,8 +4085,13 @@ pub fn emit_fk_child_insert_checks(
     let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
         s.get_indices(&child_tbl.name).cloned().collect()
     });
-    let mut fk_refs =
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?;
+    let mut fk_refs = if program.checks_foreign_keys_row_by_row {
+        resolver.with_schema(database_id, |s| {
+            s.resolved_fks_for_child_with_missing_parents(&child_tbl.name)
+        })?
+    } else {
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
+    };
     if program.checks_foreign_keys_row_by_row {
         sort_by_the_index_innodb_checks_them_at(&mut fk_refs, child_tbl, &indexes);
     }
@@ -4106,6 +4111,18 @@ pub fn emit_fk_child_insert_checks(
                 reg: src,
                 target_pc: fk_ok,
             });
+        }
+        if fk_ref.parent_is_missing {
+            emit_refused_child_row(
+                program,
+                &fk_ref,
+                child_tbl,
+                &indexes,
+                skip_a_refused_row,
+                refused_writes,
+            )?;
+            program.preassign_label_to_next_insn(fk_ok);
+            continue;
         }
         let parent_tbl = resolver
             .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))

@@ -2593,6 +2593,48 @@ impl Schema {
         Ok(out)
     }
 
+    pub fn resolved_fks_for_child_with_missing_parents(
+        &self,
+        child_table: &str,
+    ) -> crate::Result<Vec<ResolvedFkRef>> {
+        let child_name = normalize_ident(child_table);
+        let child = self
+            .get_btree_table(&child_name)
+            .ok_or_else(|| fk_mismatch_err(&child_name, "<unknown>"))?;
+        let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
+        for fk in &child.foreign_keys {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let resolved = match self.get_btree_table(&parent_name) {
+                Some(parent_tbl) => self.resolve_fk(fk, &child, &parent_tbl, true)?,
+                None => {
+                    let child_pos = fk
+                        .child_columns
+                        .iter()
+                        .map(|cname| {
+                            child
+                                .get_column(cname)
+                                .map(|(i, _)| i)
+                                .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    ResolvedFkRef {
+                        child_table: Arc::clone(&child),
+                        fk: Arc::clone(fk),
+                        parent_cols: fk.parent_columns.clone(),
+                        child_pos: child_pos.into_boxed_slice(),
+                        parent_pos: Vec::new().into_boxed_slice(),
+                        parent_uses_rowid: false,
+                        parent_unique_index: None,
+                        parent_is_missing: true,
+                    }
+                }
+            };
+            out.push_within_capacity(resolved)
+                .expect("resolved FK vector was preallocated to child.foreign_keys.len()");
+        }
+        Ok(out)
+    }
+
     /// Resolve a single FK declared on `child` referencing `parent_tbl`.
     /// When `require_unique` is set, a non-rowid parent key must be backed by
     /// a non-partial UNIQUE index on exactly those columns.
@@ -2698,6 +2740,7 @@ impl Schema {
             parent_pos: parent_pos.into_boxed_slice(),
             parent_uses_rowid,
             parent_unique_index,
+            parent_is_missing: false,
         })
     }
 
@@ -5351,6 +5394,7 @@ pub struct ResolvedFkRef {
     /// For non-rowid parents: the UNIQUE index that enforces the parent key.
     /// (None when `parent_uses_rowid == true`.)
     pub parent_unique_index: Option<Arc<Index>>,
+    pub parent_is_missing: bool,
 }
 
 impl ResolvedFkRef {

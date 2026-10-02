@@ -1119,8 +1119,13 @@ pub fn emit_fk_child_update_counters(
     let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
         s.get_indices(child_table_name).cloned().collect()
     });
-    let mut fk_refs =
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?;
+    let mut fk_refs = if row_by_row {
+        resolver.with_schema(database_id, |s| {
+            s.resolved_fks_for_child_with_missing_parents(child_table_name)
+        })?
+    } else {
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
+    };
     if row_by_row {
         sort_by_the_index_innodb_checks_them_at(&mut fk_refs, child_tbl, &indexes);
     }
@@ -1133,7 +1138,7 @@ pub fn emit_fk_child_update_counters(
         let ncols = fk_ref.fk.child_columns.len();
 
         // Pass 1: OLD tuple handling only for deferred FKs
-        if fk_ref.fk.deferred {
+        if fk_ref.fk.deferred && !fk_ref.parent_is_missing {
             if let Some((dml_ctx, fk_col_positions, null_skip)) =
                 load_old_fk_values(program, &fk_ref.fk.child_columns)?
             {
@@ -1244,6 +1249,11 @@ pub fn emit_fk_child_update_counters(
                 layout,
                 fk_ok,
             );
+        }
+        if fk_ref.parent_is_missing {
+            emit_fk_child_violation(program, &fk_ref, child_tbl, &indexes, refused_writes)?;
+            program.preassign_label_to_next_insn(fk_ok);
+            continue;
         }
 
         // A child NEW-key check normally probes the parent table before this

@@ -289,10 +289,15 @@ pub fn emit_fk_child_decrement_on_delete(
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in
+    let fk_refs = if program.checks_foreign_keys_row_by_row {
+        resolver.with_schema(database_id, |s| {
+            s.resolved_fks_for_child_with_missing_parents(child_table_name)
+        })?
+    } else {
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
-        if !fk_ref.fk.deferred {
+    };
+    for fk_ref in fk_refs {
+        if !fk_ref.fk.deferred || fk_ref.parent_is_missing {
             continue;
         }
         // Fast path: if any FK column is NULL can't be a violation
