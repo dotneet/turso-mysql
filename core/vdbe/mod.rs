@@ -3603,7 +3603,10 @@ impl Program {
                             "Failed to rollback statement savepoint during abort",
                         );
                     }
-                    let waits_to_run_again = matches!(err, Some(LimboError::RowLocked(_)));
+                    let waits_to_run_again = matches!(
+                        err,
+                        Some(LimboError::RowLocked(_) | LimboError::GapLocked(_))
+                    );
                     if !waits_to_run_again && !must_rollback_tx_if_needed {
                         if let Err(gap_err) = self.lock_the_gaps_undone_inserts_left(pager, state) {
                             capture_abort_error(
@@ -3622,7 +3625,7 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
-                Some(LimboError::RowLocked(_)) => {
+                Some(LimboError::RowLocked(_) | LimboError::GapLocked(_)) => {
                     turso_assert!(
                         !inside_explicit_transaction || had_statement_savepoint,
                         "a statement that met a row lock inside a transaction had no statement savepoint to undo its writes"

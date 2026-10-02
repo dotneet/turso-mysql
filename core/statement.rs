@@ -342,7 +342,7 @@ pub struct Statement {
 struct RowLockWait {
     waiter: Option<u64>,
     holders: Vec<u64>,
-    releases_seen: u64,
+    releases_seen: Option<u64>,
     deadline: std::time::Instant,
     end: Option<RowLockWaitEnd>,
 }
@@ -806,7 +806,8 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
-        if matches!(&res, Err(err) if matches!(**err, LimboError::RowLocked(_))) {
+        if matches!(&res, Err(err) if matches!(**err, LimboError::RowLocked(_) | LimboError::GapLocked(_)))
+        {
             res = self.wait_for_the_rows_held(res, waker);
         }
         if matches!(&res, Err(err) if matches!(**err, LimboError::TableMetadataLocked(_))) {
@@ -1132,10 +1133,11 @@ impl Statement {
         let Err(err) = &res else {
             return res;
         };
-        let LimboError::RowLocked(holders) = &**err else {
-            return res;
+        let (holders, ends_only_with_the_holders) = match &**err {
+            LimboError::RowLocked(holders) => (holders.clone(), false),
+            LimboError::GapLocked(holders) => (holders.clone(), true),
+            _ => return res,
         };
-        let holders = holders.clone();
         let refuses_to_wait = self
             .locking_read
             .as_ref()
@@ -1152,7 +1154,8 @@ impl Statement {
             .as_ref()
             .cloned()
             .expect("only an MVCC database reports a row lock");
-        let releases_seen = mv_store.row_lock_releases_before_the_end(&holders);
+        let releases_seen = (!ends_only_with_the_holders)
+            .then(|| mv_store.row_lock_releases_before_the_end(&holders));
         let waiter = connection.get_mv_tx_id();
         if let Some(waiter) = waiter {
             if mv_store.start_row_lock_wait(waiter, &holders) == Some(waiter) {

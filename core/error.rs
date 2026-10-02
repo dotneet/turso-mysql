@@ -189,6 +189,8 @@ pub enum LimboError {
     WriteWriteConflict,
     #[error("Row locked by another transaction")]
     RowLocked(Vec<u64>),
+    #[error("Gap locked by another transaction")]
+    GapLocked(Vec<u64>),
     #[error("Table {} locked by another transaction", .0.table)]
     TableMetadataLocked(crate::MetadataLockRequest),
     #[error("Table definition has changed, please retry transaction: {0}")]

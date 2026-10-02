@@ -5873,7 +5873,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if holders.is_empty() {
             return Ok(());
         }
-        Err(LimboError::RowLocked(holders))
+        Err(LimboError::GapLocked(holders))
     }
 
     fn rewrites_a_row_it_deleted(&self, tx_id: TxID, id: &RowID) -> bool {
@@ -7290,7 +7290,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         waiter: Option<TxID>,
         holders: &[TxID],
-        releases_seen: u64,
+        releases_seen: Option<u64>,
         deadline: std::time::Instant,
         interrupted: impl Fn() -> bool,
     ) -> RowLockWaitEnd {
@@ -7299,7 +7299,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deadline,
             || {
                 holders.iter().any(|holder| self.txs.contains_key(holder))
-                    && self.row_locks.releases_before_the_end(holders) == releases_seen
+                    && releases_seen.is_none_or(|releases_seen| {
+                        self.row_locks.releases_before_the_end(holders) == releases_seen
+                    })
             },
             interrupted,
         )

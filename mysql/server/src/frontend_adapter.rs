@@ -13844,7 +13844,9 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::WriteWriteConflict | LimboError::SchemaConflict => {
             FrontendErrorKind::SerializationFailure
         }
-        LimboError::RowLocked(_) => FrontendErrorKind::LockNotAvailableNowait,
+        LimboError::RowLocked(_) | LimboError::GapLocked(_) => {
+            FrontendErrorKind::LockNotAvailableNowait
+        }
         LimboError::TableMetadataLocked(_) => FrontendErrorKind::DatabaseBusy,
         LimboError::TableDefinitionChanged(_) => FrontendErrorKind::TableDefinitionChanged,
         LimboError::ForeignKeyConstraint(message)

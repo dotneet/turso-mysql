@@ -539,6 +539,39 @@ fn two_transactions_that_locked_one_gap_and_insert_into_it_deadlock() {
 }
 
 #[test]
+fn an_insert_waiting_for_a_gap_keeps_its_timeout_when_the_gap_holder_undoes_a_failed_insert() {
+    let db = database_with_gaps_to_lock();
+    let holder = session(&db);
+    let waiter = session(&db);
+    waiter.set_busy_timeout(Duration::from_secs(1));
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    assert!(locked_ids(
+        &holder,
+        "SELECT id FROM t WHERE id = 25",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    waiter.execute("BEGIN CONCURRENT").unwrap();
+
+    let started = Instant::now();
+    let waiting = run_in_the_background(waiter, "INSERT INTO t VALUES (25, 0, 25, 0)");
+    std::thread::sleep(Duration::from_millis(600));
+    let failed = holder.execute("INSERT INTO t VALUES (27, 0, 27, 0), (28, 0, 10, 0)");
+    assert!(
+        matches!(failed, Err(LimboError::Constraint(_))),
+        "{failed:?}"
+    );
+    let (_, result) = waiting.join().unwrap();
+    assert!(matches!(result, Err(LimboError::Busy)), "{result:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "{:?}",
+        started.elapsed()
+    );
+    holder.execute("COMMIT").unwrap();
+}
+
+#[test]
 fn a_full_scan_locks_the_gap_after_the_last_row() {
     let db = database_with_gaps_to_lock();
     let reader = session(&db);
