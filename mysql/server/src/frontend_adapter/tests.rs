@@ -19339,6 +19339,44 @@ fn information_schema_tables_refuses_what_it_cannot_answer_and_reads_the_rest() 
 
 #[cfg(unix)]
 #[test]
+fn information_schema_statistics_without_an_order_lists_index_names_without_regard_to_case() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("metadata").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([52; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("metadata").unwrap();
+    adapter
+        .execute_query(
+            "CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT, d INT, e INT, \
+             KEY `Zed` (a), KEY `alpha` (b), KEY `_u` (c), KEY `B2` (d), UNIQUE KEY `beta` (e))",
+        )
+        .unwrap();
+    let CommandExecutionResult::ResultSet(result) = adapter
+        .execute_query(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = 'metadata' AND TABLE_NAME = 't'",
+        )
+        .unwrap()
+    else {
+        panic!("information_schema.STATISTICS must return a result set");
+    };
+    assert_eq!(
+        result
+            .rows
+            .into_iter()
+            .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+            .collect::<Vec<_>>(),
+        ["_u", "alpha", "B2", "beta", "PRIMARY", "Zed"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn information_schema_statistics_reports_every_index_column_with_measured_shapes() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer);

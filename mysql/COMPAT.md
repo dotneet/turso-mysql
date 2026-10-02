@@ -4296,7 +4296,12 @@ engine does not mark NOT NULL. A comparison against one of
 these columns is held to the type the column holds rather than to text, so
 `WHERE NON_UNIQUE = 0` is taken and `WHERE NON_UNIQUE = 'no'` is refused. An
 `ORDER BY` over one of the text columns sorts without regard to case, the way
-MySQL sorts them.
+MySQL sorts them. Without an `ORDER BY` the rows come by table and then by index
+name without regard to case — measured on 8.4.11 for a read naming its table,
+`_u`, `alpha`, `B2`, `beta`, `PRIMARY`, `Zed` — where they came in byte order.
+MySQL lists one table's keys in the order it keeps them, the primary key, the
+unique keys and then the rest in the order they were made, for some reads of a
+single table, and those still come by name here.
 
 drizzle-kit reads the indexes as `select * from INFORMATION_SCHEMA.STATISTICS
 WHERE INFORMATION_SCHEMA.STATISTICS.TABLE_SCHEMA = 'db' and

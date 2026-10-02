@@ -660,14 +660,16 @@ impl InternalVirtualTable for InformationSchemaStatistics {
                 }
             }
         }
-        // A scan with nothing to order it by answers in the order the ORDER BY
-        // a client writes over this table almost always asks for.
-        rows.sort_by(|left, right| {
-            (&left.table, &left.index_name, left.sequence).cmp(&(
-                &right.table,
-                &right.index_name,
-                right.sequence,
-            ))
+        // A scan with nothing to order it by answers in the order MySQL
+        // answers one naming the tables it reads: measured on 8.4.11, by
+        // table and then by index name without regard to case, `_u`, `alpha`,
+        // `B2`, `beta`, `PRIMARY`, `Zed`.
+        rows.sort_by_cached_key(|row| {
+            (
+                row.table.clone(),
+                row.index_name.to_ascii_lowercase(),
+                row.sequence,
+            )
         });
         Ok(Arc::new(RwLock::new(InformationSchemaStatisticsCursor {
             database: self.database.clone(),
@@ -2027,8 +2029,6 @@ mod tests {
                  FROM {INFORMATION_SCHEMA_STATISTICS}"
             )),
             vec![
-                row(&["reports", "child", "0", "PRIMARY", "1", "cid", "", "BTREE", "NULL"]),
-                row(&["reports", "child", "0", "PRIMARY", "2", "seq", "", "BTREE", "NULL"]),
                 row(&[
                     "reports",
                     "child",
@@ -2040,6 +2040,8 @@ mod tests {
                     "BTREE",
                     "NULL",
                 ]),
+                row(&["reports", "child", "0", "PRIMARY", "1", "cid", "", "BTREE", "NULL"]),
+                row(&["reports", "child", "0", "PRIMARY", "2", "seq", "", "BTREE", "NULL"]),
                 row(&[
                     "reports",
                     "child",
