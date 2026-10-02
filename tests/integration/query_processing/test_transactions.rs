@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
+use turso_core::{CheckpointMode, Connection, LimboError, Result, Statement, StepResult, Value};
 
 use crate::common::{assert_checkpoint_preserves_content, ExecRows, TempDatabase};
 
@@ -209,6 +209,80 @@ fn test_blocking_writer_wakes_when_the_write_lock_is_released(tmp_db: TempDataba
     );
     let rows: Vec<(i64,)> = conn1.exec_rows("SELECT COUNT(*) FROM test");
     assert_eq!(rows, vec![(2 * waits.len() as i64,)]);
+}
+
+#[turso_macros::test]
+fn test_refused_checkpoint_waits_for_the_write_lock_release(tmp_db: TempDatabase) {
+    let writer = tmp_db.connect_limbo();
+    writer
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    let checkpointer = tmp_db.connect_limbo();
+    let rows: Vec<(i64,)> = checkpointer.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(0,)]);
+    writer
+        .execute("INSERT INTO test (id, value) VALUES (1, 'committed')")
+        .unwrap();
+    writer.execute("BEGIN").unwrap();
+    writer
+        .execute("INSERT INTO test (id, value) VALUES (2, 'open')")
+        .unwrap();
+
+    let truncate = CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    };
+    assert!(matches!(
+        checkpointer.checkpoint(truncate),
+        Err(LimboError::Busy)
+    ));
+    assert_eq!(
+        checkpointer
+            .get_pager()
+            .wait_for_lock_release(Duration::from_millis(50)),
+        Some(false)
+    );
+
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(
+        checkpointer
+            .get_pager()
+            .wait_for_lock_release(Duration::from_secs(5)),
+        Some(true)
+    );
+    checkpointer.checkpoint(truncate).unwrap();
+}
+
+#[turso_macros::test]
+fn test_checkpoint_refused_by_a_reader_does_not_wake_on_its_own_release(tmp_db: TempDatabase) {
+    let writer = tmp_db.connect_limbo();
+    writer
+        .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO test (id, value) VALUES (1, 'seen')")
+        .unwrap();
+    let reader = tmp_db.connect_limbo();
+    reader.execute("BEGIN").unwrap();
+    let rows: Vec<(i64,)> = reader.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(1,)]);
+    writer
+        .execute("INSERT INTO test (id, value) VALUES (2, 'unseen')")
+        .unwrap();
+
+    let checkpointer = tmp_db.connect_limbo();
+    assert!(matches!(
+        checkpointer.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        }),
+        Err(LimboError::Busy)
+    ));
+    assert_eq!(
+        checkpointer
+            .get_pager()
+            .wait_for_lock_release(Duration::from_millis(50)),
+        Some(false)
+    );
+    reader.execute("COMMIT").unwrap();
 }
 
 fn two_tables_and_a_reader_of_the_first(

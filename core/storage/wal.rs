@@ -679,9 +679,9 @@ pub trait Wal: Debug + Send + Sync {
     fn should_checkpoint_on_close(&self) -> bool;
 
     /// Waits until another connection of this process releases the write or
-    /// checkpoint lock after this one last tried to begin a transaction, or
-    /// until `timeout` passes. Returns whether a lock was released, or `None`
-    /// where this WAL cannot wait for one.
+    /// checkpoint lock after this one last tried to begin a transaction or
+    /// last failed a checkpoint, or until `timeout` passes. Returns whether a
+    /// lock was released, or `None` where this WAL cannot wait for one.
     fn wait_for_lock_release(&self, _timeout: std::time::Duration) -> Option<bool> {
         None
     }
@@ -4120,6 +4120,7 @@ impl Wal for WalFile {
                 tracing::debug!("WAL checkpoint failed: {e}");
                 let _ = self.checkpoint_guard.write().take();
                 self.ongoing_checkpoint.write().state = CheckpointState::Start;
+                self.note_lock_releases_before_trying();
             })
     }
 
