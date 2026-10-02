@@ -17357,6 +17357,7 @@ fn row_locks_for_cursor(
         primary,
         range_end_check,
         releases_unmatched_rows,
+        locking_select: state.locking_read.is_some() && !writes_the_table,
         reads_past_held_rows,
         duplicate_mode,
     })

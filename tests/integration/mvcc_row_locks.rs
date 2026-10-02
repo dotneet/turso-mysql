@@ -979,6 +979,92 @@ fn a_read_of_an_in_list_on_a_secondary_index_locks_only_the_gap_after_each_value
     reader.execute("COMMIT").unwrap();
 }
 
+#[test]
+fn read_committed_lets_go_of_a_row_that_did_not_match_when_the_statement_ends() {
+    let db = database_with_gaps_to_lock();
+    let writer = session(&db);
+    writer.set_row_lock_level(RowLockLevel::ReadCommitted);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE t SET v = 9 WHERE id = 20 AND v = 99")
+        .unwrap();
+    writer
+        .execute("DELETE FROM t WHERE id = 30 AND v = 99")
+        .unwrap();
+    writer
+        .execute("UPDATE t SET v = 9 WHERE id IN (10, 40) AND v = 99")
+        .unwrap();
+    assert!(locked_ids(
+        &writer,
+        "SELECT id FROM t WHERE id IN (10, 40) AND v = 99",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    assert!(!waits(&db, "UPDATE t SET v = 8 WHERE id = 20"));
+    assert!(!waits(&db, "UPDATE t SET v = 8 WHERE id = 30"));
+    assert!(!waits(&db, "UPDATE t SET v = 8 WHERE id = 10"));
+    assert!(!waits(&db, "UPDATE t SET v = 8 WHERE id = 40"));
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_read_committed_locking_read_of_one_key_keeps_the_row_it_found_though_it_did_not_match() {
+    let db = database_with_gaps_to_lock();
+    let reader = session(&db);
+    reader.set_row_lock_level(RowLockLevel::ReadCommitted);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert!(locked_ids(
+        &reader,
+        "SELECT id FROM t WHERE id = 20 AND v = 99",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    assert!(locked_ids(
+        &reader,
+        "SELECT id FROM t WHERE u = 30 AND v = 99",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    assert!(waits(&db, "UPDATE t SET v = 8 WHERE id = 20"));
+    assert!(waits(&db, "UPDATE t SET v = 8 WHERE id = 30"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_missed_key_locks_the_gap_up_to_another_transactions_uncommitted_row() {
+    let db = database_with_gaps_to_lock();
+    let inserter = session(&db);
+    inserter.execute("BEGIN CONCURRENT").unwrap();
+    inserter
+        .execute("INSERT INTO t VALUES (25, 25, 25, 25)")
+        .unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE id = 22",
+        "SELECT id FROM t WHERE k = 22",
+        "SELECT id FROM t WHERE u = 22",
+    ] {
+        let reader = session(&db);
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        assert!(locked_ids(&reader, sql, RowLockMode::Exclusive).is_empty());
+        assert!(waits(&db, "INSERT INTO t VALUES (21, 21, 21, 0)"), "{sql}");
+        assert!(!waits(&db, "INSERT INTO t VALUES (26, 26, 26, 0)"), "{sql}");
+        reader.execute("ROLLBACK").unwrap();
+    }
+    for sql in [
+        "SELECT id FROM t WHERE id = 28",
+        "SELECT id FROM t WHERE k = 28",
+        "SELECT id FROM t WHERE u = 28",
+    ] {
+        let reader = session(&db);
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        assert!(locked_ids(&reader, sql, RowLockMode::Exclusive).is_empty());
+        assert!(waits(&db, "INSERT INTO t VALUES (26, 26, 26, 0)"), "{sql}");
+        assert!(!waits(&db, "INSERT INTO t VALUES (21, 21, 21, 0)"), "{sql}");
+        reader.execute("ROLLBACK").unwrap();
+    }
+    inserter.execute("ROLLBACK").unwrap();
+}
+
 fn database_with_gaps_to_lock() -> TempDatabase {
     let db = TempDatabase::builder()
         .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))

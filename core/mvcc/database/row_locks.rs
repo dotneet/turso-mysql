@@ -212,11 +212,14 @@ impl RowLocks {
 
     pub(crate) fn unlock(&self, tx_id: TxID, row: &RowID) {
         let mut table = self.table.lock();
-        let now_free = table.rows.get_mut(row).is_some_and(|holders| {
-            holders.remove(tx_id);
-            holders.is_empty()
-        });
-        if now_free {
+        let Some(holders) = table.rows.get_mut(row) else {
+            return;
+        };
+        if !holders.holds(tx_id) {
+            return;
+        }
+        holders.remove(tx_id);
+        if holders.is_empty() {
             table.rows.remove(row);
         }
         if let Some(held) = table.held.get_mut(&tx_id) {
@@ -605,7 +608,7 @@ impl Holders {
     }
 
     fn add(&mut self, tx_id: TxID, mode: RowLockMode) -> bool {
-        let already_held = self.exclusive == Some(tx_id) || self.shared.contains(&tx_id);
+        let already_held = self.holds(tx_id);
         match mode {
             RowLockMode::Exclusive => {
                 self.shared.retain(|holder| *holder != tx_id);
@@ -615,6 +618,10 @@ impl Holders {
             RowLockMode::Shared => {}
         }
         !already_held
+    }
+
+    fn holds(&self, tx_id: TxID) -> bool {
+        self.exclusive == Some(tx_id) || self.shared.contains(&tx_id)
     }
 
     fn remove(&mut self, tx_id: TxID) {

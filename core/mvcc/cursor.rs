@@ -571,6 +571,7 @@ pub(crate) struct CursorRowLocks {
     pub(crate) primary: bool,
     pub(crate) range_end_check: RangeEndCheck,
     pub(crate) releases_unmatched_rows: bool,
+    pub(crate) locking_select: bool,
     pub(crate) reads_past_held_rows: bool,
     pub(crate) duplicate_mode: RowLockMode,
 }
@@ -1309,6 +1310,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCur
         // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
         // when creating_new_rowid is false, so this is safe in every case.
         self.end_new_rowid();
+        self.let_go_of_a_row_that_did_not_match();
     }
 }
 

@@ -50,6 +50,9 @@ pub(crate) fn step_with_row_locks(
         }
     }
     let pc = state.pc as usize;
+    if matches!(insn, Insn::Halt { .. }) {
+        let_go_of_rows_that_did_not_match(state);
+    }
     before_the_instruction(program, state, insn, pc)?;
     let result = insn.to_function()(program, state, insn, pager);
     if let Ok(InsnFunctionStepResult::Step) = result {
@@ -104,6 +107,14 @@ fn do_the_work(state: &mut ProgramState, work: &RowLockWork) -> IOResultOr<RowAf
                 return_if_io!(cursor.lock_the_duplicate());
             }
             Ok(IOResult::Done(RowAfterTheWork::Kept))
+        }
+    }
+}
+
+fn let_go_of_rows_that_did_not_match(state: &mut ProgramState) {
+    for cursor_id in 0..state.cursors.len() {
+        if let Some(cursor) = mvcc_cursor(state, cursor_id) {
+            cursor.let_go_of_a_row_that_did_not_match();
         }
     }
 }

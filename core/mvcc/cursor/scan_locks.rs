@@ -19,6 +19,7 @@ pub(super) struct ScanLocks {
     arrival: Option<(Arrival, Option<RowKey>)>,
     search: Option<NeighborSearch>,
     unique_match: bool,
+    lookups: u32,
     current: CurrentRow,
     pub(super) positions_to_write: bool,
     pub(super) reads_the_range_end: bool,
@@ -27,6 +28,7 @@ pub(super) struct ScanLocks {
 #[derive(Default)]
 struct CurrentRow {
     matched: bool,
+    found_by_a_unique_key: bool,
     newly_locked: Vec<RowID>,
     held_by: Option<Vec<u64>>,
 }
@@ -133,7 +135,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     pub(super) fn step_and_lock(&mut self, direction: IterationDirection) -> IOResultOr<()> {
         if self.scan.arrival.is_none() {
-            return_if_io!(self.leave_the_row());
+            return_if_io!(self.leave_the_row(true));
             self.scan.previous = self.current_key();
             match direction {
                 IterationDirection::Forwards => return_if_io!(self.next_row()),
@@ -147,7 +149,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     pub(super) fn start_over_and_lock(&mut self, direction: IterationDirection) -> IOResultOr<()> {
         if self.scan.arrival.is_none() {
-            return_if_io!(self.leave_the_row());
+            return_if_io!(self.leave_the_row(false));
+            self.scan.lookups += 1;
             self.scan.previous = None;
             self.scan.unique_match = false;
             match direction {
@@ -169,7 +172,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         op: SeekOp,
     ) -> IOResultOr<SeekResult> {
         if self.scan.arrival.is_none() {
-            return_if_io!(self.leave_the_row());
+            return_if_io!(self.leave_the_row(false));
+            self.scan.lookups += 1;
             self.scan.previous = None;
             self.scan.unique_match = false;
             let start = self.row_key_of(&seek_key)?;
@@ -191,7 +195,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     pub(super) fn probe_and_lock(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.scan.arrival.is_none() {
-            return_if_io!(self.leave_the_row());
+            return_if_io!(self.leave_the_row(false));
+            self.scan.lookups += 1;
             self.scan.previous = None;
             self.scan.unique_match = false;
             let found = return_if_io!(self.row_exists(key));
@@ -227,6 +232,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if unique_equality {
             pending.below = Below::Nothing;
             self.scan.unique_match = true;
+            self.scan.current.found_by_a_unique_key = true;
         }
         self.lock_the_pending_row()
     }
@@ -286,6 +292,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             Some(holders) => Err(LimboError::RowLocked(holders)),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn let_go_of_a_row_that_did_not_match(&mut self) {
+        let Some(row_locks) = self.row_locks else {
+            return;
+        };
+        if !row_locks.releases_unmatched_rows
+            || self.scan.current.matched
+            || self.keeps_its_one_unique_lookup()
+        {
+            return;
+        }
+        let rows = std::mem::take(&mut self.scan.current.newly_locked);
+        self.unlock_rows(&rows);
     }
 
     pub(crate) fn lock_the_duplicate(&mut self) -> IOResultOr<()> {
@@ -362,17 +382,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         })
     }
 
-    fn leave_the_row(&mut self) -> IOResultOr<()> {
+    fn leave_the_row(&mut self, keeps_one_unique_lookup: bool) -> IOResultOr<()> {
         if self.scan.pending.is_some() {
             return_if_io!(self.lock_the_pending_row());
         }
+        let keeps = keeps_one_unique_lookup && self.keeps_its_one_unique_lookup();
         let current = std::mem::take(&mut self.scan.current);
-        if self.row_locks_in_force().releases_unmatched_rows && !current.matched {
-            for row in &current.newly_locked {
-                self.db.unlock_row(self.tx_id, row);
-            }
+        if self.row_locks_in_force().releases_unmatched_rows && !current.matched && !keeps {
+            self.unlock_rows(&current.newly_locked);
         }
         Ok(IOResult::Done(()))
+    }
+
+    fn keeps_its_one_unique_lookup(&self) -> bool {
+        self.row_locks_in_force().locking_select
+            && self.scan.lookups == 1
+            && self.scan.current.found_by_a_unique_key
+    }
+
+    fn unlock_rows(&self, rows: &[RowID]) {
+        for row in rows {
+            self.db.unlock_row(self.tx_id, row);
+        }
     }
 
     fn arrive(&mut self, arrival: Arrival) {
@@ -485,6 +516,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 let exact_start = row_locks.primary
                     && matches!(op, SeekOp::GE { .. })
                     && row_key_is(&row, &start);
+                self.scan.current.found_by_a_unique_key = exact_start && op.eq_only();
                 let below = if exact_start {
                     Below::Nothing
                 } else {
@@ -547,7 +579,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if found {
             let row = row.expect("a found row is under the cursor");
             return match self.lock_the_record(&row, true, false)? {
-                RecordLock::Taken => Ok(IOResult::Done(Arrived::OnARow)),
+                RecordLock::Taken => {
+                    self.scan.current.found_by_a_unique_key = true;
+                    Ok(IOResult::Done(Arrived::OnARow))
+                }
                 RecordLock::HeldByAnother => Ok(IOResult::Done(Arrived::PastAHeldRow)),
             };
         }

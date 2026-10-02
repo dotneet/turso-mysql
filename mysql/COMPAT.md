@@ -3773,7 +3773,9 @@ under `READ COMMITTED` too; one that stops before such a row does not. An `INSER
 the key it inserts locks the row it found in share mode, the gap below it as well on a unique
 secondary index, even under `READ COMMITTED`; an `INSERT ... ON DUPLICATE KEY UPDATE` locks
 that row exclusively. `READ COMMITTED` locks no other gap, and lets go of each row a statement
-read but did not match once the statement moves past it; an `UPDATE` there that meets a row
+read but did not match once the statement moves past it or ends — except a locking `SELECT`
+that reads one row through its primary key or a unique key, which keeps that row as MySQL
+keeps a table it reads as a constant, while an `UPDATE` or a `DELETE` lets it go; an `UPDATE` there that meets a row
 another transaction holds reads the row's latest committed version and waits only if that
 version matches, while a `DELETE`, a locking read, or an `UPDATE` through a secondary index
 waits. Which rows and gaps are locked follows from the index a statement reads, which the
