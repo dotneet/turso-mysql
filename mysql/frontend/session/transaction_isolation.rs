@@ -27,19 +27,24 @@
 //! In MVCC mode (`TURSO_MYSQL_EXPERIMENTAL_MVCC`) writers do not wait for one
 //! another, so the levels are kept by moving the transaction's snapshot to
 //! the latest commit before a statement, which keeps the rows the transaction
-//! wrote:
+//! wrote, and by InnoDB's row locks:
 //!
-//! - `READ COMMITTED` moves it before every statement, written or not.
+//! - `READ COMMITTED` moves it before every statement, written or not. Its
+//!   locks cover rows only: no gaps, and the rows a statement read but did
+//!   not match are let go.
 //! - `REPEATABLE READ` moves it before every statement until the first plain
 //!   `SELECT` of a table, and holds it from then on. Measured on MySQL
 //!   8.4.11, that `SELECT` is where InnoDB takes the read view: writes,
 //!   locking reads, savepoints and prepares before it do not take it. `WITH
-//!   CONSISTENT SNAPSHOT` holds the snapshot `BEGIN` took.
-//! - `SERIALIZABLE` begins with the engine's plain `BEGIN` instead of `BEGIN
-//!   CONCURRENT`, and its snapshot is never moved: it reads from its first
-//!   statement and takes the database's one exclusive write slot at its first
-//!   write, which is refused with 1213 once another transaction has
-//!   committed since it began reading.
+//!   CONSISTENT SNAPSHOT` holds the snapshot `BEGIN` took. Its locks cover
+//!   the gaps between the rows a statement read, so no other transaction
+//!   inserts into a range it read.
+//! - `SERIALIZABLE` locks as `REPEATABLE READ` does, and inside a transaction
+//!   every plain `SELECT` runs as `FOR SHARE`, reading the latest committed
+//!   rows. Measured on MySQL 8.4.11: two transactions that each read two rows
+//!   and then write the one the other read meet in a deadlock, and the second
+//!   writer is given up with 1213; a `SELECT` with autocommit on locks
+//!   nothing.
 
 use super::*;
 
@@ -53,8 +58,9 @@ pub enum MySqlIsolationLevel {
     /// MySQL's default level.
     #[default]
     RepeatableRead,
-    /// Run as `REPEATABLE READ` is, or in MVCC mode as an exclusive
-    /// transaction; see the module's notes.
+    /// Run as `REPEATABLE READ` is, and in MVCC mode with every plain
+    /// `SELECT` of a transaction locking what it reads; see the module's
+    /// notes.
     Serializable,
 }
 
@@ -138,6 +144,17 @@ impl MySqlConnection {
             (isolation.current, isolation.read_view_taken)
         };
         self.inner.set_snapshot_moves_after_a_lock_wait(false);
+        let level = if self.inner.get_auto_commit() {
+            next
+        } else {
+            current
+        };
+        self.inner.set_row_lock_level(match level {
+            MySqlIsolationLevel::ReadCommitted => turso_core::RowLockLevel::ReadCommitted,
+            MySqlIsolationLevel::RepeatableRead | MySqlIsolationLevel::Serializable => {
+                turso_core::RowLockLevel::RepeatableRead
+            }
+        });
         if self.inner.get_auto_commit() {
             return Ok(());
         }
@@ -151,8 +168,9 @@ impl MySqlConnection {
         }
         let reads_afresh = match current {
             MySqlIsolationLevel::ReadCommitted => true,
-            MySqlIsolationLevel::RepeatableRead => !read_view_taken,
-            MySqlIsolationLevel::Serializable => false,
+            MySqlIsolationLevel::RepeatableRead | MySqlIsolationLevel::Serializable => {
+                !read_view_taken
+            }
         };
         if !reads_afresh {
             return Ok(());

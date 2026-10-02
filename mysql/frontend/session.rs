@@ -3606,9 +3606,12 @@ impl MySqlConnection {
             } => {
                 if *reads_table {
                     self.begin_implicit_transaction_for_table_read()?;
-                    if !*locks_rows {
-                        self.note_consistent_read();
-                    }
+                }
+                let serializable_read = (!*locks_rows)
+                    .then(|| self.serializable_read_of_a_table(*reads_table))
+                    .flatten();
+                if *reads_table && !*locks_rows && serializable_read.is_none() {
+                    self.note_consistent_read();
                 }
                 let statement = prepared.statement.as_mut().ok_or_else(|| {
                     LimboError::InternalError(
@@ -3619,8 +3622,14 @@ impl MySqlConnection {
                 if let Some(timeout) = timeout {
                     statement.set_query_timeout_override(Some(Some(timeout)));
                 }
-                if let Some(locking_read) = locking_read {
-                    lock_the_rows_a_select_reads(statement, *locking_read, source_tables)?;
+                match (locking_read, serializable_read) {
+                    (Some(locking_read), _) => {
+                        lock_the_rows_a_select_reads(statement, *locking_read, source_tables)?;
+                    }
+                    (None, Some(read)) => {
+                        lock_the_rows_a_serializable_select_reads(statement, read, source_tables)?
+                    }
+                    (None, None) => statement.read_without_locking_rows(),
                 }
                 let mut rows = Vec::new();
                 statement.run_with_row_callback(|row| {
@@ -4508,13 +4517,8 @@ impl MySqlConnection {
     ///
     /// In MVCC mode a plain `BEGIN` writes under the database's one exclusive
     /// write slot, so writers would still run one at a time; `BEGIN
-    /// CONCURRENT` lets them run side by side. A `SERIALIZABLE` transaction
-    /// takes the plain `BEGIN` on purpose: it reads from the moment of its
-    /// first statement and takes the exclusive slot at its first write, which
-    /// it is refused once another transaction has committed since it began
-    /// reading. So nothing it read can have changed by the time it writes,
-    /// and two transactions that each write what the other read cannot both
-    /// commit.
+    /// CONCURRENT` lets them run side by side, and row locks keep each
+    /// isolation level.
     fn engine_begin(&self) -> Stmt {
         Stmt::Begin {
             typ: self
@@ -4534,13 +4538,11 @@ impl MySqlConnection {
 
     fn begins_concurrently(&self) -> bool {
         self.inner.mvcc_enabled()
-            && self.transaction_isolation() != MySqlIsolationLevel::Serializable
     }
 
     /// Runs a write that autocommit makes a transaction of its own inside
     /// `BEGIN CONCURRENT` in MVCC mode, where the engine would otherwise run
-    /// it under the one exclusive write slot. A `SERIALIZABLE` one is left to
-    /// that slot, as a `SERIALIZABLE` transaction is.
+    /// it under the one exclusive write slot.
     fn in_a_concurrent_statement_transaction<T, E>(
         &self,
         run: impl FnOnce() -> std::result::Result<T, E>,
@@ -4748,6 +4750,21 @@ impl MySqlConnection {
         &self,
     ) -> std::result::Result<(), MySqlQueryError> {
         self.begin_implicit_transaction_for_write()
+    }
+
+    /// The lock a plain `SELECT` of a table takes inside a `SERIALIZABLE`
+    /// transaction in MVCC mode: `FOR SHARE` on every table it reads, as
+    /// InnoDB takes. Measured on MySQL 8.4.11, the same `SELECT` with
+    /// autocommit on is a consistent read that locks nothing.
+    fn serializable_read_of_a_table(&self, reads_table: bool) -> Option<MySqlLockingRead> {
+        let locks = reads_table
+            && self.inner.mvcc_enabled()
+            && !self.inner.get_auto_commit()
+            && self.transaction_isolation() == MySqlIsolationLevel::Serializable;
+        locks.then_some(MySqlLockingRead {
+            shared: true,
+            wait: MySqlRowLockWait::Wait,
+        })
     }
 
     /// Takes the write lock a `SELECT ... FOR UPDATE` asked for.
@@ -7419,9 +7436,12 @@ impl MySqlConnection {
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
-            if !translated.locks_rows() {
-                self.note_consistent_read();
-            }
+        }
+        let serializable_read = (!translated.locks_rows())
+            .then(|| self.serializable_read_of_a_table(translated.reads_table()))
+            .flatten();
+        if translated.reads_table() && !translated.locks_rows() && serializable_read.is_none() {
+            self.note_consistent_read();
         }
         let locking_read = translated.locking_read();
         if let Some(locking_read) = locking_read.filter(|_| !self.inner.mvcc_enabled()) {
@@ -7449,6 +7469,10 @@ impl MySqlConnection {
         }
         if let Some(locking_read) = locking_read.filter(|_| self.inner.mvcc_enabled()) {
             lock_the_rows_a_select_reads(&mut stmt, locking_read, translated.source_tables())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        if let Some(read) = serializable_read {
+            lock_the_rows_a_serializable_select_reads(&mut stmt, read, translated.source_tables())
                 .map_err(MySqlQueryError::Engine)?;
         }
         let static_result_metadata =
@@ -12488,6 +12512,34 @@ fn lock_the_rows_a_select_reads(
     locking_read: MySqlLockingRead,
     sources: &[MySqlSelectSource],
 ) -> Result<()> {
+    let tables = sources
+        .iter()
+        .filter(|source| {
+            !source.subquery() && source.derived().is_none() && source.catalog().is_none()
+        })
+        .map(|source| source.table().as_str().to_owned())
+        .collect();
+    lock_the_rows_of_tables(statement, locking_read, tables)
+}
+
+fn lock_the_rows_a_serializable_select_reads(
+    statement: &mut Statement,
+    locking_read: MySqlLockingRead,
+    sources: &[MySqlSelectSource],
+) -> Result<()> {
+    let tables = sources
+        .iter()
+        .filter(|source| source.derived().is_none() && source.catalog().is_none())
+        .map(|source| source.table().as_str().to_owned())
+        .collect();
+    lock_the_rows_of_tables(statement, locking_read, tables)
+}
+
+fn lock_the_rows_of_tables(
+    statement: &mut Statement,
+    locking_read: MySqlLockingRead,
+    tables: Vec<String>,
+) -> Result<()> {
     let wait = locking_read.wait;
     statement.lock_rows_it_reads(turso_core::LockingRead {
         mode: if locking_read.shared {
@@ -12500,13 +12552,7 @@ fn lock_the_rows_a_select_reads(
             MySqlRowLockWait::NoWait => turso_core::RowLockWaitPolicy::NoWait,
             MySqlRowLockWait::SkipLocked => turso_core::RowLockWaitPolicy::SkipLocked,
         },
-        tables: sources
-            .iter()
-            .filter(|source| {
-                !source.subquery() && source.derived().is_none() && source.catalog().is_none()
-            })
-            .map(|source| source.table().as_str().to_owned())
-            .collect(),
+        tables,
     });
     if wait == MySqlRowLockWait::Wait {
         statement.run_to_lock_rows()?;

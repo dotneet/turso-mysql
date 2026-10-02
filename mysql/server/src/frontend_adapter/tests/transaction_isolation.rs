@@ -429,10 +429,12 @@ fn a_consistent_snapshot_is_taken_at_the_statement() {
 /// client reading every later answer one behind.
 ///
 /// Two transactions each read both rows and then write the one the other did
-/// not: under `SERIALIZABLE` MySQL makes the second writer a deadlock victim
-/// (1213), each read having locked what the other writes. Here the first
-/// commits and the second, whose snapshot is then stale, is given up with
-/// 1213 — one of them, and never both, is written, as in MySQL.
+/// not. Measured on MySQL 8.4.11: each read locks both rows in share mode, so
+/// the first writer waits for the second's lock, and the second writer closes
+/// the cycle and is given up with 1213 while the first goes on. In MVCC mode
+/// the reads take the same locks. Without MVCC the first commits and the
+/// second, whose snapshot is then stale, is given up with 1213. Either way one
+/// of them, and never both, is written.
 #[test]
 fn serializable_refuses_one_of_two_transactions_that_each_write_what_the_other_read() {
     let TwoSessions {
@@ -450,13 +452,33 @@ fn serializable_refuses_one_of_two_transactions_that_each_write_what_the_other_r
         assert_eq!(n_of(session, 1), "0");
         assert_eq!(n_of(session, 2), "0");
     }
-    run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
-    run(&mut one, "COMMIT");
-    assert_eq!(
-        two.execute_query("UPDATE c SET n = 1 WHERE id = 2"),
-        Err(FrontendErrorKind::SerializationFailure)
-    );
-    assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    if turso_mysql::experimental_mvcc_is_on() {
+        let waiting = std::thread::spawn(move || {
+            let result = one
+                .execute_query("UPDATE c SET n = 1 WHERE id = 1")
+                .map(|_| ());
+            (one, result)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!waiting.is_finished());
+        assert_eq!(
+            two.execute_query("UPDATE c SET n = 1 WHERE id = 2")
+                .map(|_| ()),
+            Err(FrontendErrorKind::SerializationFailure)
+        );
+        assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+        let (mut one, result) = waiting.join().unwrap();
+        assert_eq!(result, Ok(()));
+        run(&mut one, "COMMIT");
+    } else {
+        run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
+        run(&mut one, "COMMIT");
+        assert_eq!(
+            two.execute_query("UPDATE c SET n = 1 WHERE id = 2"),
+            Err(FrontendErrorKind::SerializationFailure)
+        );
+        assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    }
     assert_eq!(
         (n_of(&mut two, 1), n_of(&mut two, 2)),
         ("1".to_owned(), "0".to_owned())
@@ -609,13 +631,13 @@ fn read_committed_reads_a_table_another_session_created_after_it_wrote() {
     run(&mut one, "COMMIT");
 }
 
-/// A `SERIALIZABLE` transaction runs as the engine's exclusive transaction
-/// in MVCC mode, so it is given up with 1213 at its first write once any
-/// other session committed after its first read, even a row it never read.
-/// Measured on MySQL 8.4.11, the write goes ahead there: InnoDB's locks only
-/// keep other sessions off the rows it read.
+/// Measured on MySQL 8.4.11: inside a `SERIALIZABLE` transaction a plain
+/// `SELECT` reads the latest committed rows and locks them in share mode. A
+/// write of a row it read waits and answers 1205, a write of a row it has not
+/// read yet goes ahead, and that commit does not keep the transaction from
+/// writing.
 #[test]
-fn serializable_gives_up_a_write_after_any_other_commit_since_its_first_read() {
+fn serializable_reads_the_latest_rows_and_keeps_them_from_other_writers() {
     if !turso_mysql::experimental_mvcc_is_on() {
         return;
     }
@@ -630,21 +652,52 @@ fn serializable_gives_up_a_write_after_any_other_commit_since_its_first_read() {
         "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
     );
     run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
     run(&mut two, "UPDATE c SET n = 6 WHERE id = 3");
-    assert_eq!(n_of(&mut one, 1), "0");
     assert_eq!(n_of(&mut one, 3), "6");
-    run(&mut two, "UPDATE c SET n = 7 WHERE id = 3");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
     assert_eq!(
-        one.execute_query("UPDATE c SET n = 6 WHERE id = 1"),
-        Err(FrontendErrorKind::SerializationFailure)
+        two.execute_query("UPDATE c SET n = 7 WHERE id = 3")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
     );
-    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
-
-    run(&mut one, "START TRANSACTION");
-    assert_eq!(n_of(&mut one, 1), "0");
     run(&mut one, "UPDATE c SET n = 6 WHERE id = 1");
     run(&mut one, "COMMIT");
-    assert_eq!(n_of(&mut two, 1), "6");
+    run(&mut two, "UPDATE c SET n = 7 WHERE id = 3");
+    assert_eq!(rows_of(&mut two), ["1 6", "2 0", "3 7"]);
+}
+
+/// Measured on MySQL 8.4.11: under `SERIALIZABLE` a `SELECT` with autocommit
+/// on is a consistent read that does not wait for another transaction's
+/// write of the row, while the same `SELECT` with autocommit off locks the
+/// row, waits, and answers 1205.
+#[test]
+fn a_serializable_select_locks_only_inside_a_transaction() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "UPDATE c SET n = 5 WHERE id = 1");
+    run(
+        &mut two,
+        "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(n_of(&mut two, 1), "0");
+    run(&mut two, "SET autocommit = 0");
+    assert_eq!(
+        two.execute_query("SELECT n FROM c WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut one, "COMMIT");
+    assert_eq!(n_of(&mut two, 1), "5");
+    run(&mut two, "COMMIT");
 }
 
 fn rows_of(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) -> Vec<String> {

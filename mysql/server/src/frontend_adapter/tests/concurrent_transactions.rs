@@ -551,12 +551,13 @@ fn an_update_of_a_row_another_transaction_holds_waits_and_gives_up_with_1205() {
 }
 
 /// A `SERIALIZABLE` transaction that wrote holds the database's one
-/// exclusive write, under WAL and under MVCC alike, so a write of another
-/// transaction waits for it to end rather than failing when it commits, and
-/// gives up with 1205 after `innodb_lock_wait_timeout`. MySQL lets a write
-/// to a row the `SERIALIZABLE` transaction did not touch go ahead at once.
+/// exclusive write under WAL, so a write of another transaction waits for it
+/// to end rather than failing when it commits, and gives up with 1205 after
+/// `innodb_lock_wait_timeout`. Measured on MySQL 8.4.11, a write to a row the
+/// `SERIALIZABLE` transaction did not touch goes ahead at once, and so it does
+/// with row locks in MVCC mode.
 #[test]
-fn a_write_beside_a_serializable_writer_waits_for_it_to_end() {
+fn a_write_beside_a_serializable_writer_waits_for_it_only_without_row_locks() {
     let TwoSessions {
         _directory,
         mut one,
@@ -574,6 +575,13 @@ fn a_write_beside_a_serializable_writer_waits_for_it_to_end() {
     run(&mut one, "UPDATE tags SET name = 'held' WHERE id = 1");
     run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
     run(&mut two, "BEGIN");
+    if turso_mysql::experimental_mvcc_is_on() {
+        run(&mut two, "UPDATE tags SET name = 'beside' WHERE id = 2");
+        run(&mut two, "COMMIT");
+        run(&mut one, "COMMIT");
+        assert_eq!(names(&mut two), ["beside", "held"]);
+        return;
+    }
     assert_eq!(
         two.execute_query("UPDATE tags SET name = 'gave up' WHERE id = 2")
             .err(),
@@ -882,6 +890,93 @@ fn an_insert_select_keeps_the_rows_it_read_from_other_writers() {
     );
     run(&mut two, "UPDATE accounts SET balance = 9 WHERE id = 2");
     run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11: under `REPEATABLE READ` a locking read of a
+/// range locks the gaps it read, up to the end of the table here, so another
+/// session's insert into the range waits for it to commit.
+#[test]
+fn a_range_locking_read_keeps_an_insert_out_of_its_range_until_it_commits() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut one, "SELECT id FROM accounts WHERE id > 1 FOR UPDATE");
+    let waiting = in_the_background(two, "INSERT INTO accounts (id, balance) VALUES (4, 40)");
+    assert!(still_waiting(&waiting));
+    run(&mut one, "COMMIT");
+    let (_two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(balances(&mut one), ["10", "20", "30", "40"]);
+}
+
+/// Measured on MySQL 8.4.11: under `READ COMMITTED` a locking read locks the
+/// rows it read and no gap, so another session's insert into the range goes
+/// ahead at once.
+#[test]
+fn read_committed_lets_an_insert_into_a_range_it_read_go_ahead() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(
+        &mut one,
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    );
+    run(&mut one, "BEGIN");
+    run(&mut one, "SELECT id FROM accounts WHERE id > 1 FOR UPDATE");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    run(
+        &mut two,
+        "INSERT INTO accounts (id, balance) VALUES (4, 40)",
+    );
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 0 WHERE id = 2")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut one, "COMMIT");
+    assert_eq!(balances(&mut one), ["10", "20", "30", "40"]);
+}
+
+/// Measured on MySQL 8.4.11: two sessions that each lock a missing key in one
+/// gap and then insert into it end in 1213 for the one whose insert closes
+/// the cycle, and the other's insert goes on.
+#[test]
+fn two_sessions_that_lock_one_gap_and_insert_into_it_end_in_a_deadlock() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut two, "BEGIN");
+    run(&mut one, "SELECT id FROM accounts WHERE id = 5 FOR UPDATE");
+    run(&mut two, "SELECT id FROM accounts WHERE id = 6 FOR UPDATE");
+    let waiting = in_the_background(one, "INSERT INTO accounts (id, balance) VALUES (5, 50)");
+    assert!(still_waiting(&waiting));
+    assert_eq!(
+        two.execute_query("INSERT INTO accounts (id, balance) VALUES (6, 60)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    let (mut one, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    run(&mut one, "COMMIT");
+    assert_eq!(balances(&mut one), ["10", "20", "30", "50"]);
 }
 
 fn row_lock_sessions() -> Option<TwoSessions> {

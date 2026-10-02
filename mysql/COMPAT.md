@@ -3735,13 +3735,37 @@ for the one whose wait closed the cycle when both wrote as many; that transactio
 back. `FOR SHARE` locks let each other in and keep writers out; `NOWAIT` answers 3572 at once
 for a row another transaction holds; `SKIP LOCKED` leaves such a row out. An `UPDATE` or
 `DELETE` locks every row it reads, so one that reads a whole table through no index keeps
-every row of it from other writers until it ends, as InnoDB's does; rows of the other tables a
-writing statement reads are locked in share mode.
+every row of it from other writers until it ends, as InnoDB's does; under `REPEATABLE READ` and
+`SERIALIZABLE` rows of the other tables a writing statement reads are locked in share mode, and
+under `READ COMMITTED` they are read without locks.
 Outside a transaction a locking read holds its locks for its own statement only.
 
-What InnoDB does that this does not do yet: it locks the gaps between rows too, so measured on
-8.4.11 an `INSERT` into a range another transaction read with `FOR UPDATE` waits, and a locking
-read that meets a row another open transaction inserted waits for it; here neither waits.
+Under `REPEATABLE READ` and `SERIALIZABLE` the locks cover the gaps between rows too, InnoDB's
+gap and next-key locks, so an `INSERT` into a range another open transaction read with a
+locking read, an `UPDATE` or a `DELETE` waits for it, and two transactions that locked one gap
+and both insert into it end in 1213. Each of the following was measured on 8.4.11 with
+`performance_schema.data_locks` and is matched, for a table keyed by its primary key and for
+its secondary indexes. A read of one key of a unique index or the primary key that finds the
+row locks that row alone; one that finds none locks the gap the key would be in, the gap
+after the last row when the key is past it. A range read locks each row it reads and the gap
+below it, from the row before the range on; where it stops, past the last row in range, it
+locks only the gap below that row on the primary key, the row and its gap on a secondary
+index, and the gap alone when the read is one value of a secondary index; a read up to a
+primary key value it found (`id <= 20`) stops there and locks nothing past it, and a read that
+starts at a primary key value it found (`id >= 20`) locks no gap below it. A read through no
+index locks every row and the gap after the last one. A descending read locks the gap above
+the row it starts on, and where it stops the row and the gap below it. A secondary index read
+locks the rows it matches as well, in the same mode. A locking read, an `UPDATE` or a `DELETE`
+that meets a row another open transaction inserted into its range waits for that transaction,
+under `READ COMMITTED` too; one that stops before such a row does not. An `INSERT` that finds
+the key it inserts locks the row it found in share mode, the gap below it as well on a unique
+secondary index, even under `READ COMMITTED`; an `INSERT ... ON DUPLICATE KEY UPDATE` locks
+that row exclusively. `READ COMMITTED` locks no other gap, and lets go of each row a statement
+read but did not match once the statement moves past it; an `UPDATE` there that meets a row
+another transaction holds reads the row's latest committed version and waits only if that
+version matches, while a `DELETE`, a locking read, or an `UPDATE` through a secondary index
+waits. Which rows and gaps are locked follows from the index a statement reads, which the
+engine chooses and MySQL's optimizer may choose differently.
 An `INSERT` into an `AUTO_INCREMENT` table takes its id before it waits for a key another
 transaction holds, so measured on 8.4.11 an insert by a third session meanwhile takes the next
 id after it; here the waiting insert takes its id only once the wait ends, so the third
@@ -5108,15 +5132,15 @@ reading the other rows as its snapshot found them, as MySQL does; a write to a
 row another session changed after the snapshot is still given up with 1213.
 Another session's definition change waits for every transaction that used the
 table (its metadata lock, see `LOCK TABLES`), and a transaction that used only
-other tables commits after it, as on MySQL. `SERIALIZABLE` runs as one exclusive transaction there: it reads from
-its first statement and takes the database's one exclusive write slot at its
-first write, so the two transactions above still end with one committed and
-the other answered 1213. It is also given up with 1213 at its first write when
-any other session committed since its first read, even to rows it never read —
-measured on 8.4.11 that write goes ahead, InnoDB's shared locks only keeping
-others off the rows read — and while it holds the slot a `BEGIN CONCURRENT`
-writer in another session is answered 1213 at commit where MySQL lets it
-commit, or waits, if it touched those rows.
+other tables commits after it, as on MySQL. `SERIALIZABLE` is kept the way
+InnoDB keeps it: inside a transaction, with autocommit off or after `BEGIN`,
+every plain `SELECT` reads the latest committed rows as `FOR SHARE` does and
+locks them, rows and gaps, while a `SELECT` with autocommit on locks nothing.
+Measured on 8.4.11 and matched: the two transactions above meet in a deadlock,
+the first writer waiting for the second's lock and the second answered 1213
+when its write closes the cycle; a write of a row a `SERIALIZABLE` transaction
+read waits for it, and a commit to rows it never read does not keep it from
+writing.
 
 A database opened while `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` is set gets a
 `<file key>.turso-mysql-mvcc-log` file beside its other files, and it keeps
@@ -7279,7 +7303,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `WHERE` comparison against `CURDATE()` / `NOW()` / `CURTIME()` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/lib.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-now-comparison.json), [P0 manifest](conformance/Makefile) | Each is rendered as the engine call answering the same value in the same form — `date('now')`, `datetime('now')`, `time('now')` — and meets the column whose form it answers in: a day meets a `DATE`, a moment a `DATETIME` or `TIMESTAMP`, and a time of day a `TIME`, for sameness only. Both spellings of each, with and without parentheses, are read. Any other call on the right of a comparison is still refused. Every answer is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against a number written with a fraction — `money > 9.99` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-decimal-literal-comparison.json), [P0 manifest](conformance/Makefile) | Read as the number it names and carried into the rendered SQL as it was written, so the engine reads the same number. It meets any column that holds a number, whole or not; a text column is refused, the mirror of a string against an integer column. A direct comparison against a known exact `DECIMAL` column accepts whole numbers beyond `i64` up to 65 written digits; `IN` with those literals remains refused. A `HAVING` still takes only a whole number, being counted against a count. Every answer is pinned to the 8.4.11 golden. |
 | `LOCK TABLES` / `UNLOCK TABLES` | partial | partial | n/a | n/a | partial | [`lock parser`](parser/lock_tables.rs), [`write lock`](frontend/session.rs) | The lock is really held, until `UNLOCK TABLES`: it is the engine's write lock, held by the write transaction the statement opens, and a session that writes while it is held waits and answers 1205. One lock over the whole database rather than one for each table, so `READ` and `WRITE` take the same one and the names are read and let go. The statements between commit together at the unlock, so `START TRANSACTION`, `COMMIT` and `ROLLBACK` are refused while it is held rather than dropping the lock. `READ LOCAL`, `LOW_PRIORITY WRITE` and `LOCK INSTANCE FOR BACKUP` are refused. |
-| `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `SKIP LOCKED` takes the same lock, waiting for it where MySQL would skip the rows another session holds. `NOWAIT` and `OF <table>` are refused. `LOCK IN SHARE MODE` is read as `FOR SHARE`. With `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` the locks are row locks with InnoDB's waits, 1205, 1213 deadlock victims, `NOWAIT` (3572) and `SKIP LOCKED`; gap locks are not taken. |
+| `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `SKIP LOCKED` takes the same lock, waiting for it where MySQL would skip the rows another session holds. `NOWAIT` and `OF <table>` are refused. `LOCK IN SHARE MODE` is read as `FOR SHARE`. With `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` the locks are row locks with InnoDB's waits, 1205, 1213 deadlock victims, `NOWAIT` (3572) and `SKIP LOCKED`, and with InnoDB's gap and next-key locks under `REPEATABLE READ` and `SERIALIZABLE`. |
 | `WHERE` comparison against a `DATE` / `DATETIME` / `TIMESTAMP` / `TIME` / `YEAR` / `DECIMAL` / `DOUBLE` / `FLOAT` / `ENUM` / `SET` column | partial | partial | n/a | n/a | partial | [`comparison validator`](frontend/session.rs), [`temporal values`](parser/temporal_value.rs), [oracle case](conformance/cases/p0/select-temporal-comparison.json), [P0 manifest](conformance/Makefile) | These columns hold the canonical form MySQL stores, so a comparison against a value already written that way answers the rows MySQL answers, whatever each row was written as. A day and a moment read in order read in time order, so every operator works; a `TIME` runs past a day and carries a sign, so only `=`, `!=`, `<=>` and `IN` are answered for one. A `YEAR` and a real are compared as numbers. A value written any other way is refused rather than rewritten — measured, `d = '2024-1-1'`, `dt = '2024-01-01'` and `y = 24` each find rows in MySQL that comparing the stored form would not — while a bound `?` is normalized for DATE, DATETIME and TIMESTAMP columns. Bound TIME and YEAR comparisons remain refused. An `ENUM` or `SET` member spelled the way it was declared is compared for sameness; a member spelled another way, a number naming a member's position, and any ordering comparison are refused, because MySQL reads each of those by a rule the stored spelling does not meet. Every answer above is pinned to the 8.4.11 golden. |
 | Signed `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` assignment | partial | partial | rejected | planned | partial | [`numeric parser`](parser/lib.rs), [`assignment validator`](frontend/dialect.rs), [numeric oracle case](conformance/cases/p0/numeric-coercion.json), [MEDIUMINT oracle case](conformance/cases/p0/numeric-mediumint.json) | Strict signed ranges are checked before storage for marked columns: `TINYINT` −128..127, `SMALLINT` −32,768..32,767, `MEDIUMINT` −8,388,608..8,388,607, `INT` −2,147,483,648..2,147,483,647, and `BIGINT` `i64::MIN..i64::MAX`. The checked `INSERT`/`UPDATE` path covers parameters, multi-row rollback, triggers, TEMP/attached schemas, reopen, and `VACUUM`; durable DDL and metadata retain the width. String/real coercion, expressions, other widths, permissive warnings, casts, arithmetic, ordering, and protocol errors remain rejected or unimplemented. |
 | `SHOW COLUMNS` / `DESCRIBE` / `EXPLAIN table` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`frontend metadata`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [pinned case](conformance/cases/p0/show-columns.json) | Only plain `SHOW COLUMNS FROM table`, `DESCRIBE table`, `DESC table`, and `EXPLAIN table` — measured on MySQL 8.4.11, `EXPLAIN t` prints exactly what `DESCRIBE t` prints — with MySQL's own synonyms taken, `FIELDS` for `COLUMNS` and `IN` for `FROM`, since a schema reader written against MySQL reaches for either and measured on 8.4.11 all four spellings print the same rows — with one canonical unqualified table or one canonical marked view with a direct projection from one base table, plus an optional single semicolon, are accepted. The selected database is required; database-level `Query` authorization runs before metadata lookup, with an exact table `Select` grant as the narrow fallback. Table metadata comes from verified normalized MySQL DDL and typed defaults, including `PRI` and `auto_increment` for the checked primary auto-increment form. Direct-view metadata verifies persisted view rootpage, SQL, and base-column provenance; it preserves projected type and nullable metadata while clearing table-only `Key`, `Default`, and `Extra`. View chains, projection/source aliases, expressions, joins, qualified or system sources, and duplicate output names are rejected. Frontend metadata preserves declared `INT` versus `INTEGER` spelling, while the wire `Type` column canonicalizes both to `int`. Every type a `CREATE TABLE` here takes reads back, through one renderer shared with `SHOW CREATE TABLE`: a second table of type names had drifted five behind it — `DATE`, `TIME`, `YEAR`, `DOUBLE UNSIGNED` and `FLOAT UNSIGNED` — so a table holding any of them answered 1105 to `SHOW COLUMNS`, `SHOW FULL COLUMNS` and `DESCRIBE` alike while `SHOW CREATE TABLE` printed the same table without complaint. The two are one now, and all thirty-six types are measured on 8.4.11 and matched. Unknown extras fail closed. The pinned case/golden covers this metadata; scan, row, value, packet, and retained-memory bounds apply. A `LIKE` pattern names the columns to report, and `DESCRIBE t <name>` reads a name after the table the same way. `FULL` adds `Collation`, `Privileges` and `Comment`, the first from the stored column collation and the last always empty. `Privileges` reflects database or table grants; column-specific grants remain unsupported. Qualification outside an explicit selected database on `SHOW FULL COLUMNS`, comments, `WHERE`, `DESCRIBE TABLE t`, and a pattern after `EXPLAIN` remain rejected; `information_schema` is not a substitute and remains incomplete. |
