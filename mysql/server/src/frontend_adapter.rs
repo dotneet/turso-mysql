@@ -13856,6 +13856,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         }
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
+        LimboError::CompletionError(_) => FrontendErrorKind::StorageEngineIoFailure,
         LimboError::InvalidArgument(message)
             if message.starts_with(turso_mysql::GROUP_CONCAT_CUT_ERROR) =>
         {

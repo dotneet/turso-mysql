@@ -153,6 +153,23 @@ fn bigint_unsigned_arithmetic_overflow_uses_mysql_numeric_overflow() {
 }
 
 #[test]
+fn a_failed_read_write_or_sync_of_a_file_is_a_storage_engine_error_1030() {
+    let failed_sync = LimboError::CompletionError(turso_core::CompletionError::IOError(
+        std::io::ErrorKind::Other,
+        "sync",
+    ));
+    let kind = frontend_error_kind(failed_sync);
+    assert_eq!(kind, FrontendErrorKind::StorageEngineIoFailure);
+    let packet = crate::map_frontend_error(kind);
+    assert_eq!(packet.error_code, 1030);
+    assert_eq!(packet.sql_state, *b"HY000");
+    assert_eq!(
+        packet.message,
+        b"Got error 5 - 'Input/output error' from storage engine"
+    );
+}
+
+#[test]
 fn a_write_write_conflict_is_a_transaction_given_up_with_1213() {
     assert_eq!(
         frontend_error_kind(LimboError::WriteWriteConflict),

@@ -8,12 +8,13 @@ use crate::{
     schema_sql::{decode_schema_sql, CharacterSet, Collation, SchemaSqlKind, SchemaSqlMode},
     MySqlDialect,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use turso_core::{
-    io::FileSyncType,
+    io::{FileId, FileSyncType},
     storage::auto_increment::{AllocatorDatabaseIdentity, AllocatorOpenMode},
     storage::database::DatabaseFile,
-    AssignmentError, Database, DatabaseOpts, MemoryIO, OpenFlags, OpenOptions, PlatformIO,
-    SchemaCatalogValidationContext, Value, IO,
+    AssignmentError, Buffer, Completion, CompletionError, Database, DatabaseOpts, File, MemoryIO,
+    OpenFlags, OpenOptions, PlatformIO, SchemaCatalogValidationContext, Value, IO,
 };
 use turso_parser::parser::Parser;
 
@@ -1296,6 +1297,140 @@ fn a_counted_insert_under_mvcc_takes_its_numbers_in_one_counter_operation() -> R
     );
     connection.close()?;
     Ok(())
+}
+
+#[test]
+fn after_a_sync_of_the_counter_sidecar_fails_every_counted_insert_answers_an_io_error() -> Result<()>
+{
+    let path = "mysql-session-sidecar-sync-failure.db";
+    let database_identity = [0x5f; 16];
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let database =
+        open_database_with_identity(Arc::clone(&io), path, OpenFlags::Create, database_identity)?;
+    let sidecar = Arc::new(SyncFailingFile {
+        inner: io.open_file(
+            &format!("{path}.auto-increment"),
+            OpenFlags::Create | OpenFlags::NoLock,
+            false,
+        )?,
+        syncs: AtomicUsize::new(0),
+        fail_on_sync: AtomicUsize::new(usize::MAX),
+    });
+    let allocator = DurableRangeAllocator::from_file(
+        sidecar.clone(),
+        AllocatorDatabaseIdentity::new(database_identity)?,
+        AllocatorOpenMode::Create,
+        FileSyncType::Fsync,
+    )?;
+    let mut initialization = allocator.initialize()?;
+    io.block(|| initialization.step())?;
+    let connection = MySqlConnection::new_with_auto_increment_and_prepared_statement_authority(
+        database.connect()?,
+        binary_context(),
+        allocator,
+        Arc::clone(&io),
+        MySqlPreparedStatementAuthority::default(),
+    )?;
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
+    connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+
+    sidecar.fail_the_next_sync();
+    let failed =
+        connection.execute_checked_write("INSERT INTO users (name) VALUES ('Grace')", None);
+    assert!(
+        matches!(
+            failed,
+            Err(MySqlQueryError::Engine(LimboError::CompletionError(_)))
+        ),
+        "{failed:?}"
+    );
+    let syncs = sidecar.syncs.load(Ordering::SeqCst);
+    for sql in [
+        "INSERT INTO users (name) VALUES ('Linus')",
+        "INSERT INTO users (id, name) VALUES (50, 'Barbara')",
+    ] {
+        let refused = connection.execute_checked_write(sql, None);
+        assert!(
+            matches!(
+                refused,
+                Err(MySqlQueryError::Engine(LimboError::CompletionError(_)))
+            ),
+            "{sql}: {refused:?}"
+        );
+    }
+    assert_eq!(sidecar.syncs.load(Ordering::SeqCst), syncs);
+
+    connection.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+    connection.execute("INSERT INTO notes (id, body) VALUES (1, 'kept')")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, name FROM users")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1), Value::from_text("Ada")]]
+    );
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, body FROM notes")?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1), Value::from_text("kept")]]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+struct SyncFailingFile {
+    inner: Arc<dyn File>,
+    syncs: AtomicUsize,
+    fail_on_sync: AtomicUsize,
+}
+
+impl SyncFailingFile {
+    fn fail_the_next_sync(&self) {
+        self.fail_on_sync
+            .store(self.syncs.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+}
+
+impl File for SyncFailingFile {
+    fn file_id(&self) -> Result<FileId> {
+        self.inner.file_id()
+    }
+
+    fn lock_file(&self, exclusive: bool) -> Result<()> {
+        self.inner.lock_file(exclusive)
+    }
+
+    fn unlock_file(&self) -> Result<()> {
+        self.inner.unlock_file()
+    }
+
+    fn pread(&self, pos: u64, completion: Completion) -> Result<Completion> {
+        self.inner.pread(pos, completion)
+    }
+
+    fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, completion: Completion) -> Result<Completion> {
+        self.inner.pwrite(pos, buffer, completion)
+    }
+
+    fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        let call = self.syncs.fetch_add(1, Ordering::SeqCst);
+        if call == self.fail_on_sync.load(Ordering::SeqCst) {
+            return Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "sync",
+            )));
+        }
+        self.inner.sync(completion, sync_type)
+    }
+
+    fn size(&self) -> Result<u64> {
+        self.inner.size()
+    }
+
+    fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
+        self.inner.truncate(len, completion)
+    }
 }
 
 #[test]

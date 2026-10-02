@@ -347,6 +347,7 @@ pub enum FrontendErrorKind {
     TableDefinitionChanged,
     /// A catalog or storage failure whose details must not reach the client.
     Internal,
+    StorageEngineIoFailure,
     /// A referenced table, column, or other object does not exist.
     MissingObject,
     /// An identifier in the statement named no column.
@@ -532,6 +533,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             b"Table definition has changed, please retry transaction".as_slice(),
         ),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
+        FrontendErrorKind::StorageEngineIoFailure => (
+            1030,
+            *b"HY000",
+            b"Got error 5 - 'Input/output error' from storage engine".as_slice(),
+        ),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
         FrontendErrorKind::UnknownColumn => (1054, *b"42S22", b"unknown column".as_slice()),
         // Measured on MySQL 8.4.11: 1052, SQLSTATE 23000, for a name two
@@ -2724,6 +2730,7 @@ mod tests {
             ),
             (FrontendErrorKind::NotPreparable, 1295, *b"HY000"),
             (FrontendErrorKind::Internal, 1105, *b"HY000"),
+            (FrontendErrorKind::StorageEngineIoFailure, 1030, *b"HY000"),
             (FrontendErrorKind::MissingObject, 1146, *b"42S02"),
             (FrontendErrorKind::UnknownColumn, 1054, *b"42S22"),
             (FrontendErrorKind::PacketTooLarge, 1153, *b"08S01"),
