@@ -8,8 +8,8 @@ use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{CursorRowLocks, MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
-    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, RowLockMode,
-    RowLockWaitPolicy, TxID,
+    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, LockingRead, MetadataLockMode,
+    MetadataLockRequest, RowLockMode, RowLockWaitPolicy, TxID,
 };
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
@@ -45,10 +45,11 @@ use crate::util::{
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
 };
+use crate::vdbe::builder::CursorKey;
 use crate::vdbe::hash_table::{
     HashEntry, HashInsertResult, HashTable, HashTableConfig, PendingHashInsert, DEFAULT_MEM_BUDGET,
 };
-use crate::vdbe::insn::InsertFlags;
+use crate::vdbe::insn::{InsertFlags, Subprogram};
 use crate::vdbe::metrics::HashJoinMetrics;
 use crate::vdbe::vacuum::VacuumInPlaceOpContext;
 use crate::vdbe::value::ComparisonOp;
@@ -4874,6 +4875,15 @@ pub fn op_transaction_inner(
                         // for both.
                         let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
                         let has_existing_mv_tx = current_mv_tx.is_some();
+                        if let Err(err) =
+                            lock_the_tables_the_statement_uses(program, state, mv_store, &conn)
+                        {
+                            if started_read_tx {
+                                conn.set_tx_state(TransactionState::None);
+                                state.auto_txn_cleanup = TxnCleanup::None;
+                            }
+                            return Err(err.into());
+                        }
                         if let Some((tx_id, TransactionMode::Concurrent)) = current_mv_tx {
                             if statement_writes_db && !conn.is_nested_stmt() {
                                 mv_store.begin_writing_in_concurrent_tx(tx_id)?;
@@ -4945,6 +4955,7 @@ pub fn op_transaction_inner(
                                     program
                                         .connection
                                         .set_mv_tx_for_db(*db, Some((tx_id, *tx_mode)));
+                                    conn.give_metadata_locks_to_the_transaction(mv_store, tx_id);
                                     if started_read_tx && conn.get_auto_commit() {
                                         state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                                     }
@@ -5409,6 +5420,7 @@ pub fn op_auto_commit(
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.release_metadata_locks_no_transaction_took();
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
@@ -5427,6 +5439,7 @@ pub fn op_auto_commit(
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.release_metadata_locks_no_transaction_took();
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
@@ -17139,6 +17152,107 @@ pub fn op_open_dup(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn lock_the_tables_the_statement_uses(
+    program: &Program,
+    state: &ProgramState,
+    mv_store: &MvStore,
+    connection: &Connection,
+) -> Result<()> {
+    if !mv_store.row_locks_enabled() || connection.is_nested_stmt() {
+        return Ok(());
+    }
+    let tables = tables_the_statement_uses(program, state);
+    if tables.is_empty() {
+        return Ok(());
+    }
+    let owner = connection.metadata_lock_owner(mv_store);
+    let owner_is_a_transaction = connection.get_mv_tx_id() == Some(owner);
+    let owner_held_nothing_before = !mv_store.holds_table_metadata(owner);
+    for (table, mode) in tables {
+        if owner_is_a_transaction && mv_store.table_definition_changed_since(owner, &table) {
+            return Err(LimboError::TableDefinitionChanged(table));
+        }
+        if !mv_store.lock_table_metadata(owner, &table, mode).is_empty() {
+            return Err(LimboError::TableMetadataLocked(MetadataLockRequest {
+                owner,
+                table,
+                mode,
+                owner_held_nothing_before,
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn tables_the_statement_uses(
+    program: &Program,
+    state: &ProgramState,
+) -> Vec<(String, MetadataLockMode)> {
+    let mut tables = Vec::new();
+    add_the_tables_a_program_uses(
+        &program.cursor_ref,
+        &program.insns,
+        state.locking_read.as_ref(),
+        &mut tables,
+    );
+    tables.sort();
+    tables.dedup_by(|later, kept| {
+        if later.0 != kept.0 {
+            return false;
+        }
+        kept.1 = kept.1.max(later.1);
+        true
+    });
+    tables
+}
+
+fn add_the_tables_a_program_uses(
+    cursor_ref: &[(Option<CursorKey>, CursorType)],
+    insns: &[(Insn, usize)],
+    locking_read: Option<&LockingRead>,
+    tables: &mut Vec<(String, MetadataLockMode)>,
+) {
+    let written_cursors: Vec<usize> = insns
+        .iter()
+        .filter_map(|(insn, _)| match insn {
+            Insn::OpenWrite { cursor_id, .. } => Some(*cursor_id),
+            _ => None,
+        })
+        .collect();
+    for (cursor_id, (_, cursor_type)) in cursor_ref.iter().enumerate() {
+        let table = match cursor_type {
+            CursorType::BTreeTable(table) => table.name.as_str(),
+            CursorType::BTreeIndex(index) => index.table_name.as_str(),
+            _ => continue,
+        };
+        if crate::schema::is_system_table(table) {
+            continue;
+        }
+        let locked_for_update = locking_read.is_some_and(|read| {
+            read.mode == RowLockMode::Exclusive
+                && read
+                    .tables
+                    .iter()
+                    .any(|locked| locked.eq_ignore_ascii_case(table))
+        });
+        let mode = if written_cursors.contains(&cursor_id) || locked_for_update {
+            MetadataLockMode::SharedWrite
+        } else {
+            MetadataLockMode::SharedRead
+        };
+        tables.push((table.to_ascii_lowercase(), mode));
+    }
+    for (insn, _) in insns {
+        if let Insn::Program {
+            program: Subprogram::PreparedProgram(subprogram),
+            ..
+        } = insn
+        {
+            add_the_tables_a_program_uses(&subprogram.cursor_ref, &subprogram.insns, None, tables);
+        }
+    }
 }
 
 fn row_locks_for_cursor(

@@ -18,6 +18,7 @@ mod index_method;
 mod integrity_check;
 mod mvcc;
 mod mvcc_row_locks;
+mod mvcc_table_metadata_locks;
 mod pragma;
 mod query_processing;
 mod query_timeout;

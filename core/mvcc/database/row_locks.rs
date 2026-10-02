@@ -184,6 +184,10 @@ impl RowLocks {
         Some(victim)
     }
 
+    pub(crate) fn wake_waiters(&self) {
+        self.transaction_ended.released();
+    }
+
     pub(crate) fn stop_waiting(&self, waiter: TxID) {
         let mut table = self.table.lock();
         table.waits_for.remove(&waiter);

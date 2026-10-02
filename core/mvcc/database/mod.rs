@@ -68,6 +68,10 @@ pub use checkpoint_state_machine::{
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
+mod metadata_locks;
+pub use metadata_locks::{MetadataLockMode, MetadataLockRequest};
+pub(crate) use metadata_locks::{MetadataLockWaitEnd, MetadataLocks};
+
 mod row_locks;
 pub use row_locks::{LockingRead, RowLockMode, RowLockWaitPolicy};
 pub(crate) use row_locks::{RowLockWaitEnd, RowLocks};
@@ -3198,10 +3202,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     // Now check if we saw schema change which would require reprepare. Let's note
                     // that we check this right after exlusive tx because we update this before we release
                     // exclusive lock.
-                    let schema_updated = mvcc_store
-                        .last_committed_schema_change_ts
-                        .load(Ordering::Acquire)
-                        > tx.begin_ts();
+                    let our_cookie = tx.header.read().schema_cookie.get();
+                    let metadata_locks_on = mvcc_store.row_locks.enabled();
+                    let schema_updated = if metadata_locks_on {
+                        mvcc_store
+                            .metadata_locks
+                            .a_used_definition_changed_after(self.tx_id, u64::from(our_cookie))
+                    } else {
+                        mvcc_store
+                            .last_committed_schema_change_ts
+                            .load(Ordering::Acquire)
+                            > tx.begin_ts()
+                    };
                     // last_committed_schema_ts is not enough, we need to check schema cookie
                     // is the same because e.g:
                     // T1 CREATE INDEX
@@ -3215,7 +3227,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     // we will see schema was not updated because we see an younger timestamp and
                     // ours is older!
                     //
-                    let our_cookie = tx.header.read().schema_cookie.get();
                     let global_cookie = {
                         let h = mvcc_store.global_header.read();
                         let h = h.as_ref();
@@ -3225,7 +3236,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                     let header_dirty = tx.header_dirty.load(Ordering::Acquire);
                     turso_assert!(!header_dirty || mvcc_store.is_exclusive_tx(&tx.tx_id), "header_dirty=true implies that tx is exclusive");
-                    if our_cookie != global_cookie && !header_dirty {
+                    if our_cookie != global_cookie && !header_dirty && !metadata_locks_on {
                         tracing::debug!("cookie mismatch in CommitState::Initial tx({our_cookie}) != global(!{global_cookie})");
                         schema_conflict = true;
                     }
@@ -3673,6 +3684,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if schema_did_change {
                     let schema = self.connection.schema.read().clone();
                     self.connection.db.update_schema_if_newer(schema);
+                    if mvcc_store.row_locks.enabled() {
+                        mvcc_store.note_table_definitions_changed(
+                            tx_unlocked,
+                            u64::from(tx_header.schema_cookie.get()),
+                        )?;
+                    }
                 }
                 // Guard the global_header write against out-of-order
                 // completion. An exclusive tx can bypass `pager_commit_lock`
@@ -3682,11 +3699,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // older write would regress `global_header.schema_cookie`
                 // below the latest committed value. The same monotonicity
                 // applies in FinalizeCommit below.
-                let prev_hdr_ts = mvcc_store
-                    .last_global_header_ts
-                    .fetch_max(*end_ts, Ordering::AcqRel);
-                if prev_hdr_ts <= *end_ts {
-                    self.header.write().replace(tx_header);
+                if mvcc_store.publishes_the_header_of(tx_unlocked) {
+                    let prev_hdr_ts = mvcc_store
+                        .last_global_header_ts
+                        .fetch_max(*end_ts, Ordering::AcqRel);
+                    if prev_hdr_ts <= *end_ts {
+                        self.header.write().replace(tx_header);
+                    }
                 }
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
@@ -3753,7 +3772,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     let last_committed_ts = mvcc_store
                         .last_committed_tx_ts
                         .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
+                    if last_committed_ts <= *end_ts
+                        && mvcc_store.publishes_the_header_of(tx_unlocked)
+                    {
                         global_header.replace(tx_header);
                     }
                 }
@@ -4590,6 +4611,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     gc_last_lwm: AtomicU64,
     experimental_mvcc_passive_checkpoint: bool,
     row_locks: RowLocks,
+    metadata_locks: MetadataLocks,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -4716,6 +4738,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             gc_last_lwm: AtomicU64::new(u64::MAX),
             experimental_mvcc_passive_checkpoint,
             row_locks: RowLocks::default(),
+            metadata_locks: MetadataLocks::default(),
         })
     }
 
@@ -6578,6 +6601,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
     ) -> Result<TxID> {
+        #[cfg(not(any(test, injected_yields)))]
+        let _ = connection;
         turso_assert!(
             maybe_existing_tx_id.is_none() || !checkpoint_read_guard.is_held(),
             "checkpoint read guard is only passed for fresh MVCC begins"
@@ -6949,8 +6974,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let has_written = !tx.write_set.lock().is_empty();
         let mut schema_changed_under_writes = false;
         self.clock.get_timestamp(|ts| {
-            let schema_changed =
-                self.last_committed_schema_change_ts.load(Ordering::Acquire) > tx.begin_ts();
+            let schema_changed = if self.row_locks.enabled() {
+                let read_with = u64::from(tx.header.read().schema_cookie.get());
+                self.metadata_locks
+                    .a_used_definition_changed_after(tx_id, read_with)
+            } else {
+                self.last_committed_schema_change_ts.load(Ordering::Acquire) > tx.begin_ts()
+            };
             if schema_changed && has_written {
                 schema_changed_under_writes = true;
                 return;
@@ -7061,6 +7091,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn release_row_locks(&self, tx_id: TxID) {
         if self.row_locks.enabled() {
+            self.metadata_locks.release(tx_id);
             self.row_locks.release(tx_id);
         }
     }
@@ -7121,7 +7152,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     pub(crate) fn start_row_lock_wait(&self, waiter: TxID, holders: &[TxID]) -> Option<TxID> {
         self.row_locks
-            .start_waiting(waiter, holders, |tx_id| self.rows_written_by(tx_id))
+            .start_waiting(waiter, holders, |tx_id| self.deadlock_weight(tx_id))
     }
 
     pub(crate) fn wait_for_row_lock_holders(
@@ -7143,10 +7174,123 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.row_locks.stop_waiting(waiter);
     }
 
+    fn deadlock_weight(&self, tx_id: TxID) -> u64 {
+        let definition_lock_weight = if self.metadata_locks.waits_for_a_definition_lock(tx_id) {
+            1 << 40
+        } else {
+            0
+        };
+        definition_lock_weight + self.rows_written_by(tx_id)
+    }
+
     fn rows_written_by(&self, tx_id: TxID) -> u64 {
         self.txs
             .get(&tx_id)
             .map_or(0, |tx| tx.value().write_set.lock().entries.len() as u64)
+    }
+
+    pub(crate) fn lock_table_metadata(
+        &self,
+        owner: TxID,
+        table: &str,
+        mode: MetadataLockMode,
+    ) -> Vec<TxID> {
+        self.metadata_locks.lock(owner, table, mode)
+    }
+
+    pub(crate) fn holds_table_metadata(&self, owner: TxID) -> bool {
+        self.metadata_locks.holds_any(owner)
+    }
+
+    pub(crate) fn wait_for_table_metadata(
+        &self,
+        owner: TxID,
+        table: &str,
+        mode: MetadataLockMode,
+        deadline: std::time::Instant,
+        interrupted: impl Fn() -> bool,
+    ) -> MetadataLockWaitEnd {
+        self.metadata_locks.add_waiting(owner, table, mode);
+        loop {
+            let in_the_way = self.metadata_locks.lock(owner, table, mode);
+            if in_the_way.is_empty() {
+                self.row_locks.stop_waiting(owner);
+                return MetadataLockWaitEnd::Granted;
+            }
+            if self.start_row_lock_wait(owner, &in_the_way) == Some(owner) {
+                return MetadataLockWaitEnd::ChosenAsDeadlockVictim;
+            }
+            let end = self.row_locks.wait(
+                Some(owner),
+                deadline,
+                || self.metadata_locks.owners_in_the_way(owner, table, mode) == in_the_way,
+                &interrupted,
+            );
+            match end {
+                RowLockWaitEnd::HoldersEnded => continue,
+                RowLockWaitEnd::TimedOut => return MetadataLockWaitEnd::TimedOut,
+                RowLockWaitEnd::ChosenAsDeadlockVictim => {
+                    return MetadataLockWaitEnd::ChosenAsDeadlockVictim
+                }
+                RowLockWaitEnd::Interrupted => return MetadataLockWaitEnd::Interrupted,
+            }
+        }
+    }
+
+    pub(crate) fn stop_waiting_for_table_metadata(&self, owner: TxID, table: &str) {
+        self.row_locks.stop_waiting(owner);
+        self.metadata_locks.remove_waiting(owner, table);
+        self.row_locks.wake_waiters();
+    }
+
+    pub(crate) fn release_table_metadata(&self, owner: TxID) {
+        self.row_locks.stop_waiting(owner);
+        if self.metadata_locks.release(owner) {
+            self.row_locks.wake_waiters();
+        }
+    }
+
+    pub(crate) fn move_table_metadata(&self, from: TxID, to: TxID) {
+        self.metadata_locks.move_locks(from, to);
+    }
+
+    fn publishes_the_header_of(&self, tx: &Transaction<A>) -> bool {
+        !self.row_locks.enabled() || tx.header_dirty.load(Ordering::Acquire)
+    }
+
+    fn note_table_definitions_changed(
+        &self,
+        tx: &Transaction<A>,
+        schema_version: u64,
+    ) -> Result<()> {
+        let mut tables = Vec::new();
+        for (id, versions) in tx.write_set.lock().entries.iter() {
+            if id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+                continue;
+            }
+            for version in versions.read().iter() {
+                let Some(data) = version.row.data.as_ref() else {
+                    continue;
+                };
+                let record = ImmutableRecordRef::from_bin_record(data);
+                let (_, _, table) = record.get_three_values(0, 1, 2)?;
+                if let ValueRef::Text(table) = table {
+                    tables.push(table.as_str().to_ascii_lowercase());
+                }
+            }
+        }
+        self.metadata_locks
+            .note_definitions_changed(&tables, schema_version);
+        Ok(())
+    }
+
+    pub(crate) fn table_definition_changed_since(&self, tx_id: TxID, table: &str) -> bool {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return false;
+        };
+        let read_with = u64::from(tx.value().header.read().schema_cookie.get());
+        self.metadata_locks
+            .definition_changed_after(table, read_with)
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]

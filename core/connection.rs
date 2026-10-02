@@ -1,5 +1,6 @@
 use crate::alloc::{TryClone, TursoTryWithCapacityExt, TursoVecExt};
 use crate::error::io_error;
+use crate::mvcc::database::{MetadataLockMode, MetadataLockWaitEnd};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
@@ -45,6 +46,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use tracing::{instrument, Level};
 use turso_macros::{turso_assert_ne, AtomicEnum};
+
+pub(crate) const DEFAULT_METADATA_LOCK_WAIT_MS: u64 = 31_536_000_000;
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -734,6 +737,10 @@ pub struct Connection {
     pub(crate) main_database_was_used: AtomicBool,
     /// See [`Connection::set_exclusive_tx_waits_for_writers`].
     pub(crate) exclusive_tx_waits_for_writers: AtomicBool,
+    pub(crate) metadata_lock_wait_ms: AtomicU64,
+    pub(crate) metadata_owner_outside_a_transaction: AtomicU64,
+    pub(crate) metadata_owner_is_kept: AtomicBool,
+    pub(crate) snapshot_moves_after_a_lock_wait: AtomicBool,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -2699,6 +2706,7 @@ impl Connection {
             return Ok(());
         }
         self.closed.store(true, Ordering::SeqCst);
+        self.release_metadata_locks_outside_a_transaction();
         let pager = self.pager.load();
 
         match self.get_tx_state() {
@@ -3241,6 +3249,115 @@ impl Connection {
         self.exclusive_tx_waits_for_writers.load(Ordering::SeqCst)
     }
 
+    pub fn set_metadata_lock_wait(&self, wait: Duration) {
+        let millis = wait.as_millis().min(u128::from(u64::MAX)) as u64;
+        self.metadata_lock_wait_ms.store(millis, Ordering::SeqCst);
+    }
+
+    pub(crate) fn metadata_lock_wait(&self) -> Duration {
+        Duration::from_millis(self.metadata_lock_wait_ms.load(Ordering::SeqCst))
+    }
+
+    pub fn set_snapshot_moves_after_a_lock_wait(&self, moves: bool) {
+        self.snapshot_moves_after_a_lock_wait
+            .store(moves, Ordering::SeqCst);
+    }
+
+    pub(crate) fn snapshot_moves_after_a_lock_wait(&self) -> bool {
+        self.snapshot_moves_after_a_lock_wait.load(Ordering::SeqCst)
+    }
+
+    pub fn lock_tables_metadata(&self, tables: &[(&str, MetadataLockMode)]) -> Result<()> {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return Err(LimboError::TxError(
+                "table metadata locks need MVCC".to_string(),
+            ));
+        };
+        turso_assert!(
+            mv_store.row_locks_enabled(),
+            "table metadata locks are taken only where row locks are on"
+        );
+        let owner = self.metadata_lock_owner(mv_store);
+        if self.get_mv_tx_id().is_none() {
+            self.metadata_owner_is_kept.store(true, Ordering::SeqCst);
+        }
+        let deadline = std::time::Instant::now() + self.metadata_lock_wait();
+        let mut requests: Vec<(String, MetadataLockMode)> = tables
+            .iter()
+            .map(|(table, mode)| (table.to_ascii_lowercase(), *mode))
+            .collect();
+        requests.sort();
+        for (table, mode) in requests {
+            if mv_store.lock_table_metadata(owner, &table, mode).is_empty() {
+                continue;
+            }
+            let end = mv_store
+                .wait_for_table_metadata(owner, &table, mode, deadline, || self.is_interrupted());
+            if end == MetadataLockWaitEnd::Granted {
+                continue;
+            }
+            mv_store.stop_waiting_for_table_metadata(owner, &table);
+            return Err(match end {
+                MetadataLockWaitEnd::TimedOut => LimboError::Busy,
+                MetadataLockWaitEnd::ChosenAsDeadlockVictim => LimboError::WriteWriteConflict,
+                MetadataLockWaitEnd::Interrupted => LimboError::Interrupt,
+                MetadataLockWaitEnd::Granted => unreachable!("a granted lock does not fail"),
+            });
+        }
+        Ok(())
+    }
+
+    pub fn release_metadata_locks_outside_a_transaction(&self) {
+        let Some(owner) = self.take_metadata_owner_outside_a_transaction() else {
+            return;
+        };
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            mv_store.release_table_metadata(owner);
+        }
+    }
+
+    pub(crate) fn release_metadata_locks_no_transaction_took(&self) {
+        if self.get_mv_tx_id().is_some() || self.metadata_owner_is_kept.load(Ordering::SeqCst) {
+            return;
+        }
+        self.release_metadata_locks_outside_a_transaction();
+    }
+
+    pub(crate) fn metadata_lock_owner(&self, mv_store: &MvStore) -> u64 {
+        if let Some(tx_id) = self.get_mv_tx_id() {
+            return tx_id;
+        }
+        let owner = self
+            .metadata_owner_outside_a_transaction
+            .load(Ordering::SeqCst);
+        if owner != 0 {
+            return owner;
+        }
+        let owner = mv_store.get_tx_id();
+        self.metadata_owner_outside_a_transaction
+            .store(owner, Ordering::SeqCst);
+        owner
+    }
+
+    pub(crate) fn give_metadata_locks_to_the_transaction(&self, mv_store: &MvStore, tx_id: u64) {
+        if self.get_auto_commit() && self.metadata_owner_is_kept.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(owner) = self.take_metadata_owner_outside_a_transaction() else {
+            return;
+        };
+        mv_store.move_table_metadata(owner, tx_id);
+    }
+
+    pub(crate) fn take_metadata_owner_outside_a_transaction(&self) -> Option<u64> {
+        self.metadata_owner_is_kept.store(false, Ordering::SeqCst);
+        let owner = self
+            .metadata_owner_outside_a_transaction
+            .swap(0, Ordering::SeqCst);
+        (owner != 0).then_some(owner)
+    }
+
     /// Fixes what an explicit transaction reads now, instead of at its first
     /// read.
     ///
@@ -3301,6 +3418,17 @@ impl Connection {
     /// change committed after its snapshot: its writes can no longer commit.
     pub fn refresh_read_snapshot(&self) -> Result<()> {
         self.check_no_statement_runs_in_explicit_transaction()?;
+        self.move_read_snapshot_to_now()
+    }
+
+    pub(crate) fn move_snapshot_after_a_lock_wait(&self) -> Result<()> {
+        if self.get_auto_commit() || self.n_active_root_statements.load(Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
+        self.move_read_snapshot_to_now()
+    }
+
+    fn move_read_snapshot_to_now(&self) -> Result<()> {
         let mv_store = self.mv_store();
         let Some(mv_store) = mv_store.as_ref() else {
             return Err(LimboError::TxError(

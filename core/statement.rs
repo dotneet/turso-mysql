@@ -13,7 +13,9 @@ use turso_parser::ast::{fmt::ToTokens, Cmd};
 use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
-    mvcc::database::{LockingRead, RowLockWaitEnd, RowLockWaitPolicy},
+    mvcc::database::{
+        LockingRead, MetadataLockRequest, MetadataLockWaitEnd, RowLockWaitEnd, RowLockWaitPolicy,
+    },
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -331,6 +333,8 @@ pub struct Statement {
     nested_guard_active: bool,
     locking_read: Option<LockingRead>,
     row_lock_wait: Option<RowLockWait>,
+    table_metadata_wait: Option<TableMetadataWait>,
+    owner_held_no_table_metadata_before: Option<bool>,
     reads_latest_rows_in: Option<u64>,
     repeats_rows_after_a_wait: bool,
 }
@@ -340,6 +344,12 @@ struct RowLockWait {
     holders: Vec<u64>,
     deadline: std::time::Instant,
     end: Option<RowLockWaitEnd>,
+}
+
+struct TableMetadataWait {
+    request: MetadataLockRequest,
+    deadline: std::time::Instant,
+    end: Option<MetadataLockWaitEnd>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -423,6 +433,8 @@ impl Statement {
             analyze_refresh: None,
             locking_read: None,
             row_lock_wait: None,
+            table_metadata_wait: None,
+            owner_held_no_table_metadata_before: None,
             reads_latest_rows_in: None,
             repeats_rows_after_a_wait: false,
         }
@@ -606,6 +618,7 @@ impl Statement {
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
             || self.row_lock_wait.is_some()
+            || self.table_metadata_wait.is_some()
         {
             if let Some(result) = self.prepare_step(waker)? {
                 return Ok(result);
@@ -667,6 +680,11 @@ impl Statement {
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if self.row_lock_wait.is_some() {
             if let Some(result) = self.end_row_lock_wait(waker)? {
+                return Ok(Some(result));
+            }
+        }
+        if self.table_metadata_wait.is_some() {
+            if let Some(result) = self.end_table_metadata_wait(waker)? {
                 return Ok(Some(result));
             }
         }
@@ -770,6 +788,17 @@ impl Statement {
 
         if matches!(&res, Err(err) if matches!(**err, LimboError::RowLocked(_))) {
             res = self.wait_for_the_rows_held(res, waker);
+        }
+        if matches!(&res, Err(err) if matches!(**err, LimboError::TableMetadataLocked(_))) {
+            res = self.wait_for_the_table_metadata(res, waker);
+        }
+        if matches!(res, Ok(StepResult::Done)) || res.is_err() {
+            self.owner_held_no_table_metadata_before = None;
+        }
+        if res.is_err() {
+            self.program
+                .connection
+                .release_metadata_locks_no_transaction_took();
         }
         if matches!(res, Ok(StepResult::Done)) || res.is_err() {
             self.stop_reading_latest_rows();
@@ -1020,6 +1049,24 @@ impl Statement {
     /// it pumps IO as for any other suspension, which retries once the delay
     /// has passed.
     fn wait_out_busy_delay(&mut self) -> Result<()> {
+        if let Some(wait) = self.table_metadata_wait.as_mut() {
+            if wait.end.is_none() {
+                let connection = &self.program.connection;
+                let mv_store = connection
+                    .mv_store()
+                    .as_ref()
+                    .cloned()
+                    .expect("only an MVCC database waits for a table's metadata lock");
+                wait.end = Some(mv_store.wait_for_table_metadata(
+                    wait.request.owner,
+                    &wait.request.table,
+                    wait.request.mode,
+                    wait.deadline,
+                    || connection.is_interrupted(),
+                ));
+            }
+            return Ok(());
+        }
         if let Some(wait) = self.row_lock_wait.as_mut() {
             if wait.end.is_none() {
                 let connection = &self.program.connection;
@@ -1160,6 +1207,112 @@ impl Statement {
         if let Some(mv_store) = self.program.connection.mv_store().as_ref() {
             mv_store.stop_row_lock_wait(waiter);
         }
+    }
+
+    fn wait_for_the_table_metadata(
+        &mut self,
+        res: std::result::Result<StepResult, Box<LimboError>>,
+        waker: Option<&Waker>,
+    ) -> std::result::Result<StepResult, Box<LimboError>> {
+        let Err(err) = &res else {
+            return res;
+        };
+        let LimboError::TableMetadataLocked(request) = &**err else {
+            return res;
+        };
+        self.owner_held_no_table_metadata_before
+            .get_or_insert(request.owner_held_nothing_before);
+        let now = std::time::Instant::now();
+        let deadline = now + self.program.connection.metadata_lock_wait();
+        self.table_metadata_wait = Some(TableMetadataWait {
+            request: request.clone(),
+            deadline,
+            end: None,
+        });
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
+        }
+        Ok(StepResult::Sleep {
+            duration: deadline.saturating_duration_since(now),
+        })
+    }
+
+    fn end_table_metadata_wait(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+        let connection = self.program.connection.clone();
+        let mv_store = connection
+            .mv_store()
+            .as_ref()
+            .cloned()
+            .expect("only an MVCC database waits for a table's metadata lock");
+        let wait = self
+            .table_metadata_wait
+            .as_mut()
+            .expect("a table metadata lock wait is under way");
+        let end = match wait.end {
+            Some(end) => end,
+            None => {
+                let now = std::time::Instant::now();
+                let end = mv_store.wait_for_table_metadata(
+                    wait.request.owner,
+                    &wait.request.table,
+                    wait.request.mode,
+                    now,
+                    || connection.is_interrupted(),
+                );
+                if end == MetadataLockWaitEnd::TimedOut && now < wait.deadline {
+                    if let Some(waker) = waker {
+                        waker.wake_by_ref();
+                    }
+                    return Ok(Some(StepResult::Sleep {
+                        duration: wait.deadline - now,
+                    }));
+                }
+                end
+            }
+        };
+        let request = self
+            .table_metadata_wait
+            .take()
+            .expect("a table metadata lock wait is under way")
+            .request;
+        let owner_held_nothing_before = self.owner_held_no_table_metadata_before == Some(true);
+        if end == MetadataLockWaitEnd::Granted {
+            self.reset_internal(None, None, false)?;
+            if owner_held_nothing_before || connection.snapshot_moves_after_a_lock_wait() {
+                connection.move_snapshot_after_a_lock_wait()?;
+            }
+            return Ok(None);
+        }
+        mv_store.stop_waiting_for_table_metadata(request.owner, &request.table);
+        if end == MetadataLockWaitEnd::ChosenAsDeadlockVictim && owner_held_nothing_before {
+            mv_store.release_table_metadata(request.owner);
+            self.reset_internal(None, None, false)?;
+            return Ok(None);
+        }
+        let failure = match end {
+            MetadataLockWaitEnd::TimedOut => LimboError::Busy,
+            MetadataLockWaitEnd::ChosenAsDeadlockVictim => {
+                self.give_up_the_transaction_for_a_deadlock();
+                LimboError::WriteWriteConflict
+            }
+            MetadataLockWaitEnd::Interrupted => LimboError::Interrupt,
+            MetadataLockWaitEnd::Granted => unreachable!("a granted lock was handled above"),
+        };
+        self.owner_held_no_table_metadata_before = None;
+        connection.release_metadata_locks_no_transaction_took();
+        self.release_active_root_if_counted();
+        Err(failure)
+    }
+
+    fn give_up_table_metadata_wait(&mut self) {
+        let Some(wait) = self.table_metadata_wait.take() else {
+            return;
+        };
+        let connection = &self.program.connection;
+        if let Some(mv_store) = connection.mv_store().as_ref() {
+            mv_store.stop_waiting_for_table_metadata(wait.request.owner, &wait.request.table);
+        }
+        connection.release_metadata_locks_no_transaction_took();
     }
 
     fn give_up_the_transaction_for_a_deadlock(&mut self) {
@@ -1867,6 +2020,7 @@ impl Statement {
         let mut reset_error: Option<LimboError> = None;
 
         self.give_up_row_lock_wait();
+        self.give_up_table_metadata_wait();
         self.stop_reading_latest_rows();
 
         // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement

@@ -3561,6 +3561,15 @@ impl Program {
                     }
                     self.connection.set_changes(0);
                 }
+                Some(LimboError::TableMetadataLocked(_)) => {
+                    self.connection.set_changes(0);
+                }
+                Some(LimboError::TableDefinitionChanged(_)) => {
+                    if must_rollback_tx_if_needed {
+                        self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
                 // Same-connection "SQL statements in progress" rejections do
                 // not cause a rollback either: the rejected operation was
                 // refused before it touched any transaction or savepoint

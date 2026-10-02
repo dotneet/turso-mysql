@@ -31,7 +31,9 @@ pub mod json;
 ))]
 mod multiprocess_tests;
 pub mod mvcc;
-pub use mvcc::database::{LockingRead, RowLockMode, RowLockWaitPolicy};
+pub use mvcc::database::{
+    LockingRead, MetadataLockMode, MetadataLockRequest, RowLockMode, RowLockWaitPolicy,
+};
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
