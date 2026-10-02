@@ -5811,7 +5811,7 @@ impl MySqlConnection {
                 "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
             )
         })?;
-        let high_water = self.when_the_counter_is_free(|| {
+        let high_water = self.when_the_counter_is_free(&capability.allocator, || {
             let mut query = capability.allocator.peek_high_water(table.key)?;
             capability.io.block(|| query.step())
         })?;
@@ -5955,7 +5955,7 @@ impl MySqlConnection {
             ));
         }
         let (mut lease, current) = self
-            .when_the_counter_is_free(|| {
+            .when_the_counter_is_free(&capability.allocator, || {
                 let mut lease = capability.allocator.lease_high_water(table.key)?;
                 let current = capability.io.block(|| lease.read())?;
                 Ok((lease, current))
@@ -10303,7 +10303,7 @@ impl MySqlConnection {
         // number and still writes the rows that fit, which this does not
         // repeat.
         let high_water = self
-            .when_the_counter_is_free(|| {
+            .when_the_counter_is_free(&capability.allocator, || {
                 let mut peek = capability.allocator.peek_high_water(table.key)?;
                 capability.io.block(|| peek.step())
             })
@@ -10319,7 +10319,7 @@ impl MySqlConnection {
         }
         self.check_write_deadline(deadline)?;
         let range = self
-            .when_the_counter_is_free(|| {
+            .when_the_counter_is_free(&capability.allocator, || {
                 let mut reservation = capability.allocator.reserve(table.key, spent)?;
                 capability.io.block(|| reservation.step())
             })
@@ -10647,7 +10647,7 @@ impl MySqlConnection {
             )
         })?;
         self.check_write_deadline(deadline)?;
-        self.when_the_counter_is_free(|| {
+        self.when_the_counter_is_free(&capability.allocator, || {
             let mut operation = capability.allocator.advance_past(table.key, high_water)?;
             capability.io.block(|| operation.step())
         })
@@ -10988,7 +10988,7 @@ impl MySqlConnection {
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let high_water = self.when_the_counter_is_free(|| {
+        let high_water = self.when_the_counter_is_free(&capability.allocator, || {
             let mut peek = capability.allocator.peek_high_water(table.key)?;
             capability.io.block(|| peek.step())
         })?;
@@ -11157,7 +11157,7 @@ impl MySqlConnection {
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let high_water = self.when_the_counter_is_free(|| {
+        let high_water = self.when_the_counter_is_free(&capability.allocator, || {
             let mut peek = capability.allocator.peek_high_water(table.key)?;
             capability.io.block(|| peek.step())
         })?;
@@ -11195,11 +11195,12 @@ impl MySqlConnection {
         }
         self.check_write_deadline(deadline)
             .map_err(Into::<LimboError>::into)?;
-        let (mut lease, mut current) = self.when_the_counter_is_free(|| {
-            let mut lease = capability.allocator.lease_high_water(table.key)?;
-            let current = capability.io.block(|| lease.read())?;
-            Ok((lease, current))
-        })?;
+        let (mut lease, mut current) =
+            self.when_the_counter_is_free(&capability.allocator, || {
+                let mut lease = capability.allocator.lease_high_water(table.key)?;
+                let current = capability.io.block(|| lease.read())?;
+                Ok((lease, current))
+            })?;
         if highest_explicit <= current {
             lease.release()?;
             return Ok(None);
@@ -11430,10 +11431,16 @@ impl MySqlConnection {
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let high_water = self.when_the_counter_is_free(|| {
-            let mut peek = capability.allocator.peek_high_water(table.key)?;
-            capability.io.block(|| peek.step())
+        let last_seen = self.when_the_counter_is_free(&capability.allocator, || {
+            capability.allocator.last_seen_high_water(table.key)
         })?;
+        let high_water = match last_seen {
+            Some(high_water) => high_water,
+            None => self.when_the_counter_is_free(&capability.allocator, || {
+                let mut peek = capability.allocator.peek_high_water(table.key)?;
+                capability.io.block(|| peek.step())
+            })?,
+        };
         if !the_batch_fits_the_column(table, high_water, bound.row_count().get() as u64) {
             return Ok(None);
         }
@@ -11449,7 +11456,7 @@ impl MySqlConnection {
             let generated_ceiling = generated_ceiling(table);
             let taken_after = taken_after.clone();
             Box::new(move || {
-                let reserved = when_the_counter_is_free_within(busy_timeout, || {
+                let reserved = when_the_counter_is_free_within(&allocator, busy_timeout, || {
                     let mut reservation =
                         allocator.reserve_insert_values(key, row_values.clone())?;
                     io.block(|| reservation.step())
@@ -11768,7 +11775,7 @@ impl MySqlConnection {
             .max()
             .unwrap_or(0);
         if highest_explicit > 0 {
-            let high_water = self.when_the_counter_is_free(|| {
+            let high_water = self.when_the_counter_is_free(&capability.allocator, || {
                 let mut peek = capability.allocator.peek_high_water(table.key)?;
                 capability.io.block(|| peek.step())
             })?;
@@ -11780,7 +11787,7 @@ impl MySqlConnection {
             }
         }
         let high_water_before = if has_generated {
-            let reserved = self.when_the_counter_is_free(|| {
+            let reserved = self.when_the_counter_is_free(&capability.allocator, || {
                 let mut reservation = capability
                     .allocator
                     .reserve_insert_values(table.key, row_values.clone())?;
@@ -11814,8 +11821,12 @@ impl MySqlConnection {
     /// long as it waits for any other lock, the way MySQL's inserts wait their
     /// turn at a table's AUTO-INC lock. Answering 1205 at once failed one of
     /// Prisma's two concurrent `tag.create` calls in the framework harness.
-    fn when_the_counter_is_free<T>(&self, step: impl FnMut() -> Result<T>) -> Result<T> {
-        when_the_counter_is_free_within(self.inner.get_busy_timeout(), step)
+    fn when_the_counter_is_free<T>(
+        &self,
+        allocator: &DurableRangeAllocator,
+        step: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        when_the_counter_is_free_within(allocator, self.inner.get_busy_timeout(), step)
     }
 
     /// The ids a `VALUES` insert's rows take when the counter stands at
@@ -14818,16 +14829,27 @@ fn generated_ceiling(table: &AutoIncrementTable) -> u64 {
 }
 
 fn when_the_counter_is_free_within<T>(
+    allocator: &DurableRangeAllocator,
     busy_timeout: Duration,
     mut step: impl FnMut() -> Result<T>,
 ) -> Result<T> {
+    const LONGEST_WAIT_BEFORE_TRYING_AGAIN: Duration = Duration::from_millis(1);
     let deadline = std::time::Instant::now().checked_add(busy_timeout);
     loop {
+        let finished_before = allocator.operations_finished();
         match step() {
             Err(LimboError::Busy)
                 if deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) =>
             {
-                std::thread::sleep(Duration::from_millis(1));
+                if allocator
+                    .wait_for_an_operation_to_finish(
+                        finished_before,
+                        LONGEST_WAIT_BEFORE_TRYING_AGAIN,
+                    )
+                    .is_none()
+                {
+                    std::thread::sleep(LONGEST_WAIT_BEFORE_TRYING_AGAIN);
+                }
             }
             answer => return answer,
         }

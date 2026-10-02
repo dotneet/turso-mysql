@@ -19,6 +19,7 @@ use std::{
 
 use crate::{
     io::{File, FileId, FileSyncType, OpenFlags, IO},
+    storage::lock_release::LockReleaseSignal,
     types::{IOCompletions, IOResultOr},
     Buffer, Completion, CompletionError, IOResult, LimboError, Result,
 };
@@ -132,6 +133,7 @@ struct AllocatorShared {
     database_identity: AllocatorDatabaseIdentity,
     open_mode: AllocatorOpenMode,
     operation_in_progress: AtomicBool,
+    operations_finished: LockReleaseSignal,
     poisoned: AtomicBool,
     /// What the log held as this process last read or wrote it, so that an
     /// operation reads only the records appended since. Without it every
@@ -189,6 +191,7 @@ impl DurableRangeAllocator {
             database_identity,
             open_mode,
             operation_in_progress: AtomicBool::new(false),
+            operations_finished: LockReleaseSignal::default(),
             poisoned: AtomicBool::new(false),
             scanned: Mutex::new(None),
         });
@@ -273,6 +276,7 @@ impl DurableRangeAllocator {
                 database_identity,
                 open_mode,
                 operation_in_progress: AtomicBool::new(false),
+                operations_finished: LockReleaseSignal::default(),
                 poisoned: AtomicBool::new(false),
                 scanned: Mutex::new(None),
             }),
@@ -414,6 +418,35 @@ impl DurableRangeAllocator {
         })
     }
 
+    pub fn last_seen_high_water(&self, key: AutoIncrementKey) -> Result<Option<u64>> {
+        self.ensure_usable()?;
+        if self.shared.operation_in_progress.load(Ordering::Acquire) {
+            return Err(LimboError::Busy);
+        }
+        let scanned = self
+            .shared
+            .scanned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(scanned
+            .as_ref()
+            .map(|log| log.high_waters.get(&key).copied().unwrap_or(0)))
+    }
+
+    pub fn operations_finished(&self) -> u64 {
+        self.shared.operations_finished.releases()
+    }
+
+    pub fn wait_for_an_operation_to_finish(
+        &self,
+        seen: u64,
+        timeout: std::time::Duration,
+    ) -> Option<bool> {
+        self.shared
+            .operations_finished
+            .wait_for_release_after(seen, timeout)
+    }
+
     fn ensure_usable(&self) -> Result<()> {
         if self.shared.poisoned.load(Ordering::Acquire) {
             return Err(LimboError::InternalError(
@@ -492,9 +525,7 @@ impl AllocatorSidecarOperation {
             return self.fail(LimboError::Busy);
         }
         if let Err(error) = self.shared.file.lock_file(true) {
-            self.shared
-                .operation_in_progress
-                .store(false, Ordering::Release);
+            let_the_next_operation_start(&self.shared);
             return self.fail(error);
         }
         self.holds_lock = true;
@@ -671,9 +702,7 @@ impl AllocatorSidecarOperation {
             return Err(error);
         }
         self.holds_lock = false;
-        self.shared
-            .operation_in_progress
-            .store(false, Ordering::Release);
+        let_the_next_operation_start(&self.shared);
         Ok(())
     }
 }
@@ -918,9 +947,7 @@ impl RangeReservation {
         }
 
         if let Err(error) = self.shared.file.lock_file(true) {
-            self.shared
-                .operation_in_progress
-                .store(false, Ordering::Release);
+            let_the_next_operation_start(&self.shared);
             return self.fail(error);
         }
         self.holds_lock = true;
@@ -1428,9 +1455,7 @@ impl RangeReservation {
             return Err(error);
         }
         self.holds_lock = false;
-        self.shared
-            .operation_in_progress
-            .store(false, Ordering::Release);
+        let_the_next_operation_start(&self.shared);
         Ok(())
     }
 }
@@ -1492,6 +1517,11 @@ impl RangeReservation {
             ReservationState::Start | ReservationState::Leased | ReservationState::Finished
         )
     }
+}
+
+fn let_the_next_operation_start(shared: &AllocatorShared) {
+    shared.operation_in_progress.store(false, Ordering::Release);
+    shared.operations_finished.released();
 }
 
 fn poison_allocator(shared: &Arc<AllocatorShared>) {
@@ -2448,6 +2478,56 @@ mod tests {
         assert!(matches!(turned_away.step(), Err(error) if matches!(*error, LimboError::Busy)));
         assert_eq!(io.block(|| running.step()).unwrap().first(), 3);
         assert_eq!(reserve(&io, &allocator, KEY_B, 1).first(), 6);
+    }
+
+    #[test]
+    fn the_last_seen_mark_is_what_the_last_operation_left_and_busy_while_one_runs() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(allocator.last_seen_high_water(KEY_A).unwrap(), None);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 3).last(), 3);
+        let mut peek = allocator.peek_high_water(KEY_A).unwrap();
+        assert_eq!(io.block(|| peek.step()).unwrap(), 3);
+        assert_eq!(allocator.last_seen_high_water(KEY_A).unwrap(), Some(3));
+        assert_eq!(allocator.last_seen_high_water(KEY_B).unwrap(), Some(0));
+
+        let mut running = allocator.reserve(KEY_A, 1).unwrap();
+        assert!(matches!(running.step(), Ok(IOResult::IO(_))));
+        assert!(matches!(
+            allocator.last_seen_high_water(KEY_A),
+            Err(LimboError::Busy)
+        ));
+        assert_eq!(io.block(|| running.step()).unwrap().first(), 4);
+        assert_eq!(allocator.last_seen_high_water(KEY_A).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn a_waiter_turned_away_wakes_when_the_running_operation_finishes() {
+        let io = Arc::new(MemoryIO::new());
+        let allocator = Arc::new(open_allocator(io.as_ref()));
+        let mut running = allocator.reserve(KEY_A, 1).unwrap();
+        assert!(matches!(running.step(), Ok(IOResult::IO(_))));
+        let seen = allocator.operations_finished();
+        let mut turned_away = allocator.reserve(KEY_A, 1).unwrap();
+        assert!(matches!(turned_away.step(), Err(error) if matches!(*error, LimboError::Busy)));
+        let waiter = thread::spawn({
+            let allocator = allocator.clone();
+            move || {
+                let started = std::time::Instant::now();
+                let finished = allocator
+                    .wait_for_an_operation_to_finish(seen, std::time::Duration::from_secs(30));
+                (finished, started.elapsed())
+            }
+        });
+        thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(io.block(|| running.step()).unwrap().first(), 1);
+        let (finished, waited) = waiter.join().unwrap();
+        assert_eq!(finished, Some(true));
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "waited {waited:?}"
+        );
+        assert_eq!(reserve(io.as_ref(), &allocator, KEY_A, 1).first(), 2);
     }
 
     #[test]

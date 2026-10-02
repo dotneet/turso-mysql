@@ -1267,6 +1267,38 @@ fn auto_increment_execute_reserves_and_injects_one_range_per_values_batch() -> R
 }
 
 #[test]
+fn a_counted_insert_under_mvcc_takes_its_numbers_in_one_counter_operation() -> Result<()> {
+    let (connection, allocator, io) =
+        open_allocator_connection("mysql-session-auto-increment-mvcc.db", [0x5a; 16])?;
+    connection.inner.execute("PRAGMA journal_mode = 'mvcc'")?;
+    assert!(connection.inner.mvcc_enabled());
+    connection
+        .execute("CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)")?;
+    connection.execute("INSERT INTO users (name) VALUES ('Ada')")?;
+
+    let before = allocator.operations_finished();
+    connection.execute("INSERT INTO users (name) VALUES ('Grace'), ('Linus')")?;
+    assert_eq!(allocator.operations_finished() - before, 1);
+
+    let mut reservation = allocator.reserve(auto_increment_key(&connection, "users")?, 2)?;
+    assert_eq!(io.block(|| reservation.step())?.first(), 4);
+    connection.execute("INSERT INTO users (name) VALUES ('Barbara')")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT id, name FROM users")?
+            .run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1), Value::from_text("Ada")],
+            vec![Value::from_i64(2), Value::from_text("Grace")],
+            vec![Value::from_i64(3), Value::from_text("Linus")],
+            vec![Value::from_i64(6), Value::from_text("Barbara")],
+        ]
+    );
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn auto_increment_prepare_never_reserves_and_unsupported_marked_insert_fails_closed() -> Result<()>
 {
     let (connection, allocator, io) =
