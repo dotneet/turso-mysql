@@ -410,7 +410,9 @@ pub(crate) trait RegistryRoot {
     ///
     /// This makes recovery of interrupted creating and dropping records
     /// idempotent. The whole five-artifact bundle must pass identity,
-    /// raw-to-sidecar binding, and allocator-header checks before removal starts.
+    /// raw-to-sidecar binding, and allocator-header checks before removal starts,
+    /// and so must the MVCC log of a database that keeps one, which is removed
+    /// after the others.
     fn unlink_database(&mut self, expected: &DatabaseFileExpectation) -> Result<(), RegistryError>;
     fn fsync_dir(&mut self) -> Result<(), RegistryError>;
 }

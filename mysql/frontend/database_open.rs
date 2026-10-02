@@ -274,6 +274,74 @@ mod tests {
         Ok(())
     }
 
+    /// A crash is stood in for by copying the files aside while the database
+    /// is still open and opening the copies as a database of their own: what
+    /// they hold is all a restart would find.
+    #[test]
+    fn rows_committed_under_mvcc_survive_a_crash_and_uncommitted_ones_do_not() -> Result<()> {
+        let (directory, main, wal) = files();
+        let log = FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("main.db-log"))
+            .unwrap();
+        let db = open_preopened_database_with_wal(
+            Arc::new(NoPathIo),
+            main,
+            wal,
+            opaque_identity(),
+            identity(7),
+            "probe",
+            Some(log),
+            (),
+        )?;
+        let writer = crate::MySqlConnection::new(db.connect()?, binary_context())?;
+        let left_open = crate::MySqlConnection::new(db.connect()?, binary_context())?;
+        writer.execute("CREATE TABLE records (id INT)")?;
+        writer.execute("INSERT INTO records (id) VALUES (1)")?;
+        writer.execute_transaction_command("BEGIN").unwrap();
+        writer.execute("INSERT INTO records (id) VALUES (2)")?;
+        writer.execute_transaction_command("COMMIT").unwrap();
+        left_open.execute_transaction_command("BEGIN").unwrap();
+        left_open.execute("INSERT INTO records (id) VALUES (3)")?;
+        assert!(
+            std::fs::metadata(directory.path().join("main.db-log"))
+                .unwrap()
+                .len()
+                > 0
+        );
+
+        let crashed = tempfile::tempdir().unwrap();
+        for name in ["main.db", "main.db-wal", "main.db-log"] {
+            std::fs::copy(directory.path().join(name), crashed.path().join(name)).unwrap();
+        }
+        let copy = |name: &str| {
+            FsOpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(crashed.path().join(name))
+                .unwrap()
+        };
+        let restarted = open_preopened_database_with_wal(
+            Arc::new(NoPathIo),
+            copy("main.db"),
+            copy("main.db-wal"),
+            PreopenedDatabaseIdentity::new("db_fedcba9876543210fedcba9876543210").unwrap(),
+            identity(7),
+            "probe",
+            Some(copy("main.db-log")),
+            (),
+        )?;
+        let connection = crate::MySqlConnection::new(restarted.connect()?, binary_context())?;
+        assert_eq!(
+            rows_of(&connection)?,
+            vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+        );
+        drop((writer, left_open, db));
+        Ok(())
+    }
+
     struct DropGuard(Arc<AtomicUsize>);
 
     impl Drop for DropGuard {

@@ -655,6 +655,82 @@ mod five_artifact_tests {
     }
 
     #[test]
+    fn a_databases_mvcc_log_is_checked_opened_and_dropped_with_it() {
+        let directory = private_tempdir();
+        let mut root = OsDataRoot::open(directory.path()).unwrap();
+        let entry = expected("db_00000000000000000000000000000021");
+        create_database_new(&mut root, &entry).unwrap();
+        let log = directory
+            .path()
+            .join(OsDataRoot::artifact_name(&entry, DatabaseArtifact::MvccLog));
+        fs::write(&log, b"committed rows").unwrap();
+
+        assert_eq!(
+            root.inspect_database(&entry),
+            Ok(DatabaseFileInspection::Matching)
+        );
+        let OpenDatabaseInspection::Matching(handle) = root.open_database(&entry).unwrap() else {
+            panic!("a database with its log must open");
+        };
+        let opened = handle
+            .mvcc_log_file()
+            .unwrap()
+            .expect("a log that is there is handed to the engine");
+        assert_eq!(
+            OsDataRoot::file_identity(&opened).unwrap(),
+            OsDataRoot::file_identity(&File::open(&log).unwrap()).unwrap()
+        );
+        drop((handle, opened));
+
+        root.unlink_database(&entry).unwrap();
+        assert!(!log.exists());
+        assert_eq!(
+            root.inspect_database(&entry),
+            Ok(DatabaseFileInspection::Missing)
+        );
+    }
+
+    #[test]
+    fn an_mvcc_log_left_alone_is_removed_and_one_that_is_another_file_is_refused() {
+        let directory = private_tempdir();
+        let mut root = OsDataRoot::open(directory.path()).unwrap();
+        let entry = expected("db_00000000000000000000000000000022");
+        let log = directory
+            .path()
+            .join(OsDataRoot::artifact_name(&entry, DatabaseArtifact::MvccLog));
+        fs::write(&log, b"left behind").unwrap();
+        assert_eq!(
+            root.inspect_database(&entry),
+            Ok(DatabaseFileInspection::Partial)
+        );
+        assert_eq!(
+            root.inspect_database_creation(&entry),
+            Ok(DatabaseFileInspection::Mismatch)
+        );
+        root.unlink_database(&entry).unwrap();
+        assert!(!log.exists());
+
+        create_database_new(&mut root, &entry).unwrap();
+        fs::remove_file(&log).ok();
+        fs::hard_link(
+            directory
+                .path()
+                .join(OsDataRoot::artifact_name(&entry, DatabaseArtifact::Main)),
+            &log,
+        )
+        .unwrap();
+        assert_eq!(
+            root.inspect_database(&entry),
+            Ok(DatabaseFileInspection::Mismatch)
+        );
+        assert!(matches!(
+            root.open_database(&entry),
+            Ok(OpenDatabaseInspection::Mismatch)
+        ));
+        assert_eq!(root.unlink_database(&entry), Err(RegistryError::Backend));
+    }
+
+    #[test]
     fn missing_or_invalid_required_artifacts_fail_closed() {
         for artifact in DatabaseArtifact::ALL {
             let directory = private_tempdir();
@@ -678,6 +754,7 @@ mod five_artifact_tests {
                     | DatabaseArtifact::Allocator => {
                         DatabaseFileInspection::Mismatch
                     }
+                    DatabaseArtifact::MvccLog => unreachable!("the MVCC log is not required"),
                 }),
                 "{artifact:?}"
             );
@@ -1107,6 +1184,7 @@ enum DatabaseArtifact {
     MainInfo,
     WalInfo,
     Allocator,
+    MvccLog,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1182,9 +1260,21 @@ impl DatabaseArtifact {
         Self::Allocator,
     ];
 
+    /// Every artifact a database may have, the MVCC log last: a database
+    /// opened in MVCC mode keeps one, and it is removed only after the main
+    /// file, so that no crash leaves a database that opens without its log.
+    const ALL_WITH_THE_MVCC_LOG: [Self; 6] = [
+        Self::Main,
+        Self::Wal,
+        Self::MainInfo,
+        Self::WalInfo,
+        Self::Allocator,
+        Self::MvccLog,
+    ];
+
     const fn metadata_role(self) -> Option<MetadataArtifactRole> {
         match self {
-            Self::Main | Self::Wal | Self::Allocator => None,
+            Self::Main | Self::Wal | Self::Allocator | Self::MvccLog => None,
             Self::MainInfo => Some(MetadataArtifactRole::Main),
             Self::WalInfo => Some(MetadataArtifactRole::Wal),
         }
@@ -1197,6 +1287,7 @@ impl DatabaseArtifact {
             Self::MainInfo => "database-main-info.tmp",
             Self::WalInfo => "database-wal-info.tmp",
             Self::Allocator => "database-auto-increment.tmp",
+            Self::MvccLog => "database-mvcc-log.tmp",
         }
     }
 
@@ -1207,6 +1298,7 @@ impl DatabaseArtifact {
             Self::MainInfo => "main-info",
             Self::WalInfo => "wal-info",
             Self::Allocator => "auto-increment",
+            Self::MvccLog => "mvcc-log",
         }
     }
 }
@@ -1371,20 +1463,29 @@ impl OsDataRoot {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
-    /// Opens, creating it when missing, the logical log a database keeps in
-    /// MVCC mode, or nothing while the experimental switch is off.
+    /// Opens the logical log a database keeps in MVCC mode, creating it
+    /// when it is missing and the experimental switch is on.
     ///
-    /// Not yet one of the verified artifacts: a dropped database leaves it
-    /// behind, under a key no later database takes.
+    /// A log already there is opened with the switch off too: it can hold
+    /// committed rows the database file does not have yet, and the engine
+    /// refuses to open an MVCC database without it rather than lose them.
     fn open_mvcc_log(
         &self,
         expected: &DatabaseFileExpectation,
     ) -> Result<Option<File>, RegistryError> {
+        let name = Self::artifact_name(expected, DatabaseArtifact::MvccLog);
+        if let Some(file) = self.open_child_optional(&name, libc::O_RDWR)? {
+            if Self::inspect_open_artifact(&file, expected, DatabaseArtifact::MvccLog)?
+                != DatabaseFileInspection::Matching
+            {
+                return Err(RegistryError::Backend);
+            }
+            return Ok(Some(file));
+        }
         if !crate::database_open::experimental_mvcc_is_on() {
             return Ok(None);
         }
-        let name = format!("{}{MVCC_LOG_SUFFIX}", expected.file_key().as_str());
-        self.open_child(&name, libc::O_RDWR | libc::O_CREAT, 0o600)
+        self.open_child(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600)
             .map(Some)
     }
 
@@ -1634,6 +1735,7 @@ impl OsDataRoot {
             DatabaseArtifact::MainInfo => format!("{key}{MAIN_INFO_SUFFIX}"),
             DatabaseArtifact::WalInfo => format!("{key}{WAL_INFO_SUFFIX}"),
             DatabaseArtifact::Allocator => format!("{key}{ALLOCATOR_SUFFIX}"),
+            DatabaseArtifact::MvccLog => format!("{key}{MVCC_LOG_SUFFIX}"),
         }
     }
 
@@ -1769,7 +1871,7 @@ impl OsDataRoot {
         }
         let matching = match artifact {
             DatabaseArtifact::Main => Self::main_header_matches(file, expected)?,
-            DatabaseArtifact::Wal | DatabaseArtifact::Allocator => true,
+            DatabaseArtifact::Wal | DatabaseArtifact::Allocator | DatabaseArtifact::MvccLog => true,
             DatabaseArtifact::MainInfo | DatabaseArtifact::WalInfo => {
                 let bytes = match Self::read_fixed_at_start(file, database_metadata::ENCODED_BYTES)
                 {
@@ -1866,6 +1968,7 @@ impl OsDataRoot {
         let main_info = self.open_unlink_artifact(expected, DatabaseArtifact::MainInfo)?;
         let wal_info = self.open_unlink_artifact(expected, DatabaseArtifact::WalInfo)?;
         let allocator = self.open_unlink_artifact(expected, DatabaseArtifact::Allocator)?;
+        let mvcc_log = self.open_unlink_artifact(expected, DatabaseArtifact::MvccLog)?;
 
         if (main.is_final() && main_info.is_tombstone())
             || (wal.is_final() && wal_info.is_tombstone())
@@ -1882,6 +1985,14 @@ impl OsDataRoot {
         if let (Some(main), Some(wal)) = (main.file(), wal.file()) {
             if Self::file_identity(main)? == Self::file_identity(wal)? {
                 return Err(RegistryError::Backend);
+            }
+        }
+        if let Some(mvcc_log) = mvcc_log.file() {
+            let log_identity = Self::file_identity(mvcc_log)?;
+            for file in [main.file(), wal.file()].into_iter().flatten() {
+                if Self::file_identity(file)? == log_identity {
+                    return Err(RegistryError::Backend);
+                }
             }
         }
         Ok(())
@@ -2196,7 +2307,7 @@ impl RegistryRoot for OsDataRoot {
         &mut self,
         expected: &DatabaseFileExpectation,
     ) -> Result<DatabaseFileInspection, RegistryError> {
-        for artifact in DatabaseArtifact::ALL {
+        for artifact in DatabaseArtifact::ALL_WITH_THE_MVCC_LOG {
             for name in [
                 Self::artifact_name(expected, artifact),
                 Self::artifact_tombstone_name(expected, artifact),
@@ -2421,12 +2532,17 @@ impl RegistryRoot for OsDataRoot {
             &Self::artifact_name(expected, DatabaseArtifact::Allocator),
             libc::O_RDWR,
         )?;
+        let mvcc_log = self.open_child_optional(
+            &Self::artifact_name(expected, DatabaseArtifact::MvccLog),
+            libc::O_RDONLY,
+        )?;
         if [
             main.as_ref(),
             wal.as_ref(),
             main_info.as_ref(),
             wal_info.as_ref(),
             allocator.as_ref(),
+            mvcc_log.as_ref(),
         ]
         .iter()
         .all(Option::is_none)
@@ -2439,6 +2555,7 @@ impl RegistryRoot for OsDataRoot {
             (main_info.as_ref(), DatabaseArtifact::MainInfo),
             (wal_info.as_ref(), DatabaseArtifact::WalInfo),
             (allocator.as_ref(), DatabaseArtifact::Allocator),
+            (mvcc_log.as_ref(), DatabaseArtifact::MvccLog),
         ] {
             if let Some(file) = file {
                 if Self::inspect_open_artifact(file, expected, artifact)?
@@ -2467,6 +2584,14 @@ impl RegistryRoot for OsDataRoot {
             (Some(_), None) => return Ok(DatabaseFileInspection::Mismatch),
             (None, Some(_)) | (None, None) => false,
         };
+        if let Some(mvcc_log) = mvcc_log.as_ref() {
+            let log_identity = Self::file_identity(mvcc_log)?;
+            for file in [main.as_ref(), wal.as_ref()].into_iter().flatten() {
+                if Self::file_identity(file)? == log_identity {
+                    return Ok(DatabaseFileInspection::Mismatch);
+                }
+            }
+        }
         match (
             main.as_ref(),
             wal.as_ref(),
@@ -2553,6 +2678,14 @@ impl RegistryRoot for OsDataRoot {
             return Ok(OpenDatabaseInspection::Mismatch);
         }
         let mvcc_log_file = self.open_mvcc_log(expected)?;
+        if let Some(mvcc_log) = mvcc_log_file.as_ref() {
+            let log_identity = Self::file_identity(mvcc_log)?;
+            if Self::file_identity(&main_file)? == log_identity
+                || Self::file_identity(&wal_file)? == log_identity
+            {
+                return Ok(OpenDatabaseInspection::Mismatch);
+            }
+        }
         Ok(OpenDatabaseInspection::Matching(OsDatabaseHandle {
             main_file,
             wal_file,
@@ -2568,7 +2701,7 @@ impl RegistryRoot for OsDataRoot {
         if let Some(hook) = self.before_database_artifact_unlink_test_hook.take() {
             std::fs::copy(hook.from, hook.to).map_err(|_| RegistryError::Backend)?;
         }
-        for artifact in DatabaseArtifact::ALL {
+        for artifact in DatabaseArtifact::ALL_WITH_THE_MVCC_LOG {
             self.unlink_database_artifact(expected, artifact)?;
         }
         Ok(())
