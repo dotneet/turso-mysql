@@ -1490,6 +1490,61 @@ fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_its_foreign_k
 }
 
 #[test]
+fn an_upsert_refused_with_1452_keeps_the_gaps_of_the_entries_it_moved_before_the_foreign_keys_key()
+{
+    for (level, keeps_the_gaps) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        for (update, kept_gap, free_gap) in [
+            (
+                "a = 26, parent_id = 99, b = 260",
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (20, 27, 10, 400)",
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 40, 10, 255)",
+            ),
+            (
+                "id = 5, parent_id = 99",
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (6, 40, 10, 400)",
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 40, 10, 210)",
+            ),
+        ] {
+            let Some(TwoSessions {
+                _directory,
+                mut one,
+                mut two,
+            }) = refused_child_sessions()
+            else {
+                return;
+            };
+            run(
+                &mut one,
+                &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+            );
+            run(&mut one, "BEGIN");
+            assert_eq!(
+                one.execute_query(&format!(
+                    "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (2, 25, 10, 250) \
+                     ON DUPLICATE KEY UPDATE {update}"
+                ))
+                .map(|_| ()),
+                Err(FrontendErrorKind::ForeignKeyViolation),
+                "{level}: {update}"
+            );
+            run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+            let inserted = two.execute_query(kept_gap).map(|_| ());
+            if keeps_the_gaps {
+                assert_eq!(
+                    inserted,
+                    Err(FrontendErrorKind::DatabaseBusy),
+                    "{level}: {update}"
+                );
+            } else {
+                assert_eq!(inserted, Ok(()), "{level}: {update}");
+            }
+            run(&mut two, free_gap);
+            run(&mut one, "ROLLBACK");
+        }
+    }
+}
+
+#[test]
 fn a_counted_child_insert_ignore_skips_keeps_the_end_of_the_table_only_under_repeatable_read() {
     for (level, keeps_the_gap) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
         let Some(TwoSessions {

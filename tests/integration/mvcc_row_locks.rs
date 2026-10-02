@@ -1712,6 +1712,40 @@ fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_the_foreign_k
 }
 
 #[test]
+fn an_upsert_refused_by_its_foreign_key_keeps_the_gaps_of_the_entries_it_moved_before_that_key() {
+    for (level, keeps_the_gaps) in [
+        (RowLockLevel::RepeatableRead, true),
+        (RowLockLevel::ReadCommitted, false),
+    ] {
+        let db = database_with_a_child_of_three_keys();
+        let writer = row_by_row_foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute(
+            "INSERT INTO c VALUES (2, 25, 1, 250) \
+             ON CONFLICT (id) DO UPDATE SET a = 26, pid = 99, b = 260",
+        );
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            waits(&db, "INSERT INTO c VALUES (20, 27, 50, 400)"),
+            keeps_the_gaps,
+            "{level:?}"
+        );
+        assert!(
+            !waits(&db, "INSERT INTO c VALUES (21, 40, 50, 255)"),
+            "{level:?}"
+        );
+        assert!(
+            !waits(&db, "INSERT INTO c VALUES (3, 40, 50, 400)"),
+            "{level:?}"
+        );
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
 fn a_child_insert_or_ignore_skips_keeps_its_gaps_whole_around_the_rows_written_after_it() {
     for (level, keeps_the_gaps) in [
         (RowLockLevel::RepeatableRead, true),

@@ -12,7 +12,7 @@ use crate::translate::emitter::{emit_check_constraints, emit_make_record, Update
 use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
-    fire_fk_update_actions, ParentKeyNewProbeMode,
+    fire_fk_update_actions, ParentKeyNewProbeMode, RowWrite,
 };
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::plan::ColumnMask;
@@ -1001,6 +1001,7 @@ pub fn emit_upsert(
 
             // Child-side checks
             if resolver.with_schema(upsert_database_id, |s| s.has_child_fks(bt.name.as_str())) {
+                let resolver: &Resolver = resolver;
                 emit_fk_child_update_counters(
                     program,
                     &bt,
@@ -1012,7 +1013,22 @@ pub fn emit_upsert(
                     upsert_database_id,
                     resolver,
                     &layout,
-                    &mut |_, _| Ok(()),
+                    &mut |program, writes| {
+                        emit_refused_writes_of_an_upsert(
+                            program,
+                            resolver,
+                            table,
+                            ctx,
+                            UpsertRowImage {
+                                new_start,
+                                new_rowid: rowid_new_reg,
+                                layout: &layout,
+                                directly_changed_cols: &directly_changed_cols,
+                                rowid_changed,
+                            },
+                            writes,
+                        )
+                    },
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {
@@ -1157,43 +1173,9 @@ pub fn emit_upsert(
                 lbl
             });
 
-            // NEW key (use NEW rowid if present)
-            let ins = program.alloc_registers(k + 1);
-            for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
-                    emit_upsert_expr_index_value(
-                        program,
-                        resolver,
-                        table,
-                        ic,
-                        new_start,
-                        new_rowid,
-                        ins + i,
-                        &layout,
-                    )?;
-                } else {
-                    let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
-                    program.emit_insn(Insn::Copy {
-                        src_reg: layout.to_register(new_start, ci),
-                        dst_reg: ins + i,
-                        extra_amount: 0,
-                    });
-                }
-            }
-            program.emit_insn(Insn::Copy {
-                src_reg: new_rowid,
-                dst_reg: ins + k,
-                extra_amount: 0,
-            });
-
-            let rec = program.alloc_register();
-            program.emit_insn(Insn::MakeRecord {
-                start_reg: to_u32(ins),
-                count: to_u32(k + 1),
-                dest_reg: to_u32(rec),
-                index_name: Some((*idx_name).clone()),
-                affinity_str: None,
-            });
+            let (ins, rec) = emit_new_index_key_of_an_upsert(
+                program, resolver, table, &idx_meta, new_start, new_rowid, &layout,
+            )?;
 
             if idx_meta.unique {
                 // Affinity on the key columns for the NoConflict probe
@@ -1687,6 +1669,128 @@ pub fn collect_set_clauses_for_upsert(
         }
     }
     Ok(out)
+}
+
+struct UpsertRowImage<'a> {
+    new_start: usize,
+    new_rowid: usize,
+    layout: &'a ColumnLayout,
+    directly_changed_cols: &'a ColumnMask,
+    rowid_changed: bool,
+}
+
+fn emit_refused_writes_of_an_upsert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    ctx: &InsertEmitCtx,
+    row: UpsertRowImage<'_>,
+    writes: &[RowWrite],
+) -> crate::Result<()> {
+    for write in writes {
+        match write {
+            RowWrite::TableRow if row.rowid_changed => program.emit_insn(Insn::RefusedWrite {
+                cursor_id: ctx.cursor_id,
+                key_reg: row.new_rowid,
+            }),
+            RowWrite::TableRow => {}
+            RowWrite::IndexEntry(index) => {
+                if !upsert_index_is_affected(
+                    table,
+                    index,
+                    row.directly_changed_cols,
+                    row.rowid_changed,
+                )? {
+                    continue;
+                }
+                let cursor_id = ctx
+                    .idx_cursors
+                    .iter()
+                    .find(|(name, _, _)| name == &index.name)
+                    .map(|(_, _, cursor_id)| *cursor_id)
+                    .expect("every index of the table has a write cursor");
+                let not_written = program.allocate_label();
+                if let Some(new_satisfied) = eval_partial_pred_for_row_image(
+                    program,
+                    table,
+                    index,
+                    row.new_start,
+                    row.new_rowid,
+                    resolver,
+                    row.layout,
+                ) {
+                    program.emit_insn(Insn::IfNot {
+                        reg: new_satisfied,
+                        target_pc: not_written,
+                        jump_if_null: true,
+                    });
+                }
+                let (_, record_reg) = emit_new_index_key_of_an_upsert(
+                    program,
+                    resolver,
+                    table,
+                    index,
+                    row.new_start,
+                    row.new_rowid,
+                    row.layout,
+                )?;
+                program.emit_insn(Insn::RefusedWrite {
+                    cursor_id,
+                    key_reg: record_reg,
+                });
+                program.preassign_label_to_next_insn(not_written);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_new_index_key_of_an_upsert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &Table,
+    index: &Index,
+    new_start: usize,
+    new_rowid: usize,
+    layout: &ColumnLayout,
+) -> crate::Result<(usize, usize)> {
+    let k = index.columns.len();
+    let ins = program.alloc_registers(k + 1);
+    for (i, ic) in index.columns.iter().enumerate() {
+        if ic.expr.is_some() {
+            emit_upsert_expr_index_value(
+                program,
+                resolver,
+                table,
+                ic,
+                new_start,
+                new_rowid,
+                ins + i,
+                layout,
+            )?;
+        } else {
+            let (ci, _) = table.get_column_by_name(&ic.name).unwrap();
+            program.emit_insn(Insn::Copy {
+                src_reg: layout.to_register(new_start, ci),
+                dst_reg: ins + i,
+                extra_amount: 0,
+            });
+        }
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: new_rowid,
+        dst_reg: ins + k,
+        extra_amount: 0,
+    });
+    let rec = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(ins),
+        count: to_u32(k + 1),
+        dest_reg: to_u32(rec),
+        index_name: Some(index.name.clone()),
+        affinity_str: None,
+    });
+    Ok((ins, rec))
 }
 
 fn eval_partial_pred_for_row_image(

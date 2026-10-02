@@ -6047,7 +6047,11 @@ supremum at the end of the table), and none in the keys after it: with an
 the end of the table. Under `READ COMMITTED` nothing is kept. An `UPDATE`
 refused with 1452 keeps the gap of each entry it moved before the foreign key's
 key — the new primary key when it changes it, and the new entry of a key whose
-columns it changes — and none for an entry it left as it was. Before the
+columns it changes — and none for an entry it left as it was. So does the update
+of an `INSERT ... ON DUPLICATE KEY UPDATE` refused with 1452, beside the lock on
+the row it collided with: measured, `ON DUPLICATE KEY UPDATE a = 26, parent_id =
+99` keeps the gap of the new `a` entry, and `id = 5, parent_id = 99` the gap of
+the new primary key and of every key entry before the foreign key's own. Before the
 check, the row waits, as InnoDB's insert does, for a gap another session holds
 where it would have been written, and answers 1205 if that session keeps it.
 A row naming two missing parents is refused at the foreign key whose key
@@ -6083,9 +6087,7 @@ where InnoDB moves each of them and keeps the gap each new entry was in. The
 key the server makes for a foreign key whose columns no declared key covers
 goes after every key the `CREATE TABLE` declares, where InnoDB places it where
 the `FOREIGN KEY` clause stands, so a key declared after that clause is
-written before the foreign key check here and after it in InnoDB. An `INSERT
-... ON DUPLICATE KEY UPDATE` whose update is refused with 1452 keeps no gap of
-its own. And an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
+written before the foreign key check here and after it in InnoDB. And an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
 child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
