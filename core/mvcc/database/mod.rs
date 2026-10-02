@@ -4488,6 +4488,9 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// (locked) publish durable_txid_max / global_header / schema roots; (unlocked) GC,
     /// CheckpointWal, truncate logical log, TruncateWal.
     blocking_checkpoint_lock: Arc<TursoRwLock>,
+    /// While above zero, a transaction that begins answers `Busy`; see
+    /// [`MvStore::hold_new_transactions`].
+    new_transactions_held: AtomicUsize,
     /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
     /// calls contend out instead of pinning a lifetime checkpoint read guard.
     checkpoint_publish_in_progress: AtomicBool,
@@ -4693,6 +4696,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
+            new_transactions_held: AtomicUsize::new(0),
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
@@ -6539,7 +6543,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.experimental_mvcc_passive_checkpoint {
             return Ok(CheckpointReadLockState::NotHeld);
         }
-        if !self.blocking_checkpoint_lock.read() {
+        if !self.read_lock_the_checkpoint_for_a_new_transaction() {
             return Err(LimboError::Busy);
         }
         Ok(CheckpointReadLockState::Held)
@@ -6600,7 +6604,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         };
         if acquires_checkpoint_guard
             && !checkpoint_read_guard.is_held()
-            && !self.blocking_checkpoint_lock.read()
+            && !self.read_lock_the_checkpoint_for_a_new_transaction()
         {
             // If there is a stop-the-world checkpoint in progress, we cannot begin any transaction at all.
             return Err(LimboError::Busy);
@@ -6834,7 +6838,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             "checkpoint read guard must be paired with a pager read mark before MVCC begin"
         );
         let passive = self.experimental_mvcc_passive_checkpoint;
-        if !passive && !checkpoint_read_guard.is_held() && !self.blocking_checkpoint_lock.read() {
+        if !passive
+            && !checkpoint_read_guard.is_held()
+            && !self.read_lock_the_checkpoint_for_a_new_transaction()
+        {
             // Stop-the-world truncate checkpoint in progress.
             return Err(LimboError::Busy);
         }
@@ -6977,6 +6984,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
         self.txs.try_insert(tx_id, tx)?;
         Ok(())
+    }
+
+    fn read_lock_the_checkpoint_for_a_new_transaction(&self) -> bool {
+        self.new_transactions_held.load(Ordering::SeqCst) == 0
+            && self.blocking_checkpoint_lock.read()
+    }
+
+    /// Makes every transaction that begins from now on answer `Busy` until
+    /// [`Self::let_new_transactions_begin`] is called as many times.
+    ///
+    /// A blocking checkpoint needs every transaction to have ended. Under a
+    /// steady load of overlapping transactions that moment never comes, so
+    /// the logical log, and the row versions in memory, grow until the load
+    /// stops; holding new transactions back lets the ones running finish and
+    /// the checkpoint run. A transaction that waits for one under the busy
+    /// handler begins once they are let go.
+    pub fn hold_new_transactions(&self) {
+        self.new_transactions_held.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn let_new_transactions_begin(&self) {
+        let held = self.new_transactions_held.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(held > 0, "new transactions let go more often than held");
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {

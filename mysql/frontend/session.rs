@@ -1765,7 +1765,42 @@ impl MySqlConnection {
     /// it here. Another session reading at the same moment keeps the WAL busy;
     /// the attempt is left to a later statement then.
     pub fn keep_the_wal_small(&self) -> Result<()> {
+        if self.inner.mvcc_enabled() {
+            return self.keep_the_mvcc_log_small();
+        }
         self.truncate_the_wal_past(Self::WAL_FRAMES_BEFORE_TRUNCATING)
+    }
+
+    /// Asks the keeper to checkpoint an MVCC database whose logical log grew
+    /// past twice the engine's own bound, or whose WAL did.
+    ///
+    /// The engine checkpoints the log at a commit only when no other
+    /// transaction is open, which under a steady load of overlapping
+    /// transactions never happens. Measured with eight sysbench sessions
+    /// running `oltp_read_write`, the log grew from 2 MB to 20 MB in 30 s
+    /// without one checkpoint, and the checkpoint that ran once the load
+    /// stopped held a reader back for 150 ms, 500 ms after 120 s. The keeper
+    /// holds new transactions back until the running ones end, so the log
+    /// stays near the bound and each checkpoint stays short.
+    fn keep_the_mvcc_log_small(&self) -> Result<()> {
+        let Some((keeper, database)) = &self.wal_keeper else {
+            return Ok(());
+        };
+        let log_past_its_bound = self.inner.mv_store().as_ref().is_some_and(|store| {
+            u64::try_from(store.checkpoint_threshold())
+                .is_ok_and(|threshold| store.logical_log_offset() >= threshold.saturating_mul(2))
+        });
+        if !log_past_its_bound
+            && self.inner.wal_state()?.max_frame <= Self::WAL_FRAMES_BEFORE_TRUNCATING
+        {
+            return Ok(());
+        }
+        keeper.ask_to_truncate(
+            database,
+            self.database_user
+                .as_ref()
+                .map(|user| user.another_on_the_same_database()),
+        )
     }
 
     /// 64 MiB of 4 KiB pages.

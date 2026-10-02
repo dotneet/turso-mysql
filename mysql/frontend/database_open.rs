@@ -342,6 +342,60 @@ mod tests {
         Ok(())
     }
 
+    /// Four sessions each keep beginning a transaction as soon as the last
+    /// one ended, so one is nearly always open and the engine's own
+    /// checkpoint, which needs none open, does not get to run.
+    #[test]
+    fn the_keeper_checkpoints_a_log_that_overlapping_transactions_keep_open() -> Result<()> {
+        let (directory, main, wal) = files();
+        let log = FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("main.db-log"))
+            .unwrap();
+        let db = open_preopened_database_with_wal(
+            Arc::new(NoPathIo),
+            main,
+            wal,
+            opaque_identity(),
+            identity(5),
+            "probe",
+            Some(log),
+            (),
+        )?;
+        crate::MySqlConnection::new(db.connect()?, binary_context())?
+            .execute("CREATE TABLE t (x INT)")?;
+        let store = db.get_mv_store().clone().unwrap();
+        store.set_checkpoint_threshold(-1);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sessions = (0..4)
+            .map(|_| {
+                let connection = db.connect().unwrap();
+                connection.set_busy_timeout(std::time::Duration::from_secs(10));
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        connection.execute("BEGIN CONCURRENT").unwrap();
+                        connection.execute("INSERT INTO t VALUES (1)").unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        connection.execute("COMMIT").unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(store.logical_log_offset() > 0);
+
+        let checkpointed = crate::wal_keeper::checkpoint_the_mvcc_log(&db, None);
+        stop.store(true, Ordering::SeqCst);
+        for session in sessions {
+            session.join().unwrap();
+        }
+        assert_eq!(checkpointed?, crate::wal_keeper::Emptied::Yes);
+        Ok(())
+    }
+
     struct DropGuard(Arc<AtomicUsize>);
 
     impl Drop for DropGuard {

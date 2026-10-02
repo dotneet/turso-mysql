@@ -150,6 +150,18 @@ pub(crate) const PAUSE_AFTER_A_BUSY_WAL: Duration = Duration::from_millis(50);
 /// eight seconds without being emptied once.
 pub(crate) const TIME_TO_WAIT_FOR_A_BUSY_WAL: Duration = Duration::from_millis(100);
 
+/// How long the keeper holds new transactions of an MVCC database back
+/// while it waits for the running ones to end so that it can checkpoint.
+/// Measured with eight sysbench sessions running `oltp_read_write`, the
+/// transactions then running end within a few milliseconds.
+pub(crate) const TIME_TO_HOLD_NEW_TRANSACTIONS: Duration = Duration::from_millis(100);
+
+/// How long an MVCC database whose running transactions outlasted
+/// [`TIME_TO_HOLD_NEW_TRANSACTIONS`] is left alone before the keeper holds
+/// new transactions back again, so that a long transaction costs the other
+/// sessions one short wait a second rather than one after every statement.
+pub(crate) const PAUSE_AFTER_A_LONG_TRANSACTION: Duration = Duration::from_secs(1);
+
 fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
     let mut left_busy: Vec<(Weak<Database>, Instant)> = Vec::new();
     while let Ok(request) = received.recv() {
@@ -172,9 +184,8 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
                 Request::Stop => stop = true,
             }
         }
-        left_busy.retain(|(database, at)| {
-            database.strong_count() > 0 && at.elapsed() < PAUSE_AFTER_A_BUSY_WAL
-        });
+        left_busy
+            .retain(|(database, until)| database.strong_count() > 0 && Instant::now() < *until);
         for (weak_database, user) in databases {
             if left_busy
                 .iter()
@@ -195,12 +206,20 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
             handle
                 .attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let truncated = truncate(&database, || {
-                #[cfg(test)]
-                handle
-                    .refusals
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            });
+            let (truncated, pause) = if database.mvcc_enabled() {
+                (
+                    checkpoint_the_mvcc_log(&database, user.as_ref()),
+                    PAUSE_AFTER_A_LONG_TRANSACTION,
+                )
+            } else {
+                let truncated = truncate(&database, || {
+                    #[cfg(test)]
+                    handle
+                        .refusals
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+                (truncated, PAUSE_AFTER_A_BUSY_WAL)
+            };
             drop(user);
             match truncated {
                 Ok(Emptied::Yes) => {
@@ -209,7 +228,7 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
                         .truncated
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                Ok(Emptied::KeptBusy) => left_busy.push((weak_database, Instant::now())),
+                Ok(Emptied::KeptBusy) => left_busy.push((weak_database, Instant::now() + pause)),
                 Err(error) => {
                     *handle
                         .failure
@@ -228,7 +247,8 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
     }
 }
 
-enum Emptied {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Emptied {
     Yes,
     KeptBusy,
 }
@@ -272,6 +292,48 @@ fn copy_then_truncate(
             return Ok(Emptied::KeptBusy);
         }
     }
+}
+
+/// Checkpoints an MVCC database, which empties its logical log and its WAL,
+/// over a connection of its own.
+///
+/// The checkpoint runs only once no transaction is open, so new ones are
+/// held back, answering `Busy` to the sessions' busy handlers, while the
+/// running ones end, for at most [`TIME_TO_HOLD_NEW_TRANSACTIONS`]. The
+/// keeper tries again each time a transaction on the database ends.
+pub(crate) fn checkpoint_the_mvcc_log(
+    database: &Arc<Database>,
+    user: Option<&DatabaseUser>,
+) -> Result<Emptied> {
+    let store = database
+        .get_mv_store()
+        .clone()
+        .expect("an MVCC database has a store");
+    let connection = database.connect()?;
+    store.hold_new_transactions();
+    let held_until = Instant::now() + TIME_TO_HOLD_NEW_TRANSACTIONS;
+    let checkpointed = loop {
+        let ended_before = user.map(DatabaseUser::transactions_ended);
+        match connection.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        }) {
+            Ok(_) => break Ok(Emptied::Yes),
+            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {}
+            Err(error) => break Err(error),
+        }
+        if Instant::now() >= held_until {
+            break Ok(Emptied::KeptBusy);
+        }
+        match (user, ended_before) {
+            (Some(user), Some(ended_before)) => {
+                user.wait_for_a_transaction_to_end(ended_before, Some(held_until));
+            }
+            _ => std::thread::sleep(Duration::from_millis(1)),
+        }
+    };
+    store.let_new_transactions_begin();
+    connection.close()?;
+    checkpointed
 }
 
 /// Copies what it can into the database file without the write lock, and

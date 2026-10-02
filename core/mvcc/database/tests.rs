@@ -973,6 +973,42 @@ fn a_concurrent_commit_waits_for_an_exclusive_transaction_when_asked_to() {
 }
 
 #[test]
+fn a_blocking_checkpoint_runs_once_new_transactions_are_held_back() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let store = db.get_mvcc_store();
+    let running = db.connect();
+    let waiting = db.connect();
+    let checkpointing = db.connect();
+    running.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let checkpoint = || {
+        checkpointing.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+    };
+
+    running.execute("BEGIN CONCURRENT").unwrap();
+    running.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(matches!(checkpoint(), Err(LimboError::Busy)));
+    store.hold_new_transactions();
+    assert!(matches!(
+        waiting.execute("BEGIN CONCURRENT"),
+        Err(LimboError::Busy)
+    ));
+    running.execute("COMMIT").unwrap();
+    checkpoint().unwrap();
+    assert!(store.logical_log_offset() <= LOG_HDR_SIZE as u64);
+
+    store.let_new_transactions_begin();
+    waiting.execute("BEGIN CONCURRENT").unwrap();
+    waiting.execute("INSERT INTO t VALUES (2)").unwrap();
+    waiting.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&waiting, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
