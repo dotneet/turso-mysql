@@ -1860,6 +1860,7 @@ impl MySqlConnection {
     /// starts while a drop waits waits behind it, as MySQL's does.
     pub fn start_a_statement(&self) -> std::result::Result<(), MySqlStatementNotStarted> {
         *self.transaction_command_ran.lock().unwrap() = TransactionCommandRan::None;
+        self.inner.take_main_database_was_used();
         match &self.database_user {
             Some(user) => user.start_using(self.metadata_lock_wait()),
             None => Ok(()),
@@ -1874,7 +1875,9 @@ impl MySqlConnection {
     /// and not for one that has only begun — `WITH CONSISTENT SNAPSHOT`
     /// among them — taken a savepoint or run `SELECT 1`. The engine takes a
     /// transaction's snapshot at its first read, so a snapshot left by a
-    /// statement other than a transaction command is such a read.
+    /// statement other than a transaction command is such a read. In MVCC
+    /// mode `BEGIN CONCURRENT` holds a snapshot from the start, and a
+    /// statement that used the database is the read instead.
     pub fn finish_a_statement(&self) {
         let Some(user) = &self.database_user else {
             return;
@@ -1887,11 +1890,19 @@ impl MySqlConnection {
         match ran {
             TransactionCommandRan::BeganATransaction => user.stop_using(),
             TransactionCommandRan::Savepoint => user.stop_using_unless_the_transaction_keeps_it(),
-            TransactionCommandRan::None if self.inner.has_read_snapshot() => {
+            TransactionCommandRan::None if self.the_transaction_read_the_database() => {
                 user.keep_for_the_transaction();
             }
             TransactionCommandRan::None => user.stop_using_unless_the_transaction_keeps_it(),
         }
+    }
+
+    fn the_transaction_read_the_database(&self) -> bool {
+        let used = self.inner.take_main_database_was_used();
+        if self.inner.mvcc_enabled() {
+            return used;
+        }
+        self.inner.has_read_snapshot()
     }
 
     /// Lets the database go whatever this connection still has open, for a

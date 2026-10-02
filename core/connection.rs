@@ -729,6 +729,9 @@ pub struct Connection {
     /// handles; a handle re-positions on its next blob operation after the
     /// checkpoint's cache clear).
     pub(crate) n_active_blob_statements: AtomicI32,
+    /// Set when a statement opens or joins a transaction on the main
+    /// database; see [`Connection::take_main_database_was_used`].
+    pub(crate) main_database_was_used: AtomicBool,
     /// Prevents root statements and explicit checkpoints from overlapping on this connection.
     pub(crate) statement_activity: Arc<Mutex<StatementActivity>>,
     /// Whether pragma ignore_check_constraints=ON for this connection
@@ -3206,6 +3209,17 @@ impl Connection {
     /// by reading or writing, or through [`Self::begin_read_snapshot`].
     pub fn has_read_snapshot(&self) -> bool {
         self.get_tx_state() != TransactionState::None
+    }
+
+    /// Whether a statement opened or joined a transaction on the main
+    /// database since this was last asked, which every statement that reads
+    /// or writes one of its tables or its schema does. Asking forgets it.
+    ///
+    /// In MVCC mode `BEGIN CONCURRENT` holds a transaction from the start, so
+    /// [`Self::has_read_snapshot`] cannot tell a transaction that read from
+    /// one that has only begun.
+    pub fn take_main_database_was_used(&self) -> bool {
+        self.main_database_was_used.swap(false, Ordering::SeqCst)
     }
 
     /// Fixes what an explicit transaction reads now, instead of at its first

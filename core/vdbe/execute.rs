@@ -4676,6 +4676,9 @@ pub fn op_transaction_inner(
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
+                if is_main_db {
+                    conn.main_database_was_used.store(true, Ordering::SeqCst);
+                }
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
