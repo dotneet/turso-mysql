@@ -7099,6 +7099,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(entry) = self.txs.get(&tx_id) {
             let tx = entry.value();
             let held_checkpoint_read = tx.holds_blocking_checkpoint_read.load(Ordering::Acquire);
+            let committed = matches!(tx.state.load(), TransactionState::Committed(_));
             if let TransactionState::Committed(commit_ts) = tx.state.load() {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
@@ -7133,21 +7134,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 { "tx_id": tx_id }
             );
             self.txs.remove(&tx_id);
-            self.release_row_locks(tx_id);
+            self.release_row_locks(tx_id, committed);
             if held_checkpoint_read {
                 self.blocking_checkpoint_lock.unlock();
             }
             return Ok(());
         }
         self.txs.remove(&tx_id);
-        self.release_row_locks(tx_id);
+        self.release_row_locks(tx_id, false);
         Ok(())
     }
 
-    fn release_row_locks(&self, tx_id: TxID) {
+    fn release_row_locks(&self, tx_id: TxID, committed: bool) {
         if self.row_locks.enabled() {
             self.metadata_locks.release(tx_id);
-            self.row_locks.release(tx_id);
+            self.row_locks.release(tx_id, committed);
         }
     }
 

@@ -112,6 +112,13 @@ impl PartialOrd for GapEnd {
 struct Gap {
     low: Option<RowKey>,
     holder: TxID,
+    found: FoundBounds,
+}
+
+#[derive(Clone)]
+struct FoundBounds {
+    low: Option<RowKey>,
+    high: Option<RowKey>,
 }
 
 impl Gap {
@@ -278,6 +285,9 @@ impl RowLocks {
         for key in &forgotten {
             table.inserted.remove(*key);
         }
+        for key in &forgotten {
+            table.widen_the_gaps_an_undone_insert_bounded(key);
+        }
         if let Some(held) = table.held.get_mut(&tx_id) {
             held.retain(
                 |lock| !matches!(lock, HeldLock::Inserted(key) if forgotten.contains(&key)),
@@ -296,6 +306,10 @@ impl RowLocks {
         keeps_the_gap: bool,
     ) -> Vec<TxID> {
         let mut table = self.table.lock();
+        let found = FoundBounds {
+            low: gap.low.clone(),
+            high: gap.high.clone(),
+        };
         let mut low = gap.low;
         let mut high = gap.high;
         let mut met = Vec::new();
@@ -321,12 +335,13 @@ impl RowLocks {
         if !met.is_empty() || !keeps_the_gap {
             return met;
         }
-        table.add_gap(tx_id, gap.table_id, low, high);
+        table.add_gap(tx_id, gap.table_id, low, high, found);
         met
     }
 
-    pub(crate) fn release(&self, tx_id: TxID) {
+    pub(crate) fn release(&self, tx_id: TxID, committed: bool) {
         let mut table = self.table.lock();
+        let mut undone_inserts = Vec::new();
         for lock in table.held.remove(&tx_id).unwrap_or_default() {
             match lock {
                 HeldLock::Row(row) => {
@@ -344,11 +359,17 @@ impl RowLocks {
                 HeldLock::Inserted(key) => {
                     if table.inserted.get(&key) == Some(&tx_id) {
                         table.inserted.remove(&key);
+                        undone_inserts.push(key);
                     }
                 }
                 HeldLock::Gap(end) => {
                     table.remove_gap(tx_id, &end);
                 }
+            }
+        }
+        if !committed {
+            for key in &undone_inserts {
+                table.widen_the_gaps_an_undone_insert_bounded(key);
             }
         }
         table.released_before_the_end.remove(&tx_id);
@@ -487,23 +508,92 @@ impl LockTable {
         table_id: MVTableId,
         low: Option<RowKey>,
         high: Option<RowKey>,
+        found: FoundBounds,
     ) {
-        let low = self.join_the_gap_below(tx_id, table_id, low);
-        let end = GapEnd { table_id, high };
+        let (low, found) = self.join_the_gap_below(tx_id, table_id, low, found);
+        self.put_gap(
+            GapEnd { table_id, high },
+            Gap {
+                low,
+                holder: tx_id,
+                found,
+            },
+        );
+    }
+
+    fn put_gap(&mut self, end: GapEnd, gap: Gap) {
         let gaps = self.gaps.entry(end.clone()).or_default();
-        if let Some(held) = gaps.iter_mut().find(|gap| gap.holder == tx_id) {
-            let wider = match (&held.low, &low) {
-                (Some(held_low), Some(low)) => low < held_low,
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if wider {
-                held.low = low;
+        if let Some(held) = gaps.iter_mut().find(|held| held.holder == gap.holder) {
+            if lower(&gap.low, &held.low) {
+                held.low = gap.low;
+            }
+            if lower(&gap.found.low, &held.found.low) {
+                held.found.low = gap.found.low;
             }
             return;
         }
-        gaps.push(Gap { low, holder: tx_id });
-        self.held.entry(tx_id).or_default().push(HeldLock::Gap(end));
+        let holder = gap.holder;
+        gaps.push(gap);
+        self.held
+            .entry(holder)
+            .or_default()
+            .push(HeldLock::Gap(end));
+    }
+
+    fn widen_the_gaps_an_undone_insert_bounded(&mut self, key: &RowID) {
+        let ended_at_it = GapEnd {
+            table_id: key.table_id,
+            high: Some(key.row_id.clone()),
+        };
+        for gap in self.gaps.remove(&ended_at_it).unwrap_or_default() {
+            let high = self
+                .inserted_between(
+                    key.table_id,
+                    Some(key.row_id.clone()),
+                    gap.found.high.clone(),
+                )
+                .first()
+                .map(|(next, _)| next.row_id.clone())
+                .or_else(|| gap.found.high.clone());
+            let holder = gap.holder;
+            let end = GapEnd {
+                table_id: key.table_id,
+                high,
+            };
+            if let Some(held) = self.held.get_mut(&holder) {
+                held.retain(
+                    |lock| !matches!(lock, HeldLock::Gap(held_end) if *held_end == ended_at_it),
+                );
+            }
+            self.put_gap(end, gap);
+        }
+        let starts_at_it = Some(key.row_id.clone());
+        let mut lows = Vec::new();
+        for (end, gaps) in self
+            .gaps
+            .range((Bound::Excluded(ended_at_it), Bound::Unbounded))
+        {
+            if end.table_id != key.table_id {
+                break;
+            }
+            for gap in gaps.iter().filter(|gap| gap.low == starts_at_it) {
+                lows.push((end.clone(), gap.holder, gap.found.low.clone()));
+            }
+        }
+        for (end, holder, found_low) in lows {
+            let low = self
+                .inserted_between(key.table_id, found_low.clone(), starts_at_it.clone())
+                .last()
+                .map(|(below, _)| below.row_id.clone())
+                .or(found_low);
+            if let Some(gap) = self
+                .gaps
+                .get_mut(&end)
+                .and_then(|gaps| gaps.iter_mut().find(|gap| gap.holder == holder))
+            {
+                gap.low = low;
+            }
+        }
     }
 
     fn join_the_gap_below(
@@ -511,21 +601,24 @@ impl LockTable {
         tx_id: TxID,
         table_id: MVTableId,
         low: Option<RowKey>,
-    ) -> Option<RowKey> {
-        let record = low?;
+        found: FoundBounds,
+    ) -> (Option<RowKey>, FoundBounds) {
+        let Some(record) = low else {
+            return (None, found);
+        };
         let record_id = RowID::new(table_id, record.clone());
         let holds_the_record = self.rows.get(&record_id).is_some_and(|holders| {
             holders.exclusive == Some(tx_id) || holders.shared.contains(&tx_id)
         });
         if !holds_the_record {
-            return Some(record);
+            return (Some(record), found);
         }
         let below = GapEnd {
             table_id,
             high: Some(record.clone()),
         };
-        let Some(joined_low) = self.remove_gap(tx_id, &below) else {
-            return Some(record);
+        let Some(joined) = self.remove_gap(tx_id, &below) else {
+            return (Some(record), found);
         };
         if let Some(held) = self.held.get_mut(&tx_id) {
             if let Some(position) = held
@@ -535,17 +628,23 @@ impl LockTable {
                 held.swap_remove(position);
             }
         }
-        joined_low
+        (
+            joined.low,
+            FoundBounds {
+                low: joined.found.low,
+                high: found.high,
+            },
+        )
     }
 
-    fn remove_gap(&mut self, tx_id: TxID, end: &GapEnd) -> Option<Option<RowKey>> {
+    fn remove_gap(&mut self, tx_id: TxID, end: &GapEnd) -> Option<Gap> {
         let gaps = self.gaps.get_mut(end)?;
         let position = gaps.iter().position(|gap| gap.holder == tx_id)?;
         let removed = gaps.swap_remove(position);
         if gaps.is_empty() {
             self.gaps.remove(end);
         }
-        Some(removed.low)
+        Some(removed)
     }
 
     fn lightest_by_rows(
@@ -606,6 +705,14 @@ impl LockTable {
         }
         path.pop();
         false
+    }
+}
+
+fn lower(bound: &Option<RowKey>, than: &Option<RowKey>) -> bool {
+    match (bound, than) {
+        (Some(bound), Some(than)) => bound < than,
+        (None, Some(_)) => true,
+        (_, None) => false,
     }
 }
 

@@ -3767,7 +3767,11 @@ index locks every row and the gap after the last one. A descending read locks th
 the row it starts on, each row it reads with the gap below it, so one stopped by its `LIMIT`
 keeps inserts out of the gap below its last row, and where it stops the row and the gap below
 it. A secondary index read
-locks the rows it matches as well, in the same mode. A locking read, an `UPDATE` or a `DELETE`
+locks the rows it matches as well, in the same mode. A read of a key that finds none next to
+a row another open transaction inserted locks the gap up to that row; when that transaction
+rolls back the gap reaches the next row, as InnoDB's gap passes to the next record, and when it
+commits the gap stays as it was. A read through an `IN` subquery locks the rows the subquery
+reads, which it reads whole before probing the values it kept. A locking read, an `UPDATE` or a `DELETE`
 that meets a row another open transaction inserted into its range waits for that transaction,
 under `READ COMMITTED` too; one that stops before such a row does not. An `INSERT` that finds
 the key it inserts locks the row it found in share mode, the gap below it as well on a unique
@@ -3779,7 +3783,13 @@ keeps a table it reads as a constant, while an `UPDATE` or a `DELETE` lets it go
 another transaction holds reads the row's latest committed version and waits only if that
 version matches, while a `DELETE`, a locking read, or an `UPDATE` through a secondary index
 waits. Which rows and gaps are locked follows from the index a statement reads, which the
-engine chooses and MySQL's optimizer may choose differently.
+engine chooses and MySQL's optimizer may choose differently. And one difference remains: on a table whose primary
+key is not the engine's rowid — every primary key but a counted one, which lowers to `INT NOT
+NULL PRIMARY KEY` — a secondary index keeps entries with equal values in the order of the rowid
+the engine gave each row, the order the rows were inserted in, where InnoDB keeps them in
+primary key order; so a range that stops among equal values stops on, and locks, another row
+than InnoDB's, and the gaps between equal values lie between other rows. Fixing it needs an
+index that holds the primary key, which changes what such an index stores.
 An `INSERT` into an `AUTO_INCREMENT` table takes its ids once its first row is filled and
 before it waits for a key or a gap another transaction holds, as InnoDB does: measured on 8.4.11,
 and here, an insert by a third session meanwhile takes the ids after them, the waiting insert

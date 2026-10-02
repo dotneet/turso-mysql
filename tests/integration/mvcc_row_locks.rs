@@ -1234,3 +1234,106 @@ fn locking_read_waits(db: &TempDatabase, level: RowLockLevel, sql: &str) -> bool
         Err(err) => panic!("{sql}: {err:?}"),
     }
 }
+
+#[test]
+fn a_locking_read_through_an_in_subquery_locks_the_rows_the_subquery_read() {
+    let db = database_with_gaps_to_lock();
+    for sql in [
+        "SELECT id FROM t WHERE v IN (SELECT v FROM p)",
+        "SELECT id FROM t WHERE v NOT IN (SELECT id FROM p)",
+        "SELECT id FROM t WHERE k IN (SELECT id FROM p)",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM p)",
+    ] {
+        let reader = session(&db);
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        let mut statement = reader.prepare(sql).unwrap();
+        statement.lock_rows_it_reads(LockingRead {
+            mode: RowLockMode::Shared,
+            policy: RowLockWaitPolicy::Wait,
+            tables: vec!["t".to_string(), "p".to_string()],
+        });
+        statement.run_collect_rows().unwrap();
+        drop(statement);
+        assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 30"), "{sql}");
+        assert!(waits(&db, "DELETE FROM p WHERE id = 70"), "{sql}");
+        assert!(waits(&db, "INSERT INTO p VALUES (35, 0)"), "{sql}");
+        reader.execute("COMMIT").unwrap();
+    }
+}
+
+#[test]
+fn a_secondary_index_of_a_table_without_a_rowid_key_orders_equal_values_by_rowid_not_by_key() {
+    let db = database_with_gaps_to_lock();
+    let setup = db.connect_limbo();
+    setup
+        .execute("CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT, v INT)")
+        .unwrap();
+    setup.execute("CREATE INDEX q_k ON q (k)").unwrap();
+    setup.execute("INSERT INTO q VALUES (30, 5, 0)").unwrap();
+    setup.execute("INSERT INTO q VALUES (10, 5, 0)").unwrap();
+    setup.execute("INSERT INTO q VALUES (1, 1, 0)").unwrap();
+
+    let reader = session(&db);
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let mut statement = reader.prepare("SELECT id FROM q WHERE k < 5").unwrap();
+    statement.lock_rows_it_reads(LockingRead {
+        mode: RowLockMode::Exclusive,
+        policy: RowLockWaitPolicy::Wait,
+        tables: vec!["q".to_string()],
+    });
+    let ids: Vec<i64> = statement
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect();
+    drop(statement);
+    assert_eq!(ids, [1]);
+
+    assert!(waits(&db, "UPDATE q SET v = 9 WHERE id = 30"));
+    assert!(!waits(&db, "UPDATE q SET v = 9 WHERE id = 10"));
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_gap_that_ends_at_another_transactions_uncommitted_row_reaches_the_next_row_when_that_row_is_rolled_back(
+) {
+    let db = database_with_gaps_to_lock();
+    for (ends_with, widened) in [("ROLLBACK", true), ("COMMIT", false)] {
+        let inserter = session(&db);
+        inserter.execute("BEGIN CONCURRENT").unwrap();
+        inserter
+            .execute("INSERT INTO t VALUES (25, 25, 25, 25)")
+            .unwrap();
+        let reader = session(&db);
+        reader.execute("BEGIN CONCURRENT").unwrap();
+        assert!(locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id = 22",
+            RowLockMode::Exclusive
+        )
+        .is_empty());
+        assert!(locked_ids(
+            &reader,
+            "SELECT id FROM t WHERE id = 33",
+            RowLockMode::Exclusive
+        )
+        .is_empty());
+        assert!(!waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+        inserter.execute(ends_with).unwrap();
+        assert_eq!(
+            waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"),
+            widened,
+            "{ends_with}"
+        );
+        assert!(waits(&db, "INSERT INTO t VALUES (21, 0, 21, 0)"));
+        assert!(waits(&db, "INSERT INTO t VALUES (35, 0, 35, 0)"));
+        assert!(!waits(&db, "INSERT INTO t VALUES (45, 0, 45, 0)"));
+        reader.execute("ROLLBACK").unwrap();
+        if ends_with == "COMMIT" {
+            db.connect_limbo()
+                .execute("DELETE FROM t WHERE id = 25")
+                .unwrap();
+        }
+    }
+}
