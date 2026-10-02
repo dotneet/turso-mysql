@@ -1458,8 +1458,13 @@ fn a_child_insert_waits_for_the_transaction_that_inserted_or_deleted_its_parent(
 
 #[test]
 fn a_parent_delete_locks_the_child_index_entry_it_found_and_not_the_child_row() {
-    for level in [RowLockLevel::RepeatableRead, RowLockLevel::ReadCommitted] {
-        let db = database_with_foreign_keys("");
+    for (level, child_index) in [
+        (RowLockLevel::RepeatableRead, "pid"),
+        (RowLockLevel::ReadCommitted, "pid"),
+        (RowLockLevel::RepeatableRead, "pid, id"),
+        (RowLockLevel::ReadCommitted, "pid, id"),
+    ] {
+        let db = database_with_foreign_keys_and_a_child_index("", child_index);
         let writer = foreign_key_session(&db, level);
         writer.execute("BEGIN CONCURRENT").unwrap();
         let refused = writer.execute("DELETE FROM p WHERE id = 20");
@@ -1468,13 +1473,22 @@ fn a_parent_delete_locks_the_child_index_entry_it_found_and_not_the_child_row() 
             "{refused:?}"
         );
 
-        assert!(waits(&db, "DELETE FROM c WHERE id = 1"), "{level:?}");
+        assert!(
+            waits(&db, "DELETE FROM c WHERE id = 1"),
+            "{level:?} {child_index}"
+        );
         assert!(
             waits(&db, "UPDATE c SET pid = 30 WHERE id = 1"),
-            "{level:?}"
+            "{level:?} {child_index}"
         );
-        assert!(!waits(&db, "UPDATE c SET v = 9 WHERE id = 1"), "{level:?}");
-        assert!(!waits(&db, "DELETE FROM c WHERE id = 3"), "{level:?}");
+        assert!(
+            !waits(&db, "UPDATE c SET v = 9 WHERE id = 1"),
+            "{level:?} {child_index}"
+        );
+        assert!(
+            !waits(&db, "DELETE FROM c WHERE id = 3"),
+            "{level:?} {child_index}"
+        );
         writer.execute("ROLLBACK").unwrap();
     }
 }
@@ -1873,6 +1887,10 @@ fn row_by_row_foreign_key_session(db: &TempDatabase, level: RowLockLevel) -> Arc
 }
 
 fn database_with_foreign_keys(action: &str) -> TempDatabase {
+    database_with_foreign_keys_and_a_child_index(action, "pid")
+}
+
+fn database_with_foreign_keys_and_a_child_index(action: &str, child_index: &str) -> TempDatabase {
     let db = TempDatabase::builder()
         .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))
         .with_mvcc(true)
@@ -1884,7 +1902,8 @@ fn database_with_foreign_keys(action: &str) -> TempDatabase {
         "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id) {action}, v INT)"
     ))
     .unwrap();
-    conn.execute("CREATE INDEX c_pid ON c (pid)").unwrap();
+    conn.execute(format!("CREATE INDEX c_pid ON c ({child_index})"))
+        .unwrap();
     conn.execute("INSERT INTO p VALUES (10, 1), (20, 2), (30, 3)")
         .unwrap();
     conn.execute("INSERT INTO c VALUES (1, 20, 0), (2, 20, 0), (3, 30, 0)")

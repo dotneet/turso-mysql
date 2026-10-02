@@ -320,7 +320,10 @@ fn copy_with_affinity(
         program.emit_insn(Insn::Affinity {
             start_reg: dst,
             count,
-            affinities: build_index_affinity_string(idx, aff_from_tbl),
+            affinities: build_index_affinity_string(idx, aff_from_tbl)
+                .chars()
+                .take(len)
+                .collect(),
         });
     }
     dst
@@ -939,20 +942,10 @@ fn emit_fk_parent_key_probe(
         Ok(())
     };
 
-    // Prefer an exact child index on (child_cols...). If the current row must
-    // be excluded, scan only the matching index range so the rowid can be
-    // checked before counting the match.
+    // If the current row must be excluded, scan only the matching index range
+    // so the rowid can be checked before counting the match.
     let idx = resolver.with_schema(database_id, |s| {
-        s.get_indices(&child_tbl.name)
-            .find(|ix| {
-                ix.columns.len() == child_cols.len()
-                    && ix
-                        .columns
-                        .iter()
-                        .zip(child_cols.iter())
-                        .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-            })
-            .cloned()
+        child_index_for_foreign_key(s.get_indices(&child_tbl.name), child_cols)
     });
 
     if let Some(ix) = idx.as_ref() {
@@ -1594,16 +1587,8 @@ fn emit_fk_delete_parent_existence_check_single(
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
     let child_cols = &fk_ref.fk.child_columns;
-    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-        s.get_indices(&fk_ref.child_table.name).cloned().collect()
-    });
-    let child_idx = indices.into_iter().find(|idx| {
-        idx.columns.len() == child_cols.len()
-            && idx
-                .columns
-                .iter()
-                .zip(child_cols.iter())
-                .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+    let child_idx = resolver.with_schema(database_id, |s| {
+        child_index_for_foreign_key(s.get_indices(&fk_ref.child_table.name), child_cols)
     });
 
     let emit_violation =
@@ -1638,6 +1623,28 @@ fn emit_fk_delete_parent_existence_check_single(
     }
     program.preassign_label_to_next_insn(skip_check);
     Ok(())
+}
+
+fn child_index_for_foreign_key<'a>(
+    indices: impl Iterator<Item = &'a Arc<Index>>,
+    child_cols: &[String],
+) -> Option<Arc<Index>> {
+    let starts_with_the_child_columns = |index: &Index| {
+        index.where_clause.is_none()
+            && index.index_method.is_none()
+            && index.columns.len() >= child_cols.len()
+            && index.columns.iter().zip(child_cols).all(|(column, child)| {
+                column.expr.is_none() && column.name.eq_ignore_ascii_case(child)
+            })
+    };
+    let candidates: Vec<&Arc<Index>> = indices
+        .filter(|index| starts_with_the_child_columns(index))
+        .collect();
+    candidates
+        .iter()
+        .find(|index| index.columns.len() == child_cols.len())
+        .or_else(|| candidates.first())
+        .map(|index| Arc::clone(index))
 }
 
 fn emit_fk_parent_violation(

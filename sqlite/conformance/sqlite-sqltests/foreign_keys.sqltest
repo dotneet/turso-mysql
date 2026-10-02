@@ -72,6 +72,45 @@ expect error {
 }
 
 @cross-check-integrity
+test fk-delete-parent-blocked-through-a-child-index-with-more-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, tid INT REFERENCES t(id));
+    CREATE INDEX t2_tid ON t2 (tid, id);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,2);
+    DELETE FROM t WHERE id=2;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-update-parent-key-blocked-through-a-child-index-with-more-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, tid INT REFERENCES t(id));
+    CREATE INDEX t2_tid ON t2 (tid, id);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,2);
+    UPDATE t SET id = 3 WHERE id = 2;
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-delete-parent-blocked-beside-a-partial-child-index {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY, tid INT REFERENCES t(id));
+    CREATE INDEX t2_tid ON t2 (tid) WHERE tid > 25;
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,2);
+    DELETE FROM t WHERE id=2;
+}
+expect error {
+}
+
+@cross-check-integrity
 test fk-delete-parent-ok-when-no-child {
     PRAGMA foreign_keys=ON;
     CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
