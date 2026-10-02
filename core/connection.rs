@@ -2355,8 +2355,8 @@ impl Connection {
         if !self.has_no_open_transaction_state() {
             return false;
         }
-        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
+        let current_schema = self.schema.read();
         self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
     }
 
@@ -2381,8 +2381,8 @@ impl Connection {
         // schema after this read is caught by the comparison below (it changes the Arc), and any
         // publish that lands during begin is caught by the clock re-check (it bumps the generation).
         let generation = mv.schema_generation();
-        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
+        let current_schema = self.schema.read();
         if self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema) {
             return Err(LimboError::SchemaUpdated);
         }
