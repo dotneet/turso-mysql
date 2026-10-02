@@ -6112,6 +6112,18 @@ an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
 child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
+Around `IGNORE`, MySQL also warns 1062 for each row it skips as a duplicate,
+which is not done here, so a statement skipping duplicates beside rows a
+foreign key refuses counts fewer warnings; `INSERT IGNORE ... SELECT` and a
+joined `UPDATE IGNORE` stay refused; and a NULL that `IGNORE` would coerce
+into a `NOT NULL` column is refused where it is written and skips the row
+where an expression yields it. A key `ALTER TABLE` adds without a name is
+numbered after the keys written without one, where MySQL numbers it past the
+highest `t_ibfk_<n>` the table has, which differs only after a key was given
+such a name explicitly; and a key whose name was written into the table when
+another was dropped keeps that name across `RENAME TABLE`, where MySQL renames
+it with the table.
+
 `SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
 counted from one in declaration order over the keys written without a name,
 with its `ON DELETE` and `ON UPDATE` where they were written. Measured on 8.4.11
