@@ -835,3 +835,43 @@ fn foreign_keys_written_without_a_name_are_counted_among_themselves() {
         ]
     );
 }
+
+#[test]
+fn a_foreign_key_alter_table_adds_replaces_the_index_another_foreign_key_asked_for() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT PRIMARY KEY, k INT, UNIQUE KEY (k))",
+        "CREATE TABLE p2 (a INT, b INT, PRIMARY KEY (a, b))",
+        "CREATE TABLE c (id INT PRIMARY KEY, a INT, b INT, z INT, KEY kz (z), \
+         CONSTRAINT fa FOREIGN KEY (a) REFERENCES p (id))",
+        "ALTER TABLE c ADD FOREIGN KEY (a, b) REFERENCES p2 (a, b)",
+        "CREATE TABLE d (id INT PRIMARY KEY, a INT, b INT, z INT, KEY kz (z), \
+         FOREIGN KEY (a, b) REFERENCES p2 (a, b))",
+        "ALTER TABLE d ADD CONSTRAINT fa2 FOREIGN KEY (a) REFERENCES p (id)",
+        "CREATE TABLE e (id INT PRIMARY KEY, a INT, z INT, CONSTRAINT fe FOREIGN KEY (a) \
+         REFERENCES p (id), KEY kz (z))",
+        "ALTER TABLE e ADD CONSTRAINT fe2 FOREIGN KEY (a) REFERENCES p (k)",
+        "CREATE TABLE f (id INT PRIMARY KEY, a INT, KEY ka (a), CONSTRAINT ff FOREIGN KEY (a) \
+         REFERENCES p (id))",
+        "ALTER TABLE f ADD FOREIGN KEY (a) REFERENCES p (k)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (table, keys) in [
+        (
+            "c",
+            &["PRIMARY KEY (`id`)", "KEY `kz` (`z`)", "KEY `a` (`a`,`b`)"][..],
+        ),
+        (
+            "d",
+            &["PRIMARY KEY (`id`)", "KEY `kz` (`z`)", "KEY `a` (`a`,`b`)"][..],
+        ),
+        (
+            "e",
+            &["PRIMARY KEY (`id`)", "KEY `kz` (`z`)", "KEY `fe2` (`a`)"][..],
+        ),
+        ("f", &["PRIMARY KEY (`id`)", "KEY `ka` (`a`)"][..]),
+    ] {
+        assert_eq!(keys_printed(&mut adapter, table), keys, "{table}");
+    }
+}

@@ -6280,7 +6280,8 @@ impl MySqlConnection {
                     .run_ignore_rows()
                     .map_err(MySqlQueryError::Engine)?;
                 if let Some(table) = &added_to {
-                    self.ensure_foreign_key_child_indexes(table)?;
+                    self.drop_the_indexes_an_added_foreign_key_replaces(table, keys_before)?;
+                    self.ensure_foreign_key_child_indexes(table, Some(keys_before))?;
                     self.check_the_foreign_keys_of(table, keys_before)?;
                 }
                 if let Some(table) = self.created_index_table(statement) {
@@ -6399,6 +6400,63 @@ impl MySqlConnection {
             }],
         )?;
         Ok(btree.foreign_keys.len())
+    }
+
+    fn drop_the_indexes_an_added_foreign_key_replaces(
+        &self,
+        table: &MySqlTableName,
+        added_at: usize,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        let Some(btree) = schema.get_btree_table(table.as_str()) else {
+            return Ok(());
+        };
+        let Some(added) = btree
+            .foreign_keys
+            .iter()
+            .find(|foreign_key| foreign_key.decl_order == added_at)
+        else {
+            return Ok(());
+        };
+        let columns = &added.child_columns;
+        let primary_key = &btree.primary_key_columns;
+        let indexes = schema.get_indices(table.as_str()).collect::<Vec<_>>();
+        let kept_by_another_key = primary_key_covers_columns(primary_key, columns)
+            || indexes.iter().any(|index| {
+                index_covers_columns(index, primary_key, columns)
+                    && (!is_implicit_index(&index.name)
+                        || mysql_index_columns(index, primary_key).len() > columns.len())
+            });
+        if kept_by_another_key {
+            return Ok(());
+        }
+        let replaced = indexes
+            .iter()
+            .filter(|index| is_implicit_index(&index.name))
+            .filter(|index| {
+                let shown = mysql_index_columns(index, primary_key);
+                shown.len() <= columns.len()
+                    && shown
+                        .iter()
+                        .zip(columns.iter())
+                        .all(|(indexed, column)| indexed.name.eq_ignore_ascii_case(column))
+            })
+            .map(|index| index.name.clone())
+            .collect::<Vec<_>>();
+        for name in replaced {
+            let sql = format!("DROP INDEX {}", mysql_quoted(&name));
+            let stmt = Stmt::DropIndex {
+                if_exists: false,
+                idx_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    name,
+                )),
+            };
+            self.inner
+                .prepare_translated_stmt(stmt, &sql)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        Ok(())
     }
 
     fn added_foreign_key_table(&self, sql: &str) -> Option<MySqlTableName> {
@@ -6939,7 +6997,7 @@ impl MySqlConnection {
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
-        self.ensure_foreign_key_child_indexes(checked.table())?;
+        self.ensure_foreign_key_child_indexes(checked.table(), None)?;
         self.check_the_foreign_keys_of(checked.table(), 0)?;
         Ok(())
     }
@@ -7173,8 +7231,9 @@ impl MySqlConnection {
     fn ensure_foreign_key_child_indexes(
         &self,
         table: &MySqlTableName,
+        added_at: Option<usize>,
     ) -> std::result::Result<(), MySqlQueryError> {
-        let foreign_keys = self
+        let mut foreign_keys = self
             .inner
             .current_schema()
             .get_btree_table(table.as_str())
@@ -7185,9 +7244,16 @@ impl MySqlConnection {
             })?
             .foreign_keys
             .iter()
-            .map(|foreign_key| (foreign_key.name.clone(), foreign_key.child_columns.to_vec()))
+            .map(|foreign_key| {
+                (
+                    foreign_key.decl_order,
+                    foreign_key.name.clone(),
+                    foreign_key.child_columns.to_vec(),
+                )
+            })
             .collect::<Vec<_>>();
-        for (name, columns) in foreign_keys {
+        foreign_keys.sort_by_key(|(decl_order, _, _)| Some(*decl_order) != added_at);
+        for (_, name, columns) in foreign_keys {
             let schema = self.inner.current_schema();
             let btree = schema.get_btree_table(table.as_str()).ok_or_else(|| {
                 MySqlQueryError::Engine(LimboError::Corrupt(

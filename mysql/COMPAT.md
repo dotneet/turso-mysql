@@ -6145,6 +6145,14 @@ shorter is left out, and of two alike the earlier, so `FOREIGN KEY (b), KEY
 kc (c), FOREIGN KEY (b) ...` lists `kc`, `b`. A key's hidden primary key
 columns are not among the columns it starts with.
 
+A foreign key `ALTER TABLE` adds is measured the same way against the keys the
+table has: where the only keys starting with its columns are ones made for
+other foreign keys and no longer than its own, those are dropped and its own is
+made in their place, after every other key, under its constraint's name or its
+first column's. Measured on 8.4.11 and matched: `CONSTRAINT fe FOREIGN KEY (a)`
+and then `ALTER TABLE ... ADD CONSTRAINT fe2 FOREIGN KEY (a) ...` leaves one key,
+`fe2`, and a key made for `(a)` makes way for one over `(a, b)`.
+
 A foreign key MySQL cannot make is refused at `CREATE TABLE` and at `ALTER
 TABLE ... ADD FOREIGN KEY` with MySQL's error and message, where the engine
 took it and found out at the first write. Measured on 8.4.11 and matched, in
