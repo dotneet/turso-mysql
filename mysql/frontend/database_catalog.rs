@@ -1599,11 +1599,14 @@ mod tests {
     /// A counted insert that waits for another session's write lock reads the
     /// counter's next number only once it holds the lock, so a number the
     /// other session took meanwhile is not written first and then undone.
+    ///
+    /// Measured on MySQL 8.4.11: the insert does not wait for a transaction
+    /// that wrote only another table, and takes 1 before that transaction's
+    /// own insert takes 2. Under MVCC there is no write lock over the whole
+    /// database, so it does not wait here either and the ids come out as
+    /// MySQL's do.
     #[test]
     fn a_counted_insert_waiting_for_the_write_lock_writes_its_row_once() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
-            return Ok(());
-        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1627,10 +1630,23 @@ mod tests {
             let waiter = waiter.clone();
             move || waiter.execute("INSERT INTO users (name) VALUES ('waited')")
         });
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        holder.execute("INSERT INTO users (name) VALUES ('first')")?;
-        holder.execute_transaction_command("COMMIT").unwrap();
-        inserting.join().unwrap()?;
+        let in_the_order_written = if crate::experimental_mvcc_is_on() {
+            let started = std::time::Instant::now();
+            while !inserting.is_finished() && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(inserting.is_finished());
+            inserting.join().unwrap()?;
+            holder.execute("INSERT INTO users (name) VALUES ('first')")?;
+            holder.execute_transaction_command("COMMIT").unwrap();
+            ["waited", "first"]
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            holder.execute("INSERT INTO users (name) VALUES ('first')")?;
+            holder.execute_transaction_command("COMMIT").unwrap();
+            inserting.join().unwrap()?;
+            ["first", "waited"]
+        };
 
         assert_eq!(
             waiter
@@ -1643,8 +1659,14 @@ mod tests {
                 .prepare_select("SELECT id, name FROM users ORDER BY id")?
                 .run_collect_rows()?,
             vec![
-                vec![Value::from_i64(1), Value::from_text("first")],
-                vec![Value::from_i64(2), Value::from_text("waited")],
+                vec![
+                    Value::from_i64(1),
+                    Value::from_text(in_the_order_written[0])
+                ],
+                vec![
+                    Value::from_i64(2),
+                    Value::from_text(in_the_order_written[1])
+                ],
             ]
         );
         Ok(())
