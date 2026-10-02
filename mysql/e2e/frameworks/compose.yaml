@@ -41,6 +41,11 @@ volumes:
     name: ${E2E_CARGO_TARGET_VOLUME:-turso-e2e-cargo-target}
   go-cache:
     name: turso-e2e-go-cache
+  # Disk-backed data directories, used instead of tmpfs when E2E_DATA_ON_DISK=1.
+  turso-data:
+    name: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-turso-data
+  mysql-data:
+    name: ${COMPOSE_PROJECT_NAME:-turso-e2e-fw}-mysql-data
 
 services:
   # Debug build of the three server binaries into a cached volume, never into
@@ -103,11 +108,14 @@ services:
       # `1` opens every database in MVCC mode with concurrent writers; see
       # mysql/frontend/database_open.rs. Off unless set.
       TURSO_MYSQL_EXPERIMENTAL_MVCC: ${TURSO_MYSQL_EXPERIMENTAL_MVCC:-}
+      # `1` keeps the databases on the turso-data volume instead of tmpfs.
+      E2E_DATA_ON_DISK: ${E2E_DATA_ON_DISK:-}
     volumes:
       - cargo-target:/target:ro
       - ./server/boot-turso.sh:/boot-turso.sh:ro
       - ${E2E_RUN_DIR:-./.run}/tls:/tls-in:ro
       - ${E2E_RUN_DIR:-./.run}/turso-log:/log
+      - turso-data:/disk
     tmpfs:
       - /run/t:mode=755
     entrypoint: ["/boot-turso.sh"]
@@ -131,9 +139,12 @@ services:
       - --ssl-cert=/tls/server-chain.pem
       - --ssl-key=/tls/server-key.pem
       - --require-secure-transport=ON
+      # run.sh points this at the mysql-data volume when E2E_DATA_ON_DISK=1.
+      - --datadir=${E2E_MYSQL_DATADIR:-/var/lib/mysql}
     volumes:
       - ${E2E_RUN_DIR:-./.run}/tls-mysql:/tls:ro
       - ./server/mysql-init.sql:/docker-entrypoint-initdb.d/e2e.sql:ro
+      - mysql-data:/var/lib/mysql-disk
     tmpfs:
       - /var/lib/mysql
     healthcheck:

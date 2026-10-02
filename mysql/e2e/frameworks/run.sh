@@ -104,11 +104,17 @@ up() {
 
   log "starting turso and mysql"
   compose --profile servers down --remove-orphans --timeout 10 >/dev/null 2>&1 || true
+  # Both servers start from empty data directories, on disk or on tmpfs.
+  docker volume rm "${prefix}-turso-data" "${prefix}-mysql-data" >/dev/null 2>&1 || true
+  if [[ "${E2E_DATA_ON_DISK:-}" == 1 ]]; then
+    export E2E_MYSQL_DATADIR=/var/lib/mysql-disk
+  fi
   compose --profile servers up -d --wait turso mysql
 }
 
 down() {
   compose --profile servers --profile apps down --remove-orphans --timeout 10 >/dev/null 2>&1 || true
+  docker volume rm "${prefix}-turso-data" "${prefix}-mysql-data" >/dev/null 2>&1 || true
 }
 
 use_running_servers() {

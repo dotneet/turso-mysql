@@ -15,7 +15,14 @@ readonly root=/run/t
 readonly state="${root}/s"
 readonly sockets="${root}/k"
 readonly accounts="${root}/a"
-readonly data="${root}/d"
+# E2E_DATA_ON_DISK=1 puts the databases on the disk-backed volume at /disk, so
+# every fsync reaches a device instead of tmpfs.
+if [[ "${E2E_DATA_ON_DISK:-}" == 1 ]]; then
+  readonly data=/disk/d
+  rm -rf "${data}"
+else
+  readonly data="${root}/d"
+fi
 readonly tls="${root}/tls"
 readonly socket="${sockets}/a.sock"
 

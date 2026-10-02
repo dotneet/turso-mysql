@@ -2,9 +2,9 @@
 
 sysbench 1.0.20 runs the same workloads against a live `turso-mysql-server` and
 MySQL 8.4.11, each in its own container on the same Docker host, both over TLS
-with the same account and both with their data on tmpfs. sysbench talks to
-each server directly; the logging proxy the framework apps use is not in the
-path.
+with the same account and both with their data on tmpfs unless
+`E2E_DATA_ON_DISK=1`. sysbench talks to each server directly; the logging proxy
+the framework apps use is not in the path.
 
 The server is built with the `bench-profile` cargo profile (release with debug
 info, so `perf` can name functions). That build lives only in its own Docker
@@ -25,6 +25,13 @@ scripts: `oltp_point_select oltp_read_only oltp_write_only oltp_read_write
 oltp_insert`), `BENCH_THREADS` (`1 8`), `BENCH_TIME` (seconds, 30) and
 `BENCH_TABLE_SIZE` (rows, 100000). The raw sysbench outputs and `summary.md`
 are in `.run/results/bench/`.
+
+Both servers keep their data on tmpfs by default, where an fsync costs nothing.
+`E2E_DATA_ON_DISK=1` on `run.sh --up` puts each server's data directory on a
+Docker volume of its own instead (`<project>-turso-data`, `<project>-mysql-data`),
+so every fsync reaches the Docker VM's disk; on Docker Desktop for Mac one
+36-byte append and fsync there took about 0.7 ms (tmpfs: 0.5 µs). Every `--up`
+and `--down` removes both volumes, so each run starts from empty databases.
 
 `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` on `run.sh --up` starts the turso server with
 every database in the engine's MVCC mode, where writers run side by side
