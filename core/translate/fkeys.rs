@@ -12,7 +12,7 @@ use crate::{
     vdbe::{
         builder::{CursorType, DmlColumnContext, QueryMode},
         insn::{CmpInsFlags, Insn, Subprogram},
-        BranchOffset, PreparedProgram,
+        BranchOffset, PreparedProgram, RowLockPoint,
     },
     Connection, LimboError, Result,
 };
@@ -276,6 +276,7 @@ fn emit_parent_key_change_probes(
 #[inline]
 pub fn open_read_index(program: &mut ProgramBuilder, idx: &Arc<Index>, db: usize) -> usize {
     let icur = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
+    program.mark_row_lock_point(RowLockPoint::ChecksAForeignKey { cursor_id: icur });
     program.emit_insn(Insn::OpenRead {
         cursor_id: icur,
         root_page: idx.root_page,
@@ -288,6 +289,7 @@ pub fn open_read_index(program: &mut ProgramBuilder, idx: &Arc<Index>, db: usize
 #[inline]
 pub fn open_read_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>, db: usize) -> usize {
     let tcur = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
+    program.mark_row_lock_point(RowLockPoint::ChecksAForeignKey { cursor_id: tcur });
     program.emit_insn(Insn::OpenRead {
         cursor_id: tcur,
         root_page: tbl.root_page,
@@ -419,6 +421,11 @@ where
 
     let loop_top = program.allocate_label();
     program.preassign_label_to_next_insn(loop_top);
+    program.mark_row_lock_point(RowLockPoint::ChecksTheRangeEnd {
+        cursor_id: icur,
+        equality: true,
+        unique_equality: false,
+    });
     program.emit_insn(Insn::IdxGT {
         cursor_id: icur,
         start_reg: probe_start,
@@ -1404,21 +1411,17 @@ fn emit_fk_delete_parent_existence_check_single(
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
     let child_cols = &fk_ref.fk.child_columns;
-    let child_idx = if !is_self_ref {
-        let indices: Vec<_> = resolver.with_schema(database_id, |s| {
-            s.get_indices(&fk_ref.child_table.name).cloned().collect()
-        });
-        indices.into_iter().find(|idx| {
-            idx.columns.len() == child_cols.len()
-                && idx
-                    .columns
-                    .iter()
-                    .zip(child_cols.iter())
-                    .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
-        })
-    } else {
-        None
-    };
+    let indices: Vec<_> = resolver.with_schema(database_id, |s| {
+        s.get_indices(&fk_ref.child_table.name).cloned().collect()
+    });
+    let child_idx = indices.into_iter().find(|idx| {
+        idx.columns.len() == child_cols.len()
+            && idx
+                .columns
+                .iter()
+                .zip(child_cols.iter())
+                .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
+    });
 
     // Closure to emit the appropriate violation based on action type
     let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
@@ -1433,17 +1436,18 @@ fn emit_fk_delete_parent_existence_check_single(
     if let Some(ref idx) = child_idx {
         let icur = open_read_index(program, idx, database_id);
         let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
-        index_probe(
-            program,
-            icur,
-            probe,
-            ncols,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
-            |_p| Ok(()),
-        )?;
+        if is_self_ref {
+            index_scan_match_any(
+                program,
+                icur,
+                probe,
+                ncols,
+                Some(parent_rowid_reg),
+                emit_violation,
+            )?;
+        } else {
+            index_probe(program, icur, probe, ncols, emit_violation, |_p| Ok(()))?;
+        }
     } else {
         table_scan_match_any(
             program,
@@ -1739,6 +1743,7 @@ fn emit_fk_action_subprogram(
             FK_SUBPROGRAM_OPTS,
         );
         let entry = compile_stack.push(foreign_key, parent_change);
+        subprogram_builder.changes_rows_for_a_foreign_key = true;
         subprogram_builder.prologue();
         translate_inner(
             stmt,

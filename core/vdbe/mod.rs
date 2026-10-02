@@ -1923,6 +1923,9 @@ pub(crate) enum RowLockPoint {
     RowsMatched {
         cursor_id: CursorID,
     },
+    ChecksAForeignKey {
+        cursor_id: CursorID,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -1954,6 +1957,7 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
+    pub changes_rows_for_a_foreign_key: bool,
     pub resolve_type: ResolveType,
     pub prepare_context: PrepareContext,
     pub(crate) prepare_options: crate::PrepareOptions,

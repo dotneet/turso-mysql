@@ -132,7 +132,9 @@ fn before_the_instruction(
     }
     if let Some(cursor_id) = positions_to_write(insn) {
         if let Some(cursor) = mvcc_cursor(state, cursor_id) {
-            cursor.position_to_write(true);
+            if !cursor.checks_a_foreign_key() {
+                cursor.position_to_write(true);
+            }
         }
     }
     for (_, point) in points_at(program, pc) {
@@ -154,6 +156,7 @@ fn before_the_instruction(
                     cursor.row_matched()?;
                 }
             }
+            RowLockPoint::ChecksAForeignKey { .. } => {}
         }
     }
     Ok(())
@@ -187,7 +190,10 @@ fn refuse_to_change_a_row_of_a_redefined_table(
 }
 
 fn after_the_instruction(program: &Program, state: &mut ProgramState, insn: &Insn, pc: usize) {
-    if let Some(cursor_id) = positions_to_write(insn) {
+    let positioned_to_write = positions_to_write(insn).filter(|cursor_id| {
+        mvcc_cursor(state, *cursor_id).is_none_or(|cursor| !cursor.checks_a_foreign_key())
+    });
+    if let Some(cursor_id) = positioned_to_write {
         if let Some(cursor) = mvcc_cursor(state, cursor_id) {
             cursor.position_to_write(false);
         }
@@ -227,7 +233,7 @@ fn after_the_instruction(program: &Program, state: &mut ProgramState, insn: &Ins
                     }
                 });
             }
-            RowLockPoint::RowsMatched { .. } => {}
+            RowLockPoint::RowsMatched { .. } | RowLockPoint::ChecksAForeignKey { .. } => {}
         }
     }
 }

@@ -1337,3 +1337,264 @@ fn a_gap_that_ends_at_another_transactions_uncommitted_row_reaches_the_next_row_
         }
     }
 }
+
+#[test]
+fn a_child_insert_locks_its_parent_row_in_share_mode_under_both_levels() {
+    for level in [RowLockLevel::RepeatableRead, RowLockLevel::ReadCommitted] {
+        let db = database_with_foreign_keys("");
+        let writer = foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("INSERT INTO c VALUES (5, 20, 0)").unwrap();
+
+        assert!(waits(&db, "DELETE FROM p WHERE id = 20"), "{level:?}");
+        assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 20"), "{level:?}");
+        assert!(waits(&db, "UPDATE p SET v = 9 WHERE v = 2"), "{level:?}");
+        assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 30"), "{level:?}");
+        assert!(!waits(&db, "INSERT INTO p VALUES (25, 0)"), "{level:?}");
+        let other = foreign_key_session(&db, level);
+        other.execute("BEGIN CONCURRENT").unwrap();
+        other.execute("INSERT INTO c VALUES (6, 20, 0)").unwrap();
+        other.execute("ROLLBACK").unwrap();
+        writer.execute("COMMIT").unwrap();
+        assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 20"), "{level:?}");
+    }
+}
+
+#[test]
+fn a_child_insert_of_a_missing_parent_locks_the_gap_it_would_be_in_only_under_repeatable_read() {
+    for (level, keeps_the_gap) in [
+        (RowLockLevel::RepeatableRead, true),
+        (RowLockLevel::ReadCommitted, false),
+    ] {
+        let db = database_with_foreign_keys("");
+        let writer = foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute("INSERT INTO c VALUES (5, 25, 0)");
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            waits(&db, "INSERT INTO p VALUES (25, 0)"),
+            keeps_the_gap,
+            "{level:?}"
+        );
+        assert!(!waits(&db, "INSERT INTO p VALUES (35, 0)"), "{level:?}");
+        assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 30"), "{level:?}");
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn a_child_insert_waits_for_the_transaction_that_inserted_or_deleted_its_parent() {
+    for level in [RowLockLevel::RepeatableRead, RowLockLevel::ReadCommitted] {
+        for ends_with in ["COMMIT", "ROLLBACK"] {
+            let db = database_with_foreign_keys("");
+            let parent_writer = foreign_key_session(&db, level);
+            parent_writer.execute("BEGIN CONCURRENT").unwrap();
+            parent_writer
+                .execute("INSERT INTO p VALUES (25, 0)")
+                .unwrap();
+            parent_writer
+                .execute("DELETE FROM p WHERE id = 10")
+                .unwrap();
+
+            let inserting_a_child_of_the_new_parent = run_in_the_background(
+                foreign_key_session(&db, level),
+                "INSERT INTO c VALUES (5, 25, 0)",
+            );
+            let inserting_a_child_of_the_deleted_parent = run_in_the_background(
+                foreign_key_session(&db, level),
+                "INSERT INTO c VALUES (6, 10, 0)",
+            );
+            assert!(still_waits(&inserting_a_child_of_the_new_parent));
+            assert!(still_waits(&inserting_a_child_of_the_deleted_parent));
+            parent_writer.execute(ends_with).unwrap();
+            let (_, new_parent) = inserting_a_child_of_the_new_parent.join().unwrap();
+            let (_, deleted_parent) = inserting_a_child_of_the_deleted_parent.join().unwrap();
+            let committed = ends_with == "COMMIT";
+            assert_eq!(new_parent.is_ok(), committed, "{level:?} {ends_with}");
+            assert_eq!(deleted_parent.is_ok(), !committed, "{level:?} {ends_with}");
+        }
+    }
+}
+
+#[test]
+fn a_parent_delete_locks_the_child_index_entry_it_found_and_not_the_child_row() {
+    for level in [RowLockLevel::RepeatableRead, RowLockLevel::ReadCommitted] {
+        let db = database_with_foreign_keys("");
+        let writer = foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute("DELETE FROM p WHERE id = 20");
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{refused:?}"
+        );
+
+        assert!(waits(&db, "DELETE FROM c WHERE id = 1"), "{level:?}");
+        assert!(
+            waits(&db, "UPDATE c SET pid = 30 WHERE id = 1"),
+            "{level:?}"
+        );
+        assert!(!waits(&db, "UPDATE c SET v = 9 WHERE id = 1"), "{level:?}");
+        assert!(!waits(&db, "DELETE FROM c WHERE id = 3"), "{level:?}");
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn a_parent_delete_without_children_locks_the_gap_in_the_child_index_only_under_repeatable_read() {
+    for (level, keeps_the_gap) in [
+        (RowLockLevel::RepeatableRead, true),
+        (RowLockLevel::ReadCommitted, false),
+    ] {
+        let db = database_with_foreign_keys("");
+        let writer = foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("DELETE FROM p WHERE id = 10").unwrap();
+
+        assert_eq!(
+            waits(&db, "INSERT INTO c VALUES (7, 15, 0)"),
+            keeps_the_gap,
+            "{level:?}"
+        );
+        assert!(!waits(&db, "INSERT INTO c VALUES (8, 25, 0)"), "{level:?}");
+        assert!(!waits(&db, "UPDATE c SET v = 9 WHERE id = 1"), "{level:?}");
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn a_cascade_locks_the_child_rows_it_changes_and_only_the_gap_where_its_scan_stops() {
+    for action in ["ON DELETE CASCADE", "ON DELETE SET NULL"] {
+        let db = database_with_foreign_keys(action);
+        let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer.execute("DELETE FROM p WHERE id = 20").unwrap();
+
+        assert!(waits(&db, "UPDATE c SET v = 9 WHERE id = 1"), "{action}");
+        assert!(waits(&db, "UPDATE c SET v = 9 WHERE id = 2"), "{action}");
+        assert!(!waits(&db, "UPDATE c SET v = 9 WHERE id = 3"), "{action}");
+        assert!(!waits(&db, "INSERT INTO c VALUES (7, 15, 0)"), "{action}");
+        assert!(waits(&db, "INSERT INTO c VALUES (8, 25, 0)"), "{action}");
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn two_child_inserts_that_both_update_their_parent_deadlock() {
+    let db = database_with_foreign_keys("");
+    let first = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    let second = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    first.execute("BEGIN CONCURRENT").unwrap();
+    second.execute("BEGIN CONCURRENT").unwrap();
+    first.execute("INSERT INTO c VALUES (5, 20, 0)").unwrap();
+    second.execute("INSERT INTO c VALUES (6, 20, 0)").unwrap();
+
+    let waiting = run_in_the_background(first, "UPDATE p SET v = 1 WHERE id = 20");
+    assert!(still_waits(&waiting));
+    let closing = second.execute("UPDATE p SET v = 2 WHERE id = 20");
+    assert!(
+        matches!(closing, Err(LimboError::WriteWriteConflict)),
+        "{closing:?}"
+    );
+    let (first, result) = waiting.join().unwrap();
+    result.unwrap();
+    first.execute("COMMIT").unwrap();
+    let values: Vec<(i64,)> = first.exec_rows("SELECT v FROM p WHERE id = 20");
+    assert_eq!(values, [(1,)]);
+}
+
+#[test]
+fn a_self_referencing_delete_checks_the_children_through_their_index() {
+    let db = database_with_row_locks();
+    let setup = db.connect_limbo();
+    setup
+        .execute(
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, parent INT REFERENCES t (id), v INT)",
+        )
+        .unwrap();
+    setup
+        .execute("CREATE INDEX t_parent ON t (parent)")
+        .unwrap();
+    setup
+        .execute(
+            "INSERT INTO t VALUES (10, NULL, 0), (20, 10, 0), (30, 10, 0), (40, 30, 0), (50, 50, 0)",
+        )
+        .unwrap();
+    let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 20").unwrap();
+    let refused = writer.execute("DELETE FROM t WHERE id = 30");
+    assert!(
+        matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+        "{refused:?}"
+    );
+
+    assert!(waits(&db, "UPDATE t SET parent = 10 WHERE id = 40"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 40"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 10"));
+    assert!(!waits(&db, "UPDATE t SET v = 9 WHERE id = 50"));
+    assert!(waits(&db, "INSERT INTO t VALUES (60, 25, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (70, 5, 0)"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_child_insert_locks_its_parent_row_by_every_column_of_a_composite_key() {
+    let db = database_with_row_locks();
+    let setup = db.connect_limbo();
+    setup
+        .execute("CREATE TABLE pc (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    setup
+        .execute(
+            "CREATE TABLE cc (id INT NOT NULL PRIMARY KEY, a INT, b INT, FOREIGN KEY (a, b) REFERENCES pc (a, b))",
+        )
+        .unwrap();
+    setup.execute("CREATE INDEX cc_ab ON cc (a, b)").unwrap();
+    setup
+        .execute("INSERT INTO pc VALUES (1, 1, 0), (1, 2, 0), (2, 1, 0)")
+        .unwrap();
+    let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO cc VALUES (5, 1, 2)").unwrap();
+    let refused = writer.execute("INSERT INTO cc VALUES (6, 1, 3)");
+    assert!(
+        matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+        "{refused:?}"
+    );
+
+    assert!(waits(&db, "DELETE FROM pc WHERE a = 1 AND b = 2"));
+    assert!(!waits(&db, "DELETE FROM pc WHERE a = 1 AND b = 1"));
+    assert!(waits(&db, "INSERT INTO pc VALUES (1, 3, 0)"));
+    assert!(!waits(&db, "INSERT INTO pc VALUES (2, 5, 0)"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+fn database_with_foreign_keys(action: &str) -> TempDatabase {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute(format!(
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id) {action}, v INT)"
+    ))
+    .unwrap();
+    conn.execute("CREATE INDEX c_pid ON c (pid)").unwrap();
+    conn.execute("INSERT INTO p VALUES (10, 1), (20, 2), (30, 3)")
+        .unwrap();
+    conn.execute("INSERT INTO c VALUES (1, 20, 0), (2, 20, 0), (3, 30, 0)")
+        .unwrap();
+    db
+}
+
+fn foreign_key_session(db: &TempDatabase, level: RowLockLevel) -> Arc<Connection> {
+    let conn = session(db);
+    conn.set_row_lock_level(level);
+    conn.execute("PRAGMA foreign_keys = ON").unwrap();
+    conn
+}

@@ -737,7 +737,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         if taken == RecordLock::Taken {
             let row_locks = self.row_locks_in_force();
             match pending.direction {
-                IterationDirection::Forwards if !matches!(pending.below, Below::Nothing) => {
+                IterationDirection::Forwards
+                    if row_locks.locks_the_gap_below_each_row
+                        && !matches!(pending.below, Below::Nothing) =>
+                {
                     let (low, start) = return_if_io!(self.gap_below_the_pending_row());
                     let skips = row_locks.policy == RowLockWaitPolicy::SkipLocked;
                     self.lock_the_gap(low, Some(pending.row.clone()), |key| {
@@ -836,7 +839,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         {
             return Ok(RecordLock::HeldByAnother);
         }
-        if with_the_table_row && row_locks.mode == RowLockMode::Exclusive {
+        let locks_the_table_row = row_locks.mode == RowLockMode::Exclusive
+            || (row_locks.checks_a_foreign_key && row_locks.primary);
+        if with_the_table_row && locks_the_table_row {
             if let Some(table_row) = self.table_row_of_index_entry(&id, row_locks) {
                 return self.lock_one_record(table_row, row_locks, reads_past_a_held_row);
             }

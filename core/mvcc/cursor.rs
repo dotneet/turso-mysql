@@ -574,6 +574,8 @@ pub(crate) struct CursorRowLocks {
     pub(crate) locking_select: bool,
     pub(crate) reads_past_held_rows: bool,
     pub(crate) duplicate_mode: RowLockMode,
+    pub(crate) checks_a_foreign_key: bool,
+    pub(crate) locks_the_gap_below_each_row: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,6 +656,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     pub(crate) fn lock_rows_it_reads(&mut self, row_locks: CursorRowLocks) {
         self.row_locks = Some(row_locks);
+    }
+
+    pub(crate) fn checks_a_foreign_key(&self) -> bool {
+        self.row_locks
+            .is_some_and(|row_locks| row_locks.checks_a_foreign_key)
     }
 
     pub(crate) fn position_to_write(&mut self, writes: bool) {

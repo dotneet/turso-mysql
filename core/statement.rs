@@ -918,6 +918,10 @@ impl Statement {
     /// arming, busy handler, metrics recording, and schema retry.
     /// The parent statement handles all of those concerns.
     #[inline]
+    pub(crate) fn step_with_row_locks_like(&mut self, parent: &vdbe::ProgramState) {
+        self.state.steps_with_row_locks = parent.steps_with_row_locks;
+    }
+
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)

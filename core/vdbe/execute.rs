@@ -6023,6 +6023,8 @@ pub fn op_program(
                         (false, None, None)
                     };
 
+                statement.step_with_row_locks_like(state);
+
                 // Copy parameter values from parent registers into the subprogram's parameters.
                 for (param_idx, &parent_reg) in param_registers.iter().enumerate() {
                     let value = state.registers[parent_reg].get_value().clone();
@@ -17347,7 +17349,11 @@ fn row_locks_for_cursor(
     }
     let level = program.connection.row_lock_level();
     let writes_the_table = program_writes_table(program, table_name);
+    let checks_a_foreign_key = program.row_lock_points.iter().any(|(_, point)| {
+        matches!(point, crate::vdbe::RowLockPoint::ChecksAForeignKey { cursor_id: checking } if *checking == cursor_id)
+    });
     let (mode, policy) = match &state.locking_read {
+        _ if checks_a_foreign_key => (RowLockMode::Shared, RowLockWaitPolicy::Wait),
         Some(locking_read) => {
             let locked = locking_read
                 .tables
@@ -17391,21 +17397,25 @@ fn row_locks_for_cursor(
     let range_end_check = range_end_check_of(program, cursor_id, hooks);
     let read_committed = level == RowLockLevel::ReadCommitted;
     let releases_unmatched_rows = read_committed
+        && !checks_a_foreign_key
         && marked(
             |point, cursor_id| matches!(point, crate::vdbe::RowLockPoint::RowsMatched { cursor_id: matched } if *matched == cursor_id),
         );
     let updates_the_table = program_updates_table(program, table_name);
     let reads_past_held_rows = read_committed
+        && !checks_a_foreign_key
         && state.locking_read.is_none()
         && writes_the_table
         && updates_the_table
         && primary
         && !program_scans_a_secondary_index_of(program, table_name, &schema);
-    let duplicate_mode = if updates_the_table {
+    let duplicate_mode = if updates_the_table && !checks_a_foreign_key {
         RowLockMode::Exclusive
     } else {
         RowLockMode::Shared
     };
+    let changes_rows_for_a_foreign_key =
+        program.changes_rows_for_a_foreign_key && writes_the_table && !checks_a_foreign_key;
     Some(CursorRowLocks {
         mode,
         policy,
@@ -17417,6 +17427,8 @@ fn row_locks_for_cursor(
         locking_select: state.locking_read.is_some() && !writes_the_table,
         reads_past_held_rows,
         duplicate_mode,
+        checks_a_foreign_key,
+        locks_the_gap_below_each_row: !checks_a_foreign_key && !changes_rows_for_a_foreign_key,
     })
 }
 

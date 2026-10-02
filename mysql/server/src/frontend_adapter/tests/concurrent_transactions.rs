@@ -1084,6 +1084,242 @@ fn two_sessions_that_lock_one_gap_and_insert_into_it_end_in_a_deadlock() {
     assert_eq!(balances(&mut one), ["10", "20", "30", "50"]);
 }
 
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: a child
+/// row's insert locks its parent row in share mode (`S,REC_NOT_GAP`) under
+/// both levels, so another session's delete or update of that parent waits
+/// and answers 1205, while its share lock and its own child insert go ahead.
+#[test]
+fn a_child_insert_keeps_its_parent_from_being_deleted_or_changed() {
+    for level in ["REPEATABLE READ", "READ COMMITTED"] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = foreign_key_sessions("")
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        run(
+            &mut one,
+            "INSERT INTO children (id, parent_id, v) VALUES (5, 20, 0)",
+        );
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        for blocked in [
+            "DELETE FROM parents WHERE id = 20",
+            "UPDATE parents SET v = 9 WHERE id = 20",
+            "UPDATE parents SET v = 9 WHERE v = 2",
+            "SELECT id FROM parents WHERE id = 20 FOR UPDATE",
+        ] {
+            assert_eq!(
+                two.execute_query(blocked).map(|_| ()),
+                Err(FrontendErrorKind::DatabaseBusy),
+                "{level}: {blocked}"
+            );
+        }
+        run(&mut two, "BEGIN");
+        run(&mut two, "SELECT id FROM parents WHERE id = 20 FOR SHARE");
+        run(
+            &mut two,
+            "INSERT INTO children (id, parent_id, v) VALUES (6, 20, 0)",
+        );
+        run(&mut two, "UPDATE parents SET v = 9 WHERE id = 30");
+        run(&mut two, "ROLLBACK");
+        run(&mut one, "COMMIT");
+        run(&mut two, "UPDATE parents SET v = 9 WHERE id = 20");
+    }
+}
+
+/// Measured on MySQL 8.4.11: a child row naming a missing parent answers
+/// 1452 and, under `REPEATABLE READ`, keeps the gap the parent key would be in
+/// (`S,GAP` on the next parent row), so an insert of that parent waits;
+/// under `READ COMMITTED` it keeps nothing.
+#[test]
+fn a_child_insert_of_a_missing_parent_keeps_the_gap_only_under_repeatable_read() {
+    for (level, keeps_the_gap) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = foreign_key_sessions("")
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        assert_eq!(
+            one.execute_query("INSERT INTO children (id, parent_id, v) VALUES (5, 25, 0)")
+                .map(|_| ()),
+            Err(FrontendErrorKind::ForeignKeyViolation)
+        );
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        let parent_insert = two
+            .execute_query("INSERT INTO parents (id, v) VALUES (25, 0)")
+            .map(|_| ());
+        if keeps_the_gap {
+            assert_eq!(parent_insert, Err(FrontendErrorKind::DatabaseBusy));
+        } else {
+            assert_eq!(parent_insert, Ok(()));
+        }
+        run(&mut two, "INSERT INTO parents (id, v) VALUES (35, 0)");
+        run(&mut one, "ROLLBACK");
+    }
+}
+
+/// Measured on MySQL 8.4.11: a child insert naming a parent another open
+/// transaction inserted waits for it, and goes ahead once it commits.
+#[test]
+fn a_child_insert_waits_for_the_transaction_that_inserted_its_parent() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        two,
+    }) = foreign_key_sessions("")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut one, "INSERT INTO parents (id, v) VALUES (25, 0)");
+    let waiting = in_the_background(
+        two,
+        "INSERT INTO children (id, parent_id, v) VALUES (5, 25, 0)",
+    );
+    assert!(still_waiting(&waiting));
+    run(&mut one, "COMMIT");
+    let (_two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+}
+
+/// Measured on MySQL 8.4.11: a parent delete refused because a child names it
+/// locks the child's index entry it found (`S,REC_NOT_GAP`) and not the child
+/// row, so another session's delete of that child waits while an update of
+/// its other columns goes ahead.
+#[test]
+fn a_refused_parent_delete_keeps_the_child_entry_it_found() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = foreign_key_sessions("")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    assert_eq!(
+        one.execute_query("DELETE FROM parents WHERE id = 20")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query("DELETE FROM children WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut two, "UPDATE children SET v = 9 WHERE id = 1");
+    run(&mut one, "ROLLBACK");
+}
+
+/// Measured on MySQL 8.4.11: two sessions that each inserted a child of one
+/// parent and then both update that parent end in 1213 for the one whose wait
+/// closes the cycle, and the other's update goes on.
+#[test]
+fn two_child_inserts_that_both_update_their_parent_end_in_a_deadlock() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = foreign_key_sessions("")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut two, "BEGIN");
+    run(
+        &mut one,
+        "INSERT INTO children (id, parent_id, v) VALUES (5, 20, 0)",
+    );
+    run(
+        &mut two,
+        "INSERT INTO children (id, parent_id, v) VALUES (6, 20, 0)",
+    );
+    let waiting = in_the_background(one, "UPDATE parents SET v = 1 WHERE id = 20");
+    assert!(still_waiting(&waiting));
+    assert_eq!(
+        two.execute_query("UPDATE parents SET v = 2 WHERE id = 20")
+            .map(|_| ()),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    let (mut one, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: an
+/// `ON DELETE CASCADE` locks the child rows it deletes and the gap where its
+/// scan of the child index stops, and no gap below the children it deleted,
+/// so another session's insert of a child of another parent goes ahead.
+#[test]
+fn a_cascade_keeps_the_children_it_deleted_and_lets_other_children_in() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = foreign_key_sessions("ON DELETE CASCADE")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut one, "DELETE FROM parents WHERE id = 20");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query("UPDATE children SET v = 9 WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(
+        &mut two,
+        "INSERT INTO children (id, parent_id, v) VALUES (0, 10, 0)",
+    );
+    run(&mut two, "UPDATE children SET v = 9 WHERE id = 3");
+    run(&mut one, "COMMIT");
+}
+
+fn foreign_key_sessions(action: &str) -> Option<TwoSessions> {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return None;
+    }
+    let mut sessions = two_sessions();
+    run(
+        &mut sessions.one,
+        "CREATE TABLE parents (id INT NOT NULL PRIMARY KEY, v INT)",
+    );
+    run(
+        &mut sessions.one,
+        &format!(
+            "CREATE TABLE children (id INT NOT NULL PRIMARY KEY, parent_id INT, v INT, \
+             FOREIGN KEY (parent_id) REFERENCES parents (id) {action})"
+        ),
+    );
+    run(
+        &mut sessions.one,
+        "INSERT INTO parents (id, v) VALUES (10, 1), (20, 2), (30, 3)",
+    );
+    run(
+        &mut sessions.one,
+        "INSERT INTO children (id, parent_id, v) VALUES (1, 20, 0), (2, 20, 0), (3, 30, 0)",
+    );
+    Some(sessions)
+}
+
 fn row_lock_sessions() -> Option<TwoSessions> {
     if !turso_mysql::experimental_mvcc_is_on() {
         return None;

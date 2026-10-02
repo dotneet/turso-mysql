@@ -248,6 +248,7 @@ pub struct ProgramBuilder {
     pub parameters: Parameters,
     pub result_columns: Vec<ResultSetColumn>,
     row_lock_points: Vec<(BranchOffset, RowLockPoint)>,
+    pub(crate) changes_rows_for_a_foreign_key: bool,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// Registry of materialized CTEs, keyed by cte_id.
@@ -718,6 +719,7 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             row_lock_points: Vec::new(),
+            changes_rows_for_a_foreign_key: false,
             table_references: TableReferences::new(vec![], vec![]),
             collation: None,
             nested_level: 0,
@@ -2397,6 +2399,7 @@ impl ProgramBuilder {
             )),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
+            changes_rows_for_a_foreign_key: self.changes_rows_for_a_foreign_key,
             resolve_type: self.resolve_type,
             prepare_context,
             prepare_options: crate::PrepareOptions::default(),
