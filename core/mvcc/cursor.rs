@@ -5,7 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowLockMode, RowLockWaitPolicy,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -554,6 +555,21 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
+    row_locks: Option<CursorRowLocks>,
+    moving_past_held_rows: Option<IterationDirection>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CursorRowLocks {
+    pub(crate) mode: RowLockMode,
+    pub(crate) policy: RowLockWaitPolicy,
+    pub(crate) table_of_index: Option<MVTableId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowLockResult {
+    Locked,
+    HeldByAnother,
 }
 
 pub enum NextRowidResult {
@@ -620,7 +636,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
+            row_locks: None,
+            moving_past_held_rows: None,
         })
+    }
+
+    pub(crate) fn lock_rows_it_reads(&mut self, row_locks: CursorRowLocks) {
+        self.row_locks = Some(row_locks);
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -1269,6 +1291,422 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
     fn last(&mut self) -> IOResultOr<()> {
+        if let Some(direction) = self.moving_past_held_rows {
+            return self.lock_the_row_or_move_past_it(direction);
+        }
+        return_if_io!(self.last_row());
+        self.lock_the_row_or_move_past_it(IterationDirection::Backwards)
+    }
+
+    fn next(&mut self) -> IOResultOr<()> {
+        if let Some(direction) = self.moving_past_held_rows {
+            return self.lock_the_row_or_move_past_it(direction);
+        }
+        return_if_io!(self.next_row());
+        self.lock_the_row_or_move_past_it(IterationDirection::Forwards)
+    }
+
+    fn prev(&mut self) -> IOResultOr<()> {
+        if let Some(direction) = self.moving_past_held_rows {
+            return self.lock_the_row_or_move_past_it(direction);
+        }
+        return_if_io!(self.prev_row());
+        self.lock_the_row_or_move_past_it(IterationDirection::Backwards)
+    }
+
+    fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        if self.get_null_flag() {
+            return Ok(IOResult::Done(None));
+        }
+        let rowid = match self.get_current_pos() {
+            CursorPosition::Loaded {
+                row_id,
+                in_btree: _,
+                ..
+            } => match &row_id.row_id {
+                RowKey::Int(id) => Some(*id),
+                RowKey::Record(sortable_key) => {
+                    // For index cursors, the rowid is stored in the last column of the index record
+                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                        panic!("RowKey::Record requires Index cursor type");
+                    };
+                    if index_info.has_rowid {
+                        match sortable_key.key.last_value() {
+                            Some(Ok(crate::types::ValueRef::Numeric(
+                                crate::numeric::Numeric::Integer(rowid),
+                            ))) => Some(rowid),
+                            _ => {
+                                crate::bail_parse_error!("Failed to parse rowid from index record")
+                            }
+                        }
+                    } else {
+                        crate::bail_parse_error!("Indexes without rowid are not supported in MVCC");
+                    }
+                }
+            },
+            CursorPosition::BeforeFirst => None,
+            CursorPosition::End => None,
+        };
+        Ok(IOResult::Done(rowid))
+    }
+
+    fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        self.current_row()
+    }
+
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
+        let record = ImmutableRecord::from_registers(registers, registers.len())?;
+        self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
+    }
+
+    fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        if let Some(direction) = self.moving_past_held_rows {
+            return self.move_past_held_rows_after_a_seek(direction);
+        }
+        let found = return_if_io!(self.seek_row(seek_key, op));
+        if found != SeekResult::Found {
+            return Ok(IOResult::Done(found));
+        }
+        if self.lock_the_row()? == RowLockResult::Locked {
+            return Ok(IOResult::Done(found));
+        }
+        if op.eq_only() {
+            self.current_pos = match op.iteration_direction() {
+                IterationDirection::Forwards => CursorPosition::End,
+                IterationDirection::Backwards => CursorPosition::BeforeFirst,
+            };
+            return Ok(IOResult::Done(SeekResult::NotFound));
+        }
+        self.moving_past_held_rows = Some(op.iteration_direction());
+        self.move_past_held_rows_after_a_seek(op.iteration_direction())
+    }
+
+    /// Insert a row into the table or index.
+    /// Sets the cursor to the inserted row.
+    fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
+        let row_id = match key {
+            BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
+            BTreeKey::IndexKey(record) => {
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("BTreeKey::IndexKey requires Index cursor type");
+                };
+                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
+                    record,
+                    index_info.clone(),
+                    self.db.allocator(),
+                )?);
+                RowID::new(self.table_id, RowKey::Record(sortable_key))
+            }
+        };
+        let row = match &self.mv_cursor_type {
+            MvccCursorType::Table => {
+                let BTreeKey::TableRowId((_, record)) = key else {
+                    return Err(LimboError::InternalError(
+                        "Table cursor requires a TableRowId key".to_string(),
+                    )
+                    .into());
+                };
+                let record = record.as_ref().ok_or_else(|| {
+                    LimboError::InternalError("TableRowId should have a record".to_string())
+                })?;
+                let num_columns = record.column_count();
+                crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        row_id,
+                        record.get_payload(),
+                        num_columns,
+                        self.db.allocator(),
+                    )
+                )
+            }
+            MvccCursorType::Index(_) => {
+                let BTreeKey::IndexKey(record) = key else {
+                    return Err(LimboError::InternalError(
+                        "Index cursor requires an IndexKey".to_string(),
+                    )
+                    .into());
+                };
+                Ok(Row::new_index_row(row_id, record.column_count()))
+            }
+        }?;
+
+        // Check if the cursor is currently positioned at a B-tree row that matches
+        // the row we're inserting. This indicates we're updating a B-tree-resident row
+        // that doesn't yet have an MVCC version.
+        let was_btree_resident = match &self.current_pos {
+            CursorPosition::Loaded {
+                row_id: current_row_id,
+                in_btree,
+                ..
+            } => *in_btree && *current_row_id == row.id,
+            _ => false,
+        };
+
+        self.current_pos = CursorPosition::Loaded {
+            row_id: row.id.clone(),
+            in_btree: was_btree_resident,
+            versions: None,
+        };
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
+        // FIXME: set btree to somewhere close to this rowid?
+        if self
+            .db
+            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
+            .is_some()
+        {
+            let updated = self
+                .db
+                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos = CursorPosition::BeforeFirst;
+                })?;
+            turso_assert!(
+                updated,
+                "read found a visible version but update could not supersede it"
+            );
+        } else if was_btree_resident {
+            // The row exists in B-tree but not in MvStore - mark it as B-tree resident
+            // so that checkpoint knows to write deletes to the B-tree file.
+            self.db
+                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos = CursorPosition::BeforeFirst;
+                })?;
+        } else {
+            self.db
+                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos = CursorPosition::BeforeFirst;
+                })?;
+        }
+        self.invalidate_record();
+        Ok(IOResult::Done(()))
+    }
+
+    fn delete(&mut self) -> IOResultOr<()> {
+        let (rowid, in_btree) = match self.get_current_pos() {
+            CursorPosition::Loaded {
+                row_id, in_btree, ..
+            } => (row_id, in_btree),
+            _ => panic!("Cannot delete: no current row"),
+        };
+        if in_btree {
+            turso_assert!(
+                self.is_btree_allocated(),
+                "MVCC cursor marked current row as B-tree resident without an allocated B-tree",
+                { "row_id": &rowid }
+            );
+        }
+        let maybe_index_id = match &self.mv_cursor_type {
+            MvccCursorType::Index(_) => Some(self.table_id),
+            MvccCursorType::Table => None,
+        };
+        // If the cursor is positioned at a btree-resident row, the VDBE may never
+        // have materialized the row's record (e.g. UPDATE through a DeferredSeek
+        // never calls Column on the table cursor). Pre-fetch it here so the
+        // later synchronous fetch used to build a tombstone doesn't have to
+        // yield IO from inside this function, which is not IO-reentrant w.r.t.
+        // `delete_from_table_or_index`'s side effects.
+        if in_btree {
+            return_if_io!(self.record());
+        }
+        let was_deleted =
+            self.db
+                .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
+        // If was_deleted is false, this can ONLY happen when we have a row that only exists
+        // in the btree but not the mv store. In this case, we create a tombstone for the row
+        // based on the btree row.
+        if !was_deleted {
+            // The cursor can also be positioned on a row that was rolled back
+            // after seek. That row does not exist in either MVCC or the B-tree.
+            if !in_btree {
+                self.invalidate_record();
+                return Ok(IOResult::Done(()));
+            }
+            // The btree cursor must be correctly positioned and cannot cause IO to happen
+            // because we pre-fetched the record above when `in_btree` was true.
+            let IOResult::Done(Some(record)) = self.record()? else {
+                crate::bail_corrupt_error!(
+                    "Btree cursor should have a record when deleting a row that only exists in the btree"
+                );
+            };
+            // All operations below clone values so we can clone it here to circumvent the borrow checker
+            let record = record.clone();
+            let column_count = record.column_count();
+            let row = match &self.mv_cursor_type {
+                MvccCursorType::Table => crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        rowid.clone(),
+                        record.get_payload(),
+                        column_count,
+                        self.db.allocator(),
+                    )
+                ),
+                MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
+            }?;
+            self.db
+                .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
+        }
+        self.invalidate_record();
+        Ok(IOResult::Done(()))
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.null_flag
+    }
+
+    fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        let exists = return_if_io!(self.row_exists(key));
+        if !exists {
+            return Ok(IOResult::Done(false));
+        }
+        Ok(IOResult::Done(
+            self.lock_the_row()? == RowLockResult::Locked,
+        ))
+    }
+
+    fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
+        todo!()
+    }
+
+    fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
+        todo!()
+    }
+
+    fn count(&mut self) -> IOResultOr<usize> {
+        loop {
+            let state = self.count_state;
+            match state {
+                None => {
+                    self.count_state.replace(CountState::Rewind);
+                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                }
+                Some(CountState::Rewind) => {
+                    return_if_io!(self.rewind());
+                    self.count_state
+                        .replace(CountState::CheckBtreeKey { count: 0 });
+                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                }
+                Some(CountState::CheckBtreeKey { count }) => {
+                    if let CursorPosition::Loaded {
+                        row_id: _,
+                        in_btree: _,
+                        ..
+                    } = self.get_current_pos()
+                    {
+                        self.count_state
+                            .replace(CountState::NextBtree { count: count + 1 });
+                        inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                    } else {
+                        self.count_state = None;
+                        return Ok(IOResult::Done(count));
+                    }
+                }
+                Some(CountState::NextBtree { count }) => {
+                    // advance the btree cursor skips non valid keys
+                    return_if_io!(self.next());
+                    self.count_state
+                        .replace(CountState::CheckBtreeKey { count });
+                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
+                }
+            }
+        }
+    }
+
+    /// Returns true if the is not pointing to any row.
+    fn is_empty(&self) -> bool {
+        // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
+        // If we have loaded a row, it means there is something in the table.
+        match self.get_current_pos() {
+            CursorPosition::Loaded { .. } => false,
+            CursorPosition::BeforeFirst => true,
+            CursorPosition::End => true,
+        }
+    }
+
+    fn root_page(&self) -> i64 {
+        self.table_id.into()
+    }
+
+    fn rewind(&mut self) -> IOResultOr<()> {
+        if let Some(direction) = self.moving_past_held_rows {
+            return self.lock_the_row_or_move_past_it(direction);
+        }
+        return_if_io!(self.rewind_rows());
+        self.lock_the_row_or_move_past_it(IterationDirection::Forwards)
+    }
+
+    fn has_record(&self) -> bool {
+        matches!(self.get_current_pos(), CursorPosition::Loaded { .. })
+    }
+
+    fn set_has_record(&mut self, _has_record: bool) {
+        todo!()
+    }
+
+    fn index_info(&self) -> Option<&Arc<crate::types::IndexInfo>> {
+        match &self.mv_cursor_type {
+            MvccCursorType::Index(index_info) => Some(index_info),
+            MvccCursorType::Table => None,
+        }
+    }
+
+    fn seek_end(&mut self) -> IOResultOr<()> {
+        if self.is_btree_allocated() {
+            // Defer to btree cursor's seek_end implementation
+            self.btree_cursor.seek_end()
+        } else {
+            // SkipMap inserts don't require cursor positioning because
+            // SeekEnd instruction is only used for insertions.
+            Ok(IOResult::Done(()))
+        }
+    }
+
+    fn seek_to_last(&mut self) -> IOResultOr<()> {
+        match self.seek_row(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
+            IOResult::Done(_) => Ok(IOResult::Done(())),
+            IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),
+        }
+    }
+
+    fn invalidate_record(&mut self) {
+        if let Some(record) = self.reusable_immutable_record.as_mut() {
+            record.invalidate();
+        }
+    }
+
+    fn has_rowid(&self) -> bool {
+        match &self.mv_cursor_type {
+            MvccCursorType::Index(index_info) => index_info.has_rowid,
+            MvccCursorType::Table => true, // currently we don't support WITHOUT ROWID tables
+        }
+    }
+
+    fn get_pager(&self) -> Arc<Pager> {
+        self.btree_cursor.get_pager()
+    }
+
+    fn get_skip_advance(&self) -> bool {
+        todo!()
+    }
+
+    /// Returns true if this cursor operates in MVCC mode.
+    fn is_mvcc(&self) -> bool {
+        true
+    }
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
+    fn last_row(&mut self) -> IOResultOr<()> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -1343,7 +1781,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn next(&mut self) -> IOResultOr<()> {
+    fn next_row(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             let current_pos = self.get_current_pos();
@@ -1439,7 +1877,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn prev(&mut self) -> IOResultOr<()> {
+    fn prev_row(&mut self) -> IOResultOr<()> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             let current_pos = self.get_current_pos();
@@ -1448,7 +1886,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 if uninitialized {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized));
-                    return_if_io!(self.last());
+                    return_if_io!(self.last_row());
                 } else {
                     self.state
                         .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
@@ -1463,7 +1901,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             self.state.as_ref().expect("prev state is not initialized"),
             MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
         ) {
-            return_if_io!(self.last());
+            return_if_io!(self.last_row());
             self.state
                 .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
         }
@@ -1526,52 +1964,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         Ok(IOResult::Done(()))
     }
 
-    fn rowid(&mut self) -> IOResultOr<Option<i64>> {
-        if self.get_null_flag() {
-            return Ok(IOResult::Done(None));
-        }
-        let rowid = match self.get_current_pos() {
-            CursorPosition::Loaded {
-                row_id,
-                in_btree: _,
-                ..
-            } => match &row_id.row_id {
-                RowKey::Int(id) => Some(*id),
-                RowKey::Record(sortable_key) => {
-                    // For index cursors, the rowid is stored in the last column of the index record
-                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                        panic!("RowKey::Record requires Index cursor type");
-                    };
-                    if index_info.has_rowid {
-                        match sortable_key.key.last_value() {
-                            Some(Ok(crate::types::ValueRef::Numeric(
-                                crate::numeric::Numeric::Integer(rowid),
-                            ))) => Some(rowid),
-                            _ => {
-                                crate::bail_parse_error!("Failed to parse rowid from index record")
-                            }
-                        }
-                    } else {
-                        crate::bail_parse_error!("Indexes without rowid are not supported in MVCC");
-                    }
-                }
-            },
-            CursorPosition::BeforeFirst => None,
-            CursorPosition::End => None,
-        };
-        Ok(IOResult::Done(rowid))
-    }
-
-    fn record(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
-        self.current_row()
-    }
-
-    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
-        let record = ImmutableRecord::from_registers(registers, registers.len())?;
-        self.seek(SeekKey::IndexKey(record.as_record_ref()), op)
-    }
-
-    fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+    fn seek_row(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1809,190 +2202,76 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    /// Insert a row into the table or index.
-    /// Sets the cursor to the inserted row.
-    fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
-        let row_id = match key {
-            BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
-            BTreeKey::IndexKey(record) => {
-                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                    panic!("BTreeKey::IndexKey requires Index cursor type");
-                };
-                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
-                    record,
-                    index_info.clone(),
-                    self.db.allocator(),
-                )?);
-                RowID::new(self.table_id, RowKey::Record(sortable_key))
-            }
-        };
-        let row = match &self.mv_cursor_type {
+    fn rewind_rows(&mut self) -> IOResultOr<()> {
+        // A cursor may be NullRow'd during outer-join unmatched emission.
+        // Repositioning to a real row must clear that synthetic NULL state.
+        self.set_null_flag(false);
+        let state = self.state.clone();
+        if state.is_none() {
+            let _ = self.table_iterator.take();
+            let _ = self.index_iterator.take();
+            self.reset_dual_peek();
+            self.state
+                .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
+        }
+
+        turso_assert!(
+            matches!(
+                self.state
+                    .as_ref()
+                    .expect("rewind state is not initialized"),
+                MvccLazyCursorState::Rewind(RewindState::Advance)
+            ),
+            "invalid rewind state",
+            { "state": format!("{:?}", self.state) }
+        );
+        // First run btree_cursor rewind so that we don't need a explicit state machine.
+        return_if_io!(self.advance_btree_forward());
+
+        self.invalidate_record();
+        self.current_pos = CursorPosition::BeforeFirst;
+
+        // Initialize MVCC iterators for rewind operation; in practice there is only one of these
+        // depending on the cursor type, so we should at some point refactor the iterator thing to be
+        // generic over the type instead of having two on the struct.
+        match &self.mv_cursor_type {
             MvccCursorType::Table => {
-                let BTreeKey::TableRowId((_, record)) = key else {
-                    return Err(LimboError::InternalError(
-                        "Table cursor requires a TableRowId key".to_string(),
-                    )
-                    .into());
+                // For table cursors, initialize iterator from the correct table id + i64::MIN;
+                // this is because table rows from all tables are stored in the same map
+                let start_rowid = RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Int(i64::MIN),
                 };
-                let record = record.as_ref().ok_or_else(|| {
-                    LimboError::InternalError("TableRowId should have a record".to_string())
-                })?;
-                let num_columns = record.column_count();
-                crate::with_mv_store_allocation_site!(
-                    RowPayload,
-                    Row::new_table_row_in(
-                        row_id,
-                        record.get_payload(),
-                        num_columns,
-                        self.db.allocator(),
-                    )
-                )
+                let range = (
+                    std::ops::Bound::Included(start_rowid),
+                    std::ops::Bound::Unbounded,
+                );
+                let iter_box = Box::new(self.db.rows.range(range));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
             }
             MvccCursorType::Index(_) => {
-                let BTreeKey::IndexKey(record) = key else {
-                    return Err(LimboError::InternalError(
-                        "Index cursor requires an IndexKey".to_string(),
-                    )
-                    .into());
-                };
-                Ok(Row::new_index_row(row_id, record.column_count()))
+                // For index cursors, initialize the iterator to the beginning
+                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
+                let index_rows = index_rows.value();
+                let iter_box: Box<
+                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
+                > = Box::new(index_rows.iter());
+                self.index_iterator =
+                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
             }
-        }?;
-
-        // Check if the cursor is currently positioned at a B-tree row that matches
-        // the row we're inserting. This indicates we're updating a B-tree-resident row
-        // that doesn't yet have an MVCC version.
-        let was_btree_resident = match &self.current_pos {
-            CursorPosition::Loaded {
-                row_id: current_row_id,
-                in_btree,
-                ..
-            } => *in_btree && *current_row_id == row.id,
-            _ => false,
-        };
-
-        self.current_pos = CursorPosition::Loaded {
-            row_id: row.id.clone(),
-            in_btree: was_btree_resident,
-            versions: None,
-        };
-        let maybe_index_id = match &self.mv_cursor_type {
-            MvccCursorType::Index(_) => Some(self.table_id),
-            MvccCursorType::Table => None,
-        };
-        // FIXME: set btree to somewhere close to this rowid?
-        if self
-            .db
-            .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
-            .is_some()
-        {
-            let updated = self
-                .db
-                .update_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
-            turso_assert!(
-                updated,
-                "read found a visible version but update could not supersede it"
-            );
-        } else if was_btree_resident {
-            // The row exists in B-tree but not in MvStore - mark it as B-tree resident
-            // so that checkpoint knows to write deletes to the B-tree file.
-            self.db
-                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
-        } else {
-            self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
         }
+
+        // Rewind mvcc iterator
+        self.advance_mvcc_iterator();
+
+        self.refresh_current_position(IterationDirection::Forwards);
+
         self.invalidate_record();
+        self.state = None;
         Ok(IOResult::Done(()))
     }
 
-    fn delete(&mut self) -> IOResultOr<()> {
-        let (rowid, in_btree) = match self.get_current_pos() {
-            CursorPosition::Loaded {
-                row_id, in_btree, ..
-            } => (row_id, in_btree),
-            _ => panic!("Cannot delete: no current row"),
-        };
-        if in_btree {
-            turso_assert!(
-                self.is_btree_allocated(),
-                "MVCC cursor marked current row as B-tree resident without an allocated B-tree",
-                { "row_id": &rowid }
-            );
-        }
-        let maybe_index_id = match &self.mv_cursor_type {
-            MvccCursorType::Index(_) => Some(self.table_id),
-            MvccCursorType::Table => None,
-        };
-        // If the cursor is positioned at a btree-resident row, the VDBE may never
-        // have materialized the row's record (e.g. UPDATE through a DeferredSeek
-        // never calls Column on the table cursor). Pre-fetch it here so the
-        // later synchronous fetch used to build a tombstone doesn't have to
-        // yield IO from inside this function, which is not IO-reentrant w.r.t.
-        // `delete_from_table_or_index`'s side effects.
-        if in_btree {
-            return_if_io!(self.record());
-        }
-        let was_deleted =
-            self.db
-                .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
-        // If was_deleted is false, this can ONLY happen when we have a row that only exists
-        // in the btree but not the mv store. In this case, we create a tombstone for the row
-        // based on the btree row.
-        if !was_deleted {
-            // The cursor can also be positioned on a row that was rolled back
-            // after seek. That row does not exist in either MVCC or the B-tree.
-            if !in_btree {
-                self.invalidate_record();
-                return Ok(IOResult::Done(()));
-            }
-            // The btree cursor must be correctly positioned and cannot cause IO to happen
-            // because we pre-fetched the record above when `in_btree` was true.
-            let IOResult::Done(Some(record)) = self.record()? else {
-                crate::bail_corrupt_error!(
-                    "Btree cursor should have a record when deleting a row that only exists in the btree"
-                );
-            };
-            // All operations below clone values so we can clone it here to circumvent the borrow checker
-            let record = record.clone();
-            let column_count = record.column_count();
-            let row = match &self.mv_cursor_type {
-                MvccCursorType::Table => crate::with_mv_store_allocation_site!(
-                    RowPayload,
-                    Row::new_table_row_in(
-                        rowid.clone(),
-                        record.get_payload(),
-                        column_count,
-                        self.db.allocator(),
-                    )
-                ),
-                MvccCursorType::Index(_) => Ok(Row::new_index_row(rowid.clone(), column_count)),
-            }?;
-            self.db
-                .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
-        }
-        self.invalidate_record();
-        Ok(IOResult::Done(()))
-    }
-
-    fn set_null_flag(&mut self, flag: bool) {
-        self.null_flag = flag;
-    }
-
-    fn get_null_flag(&self) -> bool {
-        self.null_flag
-    }
-
-    fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+    fn row_exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
             self.invalidate_record();
             let int_key = match key {
@@ -2118,195 +2397,81 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         }
     }
 
-    fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
-        todo!()
-    }
-
-    fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
-        todo!()
-    }
-
-    fn count(&mut self) -> IOResultOr<usize> {
+    fn lock_the_row_or_move_past_it(&mut self, direction: IterationDirection) -> IOResultOr<()> {
         loop {
-            let state = self.count_state;
-            match state {
-                None => {
-                    self.count_state.replace(CountState::Rewind);
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
+            if self.moving_past_held_rows.is_none() {
+                if self.lock_the_row()? == RowLockResult::Locked {
+                    return Ok(IOResult::Done(()));
                 }
-                Some(CountState::Rewind) => {
-                    return_if_io!(self.rewind());
-                    self.count_state
-                        .replace(CountState::CheckBtreeKey { count: 0 });
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                }
-                Some(CountState::CheckBtreeKey { count }) => {
-                    if let CursorPosition::Loaded {
-                        row_id: _,
-                        in_btree: _,
-                        ..
-                    } = self.get_current_pos()
-                    {
-                        self.count_state
-                            .replace(CountState::NextBtree { count: count + 1 });
-                        inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                    } else {
-                        self.count_state = None;
-                        return Ok(IOResult::Done(count));
-                    }
-                }
-                Some(CountState::NextBtree { count }) => {
-                    // advance the btree cursor skips non valid keys
-                    return_if_io!(self.next());
-                    self.count_state
-                        .replace(CountState::CheckBtreeKey { count });
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                }
+                self.moving_past_held_rows = Some(direction);
             }
-        }
-    }
-
-    /// Returns true if the is not pointing to any row.
-    fn is_empty(&self) -> bool {
-        // If we reached the end of the table, it means we traversed the whole table therefore there must be something in the table.
-        // If we have loaded a row, it means there is something in the table.
-        match self.get_current_pos() {
-            CursorPosition::Loaded { .. } => false,
-            CursorPosition::BeforeFirst => true,
-            CursorPosition::End => true,
-        }
-    }
-
-    fn root_page(&self) -> i64 {
-        self.table_id.into()
-    }
-
-    fn rewind(&mut self) -> IOResultOr<()> {
-        // A cursor may be NullRow'd during outer-join unmatched emission.
-        // Repositioning to a real row must clear that synthetic NULL state.
-        self.set_null_flag(false);
-        let state = self.state.clone();
-        if state.is_none() {
-            let _ = self.table_iterator.take();
-            let _ = self.index_iterator.take();
-            self.reset_dual_peek();
-            self.state
-                .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
-        }
-
-        turso_assert!(
-            matches!(
-                self.state
-                    .as_ref()
-                    .expect("rewind state is not initialized"),
-                MvccLazyCursorState::Rewind(RewindState::Advance)
-            ),
-            "invalid rewind state",
-            { "state": format!("{:?}", self.state) }
-        );
-        // First run btree_cursor rewind so that we don't need a explicit state machine.
-        return_if_io!(self.advance_btree_forward());
-
-        self.invalidate_record();
-        self.current_pos = CursorPosition::BeforeFirst;
-
-        // Initialize MVCC iterators for rewind operation; in practice there is only one of these
-        // depending on the cursor type, so we should at some point refactor the iterator thing to be
-        // generic over the type instead of having two on the struct.
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => {
-                // For table cursors, initialize iterator from the correct table id + i64::MIN;
-                // this is because table rows from all tables are stored in the same map
-                let start_rowid = RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(i64::MIN),
-                };
-                let range = (
-                    std::ops::Bound::Included(start_rowid),
-                    std::ops::Bound::Unbounded,
-                );
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+            match direction {
+                IterationDirection::Forwards => return_if_io!(self.next_row()),
+                IterationDirection::Backwards => return_if_io!(self.prev_row()),
             }
-            MvccCursorType::Index(_) => {
-                // For index cursors, initialize the iterator to the beginning
-                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
-                let index_rows = index_rows.value();
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
-            }
-        }
-
-        // Rewind mvcc iterator
-        self.advance_mvcc_iterator();
-
-        self.refresh_current_position(IterationDirection::Forwards);
-
-        self.invalidate_record();
-        self.state = None;
-        Ok(IOResult::Done(()))
-    }
-
-    fn has_record(&self) -> bool {
-        matches!(self.get_current_pos(), CursorPosition::Loaded { .. })
-    }
-
-    fn set_has_record(&mut self, _has_record: bool) {
-        todo!()
-    }
-
-    fn index_info(&self) -> Option<&Arc<crate::types::IndexInfo>> {
-        match &self.mv_cursor_type {
-            MvccCursorType::Index(index_info) => Some(index_info),
-            MvccCursorType::Table => None,
+            self.moving_past_held_rows = None;
         }
     }
 
-    fn seek_end(&mut self) -> IOResultOr<()> {
-        if self.is_btree_allocated() {
-            // Defer to btree cursor's seek_end implementation
-            self.btree_cursor.seek_end()
+    fn move_past_held_rows_after_a_seek(
+        &mut self,
+        direction: IterationDirection,
+    ) -> IOResultOr<SeekResult> {
+        return_if_io!(self.lock_the_row_or_move_past_it(direction));
+        if matches!(self.current_pos, CursorPosition::Loaded { .. }) {
+            Ok(IOResult::Done(SeekResult::Found))
         } else {
-            // SkipMap inserts don't require cursor positioning because
-            // SeekEnd instruction is only used for insertions.
-            Ok(IOResult::Done(()))
+            Ok(IOResult::Done(SeekResult::NotFound))
         }
     }
 
-    fn seek_to_last(&mut self) -> IOResultOr<()> {
-        match self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
-            IOResult::Done(_) => Ok(IOResult::Done(())),
-            IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),
+    fn lock_the_row(&mut self) -> Result<RowLockResult> {
+        let Some(row_locks) = self.row_locks else {
+            return Ok(RowLockResult::Locked);
+        };
+        if self.get_null_flag() {
+            return Ok(RowLockResult::Locked);
+        }
+        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
+            return Ok(RowLockResult::Locked);
+        };
+        let row_id = row_id.clone();
+        let mut held = self
+            .db
+            .lock_row_for_read(self.tx_id, &row_id, row_locks.mode)?;
+        if held.is_none() && row_locks.mode == RowLockMode::Exclusive {
+            if let Some(table_row) = self.table_row_of_index_entry(&row_id, row_locks) {
+                held = self
+                    .db
+                    .lock_row_for_read(self.tx_id, &table_row, row_locks.mode)?;
+            }
+        }
+        match (held, row_locks.policy) {
+            (None, _) => Ok(RowLockResult::Locked),
+            (Some(_), RowLockWaitPolicy::SkipLocked) => Ok(RowLockResult::HeldByAnother),
+            (Some(holders), RowLockWaitPolicy::Wait | RowLockWaitPolicy::NoWait) => {
+                Err(LimboError::RowLocked(holders))
+            }
         }
     }
 
-    fn invalidate_record(&mut self) {
-        if let Some(record) = self.reusable_immutable_record.as_mut() {
-            record.invalidate();
+    fn table_row_of_index_entry(&self, entry: &RowID, row_locks: CursorRowLocks) -> Option<RowID> {
+        let table_id = row_locks.table_of_index?;
+        let RowKey::Record(key) = &entry.row_id else {
+            return None;
+        };
+        let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+            return None;
+        };
+        if !index_info.has_rowid {
+            return None;
         }
-    }
-
-    fn has_rowid(&self) -> bool {
-        match &self.mv_cursor_type {
-            MvccCursorType::Index(index_info) => index_info.has_rowid,
-            MvccCursorType::Table => true, // currently we don't support WITHOUT ROWID tables
+        match key.key.last_value() {
+            Some(Ok(crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(rowid)))) => {
+                Some(RowID::new(table_id, RowKey::Int(rowid)))
+            }
+            _ => None,
         }
-    }
-
-    fn get_pager(&self) -> Arc<Pager> {
-        self.btree_cursor.get_pager()
-    }
-
-    fn get_skip_advance(&self) -> bool {
-        todo!()
-    }
-
-    /// Returns true if this cursor operates in MVCC mode.
-    fn is_mvcc(&self) -> bool {
-        true
     }
 }
 

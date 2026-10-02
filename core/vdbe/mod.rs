@@ -928,6 +928,7 @@ pub struct ProgramState {
     /// Excludes new root statements while an explicit checkpoint is suspended.
     pub(crate) explicit_checkpoint_guard: Option<crate::connection::ExplicitCheckpointGuard>,
     pub parameters: Vec<Value>,
+    pub(crate) locking_read: Option<crate::mvcc::database::LockingRead>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1104,6 +1105,7 @@ impl ProgramState {
             query_deadline: None,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
+            locking_read: None,
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -3549,6 +3551,16 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                Some(LimboError::RowLocked(_)) => {
+                    turso_assert!(
+                        !inside_explicit_transaction || had_statement_savepoint,
+                        "a statement that met a row lock inside a transaction had no statement savepoint to undo its writes"
+                    );
+                    if must_rollback_tx_if_needed {
+                        self.rollback_current_txn(pager);
+                    }
+                    self.connection.set_changes(0);
+                }
                 // Same-connection "SQL statements in progress" rejections do
                 // not cause a rollback either: the rejected operation was
                 // refused before it touched any transaction or savepoint

@@ -6,9 +6,10 @@ use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
-use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
+use crate::mvcc::cursor::{CursorRowLocks, MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
-    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, TxID,
+    BootstrapState, CheckpointReadLockState, CheckpointStateMachine, RowLockMode,
+    RowLockWaitPolicy, TxID,
 };
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
@@ -1395,6 +1396,7 @@ pub fn op_open_read(
             "root page should be non negative when we are not in a MVCC transaction"
         );
     }
+    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
         CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -1410,14 +1412,18 @@ pub fn op_open_read(
                 return Ok(OpenedBTree::Plain(btree_cursor));
             };
             if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                let mut mv_cursor = MvCursor::new(
                     mv_store.clone(),
                     &program.connection,
                     tx_id,
                     *root_page,
                     mv_cursor_type,
                     btree_cursor,
-                )?)))
+                )?;
+                if let Some(row_locks) = row_locks {
+                    mv_cursor.lock_rows_it_reads(row_locks);
+                }
+                Ok(OpenedBTree::Mvcc(Box::new(mv_cursor)))
             } else {
                 Ok(OpenedBTree::Plain(btree_cursor))
             }
@@ -5156,7 +5162,8 @@ pub fn op_transaction_inner(
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
+                let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed)
+                    || locks_rows_it_reads(program, state, mv_store.as_ref());
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;
                 if needs_stmt_journal {
@@ -5246,6 +5253,15 @@ pub fn op_transaction_inner(
             }
         }
     }
+}
+
+fn locks_rows_it_reads(
+    program: &Program,
+    state: &ProgramState,
+    mv_store: Option<&Arc<MvStore>>,
+) -> bool {
+    mv_store.is_some_and(|mv_store| mv_store.row_locks_enabled())
+        && (program.change_cnt_on || state.locking_read.is_some())
 }
 
 /// The MvStore of database `db` for this statement, like
@@ -14466,6 +14482,7 @@ pub fn op_open_write(
         .cursor_ref
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
+    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
     let cursors = &mut state.cursors;
     let maybe_index = match cursor_type {
         CursorType::BTreeIndex(index) => Some(index),
@@ -14488,14 +14505,18 @@ pub fn op_open_write(
                     .as_ref()
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                let mut mv_cursor = MvCursor::new(
                     mv_store,
                     &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
                     btree_cursor,
-                )?)))
+                )?;
+                if let Some(row_locks) = row_locks {
+                    mv_cursor.lock_rows_it_reads(row_locks);
+                }
+                Ok(OpenedBTree::Mvcc(Box::new(mv_cursor)))
             } else if mv_store.is_some() {
                 Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
@@ -17027,6 +17048,7 @@ pub fn op_open_dup(
         .cursor_ref
         .get(*original_cursor_id)
         .expect("cursor_id should exist in cursor_ref");
+    let row_locks = row_locks_for_cursor(program, state, mv_store.as_ref(), cursor_type);
     match cursor_type {
         CursorType::BTreeTable(table) => {
             if !table.has_rowid && program.connection.get_mv_tx_id().is_some() {
@@ -17055,14 +17077,18 @@ pub fn op_open_dup(
                         .as_ref()
                         .expect("mv_store should be Some when MVCC transaction is active")
                         .clone();
-                    OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                    let mut mv_cursor = MvCursor::new(
                         mv_store,
                         &program.connection,
                         tx_id,
                         root_page,
                         MvccCursorType::Table,
                         cursor,
-                    )?))
+                    )?;
+                    if let Some(row_locks) = row_locks {
+                        mv_cursor.lock_rows_it_reads(row_locks);
+                    }
+                    OpenedBTree::Mvcc(Box::new(mv_cursor))
                 } else {
                     OpenedBTree::Plain(cursor)
                 }
@@ -17091,6 +17117,74 @@ pub fn op_open_dup(
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn row_locks_for_cursor(
+    program: &Program,
+    state: &ProgramState,
+    mv_store: Option<&Arc<MvStore>>,
+    cursor_type: &CursorType,
+) -> Option<CursorRowLocks> {
+    let mv_store = mv_store?;
+    if !mv_store.row_locks_enabled() {
+        return None;
+    }
+    let table_name = match cursor_type {
+        CursorType::BTreeTable(table) => table.name.as_str(),
+        CursorType::BTreeIndex(index) => index.table_name.as_str(),
+        _ => return None,
+    };
+    if crate::schema::is_system_table(table_name) {
+        return None;
+    }
+    let (mode, policy) = match &state.locking_read {
+        Some(locking_read) => {
+            let locked = locking_read
+                .tables
+                .iter()
+                .any(|table| table.eq_ignore_ascii_case(table_name));
+            if !locked {
+                return None;
+            }
+            (locking_read.mode, locking_read.policy)
+        }
+        None if program.change_cnt_on => {
+            let mode = if program_writes_table(program, table_name) {
+                RowLockMode::Exclusive
+            } else {
+                RowLockMode::Shared
+            };
+            (mode, RowLockWaitPolicy::Wait)
+        }
+        None => return None,
+    };
+    let table_of_index = match cursor_type {
+        CursorType::BTreeIndex(index) => program
+            .connection
+            .schema
+            .read()
+            .get_btree_table(&index.table_name)
+            .map(|table| mv_store.get_table_id_from_root_page(table.root_page)),
+        _ => None,
+    };
+    Some(CursorRowLocks {
+        mode,
+        policy,
+        table_of_index,
+    })
+}
+
+fn program_writes_table(program: &Program, table_name: &str) -> bool {
+    program.insns.iter().any(|(insn, _)| {
+        let Insn::OpenWrite { cursor_id, .. } = insn else {
+            return false;
+        };
+        match &program.cursor_ref[*cursor_id].1 {
+            CursorType::BTreeTable(table) => table.name.eq_ignore_ascii_case(table_name),
+            CursorType::BTreeIndex(index) => index.table_name.eq_ignore_ascii_case(table_name),
+            _ => false,
+        }
+    })
 }
 
 /// Execute the [Insn::Once] instruction.
@@ -19955,6 +20049,7 @@ fn op_journal_mode_inner(
                             .connection
                             .db
                             .experimental_mvcc_passive_checkpoint_enabled(),
+                        program.connection.db.mvcc_row_locks_enabled(),
                     )?;
                     // Arm the abandonment guard *before* the irreversible
                     // store install + demote so a reset/drop at any subsequent

@@ -187,6 +187,8 @@ pub enum LimboError {
     TxTerminated,
     #[error("Write-write conflict")]
     WriteWriteConflict,
+    #[error("Row locked by another transaction")]
+    RowLocked(Vec<u64>),
     #[error("Commit dependency aborted")]
     CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]

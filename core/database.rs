@@ -81,6 +81,7 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub enable_mvcc_row_locks: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -128,6 +129,11 @@ impl DatabaseOpts {
 
     pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
         self.enable_experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    pub fn with_mvcc_row_locks(mut self, enable: bool) -> Self {
+        self.enable_mvcc_row_locks = enable;
         self
     }
 
@@ -3303,6 +3309,7 @@ impl Database {
                             enc_ctx,
                             self.allocators.mv_store.clone(),
                             self.experimental_mvcc_passive_checkpoint_enabled(),
+                            self.mvcc_row_locks_enabled(),
                         )?;
                         self.mv_store.store(Some(mv_store));
                     }
@@ -3406,6 +3413,7 @@ impl Database {
                 None,
                 self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
+                self.mvcc_row_locks_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
             let mvcc_bootstrap_conn =
@@ -4604,6 +4612,10 @@ impl Database {
 
     pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
         self.opts.enable_experimental_mvcc_passive_checkpoint
+    }
+
+    pub fn mvcc_row_locks_enabled(&self) -> bool {
+        self.opts.enable_mvcc_row_locks
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

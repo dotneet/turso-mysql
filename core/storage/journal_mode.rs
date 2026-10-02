@@ -62,6 +62,7 @@ pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
     std::path::Path::exists(log_path.as_path()) && log_path.as_path().metadata().unwrap().len() > 0
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn open_mv_store(
     io: Arc<dyn IO>,
     db_path: impl AsRef<std::path::Path>,
@@ -70,6 +71,7 @@ pub fn open_mv_store(
     encryption_ctx: Option<crate::storage::encryption::EncryptionContext>,
     allocator: DynAllocator,
     experimental_mvcc_passive_checkpoint: bool,
+    row_locks: bool,
 ) -> Result<Arc<MvStore>> {
     // `encryption_ctx` encrypts database pages, but a custom DurableStorage
     // writes the MVCC log itself. If the database is encrypted, the custom
@@ -100,10 +102,14 @@ pub fn open_mv_store(
             ))
         };
 
-    Ok(Arc::new(MvStore::new_in(
+    let mv_store = MvStore::new_in(
         mvcc::MvccClock::new(),
         storage,
         allocator,
         experimental_mvcc_passive_checkpoint,
-    )?))
+    )?;
+    if row_locks {
+        mv_store.enable_row_locks();
+    }
+    Ok(Arc::new(mv_store))
 }

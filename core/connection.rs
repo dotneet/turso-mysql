@@ -4101,6 +4101,7 @@ impl Connection {
                             enc_ctx,
                             init.db.allocators.mv_store.clone(),
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
+                            init.db.mvcc_row_locks_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
                     }

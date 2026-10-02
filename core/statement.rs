@@ -13,6 +13,7 @@ use turso_parser::ast::{fmt::ToTokens, Cmd};
 use crate::alloc::TursoIteratorExt;
 use crate::{
     busy::BusyHandlerState,
+    mvcc::database::{LockingRead, RowLockWaitEnd, RowLockWaitPolicy},
     parameters,
     schema::Trigger,
     stats::{refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
@@ -328,6 +329,17 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    locking_read: Option<LockingRead>,
+    row_lock_wait: Option<RowLockWait>,
+    reads_latest_rows_in: Option<u64>,
+    repeats_rows_after_a_wait: bool,
+}
+
+struct RowLockWait {
+    waiter: Option<u64>,
+    holders: Vec<u64>,
+    deadline: std::time::Instant,
+    end: Option<RowLockWaitEnd>,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -409,7 +421,24 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
+            locking_read: None,
+            row_lock_wait: None,
+            reads_latest_rows_in: None,
+            repeats_rows_after_a_wait: false,
         }
+    }
+
+    pub fn lock_rows_it_reads(&mut self, locking_read: LockingRead) {
+        self.locking_read = Some(locking_read);
+    }
+
+    pub fn run_to_lock_rows(&mut self) -> Result<()> {
+        self.repeats_rows_after_a_wait = true;
+        let ran = self.run_ignore_rows();
+        self.repeats_rows_after_a_wait = false;
+        let reset = self.reset();
+        ran?;
+        reset
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -576,6 +605,7 @@ impl Statement {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
+            || self.row_lock_wait.is_some()
         {
             if let Some(result) = self.prepare_step(waker)? {
                 return Ok(result);
@@ -635,6 +665,11 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+        if self.row_lock_wait.is_some() {
+            if let Some(result) = self.end_row_lock_wait(waker)? {
+                return Ok(Some(result));
+            }
+        }
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
@@ -665,6 +700,8 @@ impl Statement {
                     return Err(err);
                 }
             }
+            self.state.locking_read = self.locking_read.clone();
+            self.start_reading_latest_rows();
         }
 
         self.arm_query_timeout_if_needed();
@@ -721,6 +758,13 @@ impl Statement {
             res = self
                 .program
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
+        }
+
+        if matches!(&res, Err(err) if matches!(**err, LimboError::RowLocked(_))) {
+            res = self.wait_for_the_rows_held(res, waker);
+        }
+        if matches!(res, Ok(StepResult::Done)) || res.is_err() {
+            self.stop_reading_latest_rows();
         }
 
         // Aggregate metrics when statement completes
@@ -968,6 +1012,23 @@ impl Statement {
     /// it pumps IO as for any other suspension, which retries once the delay
     /// has passed.
     fn wait_out_busy_delay(&mut self) -> Result<()> {
+        if let Some(wait) = self.row_lock_wait.as_mut() {
+            if wait.end.is_none() {
+                let connection = &self.program.connection;
+                let mv_store = connection
+                    .mv_store()
+                    .as_ref()
+                    .cloned()
+                    .expect("only an MVCC database waits for a row lock");
+                wait.end = Some(mv_store.wait_for_row_lock_holders(
+                    wait.waiter,
+                    &wait.holders,
+                    wait.deadline,
+                    || connection.is_interrupted(),
+                ));
+            }
+            return Ok(());
+        }
         let Some(busy_state) = self.busy_handler_state.as_mut() else {
             return self.pager.io.step();
         };
@@ -981,6 +1042,148 @@ impl Statement {
             None => return self.pager.io.step(),
         }
         Ok(())
+    }
+
+    fn wait_for_the_rows_held(
+        &mut self,
+        res: std::result::Result<StepResult, Box<LimboError>>,
+        waker: Option<&Waker>,
+    ) -> std::result::Result<StepResult, Box<LimboError>> {
+        let Err(err) = &res else {
+            return res;
+        };
+        let LimboError::RowLocked(holders) = &**err else {
+            return res;
+        };
+        let holders = holders.clone();
+        let refuses_to_wait = self
+            .locking_read
+            .as_ref()
+            .is_some_and(|read| read.policy == RowLockWaitPolicy::NoWait);
+        if refuses_to_wait && !holders.is_empty() {
+            return res;
+        }
+        if self.has_returned_row && !self.repeats_rows_after_a_wait {
+            return Err(Box::new(LimboError::Busy));
+        }
+        let connection = self.program.connection.clone();
+        let mv_store = connection
+            .mv_store()
+            .as_ref()
+            .cloned()
+            .expect("only an MVCC database reports a row lock");
+        let waiter = connection.get_mv_tx_id();
+        if let Some(waiter) = waiter {
+            if mv_store.start_row_lock_wait(waiter, &holders) == Some(waiter) {
+                self.give_up_the_transaction_for_a_deadlock();
+                return Err(Box::new(LimboError::WriteWriteConflict));
+            }
+        }
+        let now = std::time::Instant::now();
+        let deadline = now + connection.get_busy_timeout();
+        self.row_lock_wait = Some(RowLockWait {
+            waiter,
+            holders,
+            deadline,
+            end: None,
+        });
+        if let Some(waker) = waker {
+            waker.wake_by_ref();
+        }
+        Ok(StepResult::Sleep {
+            duration: deadline.saturating_duration_since(now),
+        })
+    }
+
+    fn end_row_lock_wait(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+        let connection = self.program.connection.clone();
+        let mv_store = connection
+            .mv_store()
+            .as_ref()
+            .cloned()
+            .expect("only an MVCC database waits for a row lock");
+        let wait = self
+            .row_lock_wait
+            .as_mut()
+            .expect("a row lock wait is under way");
+        let end = match wait.end {
+            Some(end) => end,
+            None => {
+                let now = std::time::Instant::now();
+                let end =
+                    mv_store.wait_for_row_lock_holders(wait.waiter, &wait.holders, now, || {
+                        connection.is_interrupted()
+                    });
+                if end == RowLockWaitEnd::TimedOut && now < wait.deadline {
+                    if let Some(waker) = waker {
+                        waker.wake_by_ref();
+                    }
+                    return Ok(Some(StepResult::Sleep {
+                        duration: wait.deadline - now,
+                    }));
+                }
+                end
+            }
+        };
+        self.give_up_row_lock_wait();
+        let failure = match end {
+            RowLockWaitEnd::HoldersEnded => {
+                self.reset_internal(None, None, false)?;
+                return Ok(None);
+            }
+            RowLockWaitEnd::TimedOut => LimboError::Busy,
+            RowLockWaitEnd::ChosenAsDeadlockVictim => {
+                self.give_up_the_transaction_for_a_deadlock();
+                LimboError::WriteWriteConflict
+            }
+            RowLockWaitEnd::Interrupted => LimboError::Interrupt,
+        };
+        self.release_active_root_if_counted();
+        Err(failure)
+    }
+
+    fn give_up_row_lock_wait(&mut self) {
+        let Some(wait) = self.row_lock_wait.take() else {
+            return;
+        };
+        let Some(waiter) = wait.waiter else {
+            return;
+        };
+        if let Some(mv_store) = self.program.connection.mv_store().as_ref() {
+            mv_store.stop_row_lock_wait(waiter);
+        }
+    }
+
+    fn give_up_the_transaction_for_a_deadlock(&mut self) {
+        let connection = &self.program.connection;
+        connection.rollback_current_txn_state(&self.pager, true);
+        connection.set_cdc_transaction_id(-1);
+    }
+
+    fn start_reading_latest_rows(&mut self) {
+        let connection = &self.program.connection;
+        let mv_store = connection.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return;
+        };
+        let locks_rows = self.program.change_cnt_on || self.locking_read.is_some();
+        if !mv_store.row_locks_enabled() || !locks_rows {
+            return;
+        }
+        let Some(tx_id) = connection.get_mv_tx_id() else {
+            return;
+        };
+        mv_store.read_latest_committed_rows(tx_id);
+        self.reads_latest_rows_in = Some(tx_id);
+    }
+
+    fn stop_reading_latest_rows(&mut self) {
+        let Some(tx_id) = self.reads_latest_rows_in.take() else {
+            return;
+        };
+        if let Some(mv_store) = self.program.connection.mv_store().as_ref() {
+            mv_store.read_rows_at_the_snapshot(tx_id);
+        }
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1654,6 +1857,9 @@ impl Statement {
         }
 
         let mut reset_error: Option<LimboError> = None;
+
+        self.give_up_row_lock_wait();
+        self.stop_reading_latest_rows();
 
         // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement
         // is a read-only SELECT, so dropping it never has to block.
