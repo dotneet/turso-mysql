@@ -7,13 +7,17 @@
 //! client's answer. So a session only asks, and this thread does the work over
 //! a connection of its own, which leaves the session free to run its next
 //! statement meanwhile.
+//!
+//! The same thread syncs, about once a second, the records the AUTO_INCREMENT
+//! counters of MVCC databases wrote without a sync.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use turso_core::{CheckpointMode, Database, LimboError, Result};
+use turso_core::storage::auto_increment::CommitLoggedMarks;
+use turso_core::{CheckpointMode, Database, LimboError, Result, IO};
 
 use crate::database_users::DatabaseUser;
 
@@ -47,6 +51,8 @@ enum Request {
     /// the WAL, which writes the database file, so that a drop never runs
     /// beside it; a database dropped, or being dropped, is left alone.
     Truncate(Weak<Database>, Option<DatabaseUser>),
+    /// Held weakly too: the database's store owns the marks.
+    SyncCounterRecords(Weak<CommitLoggedMarks>, Arc<dyn IO>),
     #[cfg(test)]
     Answer(Sender<()>),
     Stop,
@@ -119,6 +125,18 @@ impl WalKeeperHandle {
         Ok(())
     }
 
+    /// Asks the thread to sync, about once a second from now on, the records
+    /// one MVCC database's counters write without a sync.
+    pub(crate) fn keep_counter_records_synced(
+        &self,
+        marks: &Arc<CommitLoggedMarks>,
+        io: Arc<dyn IO>,
+    ) {
+        let _ = self
+            .requests
+            .send(Request::SyncCounterRecords(Arc::downgrade(marks), io));
+    }
+
     /// Waits for every request sent before this one to be done.
     #[cfg(test)]
     pub(crate) fn wait_for_the_requests_before(&self) {
@@ -162,9 +180,32 @@ pub(crate) const TIME_TO_HOLD_NEW_TRANSACTIONS: Duration = Duration::from_millis
 /// sessions one short wait a second rather than one after every statement.
 pub(crate) const PAUSE_AFTER_A_LONG_TRANSACTION: Duration = Duration::from_secs(1);
 
+/// How often the keeper syncs the records an MVCC database's counters wrote
+/// without a sync. InnoDB writes the counter into its redo log, which MySQL
+/// writes to disk about once a second even when no transaction commits, so a
+/// power loss there hands out again at most about a second's worth of the
+/// numbers no committed row holds. The same holds here.
+pub(crate) const COUNTER_RECORD_SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
 fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
     let mut left_busy: Vec<(Weak<Database>, Instant)> = Vec::new();
-    while let Ok(request) = received.recv() {
+    let mut counter_records = CounterRecordSyncs::default();
+    loop {
+        let waited = match counter_records.time_left(Instant::now()) {
+            Some(left) => received.recv_timeout(left),
+            None => received.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        if let Err(error) = counter_records.sync_if_due(Instant::now()) {
+            *handle
+                .failure
+                .lock()
+                .expect("WAL keeper failure mutex poisoned") = Some(error);
+        }
+        let request = match waited {
+            Ok(request) => request,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         // Every statement past the bound asks until the WAL is emptied, so
         // the requests that piled up meanwhile are read together and each
         // database is emptied once.
@@ -178,6 +219,9 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
                     if !databases.iter().any(|(kept, _)| kept.ptr_eq(&database)) {
                         databases.push((database, user));
                     }
+                }
+                Request::SyncCounterRecords(marks, io) => {
+                    counter_records.keep(marks, io, Instant::now());
                 }
                 #[cfg(test)]
                 Request::Answer(answer) => answers.push(answer),
@@ -242,8 +286,66 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
             let _ = answer.send(());
         }
         if stop {
-            return;
+            break;
         }
+    }
+    let _ = counter_records.sync_now();
+}
+
+/// The counters' sidecars the keeper syncs, and when it syncs them next.
+#[derive(Default)]
+struct CounterRecordSyncs {
+    sidecars: Vec<(Weak<CommitLoggedMarks>, Arc<dyn IO>)>,
+    next_sync: Option<Instant>,
+}
+
+impl CounterRecordSyncs {
+    fn keep(&mut self, marks: Weak<CommitLoggedMarks>, io: Arc<dyn IO>, now: Instant) {
+        self.sidecars.retain(|(kept, _)| kept.strong_count() > 0);
+        if !self.sidecars.iter().any(|(kept, _)| kept.ptr_eq(&marks)) {
+            self.sidecars.push((marks, io));
+        }
+        self.next_sync
+            .get_or_insert(now + COUNTER_RECORD_SYNC_INTERVAL);
+    }
+
+    fn time_left(&self, now: Instant) -> Option<Duration> {
+        self.next_sync
+            .map(|next_sync| next_sync.saturating_duration_since(now))
+    }
+
+    fn sync_if_due(&mut self, now: Instant) -> Result<()> {
+        if self.next_sync.is_none_or(|next_sync| now < next_sync) {
+            return Ok(());
+        }
+        let synced = self.sync_now();
+        self.next_sync = (!self.sidecars.is_empty()).then(|| now + COUNTER_RECORD_SYNC_INTERVAL);
+        synced
+    }
+
+    /// Syncs every sidecar and answers the first failure. A sidecar whose
+    /// sync failed refuses every later one, the checkpoint's included, so
+    /// that the logical log keeps the marks.
+    fn sync_now(&mut self) -> Result<()> {
+        self.sidecars.retain(|(marks, _)| marks.strong_count() > 0);
+        let mut synced = Ok(());
+        for (marks, io) in &self.sidecars {
+            let Some(marks) = marks.upgrade() else {
+                continue;
+            };
+            let sidecar_synced = sync_written_records(&marks, io.as_ref());
+            if synced.is_ok() {
+                synced = sidecar_synced;
+            }
+        }
+        synced
+    }
+}
+
+fn sync_written_records(marks: &CommitLoggedMarks, io: &dyn IO) -> Result<()> {
+    match marks.sync_written_records()? {
+        Some(completion) => io.wait_for_completion(completion),
+        None => Ok(()),
     }
 }
 
@@ -357,4 +459,169 @@ fn a_snapshot_ends_before(connection: &Arc<turso_core::Connection>, wal_end: u64
         .get_pager()
         .min_pinned_read_frame()
         .is_some_and(|snapshot_end| snapshot_end < wal_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use turso_core::io::{FileId, FileSyncType};
+    use turso_core::storage::auto_increment::{
+        AllocatorDatabaseIdentity, AllocatorOpenMode, AutoIncrementKey, DurableRangeAllocator,
+    };
+    use turso_core::{
+        Buffer, Clock, Completion, File, IOExt as _, MemoryIO, MonotonicInstant, OpenFlags,
+        WallClockInstant,
+    };
+
+    use super::*;
+
+    #[test]
+    fn counter_records_are_synced_once_a_second_has_passed_and_only_then() {
+        let io = Arc::new(SyncCountingIo::default());
+        let allocator = DurableRangeAllocator::open(
+            io.as_ref(),
+            "counter.sidecar",
+            AllocatorDatabaseIdentity::new(*b"keeper-database1").unwrap(),
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        let marks = allocator.let_commits_log_marks().unwrap();
+        let key = AutoIncrementKey::new(*b"keeper-counter-1").unwrap();
+        let take_a_number = || {
+            let mut reservation = allocator.reserve(key, 1).unwrap();
+            io.block(|| reservation.step()).unwrap();
+        };
+        let mut syncs = CounterRecordSyncs::default();
+        let started = Instant::now();
+        assert_eq!(syncs.time_left(started), None);
+        syncs.keep(Arc::downgrade(&marks), io.clone(), started);
+        assert_eq!(syncs.time_left(started), Some(COUNTER_RECORD_SYNC_INTERVAL));
+
+        for _ in 0..20 {
+            take_a_number();
+        }
+        let after_the_header = io.syncs();
+        syncs
+            .sync_if_due(started + Duration::from_millis(999))
+            .unwrap();
+        assert_eq!(io.syncs(), after_the_header);
+        assert!(marks.has_unsynced_records());
+
+        syncs
+            .sync_if_due(started + COUNTER_RECORD_SYNC_INTERVAL)
+            .unwrap();
+        assert_eq!(io.syncs(), after_the_header + 1);
+        assert!(!marks.has_unsynced_records());
+        assert_eq!(
+            syncs.time_left(started + COUNTER_RECORD_SYNC_INTERVAL),
+            Some(COUNTER_RECORD_SYNC_INTERVAL)
+        );
+
+        syncs
+            .sync_if_due(started + 2 * COUNTER_RECORD_SYNC_INTERVAL)
+            .unwrap();
+        assert_eq!(io.syncs(), after_the_header + 1);
+
+        take_a_number();
+        syncs
+            .sync_if_due(started + 3 * COUNTER_RECORD_SYNC_INTERVAL)
+            .unwrap();
+        assert_eq!(io.syncs(), after_the_header + 2);
+
+        drop(marks);
+        syncs
+            .sync_if_due(started + 4 * COUNTER_RECORD_SYNC_INTERVAL)
+            .unwrap();
+        assert_eq!(syncs.time_left(started), None);
+    }
+
+    struct SyncCountingIo {
+        inner: MemoryIO,
+        syncs: Arc<AtomicUsize>,
+    }
+
+    impl Default for SyncCountingIo {
+        fn default() -> Self {
+            Self {
+                inner: MemoryIO::new(),
+                syncs: Arc::default(),
+            }
+        }
+    }
+
+    impl SyncCountingIo {
+        fn syncs(&self) -> usize {
+            self.syncs.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Clock for SyncCountingIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for SyncCountingIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            Ok(Arc::new(SyncCountingFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                syncs: self.syncs.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+    }
+
+    struct SyncCountingFile {
+        inner: Arc<dyn File>,
+        syncs: Arc<AtomicUsize>,
+    }
+
+    impl File for SyncCountingFile {
+        fn file_id(&self) -> Result<FileId> {
+            self.inner.file_id()
+        }
+
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, completion: Completion) -> Result<Completion> {
+            self.inner.pread(pos, completion)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            completion: Completion,
+        ) -> Result<Completion> {
+            self.inner.pwrite(pos, buffer, completion)
+        }
+
+        fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+            self.inner.sync(completion, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
+            self.inner.truncate(len, completion)
+        }
+    }
 }

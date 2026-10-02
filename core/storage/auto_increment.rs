@@ -497,9 +497,21 @@ impl DurableRangeAllocator {
             file: self.shared.file.clone(),
             sync_type: self.shared.sync_type,
             not_yet_logged: Mutex::new(BTreeMap::new()),
+            records_written: AtomicU64::new(0),
+            records_synced: Arc::new(AtomicU64::new(0)),
+            sync_failed: Arc::new(AtomicBool::new(false)),
         });
         *commits = Arc::downgrade(&logged_marks);
         Ok(logged_marks)
+    }
+
+    /// The marks commits log for this sidecar, when they log them.
+    pub fn marks_logged_by_commits(&self) -> Option<Arc<CommitLoggedMarks>> {
+        self.shared
+            .commits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upgrade()
     }
 
     /// Sets how many bytes of records the log may hold before the next write
@@ -2316,6 +2328,14 @@ pub struct CommitLoggedMarks {
     file: Arc<dyn File>,
     sync_type: FileSyncType,
     not_yet_logged: Mutex<BTreeMap<AutoIncrementKey, u64>>,
+    /// How many records were written without a sync.
+    records_written: AtomicU64,
+    /// How many of those a finished sync covers.
+    records_synced: Arc<AtomicU64>,
+    /// A sync of the sidecar failed. The kernel may have dropped the pages
+    /// it could not write and report a later sync as a success, so no later
+    /// sync is trusted to make a mark durable.
+    sync_failed: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for CommitLoggedMarks {
@@ -2347,13 +2367,43 @@ impl CommitLoggedMarks {
     }
 
     pub fn sync_sidecar(&self) -> Result<Completion> {
-        self.file.sync(Completion::new_sync(|_| {}), self.sync_type)
+        let written = self.records_written.load(Ordering::Acquire);
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(LimboError::InternalError(
+                "an earlier sync of the auto-increment sidecar failed".to_owned(),
+            ));
+        }
+        let synced = self.records_synced.clone();
+        let failed = self.sync_failed.clone();
+        let completion = Completion::new_sync(move |result| match result {
+            Ok(_) => {
+                synced.fetch_max(written, Ordering::AcqRel);
+            }
+            Err(_) => failed.store(true, Ordering::Release),
+        });
+        self.file
+            .sync(completion, self.sync_type)
+            .inspect_err(|_| self.sync_failed.store(true, Ordering::Release))
+    }
+
+    /// Starts a sync of the sidecar when records were written since the last
+    /// sync finished, and nothing otherwise.
+    pub fn sync_written_records(&self) -> Result<Option<Completion>> {
+        if !self.has_unsynced_records() {
+            return Ok(None);
+        }
+        self.sync_sidecar().map(Some)
+    }
+
+    pub fn has_unsynced_records(&self) -> bool {
+        self.records_written.load(Ordering::Acquire) > self.records_synced.load(Ordering::Acquire)
     }
 
     fn written(&self, key: AutoIncrementKey, high_water: u64) {
         let mut not_yet_logged = self.not_yet_logged();
         let mark = not_yet_logged.entry(key).or_insert(high_water);
         *mark = (*mark).max(high_water);
+        self.records_written.fetch_add(1, Ordering::AcqRel);
     }
 
     fn not_yet_logged(&self) -> std::sync::MutexGuard<'_, BTreeMap<AutoIncrementKey, u64>> {
@@ -2942,6 +2992,78 @@ mod tests {
         drop(commits);
         assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 4);
         assert_eq!(io.syncs(), syncs_before + 1);
+    }
+
+    /// MySQL writes its redo log to disk about once a second even with no
+    /// commit. Here a record is written without a sync, and only the timed
+    /// sync, which syncs nothing when no record was written since, syncs it.
+    #[test]
+    fn only_the_timed_sync_syncs_the_records_written_without_one() {
+        let io = ReadCountingIo::new();
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+        let commits = allocator.let_commits_log_marks().unwrap();
+        assert!(Arc::ptr_eq(
+            &commits,
+            &allocator.marks_logged_by_commits().unwrap()
+        ));
+        let syncs_before = io.syncs();
+        assert_eq!(commits.sync_written_records().unwrap().map(|_| ()), None);
+
+        for _ in 0..50 {
+            reserve(&io, &allocator, KEY_A, 1);
+        }
+        assert_eq!(io.syncs(), syncs_before);
+        assert!(commits.has_unsynced_records());
+
+        let completion = commits.sync_written_records().unwrap().unwrap();
+        io.wait_for_completion(completion).unwrap();
+        assert_eq!(io.syncs(), syncs_before + 1);
+        assert!(!commits.has_unsynced_records());
+        assert_eq!(commits.sync_written_records().unwrap().map(|_| ()), None);
+        assert_eq!(io.syncs(), syncs_before + 1);
+
+        reserve(&io, &allocator, KEY_B, 1);
+        assert!(commits.has_unsynced_records());
+    }
+
+    #[test]
+    fn after_a_failed_sidecar_sync_no_later_sync_is_trusted() {
+        let io = MemoryIO::new();
+        let inner = io
+            .open_file(
+                "failed-timed-sync.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let failing = Arc::new(FailingSyncFile {
+            inner,
+            sync_calls: AtomicUsize::new(0),
+            fail_on_sync_call: 1,
+        });
+        let allocator = DurableRangeAllocator::from_file(
+            failing,
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        let commits = allocator.let_commits_log_marks().unwrap();
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+        assert!(matches!(
+            commits.sync_written_records(),
+            Err(LimboError::InternalError(message)) if message == "injected sync failure"
+        ));
+        assert!(commits.has_unsynced_records());
+        assert!(matches!(
+            commits.sync_written_records(),
+            Err(LimboError::InternalError(_))
+        ));
+        assert!(matches!(
+            commits.sync_sidecar(),
+            Err(LimboError::InternalError(_))
+        ));
     }
 
     #[test]

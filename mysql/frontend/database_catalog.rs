@@ -624,6 +624,12 @@ impl MySqlDatabaseSession {
                 .acquire_with_allocator(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
             let io = Arc::clone(&catalog.io);
+            if let Some(marks) = allocator.marks_logged_by_commits() {
+                self.catalog
+                    .wal_keeper
+                    .handle()
+                    .keep_counter_records_synced(&marks, Arc::clone(&io));
+            }
             let collation = catalog
                 .shared_collation(&canonical_name)
                 .map_err(MySqlDatabaseError::from)?;
@@ -2759,6 +2765,36 @@ mod tests {
         drop((first, left_open, catalog));
         put_back(directory.path(), killed);
         assert_eq!(next_user_id_in(directory.path())?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn under_mvcc_the_keeper_syncs_the_counter_records_within_about_a_second() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = an_mvcc_database_with_a_counted_table(directory.path())?;
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        session
+            .connection()
+            .unwrap()
+            .execute("INSERT INTO users (name) VALUES ('ann')")?;
+        let inserted = std::time::Instant::now();
+        let (_, allocator) = catalog
+            .inner
+            .lock()
+            .unwrap()
+            .acquire_with_allocator("kept")
+            .unwrap();
+        let marks = allocator
+            .marks_logged_by_commits()
+            .expect("an MVCC database's commits log its counters' marks");
+        while marks.has_unsynced_records() {
+            assert!(
+                inserted.elapsed() < 3 * crate::wal_keeper::COUNTER_RECORD_SYNC_INTERVAL,
+                "the counter's record was not synced"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         Ok(())
     }
 
