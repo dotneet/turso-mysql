@@ -16,12 +16,33 @@
 //! append that was never synced and that a power loss left torn, and the next
 //! write truncates it away. A checked record whose mark does not rise is
 //! corruption and stops allocation.
+//!
+//! The log is rewritten in place once it grows past a threshold, because the
+//! server holds the sidecar open and other handles share that descriptor:
+//!
+//! - Every sidecar starts as the header followed by records (the prefix).
+//! - The first rewrite appends two slots and a region holding one record per
+//!   counter, syncs them, then appends and syncs a barrier record right
+//!   where the prefix ended. The barrier is the switch: before it is durable
+//!   the prefix is the whole log, after it the prefix is never read for
+//!   marks and never written again. The barrier has a zero mark, which
+//!   older builds refuse as corruption instead of reading only the prefix.
+//! - Each slot names a region (its start, its generation, how many records
+//!   its snapshot holds) and the slot with the higher generation that passes
+//!   its check is the one in use. A region's records carry its generation and
+//!   are checked against its start, so stale records of another region end
+//!   its log.
+//! - Each later rewrite writes the snapshot of a new region, syncs it, then
+//!   writes and syncs the slot not in use. The new region goes right after
+//!   the region in use, or back to the front when the region in use is not
+//!   at the front and the snapshot fits before it, after which the file is
+//!   cut down to the snapshot.
 
 use std::{
     collections::{BTreeMap, HashMap},
     mem,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, LazyLock, Mutex, Weak,
     },
 };
@@ -39,7 +60,12 @@ const HEADER_LEN: usize = 32;
 const RECORD_MAGIC: [u8; 4] = *b"TAI1";
 const RECORD_VERSION: u16 = 1;
 const RECORD_LEN: usize = 36;
+const REGION_RECORD_MAGIC: [u8; 4] = *b"TAI2";
+const SLOT_MAGIC: [u8; 4] = *b"TAIS";
+const SLOT_VERSION: u16 = 1;
+const BARRIER_KEY: AutoIncrementKey = AutoIncrementKey(*b"TURSOAI-REGIONS!");
 const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
+const COMPACT_AFTER_LOG_BYTES: u64 = 1024 * 1024;
 
 static OPEN_ALLOCATORS: LazyLock<Mutex<HashMap<AllocatorFileIdentity, Weak<AllocatorShared>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -154,13 +180,34 @@ struct AllocatorShared {
     /// each insert into a counted table slower than the last.
     scanned: Mutex<Option<ScannedLog>>,
     commits: Mutex<Weak<CommitLoggedMarks>>,
+    /// How long the log may grow before the next write rewrites it.
+    compact_after: AtomicU64,
 }
 
-/// The high-water marks of every key in the log's first `complete_len` bytes
-/// past the header, all of them checked.
+/// The high-water marks of every key in the log's first `complete_len` bytes,
+/// all of them checked.
 struct ScannedLog {
+    layout: LogLayout,
     complete_len: u64,
     high_waters: BTreeMap<AutoIncrementKey, u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogLayout {
+    /// The records right after the header, as every sidecar starts out.
+    Prefix,
+    Region(Region),
+}
+
+/// The region the slot in use names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Region {
+    /// Where the barrier that ended the prefix is; the two slots follow it.
+    barrier_at: u64,
+    slot: usize,
+    generation: u32,
+    start: u64,
+    snapshot_records: u32,
 }
 
 impl DurableRangeAllocator {
@@ -208,6 +255,7 @@ impl DurableRangeAllocator {
             operations_finished: LockReleaseSignal::default(),
             poisoned: AtomicBool::new(false),
             scanned: Mutex::new(None),
+            compact_after: AtomicU64::new(COMPACT_AFTER_LOG_BYTES),
             commits: Mutex::new(Weak::new()),
         });
         open_allocators.insert(identity, Arc::downgrade(&shared));
@@ -294,6 +342,7 @@ impl DurableRangeAllocator {
                 operations_finished: LockReleaseSignal::default(),
                 poisoned: AtomicBool::new(false),
                 scanned: Mutex::new(None),
+                compact_after: AtomicU64::new(COMPACT_AFTER_LOG_BYTES),
                 commits: Mutex::new(Weak::new()),
             }),
         }
@@ -453,6 +502,14 @@ impl DurableRangeAllocator {
         Ok(logged_marks)
     }
 
+    /// Sets how many bytes of records the log may hold before the next write
+    /// rewrites it as one record per counter.
+    pub fn set_compaction_threshold(&self, log_bytes: u64) {
+        self.shared
+            .compact_after
+            .store(log_bytes, Ordering::Release);
+    }
+
     pub fn last_seen_high_water(&self, key: AutoIncrementKey) -> Result<Option<u64>> {
         self.ensure_usable()?;
         if self.shared.operation_in_progress.load(Ordering::Acquire) {
@@ -568,9 +625,6 @@ impl AllocatorSidecarOperation {
             Ok(size) => size,
             Err(error) => return self.fail(error),
         };
-        if file_size > MAX_LOG_BYTES {
-            return self.fail(LimboError::TooBig);
-        }
         if file_size == 0 {
             return match self.kind {
                 AllocatorSidecarOperationKind::Initialize => self.begin_write_header(),
@@ -897,13 +951,46 @@ enum ReservationState {
     SyncingHeader {
         completion: Completion,
     },
-    Reading {
+    ReadingPrefix {
         completion: Completion,
         buffer: Arc<Buffer>,
-        append_offset: u64,
-        /// Where past the header the read began: 0 for the whole log, or
+        file_size: u64,
+        /// Where past the header the read began: 0 for the whole prefix, or
         /// where the records this process already checked end.
         scanned_from: u64,
+    },
+    ReadingSlots {
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        file_size: u64,
+        barrier_at: u64,
+    },
+    ReadingRegion {
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        file_size: u64,
+        region: Region,
+        /// Where past the region's start the read began.
+        scanned_from: u64,
+    },
+    WritingCompaction {
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        short_write: Arc<AtomicBool>,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    },
+    SyncingCompaction {
+        completion: Completion,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    },
+    CuttingCompactedFile {
+        completion: Completion,
+        compaction: Compaction,
+        high_water: u64,
     },
     Writing {
         completion: Completion,
@@ -919,12 +1006,10 @@ enum ReservationState {
     },
     TruncatingTornTail {
         completion: Completion,
-        log_end: u64,
         high_water: u64,
     },
     SyncingTruncatedTail {
         completion: Completion,
-        log_end: u64,
         high_water: u64,
     },
     SyncingExisting {
@@ -933,6 +1018,22 @@ enum ReservationState {
     },
     Leased,
     Finished,
+}
+
+/// What a compaction writes, in order.
+#[derive(Clone, Copy, Debug)]
+enum CompactionStep {
+    Snapshot,
+    Switch,
+    Cut,
+}
+
+enum NextWrite {
+    Append {
+        offset: u64,
+        record: [u8; RECORD_LEN],
+    },
+    Compact(Compaction),
 }
 
 impl RangeReservation {
@@ -951,12 +1052,51 @@ impl RangeReservation {
                 short_write,
             } => self.finish_write_header(completion, buffer, short_write),
             ReservationState::SyncingHeader { completion } => self.finish_sync_header(completion),
-            ReservationState::Reading {
+            ReservationState::ReadingPrefix {
                 completion,
                 buffer,
-                append_offset,
+                file_size,
                 scanned_from,
-            } => self.finish_read(completion, buffer, append_offset, scanned_from),
+            } => self.finish_read_prefix(completion, buffer, file_size, scanned_from),
+            ReservationState::ReadingSlots {
+                completion,
+                buffer,
+                file_size,
+                barrier_at,
+            } => self.finish_read_slots(completion, buffer, file_size, barrier_at),
+            ReservationState::ReadingRegion {
+                completion,
+                buffer,
+                file_size,
+                region,
+                scanned_from,
+            } => self.finish_read_region(completion, buffer, file_size, region, scanned_from),
+            ReservationState::WritingCompaction {
+                completion,
+                buffer,
+                short_write,
+                step,
+                compaction,
+                high_water,
+            } => self.finish_compaction_write(
+                completion,
+                buffer,
+                short_write,
+                step,
+                compaction,
+                high_water,
+            ),
+            ReservationState::SyncingCompaction {
+                completion,
+                step,
+                compaction,
+                high_water,
+            } => self.finish_compaction_sync(completion, step, compaction, high_water),
+            ReservationState::CuttingCompactedFile {
+                completion,
+                compaction,
+                high_water,
+            } => self.finish_cutting_compacted_file(completion, compaction, high_water),
             ReservationState::Writing {
                 completion,
                 buffer,
@@ -971,14 +1111,12 @@ impl RangeReservation {
             } => self.finish_sync(completion, range, append_offset),
             ReservationState::TruncatingTornTail {
                 completion,
-                log_end,
                 high_water,
-            } => self.finish_truncate_torn_tail(completion, log_end, high_water),
+            } => self.finish_truncate_torn_tail(completion, high_water),
             ReservationState::SyncingTruncatedTail {
                 completion,
-                log_end,
                 high_water,
-            } => self.finish_sync_truncated_tail(completion, log_end, high_water),
+            } => self.finish_sync_truncated_tail(completion, high_water),
             ReservationState::SyncingExisting {
                 completion,
                 high_water,
@@ -1011,9 +1149,6 @@ impl RangeReservation {
             Ok(size) => size,
             Err(error) => return self.fail(error),
         };
-        if file_size > MAX_LOG_BYTES {
-            return self.fail(LimboError::TooBig);
-        }
 
         if file_size == 0 {
             return match (&self.kind, self.shared.open_mode) {
@@ -1084,67 +1219,46 @@ impl RangeReservation {
     }
 
     /// Reads the records past those this process already checked: the log
-    /// only grows, so a record once checked stays as it was, and a log
-    /// shorter than the one checked is read again from the start. The header
-    /// is read and checked every time, being one short read.
+    /// only grows until a rewrite, so a record once checked stays as it was,
+    /// and a log shorter than the one checked, or a region another than the
+    /// one checked, is read again from its start. The header, and the slots
+    /// once the prefix has ended in a barrier, are read and checked every
+    /// time, being short reads.
     fn begin_read_log(&mut self, file_size: u64) -> IOResultOr<ReservedRange> {
-        let complete_len = complete_log_len(file_size);
-        let scanned_len = self
+        let checked = self
             .scanned()
             .as_ref()
-            .map(|scanned| scanned.complete_len)
-            .filter(|scanned_len| *scanned_len <= complete_len);
-        match scanned_len {
-            Some(scanned_len) => self.begin_read_records(scanned_len, complete_len),
-            None => {
+            .map(|log| (log.layout, log.complete_len));
+        match checked {
+            Some((LogLayout::Region(region), _)) => {
+                self.begin_read_slots(file_size, region.barrier_at)
+            }
+            Some((LogLayout::Prefix, scanned_len)) if scanned_len <= prefix_read_len(file_size) => {
+                self.begin_read_prefix(file_size, scanned_len)
+            }
+            _ => {
                 *self.scanned() = None;
-                self.begin_read_records(0, complete_len)
+                self.begin_read_prefix(file_size, 0)
             }
         }
     }
 
-    /// Reads the records between `scanned_len` and `complete_len` bytes past
-    /// the header, those already checked being in [`AllocatorShared::scanned`].
-    fn begin_read_records(
-        &mut self,
-        scanned_len: u64,
-        complete_len: u64,
-    ) -> IOResultOr<ReservedRange> {
-        let append_offset = HEADER_LEN as u64 + complete_len;
-        if complete_len == scanned_len {
-            return self.finish_scan(Vec::new(), append_offset, scanned_len);
+    /// Reads the prefix records between `scanned_len` bytes past the header
+    /// and the end of what the file holds, a barrier and its slots included.
+    fn begin_read_prefix(&mut self, file_size: u64, scanned_len: u64) -> IOResultOr<ReservedRange> {
+        let read_end = prefix_read_len(file_size);
+        if read_end == scanned_len {
+            return self.finish_prefix_scan(Vec::new(), file_size, scanned_len);
         }
-        let read_len = match usize::try_from(complete_len - scanned_len) {
-            Ok(len) => len,
-            Err(_) => return self.fail(LimboError::TooBig),
-        };
-        let buffer = Arc::new(Buffer::new_temporary(read_len));
-        let expected = read_len;
-        let completion = Completion::new_read(buffer.clone(), move |result| {
-            let Ok((_, bytes_read)) = result else {
-                return None;
+        let (completion, buffer) =
+            match self.submit_read(HEADER_LEN as u64 + scanned_len, read_end - scanned_len) {
+                Ok(read) => read,
+                Err(error) => return self.fail(error),
             };
-            if bytes_read != expected as i32 {
-                return Some(CompletionError::ShortRead {
-                    page_idx: 0,
-                    expected,
-                    actual: bytes_read.max(0) as usize,
-                });
-            }
-            None
-        });
-        let completion = match self
-            .shared
-            .file
-            .pread(HEADER_LEN as u64 + scanned_len, completion)
-        {
-            Ok(completion) => completion,
-            Err(error) => return self.fail(error),
-        };
-        self.state = ReservationState::Reading {
+        self.state = ReservationState::ReadingPrefix {
             completion: completion.clone(),
             buffer,
-            append_offset,
+            file_size,
             scanned_from: scanned_len,
         };
         Ok(IOResult::IO(IOCompletions(completion)))
@@ -1217,21 +1331,22 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
-        self.begin_write(HEADER_LEN as u64, 0)
+        *self.scanned() = Some(ScannedLog::empty_prefix());
+        self.begin_write(0)
     }
 
-    fn finish_read(
+    fn finish_read_prefix(
         &mut self,
         completion: Completion,
         buffer: Arc<Buffer>,
-        append_offset: u64,
+        file_size: u64,
         scanned_from: u64,
     ) -> IOResultOr<ReservedRange> {
         if !completion.finished() {
-            self.state = ReservationState::Reading {
+            self.state = ReservationState::ReadingPrefix {
                 completion: completion.clone(),
                 buffer,
-                append_offset,
+                file_size,
                 scanned_from,
             };
             return Ok(IOResult::IO(IOCompletions(completion)));
@@ -1239,41 +1354,214 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
-        self.finish_scan(buffer.as_slice().to_vec(), append_offset, scanned_from)
+        self.finish_prefix_scan(buffer.as_slice().to_vec(), file_size, scanned_from)
     }
 
-    /// Checks the records read past `scanned_from`, keeps every mark the log
-    fn finish_scan(
+    /// Checks the prefix records read past `scanned_from` and keeps every
+    /// mark they hold, or goes on to the slots when the prefix ended in a
+    /// barrier.
+    fn finish_prefix_scan(
         &mut self,
         records: Vec<u8>,
-        append_offset: u64,
+        file_size: u64,
         scanned_from: u64,
     ) -> IOResultOr<ReservedRange> {
-        let checked = match scanned_from {
-            0 => Some(BTreeMap::new()),
-            _ => self.scanned().take().map(|scanned| scanned.high_waters),
-        };
-        let Some(mut high_waters) = checked else {
+        let Some(mut high_waters) = self.checked_marks(scanned_from) else {
             return self.fail(LimboError::InternalError(
                 "auto-increment log was read past records nobody checked".to_owned(),
             ));
         };
-        let checked_len = match scan_records(&records, &mut high_waters) {
+        match scan_prefix_records(&records, &mut high_waters) {
+            Ok(PrefixEnd::Log(checked_len)) => {
+                let complete_len = scanned_from + checked_len as u64;
+                if complete_len > MAX_LOG_BYTES {
+                    return self.fail(LimboError::TooBig);
+                }
+                *self.scanned() = Some(ScannedLog {
+                    layout: LogLayout::Prefix,
+                    complete_len,
+                    high_waters,
+                });
+                self.continue_after_scan(file_size)
+            }
+            Ok(PrefixEnd::Barrier(checked_len)) => {
+                let barrier_at = HEADER_LEN as u64 + scanned_from + checked_len as u64;
+                self.begin_read_slots(file_size, barrier_at)
+            }
+            Err(error) => self.fail(error),
+        }
+    }
+
+    fn begin_read_slots(&mut self, file_size: u64, barrier_at: u64) -> IOResultOr<ReservedRange> {
+        if file_size < barrier_at + 3 * RECORD_LEN as u64 {
+            return self.fail(LimboError::Corrupt(
+                "auto-increment sidecar ends inside its region slots".to_owned(),
+            ));
+        }
+        let (completion, buffer) =
+            match self.submit_read(barrier_at + RECORD_LEN as u64, 2 * RECORD_LEN as u64) {
+                Ok(read) => read,
+                Err(error) => return self.fail(error),
+            };
+        self.state = ReservationState::ReadingSlots {
+            completion: completion.clone(),
+            buffer,
+            file_size,
+            barrier_at,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_read_slots(
+        &mut self,
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        file_size: u64,
+        barrier_at: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::ReadingSlots {
+                completion: completion.clone(),
+                buffer,
+                file_size,
+                barrier_at,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        let region = match region_in_use(buffer.as_slice(), barrier_at) {
+            Ok(region) => region,
+            Err(error) => return self.fail(error),
+        };
+        if file_size < region.start + region.snapshot_len() {
+            return self.fail(LimboError::Corrupt(
+                "auto-increment sidecar ends inside a region's snapshot".to_owned(),
+            ));
+        }
+        let scanned_len = self
+            .scanned()
+            .as_ref()
+            .filter(|log| log.layout == LogLayout::Region(region))
+            .map(|log| log.complete_len)
+            .filter(|scanned_len| *scanned_len <= region_read_len(region, file_size));
+        match scanned_len {
+            Some(scanned_len) => self.begin_read_region(file_size, region, scanned_len),
+            None => {
+                *self.scanned() = None;
+                self.begin_read_region(file_size, region, 0)
+            }
+        }
+    }
+
+    fn begin_read_region(
+        &mut self,
+        file_size: u64,
+        region: Region,
+        scanned_len: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let read_end = region_read_len(region, file_size);
+        if read_end == scanned_len {
+            return self.finish_region_scan(Vec::new(), file_size, region, scanned_len);
+        }
+        let (completion, buffer) =
+            match self.submit_read(region.start + scanned_len, read_end - scanned_len) {
+                Ok(read) => read,
+                Err(error) => return self.fail(error),
+            };
+        self.state = ReservationState::ReadingRegion {
+            completion: completion.clone(),
+            buffer,
+            file_size,
+            region,
+            scanned_from: scanned_len,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_read_region(
+        &mut self,
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        file_size: u64,
+        region: Region,
+        scanned_from: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::ReadingRegion {
+                completion: completion.clone(),
+                buffer,
+                file_size,
+                region,
+                scanned_from,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        self.finish_region_scan(buffer.as_slice().to_vec(), file_size, region, scanned_from)
+    }
+
+    fn finish_region_scan(
+        &mut self,
+        records: Vec<u8>,
+        file_size: u64,
+        region: Region,
+        scanned_from: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let Some(mut high_waters) = self.checked_marks(scanned_from) else {
+            return self.fail(LimboError::InternalError(
+                "auto-increment region was read past records nobody checked".to_owned(),
+            ));
+        };
+        let checked_len = match scan_region_records(&records, region, &mut high_waters) {
             Ok(checked_len) => checked_len,
             Err(error) => return self.fail(error),
         };
-        let high_water = high_waters.get(&self.key).copied().unwrap_or(0);
         let complete_len = scanned_from + checked_len as u64;
+        if complete_len < region.snapshot_len() {
+            return self.fail(LimboError::Corrupt(
+                "auto-increment region lost records of its synced snapshot".to_owned(),
+            ));
+        }
         *self.scanned() = Some(ScannedLog {
+            layout: LogLayout::Region(region),
             complete_len,
             high_waters,
         });
-        let log_end = HEADER_LEN as u64 + complete_len;
+        self.continue_after_scan(file_size)
+    }
+
+    /// The marks already checked when a read began `scanned_from` bytes into
+    /// the log, taken out of the shared cache until the read is checked.
+    fn checked_marks(&self, scanned_from: u64) -> Option<BTreeMap<AutoIncrementKey, u64>> {
+        match scanned_from {
+            0 => Some(BTreeMap::new()),
+            _ => self.scanned().take().map(|log| log.high_waters),
+        }
+    }
+
+    /// Truncates whatever follows the checked log before a write appends to
+    /// it, then writes.
+    fn continue_after_scan(&mut self, file_size: u64) -> IOResultOr<ReservedRange> {
+        let (log_end, records_end, high_water) = {
+            let scanned = self.scanned();
+            let log = scanned
+                .as_ref()
+                .expect("a scan stores the log it checked before going on");
+            (
+                log.end(),
+                log.start() + whole_records_between(log.start(), file_size),
+                log.high_waters.get(&self.key).copied().unwrap_or(0),
+            )
+        };
         let only_reads = matches!(self.kind, ReservationKind::Peek) && !self.retain_lock;
-        if log_end < append_offset && !only_reads {
+        if log_end < records_end && !only_reads {
             return self.begin_truncate_torn_tail(log_end, high_water);
         }
-        self.begin_write(log_end, high_water)
+        self.begin_write(high_water)
     }
 
     fn begin_truncate_torn_tail(
@@ -1291,7 +1579,6 @@ impl RangeReservation {
         };
         self.state = ReservationState::TruncatingTornTail {
             completion: completion.clone(),
-            log_end,
             high_water,
         };
         Ok(IOResult::IO(IOCompletions(completion)))
@@ -1300,13 +1587,11 @@ impl RangeReservation {
     fn finish_truncate_torn_tail(
         &mut self,
         completion: Completion,
-        log_end: u64,
         high_water: u64,
     ) -> IOResultOr<ReservedRange> {
         if !completion.finished() {
             self.state = ReservationState::TruncatingTornTail {
                 completion: completion.clone(),
-                log_end,
                 high_water,
             };
             return Ok(IOResult::IO(IOCompletions(completion)));
@@ -1321,7 +1606,6 @@ impl RangeReservation {
         };
         self.state = ReservationState::SyncingTruncatedTail {
             completion: completion.clone(),
-            log_end,
             high_water,
         };
         Ok(IOResult::IO(IOCompletions(completion)))
@@ -1330,13 +1614,11 @@ impl RangeReservation {
     fn finish_sync_truncated_tail(
         &mut self,
         completion: Completion,
-        log_end: u64,
         high_water: u64,
     ) -> IOResultOr<ReservedRange> {
         if !completion.finished() {
             self.state = ReservationState::SyncingTruncatedTail {
                 completion: completion.clone(),
-                log_end,
                 high_water,
             };
             return Ok(IOResult::IO(IOCompletions(completion)));
@@ -1344,10 +1626,12 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
-        self.begin_write(log_end, high_water)
+        self.begin_write(high_water)
     }
 
-    fn begin_write(&mut self, append_offset: u64, high_water: u64) -> IOResultOr<ReservedRange> {
+    /// Appends this operation's record at the end of the checked log, first
+    /// rewriting the log when it has grown past the threshold.
+    fn begin_write(&mut self, high_water: u64) -> IOResultOr<ReservedRange> {
         let range = match &self.kind {
             // A read appends nothing, so there is also nothing to sync: the log
             // was read under this operation's own exclusive lock.
@@ -1417,30 +1701,38 @@ impl RangeReservation {
                 }
             }
         };
-        let write_end = match append_offset.checked_add(RECORD_LEN as u64) {
-            Some(write_end) => write_end,
-            None => return self.fail(LimboError::TooBig),
-        };
-        if write_end > MAX_LOG_BYTES {
-            return self.fail(LimboError::TooBig);
-        }
-        let buffer = Arc::new(Buffer::new(encode_record(self.key, range.last).to_vec()));
-        let short_write = Arc::new(AtomicBool::new(false));
-        let expected = buffer.len() as i32;
-        let short_write_for_callback = short_write.clone();
-        let completion = Completion::new_write(move |result| {
-            if let Ok(bytes_written) = result {
-                if bytes_written != expected {
-                    short_write_for_callback.store(true, Ordering::Release);
+        let compact_after = self.shared.compact_after.load(Ordering::Acquire);
+        let next = {
+            let scanned = self.scanned();
+            match scanned.as_ref() {
+                None => Err(LimboError::InternalError(
+                    "auto-increment log was written past records nobody checked".to_owned(),
+                )),
+                Some(log) if log.compaction_is_due(compact_after) => {
+                    Compaction::plan(log).map(NextWrite::Compact)
                 }
+                Some(log) if log.complete_len + RECORD_LEN as u64 > MAX_LOG_BYTES => {
+                    Err(LimboError::TooBig)
+                }
+                Some(log) => Ok(NextWrite::Append {
+                    offset: log.end(),
+                    record: log.encode_record(self.key, range.last),
+                }),
             }
-        });
-        let completion = match self
-            .shared
-            .file
-            .pwrite(append_offset, buffer.clone(), completion)
-        {
-            Ok(completion) => completion,
+        };
+        let (append_offset, record) = match next {
+            Ok(NextWrite::Append { offset, record }) => (offset, record),
+            Ok(NextWrite::Compact(compaction)) => {
+                return self.begin_compaction_write(
+                    CompactionStep::Snapshot,
+                    compaction,
+                    high_water,
+                )
+            }
+            Err(error) => return self.fail(error),
+        };
+        let (completion, buffer, short_write) = match self.submit_write(append_offset, &record) {
+            Ok(write) => write,
             Err(error) => return self.fail(error),
         };
         self.state = ReservationState::Writing {
@@ -1451,6 +1743,183 @@ impl RangeReservation {
             append_offset,
         };
         Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn begin_compaction_write(
+        &mut self,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let (offset, bytes) = match step {
+            CompactionStep::Snapshot => {
+                let scanned = self.scanned();
+                let log = scanned
+                    .as_ref()
+                    .expect("a compaction rewrites the log its operation checked");
+                compaction.snapshot_write(&log.high_waters)
+            }
+            CompactionStep::Switch => {
+                let (offset, record) = compaction.switch_write();
+                (offset, record.to_vec())
+            }
+            CompactionStep::Cut => unreachable!("cutting the file writes nothing"),
+        };
+        let (completion, buffer, short_write) = match self.submit_write(offset, &bytes) {
+            Ok(write) => write,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::WritingCompaction {
+            completion: completion.clone(),
+            buffer,
+            short_write,
+            step,
+            compaction,
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_compaction_write(
+        &mut self,
+        completion: Completion,
+        buffer: Arc<Buffer>,
+        short_write: Arc<AtomicBool>,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::WritingCompaction {
+                completion: completion.clone(),
+                buffer,
+                short_write,
+                step,
+                compaction,
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        if short_write.load(Ordering::Acquire) {
+            return self.fail(CompletionError::ShortWrite.into());
+        }
+        self.begin_compaction_sync(step, compaction, high_water)
+    }
+
+    /// Every compaction step is synced before the next, whatever the
+    /// database's sync setting: the switch must never reach the disk before
+    /// the snapshot it switches to.
+    fn begin_compaction_sync(
+        &mut self,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let completion = Completion::new_sync(|_| {});
+        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::SyncingCompaction {
+            completion: completion.clone(),
+            step,
+            compaction,
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_compaction_sync(
+        &mut self,
+        completion: Completion,
+        step: CompactionStep,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::SyncingCompaction {
+                completion: completion.clone(),
+                step,
+                compaction,
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        match (step, compaction.cut_file_to()) {
+            (CompactionStep::Snapshot, _) => {
+                self.begin_compaction_write(CompactionStep::Switch, compaction, high_water)
+            }
+            (CompactionStep::Switch, Some(len)) => {
+                self.begin_cutting_compacted_file(len, compaction, high_water)
+            }
+            (CompactionStep::Switch, None) | (CompactionStep::Cut, _) => {
+                self.finish_compaction(compaction, high_water)
+            }
+        }
+    }
+
+    fn begin_cutting_compacted_file(
+        &mut self,
+        len: u64,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        let completion = match self
+            .shared
+            .file
+            .truncate(len, Completion::new_trunc(|_| {}))
+        {
+            Ok(completion) => completion,
+            Err(error) => return self.fail(error),
+        };
+        self.state = ReservationState::CuttingCompactedFile {
+            completion: completion.clone(),
+            compaction,
+            high_water,
+        };
+        Ok(IOResult::IO(IOCompletions(completion)))
+    }
+
+    fn finish_cutting_compacted_file(
+        &mut self,
+        completion: Completion,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        if !completion.finished() {
+            self.state = ReservationState::CuttingCompactedFile {
+                completion: completion.clone(),
+                compaction,
+                high_water,
+            };
+            return Ok(IOResult::IO(IOCompletions(completion)));
+        }
+        if let Some(error) = completion.get_error() {
+            return self.fail(error.into());
+        }
+        self.begin_compaction_sync(CompactionStep::Cut, compaction, high_water)
+    }
+
+    fn finish_compaction(
+        &mut self,
+        compaction: Compaction,
+        high_water: u64,
+    ) -> IOResultOr<ReservedRange> {
+        {
+            let mut scanned = self.scanned();
+            let log = scanned
+                .as_mut()
+                .expect("a compaction rewrites the log its operation checked");
+            log.layout = LogLayout::Region(compaction.to);
+            log.complete_len = compaction.to.snapshot_len();
+        }
+        self.begin_write(high_water)
     }
 
     fn finish_write(
@@ -1524,7 +1993,7 @@ impl RangeReservation {
         // joins it; anywhere else, the next operation reads the log again.
         let mut scanned = self.scanned();
         match scanned.as_mut() {
-            Some(log) if HEADER_LEN as u64 + log.complete_len == append_offset => {
+            Some(log) if log.end() == append_offset => {
                 log.complete_len += RECORD_LEN as u64;
                 log.high_waters.insert(self.key, range.last);
             }
@@ -1652,9 +2121,6 @@ impl RangeReservation {
             Ok(size) => size,
             Err(error) => return self.fail(error),
         };
-        if size > MAX_LOG_BYTES {
-            return self.fail(LimboError::TooBig);
-        }
         self.kind = ReservationKind::AdvancePast { high_water: target };
         if size == 0 {
             return self.begin_write_header();
@@ -1664,9 +2130,7 @@ impl RangeReservation {
                 "auto-increment sidecar has a torn header".to_owned(),
             ));
         }
-        let append_offset =
-            HEADER_LEN as u64 + (size - HEADER_LEN as u64) / RECORD_LEN as u64 * RECORD_LEN as u64;
-        self.begin_write(append_offset, current)
+        self.begin_write(current)
     }
 
     fn is_unfinished(&self) -> bool {
@@ -1674,6 +2138,177 @@ impl RangeReservation {
             self.state,
             ReservationState::Start | ReservationState::Leased | ReservationState::Finished
         )
+    }
+
+    fn submit_read(&self, offset: u64, len: u64) -> Result<(Completion, Arc<Buffer>)> {
+        let len = usize::try_from(len).map_err(|_| LimboError::TooBig)?;
+        let buffer = Arc::new(Buffer::new_temporary(len));
+        let completion = Completion::new_read(buffer.clone(), move |result| {
+            let Ok((_, bytes_read)) = result else {
+                return None;
+            };
+            if bytes_read != len as i32 {
+                return Some(CompletionError::ShortRead {
+                    page_idx: 0,
+                    expected: len,
+                    actual: bytes_read.max(0) as usize,
+                });
+            }
+            None
+        });
+        let completion = self.shared.file.pread(offset, completion)?;
+        Ok((completion, buffer))
+    }
+
+    fn submit_write(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(Completion, Arc<Buffer>, Arc<AtomicBool>)> {
+        let buffer = Arc::new(Buffer::new(bytes.to_vec()));
+        let short_write = Arc::new(AtomicBool::new(false));
+        let expected = buffer.len() as i32;
+        let short_write_for_callback = short_write.clone();
+        let completion = Completion::new_write(move |result| {
+            if let Ok(bytes_written) = result {
+                if bytes_written != expected {
+                    short_write_for_callback.store(true, Ordering::Release);
+                }
+            }
+        });
+        let completion = self
+            .shared
+            .file
+            .pwrite(offset, buffer.clone(), completion)?;
+        Ok((completion, buffer, short_write))
+    }
+}
+
+impl ScannedLog {
+    fn empty_prefix() -> Self {
+        Self {
+            layout: LogLayout::Prefix,
+            complete_len: 0,
+            high_waters: BTreeMap::new(),
+        }
+    }
+
+    fn start(&self) -> u64 {
+        match self.layout {
+            LogLayout::Prefix => HEADER_LEN as u64,
+            LogLayout::Region(region) => region.start,
+        }
+    }
+
+    fn end(&self) -> u64 {
+        self.start() + self.complete_len
+    }
+
+    fn compaction_is_due(&self, compact_after: u64) -> bool {
+        self.complete_len >= compact_after
+            && records_len(self.high_waters.len() as u64).saturating_mul(2) <= self.complete_len
+    }
+
+    fn encode_record(&self, key: AutoIncrementKey, high_water: u64) -> [u8; RECORD_LEN] {
+        match self.layout {
+            LogLayout::Prefix => encode_record(key, high_water),
+            LogLayout::Region(region) => encode_region_record(region, key, high_water),
+        }
+    }
+}
+
+impl Region {
+    fn slot_at(&self, slot: usize) -> u64 {
+        self.barrier_at + RECORD_LEN as u64 * (1 + slot as u64)
+    }
+
+    fn front(&self) -> u64 {
+        self.barrier_at + 3 * RECORD_LEN as u64
+    }
+
+    fn snapshot_len(&self) -> u64 {
+        records_len(u64::from(self.snapshot_records))
+    }
+}
+
+/// The rewrite of a log into the region `to`.
+#[derive(Clone, Copy, Debug)]
+struct Compaction {
+    from: LogLayout,
+    to: Region,
+}
+
+impl Compaction {
+    fn plan(log: &ScannedLog) -> Result<Self> {
+        let snapshot_records =
+            u32::try_from(log.high_waters.len()).map_err(|_| LimboError::TooBig)?;
+        let to = match log.layout {
+            LogLayout::Prefix => {
+                let barrier_at = log.end();
+                Region {
+                    barrier_at,
+                    slot: 0,
+                    generation: 1,
+                    start: barrier_at + 3 * RECORD_LEN as u64,
+                    snapshot_records,
+                }
+            }
+            LogLayout::Region(current) => {
+                let generation = current.generation.checked_add(1).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "auto-increment sidecar ran out of region generations".to_owned(),
+                    )
+                })?;
+                let front = current.front();
+                let snapshot_len = records_len(u64::from(snapshot_records));
+                let start = if current.start != front && front + snapshot_len <= current.start {
+                    front
+                } else {
+                    log.end()
+                };
+                Region {
+                    barrier_at: current.barrier_at,
+                    slot: 1 - current.slot,
+                    generation,
+                    start,
+                    snapshot_records,
+                }
+            }
+        };
+        Ok(Self {
+            from: log.layout,
+            to,
+        })
+    }
+
+    /// The snapshot of every mark, written and synced before anything
+    /// switches to it. The first rewrite writes the slots in the same write.
+    fn snapshot_write(&self, high_waters: &BTreeMap<AutoIncrementKey, u64>) -> (u64, Vec<u8>) {
+        let mut bytes = Vec::with_capacity(3 * RECORD_LEN + high_waters.len() * RECORD_LEN);
+        let offset = match self.from {
+            LogLayout::Prefix => {
+                bytes.extend_from_slice(&encode_slot(self.to));
+                bytes.extend_from_slice(&[0; RECORD_LEN]);
+                self.to.slot_at(0)
+            }
+            LogLayout::Region(_) => self.to.start,
+        };
+        for (key, high_water) in high_waters {
+            bytes.extend_from_slice(&encode_region_record(self.to, *key, *high_water));
+        }
+        (offset, bytes)
+    }
+
+    /// The one record whose durable write switches the log to the new region.
+    fn switch_write(&self) -> (u64, [u8; RECORD_LEN]) {
+        match self.from {
+            LogLayout::Prefix => (self.to.barrier_at, encode_record(BARRIER_KEY, 0)),
+            LogLayout::Region(_) => (self.to.slot_at(self.to.slot), encode_slot(self.to)),
+        }
+    }
+
+    fn cut_file_to(&self) -> Option<u64> {
+        (self.to.start == self.to.front()).then(|| self.to.start + self.to.snapshot_len())
     }
 }
 
@@ -1801,13 +2436,41 @@ fn decode_header(bytes: &[u8], expected_identity: AllocatorDatabaseIdentity) -> 
     Ok(())
 }
 
-/// The bytes past the header that hold whole records, a torn tail left out.
-fn complete_log_len(file_size: u64) -> u64 {
-    (file_size - HEADER_LEN as u64) / RECORD_LEN as u64 * RECORD_LEN as u64
+/// How many bytes past the header a read of the prefix covers: every whole
+/// record the file holds, up to a full log and the barrier after it.
+fn prefix_read_len(file_size: u64) -> u64 {
+    whole_records_between(HEADER_LEN as u64, file_size)
+        .min(records_len(MAX_LOG_BYTES / RECORD_LEN as u64 + 1))
 }
 
-/// Checks each record in `bytes` and keeps its mark in `high_waters`, each
-fn scan_records(bytes: &[u8], high_waters: &mut BTreeMap<AutoIncrementKey, u64>) -> Result<usize> {
+fn region_read_len(region: Region, file_size: u64) -> u64 {
+    whole_records_between(region.start, file_size)
+        .min(records_len(MAX_LOG_BYTES / RECORD_LEN as u64))
+}
+
+/// The bytes from `start` on that hold whole records, a torn tail left out.
+fn whole_records_between(start: u64, file_size: u64) -> u64 {
+    file_size.saturating_sub(start) / RECORD_LEN as u64 * RECORD_LEN as u64
+}
+
+fn records_len(records: u64) -> u64 {
+    records.saturating_mul(RECORD_LEN as u64)
+}
+
+/// Where a scan of the prefix stopped, in bytes past where it began.
+enum PrefixEnd {
+    /// At a record that failed its check, or at the end of what was read.
+    Log(usize),
+    /// At the barrier that switched the log to its regions.
+    Barrier(usize),
+}
+
+/// Checks each prefix record in `bytes` and keeps its mark in `high_waters`,
+/// each mark rising above the last of its key.
+fn scan_prefix_records(
+    bytes: &[u8],
+    high_waters: &mut BTreeMap<AutoIncrementKey, u64>,
+) -> Result<PrefixEnd> {
     if !bytes.len().is_multiple_of(RECORD_LEN) {
         return Err(LimboError::Corrupt(
             "auto-increment log read did not end at a record boundary".to_owned(),
@@ -1815,21 +2478,164 @@ fn scan_records(bytes: &[u8], high_waters: &mut BTreeMap<AutoIncrementKey, u64>)
     }
     for (index, record) in bytes.chunks_exact(RECORD_LEN).enumerate() {
         let Ok((key, high_water)) = decode_record(record) else {
+            return Ok(PrefixEnd::Log(index * RECORD_LEN));
+        };
+        if key == BARRIER_KEY && high_water == 0 {
+            return Ok(PrefixEnd::Barrier(index * RECORD_LEN));
+        }
+        keep_rising_mark(high_waters, key, high_water)?;
+    }
+    Ok(PrefixEnd::Log(bytes.len()))
+}
+
+/// Checks each record of `region` in `bytes` and keeps its mark in
+/// `high_waters`. A record of another region, or one that fails its check,
+/// ends the region's log.
+fn scan_region_records(
+    bytes: &[u8],
+    region: Region,
+    high_waters: &mut BTreeMap<AutoIncrementKey, u64>,
+) -> Result<usize> {
+    if !bytes.len().is_multiple_of(RECORD_LEN) {
+        return Err(LimboError::Corrupt(
+            "auto-increment region read did not end at a record boundary".to_owned(),
+        ));
+    }
+    for (index, record) in bytes.chunks_exact(RECORD_LEN).enumerate() {
+        let Some((key, high_water)) = decode_region_record(region, record) else {
             return Ok(index * RECORD_LEN);
         };
-        if high_water == 0 {
-            return Err(LimboError::Corrupt(
-                "auto-increment log contains a zero high-water mark".to_owned(),
-            ));
-        }
-        let previous = high_waters.insert(key, high_water).unwrap_or(0);
-        if high_water <= previous {
-            return Err(LimboError::Corrupt(
-                "auto-increment log high-water marks are not strictly increasing".to_owned(),
-            ));
-        }
+        keep_rising_mark(high_waters, key, high_water)?;
     }
     Ok(bytes.len())
+}
+
+fn keep_rising_mark(
+    high_waters: &mut BTreeMap<AutoIncrementKey, u64>,
+    key: AutoIncrementKey,
+    high_water: u64,
+) -> Result<()> {
+    if high_water == 0 {
+        return Err(LimboError::Corrupt(
+            "auto-increment log contains a zero high-water mark".to_owned(),
+        ));
+    }
+    let previous = high_waters.insert(key, high_water).unwrap_or(0);
+    if high_water <= previous {
+        return Err(LimboError::Corrupt(
+            "auto-increment log high-water marks are not strictly increasing".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The region of the slot with the higher generation among the two in
+/// `slots`, which follow the barrier at `barrier_at`. A slot that fails its
+/// check is one whose write a crash tore; the other one is then in use.
+fn region_in_use(slots: &[u8], barrier_at: u64) -> Result<Region> {
+    let first = decode_slot(&slots[..RECORD_LEN], barrier_at, 0)?;
+    let second = decode_slot(&slots[RECORD_LEN..], barrier_at, 1)?;
+    match (first, second) {
+        (Some(first), Some(second)) if first.generation == second.generation => {
+            Err(LimboError::Corrupt(
+                "auto-increment sidecar has two region slots of one generation".to_owned(),
+            ))
+        }
+        (Some(first), Some(second)) => Ok(if first.generation > second.generation {
+            first
+        } else {
+            second
+        }),
+        (Some(region), None) | (None, Some(region)) => Ok(region),
+        (None, None) => Err(LimboError::Corrupt(
+            "auto-increment sidecar has no region slot that passes its check".to_owned(),
+        )),
+    }
+}
+
+fn encode_slot(region: Region) -> [u8; RECORD_LEN] {
+    let mut slot = [0; RECORD_LEN];
+    slot[0..4].copy_from_slice(&SLOT_MAGIC);
+    slot[4..6].copy_from_slice(&SLOT_VERSION.to_le_bytes());
+    slot[6..8].copy_from_slice(&(RECORD_LEN as u16).to_le_bytes());
+    slot[8..12].copy_from_slice(&region.generation.to_le_bytes());
+    slot[12..16].copy_from_slice(&region.snapshot_records.to_le_bytes());
+    slot[16..24].copy_from_slice(&region.start.to_le_bytes());
+    slot[24..32].copy_from_slice(&region.barrier_at.to_le_bytes());
+    let checksum = crc32c::crc32c(&slot[..32]);
+    slot[32..36].copy_from_slice(&checksum.to_le_bytes());
+    slot
+}
+
+/// The region one slot names, or `None` when the slot fails its check.
+fn decode_slot(bytes: &[u8], barrier_at: u64, slot: usize) -> Result<Option<Region>> {
+    let expected_crc = u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
+    if bytes[0..4] != SLOT_MAGIC || crc32c::crc32c(&bytes[..32]) != expected_crc {
+        return Ok(None);
+    }
+    let field = |range: std::ops::Range<usize>| -> u64 {
+        let mut le = [0; 8];
+        le[..range.len()].copy_from_slice(&bytes[range]);
+        u64::from_le_bytes(le)
+    };
+    let region = Region {
+        barrier_at: field(24..32),
+        slot,
+        generation: field(8..12) as u32,
+        start: field(16..24),
+        snapshot_records: field(12..16) as u32,
+    };
+    if field(4..6) != u64::from(SLOT_VERSION)
+        || field(6..8) != RECORD_LEN as u64
+        || region.barrier_at != barrier_at
+        || region.generation == 0
+        || region.start < region.front()
+        || (region.start - region.front()) % RECORD_LEN as u64 != 0
+    {
+        return Err(LimboError::Corrupt(
+            "auto-increment sidecar has a checked region slot that names no region".to_owned(),
+        ));
+    }
+    Ok(Some(region))
+}
+
+fn encode_region_record(
+    region: Region,
+    key: AutoIncrementKey,
+    high_water: u64,
+) -> [u8; RECORD_LEN] {
+    let mut record = [0; RECORD_LEN];
+    record[0..4].copy_from_slice(&REGION_RECORD_MAGIC);
+    record[4..8].copy_from_slice(&region.generation.to_le_bytes());
+    record[8..24].copy_from_slice(&key.0);
+    record[24..32].copy_from_slice(&high_water.to_le_bytes());
+    let checksum = region_record_checksum(region, &record[..32]);
+    record[32..36].copy_from_slice(&checksum.to_le_bytes());
+    record
+}
+
+/// The key and mark of one record of `region`, or `None` when the record
+/// fails its check, belongs to another region, or has a zero key.
+fn decode_region_record(region: Region, record: &[u8]) -> Option<(AutoIncrementKey, u64)> {
+    let expected_crc = u32::from_le_bytes([record[32], record[33], record[34], record[35]]);
+    if record[0..4] != REGION_RECORD_MAGIC
+        || record[4..8] != region.generation.to_le_bytes()
+        || region_record_checksum(region, &record[..32]) != expected_crc
+    {
+        return None;
+    }
+    let mut key_bytes = [0; 16];
+    key_bytes.copy_from_slice(&record[8..24]);
+    let key = AutoIncrementKey::new(key_bytes).ok()?;
+    let mut mark = [0; 8];
+    mark.copy_from_slice(&record[24..32]);
+    Some((key, u64::from_le_bytes(mark)))
+}
+
+/// A region record's checksum also covers where its region starts, so a
+/// record left at another place by an earlier region fails it.
+fn region_record_checksum(region: Region, record: &[u8]) -> u32 {
+    crc32c::crc32c_append(crc32c::crc32c(record), &region.start.to_le_bytes())
 }
 
 fn encode_record(key: AutoIncrementKey, high_water: u64) -> [u8; RECORD_LEN] {
@@ -2628,9 +3434,15 @@ mod tests {
             FileSyncType::Fsync,
         )
         .unwrap();
+        allocator.set_compaction_threshold(u64::MAX);
+        *allocator.shared.scanned.lock().unwrap() = Some(ScannedLog {
+            layout: LogLayout::Prefix,
+            complete_len: MAX_LOG_BYTES - RECORD_LEN as u64 + 1,
+            high_waters: BTreeMap::new(),
+        });
         let mut reservation = allocator.reserve(KEY_A, 1).unwrap();
         assert!(matches!(
-            reservation.begin_write(MAX_LOG_BYTES - RECORD_LEN as u64 + 1, 0),
+            reservation.begin_write(0),
             Err(error) if matches!(*error, LimboError::TooBig)
         ));
         assert_eq!(file.size().unwrap(), 0);
@@ -2856,6 +3668,432 @@ mod tests {
                 ReservedRange { first: 5, last: 8 }
             ]
         );
+    }
+
+    const KEY_C: AutoIncrementKey = AutoIncrementKey(*b"table-key-000003");
+    const SMALL_LOG: u64 = 8 * RECORD_LEN as u64;
+
+    #[test]
+    fn a_log_past_the_threshold_is_rewritten_and_keeps_every_counter() {
+        let io = MemoryIO::new();
+        let allocator = open_allocator(&io);
+        allocator.set_compaction_threshold(SMALL_LOG);
+        let mut next = BTreeMap::from([(KEY_A, 1), (KEY_B, 1), (KEY_C, 1)]);
+        let mut largest_file = 0;
+        for round in 0..5_000u64 {
+            let key = [KEY_A, KEY_B, KEY_C][(round % 3) as usize];
+            let count = 1 + round % 4;
+            let range = reserve(&io, &allocator, key, count);
+            let expected = next.get_mut(&key).unwrap();
+            assert_eq!(range.first(), *expected);
+            *expected = range.last() + 1;
+            largest_file = largest_file.max(sidecar_size(&io));
+        }
+        assert!(
+            largest_file < 4 * SMALL_LOG + HEADER_LEN as u64 + 3 * RECORD_LEN as u64,
+            "the sidecar grew to {largest_file} bytes"
+        );
+        drop(allocator);
+
+        let reopened = open_allocator(&io);
+        for (key, next) in next {
+            assert_eq!(peek_high_water(&io, &reopened, key), next - 1);
+            assert_eq!(reserve(&io, &reopened, key, 1).first(), next);
+        }
+    }
+
+    fn sidecar_size(io: &dyn IO) -> u64 {
+        io.open_file(
+            "auto-increment.test",
+            OpenFlags::Create | OpenFlags::NoLock,
+            false,
+        )
+        .unwrap()
+        .size()
+        .unwrap()
+    }
+
+    /// The old code answered TooBig for every insert once the log reached
+    /// 64 MB. A sidecar left at that size is rewritten by the next write.
+    #[test]
+    fn a_sidecar_at_the_old_size_limit_takes_numbers_again() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let records = (MAX_LOG_BYTES - HEADER_LEN as u64) / RECORD_LEN as u64;
+        let mut bytes = Vec::with_capacity((HEADER_LEN as u64 + records_len(records)) as usize);
+        bytes.extend_from_slice(&encode_header(DATABASE_A));
+        for record in 0..records {
+            let key = if record % 2 == 0 { KEY_A } else { KEY_B };
+            bytes.extend_from_slice(&encode_record(key, record / 2 + 1));
+        }
+        let full_size = bytes.len() as u64;
+        write_bytes(&io, file.clone(), 0, bytes);
+        let last_a = records.div_ceil(2);
+        let last_b = records / 2;
+
+        let allocator = open_allocator(&io);
+        assert_eq!(reserve(&io, &allocator, KEY_A, 1).first(), last_a + 1);
+        assert_eq!(reserve(&io, &allocator, KEY_B, 3).first(), last_b + 1);
+        assert!(file.size().unwrap() < full_size + 8 * RECORD_LEN as u64);
+        drop(allocator);
+
+        let reopened = open_allocator(&io);
+        assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), last_a + 2);
+        assert_eq!(reserve(&io, &reopened, KEY_B, 1).first(), last_b + 4);
+    }
+
+    /// Two handles that do not share the allocator, as two processes would
+    /// not, each find the region the other one rewrote the log into.
+    #[test]
+    fn a_handle_reads_the_region_another_handle_rewrote_the_log_into() {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let first = DurableRangeAllocator::from_file(
+            file.clone(),
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        let second = DurableRangeAllocator::from_file(
+            file,
+            DATABASE_A,
+            AllocatorOpenMode::Create,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first.shared, &second.shared));
+        first.set_compaction_threshold(SMALL_LOG);
+        second.set_compaction_threshold(SMALL_LOG);
+        let mut next = 1;
+        for round in 0..200 {
+            let handle = if round % 7 < 3 { &first } else { &second };
+            let key = if round % 2 == 0 { KEY_A } else { KEY_B };
+            let range = reserve(&io, handle, key, 1);
+            if key == KEY_A {
+                assert_eq!(range.first(), next);
+                next += 1;
+            }
+        }
+        assert!(matches!(
+            first
+                .shared
+                .scanned
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .layout,
+            LogLayout::Region(_)
+        ));
+    }
+
+    #[test]
+    fn concurrent_reservations_across_rewrites_never_overlap() {
+        let io = Arc::new(MemoryIO::new());
+        let allocator = Arc::new(open_allocator(io.as_ref()));
+        allocator.set_compaction_threshold(SMALL_LOG);
+        let workers = (0..4)
+            .map(|_| {
+                let io = io.clone();
+                let allocator = allocator.clone();
+                thread::spawn(move || {
+                    let mut ranges = Vec::new();
+                    while ranges.len() < 200 {
+                        let mut reservation = allocator.reserve(KEY_A, 2).unwrap();
+                        match io.block(|| reservation.step()) {
+                            Ok(range) => ranges.push(range),
+                            Err(LimboError::Busy) => thread::yield_now(),
+                            Err(error) => panic!("reservation failed: {error}"),
+                        }
+                    }
+                    ranges
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut ranges = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        ranges.sort_by_key(|range| range.first());
+        for (index, range) in ranges.iter().enumerate() {
+            assert_eq!(range.first(), 2 * index as u64 + 1);
+            assert_eq!(range.last(), 2 * index as u64 + 2);
+        }
+    }
+
+    /// Takes the disk image a crash leaves after every write, sync and
+    /// truncation of a run of reservations that rewrites the log several
+    /// times, and checks that each image opens, keeps every mark that was
+    /// durable, holds no mark that was never written, and takes numbers.
+    #[test]
+    fn every_crash_during_rewrites_keeps_the_durable_marks() {
+        assert_every_crash_keeps_the_durable_marks(false);
+    }
+
+    /// The same while commits log the marks: records are then written
+    /// without a sync, and a rewrite makes every one of them durable.
+    #[test]
+    fn every_crash_during_rewrites_keeps_the_durable_marks_while_commits_log_them() {
+        assert_every_crash_keeps_the_durable_marks(true);
+    }
+
+    fn assert_every_crash_keeps_the_durable_marks(commits_log_marks: bool) {
+        let io = RecordingIo::new();
+        let allocator = open_allocator(&io);
+        initialize(&io, &allocator);
+        allocator.set_compaction_threshold(SMALL_LOG);
+        let commits = commits_log_marks.then(|| allocator.let_commits_log_marks().unwrap());
+        let base = sidecar_bytes(&io);
+        io.ops.lock().unwrap().clear();
+
+        let mut written = Vec::new();
+        for round in 0..60u64 {
+            let key = [KEY_A, KEY_B, KEY_C][(round % 3) as usize];
+            let range = reserve(&io, &allocator, key, 1 + round % 3);
+            let ops = io.ops.lock().unwrap();
+            let record_write = ops
+                .iter()
+                .rposition(|op| matches!(op, DiskOp::Write { .. }))
+                .unwrap();
+            written.push((record_write, key, range.last()));
+        }
+        drop(commits);
+        let ops = io.ops.lock().unwrap().clone();
+        let compactions = ops
+            .iter()
+            .filter(|op| matches!(op, DiskOp::Truncate { .. }))
+            .count();
+        assert!(
+            compactions >= 3,
+            "only {compactions} rewrites went to the front"
+        );
+
+        for crash in 0..=ops.len() {
+            let written_before = |end: usize| {
+                let mut marks = BTreeMap::new();
+                for (write, key, mark) in &written {
+                    if *write < end {
+                        marks.insert(*key, *mark);
+                    }
+                }
+                marks
+            };
+            let at_most = written_before(crash);
+            let last_sync = ops[..crash]
+                .iter()
+                .rposition(|op| matches!(op, DiskOp::Sync));
+            let durable_end = last_sync.map_or(0, |sync| sync + 1);
+            let at_least = written_before(last_sync.unwrap_or(0));
+            assert_image_keeps(
+                &apply(&base, &ops[..crash]),
+                &written_before(crash),
+                &at_most,
+            );
+            for image in power_loss_images(&base, &ops[..durable_end], &ops[durable_end..crash]) {
+                assert_image_keeps(&image, &at_least, &at_most);
+            }
+        }
+    }
+
+    fn sidecar_bytes(io: &dyn IO) -> Vec<u8> {
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        let size = file.size().unwrap() as usize;
+        let buffer = Arc::new(Buffer::new_temporary(size));
+        let completion = file
+            .pread(0, Completion::new_read(buffer.clone(), |_| None))
+            .unwrap();
+        io.wait_for_completion(completion).unwrap();
+        buffer.as_slice().to_vec()
+    }
+
+    /// The images a power loss leaves: what was synced, plus none, all, all
+    /// but one, only one, or all with one of them torn in half, of the
+    /// changes made since.
+    fn power_loss_images(base: &[u8], synced: &[DiskOp], unsynced: &[DiskOp]) -> Vec<Vec<u8>> {
+        let durable = apply(base, synced);
+        let mut images = vec![durable.clone(), apply(&durable, unsynced)];
+        for skipped in 0..unsynced.len() {
+            let mut all_but_one = unsynced.to_vec();
+            all_but_one.remove(skipped);
+            images.push(apply(&durable, &all_but_one));
+            images.push(apply(&durable, &unsynced[skipped..=skipped]));
+            if let DiskOp::Write { offset, bytes } = &unsynced[skipped] {
+                let mut torn = unsynced.to_vec();
+                torn[skipped] = DiskOp::Write {
+                    offset: *offset,
+                    bytes: bytes[..bytes.len() / 2].to_vec(),
+                };
+                images.push(apply(&durable, &torn));
+            }
+        }
+        images
+    }
+
+    fn apply(base: &[u8], ops: &[DiskOp]) -> Vec<u8> {
+        let mut image = base.to_vec();
+        for op in ops {
+            match op {
+                DiskOp::Write { offset, bytes } => {
+                    let end = *offset as usize + bytes.len();
+                    if image.len() < end {
+                        image.resize(end, 0);
+                    }
+                    image[*offset as usize..end].copy_from_slice(bytes);
+                }
+                DiskOp::Truncate { len } => image.resize(*len as usize, 0),
+                DiskOp::Sync => {}
+            }
+        }
+        image
+    }
+
+    fn assert_image_keeps(
+        image: &[u8],
+        at_least: &BTreeMap<AutoIncrementKey, u64>,
+        at_most: &BTreeMap<AutoIncrementKey, u64>,
+    ) {
+        let io = MemoryIO::new();
+        let file = io
+            .open_file(
+                "auto-increment.test",
+                OpenFlags::Create | OpenFlags::NoLock,
+                false,
+            )
+            .unwrap();
+        write_bytes(&io, file, 0, image.to_vec());
+        let allocator = DurableRangeAllocator::open(
+            &io,
+            "auto-increment.test",
+            DATABASE_A,
+            AllocatorOpenMode::Reopen,
+            FileSyncType::Fsync,
+        )
+        .unwrap();
+        allocator.set_compaction_threshold(SMALL_LOG);
+        for key in [KEY_A, KEY_B, KEY_C] {
+            let mark = peek_high_water(&io, &allocator, key);
+            let lowest = at_least.get(&key).copied().unwrap_or(0);
+            let highest = at_most.get(&key).copied().unwrap_or(0);
+            assert!(
+                (lowest..=highest).contains(&mark),
+                "{key:?} reads {mark}, durable {lowest}, written {highest}"
+            );
+            assert_eq!(reserve(&io, &allocator, key, 1).first(), mark + 1);
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum DiskOp {
+        Write { offset: u64, bytes: Vec<u8> },
+        Truncate { len: u64 },
+        Sync,
+    }
+
+    /// Records every change a sidecar file sees, in order.
+    struct RecordingIo {
+        inner: MemoryIO,
+        ops: Arc<Mutex<Vec<DiskOp>>>,
+    }
+
+    impl RecordingIo {
+        fn new() -> Self {
+            Self {
+                inner: MemoryIO::new(),
+                ops: Arc::default(),
+            }
+        }
+    }
+
+    impl Clock for RecordingIo {
+        fn current_time_monotonic(&self) -> MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for RecordingIo {
+        fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+            Ok(Arc::new(RecordingFile {
+                inner: self.inner.open_file(path, flags, direct)?,
+                ops: self.ops.clone(),
+            }))
+        }
+
+        fn remove_file(&self, path: &str) -> Result<()> {
+            self.inner.remove_file(path)
+        }
+    }
+
+    struct RecordingFile {
+        inner: Arc<dyn File>,
+        ops: Arc<Mutex<Vec<DiskOp>>>,
+    }
+
+    impl File for RecordingFile {
+        fn file_id(&self) -> Result<FileId> {
+            self.inner.file_id()
+        }
+
+        fn lock_file(&self, exclusive: bool) -> Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, completion: Completion) -> Result<Completion> {
+            self.inner.pread(pos, completion)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            completion: Completion,
+        ) -> Result<Completion> {
+            self.ops.lock().unwrap().push(DiskOp::Write {
+                offset: pos,
+                bytes: buffer.as_slice().to_vec(),
+            });
+            self.inner.pwrite(pos, buffer, completion)
+        }
+
+        fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
+            self.ops.lock().unwrap().push(DiskOp::Sync);
+            self.inner.sync(completion, sync_type)
+        }
+
+        fn size(&self) -> Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
+            self.ops.lock().unwrap().push(DiskOp::Truncate { len });
+            self.inner.truncate(len, completion)
+        }
     }
 
     struct FailingSyncFile {

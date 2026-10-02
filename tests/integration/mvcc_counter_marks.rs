@@ -123,6 +123,38 @@ fn a_checkpoint_waits_for_the_recovered_marks_to_reach_the_sidecar() -> anyhow::
     Ok(())
 }
 
+#[test]
+fn a_rewritten_sidecar_keeps_the_numbers_of_committed_rows_after_a_power_loss() -> anyhow::Result<()>
+{
+    let names = Names::new("carried-mark-rewritten");
+    let io = Arc::new(UnreliableIo::new());
+    let (db, counter) = open_mvcc_with_counter(io.clone(), &names, AllocatorOpenMode::Create)?;
+    counter.set_compaction_threshold(8 * 36);
+    let conn = db.connect()?;
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)")?;
+    for _ in 0..40 {
+        let t = reserve(io.as_ref(), &counter, KEY_T, 1)?;
+        conn.execute(format!("INSERT INTO t VALUES ({t}, 'row')"))?;
+        let u = reserve(io.as_ref(), &counter, KEY_U, 2)?;
+        conn.execute(format!("INSERT INTO u VALUES ({u}, 'row')"))?;
+    }
+    let sidecar_len = io.durable_files()[&names.sidecar].len();
+    assert!(
+        sidecar_len < 40 * 36,
+        "80 records left a {sidecar_len}-byte sidecar"
+    );
+
+    let recovered = recover_after_power_loss(io.as_ref(), &names)?;
+    let after = recovered.path("after");
+    let io = Arc::new(PlatformIo::new()?);
+    let (db, counter) = open_mvcc_with_counter(io.clone(), &after, AllocatorOpenMode::Reopen)?;
+    assert_eq!(reserve(io.as_ref(), &counter, KEY_T, 1)?, 41);
+    assert_eq!(reserve(io.as_ref(), &counter, KEY_U, 1)?, 81);
+    assert_eq!(count_rows(&db.connect()?, "SELECT id FROM u")?, 40);
+    Ok(())
+}
+
 type PlatformIo = turso_core::PlatformIO;
 
 struct Names {
