@@ -63,6 +63,7 @@ pub struct MySqlConnection {
     auto_increment: Option<AutoIncrementExecutionCapability>,
     session_autocommit: Arc<Mutex<bool>>,
     session_time_zone_offset: Arc<Mutex<i32>>,
+    explained_error: Arc<Mutex<Option<String>>>,
     /// Set while a `START TRANSACTION READ ONLY` is open. MySQL answers 1792 to
     /// a write inside one, so this frontend has to know it is in one to answer
     /// the same rather than accept a transaction whose promise it does not keep.
@@ -366,8 +367,76 @@ pub enum MySqlQueryError {
     NoSuchCheck(String),
     /// A `CHECK` was given a name another constraint already has.
     DuplicateCheckName(String),
+    ForeignKeyDefinition(MySqlForeignKeyDefinitionError),
     /// The checked Turso AST reached core, which then failed to prepare it.
     Engine(LimboError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlForeignKeyDefinitionError {
+    ChildColumnMissing {
+        column: String,
+    },
+    ColumnCountMismatch {
+        constraint: Option<String>,
+    },
+    ParentTableMissing {
+        table: String,
+    },
+    ParentColumnMissing {
+        column: String,
+        constraint: String,
+        table: String,
+    },
+    IncompatibleColumns {
+        child: String,
+        parent: String,
+        constraint: String,
+    },
+    NoUniqueKeyInParent {
+        constraint: String,
+        table: String,
+    },
+    DuplicateName {
+        name: String,
+    },
+}
+
+impl MySqlForeignKeyDefinitionError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::ChildColumnMissing { column } => {
+                format!("Key column '{column}' doesn't exist in table")
+            }
+            Self::ColumnCountMismatch { constraint } => format!(
+                "Incorrect foreign key definition for '{}': Key reference and table reference don't match",
+                constraint.as_deref().unwrap_or("foreign key without name")
+            ),
+            Self::ParentTableMissing { table } => {
+                format!("Failed to open the referenced table '{table}'")
+            }
+            Self::ParentColumnMissing {
+                column,
+                constraint,
+                table,
+            } => format!(
+                "Failed to add the foreign key constraint. Missing column '{column}' for constraint '{constraint}' in the referenced table '{table}'"
+            ),
+            Self::IncompatibleColumns {
+                child,
+                parent,
+                constraint,
+            } => format!(
+                "Referencing column '{child}' and referenced column '{parent}' in foreign key constraint '{constraint}' are incompatible."
+            ),
+            Self::NoUniqueKeyInParent { constraint, table } => format!(
+                "Failed to add the foreign key constraint. Missing unique key for constraint '{constraint}' in the referenced table '{table}'"
+            ),
+            Self::DuplicateName { name } => {
+                format!("Duplicate foreign key constraint name '{name}'")
+            }
+        }
+    }
 }
 
 /// One row of `SHOW INDEX`.
@@ -1524,6 +1593,7 @@ impl fmt::Display for MySqlQueryError {
             Self::DuplicateCheckName(name) => {
                 write!(f, "Duplicate check constraint name '{name}'")
             }
+            Self::ForeignKeyDefinition(error) => f.write_str(&error.message()),
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -1545,7 +1615,8 @@ impl Error for MySqlQueryError {
             | Self::ReadOnlyTransaction
             | Self::NoSuchSavepoint
             | Self::NoSuchCheck(_)
-            | Self::DuplicateCheckName(_) => None,
+            | Self::DuplicateCheckName(_)
+            | Self::ForeignKeyDefinition(_) => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -1557,6 +1628,7 @@ impl From<MySqlQueryError> for LimboError {
     fn from(error: MySqlQueryError) -> Self {
         match error {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
+            MySqlQueryError::ForeignKeyDefinition(error) => Self::ParseError(error.message()),
             MySqlQueryError::DuplicateColumn(column) => {
                 Self::ParseError(format!("Duplicate column name '{column}'"))
             }
@@ -1666,6 +1738,7 @@ impl MySqlConnection {
             auto_increment: None,
             session_autocommit: Arc::new(Mutex::new(true)),
             session_time_zone_offset: Arc::new(Mutex::new(0)),
+            explained_error: Arc::new(Mutex::new(None)),
             read_only_transaction: Arc::new(Mutex::new(false)),
             session_read_only: Arc::new(Mutex::new(false)),
             tables_locked: Arc::new(Mutex::new(false)),
@@ -4252,6 +4325,10 @@ impl MySqlConnection {
         self.inner.take_foreign_key_refusals()
     }
 
+    pub fn take_explained_error(&self) -> Option<String> {
+        self.explained_error.lock().unwrap().take()
+    }
+
     /// How many rows the last `SQL_CALC_FOUND_ROWS` statement would have
     /// answered without its `LIMIT`, if the last statement was one. Reading
     /// it forgets it, so a statement that is not one leaves nothing behind.
@@ -6171,14 +6248,22 @@ impl MySqlConnection {
                     changed_index_table = Some(indexes.table().clone());
                     return Ok(());
                 }
+                let added_to = self.added_foreign_key_table(statement);
+                let keys_before = match &added_to {
+                    Some(table) => {
+                        self.check_the_foreign_key_columns_an_alter_names(statement, table)?
+                    }
+                    None => 0,
+                };
                 let mut prepared = self
                     .prepare(statement)
                     .map_err(|error| self.json_schema_prepare_error(statement, error))?;
                 prepared
                     .run_ignore_rows()
                     .map_err(MySqlQueryError::Engine)?;
-                if let Some(table) = self.added_foreign_key_table(statement) {
-                    self.ensure_foreign_key_child_indexes(&table)?;
+                if let Some(table) = &added_to {
+                    self.ensure_foreign_key_child_indexes(table)?;
+                    self.check_the_foreign_keys_of(table, keys_before)?;
                 }
                 if let Some(table) = self.created_index_table(statement) {
                     self.remove_replaced_implicit_fk_indexes(&table)?;
@@ -6237,6 +6322,62 @@ impl MySqlConnection {
                 Err(MySqlQueryError::DuplicateColumn(name))
             }
         }
+    }
+
+    fn check_the_foreign_key_columns_an_alter_names(
+        &self,
+        sql: &str,
+        table: &MySqlTableName,
+    ) -> std::result::Result<usize, MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        let Some(btree) = schema.get_btree_table(table.as_str()) else {
+            return Ok(0);
+        };
+        let Ok(Stmt::AlterTable(alter)) = parse_schema_ddl_ast(sql, self.parser_mode()) else {
+            return Ok(btree.foreign_keys.len());
+        };
+        let AlterTableBody::AddConstraint(named) = &alter.body else {
+            return Ok(btree.foreign_keys.len());
+        };
+        let turso_parser::ast::TableConstraint::ForeignKey {
+            columns: child_columns,
+            clause,
+            ..
+        } = &named.constraint
+        else {
+            return Ok(btree.foreign_keys.len());
+        };
+        if let Some(name) = &named.name {
+            let taken = btree.foreign_keys.iter().any(|foreign_key| {
+                crate::show_create_table::MySqlForeignKey::of(foreign_key)
+                    .name_in(table.as_str())
+                    .eq_ignore_ascii_case(name.as_str())
+            });
+            if taken {
+                return Err(self.foreign_key_definition_error(
+                    MySqlForeignKeyDefinitionError::DuplicateName {
+                        name: name.as_str().to_owned(),
+                    },
+                ));
+            }
+        }
+        let columns = btree
+            .columns()
+            .iter()
+            .filter_map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        self.check_the_written_foreign_key_columns(
+            &columns,
+            &[WrittenForeignKey {
+                name: named.name.as_ref().map(|name| name.as_str().to_owned()),
+                child_columns: child_columns
+                    .iter()
+                    .map(|column| column.col_name.as_str().to_owned())
+                    .collect(),
+                parent_column_count: clause.columns.len(),
+            }],
+        )?;
+        Ok(btree.foreign_keys.len())
     }
 
     fn added_foreign_key_table(&self, sql: &str) -> Option<MySqlTableName> {
@@ -6729,6 +6870,9 @@ impl MySqlConnection {
         let existed = self
             .names_a_table(checked.table())
             .map_err(MySqlQueryError::Engine)?;
+        if !existed {
+            self.check_the_foreign_key_columns_a_new_table_names(checked.table_sql())?;
+        }
         let collated = turso_mysql_parser::create_table_with_its_collation_on_each_text_column(
             checked.table_sql(),
             self.parser_mode(),
@@ -6775,6 +6919,226 @@ impl MySqlConnection {
                 .map_err(MySqlQueryError::Engine)?;
         }
         self.ensure_foreign_key_child_indexes(checked.table())?;
+        self.check_the_foreign_keys_of(checked.table(), 0)?;
+        Ok(())
+    }
+
+    fn check_the_foreign_key_columns_a_new_table_names(
+        &self,
+        table_sql: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let Ok(Stmt::CreateTable {
+            body:
+                turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+                    columns,
+                    constraints,
+                    ..
+                },
+            ..
+        }) = parse_schema_ddl_ast(table_sql, self.parser_mode())
+        else {
+            return Ok(());
+        };
+        let columns = columns
+            .iter()
+            .map(|column| column.col_name.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let foreign_keys = constraints
+            .iter()
+            .filter_map(|named| match &named.constraint {
+                turso_parser::ast::TableConstraint::ForeignKey {
+                    columns: child_columns,
+                    clause,
+                    ..
+                } => Some(WrittenForeignKey {
+                    name: named.name.as_ref().map(|name| name.as_str().to_owned()),
+                    child_columns: child_columns
+                        .iter()
+                        .map(|column| column.col_name.as_str().to_owned())
+                        .collect(),
+                    parent_column_count: clause.columns.len(),
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.check_the_written_foreign_key_columns(&columns, &foreign_keys)
+    }
+
+    fn check_the_written_foreign_key_columns(
+        &self,
+        columns: &[String],
+        foreign_keys: &[WrittenForeignKey],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        for column in foreign_keys
+            .iter()
+            .flat_map(|foreign_key| &foreign_key.child_columns)
+        {
+            if !columns
+                .iter()
+                .any(|declared| declared.eq_ignore_ascii_case(column))
+            {
+                return Err(self.foreign_key_definition_error(
+                    MySqlForeignKeyDefinitionError::ChildColumnMissing {
+                        column: column.clone(),
+                    },
+                ));
+            }
+        }
+        for foreign_key in foreign_keys {
+            if foreign_key.parent_column_count != 0
+                && foreign_key.parent_column_count != foreign_key.child_columns.len()
+            {
+                return Err(self.foreign_key_definition_error(
+                    MySqlForeignKeyDefinitionError::ColumnCountMismatch {
+                        constraint: foreign_key.name.clone(),
+                    },
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn foreign_key_definition_error(
+        &self,
+        error: MySqlForeignKeyDefinitionError,
+    ) -> MySqlQueryError {
+        *self.explained_error.lock().unwrap() = Some(error.message());
+        MySqlQueryError::ForeignKeyDefinition(error)
+    }
+
+    fn check_the_foreign_keys_of(
+        &self,
+        table: &MySqlTableName,
+        first_new: usize,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let schema = self.inner.current_schema();
+        let btree = schema.get_btree_table(table.as_str()).ok_or_else(|| {
+            MySqlQueryError::Engine(LimboError::Corrupt(
+                "a table with foreign keys disappeared while they were checked".to_string(),
+            ))
+        })?;
+        let mut new_keys = btree
+            .foreign_keys
+            .iter()
+            .filter(|foreign_key| foreign_key.decl_order >= first_new)
+            .cloned()
+            .collect::<Vec<_>>();
+        new_keys.sort_by_key(|foreign_key| foreign_key.decl_order);
+        let child_columns = self
+            .list_columns(table)
+            .map_err(|_| MySqlQueryError::MissingTable)?;
+        for foreign_key in &new_keys {
+            let constraint =
+                crate::show_create_table::MySqlForeignKey::of(foreign_key).name_in(table.as_str());
+            let Some(parent) = schema.get_btree_table(&foreign_key.parent_table) else {
+                if self.inner.foreign_keys_enabled() {
+                    return Err(self.foreign_key_definition_error(
+                        MySqlForeignKeyDefinitionError::ParentTableMissing {
+                            table: foreign_key.parent_table.clone(),
+                        },
+                    ));
+                }
+                continue;
+            };
+            let parent_name = MySqlTableName::parse(&parent.name)
+                .map_err(|error| MySqlQueryError::Engine(LimboError::Corrupt(error.to_string())))?;
+            let parent_columns = self
+                .list_columns(&parent_name)
+                .map_err(|_| MySqlQueryError::MissingTable)?;
+            let mut pairs = Vec::with_capacity(foreign_key.child_columns.len());
+            for (child, parent_column) in foreign_key
+                .child_columns
+                .iter()
+                .zip(foreign_key.parent_columns.iter())
+            {
+                let Some(referenced) = parent_columns
+                    .iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(parent_column))
+                else {
+                    return Err(self.foreign_key_definition_error(
+                        MySqlForeignKeyDefinitionError::ParentColumnMissing {
+                            column: parent_column.clone(),
+                            constraint,
+                            table: foreign_key.parent_table.clone(),
+                        },
+                    ));
+                };
+                let referencing = child_columns
+                    .iter()
+                    .find(|column| column.name().eq_ignore_ascii_case(child))
+                    .ok_or_else(|| {
+                        MySqlQueryError::Engine(LimboError::Corrupt(format!(
+                            "foreign key column {child} is not in its table"
+                        )))
+                    })?;
+                pairs.push((child, parent_column, referencing, referenced));
+            }
+            for (child, parent_column, referencing, referenced) in pairs {
+                if StoredAs::of(referencing) != StoredAs::of(referenced) {
+                    return Err(self.foreign_key_definition_error(
+                        MySqlForeignKeyDefinitionError::IncompatibleColumns {
+                            child: child.clone(),
+                            parent: parent_column.clone(),
+                            constraint,
+                        },
+                    ));
+                }
+            }
+            let names_these_columns = |columns: &mut dyn Iterator<Item = &str>| {
+                let columns = columns.collect::<Vec<_>>();
+                columns.len() == foreign_key.parent_columns.len()
+                    && columns
+                        .iter()
+                        .zip(foreign_key.parent_columns.iter())
+                        .all(|(key, column)| key.eq_ignore_ascii_case(column))
+            };
+            let primary_key = &parent.primary_key_columns;
+            let keyed = names_these_columns(&mut primary_key.iter().map(|(name, _)| name.as_str()))
+                || schema
+                    .get_indices(&parent.name)
+                    .filter(|index| index.unique && index.where_clause.is_none())
+                    .any(|index| {
+                        names_these_columns(
+                            &mut mysql_index_columns(index, primary_key)
+                                .iter()
+                                .map(|column| column.name.as_str()),
+                        )
+                    });
+            if !keyed {
+                return Err(self.foreign_key_definition_error(
+                    MySqlForeignKeyDefinitionError::NoUniqueKeyInParent {
+                        constraint,
+                        table: foreign_key.parent_table.clone(),
+                    },
+                ));
+            }
+        }
+        let mut taken = Vec::new();
+        for (name, other) in schema.tables.iter() {
+            let Some(other_btree) = other.btree() else {
+                continue;
+            };
+            for foreign_key in &other_btree.foreign_keys {
+                let is_new = name.eq_ignore_ascii_case(table.as_str())
+                    && foreign_key.decl_order >= first_new;
+                if !is_new {
+                    taken.push(
+                        crate::show_create_table::MySqlForeignKey::of(foreign_key)
+                            .name_in(&other_btree.name),
+                    );
+                }
+            }
+        }
+        for foreign_key in &new_keys {
+            let name =
+                crate::show_create_table::MySqlForeignKey::of(foreign_key).name_in(table.as_str());
+            if taken.iter().any(|other| other.eq_ignore_ascii_case(&name)) {
+                return Err(self.foreign_key_definition_error(
+                    MySqlForeignKeyDefinitionError::DuplicateName { name },
+                ));
+            }
+            taken.push(name);
+        }
         Ok(())
     }
 
@@ -15203,6 +15567,76 @@ fn create_index_under_another_name(sql: &str, to: &str, mode: SessionSqlMode) ->
     idx_name.name = turso_parser::ast::Name::exact(to.to_owned());
     render_create_index_mysql_with_mode(&statement, mode)
         .map_err(|error| LimboError::Corrupt(error.to_string()))
+}
+
+struct WrittenForeignKey {
+    name: Option<String>,
+    child_columns: Vec<String>,
+    parent_column_count: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StoredAs {
+    Integer { bytes: u8, unsigned: bool },
+    Date,
+    Bytes,
+    Float,
+    Double,
+    Text { collation: Option<&'static str> },
+    Other(String),
+}
+
+impl StoredAs {
+    fn of(column: &MySqlColumnMetadata) -> Self {
+        let type_name = column.type_name().to_ascii_uppercase();
+        let unsigned = type_name.ends_with(" UNSIGNED");
+        let base = type_name.trim_end_matches(" UNSIGNED");
+        let integer = |bytes| StoredAs::Integer { bytes, unsigned };
+        match base {
+            "TINYINT" | "BOOLEAN" | "BOOL" => integer(1),
+            "SMALLINT" => integer(2),
+            "MEDIUMINT" => integer(3),
+            "INT" | "INTEGER" => integer(4),
+            "BIGINT" => integer(8),
+            "YEAR" => StoredAs::Integer {
+                bytes: 1,
+                unsigned: true,
+            },
+            "DATE" => StoredAs::Date,
+            "DATETIME" | "TIMESTAMP" | "TIME" | "DECIMAL" | "NUMERIC" | "BINARY" | "VARBINARY" => {
+                StoredAs::Bytes
+            }
+            "FLOAT" => StoredAs::Float,
+            "DOUBLE" | "REAL" => StoredAs::Double,
+            "CHAR" | "VARCHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => {
+                StoredAs::Text {
+                    collation: column.collation_name(),
+                }
+            }
+            _ if base.starts_with("BIT") => StoredAs::Bytes,
+            _ => {
+                if let Some(members) = turso_mysql_parser::set_members(column.type_name()) {
+                    return StoredAs::Integer {
+                        bytes: match members.len() {
+                            0..=8 => 1,
+                            9..=16 => 2,
+                            17..=24 => 3,
+                            25..=32 => 4,
+                            _ => 8,
+                        },
+                        unsigned: true,
+                    };
+                }
+                if let Some(members) = turso_mysql_parser::enum_members(column.type_name()) {
+                    return StoredAs::Integer {
+                        bytes: if members.len() <= 255 { 1 } else { 2 },
+                        unsigned: true,
+                    };
+                }
+                StoredAs::Other(base.to_owned())
+            }
+        }
+    }
 }
 
 fn primary_key_covers_columns(

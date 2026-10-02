@@ -47,10 +47,10 @@ pub use drop_table::{MySqlDropTableError, MySqlDropTableResult};
 pub use group_concat::{DEFAULT_GROUP_CONCAT_MAX_LEN, GROUP_CONCAT_CUT_ERROR};
 pub use session::{
     MySqlAffectedRowsMode, MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata,
-    MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlIndexEntry,
-    MySqlIsolationLevel, MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
-    MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
-    MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
+    MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlForeignKeyDefinitionError,
+    MySqlIndexEntry, MySqlIsolationLevel, MySqlMarkerType, MySqlPreparedExecutionResult,
+    MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow,
+    MySqlPreparedResultRows, MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedStatementPlace,
     MySqlPreparedValue, MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError,
     MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable,

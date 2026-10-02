@@ -4345,8 +4345,8 @@ reads. The first is one row per constraint rather than one per column of one,
 with `CONSTRAINT_TYPE` saying which of the three kinds it is. The second is one
 row per foreign key, and the only place the `ON DELETE` and `ON UPDATE` a key
 was written with are read back: measured on 8.4.11, a key written with no rule
-reads back as `NO ACTION` on both, and `RESTRICT` reads back as written even
-though neither is printed by `SHOW CREATE TABLE`. `UNIQUE_CONSTRAINT_NAME`
+reads back as `NO ACTION` on both, and `RESTRICT` reads back as written, which
+`SHOW CREATE TABLE` prints too. `UNIQUE_CONSTRAINT_NAME`
 names the key in the parent the foreign key points at — `PRIMARY` for a primary
 key and its own name for a unique one. Both answer all of MySQL's columns.
 
@@ -6134,6 +6134,23 @@ included, and an index made for another foreign key: of two such indexes the
 shorter is left out, and of two alike the earlier, so `FOREIGN KEY (b), KEY
 kc (c), FOREIGN KEY (b) ...` lists `kc`, `b`. A key's hidden primary key
 columns are not among the columns it starts with.
+
+A foreign key MySQL cannot make is refused at `CREATE TABLE` and at `ALTER
+TABLE ... ADD FOREIGN KEY` with MySQL's error and message, where the engine
+took it and found out at the first write. Measured on 8.4.11 and matched, in
+this order: 1072 for a column the table has not got, checked over every key
+first; 1239 where the key names more or fewer columns than it references; then
+key by key, 1824 for a table that is not there, unless `foreign_key_checks` is
+off, 3734 for a column the referenced table has not got, 3780 for columns
+stored differently — an integer of another size or sign, `YEAR`, an `ENUM` and
+a `SET` counted as the unsigned integer of their size, `DATE` alone,
+`DATETIME`, `TIMESTAMP`, `TIME`, `DECIMAL`, `BINARY` and `VARBINARY` all alike
+whatever their precision, `CHAR` and `VARCHAR` alike under one collation, and
+`FLOAT` and `DOUBLE` each alone — and 6125 where the referenced columns are not
+the whole of the primary key or of a unique key, in that key's order; and last
+1826 for a constraint name another foreign key in the database has, compared
+without regard to case. A key referencing its own table is checked against the
+keys the statement makes.
 
 An inline `REFERENCES` on a column is read and written nowhere, which is what
 MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`

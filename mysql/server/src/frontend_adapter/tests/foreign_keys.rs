@@ -586,3 +586,157 @@ fn update_ignore_skips_a_row_whose_key_collides() {
         [["1", "1"], ["2", "2"], ["4", "4"]]
     );
 }
+
+#[test]
+fn a_foreign_key_mysql_cannot_make_is_refused_with_mysqls_error() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT PRIMARY KEY, a INT, b INT, k INT, u INT UNSIGNED, s VARCHAR(10), \
+         s2 VARCHAR(10) COLLATE utf8mb4_bin, dc DECIMAL(10,2), dt DATETIME, d DATE, y YEAR, \
+         UNIQUE KEY uab (a, b), KEY kk (k), UNIQUE KEY uu (u), UNIQUE KEY us (s), \
+         UNIQUE KEY us2 (s2), UNIQUE KEY udc (dc), UNIQUE KEY udt (dt), UNIQUE KEY ud (d), \
+         UNIQUE KEY uy (y))",
+        "CREATE TABLE taken (id INT PRIMARY KEY, x INT, CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id))",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (sql, kind, message) in [
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES nope (id), \
+             FOREIGN KEY (zz) REFERENCES p (id))",
+            FrontendErrorKind::ForeignKeyColumnMissing,
+            "Key column 'zz' doesn't exist in table",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x, id) REFERENCES nope (id))",
+            FrontendErrorKind::ForeignKeyColumnCountMismatch,
+            "Incorrect foreign key definition for 'foreign key without name': Key reference and \
+             table reference don't match",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, CONSTRAINT dup FOREIGN KEY (x) REFERENCES nope (id))",
+            FrontendErrorKind::ReferencedTableMissing,
+            "Failed to open the referenced table 'nope'",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES p (nope))",
+            FrontendErrorKind::ReferencedColumnMissing,
+            "Failed to add the foreign key constraint. Missing column 'nope' for constraint \
+             'c_ibfk_1' in the referenced table 'p'",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x VARCHAR(3), FOREIGN KEY (x) REFERENCES p (k))",
+            FrontendErrorKind::ForeignKeyColumnsIncompatible,
+            "Referencing column 'x' and referenced column 'k' in foreign key constraint \
+             'c_ibfk_1' are incompatible.",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES p (k))",
+            FrontendErrorKind::ReferencedKeyMissing,
+            "Failed to add the foreign key constraint. Missing unique key for constraint \
+             'c_ibfk_1' in the referenced table 'p'",
+        ),
+        (
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id))",
+            FrontendErrorKind::DuplicateForeignKeyName,
+            "Duplicate foreign key constraint name 'dup'",
+        ),
+    ] {
+        assert_eq!(
+            refused(&mut adapter, sql),
+            (kind, message.to_owned()),
+            "{sql}"
+        );
+    }
+    for (columns, referenced) in [
+        ("a INT, b INT", "(a, b) REFERENCES p (b, a)"),
+        ("a INT", "(a) REFERENCES p (a)"),
+        ("x MEDIUMINT", "(x) REFERENCES p (id)"),
+        ("x BIGINT", "(x) REFERENCES p (id)"),
+        ("x INT", "(x) REFERENCES p (u)"),
+        ("x VARCHAR(10) COLLATE utf8mb4_bin", "(x) REFERENCES p (s)"),
+        ("x VARCHAR(10)", "(x) REFERENCES p (s2)"),
+        ("x DATETIME", "(x) REFERENCES p (d)"),
+        ("x INT", "(x) REFERENCES p (y)"),
+    ] {
+        let sql =
+            format!("CREATE TABLE c (id INT PRIMARY KEY, {columns}, FOREIGN KEY {referenced})");
+        assert!(adapter.execute_query(&sql).is_err(), "{sql}");
+    }
+    for (columns, referenced) in [
+        ("a INT, b INT", "(a, b) REFERENCES p (a, b)"),
+        ("x INT UNSIGNED", "(x) REFERENCES p (u)"),
+        ("x CHAR(20)", "(x) REFERENCES p (s)"),
+        ("x DECIMAL(12,4)", "(x) REFERENCES p (dc)"),
+        ("x TIMESTAMP NULL", "(x) REFERENCES p (dt)"),
+        ("x TIME(3)", "(x) REFERENCES p (dt)"),
+        ("x TINYINT UNSIGNED", "(x) REFERENCES p (y)"),
+        ("x INT NOT NULL", "(x) REFERENCES p (id)"),
+    ] {
+        run(
+            &mut adapter,
+            &format!("CREATE TABLE c (id INT PRIMARY KEY, {columns}, FOREIGN KEY {referenced})"),
+        );
+        run(&mut adapter, "DROP TABLE c");
+    }
+    run(
+        &mut adapter,
+        "CREATE TABLE selfref (id INT PRIMARY KEY, up INT, FOREIGN KEY (up) REFERENCES selfref (id))",
+    );
+
+    run(&mut adapter, "SET foreign_key_checks = 0");
+    run(
+        &mut adapter,
+        "CREATE TABLE later (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES nope (id))",
+    );
+    assert_eq!(
+        refused(
+            &mut adapter,
+            "CREATE TABLE c (id INT PRIMARY KEY, x INT, FOREIGN KEY (x) REFERENCES p (k))"
+        )
+        .0,
+        FrontendErrorKind::ReferencedKeyMissing
+    );
+    run(&mut adapter, "SET foreign_key_checks = 1");
+
+    run(
+        &mut adapter,
+        "CREATE TABLE c (id INT PRIMARY KEY, x INT, s VARCHAR(10))",
+    );
+    for (sql, kind) in [
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES nope (id)",
+            FrontendErrorKind::ReferencedTableMissing,
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p (k)",
+            FrontendErrorKind::ReferencedKeyMissing,
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p (s)",
+            FrontendErrorKind::ForeignKeyColumnsIncompatible,
+        ),
+        (
+            "ALTER TABLE c ADD FOREIGN KEY (zz) REFERENCES p (id)",
+            FrontendErrorKind::ForeignKeyColumnMissing,
+        ),
+        (
+            "ALTER TABLE c ADD CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id)",
+            FrontendErrorKind::DuplicateForeignKeyName,
+        ),
+    ] {
+        assert_eq!(refused(&mut adapter, sql).0, kind, "{sql}");
+    }
+    run(
+        &mut adapter,
+        "ALTER TABLE c ADD CONSTRAINT mine FOREIGN KEY (x) REFERENCES p (id)",
+    );
+    assert_eq!(
+        refused(
+            &mut adapter,
+            "ALTER TABLE c ADD CONSTRAINT mine FOREIGN KEY (s) REFERENCES p (s)"
+        )
+        .0,
+        FrontendErrorKind::DuplicateForeignKeyName
+    );
+}

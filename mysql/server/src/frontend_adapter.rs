@@ -58,9 +58,10 @@ use turso_mysql::{
 };
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlAlterTableIndexError, MySqlConnection,
-    MySqlCreateTableAsSelectError, MySqlDropTableError, MySqlMarkerType,
-    MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
-    MySqlQueryError, MySqlRenameTableError, MySqlTruncateTableError,
+    MySqlCreateTableAsSelectError, MySqlDropTableError, MySqlForeignKeyDefinitionError,
+    MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlPreparedResultColumnTypeMetadata, MySqlQueryError, MySqlRenameTableError,
+    MySqlTruncateTableError,
 };
 use turso_mysql::{
     MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedValue,
@@ -4485,6 +4486,7 @@ where
             MySqlAffectedRowsMode::Changed
         };
         connection.take_foreign_key_refusals();
+        connection.take_explained_error();
         let result = execute_checked_query(
             connection,
             sql,
@@ -5797,12 +5799,18 @@ fn answer_the_foreign_key_refusals(
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(CommandExecutionResult::Ok(ok))
         }
-        Err(kind) => Err(name_the_refusing_foreign_key(
-            database,
-            &refusals,
-            kind,
-            error_message,
-        )),
+        Err(kind) => {
+            if let Some(message) = connection.take_explained_error() {
+                *error_message = Some(message.into_bytes());
+                return Err(kind);
+            }
+            Err(name_the_refusing_foreign_key(
+                database,
+                &refusals,
+                kind,
+                error_message,
+            ))
+        }
         result => result,
     }
 }
@@ -7004,6 +7012,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
 
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
+        MySqlQueryError::ForeignKeyDefinition(error) => foreign_key_definition_error_kind(&error),
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
@@ -7019,6 +7028,32 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
+    }
+}
+
+fn foreign_key_definition_error_kind(error: &MySqlForeignKeyDefinitionError) -> FrontendErrorKind {
+    match error {
+        MySqlForeignKeyDefinitionError::ChildColumnMissing { .. } => {
+            FrontendErrorKind::ForeignKeyColumnMissing
+        }
+        MySqlForeignKeyDefinitionError::ColumnCountMismatch { .. } => {
+            FrontendErrorKind::ForeignKeyColumnCountMismatch
+        }
+        MySqlForeignKeyDefinitionError::ParentTableMissing { .. } => {
+            FrontendErrorKind::ReferencedTableMissing
+        }
+        MySqlForeignKeyDefinitionError::ParentColumnMissing { .. } => {
+            FrontendErrorKind::ReferencedColumnMissing
+        }
+        MySqlForeignKeyDefinitionError::IncompatibleColumns { .. } => {
+            FrontendErrorKind::ForeignKeyColumnsIncompatible
+        }
+        MySqlForeignKeyDefinitionError::NoUniqueKeyInParent { .. } => {
+            FrontendErrorKind::ReferencedKeyMissing
+        }
+        MySqlForeignKeyDefinitionError::DuplicateName { .. } => {
+            FrontendErrorKind::DuplicateForeignKeyName
+        }
     }
 }
 
@@ -13988,6 +14023,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
+        MySqlQueryError::ForeignKeyDefinition(error) => foreign_key_definition_error_kind(&error),
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,

@@ -82,6 +82,13 @@ pub struct MySqlForeignKey {
 }
 
 impl MySqlForeignKey {
+    pub fn name_in(&self, table: &str) -> String {
+        match &self.name {
+            Some(name) => name.clone(),
+            None => format!("{table}_ibfk_{}", self.declaration_order + 1),
+        }
+    }
+
     pub fn of(key: &turso_core::schema::ForeignKey) -> Self {
         Self {
             name: key.name.clone(),
@@ -143,10 +150,7 @@ fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let name = match &key.name {
-        Some(name) => name.clone(),
-        None => format!("{table}_ibfk_{}", key.declaration_order + 1),
-    };
+    let name = key.name_in(table);
     let mut rendered = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
         quoted(&name),

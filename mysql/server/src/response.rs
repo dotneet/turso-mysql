@@ -408,6 +408,13 @@ pub enum FrontendErrorKind {
     ForeignKeyViolation,
     /// A child row still names the parent row a statement deleted or changed.
     ParentRowReferenced,
+    ForeignKeyColumnMissing,
+    ForeignKeyColumnCountMismatch,
+    ReferencedTableMissing,
+    ReferencedColumnMissing,
+    ForeignKeyColumnsIncompatible,
+    ReferencedKeyMissing,
+    DuplicateForeignKeyName,
     /// A `TRUNCATE TABLE` named a table another table's foreign key names.
     TruncateReferencedByForeignKey,
     /// A `DROP TABLE` named a table another table's foreign key names.
@@ -702,6 +709,45 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1452,
             *b"23000",
             b"Cannot add or update a child row: a foreign key constraint fails".as_slice(),
+        ),
+        FrontendErrorKind::ForeignKeyColumnMissing => (
+            1072,
+            *b"42000",
+            b"Key column doesn't exist in table".as_slice(),
+        ),
+        FrontendErrorKind::ForeignKeyColumnCountMismatch => (
+            1239,
+            *b"42000",
+            b"Incorrect foreign key definition: Key reference and table reference don't match"
+                .as_slice(),
+        ),
+        FrontendErrorKind::ReferencedTableMissing => (
+            1824,
+            *b"HY000",
+            b"Failed to open the referenced table".as_slice(),
+        ),
+        FrontendErrorKind::ReferencedColumnMissing => (
+            3734,
+            *b"HY000",
+            b"Failed to add the foreign key constraint. Missing column in the referenced table"
+                .as_slice(),
+        ),
+        FrontendErrorKind::ForeignKeyColumnsIncompatible => (
+            3780,
+            *b"HY000",
+            b"Referencing column and referenced column in foreign key constraint are incompatible."
+                .as_slice(),
+        ),
+        FrontendErrorKind::ReferencedKeyMissing => (
+            6125,
+            *b"HY000",
+            b"Failed to add the foreign key constraint. Missing unique key in the referenced table"
+                .as_slice(),
+        ),
+        FrontendErrorKind::DuplicateForeignKeyName => (
+            1826,
+            *b"HY000",
+            b"Duplicate foreign key constraint name".as_slice(),
         ),
         FrontendErrorKind::ParentRowReferenced => (
             1451,
@@ -2766,6 +2812,21 @@ mod tests {
             (FrontendErrorKind::NotBaseTable, 1347, *b"HY000"),
             (FrontendErrorKind::CheckConstraintViolated, 3819, *b"HY000"),
             (FrontendErrorKind::NoSuchCheck, 3821, *b"HY000"),
+            (FrontendErrorKind::ForeignKeyColumnMissing, 1072, *b"42000"),
+            (
+                FrontendErrorKind::ForeignKeyColumnCountMismatch,
+                1239,
+                *b"42000",
+            ),
+            (FrontendErrorKind::ReferencedTableMissing, 1824, *b"HY000"),
+            (FrontendErrorKind::ReferencedColumnMissing, 3734, *b"HY000"),
+            (
+                FrontendErrorKind::ForeignKeyColumnsIncompatible,
+                3780,
+                *b"HY000",
+            ),
+            (FrontendErrorKind::ReferencedKeyMissing, 6125, *b"HY000"),
+            (FrontendErrorKind::DuplicateForeignKeyName, 1826, *b"HY000"),
             (FrontendErrorKind::DuplicateCheckName, 3822, *b"HY000"),
             (FrontendErrorKind::UnknownPreparedStatement, 1243, *b"HY000"),
             (
