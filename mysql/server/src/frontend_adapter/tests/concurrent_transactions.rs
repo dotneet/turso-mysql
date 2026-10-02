@@ -352,6 +352,91 @@ fn two_sessions_inserting_counted_rows_at_once_both_write_every_row() {
     assert_eq!(names(&mut one).len(), 2 * ROUNDS);
 }
 
+/// Four sessions inserting counted rows at once, in transactions of their
+/// own and outside any, one row and several at a time. Measured on MySQL
+/// 8.4.11: every insert succeeds, the id each one reports belongs to the row
+/// it wrote, and the ids run from 1 to the number of rows with none spent.
+#[test]
+fn several_sessions_inserting_counted_rows_at_once_write_every_row_with_its_own_id() {
+    const SESSIONS: usize = 4;
+    const ROUNDS: usize = 60;
+    let (_directory, sessions) = sessions(SESSIONS);
+    let inserters: Vec<_> = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(session, mut adapter)| {
+            std::thread::spawn(move || {
+                let insert = prepare(&mut adapter, INSERT_TAG);
+                let mut reported = Vec::new();
+                for round in 0..ROUNDS {
+                    let name = format!("s{session}r{round}");
+                    let result = match round % 3 {
+                        0 => {
+                            run(&mut adapter, "BEGIN");
+                            let result =
+                                execute(&mut adapter, insert, &[Bound::Null, Bound::Word(&name)]);
+                            run(&mut adapter, "COMMIT");
+                            result.map(|result| match result {
+                                PreparedStatementExecutionResult::Ok(result) => result,
+                                other => panic!("{name}: {other:?}"),
+                            })
+                        }
+                        1 => adapter
+                            .execute_query(&format!("INSERT INTO tags (name) VALUES ('{name}')"))
+                            .map(|result| match result {
+                                CommandExecutionResult::Ok(result) => result,
+                                other => panic!("{name}: {other:?}"),
+                            }),
+                        _ => adapter
+                            .execute_query(&format!(
+                                "INSERT INTO tags (name) VALUES ('{name}'), ('{name}-second')"
+                            ))
+                            .map(|result| match result {
+                                CommandExecutionResult::Ok(result) => result,
+                                other => panic!("{name}: {other:?}"),
+                            }),
+                    };
+                    let result = result.unwrap_or_else(|error| {
+                        panic!("{name}: {error:?} {:?}", adapter.take_error_message())
+                    });
+                    reported.push((result.last_insert_id, name));
+                }
+                (adapter, reported)
+            })
+        })
+        .collect();
+    let mut reported = Vec::new();
+    let mut last = None;
+    for inserter in inserters {
+        let (adapter, rows) = inserter.join().unwrap();
+        reported.extend(rows);
+        last = Some(adapter);
+    }
+    let mut adapter = last.unwrap();
+    let rows = SESSIONS * (ROUNDS + ROUNDS / 3);
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        adapter.execute_query("SELECT id, name FROM tags ORDER BY id")
+    else {
+        panic!("the rows must read back");
+    };
+    let written: Vec<(u64, String)> = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            let id = String::from_utf8(row[0].clone().unwrap()).unwrap();
+            let name = String::from_utf8(row[1].clone().unwrap()).unwrap();
+            (id.parse().unwrap(), name)
+        })
+        .collect();
+    assert_eq!(
+        written.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+        (1..=rows as u64).collect::<Vec<_>>()
+    );
+    for (id, name) in reported {
+        assert_eq!(written[id as usize - 1], (id, name));
+    }
+}
+
 /// Measured on MySQL 8.4.11: a counted insert waiting for a key another
 /// transaction holds, given up as the victim of a deadlock, answers 1213 and
 /// its transaction is rolled back whole; nothing it wrote stays, even once
