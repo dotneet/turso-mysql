@@ -885,6 +885,64 @@ fn an_internal_helper_inside_a_transaction_stays_in_it() {
 }
 
 #[test]
+fn a_concurrent_write_waits_for_an_exclusive_transaction_when_asked_to() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_exclusive_tx_and_writers_wait(true);
+    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let writer = db.db.connect().unwrap();
+
+    db.conn.execute("BEGIN IMMEDIATE").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        writer.execute("INSERT INTO t VALUES (1)"),
+        Err(LimboError::Busy)
+    ));
+    assert_eq!(
+        get_rows(&writer, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(0)]]
+    );
+    db.conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    db.conn.execute("COMMIT").unwrap();
+
+    writer.execute("ROLLBACK").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&db.conn, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
+fn an_exclusive_transaction_waits_for_a_concurrent_writer_when_asked_to() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_exclusive_tx_and_writers_wait(true);
+    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let writer = db.db.connect().unwrap();
+    let reader = db.db.connect().unwrap();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    get_rows(&reader, "SELECT x FROM t");
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(matches!(
+        db.conn.execute("BEGIN IMMEDIATE"),
+        Err(LimboError::Busy)
+    ));
+    writer.execute("COMMIT").unwrap();
+
+    db.conn.execute("BEGIN IMMEDIATE").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    db.conn.execute("COMMIT").unwrap();
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
@@ -7770,6 +7828,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
+        has_begun_writing: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
     }
@@ -9463,6 +9522,7 @@ fn transaction_display() {
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
+        has_begun_writing: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
     };

@@ -4871,6 +4871,11 @@ pub fn op_transaction_inner(
                         // for both.
                         let current_mv_tx = program.connection.get_mv_tx_for_db(*db);
                         let has_existing_mv_tx = current_mv_tx.is_some();
+                        if let Some((tx_id, TransactionMode::Concurrent)) = current_mv_tx {
+                            if statement_writes_db && !conn.is_nested_stmt() {
+                                mv_store.begin_writing_in_concurrent_tx(tx_id)?;
+                            }
+                        }
                         if has_existing_mv_tx {
                             // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                             pager.mvcc_refresh_if_db_changed();

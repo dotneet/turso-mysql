@@ -82,6 +82,9 @@ where
         connection.execute("PRAGMA journal_mode = 'mvcc'")?;
         connection.close()?;
     }
+    if let Some(store) = database.get_mv_store().as_ref() {
+        store.set_exclusive_tx_and_writers_wait(true);
+    }
     Ok(database)
 }
 

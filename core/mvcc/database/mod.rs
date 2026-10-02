@@ -1077,6 +1077,10 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     state: AtomicTransactionState,
     /// The transaction ID.
     tx_id: u64,
+    /// True once a write statement of this `BEGIN CONCURRENT` transaction
+    /// started, when the store makes exclusive transactions and writers wait
+    /// for each other.
+    has_begun_writing: AtomicBool,
     /// The timestamp of what the transaction reads: the moment it began, or
     /// the last moment [MvStore::refresh_snapshot] moved it to.
     begin_ts: AtomicU64,
@@ -1134,6 +1138,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
+            has_begun_writing: AtomicBool::new(false),
             begin_ts: AtomicU64::new(begin_ts),
             statement_read_ts: AtomicU64::new(0),
             latest_read_ts: AtomicU64::new(0),
@@ -4462,6 +4467,12 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
+    /// When set, an exclusive transaction starts only once no `BEGIN CONCURRENT`
+    /// transaction has begun writing, and a write statement of a `BEGIN
+    /// CONCURRENT` transaction waits while another transaction is exclusive.
+    /// Off, a concurrent writer runs beside an exclusive transaction and fails
+    /// when it commits.
+    exclusive_tx_and_writers_wait: AtomicBool,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
     /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
@@ -4670,6 +4681,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
+            exclusive_tx_and_writers_wait: AtomicBool::new(false),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
@@ -7835,6 +7847,43 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
+    fn has_writing_tx_other_than(&self, tx_id: TxID) -> bool {
+        self.txs.iter().any(|entry| {
+            *entry.key() != tx_id && entry.value().has_begun_writing.load(Ordering::SeqCst)
+        })
+    }
+
+    /// Makes exclusive transactions and the writes of `BEGIN CONCURRENT`
+    /// transactions wait for each other, rather than letting a concurrent
+    /// writer run beside an exclusive transaction and fail when it commits.
+    pub fn set_exclusive_tx_and_writers_wait(&self, wait: bool) {
+        self.exclusive_tx_and_writers_wait
+            .store(wait, Ordering::SeqCst);
+    }
+
+    pub(crate) fn begin_writing_in_concurrent_tx(&self, tx_id: TxID) -> Result<()> {
+        if !self.exclusive_tx_and_writers_wait.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        if tx.has_begun_writing.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if self.has_exclusive_tx() {
+            return Err(LimboError::Busy);
+        }
+        tx.has_begun_writing.store(true, Ordering::SeqCst);
+        if self.exclusive_tx.load(Ordering::SeqCst) != NO_EXCLUSIVE_TX {
+            tx.has_begun_writing.store(false, Ordering::SeqCst);
+            return Err(LimboError::Busy);
+        }
+        Ok(())
+    }
+
     /// Acquires the exclusive transaction lock to the given transaction ID.
     ///
     /// Fails with `Busy` while another transaction holds the lock or is
@@ -7897,6 +7946,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.has_preparing_tx_other_than(*tx_id) {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
+                }
+                if self.exclusive_tx_and_writers_wait.load(Ordering::SeqCst) {
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    if self.has_writing_tx_other_than(*tx_id) {
+                        self.release_exclusive_tx(tx_id);
+                        return Err(LimboError::Busy);
+                    }
                 }
                 // we will check again, if some other txn committed in the meantime.
                 // we did this check previously too, but we will have to do this again.
