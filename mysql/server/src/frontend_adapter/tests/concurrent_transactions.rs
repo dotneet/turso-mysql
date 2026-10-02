@@ -1490,6 +1490,45 @@ fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_its_foreign_k
 }
 
 #[test]
+fn a_refused_child_keeps_no_gap_in_a_key_declared_after_its_foreign_key_clause() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    for statement in [
+        "CREATE TABLE parents (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE kids (id INT NOT NULL PRIMARY KEY, a INT, parent_id INT, c INT, KEY ka (a), \
+         FOREIGN KEY (parent_id) REFERENCES parents (id), KEY kc (c))",
+        "INSERT INTO parents (id, v) VALUES (10, 1), (20, 2), (30, 3)",
+        "INSERT INTO kids (id, a, parent_id, c) VALUES (1, 10, 10, 100), (2, 20, 20, 200), \
+         (10, 30, 30, 300)",
+        "BEGIN",
+    ] {
+        run(&mut one, statement);
+    }
+    assert_eq!(
+        one.execute_query("INSERT INTO kids (id, a, parent_id, c) VALUES (5, 15, 99, 150)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    run(
+        &mut two,
+        "INSERT INTO kids (id, a, parent_id, c) VALUES (20, 40, 10, 160)",
+    );
+    assert_eq!(
+        two.execute_query("INSERT INTO kids (id, a, parent_id, c) VALUES (21, 16, 10, 400)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut one, "ROLLBACK");
+}
+
+#[test]
 fn an_upsert_refused_with_1452_keeps_the_gaps_of_the_entries_it_moved_before_the_foreign_keys_key()
 {
     for (level, keeps_the_gaps) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {

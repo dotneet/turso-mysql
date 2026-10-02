@@ -308,7 +308,10 @@ fn foreign_key_only_create_table_uses_the_atomic_index_path() {
     .unwrap()
     .expect("a foreign key needs an index beside the table");
     assert_eq!(checked.table().as_str(), "child");
-    assert!(checked.indexes().is_empty());
+    assert_eq!(checked.indexes().len(), 1);
+    assert_eq!(checked.indexes()[0].name(), "fk_a");
+    assert_eq!(checked.indexes()[0].columns(), ["a"]);
+    assert!(checked.indexes()[0].is_for_a_foreign_key());
     assert!(checked.table_sql().contains("FOREIGN KEY"));
 
     let named = parse_optional_create_table_with_keys(

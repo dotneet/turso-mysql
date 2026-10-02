@@ -6083,11 +6083,8 @@ splits around it.
 Some differences remain. A secondary key's entry here ends with the rowid, not
 with the primary key, so an `UPDATE` that changes a primary key that is not
 counted leaves the entries of the keys before the foreign key's in place,
-where InnoDB moves each of them and keeps the gap each new entry was in. The
-key the server makes for a foreign key whose columns no declared key covers
-goes after every key the `CREATE TABLE` declares, where InnoDB places it where
-the `FOREIGN KEY` clause stands, so a key declared after that clause is
-written before the foreign key check here and after it in InnoDB. And an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
+where InnoDB moves each of them and keeps the gap each new entry was in. And
+an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
 child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
@@ -6098,6 +6095,21 @@ where they were written. The earlier slice refused a named constraint —
 The current frontend preserves the name. MySQL's InnoDB creates an index on
 the child column and prints it — measured, `` KEY `a` (`a`) `` — and the
 current frontend creates that index too.
+
+That index is made where the `FOREIGN KEY` clause stands among the keys the
+`CREATE TABLE` declares, which decides where `SHOW CREATE TABLE` and `SHOW
+INDEX` list it among the plain keys and which keys a refused child row keeps a
+gap in. Measured on 8.4.11 and matched: `KEY ka (a), FOREIGN KEY (b) ...,
+KEY kc (c)` lists `ka`, `b`, `kc`, and a refused child keeps the gap of its
+`ka` entry and none in `kc`. The index takes the constraint's name where the
+clause has one, and otherwise the first column's, gaining `_2` and so on
+against the keys written before it; a key written after it under the same name
+answers 1061. It is not made where another key written before or after the
+clause starts with the foreign key's columns — a primary key and a unique key
+included, and an index made for another foreign key: of two such indexes the
+shorter is left out, and of two alike the earlier, so `FOREIGN KEY (b), KEY
+kc (c), FOREIGN KEY (b) ...` lists `kc`, `b`. A key's hidden primary key
+columns are not among the columns it starts with.
 
 An inline `REFERENCES` on a column is read and written nowhere, which is what
 MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`

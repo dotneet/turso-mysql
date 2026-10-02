@@ -350,3 +350,150 @@ fn a_parent_row_is_refused_for_the_child_constraint_first_by_name() {
         );
     }
 }
+
+fn keys_printed(adapter: &mut Adapter, table: &str) -> Vec<String> {
+    rows(adapter, &format!("SHOW CREATE TABLE {table}"))[0][1]
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("PRIMARY KEY")
+                || line.starts_with("UNIQUE KEY")
+                || line.starts_with("KEY")
+        })
+        .map(|line| line.trim_end_matches(',').to_owned())
+        .collect()
+}
+
+#[test]
+fn the_key_a_foreign_key_asks_for_is_made_where_its_clause_stands() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE p (id INT PRIMARY KEY, x INT, UNIQUE KEY (x))",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE p6 (k INT, id INT, PRIMARY KEY (k, id))",
+    );
+    for (sql, table, keys) in [
+        (
+            "CREATE TABLE c1 (id INT PRIMARY KEY, a INT, b INT, c INT, u INT, KEY ka (a), \
+             FOREIGN KEY (b) REFERENCES p (id), KEY kc (c), UNIQUE KEY uu (u))",
+            "c1",
+            &[
+                "PRIMARY KEY (`id`)",
+                "UNIQUE KEY `uu` (`u`)",
+                "KEY `ka` (`a`)",
+                "KEY `b` (`b`)",
+                "KEY `kc` (`c`)",
+            ][..],
+        ),
+        (
+            "CREATE TABLE c2 (id INT PRIMARY KEY, a INT, FOREIGN KEY (a) REFERENCES p (id), \
+             KEY ka (a))",
+            "c2",
+            &["PRIMARY KEY (`id`)", "KEY `ka` (`a`)"][..],
+        ),
+        (
+            "CREATE TABLE c3 (id INT PRIMARY KEY, a INT, b INT, FOREIGN KEY (a) REFERENCES p (id), \
+             KEY (a, b))",
+            "c3",
+            &["PRIMARY KEY (`id`)", "KEY `a` (`a`,`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c4 (id INT PRIMARY KEY, a INT, b INT, CONSTRAINT fx FOREIGN KEY (b) \
+             REFERENCES p (id), KEY ka (a))",
+            "c4",
+            &["PRIMARY KEY (`id`)", "KEY `fx` (`b`)", "KEY `ka` (`a`)"][..],
+        ),
+        (
+            "CREATE TABLE c5 (id INT PRIMARY KEY, a INT, b INT, KEY b (a), \
+             FOREIGN KEY (b) REFERENCES p (id), KEY kz (b, a))",
+            "c5",
+            &["PRIMARY KEY (`id`)", "KEY `b` (`a`)", "KEY `kz` (`b`,`a`)"][..],
+        ),
+        (
+            "CREATE TABLE c6 (id INT PRIMARY KEY, a INT, b INT, FOREIGN KEY (b) REFERENCES p (id), \
+             FOREIGN KEY (a) REFERENCES p (id), KEY kz (b))",
+            "c6",
+            &["PRIMARY KEY (`id`)", "KEY `a` (`a`)", "KEY `kz` (`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c7 (id INT PRIMARY KEY, a INT, b INT, FOREIGN KEY (b) REFERENCES p (x), \
+             KEY ka (a), UNIQUE KEY ub (b))",
+            "c7",
+            &["PRIMARY KEY (`id`)", "UNIQUE KEY `ub` (`b`)", "KEY `ka` (`a`)"][..],
+        ),
+        (
+            "CREATE TABLE c8 (id INT PRIMARY KEY, b INT, c INT, \
+             FOREIGN KEY (b, c) REFERENCES p6 (k, id), KEY (b))",
+            "c8",
+            &["PRIMARY KEY (`id`)", "KEY `b` (`b`,`c`)", "KEY `b_2` (`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c9 (id INT PRIMARY KEY, b INT, c INT, KEY (b), \
+             FOREIGN KEY (b, c) REFERENCES p6 (k, id), KEY kc (c))",
+            "c9",
+            &[
+                "PRIMARY KEY (`id`)",
+                "KEY `b` (`b`)",
+                "KEY `b_2` (`b`,`c`)",
+                "KEY `kc` (`c`)",
+            ][..],
+        ),
+        (
+            "CREATE TABLE c11 (id INT PRIMARY KEY, b INT, c INT, FOREIGN KEY (b) REFERENCES p (id), \
+             FOREIGN KEY (b, c) REFERENCES p6 (k, id))",
+            "c11",
+            &["PRIMARY KEY (`id`)", "KEY `b` (`b`,`c`)"][..],
+        ),
+        (
+            "CREATE TABLE c12 (id INT PRIMARY KEY, b INT, c INT, FOREIGN KEY (b) REFERENCES p (id), \
+             KEY kc (c), FOREIGN KEY (b) REFERENCES p (x))",
+            "c12",
+            &["PRIMARY KEY (`id`)", "KEY `kc` (`c`)", "KEY `b` (`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c13 (id INT PRIMARY KEY, b INT, c INT UNIQUE, \
+             FOREIGN KEY (c) REFERENCES p (id), KEY (c, b))",
+            "c13",
+            &["PRIMARY KEY (`id`)", "UNIQUE KEY `c` (`c`)", "KEY `c_2` (`c`,`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c14 (id INT PRIMARY KEY, b INT, FOREIGN KEY (id) REFERENCES p (id), \
+             KEY kb (b))",
+            "c14",
+            &["PRIMARY KEY (`id`)", "KEY `kb` (`b`)"][..],
+        ),
+        (
+            "CREATE TABLE c10 (id INT AUTO_INCREMENT PRIMARY KEY, a INT, b INT, \
+             FOREIGN KEY (b) REFERENCES p (id), KEY ka (a))",
+            "c10",
+            &["PRIMARY KEY (`id`)", "KEY `b` (`b`)", "KEY `ka` (`a`)"][..],
+        ),
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(keys_printed(&mut adapter, table), keys, "{sql}");
+    }
+    assert_eq!(
+        rows(&mut adapter, "SHOW INDEX FROM c1")
+            .into_iter()
+            .map(|row| row[2].clone())
+            .collect::<Vec<_>>(),
+        ["PRIMARY", "uu", "ka", "b", "kc"]
+    );
+    for sql in [
+        "CREATE TABLE d1 (id INT PRIMARY KEY, a INT, b INT, FOREIGN KEY (b) REFERENCES p (id), \
+         KEY b (a))",
+        "CREATE TABLE d2 (id INT PRIMARY KEY, b INT, c INT, \
+         FOREIGN KEY (b, c) REFERENCES p6 (k, id), KEY (b), KEY b_2 (c))",
+        "CREATE TABLE d3 (id INT PRIMARY KEY, a INT, c INT, CONSTRAINT fk_x FOREIGN KEY (a) \
+         REFERENCES p (id), KEY fk_x (c))",
+    ] {
+        assert_eq!(
+            refused(&mut adapter, sql).0,
+            FrontendErrorKind::DuplicateKeyName,
+            "{sql}"
+        );
+    }
+}

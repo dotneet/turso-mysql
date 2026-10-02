@@ -6766,7 +6766,7 @@ impl MySqlConnection {
                 index.name().replace('`', "``"),
                 checked.table().as_str().replace('`', "``")
             );
-            self.prepare(&sql)
+            self.prepare_with_index_origin(&sql, index.is_for_a_foreign_key())
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }

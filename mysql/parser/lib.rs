@@ -2826,6 +2826,7 @@ pub struct MySqlInlineIndex {
     name: String,
     columns: Vec<String>,
     unique: bool,
+    for_a_foreign_key: bool,
 }
 
 impl MySqlInlineIndex {
@@ -2842,6 +2843,10 @@ impl MySqlInlineIndex {
     /// Whether the key lets one set of values stand in the table only once.
     pub const fn is_unique(&self) -> bool {
         self.unique
+    }
+
+    pub const fn is_for_a_foreign_key(&self) -> bool {
+        self.for_a_foreign_key
     }
 }
 
@@ -2911,15 +2916,28 @@ pub fn parse_optional_create_table_with_keys(
         MySqlTableName::parse(&table_ident.value).map_err(|_| ParseError::Unsupported {
             feature: "CREATE TABLE name",
         })?;
-    // The column's own `UNIQUE` comes before every key the table writes after
-    // its columns, so it takes its name first.
-    let mut indexes = Vec::new();
-    if let Some(column) = keyed_column {
-        indexes.push(MySqlInlineIndex {
-            name: column.clone(),
-            columns: vec![column],
-            unique: true,
-        });
+    let mut keys = Vec::new();
+    for column in &table.columns {
+        for option in &column.options {
+            let made_by_the_table = match &option.option {
+                ColumnOption::PrimaryKey(_) => KeyKind::Primary,
+                ColumnOption::Unique(_)
+                    if keyed_column.as_deref() == Some(column.name.value.as_str()) =>
+                {
+                    KeyKind::Declared {
+                        name: None,
+                        unique: true,
+                    }
+                }
+                ColumnOption::Unique(_) => KeyKind::MadeByTheTable,
+                _ => continue,
+            };
+            keys.push(WrittenKey {
+                kind: made_by_the_table,
+                columns: vec![column.name.value.clone()],
+                left_out: false,
+            });
+        }
     }
     remaining.constraints.clear();
     for constraint in &table.constraints {
@@ -2951,6 +2969,34 @@ pub fn parse_optional_create_table_with_keys(
                     key.columns.as_slice(),
                 )
             }
+            TableConstraint::PrimaryKey(key) => {
+                keys.push(WrittenKey {
+                    kind: KeyKind::Primary,
+                    columns: key_column_names(&key.columns),
+                    left_out: false,
+                });
+                remaining.constraints.push(constraint.clone());
+                continue;
+            }
+            TableConstraint::ForeignKey(foreign_key) => {
+                keys.push(WrittenKey {
+                    kind: KeyKind::ForTheForeignKey {
+                        name: foreign_key
+                            .name
+                            .as_ref()
+                            .or(foreign_key.index_name.as_ref())
+                            .map(|name| name.value.clone()),
+                    },
+                    columns: foreign_key
+                        .columns
+                        .iter()
+                        .map(|column| column.value.clone())
+                        .collect(),
+                    left_out: false,
+                });
+                remaining.constraints.push(constraint.clone());
+                continue;
+            }
             _ => {
                 remaining.constraints.push(constraint.clone());
                 continue;
@@ -2960,28 +3006,23 @@ pub fn parse_optional_create_table_with_keys(
             return unsupported("index option");
         }
         let columns = inline_index_columns(index_columns)?;
-        // Measured on MySQL 8.4.11: an unnamed key is named after its first
-        // column, and where that is taken it gains `_2`, `_3` and so on. The
-        // names it counts as taken are the ones written before it and the ones
-        // named before it, in the order the statement wrote them — `KEY (a),
-        // KEY a_2 (b), KEY (a)` names the three `a`, `a_2` and `a_3`.
         let name = match written_name {
             Some(index_name) => {
                 MySqlTableName::parse(&index_name.value).map_err(|_| ParseError::Unsupported {
                     feature: "inline KEY name",
                 })?;
-                index_name.value.clone()
+                Some(index_name.value.clone())
             }
-            None => inline_index_name(&indexes, &columns).ok_or(ParseError::Unsupported {
-                feature: "inline KEY name",
-            })?,
+            None => None,
         };
-        indexes.push(MySqlInlineIndex {
-            name,
+        keys.push(WrittenKey {
+            kind: KeyKind::Declared { name, unique },
             columns,
-            unique,
+            left_out: false,
         });
     }
+    leave_out_the_keys_mysql_leaves_out(&mut keys);
+    let indexes = name_the_keys(&keys)?;
     Ok(Some(MySqlCreateTableWithKeys {
         table: table_name,
         table_sql: Statement::CreateTable(remaining).to_string(),
@@ -3053,17 +3094,120 @@ fn unique_written_on_the_primary_key(
     }
 }
 
+struct WrittenKey {
+    kind: KeyKind,
+    columns: Vec<String>,
+    left_out: bool,
+}
+
+enum KeyKind {
+    Primary,
+    MadeByTheTable,
+    Declared { name: Option<String>, unique: bool },
+    ForTheForeignKey { name: Option<String> },
+}
+
+impl WrittenKey {
+    fn is_for_a_foreign_key(&self) -> bool {
+        matches!(self.kind, KeyKind::ForTheForeignKey { .. })
+    }
+}
+
+fn key_column_names(columns: &[IndexColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter_map(|column| match &column.column.expr {
+            Expr::Identifier(name) => Some(name.value.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn leave_out_the_keys_mysql_leaves_out(keys: &mut [WrittenKey]) {
+    for later in 0..keys.len() {
+        for earlier in 0..later {
+            if keys[earlier].left_out
+                || !one_is_asked_for_and_starts_the_other(&keys[later], &keys[earlier])
+            {
+                continue;
+            }
+            let later_goes = !keys[earlier].is_for_a_foreign_key()
+                || (keys[later].is_for_a_foreign_key()
+                    && keys[later].columns.len() < keys[earlier].columns.len());
+            if later_goes {
+                keys[later].left_out = true;
+            } else {
+                keys[earlier].left_out = true;
+            }
+            break;
+        }
+    }
+}
+
+fn one_is_asked_for_and_starts_the_other(one: &WrittenKey, other: &WrittenKey) -> bool {
+    let (shorter, longer) = match (one.is_for_a_foreign_key(), other.is_for_a_foreign_key()) {
+        (false, false) => return false,
+        (true, true) if one.columns.len() > other.columns.len() => (other, one),
+        (true, _) => (one, other),
+        (false, true) => (other, one),
+    };
+    shorter.columns.len() <= longer.columns.len()
+        && shorter
+            .columns
+            .iter()
+            .zip(&longer.columns)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Names the keys this statement makes, in the order it wrote them.
+///
+/// Measured on MySQL 8.4.11: an unnamed key is named after its first column,
+/// and where that is taken it gains `_2`, `_3` and so on, the names taken being
+/// those of the keys written before it, the one a foreign key asks for among
+/// them; a foreign key's key takes its constraint's name where it has one.
+fn name_the_keys(keys: &[WrittenKey]) -> Result<Vec<MySqlInlineIndex>, ParseError> {
+    let mut taken = Vec::new();
+    let mut indexes = Vec::new();
+    for key in keys.iter().filter(|key| !key.left_out) {
+        let (written_name, unique, made_here) = match &key.kind {
+            KeyKind::Primary => {
+                taken.push("PRIMARY".to_owned());
+                continue;
+            }
+            KeyKind::MadeByTheTable => (None, true, false),
+            KeyKind::Declared { name, unique } => (name.clone(), *unique, true),
+            KeyKind::ForTheForeignKey { name } => (name.clone(), false, true),
+        };
+        let name = match written_name {
+            Some(name) => name,
+            None => inline_index_name(&taken, &key.columns).ok_or(ParseError::Unsupported {
+                feature: "inline KEY name",
+            })?,
+        };
+        taken.push(name.clone());
+        if made_here {
+            indexes.push(MySqlInlineIndex {
+                name,
+                columns: key.columns.clone(),
+                unique,
+                for_a_foreign_key: key.is_for_a_foreign_key(),
+            });
+        }
+    }
+    Ok(indexes)
+}
+
 /// Names an inline key the statement left unnamed.
 ///
 /// The name is the first column's, and where an earlier key in the same
 /// statement already carries it, it gains `_2`, `_3` and so on until one is
 /// free.
-fn inline_index_name(named: &[MySqlInlineIndex], columns: &[String]) -> Option<String> {
+fn inline_index_name(named: &[String], columns: &[String]) -> Option<String> {
     let first = columns.first()?;
     let taken = |candidate: &str| {
         named
             .iter()
-            .any(|index| index.name.eq_ignore_ascii_case(candidate))
+            .any(|name| name.eq_ignore_ascii_case(candidate))
     };
     if !taken(first) {
         return Some(first.clone());
