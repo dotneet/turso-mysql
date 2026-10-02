@@ -570,12 +570,10 @@ fn read_committed_reads_other_sessions_commits_after_it_wrote() {
     assert_eq!(rows_of(&mut two), ["1 1", "2 9"]);
 }
 
-/// A `READ COMMITTED` transaction that wrote cannot read past another
-/// session's table definition change: its rows were written for the tables
-/// as they were, and could no longer commit. It is rolled back with 1213.
-/// MySQL instead makes the other session's DDL wait for the transaction.
+/// Measured on MySQL 8.4.11: a `READ COMMITTED` transaction that wrote
+/// reads a table another session created after the write, and commits.
 #[test]
-fn read_committed_gives_up_a_transaction_that_wrote_before_another_sessions_ddl() {
+fn read_committed_reads_a_table_another_session_created_after_it_wrote() {
     if !turso_mysql::experimental_mvcc_is_on() {
         return;
     }
@@ -591,15 +589,17 @@ fn read_committed_gives_up_a_transaction_that_wrote_before_another_sessions_ddl(
     run(&mut one, "START TRANSACTION");
     run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
     run(&mut two, "CREATE TABLE d (id INT NOT NULL PRIMARY KEY)");
-    assert_eq!(
-        one.execute_query("SELECT COUNT(*) FROM d"),
-        Err(FrontendErrorKind::SerializationFailure)
-    );
-    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
-    assert_eq!(rows_of(&mut one), ["1 0", "2 0"]);
+    let Ok(CommandExecutionResult::ResultSet(counted)) =
+        one.execute_query("SELECT COUNT(*) FROM d")
+    else {
+        panic!("the new table must be counted");
+    };
+    assert_eq!(counted.rows, [[Some(b"0".to_vec())]]);
+    run(&mut one, "COMMIT");
+    assert_eq!(rows_of(&mut two), ["1 1", "2 0"]);
 
     run(&mut one, "START TRANSACTION");
-    assert_eq!(n_of(&mut one, 1), "0");
+    assert_eq!(n_of(&mut one, 1), "1");
     run(&mut two, "CREATE TABLE e (id INT NOT NULL PRIMARY KEY)");
     run(&mut two, "INSERT INTO e (id) VALUES (4)");
     let Ok(CommandExecutionResult::ResultSet(read)) = one.execute_query("SELECT id FROM e") else {

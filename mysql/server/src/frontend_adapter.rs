@@ -3949,16 +3949,16 @@ where
             // session dropped, `UNLOCK TABLES` answers OK and `LOCK TABLES`
             // 1049.
             let connection = match command {
-                MySqlLockTablesCommand::Lock => self.session.connection(),
+                MySqlLockTablesCommand::Lock(_) => self.session.connection(),
                 MySqlLockTablesCommand::Unlock => self.session.connection_reading_no_table(),
             }
             .map_err(database_error_kind)?;
             match command {
-                MySqlLockTablesCommand::Lock => {
+                MySqlLockTablesCommand::Lock(tables) => {
                     self.authorize(DatabaseAction::Query {
                         database: &selected_database,
                     })?;
-                    connection.lock_tables()
+                    connection.lock_tables(&tables)
                 }
                 MySqlLockTablesCommand::Unlock => connection.unlock_tables(),
             }
@@ -5255,9 +5255,17 @@ fn execute_checked_query(
     options: CheckedQueryOptions<'_>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if changes_a_table_definition(sql) {
-        return connection.waiting_for_metadata_locks(!makes_a_new_table_or_view(sql), || {
-            execute_checked_statement(connection, sql, selected_database, source_tables, options)
-        });
+        return connection
+            .waiting_for_metadata_locks(sql, || {
+                execute_checked_statement(
+                    connection,
+                    sql,
+                    selected_database,
+                    source_tables,
+                    options,
+                )
+            })
+            .map_err(frontend_query_error)?;
     }
     execute_checked_statement(connection, sql, selected_database, source_tables, options)
 }
@@ -5284,24 +5292,6 @@ fn changes_a_table_definition(sql: &str) -> bool {
     ["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"]
         .iter()
         .any(|word| first_word.eq_ignore_ascii_case(word))
-}
-
-/// Whether a definition statement makes a table or a view, which no other
-/// transaction can be using yet. Measured on MySQL 8.4.11: `CREATE TABLE d`
-/// goes ahead at once while another transaction has written to `t`, where
-/// `ALTER TABLE t` waits for it.
-fn makes_a_new_table_or_view(sql: &str) -> bool {
-    let mut words = strip_leading_sql_comments(sql)
-        .split(|character: char| !character.is_ascii_alphabetic())
-        .filter(|word| !word.is_empty());
-    words
-        .next()
-        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
-        && words.next().is_some_and(|word| {
-            ["TABLE", "TEMPORARY", "VIEW", "OR"]
-                .iter()
-                .any(|kind| word.eq_ignore_ascii_case(kind))
-        })
 }
 
 fn first_word(sql: &str) -> &str {
@@ -6061,19 +6051,18 @@ fn execute_prepared_values(
 
 /// Whether a prepared write failed because a table it names is not the one
 /// it was prepared over — dropped and made again, or altered. The session
-/// says so with `SchemaUpdated` from its counted-insert path, and with the
-/// message of the parser that reads a write again over a changed schema.
+/// says so with `SchemaUpdated` from its counted-insert path, and with
+/// `TableDefinitionChanged` from the parser that reads a write again over a
+/// changed schema.
 fn was_prepared_over_a_changed_table(error: &MySqlPreparedStatementError) -> bool {
-    match error {
-        MySqlPreparedStatementError::Engine(LimboError::SchemaUpdated)
-        | MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(
-            LimboError::SchemaUpdated,
-        )) => true,
-        MySqlPreparedStatementError::Engine(LimboError::ParseError(message)) => {
-            message.starts_with("prepared DML") && message.ends_with("prepare the statement again")
-        }
-        _ => false,
-    }
+    matches!(
+        error,
+        MySqlPreparedStatementError::Engine(
+            LimboError::SchemaUpdated | LimboError::TableDefinitionChanged(_)
+        ) | MySqlPreparedStatementError::Prepare(MySqlQueryError::Engine(
+            LimboError::SchemaUpdated
+        ))
+    )
 }
 
 fn shift_binary_timestamp_value(
@@ -7202,7 +7191,10 @@ fn may_create_a_view_or_trigger(sql: &str) -> bool {
 /// running it after the other session committed. Every run again waits for
 /// another transaction on the database to end, and once the session's
 /// `innodb_lock_wait_timeout` passes the statement answers 1205, as a MySQL
-/// statement waiting for another transaction's row lock does.
+/// statement waiting for another transaction's row lock does. One that was
+/// translated for a table definition another session changed while it waited
+/// for the table is translated again at once, as MySQL opens the table again,
+/// a few times at most.
 fn run_client_statement<T>(
     connection: &MySqlConnection,
     mut run: impl FnMut() -> Result<T, FrontendErrorKind>,
@@ -7210,17 +7202,25 @@ fn run_client_statement<T>(
     let takes_its_own_snapshot = connection.statement_takes_its_own_snapshot();
     let began_in_a_transaction = !connection.is_auto_commit();
     let deadline = std::time::Instant::now().checked_add(connection.lock_wait());
+    let mut definition_changes_left = 3;
     loop {
         let ended_before = connection.transactions_ended_on_the_database();
         let result = run();
+        let met_a_new_definition = matches!(result, Err(FrontendErrorKind::TableDefinitionChanged))
+            && definition_changes_left > 0;
         if !takes_its_own_snapshot
-            || !matches!(result, Err(FrontendErrorKind::SerializationFailure))
+            || !(met_a_new_definition
+                || matches!(result, Err(FrontendErrorKind::SerializationFailure)))
         {
             return result;
         }
         connection
             .start_a_stale_statement_again(began_in_a_transaction)
             .map_err(frontend_query_error)?;
+        if met_a_new_definition {
+            definition_changes_left -= 1;
+            continue;
+        }
         if !connection.wait_for_another_transaction_to_end(ended_before, deadline) {
             return Err(FrontendErrorKind::DatabaseBusy);
         }
@@ -13845,6 +13845,8 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             FrontendErrorKind::SerializationFailure
         }
         LimboError::RowLocked(_) => FrontendErrorKind::LockNotAvailableNowait,
+        LimboError::TableMetadataLocked(_) => FrontendErrorKind::DatabaseBusy,
+        LimboError::TableDefinitionChanged(_) => FrontendErrorKind::TableDefinitionChanged,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::InvalidArgument(message)

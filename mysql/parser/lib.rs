@@ -14,6 +14,7 @@ mod create_table_like;
 mod current_database;
 mod database_options;
 mod date_format;
+mod definition_targets;
 mod dollar_quote;
 mod drop_table;
 mod drop_view;
@@ -149,6 +150,7 @@ pub use current_database::{leave_out_the_current_database, write_the_current_dat
 pub use date_format::{
     days_from_the_year_zero, format_moment, format_width, week_number, year_and_week,
 };
+pub use definition_targets::{tables_a_definition_changes, DefinitionTargets};
 pub use dollar_quote::opens_a_dollar_quote;
 pub use drop_table::{parse_optional_drop_table, MySqlDropTableCommand};
 pub use drop_view::{parse_optional_drop_view, MySqlDropViewCommand};
@@ -172,7 +174,7 @@ pub use json_value::{
     json_type, json_unquote, normalize_json, JsonError, JsonNumberReading,
 };
 pub use like_pattern::MySqlLikePattern;
-pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand};
+pub use lock_tables::{parse_optional_lock_tables, MySqlLockTablesCommand, MySqlLockedTable};
 pub use moment_difference::{days_between, units_between};
 pub use mysql_ddl::{
     render_counted_create_table_mysql_with_mode, render_create_index_mysql,

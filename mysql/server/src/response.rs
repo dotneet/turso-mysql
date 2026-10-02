@@ -344,6 +344,7 @@ pub enum FrontendErrorKind {
     /// among them.
     DatabaseBusy,
     LockNotAvailableNowait,
+    TableDefinitionChanged,
     /// A catalog or storage failure whose details must not reach the client.
     Internal,
     /// A referenced table, column, or other object does not exist.
@@ -522,6 +523,11 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             *b"HY000",
             b"Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set."
                 .as_slice(),
+        ),
+        FrontendErrorKind::TableDefinitionChanged => (
+            1412,
+            *b"HY000",
+            b"Table definition has changed, please retry transaction".as_slice(),
         ),
         FrontendErrorKind::Internal => (1105, *b"HY000", b"internal error".as_slice()),
         FrontendErrorKind::MissingObject => (1146, *b"42S02", b"unknown object".as_slice()),
@@ -2699,6 +2705,7 @@ mod tests {
             (FrontendErrorKind::DuplicateDatabase, 1007, *b"HY000"),
             (FrontendErrorKind::DatabaseBusy, 1205, *b"HY000"),
             (FrontendErrorKind::LockNotAvailableNowait, 3572, *b"HY000"),
+            (FrontendErrorKind::TableDefinitionChanged, 1412, *b"HY000"),
             (FrontendErrorKind::NoDatabaseToDrop, 1008, *b"HY000"),
             (FrontendErrorKind::SerializationFailure, 1213, *b"40001"),
             (FrontendErrorKind::IncorrectUserLockName, 3057, *b"42000"),

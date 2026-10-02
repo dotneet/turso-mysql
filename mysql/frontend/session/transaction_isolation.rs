@@ -137,6 +137,7 @@ impl MySqlConnection {
             isolation.began_transaction = false;
             (isolation.current, isolation.read_view_taken)
         };
+        self.inner.set_snapshot_moves_after_a_lock_wait(false);
         if self.inner.get_auto_commit() {
             return Ok(());
         }
@@ -156,6 +157,7 @@ impl MySqlConnection {
         if !reads_afresh {
             return Ok(());
         }
+        self.inner.set_snapshot_moves_after_a_lock_wait(true);
         match self.inner.refresh_read_snapshot() {
             Err(LimboError::SchemaConflict) => {
                 self.roll_back_after_serialization_failure()?;

@@ -6708,20 +6708,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(
-                &tx_id,
-                connection.exclusive_tx_waits_for_writers(),
-                exclusive_yield_context,
-            )
-            .inspect_err(|_| {
-                // Fresh txns were already published into `txs` above; undo
-                // that so a failed begin doesn't leave a phantom Active txn
-                // pinning the LWM forever.
-                if maybe_existing_tx_id.is_none() {
-                    self.txs.remove(&tx_id);
-                }
-                unlock_checkpoint_guard();
-            })?;
+            self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
+                .inspect_err(|_| {
+                    // Fresh txns were already published into `txs` above; undo
+                    // that so a failed begin doesn't leave a phantom Active txn
+                    // pinning the LWM forever.
+                    if maybe_existing_tx_id.is_none() {
+                        self.txs.remove(&tx_id);
+                    }
+                    unlock_checkpoint_guard();
+                })?;
         }
 
         // Hoist: validate the existing tx still exists and snapshot the
@@ -8030,16 +8026,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
-    fn has_writing_tx_other_than(&self, tx_id: TxID) -> bool {
-        self.txs.iter().any(|entry| {
-            *entry.key() != tx_id && entry.value().has_begun_writing.load(Ordering::SeqCst)
-        })
-    }
-
     /// Makes the writes and commits of `BEGIN CONCURRENT` transactions wait
     /// for an exclusive transaction, rather than letting a concurrent writer
-    /// run beside it and fail when it commits; see
-    /// [`Connection::set_exclusive_tx_waits_for_writers`] for the other way.
+    /// run beside it and fail when it commits.
     pub fn set_writers_wait_for_exclusive_tx(&self, wait: bool) {
         self.writers_wait_for_exclusive_tx
             .store(wait, Ordering::SeqCst);
@@ -8079,7 +8068,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
-        waits_for_writers: bool,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
@@ -8131,13 +8119,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.has_preparing_tx_other_than(*tx_id) {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
-                }
-                if waits_for_writers {
-                    std::sync::atomic::fence(Ordering::SeqCst);
-                    if self.has_writing_tx_other_than(*tx_id) {
-                        self.release_exclusive_tx(tx_id);
-                        return Err(LimboError::Busy);
-                    }
                 }
                 // we will check again, if some other txn committed in the meantime.
                 // we did this check previously too, but we will have to do this again.

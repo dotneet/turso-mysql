@@ -6,16 +6,19 @@ use super::{
 /// `LOCK TABLES` and `UNLOCK TABLES`.
 ///
 /// MySQL locks each table it names, and holds the lock until `UNLOCK TABLES`
-/// or the next `LOCK TABLES`. This server holds one write lock over the whole
-/// database, so it locks more than was asked for rather than less — which is
-/// why the tables the statement names are read and then not kept: locking any
-/// of them locks all of them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// or the next `LOCK TABLES`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MySqlLockTablesCommand {
     /// `LOCK TABLES <table> [AS <alias>] READ|WRITE [, ...]`.
-    Lock,
+    Lock(Vec<MySqlLockedTable>),
     /// `UNLOCK TABLES`.
     Unlock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlLockedTable {
+    pub table: String,
+    pub write: bool,
 }
 
 /// Parses `LOCK TABLES` or `UNLOCK TABLES`, or nothing for another statement.
@@ -60,74 +63,77 @@ pub fn parse_optional_lock_tables(
         }
         return Ok(Some(MySqlLockTablesCommand::Unlock));
     }
-    read_locked_tables(&tokens, &mut cursor)?;
+    let tables = read_locked_tables(&tokens, &mut cursor)?;
     skip_one_semicolon(&tokens, &mut cursor);
     if cursor != tokens.len() {
         return Err(ParseError::Unsupported {
             feature: "LOCK TABLES option",
         });
     }
-    Ok(Some(MySqlLockTablesCommand::Lock))
+    Ok(Some(MySqlLockTablesCommand::Lock(tables)))
 }
 
 /// Reads the list of tables and the lock each was asked for.
-///
-/// The names are read and let go: one lock covers every table, so which of
-/// them were named changes nothing. Reading them is still what tells a
-/// malformed statement from one this server answers.
-fn read_locked_tables(tokens: &[AdminToken], cursor: &mut usize) -> Result<(), ParseError> {
+fn read_locked_tables(
+    tokens: &[AdminToken],
+    cursor: &mut usize,
+) -> Result<Vec<MySqlLockedTable>, ParseError> {
+    let mut tables = Vec::new();
     loop {
-        if !read_one_name(tokens, cursor) {
+        let Some(table) = read_one_name(tokens, cursor) else {
             return Err(ParseError::Unsupported {
                 feature: "LOCK TABLES without a table to lock",
             });
-        }
+        };
         // `LOCK TABLES t AS a READ` locks the table under an alias, which
         // changes which name the session may use it by in MySQL and nothing
         // here.
-        if consume_admin_word(tokens, cursor, "AS") && !read_one_name(tokens, cursor) {
+        if consume_admin_word(tokens, cursor, "AS") && read_one_name(tokens, cursor).is_none() {
             return Err(ParseError::Unsupported {
                 feature: "LOCK TABLES alias",
             });
         }
         // On InnoDB, `READ LOCAL` also blocks concurrent inserts. MySQL 8.4.11
-        // returned 1205 for one after a one-second table lock wait. This
-        // server exposes InnoDB tables only, so its database lock is strong
-        // enough for both READ spellings.
-        if consume_admin_word(tokens, cursor, "READ") {
+        // returned 1205 for one after a one-second table lock wait, so both
+        // READ spellings take the same lock.
+        let write = if consume_admin_word(tokens, cursor, "READ") {
             let _ = consume_admin_word(tokens, cursor, "LOCAL");
-        } else if !consume_admin_word(tokens, cursor, "WRITE") {
+            false
+        } else if consume_admin_word(tokens, cursor, "WRITE") {
+            true
+        } else {
             return Err(ParseError::Unsupported {
                 feature: "LOCK TABLES without READ or WRITE",
             });
-        }
+        };
+        tables.push(MySqlLockedTable {
+            table: table.to_ascii_lowercase(),
+            write,
+        });
         if !matches!(tokens.get(*cursor), Some(AdminToken::Comma)) {
-            return Ok(());
+            return Ok(tables);
         }
         *cursor += 1;
     }
 }
 
-/// Reads one table name, qualified or not, and reports whether it found one.
-fn read_one_name(tokens: &[AdminToken], cursor: &mut usize) -> bool {
-    if !matches!(
-        tokens.get(*cursor),
-        Some(AdminToken::Word(_) | AdminToken::QuotedIdentifier(_))
-    ) {
-        return false;
-    }
+/// Reads one table name, qualified or not, and answers the table's own name.
+fn read_one_name(tokens: &[AdminToken], cursor: &mut usize) -> Option<String> {
+    let mut name = identifier_at(tokens, *cursor)?;
     *cursor += 1;
     if matches!(tokens.get(*cursor), Some(AdminToken::Dot)) {
         *cursor += 1;
-        if !matches!(
-            tokens.get(*cursor),
-            Some(AdminToken::Word(_) | AdminToken::QuotedIdentifier(_))
-        ) {
-            return false;
-        }
+        name = identifier_at(tokens, *cursor)?;
         *cursor += 1;
     }
-    true
+    Some(name)
+}
+
+fn identifier_at(tokens: &[AdminToken], cursor: usize) -> Option<String> {
+    match tokens.get(cursor) {
+        Some(AdminToken::Word(name) | AdminToken::QuotedIdentifier(name)) => Some(name.clone()),
+        _ => None,
+    }
 }
 
 fn skip_one_semicolon(tokens: &[AdminToken], cursor: &mut usize) {
@@ -141,25 +147,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_shapes_that_lock_every_table_are_taken_and_the_rest_are_not() {
+    fn the_shapes_that_lock_tables_are_taken_with_each_table_and_its_lock() {
         let mode = SessionSqlMode::default();
+        let locked = |locks: &[(&str, bool)]| {
+            MySqlLockTablesCommand::Lock(
+                locks
+                    .iter()
+                    .map(|(table, write)| MySqlLockedTable {
+                        table: table.to_string(),
+                        write: *write,
+                    })
+                    .collect(),
+            )
+        };
         for (sql, command) in [
-            ("LOCK TABLES records READ", MySqlLockTablesCommand::Lock),
-            ("LOCK TABLES records WRITE;", MySqlLockTablesCommand::Lock),
-            ("lock table `records` write", MySqlLockTablesCommand::Lock),
+            ("LOCK TABLES records READ", locked(&[("records", false)])),
+            ("LOCK TABLES records WRITE;", locked(&[("records", true)])),
+            ("lock table `Records` write", locked(&[("records", true)])),
             (
                 "LOCK TABLES a READ, b WRITE, reports.c READ",
-                MySqlLockTablesCommand::Lock,
+                locked(&[("a", false), ("b", true), ("c", false)]),
             ),
-            ("LOCK TABLES a AS x READ", MySqlLockTablesCommand::Lock),
-            ("LOCK TABLES a READ LOCAL", MySqlLockTablesCommand::Lock),
+            ("LOCK TABLES a AS x READ", locked(&[("a", false)])),
+            ("LOCK TABLES a READ LOCAL", locked(&[("a", false)])),
             (
                 "LOCK TABLES `records` READ /*!32311 LOCAL */",
-                MySqlLockTablesCommand::Lock,
+                locked(&[("records", false)]),
             ),
             (
                 "LOCK TABLES a READ /*!32311 LOCAL */, b READ /*!32311 LOCAL */",
-                MySqlLockTablesCommand::Lock,
+                locked(&[("a", false), ("b", false)]),
             ),
             ("UNLOCK TABLES", MySqlLockTablesCommand::Unlock),
             ("unlock tables;", MySqlLockTablesCommand::Unlock),

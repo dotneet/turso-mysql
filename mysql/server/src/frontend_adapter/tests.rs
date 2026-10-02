@@ -23710,6 +23710,8 @@ fn lock_tables_holds_the_lock_until_it_is_unlocked() {
     two.execute_init_db("stock").unwrap();
     two.execute_query("SET SESSION innodb_lock_wait_timeout = 1")
         .unwrap();
+    two.execute_query("SET SESSION lock_wait_timeout = 1")
+        .unwrap();
 
     // Nothing is held yet, so the other session writes.
     two.execute_query("UPDATE items SET count = 11 WHERE id = 1")
@@ -30936,6 +30938,9 @@ mod joined_reports;
 
 #[cfg(unix)]
 mod concurrent_transactions;
+
+#[cfg(unix)]
+mod metadata_locks;
 
 #[cfg(unix)]
 mod prisma_client_reads;

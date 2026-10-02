@@ -915,35 +915,6 @@ fn a_concurrent_write_waits_for_an_exclusive_transaction_when_asked_to() {
 }
 
 #[test]
-fn an_exclusive_transaction_waits_for_a_concurrent_writer_when_asked_to() {
-    let db = MvccTestDb::new();
-    db.mvcc_store.set_writers_wait_for_exclusive_tx(true);
-    db.conn.set_exclusive_tx_waits_for_writers(true);
-    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
-    let writer = db.db.connect().unwrap();
-    let reader = db.db.connect().unwrap();
-
-    reader.execute("BEGIN CONCURRENT").unwrap();
-    get_rows(&reader, "SELECT x FROM t");
-    writer.execute("BEGIN CONCURRENT").unwrap();
-    writer.execute("INSERT INTO t VALUES (1)").unwrap();
-    assert!(matches!(
-        db.conn.execute("BEGIN IMMEDIATE"),
-        Err(LimboError::Busy)
-    ));
-    writer.execute("COMMIT").unwrap();
-
-    db.conn.execute("BEGIN IMMEDIATE").unwrap();
-    db.conn.execute("INSERT INTO t VALUES (2)").unwrap();
-    db.conn.execute("COMMIT").unwrap();
-    reader.execute("COMMIT").unwrap();
-    assert_eq!(
-        get_rows(&reader, "SELECT x FROM t ORDER BY x"),
-        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
-    );
-}
-
-#[test]
 fn a_concurrent_commit_waits_for_an_exclusive_transaction_when_asked_to() {
     let db = MvccTestDb::new();
     db.mvcc_store.set_writers_wait_for_exclusive_tx(true);
@@ -9098,7 +9069,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     // Now try to acquire exclusive lock for the tx that started before the
     // read-only dependent committed. Should succeed because the read-only tx
     // did not advance last_committed_tx_ts.
-    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, false, None);
+    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, None);
     assert!(
         acquire_result.is_ok(),
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",

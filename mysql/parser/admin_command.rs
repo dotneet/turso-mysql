@@ -405,6 +405,13 @@ pub(crate) fn tokenize_versioned_admin_command(
     tokenize_admin_text(sql, mode, VersionedComments::Expanded)
 }
 
+pub(crate) fn tokenize_definition_statement(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Rc<Vec<AdminToken>>, ParseError> {
+    tokenize_admin_text(sql, mode, VersionedComments::Expanded)
+}
+
 pub(crate) fn tokenize_lock_tables_command(
     sql: &str,
     mode: SessionSqlMode,

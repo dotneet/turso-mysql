@@ -735,8 +735,6 @@ pub struct Connection {
     /// Set when a statement opens or joins a transaction on the main
     /// database; see [`Connection::take_main_database_was_used`].
     pub(crate) main_database_was_used: AtomicBool,
-    /// See [`Connection::set_exclusive_tx_waits_for_writers`].
-    pub(crate) exclusive_tx_waits_for_writers: AtomicBool,
     pub(crate) metadata_lock_wait_ms: AtomicU64,
     pub(crate) metadata_owner_outside_a_transaction: AtomicU64,
     pub(crate) metadata_owner_is_kept: AtomicBool,
@@ -3230,23 +3228,6 @@ impl Connection {
     /// one that has only begun.
     pub fn take_main_database_was_used(&self) -> bool {
         self.main_database_was_used.swap(false, Ordering::SeqCst)
-    }
-
-    /// Makes an exclusive MVCC transaction this connection begins, or a
-    /// transaction it upgrades to one, wait (answer `Busy`) while another
-    /// `BEGIN CONCURRENT` transaction has begun writing, when the store makes
-    /// writers wait for exclusive transactions
-    /// ([`crate::mvcc::MvStore::set_writers_wait_for_exclusive_tx`]).
-    ///
-    /// A statement that changes a table other transactions may be using asks
-    /// for this; one that only adds something new does not, and goes ahead.
-    pub fn set_exclusive_tx_waits_for_writers(&self, wait: bool) {
-        self.exclusive_tx_waits_for_writers
-            .store(wait, Ordering::SeqCst);
-    }
-
-    pub(crate) fn exclusive_tx_waits_for_writers(&self) -> bool {
-        self.exclusive_tx_waits_for_writers.load(Ordering::SeqCst)
     }
 
     pub fn set_metadata_lock_wait(&self, wait: Duration) {

@@ -13,9 +13,9 @@ use std::{
 use turso_core::{
     storage::auto_increment::{AutoIncrementKey, DurableRangeAllocator, InsertAutoIncrementValue},
     AssignmentOperation, AssignmentValidator, Connection, DatabaseFileOwner, IOExt as _,
-    LimboError, Numeric, PrepareOptions, ReprepareContext, ReprepareParser, Result,
-    SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter, TriggerRowidSupplier,
-    Value, IO,
+    LimboError, MetadataLockMode, Numeric, PrepareOptions, ReprepareContext, ReprepareParser,
+    Result, SchemaSqlFormatter, SchemaSqlKind, Statement, StatementStatusCounter,
+    TriggerRowidSupplier, Value, IO,
 };
 use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_auto_increment_insert,
@@ -31,9 +31,9 @@ use turso_mysql_parser::{
     CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
     ColumnLiteral, MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
-    MySqlDropViewCommand, MySqlLockingRead, MySqlRowLockWait, MySqlSelectSource, MySqlTableName,
-    MySqlTransactionCommand, MySqlTruncateTableCommand, MySqlViewReplacement, OfferedValue,
-    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
+    MySqlDropViewCommand, MySqlLockedTable, MySqlLockingRead, MySqlRowLockWait, MySqlSelectSource,
+    MySqlTableName, MySqlTransactionCommand, MySqlTruncateTableCommand, MySqlViewReplacement,
+    OfferedValue, ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
     StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
 };
 use turso_parser::ast::{
@@ -244,7 +244,6 @@ struct RestoresLockWait<'a> {
 impl Drop for RestoresLockWait<'_> {
     fn drop(&mut self) {
         self.connection.set_busy_timeout(self.wait);
-        self.connection.set_exclusive_tx_waits_for_writers(false);
     }
 }
 
@@ -4084,35 +4083,95 @@ impl MySqlConnection {
     /// session is using, which is MySQL's `lock_wait_timeout`.
     pub fn set_metadata_lock_wait(&self, wait: Duration) {
         *self.metadata_lock_wait.lock().unwrap() = wait;
+        self.inner.set_metadata_lock_wait(wait);
     }
 
     pub fn metadata_lock_wait(&self) -> Duration {
         *self.metadata_lock_wait.lock().unwrap()
     }
 
-    /// Runs a statement that changes a table's definition, or locks tables,
-    /// waiting for the engine's write lock as long as `lock_wait_timeout`
-    /// says rather than `innodb_lock_wait_timeout`.
+    /// Runs a statement that changes a table's definition, waiting for the
+    /// tables it changes as long as `lock_wait_timeout` says rather than
+    /// `innodb_lock_wait_timeout`.
     ///
     /// Measured on MySQL 8.4.11 with `lock_wait_timeout = 1` and
     /// `innodb_lock_wait_timeout = 30`: `ALTER TABLE`, `DROP TABLE`,
-    /// `TRUNCATE TABLE`, `CREATE INDEX`, `RENAME TABLE` and `LOCK TABLES` on a
-    /// table another open transaction wrote each answer 1205 after one
-    /// second. Such a statement waits only for the table's metadata lock, and
-    /// here the engine's one write lock stands for it: under MVCC its
-    /// exclusive transaction, which waits for every transaction that has
-    /// begun writing, when `changes_what_others_use` says the statement changes
-    /// or locks a table other transactions can be using. A `CREATE TABLE` of a
-    /// new table is not one, and waits for no writer, as MySQL's does not.
+    /// `TRUNCATE TABLE`, `CREATE INDEX` and `RENAME TABLE` on a table another
+    /// open transaction read or wrote each answer 1205 after one second, and
+    /// go ahead at once while that transaction used only other tables. Under
+    /// MVCC the statement first commits what came before it and takes each
+    /// table's exclusive metadata lock; under WAL the engine's one write lock
+    /// stands for them.
     pub fn waiting_for_metadata_locks<T>(
         &self,
-        changes_what_others_use: bool,
+        sql: &str,
         run: impl FnOnce() -> T,
-    ) -> T {
+    ) -> std::result::Result<T, MySqlQueryError> {
+        let ran = self.with_the_metadata_lock_wait(|| {
+            self.lock_the_tables_a_definition_changes(sql)
+                .map(|()| run())
+        });
+        self.inner.release_metadata_locks_outside_a_transaction();
+        ran
+    }
+
+    fn lock_the_tables_a_definition_changes(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if !self.inner.mvcc_enabled() || self.tables_are_locked() {
+            return Ok(());
+        }
+        let targets = turso_mysql_parser::tables_a_definition_changes(sql, self.parser_mode());
+        let mut tables: Vec<String> = targets
+            .tables
+            .into_iter()
+            .map(|named| named.table.to_ascii_lowercase())
+            .collect();
+        for trigger in &targets.dropped_triggers {
+            tables.extend(self.table_of_trigger(&trigger.table)?);
+        }
+        if tables.is_empty() {
+            return Ok(());
+        }
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        let requests: Vec<(&str, MetadataLockMode)> = tables
+            .iter()
+            .map(|table| (table.as_str(), MetadataLockMode::Exclusive))
+            .collect();
+        self.inner
+            .lock_tables_metadata(&requests)
+            .map_err(MySqlQueryError::Engine)
+    }
+
+    fn table_of_trigger(
+        &self,
+        trigger: &str,
+    ) -> std::result::Result<Option<String>, MySqlQueryError> {
+        let mut statement = self
+            .inner
+            .prepare("SELECT tbl_name FROM sqlite_schema WHERE type = 'trigger' AND lower(name) = lower(?)")
+            .map_err(MySqlQueryError::Engine)?;
+        statement
+            .bind_at(
+                std::num::NonZeroUsize::MIN,
+                turso_core::Value::build_text(trigger.to_string()),
+            )
+            .map_err(MySqlQueryError::Engine)?;
+        let rows = statement
+            .run_collect_rows()
+            .map_err(MySqlQueryError::Engine)?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|table| table.to_text().map(str::to_ascii_lowercase)))
+    }
+
+    fn with_the_metadata_lock_wait<T>(&self, run: impl FnOnce() -> T) -> T {
         let row_lock_wait = self.inner.get_busy_timeout();
         self.inner.set_busy_timeout(self.metadata_lock_wait());
-        self.inner
-            .set_exclusive_tx_waits_for_writers(changes_what_others_use);
         let restores = RestoresLockWait {
             connection: &self.inner,
             wait: row_lock_wait,
@@ -4183,19 +4242,49 @@ impl MySqlConnection {
         crate::found_rows::noted(&self.inner)
     }
 
-    /// Takes the lock `LOCK TABLES` asks for and holds it.
+    /// Takes the locks `LOCK TABLES` asks for and holds them until `UNLOCK
+    /// TABLES`.
     ///
-    /// MySQL locks each table the statement names and holds the lock across
-    /// statements until `UNLOCK TABLES`. The engine holds one write lock over
-    /// the whole database, and holds it for as long as a write transaction is
-    /// open, so the lock is taken by opening one with `BEGIN IMMEDIATE` and
-    /// held until the unlocking statement ends it.
+    /// Under MVCC each named table gets MySQL's metadata lock: `READ` (and
+    /// `READ LOCAL`, which on InnoDB blocks writers too) the shared read-only
+    /// lock, which lets other sessions read the table and makes their writes
+    /// wait, and `WRITE` the shared no-read-write lock, which makes their
+    /// reads and writes wait. Other tables stay open to everyone. MySQL
+    /// commits an open transaction before it locks, and so does this; the
+    /// locks belong to a transaction this opens and ends at `UNLOCK TABLES`.
     ///
-    /// MySQL commits an open transaction before it locks, which this does too
-    /// — a write transaction cannot be opened inside another.
-    pub fn lock_tables(&self) -> std::result::Result<(), MySqlQueryError> {
+    /// Under WAL the engine holds one write lock over the whole database, so
+    /// a `BEGIN IMMEDIATE` takes it for every table, which locks more than was
+    /// asked for.
+    pub fn lock_tables(
+        &self,
+        tables: &[MySqlLockedTable],
+    ) -> std::result::Result<(), MySqlQueryError> {
         self.unlock_tables()?;
-        self.waiting_for_metadata_locks(true, || self.run_engine_statement("BEGIN IMMEDIATE"))?;
+        if !self.inner.mvcc_enabled() {
+            self.with_the_metadata_lock_wait(|| self.run_engine_statement("BEGIN IMMEDIATE"))?;
+            *self.tables_locked.lock().unwrap() = true;
+            return Ok(());
+        }
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_engine_statement("BEGIN CONCURRENT")?;
+        let requests: Vec<(&str, MetadataLockMode)> = tables
+            .iter()
+            .map(|locked| {
+                let mode = if locked.write {
+                    MetadataLockMode::SharedNoReadWrite
+                } else {
+                    MetadataLockMode::SharedReadOnly
+                };
+                (locked.table.as_str(), mode)
+            })
+            .collect();
+        if let Err(error) = self.inner.lock_tables_metadata(&requests) {
+            self.run_engine_statement("ROLLBACK")?;
+            return Err(MySqlQueryError::Engine(error));
+        }
         *self.tables_locked.lock().unwrap() = true;
         Ok(())
     }
@@ -15036,16 +15125,11 @@ impl ReprepareParser for FrozenDmlParser {
                 .get_btree_table(name)
                 .ok_or(LimboError::SchemaUpdated)?;
             if &current.to_sql() != definition {
-                return Err(LimboError::ParseError(
-                    "prepared DML table definition changed; prepare the statement again"
-                        .to_string(),
-                ));
+                return Err(LimboError::TableDefinitionChanged(name.clone()));
             }
         }
         if self.untracked_read_source {
-            return Err(LimboError::ParseError(
-                "prepared DML source cannot be checked after a schema change; prepare the statement again".to_string(),
-            ));
+            return Err(LimboError::TableDefinitionChanged(String::new()));
         }
         for (name, definition) in &self.read_table_definitions {
             let current = context
@@ -15053,10 +15137,7 @@ impl ReprepareParser for FrozenDmlParser {
                 .get_btree_table(name)
                 .ok_or(LimboError::SchemaUpdated)?;
             if &current.to_sql() != definition {
-                return Err(LimboError::ParseError(
-                    "prepared DML source table definition changed; prepare the statement again"
-                        .to_string(),
-                ));
+                return Err(LimboError::TableDefinitionChanged(name.clone()));
             }
         }
         if let Some(statement) = &self.typed_copy {
@@ -15093,9 +15174,7 @@ impl ReprepareParser for FrozenSelectParser {
             )?;
         }
         if self.untracked_source {
-            return Err(LimboError::ParseError(
-                "prepared SELECT source cannot be checked after a schema change; prepare the statement again".to_string(),
-            ));
+            return Err(LimboError::TableDefinitionChanged(String::new()));
         }
         for (name, columns) in &self.source_columns {
             let current = context
@@ -15108,9 +15187,7 @@ impl ReprepareParser for FrozenSelectParser {
                 .map(|column| format!("{column:?}"))
                 .collect::<Vec<_>>();
             if !current_columns.starts_with(columns) {
-                return Err(LimboError::ParseError(
-                    "prepared SELECT column types changed; prepare the statement again".to_string(),
-                ));
+                return Err(LimboError::TableDefinitionChanged(name.clone()));
             }
         }
         if let Some(statement) = &self.typed_statement {
@@ -15120,10 +15197,7 @@ impl ReprepareParser for FrozenSelectParser {
                     .get_btree_table(name)
                     .ok_or(LimboError::SchemaUpdated)?;
                 if &current.to_sql() != definition {
-                    return Err(LimboError::ParseError(
-                        "prepared SELECT table definition changed; prepare the statement again"
-                            .to_string(),
-                    ));
+                    return Err(LimboError::TableDefinitionChanged(name.clone()));
                 }
             }
             return Ok((Some(Cmd::Stmt(statement.clone())), sql.len()));

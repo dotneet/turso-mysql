@@ -3793,6 +3793,47 @@ write lock cannot. So is `LOW_PRIORITY WRITE`, which changes who waits for whom,
 `LOCK INSTANCE FOR BACKUP`. An `UNLOCK TABLES` holding nothing answers OK, the way MySQL's
 does.
 
+With `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` tables are locked one by one with MySQL's metadata
+locks, and each of the following was measured on 8.4.11 (`performance_schema.metadata_locks`
+for the lock kinds) and is matched there. Every statement locks each table it reads with a
+shared read lock and each table it writes, or reads `FOR UPDATE`, with a shared write lock
+(`FOR SHARE` reads), triggers' and foreign keys' tables included, and keeps them until its
+transaction ends. `LOCK TABLES t READ` (and `READ LOCAL`, which on InnoDB keeps inserts out
+too) takes the shared read-only lock: other sessions read `t`, and their writes to it wait.
+`LOCK TABLES t WRITE` takes the shared no-read-write lock: their reads and writes of `t` wait.
+Neither touches other tables, and a `COMMIT` in another session never waits for either. Every
+definition change — `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX`, `DROP TABLE`, `TRUNCATE
+TABLE`, `RENAME TABLE`, `CREATE TABLE`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP TRIGGER` —
+first commits what came before it, then takes the exclusive lock on each table it changes,
+tables an added foreign key names included, so it waits for every open transaction that read
+or wrote one of them and for no other. A waiting exclusive lock, or a waiting `LOCK TABLES
+... WRITE`, holds back new readers and writers of the table, and a waiting writer holds back a
+new `LOCK TABLES ... READ`, as MySQL's waiting requests do. A wait lasts `lock_wait_timeout`
+— `NOWAIT` and `SKIP LOCKED` do not apply to it, measured — and answers 1205 when it runs
+out, undoing that statement alone: the transaction and what it wrote stay. A transaction that
+read a table and then asks to write it while a definition change waits for that table ends in
+1213 and is rolled back, the definition change going ahead, as MySQL chooses a DML waiter
+over a DDL one. A statement that waited for a definition change runs on the new definition.
+A transaction that took its read view before another session changed a table's definition
+answers 1412, `Table definition has changed, please retry transaction`, when it reads that
+table, and keeps going; one that has not taken its read view yet, or reads at `READ
+COMMITTED`, reads the new table. `LOCK TABLES` itself commits what came before it and holds
+its locks in a transaction of its own until `UNLOCK TABLES`, so the statements in between
+still commit together there, and `START TRANSACTION`, `COMMIT` and `ROLLBACK` stay refused
+while tables are locked.
+
+What MySQL does that this does not: a cycle of waits that runs through both a metadata lock
+and a row lock is found here at once and the lightest transaction in it answers 1213, where
+MySQL's two deadlock detectors each see only their half, so measured on 8.4.11 the
+metadata-lock waiter in such a cycle answers 1205 once `lock_wait_timeout` runs out. MySQL
+answers 1100 to a session under `LOCK TABLES` that touches a table it did not lock; this lets
+it. An `ALTER TABLE` holds the exclusive lock for all of its run, where MySQL's in-place
+`ALTER` lets other sessions read and write the table while it copies; the wait for other
+sessions is the same. A statement on a table of another database, `SHOW CREATE TABLE`,
+`DESCRIBE` and `information_schema` reads take no metadata lock. A `ROLLBACK TO SAVEPOINT`
+keeps the metadata locks taken after the savepoint, where MySQL lets them go. Under WAL,
+without the switch, the one database write lock described above stands for all of these.
+
 `ALTER TABLE` takes several operations in one statement, which is how a
 migration writes one. The engine takes one operation per statement, so the
 statement is split into one per operation and they run inside a transaction:
@@ -4880,7 +4921,9 @@ session's open transaction that wrote a table: `ALTER TABLE`, `DROP TABLE`,
 `TRUNCATE TABLE`, `CREATE INDEX`, `RENAME TABLE` and `LOCK TABLES` of that table
 each answer 1205 after one second. Here each of those waits for the engine's
 one write lock, so it waits `lock_wait_timeout` for it rather than the
-`innodb_lock_wait_timeout` an `INSERT` or an `UPDATE` waits. Every 1205 now
+`innodb_lock_wait_timeout` an `INSERT` or an `UPDATE` waits. With
+`TURSO_MYSQL_EXPERIMENTAL_MVCC=1` they wait for the table's metadata lock
+instead, and only for transactions that used that table; see `LOCK TABLES`. Every 1205 now
 carries MySQL's message, `Lock wait timeout exceeded; try restarting
 transaction`, where it used to read `database is busy`.
 
@@ -5062,11 +5105,10 @@ holds it from then on, which is where InnoDB takes the read view: measured on
 sessions commit, while `WITH CONSISTENT SNAPSHOT` takes the view at once. A
 write to a row nobody else changed goes ahead, and the transaction goes on
 reading the other rows as its snapshot found them, as MySQL does; a write to a
-row another session changed after the snapshot is still given up with 1213. A
-transaction that wrote and then meets another session's table definition change
-is given up with 1213 at its next statement, its rows having been written for
-the tables as they were; MySQL makes the definition change wait for it
-instead. `SERIALIZABLE` runs as one exclusive transaction there: it reads from
+row another session changed after the snapshot is still given up with 1213.
+Another session's definition change waits for every transaction that used the
+table (its metadata lock, see `LOCK TABLES`), and a transaction that used only
+other tables commits after it, as on MySQL. `SERIALIZABLE` runs as one exclusive transaction there: it reads from
 its first statement and takes the database's one exclusive write slot at its
 first write, so the two transactions above still end with one committed and
 the other answered 1213. It is also given up with 1213 at its first write when

@@ -3768,7 +3768,6 @@ impl Database {
             n_active_root_statements: AtomicI32::new(0),
             n_active_blob_statements: AtomicI32::new(0),
             main_database_was_used: AtomicBool::new(false),
-            exclusive_tx_waits_for_writers: AtomicBool::new(false),
             metadata_lock_wait_ms: AtomicU64::new(crate::connection::DEFAULT_METADATA_LOCK_WAIT_MS),
             metadata_owner_outside_a_transaction: AtomicU64::new(0),
             metadata_owner_is_kept: AtomicBool::new(false),
