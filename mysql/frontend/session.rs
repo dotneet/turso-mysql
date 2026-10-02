@@ -81,7 +81,7 @@ pub struct MySqlConnection {
     prepared_statements: Arc<Mutex<PreparedStatementRegistry>>,
     prepared_statement_authority: MySqlPreparedStatementAuthority,
     schema_readings: Arc<Mutex<SchemaReadings>>,
-    prepared_counted_rows_savepoints: Arc<Mutex<HashMap<&'static str, turso_core::Statement>>>,
+    prepared_counted_rows_statements: Arc<Mutex<HashMap<&'static str, turso_core::Statement>>>,
     prepared_transaction_statements: Arc<Mutex<Vec<(Stmt, String, turso_core::Statement)>>>,
     /// The catalog's WAL keeper and this connection's database, when the
     /// connection belongs to a catalog.
@@ -1666,7 +1666,7 @@ impl MySqlConnection {
             prepared_statements: Arc::new(Mutex::new(PreparedStatementRegistry::default())),
             prepared_statement_authority,
             schema_readings: Arc::default(),
-            prepared_counted_rows_savepoints: Arc::default(),
+            prepared_counted_rows_statements: Arc::default(),
             prepared_transaction_statements: Arc::default(),
             wal_keeper: None,
             #[cfg(test)]
@@ -1706,7 +1706,7 @@ impl MySqlConnection {
     }
 
     #[cfg(test)]
-    fn inner(&self) -> &Arc<Connection> {
+    pub(crate) fn inner(&self) -> &Arc<Connection> {
         &self.inner
     }
 
@@ -11034,15 +11034,48 @@ impl MySqlConnection {
         if !self.counter_numbers_can_be_predicted(bound, table) {
             return reserve_first();
         }
-        self.run_counted_rows_savepoint_statement(SET_THE_COUNTED_ROWS_SAVEPOINT)?;
-        let predicted = match self
-            .hold_the_write_lock_on(table)
-            .and_then(|()| self.numbers_the_counter_would_hand_out(bound, table, values))
-        {
+        let begins_a_transaction = self.inner.get_auto_commit();
+        if begins_a_transaction {
+            self.run_counted_rows_statement(BEGIN_THE_COUNTED_ROWS_TRANSACTION)?;
+        }
+        let written =
+            self.write_predicted_counted_rows(sql, bound, table, values, deadline, &write);
+        let ended = if begins_a_transaction && !self.inner.get_auto_commit() {
+            self.run_counted_rows_statement(if written.is_ok() {
+                COMMIT_THE_COUNTED_ROWS_TRANSACTION
+            } else {
+                ROLL_BACK_THE_COUNTED_ROWS_TRANSACTION
+            })
+        } else {
+            Ok(())
+        };
+        let written = written?;
+        ended?;
+        match written {
+            Some(written) => written,
+            None => reserve_first(),
+        }
+    }
+
+    /// Writes the rows with the numbers the counter would hand out next, and
+    /// answers the statement's own outcome once its savepoint is released, or
+    /// `None` when the counter cannot tell them after all.
+    fn write_predicted_counted_rows(
+        &self,
+        sql: &str,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        deadline: Option<turso_core::MonotonicInstant>,
+        write: &impl Fn(&ReservedAutoIncrementRows) -> Result<()>,
+    ) -> Result<Option<Result<ReservedAutoIncrementRows>>> {
+        self.hold_the_write_lock_on(table)?;
+        self.run_counted_rows_statement(SET_THE_COUNTED_ROWS_SAVEPOINT)?;
+        let predicted = match self.numbers_the_counter_would_hand_out(bound, table, values) {
             Ok(Some(predicted)) => predicted,
             Ok(None) => {
                 self.leave_the_counted_rows_savepoint()?;
-                return reserve_first();
+                return Ok(None);
             }
             Err(error) => {
                 self.leave_the_counted_rows_savepoint()?;
@@ -11085,9 +11118,9 @@ impl MySqlConnection {
             rollback()?;
         }
         if !self.inner.get_auto_commit() {
-            self.run_counted_rows_savepoint_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
+            self.run_counted_rows_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
         }
-        written?
+        written.map(Some)
     }
 
     /// Under contention the numbers the counter would hand out next are the
@@ -11097,6 +11130,13 @@ impl MySqlConnection {
     /// sessions inserting, reading them before waiting for the lock made
     /// most inserts fail on another session's key and be written twice
     /// while holding the lock.
+    ///
+    /// The lock is taken before the savepoint is set, because setting it
+    /// takes the transaction's snapshot. A session that waits for the lock
+    /// holding a snapshot keeps every checkpoint from copying the WAL past
+    /// it: measured with eight sessions inserting, waiting sessions always
+    /// held one, and the WAL grew past 150 MB in eight seconds without being
+    /// emptied once.
     fn hold_the_write_lock_on(&self, table: &AutoIncrementTable) -> Result<()> {
         let schema = self.inner.current_schema();
         let column = schema
@@ -11116,20 +11156,20 @@ impl MySqlConnection {
 
     fn leave_the_counted_rows_savepoint(&self) -> Result<()> {
         if !self.inner.get_auto_commit() {
-            self.run_counted_rows_savepoint_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
-            self.run_counted_rows_savepoint_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
+            self.run_counted_rows_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
+            self.run_counted_rows_statement(RELEASE_THE_COUNTED_ROWS_SAVEPOINT)?;
         }
         Ok(())
     }
 
     fn roll_back_to_the_counted_rows_savepoint(&self) -> Result<()> {
         if !self.inner.get_auto_commit() {
-            self.run_counted_rows_savepoint_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
+            self.run_counted_rows_statement(ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT)?;
         }
         Ok(())
     }
 
-    fn run_counted_rows_savepoint_statement(
+    fn run_counted_rows_statement(
         &self,
         sql: &'static str,
     ) -> std::result::Result<(), MySqlQueryError> {
@@ -11137,9 +11177,9 @@ impl MySqlConnection {
             return self.run_internal(sql);
         }
         let prepared = self
-            .prepared_counted_rows_savepoints
+            .prepared_counted_rows_statements
             .lock()
-            .expect("MySQL counted rows savepoints mutex poisoned")
+            .expect("MySQL counted rows statements mutex poisoned")
             .remove(sql);
         let mut statement = match prepared {
             Some(statement) => statement,
@@ -11149,9 +11189,9 @@ impl MySqlConnection {
             .run_ignore_rows()
             .map_err(MySqlQueryError::Engine)?;
         if statement.reset().is_ok() {
-            self.prepared_counted_rows_savepoints
+            self.prepared_counted_rows_statements
                 .lock()
-                .expect("MySQL counted rows savepoints mutex poisoned")
+                .expect("MySQL counted rows statements mutex poisoned")
                 .insert(sql, statement);
         }
         Ok(())
@@ -14263,6 +14303,9 @@ fn injected_auto_increment_prepare_options(
         }))
 }
 
+const BEGIN_THE_COUNTED_ROWS_TRANSACTION: &str = "BEGIN";
+const COMMIT_THE_COUNTED_ROWS_TRANSACTION: &str = "COMMIT";
+const ROLL_BACK_THE_COUNTED_ROWS_TRANSACTION: &str = "ROLLBACK";
 const SET_THE_COUNTED_ROWS_SAVEPOINT: &str = "SAVEPOINT \"__turso_auto_increment_values\"";
 const RELEASE_THE_COUNTED_ROWS_SAVEPOINT: &str =
     "RELEASE SAVEPOINT \"__turso_auto_increment_values\"";

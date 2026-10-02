@@ -4403,8 +4403,7 @@ fn kept_statements_still_run_after_a_rollback_to_a_savepoint_and_a_new_table() -
 }
 
 #[test]
-fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transactions() -> Result<()>
-{
+fn counted_inserts_reuse_their_statements_through_failures_and_transactions() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-kept-savepoints.db", [0x59; 16])?;
     connection.execute(
@@ -4436,7 +4435,7 @@ fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transac
             .collect::<Vec<_>>()
     );
     let mut kept = connection
-        .prepared_counted_rows_savepoints
+        .prepared_counted_rows_statements
         .lock()
         .unwrap()
         .keys()
@@ -4446,6 +4445,8 @@ fn counted_inserts_reuse_their_savepoint_statements_through_failures_and_transac
     assert_eq!(
         kept,
         [
+            BEGIN_THE_COUNTED_ROWS_TRANSACTION,
+            COMMIT_THE_COUNTED_ROWS_TRANSACTION,
             RELEASE_THE_COUNTED_ROWS_SAVEPOINT,
             ROLL_BACK_TO_THE_COUNTED_ROWS_SAVEPOINT,
             SET_THE_COUNTED_ROWS_SAVEPOINT

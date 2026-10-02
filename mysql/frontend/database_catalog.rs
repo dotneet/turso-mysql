@@ -1555,6 +1555,50 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_counted_insert_waits_for_the_write_lock_without_a_snapshot() -> CoreResult<()> {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut holding = catalog.new_session(binary_context());
+        holding.select_database("kept").unwrap();
+        let holder = holding.connection().unwrap().clone();
+        let mut waiting = catalog.new_session(binary_context());
+        waiting.select_database("kept").unwrap();
+        let waiter = waiting.connection().unwrap().clone();
+        holder.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT)",
+        )?;
+        holder.execute("CREATE TABLE notes (id INT, body TEXT)")?;
+
+        holder
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        holder.execute("INSERT INTO notes (id, body) VALUES (1, 'holds the lock')")?;
+        let inserting = std::thread::spawn({
+            let waiter = waiter.clone();
+            move || waiter.execute("INSERT INTO users (name) VALUES ('waited')")
+        });
+        while waiter.inner().get_auto_commit() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waited_with_a_snapshot = waiter.inner().has_read_snapshot();
+        holder.execute_transaction_command("COMMIT").unwrap();
+        inserting.join().unwrap()?;
+
+        assert!(!waited_with_a_snapshot);
+        assert!(waiter.inner().get_auto_commit());
+        assert_eq!(
+            waiter
+                .prepare_select("SELECT id, name FROM users ORDER BY id")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1), Value::from_text("waited")]]
+        );
+        Ok(())
+    }
+
     /// Only a closed engine connection runs the closing checkpoint, so a
     /// session that ends has to close its connection, or the WAL stays as
     /// large as the last write made it and the next open reads all of it.
