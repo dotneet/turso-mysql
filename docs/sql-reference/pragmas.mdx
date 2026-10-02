@@ -320,12 +320,30 @@ PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
 
 ### data_sync_retry
 
-Controls whether Turso retries a disk sync (fsync) after a failure instead of treating it as fatal.
+Controls what a failed disk sync (fsync) does.
 
 ```sql
-PRAGMA data_sync_retry = 1;   -- retry on sync failure
-PRAGMA data_sync_retry = 0;   -- do not retry (default)
+PRAGMA data_sync_retry = 1;   -- return an error where a later retry is safe
+PRAGMA data_sync_retry = 0;   -- stop the process (default)
 ```
+
+After a failed fsync the operating system may have dropped the pages it could
+not write, so a later fsync can report success for data that never reached the
+disk. With the default, a failed sync of the WAL, of the MVCC logical log, or of
+the database file stops the process with a panic, whether the I/O backend
+reports the failure at once or in the completion.
+
+With `data_sync_retry = 1`, a failed sync of the WAL fails the statement with an
+I/O error and the next commit rewrites the frames, and a failed sync of the
+database file in a `PASSIVE` or `FULL` checkpoint fails the checkpoint, which the
+next checkpoint copies again from the WAL. Two cases still stop the process,
+because no retry is safe there:
+
+- a failed sync of the MVCC logical log: the commit's record is already in the
+  log, so a later sync could make it durable after the commit failed;
+- a failed sync of the database file in a `RESTART` or `TRUNCATE` checkpoint:
+  the WAL has already been restarted, so the next write would overwrite the
+  frames that hold the only durable copy of the copied pages.
 
 ### require_where
 

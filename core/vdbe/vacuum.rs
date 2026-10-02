@@ -2021,7 +2021,10 @@ fn vacuum_in_place_step(
                     // Header write done — issue the fsync via prepare_wal_finish
                     // to set WAL `initialized = true`.
                     let wal = source_pager.wal.as_ref().unwrap();
-                    let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
+                    let sync_c = wal.prepare_wal_finish(
+                        source_pager.get_sync_type(),
+                        source_pager.on_sync_failure(),
+                    )?;
                     *completion = sync_c;
                     *fsync_phase = true;
                     continue;
@@ -2216,7 +2219,8 @@ fn vacuum_in_place_step(
                 // pager commit path in Pager::commit_tx / CommitState.
                 let sync_mode = connection.get_sync_mode();
                 if sync_mode == SyncMode::Full {
-                    let sync_c = wal.sync(source_pager.get_sync_type())?;
+                    let sync_c =
+                        wal.sync(source_pager.get_sync_type(), source_pager.on_sync_failure())?;
                     *phase = VacuumInPlacePhase::SyncSourceWal {
                         sync_completion: sync_c,
                     };

@@ -995,6 +995,9 @@ impl Connection {
         }
 
         let temp_db = self.create_temp_database()?;
+        temp_db
+            .pager
+            .set_data_sync_retry(self.get_data_sync_retry());
         let mut guard = self.temp.database.write();
         if guard.is_none() {
             self.has_non_main_pagers.store(true, Ordering::Release);
@@ -2606,11 +2609,9 @@ impl Connection {
                 pager
                     .io
                     .block(|| {
-                        return_if_io!(pager.commit_wal(
-                            WalAutoActions::empty(),
-                            self.get_sync_mode(),
-                            self.get_data_sync_retry(),
-                        ));
+                        return_if_io!(
+                            pager.commit_wal(WalAutoActions::empty(), self.get_sync_mode())
+                        );
                         pager.commit_wal_end();
                         Ok(IOResult::Done(()))
                     })
@@ -4393,6 +4394,7 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    pager.set_data_sync_retry(self.get_data_sync_retry());
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     self.attached_databases.write().insert(
                         alias.as_str(),
@@ -5300,6 +5302,12 @@ impl Connection {
     pub fn set_data_sync_retry(&self, value: bool) {
         self.data_sync_retry
             .store(value, crate::sync::atomic::Ordering::SeqCst);
+        self.pager.load().set_data_sync_retry(value);
+        self.with_all_attached_pagers_with_index(|pagers| {
+            for (_, pager) in pagers {
+                pager.set_data_sync_retry(value);
+            }
+        });
         self.bump_prepare_context_generation();
     }
 

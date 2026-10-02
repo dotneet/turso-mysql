@@ -236,7 +236,7 @@
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
 
-use crate::io::{FileSyncType, SharedBufferData};
+use crate::io::{sync_durable_file, DurableFile, FileSyncType, OnSyncFailure, SharedBufferData};
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::turso_assert;
@@ -978,11 +978,12 @@ impl LogicalLog {
     }
 
     pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
-        let completion = Completion::new_sync(move |_| {
-            tracing::debug!("logical_log_sync finish");
-        });
-        let c = self.file.sync(completion, sync_type)?;
-        Ok(c)
+        sync_durable_file(
+            DurableFile::LogicalLog,
+            OnSyncFailure::Panic,
+            |_| {},
+            |completion| self.file.sync(completion, sync_type),
+        )
     }
 
     fn current_or_new_header(&self) -> Result<LogHeader> {

@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
     ALLOC_ERR_MSG,
 };
+use crate::io::{sync_durable_file, DurableFile, OnSyncFailure};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
@@ -3037,10 +3038,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
 
                 tracing::debug!("Fsyncing database file before WAL truncation");
-                let c = self
-                    .pager
-                    .db_file
-                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
+                let on_sync_failure = if self.mode.should_restart_log() {
+                    OnSyncFailure::Panic
+                } else {
+                    self.pager.on_sync_failure()
+                };
+                let c = sync_durable_file(
+                    DurableFile::Database,
+                    on_sync_failure,
+                    |_| {},
+                    |completion| {
+                        self.pager
+                            .db_file
+                            .sync(completion, self.pager.get_sync_type())
+                    },
+                )?;
                 checkpoint_result.db_sync_sent = true;
                 Ok(TransitionResult::Io(IOCompletions(c)))
             }
@@ -3065,9 +3077,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .checkpoint_result
                         .as_mut()
                         .expect("checkpoint_result should be set");
-                    if let IOResult::IO(io) =
-                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
-                    {
+                    if let IOResult::IO(io) = wal.truncate_wal(
+                        checkpoint_result,
+                        self.pager.get_sync_type(),
+                        self.pager.on_sync_failure(),
+                    )? {
                         return Ok(TransitionResult::Io(io));
                     }
                 }

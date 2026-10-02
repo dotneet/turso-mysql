@@ -3349,7 +3349,6 @@ impl Program {
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
                         connection.get_sync_mode_for_database(db_id)?,
-                        connection.get_data_sync_retry(),
                     ) {
                         Ok(IOResult::Done(_)) => {}
                         Ok(IOResult::IO(io)) => {

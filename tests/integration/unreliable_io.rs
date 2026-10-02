@@ -33,9 +33,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use turso_core::{
-    io::FileSyncType, Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags,
-    WallClockInstant, IO,
+    io::FileSyncType, Buffer, Clock, Completion, CompletionError, File, LimboError,
+    MonotonicInstant, OpenFlags, WallClockInstant, IO,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub enum SyncFailure {
+    ReturnedBySync,
+    ReportedByCompletion,
+}
 
 /// A single not-yet-durable file mutation.
 enum UnsyncedOp {
@@ -92,6 +98,8 @@ struct UnreliableIoState {
     /// simulated power-loss point.
     armed_path: Mutex<Option<String>>,
     snapshot: Mutex<Option<CrashSnapshot>>,
+    next_failing_sync: Mutex<Option<(String, SyncFailure)>>,
+    failed_sync_completions: Mutex<Vec<Completion>>,
 }
 
 impl UnreliableIoState {
@@ -149,6 +157,8 @@ impl UnreliableIo {
                 files: Mutex::new(HashMap::new()),
                 armed_path: Mutex::new(None),
                 snapshot: Mutex::new(None),
+                next_failing_sync: Mutex::new(None),
+                failed_sync_completions: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -165,6 +175,14 @@ impl UnreliableIo {
     /// pending (unsynced) writes captures the crash snapshot.
     pub fn arm_crash_on_sync(&self, path: &str) {
         *self.state.armed_path.lock().unwrap() = Some(path.to_string());
+    }
+
+    pub fn fail_next_sync(&self, path: &str, failure: SyncFailure) {
+        *self.state.next_failing_sync.lock().unwrap() = Some((path.to_string(), failure));
+    }
+
+    pub fn a_sync_failure_is_still_waiting(&self) -> bool {
+        self.state.next_failing_sync.lock().unwrap().is_some()
     }
 
     pub fn take_crash_snapshot(&self) -> Option<CrashSnapshot> {
@@ -233,6 +251,10 @@ impl IO for UnreliableIo {
     }
 
     fn step(&self) -> turso_core::Result<()> {
+        let failed = std::mem::take(&mut *self.state.failed_sync_completions.lock().unwrap());
+        for completion in failed {
+            completion.error(failed_sync_error());
+        }
         self.inner.step()
     }
 
@@ -319,6 +341,22 @@ impl File for UnreliableFile {
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
+        if let Some(failure) = self.take_sync_failure() {
+            self.shadow.lock().unwrap().unsynced.clear();
+            return match failure {
+                SyncFailure::ReturnedBySync => {
+                    Err(LimboError::CompletionError(failed_sync_error()))
+                }
+                SyncFailure::ReportedByCompletion => {
+                    self.state
+                        .failed_sync_completions
+                        .lock()
+                        .unwrap()
+                        .push(c.clone());
+                    Ok(c)
+                }
+            };
+        }
         // Simulated power loss: crash while the armed file's fsync is in
         // flight, i.e. after its writes were submitted but before any of them
         // were made durable.
@@ -349,4 +387,22 @@ impl File for UnreliableFile {
     fn size(&self) -> turso_core::Result<u64> {
         self.inner.size()
     }
+}
+
+impl UnreliableFile {
+    fn take_sync_failure(&self) -> Option<SyncFailure> {
+        let mut next = self.state.next_failing_sync.lock().unwrap();
+        match next.as_ref() {
+            Some((path, failure)) if *path == self.path => {
+                let failure = *failure;
+                *next = None;
+                Some(failure)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn failed_sync_error() -> CompletionError {
+    CompletionError::IOError(std::io::ErrorKind::Other, "sync")
 }

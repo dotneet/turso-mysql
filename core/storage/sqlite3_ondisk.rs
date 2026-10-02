@@ -59,7 +59,10 @@ pub use super::pager::{PageContent, PageInner};
 use super::wal::{OverflowFallbackCoverage, TursoRwLock, WalSharedMetadata, WalSharedRuntime};
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, CompletionGroup, FileSyncType, ReadComplete};
+use crate::io::{
+    sync_durable_file, Buffer, Completion, CompletionGroup, DurableFile, FileSyncType,
+    OnSyncFailure, ReadComplete,
+};
 use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
@@ -774,19 +777,16 @@ pub fn begin_sync(
     db_file: &dyn DatabaseStorage,
     syncing: Arc<AtomicBool>,
     sync_type: FileSyncType,
+    on_sync_failure: OnSyncFailure,
 ) -> Result<Completion> {
     turso_assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
-    let completion = Completion::new_sync({
-        let syncing = syncing.clone();
-        move |_| {
-            syncing.store(false, Ordering::SeqCst);
-        }
-    });
-    #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion, sync_type).inspect_err(|_| {
-        syncing.store(false, Ordering::SeqCst);
-    })
+    sync_durable_file(
+        DurableFile::Database,
+        on_sync_failure,
+        move |_| syncing.store(false, Ordering::SeqCst),
+        |completion| db_file.sync(completion, sync_type),
+    )
 }
 
 #[allow(clippy::enum_variant_names)]

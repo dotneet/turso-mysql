@@ -12,6 +12,7 @@ mod database;
 mod database_leak;
 mod expr_depth_stack_overflow;
 mod external_apis;
+mod failed_sync;
 mod functions;
 mod fuzz_transaction;
 mod index_method;

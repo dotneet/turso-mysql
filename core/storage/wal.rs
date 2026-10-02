@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::io::FileSyncType;
+use crate::io::{sync_durable_file, DurableFile, OnSyncFailure};
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use crate::types::IOResultOr;
@@ -730,6 +731,7 @@ pub trait Wal: Debug + Send + Sync {
     ///
     /// TursoDB uses `page_no` and `size_after` from the supplied header, applies
     /// any configured page transform to the body, and overwrites the checksum.
+    #[allow(clippy::too_many_arguments)]
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -738,13 +740,18 @@ pub trait Wal: Debug + Send + Sync {
         db_size: u64,
         page: &[u8],
         sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
     ) -> Result<()>;
 
     /// Prepare WAL header for the future append
     /// Most of the time this method will return Ok(None)
     fn prepare_wal_start(&self, page_sz: PageSize) -> Result<Option<Completion>>;
 
-    fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion>;
+    fn prepare_wal_finish(
+        &self,
+        sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
+    ) -> Result<Completion>;
 
     /// Prepare a batch of WAL frames for durable commit/append to the log.
     fn prepare_frames(
@@ -794,7 +801,7 @@ pub trait Wal: Debug + Send + Sync {
         sync_type: FileSyncType,
     ) -> Result<Option<Completion>>;
     fn publish_backfill(&self, max_frame: u64);
-    fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+    fn sync(&self, sync_type: FileSyncType, on_sync_failure: OnSyncFailure) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
     /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
@@ -842,6 +849,7 @@ pub trait Wal: Debug + Send + Sync {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
     ) -> IOResultOr<()>;
 
     /// Try to acquire the checkpoint serialization lock. Returns `Busy` if
@@ -3992,6 +4000,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     // todo(sivukhin): change API to accept Buffer or some other owned type
     // this method involves IO and cross "async" boundary - so juggling with references is bad and dangerous
+    #[allow(clippy::too_many_arguments)]
     fn write_frame_raw(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -4000,11 +4009,12 @@ impl Wal for WalFile {
         db_size: u64,
         page: &[u8],
         sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
     ) -> Result<()> {
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
-        self.ensure_header_if_needed(page_size, sync_type)?;
+        self.ensure_header_if_needed(page_size, sync_type, on_sync_failure)?;
         tracing::debug!("write_raw_frame({})", frame_id);
         // if page_size wasn't initialized before - we will initialize it during that raw write
         if self.page_size() != 0 && page.len() != self.page_size() as usize {
@@ -4174,23 +4184,23 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+    fn sync(&self, sync_type: FileSyncType, on_sync_failure: OnSyncFailure) -> Result<Completion> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let dirty = self.dirty.clone();
-        let completion = Completion::new_sync(move |result| {
-            tracing::debug!("wal_sync finish");
-            if let Err(err) = result {
-                tracing::debug!("wal_sync failed: {err}");
-            } else {
-                dirty.store(false, Ordering::Release);
-            }
-            syncing.store(false, Ordering::Release);
-        });
         let file = self.coordination.wal_file()?;
         self.syncing.store(true, Ordering::Release);
-        let c = file.sync(completion, sync_type)?;
-        Ok(c)
+        sync_durable_file(
+            DurableFile::Wal,
+            on_sync_failure,
+            move |result| {
+                if result.is_ok() {
+                    dirty.store(false, Ordering::Release);
+                }
+                syncing.store(false, Ordering::Release);
+            },
+            |completion| file.sync(completion, sync_type),
+        )
     }
 
     // Currently used for assertion purposes
@@ -4459,11 +4469,17 @@ impl Wal for WalFile {
         verify = "full",
         parent = "wal_protocol_correctness"
     )]
-    fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
+    fn prepare_wal_finish(
+        &self,
+        sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
+    ) -> Result<Completion> {
         let file = self.coordination.wal_file()?;
         let coordination = self.coordination.clone();
-        let c = file.sync(
-            Completion::new_sync(move |res| {
+        sync_durable_file(
+            DurableFile::Wal,
+            on_sync_failure,
+            move |res| {
                 // Only mark the WAL header durable once its sync has actually
                 // succeeded. A failed sync must leave the WAL uninitialized so
                 // the header is re-issued before the next append, keeping the
@@ -4471,10 +4487,9 @@ impl Wal for WalFile {
                 if res.is_ok() {
                     coordination.mark_initialized();
                 }
-            }),
-            sync_type,
-        )?;
-        Ok(c)
+            },
+            |completion| file.sync(completion, sync_type),
+        )
     }
 
     /// Prepares a batch of dirty pages as WAL frames without modifying WAL state.
@@ -4790,8 +4805,9 @@ impl Wal for WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
     ) -> IOResultOr<()> {
-        self.truncate_log(result, sync_type)
+        self.truncate_log(result, sync_type, on_sync_failure)
     }
 }
 
@@ -5048,12 +5064,17 @@ impl WalFile {
 
     /// the WAL file has been truncated and we are writing the first
     /// frame since then. We need to ensure that the header is initialized.
-    fn ensure_header_if_needed(&self, page_size: PageSize, sync_type: FileSyncType) -> Result<()> {
+    fn ensure_header_if_needed(
+        &self,
+        page_size: PageSize,
+        sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
+    ) -> Result<()> {
         let Some(c) = self.prepare_wal_start(page_size)? else {
             return Ok(());
         };
         self.io.wait_for_completion(c)?;
-        let c = self.prepare_wal_finish(sync_type)?;
+        let c = self.prepare_wal_finish(sync_type, on_sync_failure)?;
         self.io.wait_for_completion(c)?;
         Ok(())
     }
@@ -5180,7 +5201,7 @@ impl WalFile {
                 // drops the unsynced WAL tail — a torn database that matches
                 // no committed prefix.
                 CheckpointState::SyncWal => {
-                    let c = self.sync(pager.get_sync_type())?;
+                    let c = self.sync(pager.get_sync_type(), pager.on_sync_failure())?;
                     self.ongoing_checkpoint.write().state = CheckpointState::Processing;
                     io_yield_one!(c);
                 }
@@ -5485,6 +5506,7 @@ impl WalFile {
         &self,
         result: &mut CheckpointResult,
         sync_type: FileSyncType,
+        on_sync_failure: OnSyncFailure,
     ) -> IOResultOr<()> {
         let file = self.coordination.prepare_truncate()?;
 
@@ -5505,15 +5527,11 @@ impl WalFile {
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
-            let c = file.sync(
-                Completion::new_sync(move |res| {
-                    if let Err(err) = res {
-                        tracing::debug!("WAL sync failed: {err}")
-                    } else {
-                        tracing::trace!("WAL file synced after truncation");
-                    }
-                }),
-                sync_type,
+            let c = sync_durable_file(
+                DurableFile::Wal,
+                on_sync_failure,
+                |_| {},
+                |completion| file.sync(completion, sync_type),
             )?;
             result.wal_sync_sent = true;
             io_yield_one!(c);
@@ -6250,7 +6268,7 @@ pub mod test {
     use crate::sync::{Mutex, RwLock};
     use crate::SqliteDialect;
     use crate::{
-        io::FileSyncType,
+        io::{FileSyncType, OnSyncFailure},
         storage::{
             buffer_pool::BufferPool,
             database::{DatabaseFile, DatabaseStorage},
@@ -6633,7 +6651,9 @@ pub mod test {
         if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
             io.wait_for_completion(c).unwrap();
         }
-        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        let c = wal
+            .prepare_wal_finish(FileSyncType::Fsync, OnSyncFailure::Panic)
+            .unwrap();
         io.wait_for_completion(c).unwrap();
 
         (io, buffer_pool, wal)
@@ -6662,7 +6682,9 @@ pub mod test {
         if let Some(c) = wal.prepare_wal_start(page_size).unwrap() {
             io.wait_for_completion(c).unwrap();
         }
-        let c = wal.prepare_wal_finish(FileSyncType::Fsync).unwrap();
+        let c = wal
+            .prepare_wal_finish(FileSyncType::Fsync, OnSyncFailure::Panic)
+            .unwrap();
         io.wait_for_completion(c).unwrap();
 
         (io, buffer_pool, wal)
@@ -7056,8 +7078,16 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
 
-        wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
-            .unwrap();
+        wal.write_frame_raw(
+            buffer_pool,
+            1,
+            44,
+            0,
+            &expected,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
 
         let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
         let completion = wal.read_frame_raw(1, &mut frame).unwrap();
@@ -7073,7 +7103,15 @@ pub mod test {
         let page = vec![0; page_size as usize];
 
         let err = wal
-            .write_frame_raw(buffer_pool, 1, 44, 0, &page, FileSyncType::Fsync)
+            .write_frame_raw(
+                buffer_pool,
+                1,
+                44,
+                0,
+                &page,
+                FileSyncType::Fsync,
+                OnSyncFailure::Panic,
+            )
             .unwrap_err();
 
         assert!(err.to_string().contains("codec encode failed"));
@@ -7088,15 +7126,39 @@ pub mod test {
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let page = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
 
-        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &page, FileSyncType::Fsync)
-            .unwrap();
-        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &page, FileSyncType::Fsync)
-            .unwrap();
+        wal.write_frame_raw(
+            buffer_pool.clone(),
+            1,
+            44,
+            0,
+            &page,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
+        wal.write_frame_raw(
+            buffer_pool.clone(),
+            1,
+            44,
+            0,
+            &page,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
 
         let mut different_page = page;
         different_page[0] ^= 1;
         let err = wal
-            .write_frame_raw(buffer_pool, 1, 44, 0, &different_page, FileSyncType::Fsync)
+            .write_frame_raw(
+                buffer_pool,
+                1,
+                44,
+                0,
+                &different_page,
+                FileSyncType::Fsync,
+                OnSyncFailure::Panic,
+            )
             .unwrap_err();
         assert!(matches!(err, LimboError::Conflict(_)));
         assert_eq!(wal.get_max_frame(), 1);
@@ -7109,8 +7171,16 @@ pub mod test {
         let (_io, buffer_pool, wal) = make_initialized_memory_wal(page_size);
         set_test_page_codec(&wal, Arc::new(TestPageCodec::Xor(0xa5)));
         let page = vec![0; page_size as usize];
-        wal.write_frame_raw(buffer_pool, 1, 44, 0, &page, FileSyncType::Fsync)
-            .unwrap();
+        wal.write_frame_raw(
+            buffer_pool,
+            1,
+            44,
+            0,
+            &page,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
 
         let expected_frame_len = WAL_FRAME_HEADER_SIZE + page_size as usize;
         for frame_len in [expected_frame_len - 1, expected_frame_len + 1] {
@@ -7155,8 +7225,16 @@ pub mod test {
         let mut expected = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
         expected[page_size as usize - 64..].fill(0);
 
-        wal.write_frame_raw(buffer_pool, 1, 44, 0, &expected, FileSyncType::Fsync)
-            .unwrap();
+        wal.write_frame_raw(
+            buffer_pool,
+            1,
+            44,
+            0,
+            &expected,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
 
         let mut frame = vec![0; WAL_FRAME_HEADER_SIZE + page_size as usize];
         let completion = wal.read_frame_raw(1, &mut frame).unwrap();
@@ -7172,8 +7250,16 @@ pub mod test {
         let mut source = (0..page_size).map(|i| i as u8).collect::<Vec<_>>();
         source[page_size as usize - 8..].fill(0);
 
-        wal.write_frame_raw(buffer_pool.clone(), 1, 44, 0, &source, FileSyncType::Fsync)
-            .unwrap();
+        wal.write_frame_raw(
+            buffer_pool.clone(),
+            1,
+            44,
+            0,
+            &source,
+            FileSyncType::Fsync,
+            OnSyncFailure::Panic,
+        )
+        .unwrap();
 
         let target = Arc::new(crate::Page::new(44));
         let completion = wal
@@ -11332,5 +11418,70 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    #[test]
+    fn a_wal_sync_refused_when_submitted_fails_its_completion_and_ends_the_sync() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool.finalize_with_page_size(4096).unwrap();
+        let file = io
+            .open_file("refused-sync.db-wal", OpenFlags::Create, false)
+            .unwrap();
+        let shared = WalFileShared::new_shared(Arc::new(SyncRefusingFile { inner: file })).unwrap();
+        let wal = WalFile::new(io, shared, ((0, 0), 0), buffer_pool);
+
+        let completion = wal
+            .sync(FileSyncType::Fsync, OnSyncFailure::ReturnError)
+            .expect("a refused sync is reported through its completion");
+
+        assert!(completion.failed());
+        assert!(!wal.is_syncing());
+    }
+
+    struct SyncRefusingFile {
+        inner: Arc<dyn File>,
+    }
+
+    impl File for SyncRefusingFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            self.inner.pwrite(pos, buffer, c)
+        }
+
+        fn sync(
+            &self,
+            _c: Completion,
+            _sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::Other,
+                "sync",
+            )))
+        }
+
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
+        }
     }
 }

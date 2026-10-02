@@ -19,6 +19,7 @@ pub type ReadComplete =
     dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError> + Send + Sync;
 pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub(crate) type AfterFailedSync = dyn Fn(CompletionError) + Send + Sync;
 pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 
 #[must_use]
@@ -339,6 +340,17 @@ impl Completion {
         ))))
     }
 
+    pub(crate) fn new_sync_with_after_failure<F, G>(complete: F, after_failure: G) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+        G: Fn(CompletionError) + Send + Sync + 'static,
+    {
+        Self::new(CompletionType::Sync(SyncCompletion {
+            complete: Box::new(complete),
+            after_failure: Some(Box::new(after_failure)),
+        }))
+    }
+
     pub fn new_trunc<F>(complete: F) -> Self
     where
         F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
@@ -509,6 +521,13 @@ impl Completion {
             }
         }
         inner.context.wake();
+        if first {
+            if let (CompletionType::Sync(sync), Some(Some(err))) =
+                (&inner.completion_type, inner.result.get())
+            {
+                sync.after_failure(*err);
+            }
+        }
     }
 
     fn group_one_done(&self, err: Option<CompletionError>) {
@@ -580,15 +599,25 @@ impl WriteCompletion {
 
 pub struct SyncCompletion {
     pub complete: Box<SyncComplete>,
+    after_failure: Option<Box<AfterFailedSync>>,
 }
 
 impl SyncCompletion {
     pub fn new(complete: Box<SyncComplete>) -> Self {
-        Self { complete }
+        Self {
+            complete,
+            after_failure: None,
+        }
     }
 
     pub fn callback(&self, res: Result<i32, CompletionError>) {
         (self.complete)(res);
+    }
+
+    fn after_failure(&self, err: CompletionError) {
+        if let Some(after_failure) = &self.after_failure {
+            after_failure(err);
+        }
     }
 }
 

@@ -2,6 +2,7 @@ use crate::assert::assert_send_sync;
 #[cfg(target_vendor = "apple")]
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
+use crate::io::OnSyncFailure;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1652,6 +1653,7 @@ pub struct Pager {
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
     sync_type: AtomicFileSyncType,
+    data_sync_retry: AtomicBool,
     /// Live BTreeCursors on this pager, bucketed by btree root page.
     /// Counterpart of SQLite's BtShared.pCursor list; bucketing per root
     /// supplies the BTCF_Multiple fast path (btree.c:9348).
@@ -1964,6 +1966,7 @@ impl Pager {
             init_page_1,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
+            data_sync_retry: AtomicBool::new(false),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             attached_pager_reservation: None,
             record_pool: Mutex::new(Vec::new()),
@@ -2108,6 +2111,7 @@ impl Pager {
             self.db_file.as_ref(),
             self.syncing.clone(),
             self.get_sync_type(),
+            self.on_sync_failure(),
         )
     }
 
@@ -2137,6 +2141,15 @@ impl Pager {
     #[cfg(not(target_vendor = "apple"))]
     pub fn set_sync_type(&self, _value: FileSyncType) {
         // No-op: FullFsync only has effect on Apple platforms
+    }
+
+    pub fn set_data_sync_retry(&self, data_sync_retry: bool) {
+        self.data_sync_retry
+            .store(data_sync_retry, Ordering::Release);
+    }
+
+    pub(crate) fn on_sync_failure(&self) -> OnSyncFailure {
+        OnSyncFailure::for_data_sync_retry(self.data_sync_retry.load(Ordering::Acquire))
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
@@ -3505,11 +3518,7 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
-                    return_if_io!(self.commit_wal(
-                        connection.wal_auto_actions(),
-                        sync_mode,
-                        connection.get_data_sync_retry(),
-                    ));
+                    return_if_io!(self.commit_wal(connection.wal_auto_actions(), sync_mode));
 
                     let schema_did_change = match connection.get_tx_state() {
                         TransactionState::Write { schema_did_change } => schema_did_change,
@@ -4108,7 +4117,8 @@ impl Pager {
             )),
             None => {
                 // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
+                let completion =
+                    wal.prepare_wal_finish(self.get_sync_type(), self.on_sync_failure())?;
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -4138,7 +4148,8 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
+        let finish_completion =
+            wal.prepare_wal_finish(self.get_sync_type(), self.on_sync_failure())?;
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -4388,7 +4399,8 @@ impl Pager {
                     // Header (and any truncate) durable — issue the fsync that
                     // marks the WAL initialized.
                     let wal = self.wal.as_ref().expect("PreparingWalStart requires a WAL");
-                    let finish_c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    let finish_c =
+                        wal.prepare_wal_finish(self.get_sync_type(), self.on_sync_failure())?;
                     *self.spill_state.write() = SpillState::PreparingWalFinish {
                         pages,
                         completion: finish_c,
@@ -4601,7 +4613,6 @@ impl Pager {
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
-        data_sync_retry: bool,
     ) -> IOResultOr<()> {
         {
             let mut commit_info = self.commit_info.write();
@@ -4615,7 +4626,7 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode);
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -4637,7 +4648,6 @@ impl Pager {
         &self,
         allowed_auto_actions: WalAutoActions,
         sync_mode: SyncMode,
-        data_sync_retry: bool,
     ) -> IOResultOr<()> {
         let Some(wal) = self.wal.as_ref() else {
             turso_soft_unreachable!("commit_wal() called without WAL");
@@ -4662,7 +4672,7 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    let c = wal.prepare_wal_finish(self.get_sync_type(), self.on_sync_failure())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -4847,7 +4857,7 @@ impl Pager {
                     let sync_c = match pending {
                         Some(c) => Some(c),
                         None if sync_mode == SyncMode::Full && need_fsync => {
-                            let sync_c = wal.sync(self.get_sync_type())?;
+                            let sync_c = wal.sync(self.get_sync_type(), self.on_sync_failure())?;
                             self.commit_info.write().pending_sync = Some(sync_c.clone());
                             Some(sync_c)
                         }
@@ -4858,21 +4868,12 @@ impl Pager {
                         if !sync_c.finished() {
                             io_yield_one!(sync_c);
                         }
-                        // Check for fsync error as we might need to panic on data_sync_retry=off
                         let mut commit_info = self.commit_info.write();
                         if !sync_c.succeeded() {
                             commit_info.pending_sync = None;
                             commit_info.prepared_frames.clear();
-
-                            if !data_sync_retry {
-                                panic!(
-                                    "fsync error (data_sync_retry=off): {:?}",
-                                    sync_c.get_error()
-                                );
-                            }
-                            return Err(LimboError::CompletionError(CompletionError::IOError(
-                                std::io::ErrorKind::Other,
-                                "sync",
+                            return Err(LimboError::CompletionError(sync_c.get_error().unwrap_or(
+                                CompletionError::IOError(std::io::ErrorKind::Other, "sync"),
                             ))
                             .into());
                         }
@@ -4984,6 +4985,7 @@ impl Pager {
             header.db_size as u64,
             raw_page,
             self.get_sync_type(),
+            self.on_sync_failure(),
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
@@ -5303,10 +5305,22 @@ impl Pager {
                         continue;
                     }
 
+                    let restarts_wal = self
+                        .checkpoint_state
+                        .read()
+                        .mode
+                        .expect("mode should be set")
+                        .should_restart_log();
+                    let on_sync_failure = if restarts_wal {
+                        OnSyncFailure::Panic
+                    } else {
+                        self.on_sync_failure()
+                    };
                     let c = sqlite3_ondisk::begin_sync(
                         self.db_file.as_ref(),
                         self.syncing.clone(),
                         self.get_sync_type(),
+                        on_sync_failure,
                     )?;
                     self.checkpoint_state
                         .write()
@@ -5485,6 +5499,7 @@ impl Pager {
                             .as_mut()
                             .expect("result should be set"),
                         self.get_sync_type(),
+                        self.on_sync_failure(),
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
@@ -5595,7 +5610,7 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync(self.get_sync_type())?;
+            let c = wal.sync(self.get_sync_type(), self.on_sync_failure())?;
             self.io.wait_for_completion(c)?;
         }
         if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
@@ -5860,6 +5875,7 @@ impl Pager {
                         self.db_file.as_ref(),
                         self.syncing.clone(),
                         self.get_sync_type(),
+                        self.on_sync_failure(),
                     )?;
                     *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
                     io_yield_one!(c);

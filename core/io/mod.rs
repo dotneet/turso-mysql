@@ -81,8 +81,11 @@ pub(crate) fn file_from_std(
 pub mod clock;
 mod common;
 mod completions;
+mod durable_sync;
 pub use clock::Clock;
 pub use completions::*;
+pub use durable_sync::OnSyncFailure;
+pub(crate) use durable_sync::{sync_durable_file, DurableFile};
 
 /// Platform-independent file identity, analogous to SQLite's `struct unixFileId`.
 /// On Unix: (st_dev, st_ino). On Windows: (dwVolumeSerialNumber, nFileIndex).
