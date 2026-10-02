@@ -29,6 +29,11 @@ use strum::EnumCount;
 mod scan_locks;
 pub(crate) use scan_locks::{RangeEnd, RecordLock, UndoneInsertNeighbor};
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BTREE_ROWS_CHECKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone)]
 enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
     /// We haven't loaded any row yet.
@@ -898,8 +903,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
+        #[cfg(test)]
+        BTREE_ROWS_CHECKED.with(|checked| checked.set(checked.get() + 1));
         self.db
             .query_btree_version_is_valid(self.table_id, key, self.tx_id)
+    }
+
+    fn version_store_peeks_at(&self, key: &RowKey) -> bool {
+        self.dual_peek.mvcc_peek.get_row_key() == Some(key)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -962,7 +973,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.btree_row_is_valid_forward(&k) => {
+                        Some(k)
+                            if self.version_store_peeks_at(&k)
+                                || self.btree_row_is_valid_forward(&k) =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -996,7 +1010,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     if let Some(key) = key {
-                        if self.btree_row_is_valid_forward(&key) {
+                        if self.version_store_peeks_at(&key)
+                            || self.btree_row_is_valid_forward(&key)
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
                                 versions: None,
@@ -1050,7 +1066,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k)
+                            if self.version_store_peeks_at(&k)
+                                || self.query_btree_version_is_valid(&k) =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1084,7 +1103,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k)
+                            if self.version_store_peeks_at(&k)
+                                || self.query_btree_version_is_valid(&k) =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,
@@ -1256,7 +1278,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
                     match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                        Some(k)
+                            if self.version_store_peeks_at(&k)
+                                || self.query_btree_version_is_valid(&k) =>
+                        {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key: k,
                                 versions: None,

@@ -4293,6 +4293,79 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
 }
 
+#[test]
+fn reads_among_rows_changed_since_the_checkpoint_check_only_the_b_tree_rows_they_reach() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=1000 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v + 1").unwrap();
+    let rows_and_checks = |sql: &str| -> (Vec<i64>, u64) {
+        crate::mvcc::cursor::BTREE_ROWS_CHECKED.with(|checked| checked.set(0));
+        let rows = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        (
+            rows,
+            crate::mvcc::cursor::BTREE_ROWS_CHECKED.with(|checked| checked.get()),
+        )
+    };
+
+    let (rows, checked) = rows_and_checks("SELECT v FROM t WHERE id = 500");
+    assert_eq!(rows, vec![501]);
+    assert!(checked <= 2, "the lookup checked {checked} B-tree rows");
+    let (rows, checked) = rows_and_checks("SELECT id FROM t WHERE id >= 500 ORDER BY id LIMIT 3");
+    assert_eq!(rows, vec![500, 501, 502]);
+    assert!(
+        checked <= 6,
+        "the forward scan checked {checked} B-tree rows"
+    );
+    let (rows, checked) =
+        rows_and_checks("SELECT id FROM t WHERE id <= 500 ORDER BY id DESC LIMIT 3");
+    assert_eq!(rows, vec![500, 499, 498]);
+    assert!(
+        checked <= 6,
+        "the backward scan checked {checked} B-tree rows"
+    );
+    let (rows, checked) = rows_and_checks("SELECT count(*) FROM t WHERE id BETWEEN 400 AND 600");
+    assert_eq!(rows, vec![201]);
+    assert!(checked <= 210, "the range checked {checked} B-tree rows");
+    assert_eq!(rows_and_checks("SELECT count(*) FROM t").0, vec![1000]);
+
+    conn.execute("DELETE FROM t WHERE id = 501").unwrap();
+    assert_eq!(
+        rows_and_checks("SELECT id FROM t WHERE id >= 500 ORDER BY id LIMIT 3").0,
+        vec![500, 502, 503]
+    );
+    assert_eq!(
+        rows_and_checks("SELECT id FROM t WHERE id <= 502 ORDER BY id DESC LIMIT 3").0,
+        vec![502, 500, 499]
+    );
+    assert_eq!(
+        rows_and_checks("SELECT v FROM t WHERE id = 501").0,
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        rows_and_checks("SELECT sum(v) FROM t").0,
+        vec![(2..=1001).sum::<i64>() - 502]
+    );
+    assert_eq!(rows_and_checks("SELECT count(*) FROM t").0, vec![999]);
+}
+
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]
