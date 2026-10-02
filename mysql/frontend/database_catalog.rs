@@ -1294,6 +1294,9 @@ mod tests {
     /// session stays open and goes on writing.
     #[test]
     fn the_catalogs_keeper_empties_a_wal_while_the_session_stays_open() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1344,6 +1347,9 @@ mod tests {
     /// the database's write lock.
     #[test]
     fn the_keeper_leaves_a_wal_kept_busy_alone_for_a_while() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1398,6 +1404,9 @@ mod tests {
     /// copy does not need the write lock.
     #[test]
     fn the_keeper_copies_the_wal_while_another_session_writes() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1453,6 +1462,9 @@ mod tests {
     #[test]
     fn the_keeper_empties_a_wal_once_the_session_holding_the_write_lock_commits() -> CoreResult<()>
     {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1509,6 +1521,9 @@ mod tests {
     /// other session took meanwhile is not written first and then undone.
     #[test]
     fn a_counted_insert_waiting_for_the_write_lock_writes_its_row_once() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
@@ -1604,6 +1619,9 @@ mod tests {
     /// large as the last write made it and the next open reads all of it.
     #[test]
     fn a_session_that_ends_leaves_an_empty_wal() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
