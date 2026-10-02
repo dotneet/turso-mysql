@@ -266,6 +266,28 @@ impl RowLocks {
         holders
     }
 
+    pub(crate) fn forget_inserts(&self, tx_id: TxID, keys: &[RowID]) {
+        let mut table = self.table.lock();
+        let forgotten: Vec<&RowID> = keys
+            .iter()
+            .filter(|key| table.inserted.get(*key) == Some(&tx_id))
+            .collect();
+        if forgotten.is_empty() {
+            return;
+        }
+        for key in &forgotten {
+            table.inserted.remove(*key);
+        }
+        if let Some(held) = table.held.get_mut(&tx_id) {
+            held.retain(
+                |lock| !matches!(lock, HeldLock::Inserted(key) if forgotten.contains(&key)),
+            );
+        }
+        *table.released_before_the_end.entry(tx_id).or_default() += 1;
+        drop(table);
+        self.transaction_ended.released();
+    }
+
     pub(crate) fn lock_gap(
         &self,
         tx_id: TxID,

@@ -1207,6 +1207,12 @@ impl Statement {
             }
         };
         self.give_up_row_lock_wait();
+        if matches!(end, RowLockWaitEnd::TimedOut | RowLockWaitEnd::Interrupted)
+            && !connection.get_auto_commit()
+        {
+            self.program
+                .lock_the_gaps_undone_inserts_left(&self.pager, &mut self.state)?;
+        }
         let failure = match end {
             RowLockWaitEnd::HoldersEnded => {
                 self.reset_internal(None, None, false)?;

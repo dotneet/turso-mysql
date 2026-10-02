@@ -1101,6 +1101,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Stack of savepoints for statement-level rollback.
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
+    inserts_the_last_statement_undid: Mutex<Vec<RowID>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
     /// True once this transaction's commit record is in the logical log.
@@ -1154,6 +1155,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header: RwLock::new(header),
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
+            inserts_the_last_statement_undid: Mutex::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
@@ -7910,7 +7912,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let savepoint = tx.pop_statement_savepoint();
 
         if let Some(savepoint) = savepoint {
-            self.rollback_savepoint_changes(tx_id, savepoint);
+            let undone = self.rollback_savepoint_changes(tx_id, savepoint);
+            *tx.inserts_the_last_statement_undid.lock() = undone;
             Ok(true)
         } else {
             tracing::debug!(
@@ -7944,7 +7947,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(Some(deferred_fk_violations))
     }
 
-    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) {
+    pub(crate) fn take_inserts_the_last_statement_undid(&self, tx_id: TxID) -> Vec<RowID> {
+        self.txs.get(&tx_id).map_or_else(Vec::new, |tx| {
+            std::mem::take(&mut *tx.value().inserts_the_last_statement_undid.lock())
+        })
+    }
+
+    pub(crate) fn keep_the_gap_an_undone_insert_left(
+        &self,
+        tx_id: TxID,
+        gap: GapBetween,
+        place: impl Fn(&RowKey) -> GapKey,
+    ) {
+        let met = self.row_locks.lock_gap(tx_id, gap, place, true);
+        turso_assert!(
+            met.is_empty(),
+            "a gap an undone insert left waits for no other transaction"
+        );
+    }
+
+    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint<A>) -> Vec<RowID> {
         let Savepoint {
             header,
             header_dirty,
@@ -7966,6 +7988,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         );
 
         let mut touched_rowids = BTreeSet::new();
+        let created_keys: BTreeSet<RowID> = created_table_versions
+            .iter()
+            .map(|(rowid, _)| rowid.clone())
+            .chain(
+                created_index_versions
+                    .iter()
+                    .map(|((table_id, key), _)| RowID::new(*table_id, RowKey::Record(key.clone()))),
+            )
+            .collect();
 
         for (rowid, version_id) in created_table_versions {
             touched_rowids.insert(rowid.clone());
@@ -8059,6 +8090,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         *tx.header.write() = header;
         tx.header_dirty.store(header_dirty, Ordering::Release);
+        let undone: Vec<RowID> = created_keys
+            .into_iter()
+            .filter(|key| !self.row_has_uncommitted_version_for_tx(key, tx_id))
+            .collect();
+        if self.row_locks.enabled() {
+            self.row_locks.forget_inserts(tx_id, &undone);
+        }
+        undone
     }
 
     // Rollback can make an old integer rowid visible again without going through INSERT.

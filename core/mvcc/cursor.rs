@@ -27,7 +27,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 
 mod scan_locks;
-pub(crate) use scan_locks::{RangeEnd, RecordLock};
+pub(crate) use scan_locks::{RangeEnd, RecordLock, UndoneInsertNeighbor};
 
 #[derive(Clone)]
 enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {

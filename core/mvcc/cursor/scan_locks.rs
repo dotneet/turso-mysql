@@ -102,6 +102,12 @@ pub(super) enum Arrived {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UndoneInsertNeighbor {
+    Below,
+    Above,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordLock {
     Taken,
     HeldByAnother,
@@ -345,6 +351,54 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             true,
         )?;
         Ok(IOResult::Done(()))
+    }
+
+    pub(crate) fn neighbor_of_an_undone_insert(
+        &mut self,
+        key: &RowKey,
+        side: UndoneInsertNeighbor,
+    ) -> IOResultOr<Option<RowKey>> {
+        let op = match side {
+            UndoneInsertNeighbor::Below => SeekOp::LT,
+            UndoneInsertNeighbor::Above => SeekOp::GT,
+        };
+        self.neighbor_of(
+            key,
+            op,
+            AfterTheSearch::LeaveTheRows(IterationDirection::Forwards),
+        )
+    }
+
+    pub(crate) fn keeps_gaps(&self) -> bool {
+        self.row_locks
+            .is_some_and(|row_locks| row_locks.level == RowLockLevel::RepeatableRead)
+    }
+
+    pub(crate) fn keep_the_gap_an_undone_insert_left(
+        &self,
+        key: &RowKey,
+        low: Option<RowKey>,
+        high: Option<RowKey>,
+    ) {
+        self.db.keep_the_gap_an_undone_insert_left(
+            self.tx_id,
+            GapBetween {
+                table_id: self.table_id,
+                low,
+                high,
+            },
+            |inserted| {
+                if inserted < key {
+                    GapKey::BelowTheScan
+                } else {
+                    GapKey::AboveTheScan
+                }
+            },
+        );
+    }
+
+    pub(crate) fn table_id(&self) -> crate::mvcc::database::MVTableId {
+        self.table_id
     }
 
     fn row_locks_in_force(&self) -> CursorRowLocks {

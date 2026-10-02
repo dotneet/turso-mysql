@@ -3596,6 +3596,16 @@ impl Program {
                             "Failed to rollback statement savepoint during abort",
                         );
                     }
+                    let waits_to_run_again = matches!(err, Some(LimboError::RowLocked(_)));
+                    if !waits_to_run_again && !must_rollback_tx_if_needed {
+                        if let Err(gap_err) = self.lock_the_gaps_undone_inserts_left(pager, state) {
+                            capture_abort_error(
+                                &mut abort_error,
+                                gap_err,
+                                "Failed to lock the gaps a failed statement's inserts left",
+                            );
+                        }
+                    }
                 }
             }
             match err {
@@ -3844,6 +3854,62 @@ impl Program {
         state.auto_txn_cleanup = TxnCleanup::None;
         if let Some(err) = abort_error {
             return Err(err);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lock_the_gaps_undone_inserts_left(
+        &self,
+        pager: &Arc<Pager>,
+        state: &mut ProgramState,
+    ) -> Result<()> {
+        let mv_store = self.connection.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.connection.get_mv_tx_id() else {
+            return Ok(());
+        };
+        let undone = mv_store.take_inserts_the_last_statement_undid(tx_id);
+        if !mv_store.row_locks_enabled() {
+            return Ok(());
+        }
+        let undone_rows: Vec<i64> = undone
+            .iter()
+            .filter_map(|key| match key.row_id {
+                crate::mvcc::database::RowKey::Int(rowid) => Some(rowid),
+                crate::mvcc::database::RowKey::Record(_) => None,
+            })
+            .collect();
+        let of_an_undone_row = |key: &crate::mvcc::database::RowKey| match key {
+            crate::mvcc::database::RowKey::Int(_) => true,
+            crate::mvcc::database::RowKey::Record(record) => matches!(
+                record.key.last_value(),
+                Some(Ok(ValueRef::Numeric(crate::numeric::Numeric::Integer(rowid)))) if undone_rows.contains(&rowid)
+            ),
+        };
+        for key in undone.iter().filter(|key| of_an_undone_row(&key.row_id)) {
+            let Some(cursor_id) = (0..state.cursors.len()).find(|cursor_id| {
+                row_lock_hooks::mvcc_cursor(state, *cursor_id)
+                    .is_some_and(|cursor| cursor.table_id() == key.table_id && cursor.keeps_gaps())
+            }) else {
+                continue;
+            };
+            let cursor = row_lock_hooks::mvcc_cursor(state, cursor_id)
+                .expect("the cursor was found just above");
+            let low = crate::util::IOExt::block(pager.io.as_ref(), || {
+                cursor.neighbor_of_an_undone_insert(
+                    &key.row_id,
+                    crate::mvcc::cursor::UndoneInsertNeighbor::Below,
+                )
+            })?;
+            let high = crate::util::IOExt::block(pager.io.as_ref(), || {
+                cursor.neighbor_of_an_undone_insert(
+                    &key.row_id,
+                    crate::mvcc::cursor::UndoneInsertNeighbor::Above,
+                )
+            })?;
+            cursor.keep_the_gap_an_undone_insert_left(&key.row_id, low, high);
         }
         Ok(())
     }

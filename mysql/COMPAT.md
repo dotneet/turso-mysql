@@ -3786,6 +3786,14 @@ and here, an insert by a third session meanwhile takes the ids after them, the w
 keeps its ids when the other transaction rolls back, and spends them when it commits and the
 insert answers 1062. A first row that fails to fill still spends no id, no id is written twice,
 and an insert given up for a deadlock writes nothing.
+A statement that fails or gives up waiting lets go of the rows it inserted, so a locking read
+over them no longer waits, but under `REPEATABLE READ` and `SERIALIZABLE` keeps the gap each
+row was in, in its table and in every index, until the transaction ends, so another
+transaction's insert there waits — measured on 8.4.11 with `performance_schema.data_locks`
+(`X,GAP` on the row after each undone one). Under `READ COMMITTED`, and after `ROLLBACK TO
+SAVEPOINT`, nothing of the undone rows is kept. The engine writes a row's index entries before
+its table row, so the entries of a row whose table row a statement never wrote leave no gap
+here; InnoDB, which writes the table row first, would keep one in the indexes it reached.
 
 `LOCK IN SHARE MODE`, MySQL's older spelling of `FOR SHARE` — the one Laravel's
 `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` write — is read as `FOR SHARE` and takes

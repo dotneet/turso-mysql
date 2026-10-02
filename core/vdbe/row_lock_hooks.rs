@@ -372,7 +372,7 @@ fn reads_its_cursor(insn: &Insn) -> bool {
     )
 }
 
-fn mvcc_cursor(state: &mut ProgramState, cursor_id: CursorID) -> Option<&mut MvCursor> {
+pub(super) fn mvcc_cursor(state: &mut ProgramState, cursor_id: CursorID) -> Option<&mut MvCursor> {
     match state.cursors.get_mut(cursor_id)? {
         Some(cursor @ (Cursor::BTree(..) | Cursor::Dyn(..))) => {
             let cursor = cursor.as_btree_mut() as &mut dyn Any;

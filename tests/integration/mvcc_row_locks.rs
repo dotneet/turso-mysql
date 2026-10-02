@@ -1065,6 +1065,97 @@ fn a_missed_key_locks_the_gap_up_to_another_transactions_uncommitted_row() {
     inserter.execute("ROLLBACK").unwrap();
 }
 
+#[test]
+fn a_failed_statement_lets_go_of_its_inserted_rows_and_keeps_the_gaps_they_were_in() {
+    let db = database_with_gaps_to_lock();
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        writer.execute("INSERT INTO t VALUES (25, 25, 25, 0), (10, 10, 99, 0)"),
+        Err(LimboError::Constraint(_))
+    ));
+    assert!(!writer.get_auto_commit());
+    assert!(!locking_read_waits(
+        &db,
+        RowLockLevel::RepeatableRead,
+        "SELECT id FROM t WHERE id > 20 AND id < 30"
+    ));
+    assert!(waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (5, 30, 5, 0)"));
+    assert!(waits(&db, "INSERT INTO t VALUES (6, 0, 22, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (15, 15, 15, 0)"));
+    writer.execute("COMMIT").unwrap();
+    assert!(!waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+}
+
+#[test]
+fn an_insert_that_gives_up_waiting_keeps_the_gaps_its_undone_rows_were_in() {
+    let db = database_with_gaps_to_lock();
+    let holder = session(&db);
+    holder.execute("BEGIN CONCURRENT").unwrap();
+    assert!(locked_ids(
+        &holder,
+        "SELECT id FROM t WHERE id = 35",
+        RowLockMode::Exclusive
+    )
+    .is_empty());
+    let writer = session(&db);
+    writer.set_busy_timeout(Duration::from_millis(200));
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        writer.execute("INSERT INTO t VALUES (25, 25, 25, 0), (35, 35, 35, 0)"),
+        Err(LimboError::Busy)
+    ));
+    assert!(!writer.get_auto_commit());
+    holder.execute("COMMIT").unwrap();
+    assert!(!locking_read_waits(
+        &db,
+        RowLockLevel::RepeatableRead,
+        "SELECT id FROM t WHERE id > 20 AND id < 30"
+    ));
+    assert!(waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+    assert!(!waits(&db, "INSERT INTO t VALUES (36, 0, 36, 0)"));
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_failed_statement_under_read_committed_keeps_nothing_of_its_inserted_rows() {
+    let db = database_with_gaps_to_lock();
+    let writer = session(&db);
+    writer.set_row_lock_level(RowLockLevel::ReadCommitted);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        writer.execute("INSERT INTO t VALUES (25, 25, 25, 0), (10, 10, 99, 0)"),
+        Err(LimboError::Constraint(_))
+    ));
+    assert!(!locking_read_waits(
+        &db,
+        RowLockLevel::RepeatableRead,
+        "SELECT id FROM t WHERE id > 20 AND id < 30"
+    ));
+    assert!(!waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_rollback_to_a_savepoint_keeps_nothing_of_the_rows_it_undid() {
+    let db = database_with_gaps_to_lock();
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("SAVEPOINT s").unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (25, 25, 25, 0)")
+        .unwrap();
+    writer.execute("ROLLBACK TO SAVEPOINT s").unwrap();
+    assert!(!locking_read_waits(
+        &db,
+        RowLockLevel::RepeatableRead,
+        "SELECT id FROM t WHERE id > 20 AND id < 30"
+    ));
+    assert!(!waits(&db, "INSERT INTO t VALUES (27, 0, 27, 0)"));
+    writer.execute("COMMIT").unwrap();
+}
+
 fn database_with_gaps_to_lock() -> TempDatabase {
     let db = TempDatabase::builder()
         .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))
