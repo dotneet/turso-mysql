@@ -352,6 +352,77 @@ fn two_sessions_inserting_counted_rows_at_once_both_write_every_row() {
     assert_eq!(names(&mut one).len(), 2 * ROUNDS);
 }
 
+/// Measured on MySQL 8.4.11: a counted insert waiting for a key another
+/// transaction holds, given up as the victim of a deadlock, answers 1213 and
+/// its transaction is rolled back whole; nothing it wrote stays, even once
+/// the key is free again.
+#[test]
+fn a_counted_insert_given_up_for_a_deadlock_writes_nothing() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let (_directory, sessions) = sessions(3);
+    let [mut one, mut two, mut three] = <[Adapter; 3]>::try_from(sessions).ok().unwrap();
+    run(
+        &mut one,
+        "CREATE TABLE accounts (id INT NOT NULL PRIMARY KEY, balance INT)",
+    );
+    run(
+        &mut one,
+        "INSERT INTO accounts (id, balance) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE accounts SET balance = 11 WHERE id = 1");
+    run(&mut two, "BEGIN");
+    run(&mut two, "INSERT INTO tags (name) VALUES ('held')");
+    run(&mut two, "UPDATE accounts SET balance = 21 WHERE id = 2");
+    run(&mut two, "UPDATE accounts SET balance = 31 WHERE id = 3");
+
+    let given_up = in_the_background(one, "INSERT INTO tags (name) VALUES ('held')");
+    assert!(still_waiting(&given_up));
+    run(&mut three, "INSERT INTO tags (name) VALUES ('third')");
+    run(&mut two, "UPDATE accounts SET balance = 12 WHERE id = 1");
+    run(&mut two, "ROLLBACK");
+
+    let (mut one, result) = given_up.join().unwrap();
+    assert_eq!(result, Err(FrontendErrorKind::SerializationFailure));
+    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    assert_eq!(names(&mut one), ["third"]);
+    assert_eq!(balances(&mut one), ["10", "20", "30"]);
+}
+
+fn sessions(count: usize) -> (tempfile::TempDir, Vec<Adapter>) {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (directory, catalog, factory) = catalog_factory(authorizer.clone());
+    catalog.create("prisma").unwrap();
+    let mut first = session_of(factory, 190);
+    run(&mut first, PRISMA_TAGS);
+    let mut sessions = vec![first];
+    for session in 1..count {
+        let factory = AuthorizedDatabaseAdapterFactory::new(
+            catalog.clone(),
+            binary_context(),
+            authorizer.clone(),
+        );
+        sessions.push(session_of(factory, 190 + session as u8));
+    }
+    (directory, sessions)
+}
+
+fn session_of(
+    factory: AuthorizedDatabaseAdapterFactory<RecordingAuthorizer>,
+    account: u8,
+) -> Adapter {
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([account; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("prisma").unwrap();
+    adapter
+}
+
 /// Measured on MySQL 8.4.11 with `innodb_lock_wait_timeout = 1`: an update
 /// of a row another open transaction updated waits for that transaction,
 /// answers 1205 after about a second, and once the transaction commits the

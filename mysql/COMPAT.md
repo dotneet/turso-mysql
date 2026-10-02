@@ -3742,6 +3742,11 @@ Outside a transaction a locking read holds its locks for its own statement only.
 What InnoDB does that this does not do yet: it locks the gaps between rows too, so measured on
 8.4.11 an `INSERT` into a range another transaction read with `FOR UPDATE` waits, and a locking
 read that meets a row another open transaction inserted waits for it; here neither waits.
+An `INSERT` into an `AUTO_INCREMENT` table takes its id before it waits for a key another
+transaction holds, so measured on 8.4.11 an insert by a third session meanwhile takes the next
+id after it; here the waiting insert takes its id only once the wait ends, so the third
+session's insert takes the id MySQL gave the waiting one. Either way no id is written twice and
+an insert given up for a deadlock writes nothing.
 
 `LOCK IN SHARE MODE`, MySQL's older spelling of `FOR SHARE` — the one Laravel's
 `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` write — is read as `FOR SHARE` and takes

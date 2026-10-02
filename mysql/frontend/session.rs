@@ -11155,9 +11155,10 @@ impl MySqlConnection {
     /// their own twice if the statement had to be written again.
     ///
     /// The engine ends the whole transaction, savepoint and all, on a value
-    /// the assignment check refuses, where it ends only the statement on a
-    /// broken constraint; the savepoint stands exactly while a transaction is
-    /// open, so each step checks that first.
+    /// the assignment check refuses and on a deadlock, where it ends only the
+    /// statement on a broken constraint; the savepoint stands exactly while a
+    /// transaction is open, so each step checks that first, and a statement
+    /// whose transaction ended is never written again outside it.
     fn write_counted_rows(
         &self,
         sql: &str,
@@ -11240,7 +11241,8 @@ impl MySqlConnection {
                 }
             };
             let taken = self.reserve_insert_row_ids(bound, table, values, deadline)?;
-            if taken.ids == predicted.ids {
+            let the_transaction_ended = self.inner.get_auto_commit();
+            if taken.ids == predicted.ids || the_transaction_ended {
                 return Ok(match failure {
                     None => Ok(taken),
                     Some(error) => Err(error),
