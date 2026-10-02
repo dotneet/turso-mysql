@@ -1008,6 +1008,7 @@ pub fn emit_upsert(
                     upsert_database_id,
                     resolver,
                     &layout,
+                    &mut |_, _| Ok(()),
                 )?;
             }
             let upsert_indices: Vec<_> = resolver.with_schema(upsert_database_id, |s| {

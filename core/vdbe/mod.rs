@@ -939,6 +939,7 @@ pub struct ProgramState {
     pub(crate) row_lock_work: Option<row_lock_hooks::RowLockWork>,
     pub(crate) before_writing: Option<BeforeWriting>,
     pub(crate) inserts_into_redefined_tables: Vec<String>,
+    pub(crate) refused_writes: Vec<crate::mvcc::database::RowID>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1120,6 +1121,7 @@ impl ProgramState {
             row_lock_work: None,
             before_writing: None,
             inserts_into_redefined_tables: Vec::new(),
+            refused_writes: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1222,6 +1224,7 @@ impl ProgramState {
         self.row_lock_work = None;
         self.before_writing = None;
         self.inserts_into_redefined_tables.clear();
+        self.refused_writes.clear();
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -3873,6 +3876,7 @@ impl Program {
         pager: &Arc<Pager>,
         state: &mut ProgramState,
     ) -> Result<()> {
+        let refused = std::mem::take(&mut state.refused_writes);
         let mv_store = self.connection.mv_store();
         let Some(mv_store) = mv_store.as_ref() else {
             return Ok(());
@@ -3899,28 +3903,59 @@ impl Program {
             ),
         };
         for key in undone.iter().filter(|key| of_an_undone_row(&key.row_id)) {
-            let Some(cursor_id) = (0..state.cursors.len()).find(|cursor_id| {
-                row_lock_hooks::mvcc_cursor(state, *cursor_id)
-                    .is_some_and(|cursor| cursor.table_id() == key.table_id && cursor.keeps_gaps())
-            }) else {
-                continue;
-            };
-            let cursor = row_lock_hooks::mvcc_cursor(state, cursor_id)
-                .expect("the cursor was found just above");
-            let low = crate::util::IOExt::block(pager.io.as_ref(), || {
-                cursor.neighbor_of_an_undone_insert(
-                    &key.row_id,
-                    crate::mvcc::cursor::UndoneInsertNeighbor::Below,
-                )
-            })?;
-            let high = crate::util::IOExt::block(pager.io.as_ref(), || {
-                cursor.neighbor_of_an_undone_insert(
-                    &key.row_id,
-                    crate::mvcc::cursor::UndoneInsertNeighbor::Above,
-                )
-            })?;
-            cursor.keep_the_gap_an_undone_insert_left(&key.row_id, low, high);
+            self.keep_the_gap_a_row_left(
+                pager,
+                state,
+                key,
+                crate::mvcc::cursor::UndoneInsertNeighbor::Below,
+            )?;
         }
+        for key in &refused {
+            self.keep_the_gap_a_row_left(
+                pager,
+                state,
+                key,
+                crate::mvcc::cursor::UndoneInsertNeighbor::AtOrBelow,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn keep_the_gap_a_row_left(
+        &self,
+        pager: &Arc<Pager>,
+        state: &mut ProgramState,
+        key: &crate::mvcc::database::RowID,
+        below: crate::mvcc::cursor::UndoneInsertNeighbor,
+    ) -> Result<()> {
+        let Some(cursor_id) = (0..state.cursors.len()).find(|cursor_id| {
+            row_lock_hooks::mvcc_cursor(state, *cursor_id)
+                .is_some_and(|cursor| cursor.table_id() == key.table_id && cursor.keeps_gaps())
+        }) else {
+            return Ok(());
+        };
+        let rowid_is_the_key = matches!(
+            &self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(table) if table.rowid_is_its_key()
+        );
+        if matches!(key.row_id, crate::mvcc::database::RowKey::Int(_)) && !rowid_is_the_key {
+            return Ok(());
+        }
+        let cursor =
+            row_lock_hooks::mvcc_cursor(state, cursor_id).expect("the cursor was found just above");
+        let low = crate::util::IOExt::block(pager.io.as_ref(), || {
+            cursor.neighbor_of_an_undone_insert(&key.row_id, below)
+        })?;
+        if low.as_ref() == Some(&key.row_id) {
+            return Ok(());
+        }
+        let high = crate::util::IOExt::block(pager.io.as_ref(), || {
+            cursor.neighbor_of_an_undone_insert(
+                &key.row_id,
+                crate::mvcc::cursor::UndoneInsertNeighbor::Above,
+            )
+        })?;
+        cursor.keep_the_gap_an_undone_insert_left(&key.row_id, low, high);
         Ok(())
     }
 

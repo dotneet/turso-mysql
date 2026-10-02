@@ -33,7 +33,7 @@ use crate::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
             emit_fk_parent_deferred_new_key_probes, emit_fk_update_parent_actions,
             fire_fk_update_actions, stabilize_new_row_for_fk, ForeignKeyActions,
-            ParentKeyNewProbeMode,
+            ParentKeyNewProbeMode, RowWrite,
         },
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
@@ -2210,6 +2210,43 @@ fn emit_update_insns<'a>(
                     update_database_id,
                     &t_ctx.resolver,
                     &layout,
+                    &mut |program, writes| {
+                        for write in writes {
+                            match write {
+                                RowWrite::TableRow if updates_rowid => {
+                                    program.emit_insn(Insn::RefusedWrite {
+                                        cursor_id: target_table_cursor_id,
+                                        key_reg: effective_rowid_reg,
+                                    })
+                                }
+                                RowWrite::TableRow => {}
+                                RowWrite::IndexEntry(index) => {
+                                    let Some(ctx) = indexes_to_update
+                                        .iter()
+                                        .zip(idx_phase_ctxs.iter())
+                                        .find(|(updated, _)| updated.name == index.name)
+                                        .map(|(_, ctx)| ctx)
+                                    else {
+                                        continue;
+                                    };
+                                    let not_written = program.allocate_label();
+                                    if let Some(new_satisfied) = ctx.new_satisfies_where {
+                                        program.emit_insn(Insn::IfNot {
+                                            reg: new_satisfied,
+                                            target_pc: not_written,
+                                            jump_if_null: true,
+                                        });
+                                    }
+                                    program.emit_insn(Insn::RefusedWrite {
+                                        cursor_id: ctx.idx_cursor_id,
+                                        key_reg: ctx.record_reg,
+                                    });
+                                    program.preassign_label_to_next_insn(not_written);
+                                }
+                            }
+                        }
+                        Ok(())
+                    },
                 )?;
             }
         }

@@ -5908,6 +5908,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Err(LimboError::GapLocked(holders))
     }
 
+    pub(crate) fn refuse_a_refused_write_into_a_locked_gap(
+        &self,
+        tx_id: TxID,
+        id: &RowID,
+    ) -> Result<()> {
+        if self.rewrites_a_row_it_deleted(tx_id, id) {
+            return Ok(());
+        }
+        let holders = self.row_locks.holders_of_the_gaps_around(tx_id, id);
+        if holders.is_empty() {
+            return Ok(());
+        }
+        Err(LimboError::GapLocked(holders))
+    }
+
     fn rewrites_a_row_it_deleted(&self, tx_id: TxID, id: &RowID) -> bool {
         let deleted_by_it = |versions: &[RowVersion]| {
             versions

@@ -5990,15 +5990,39 @@ parent goes ahead. Two transactions that each inserted a child of one parent
 and then both update that parent end in 1213 for the one whose wait closes
 the cycle.
 
-Two differences remain, both from the order InnoDB writes a row in. InnoDB
-writes a child row's primary key record, and every index before the foreign
-key's own, before it checks the key, so under `REPEATABLE READ` a child
-refused with 1452 keeps the gaps that row would have filled there (`X` on the
-next record) and another session's child insert into one waits; the engine
-checks before it writes anything, so nothing of a refused child is kept. And
-an `ON UPDATE CASCADE` changes each child as InnoDB's read of the child index
-reaches it, so InnoDB's gap lock stops at the first child it moved; here the
-gap reaches the next child of another parent.
+InnoDB writes a child row's primary key record, then its unique keys, then its
+other keys in the order they were made, and checks a foreign key just before it
+writes the first key whose leading columns are the foreign key's. Measured on
+8.4.11 with `performance_schema.data_locks`, a child refused with 1452 under
+`REPEATABLE READ` or `SERIALIZABLE` therefore keeps, until its transaction
+ends, the gap the row would have filled in the primary key and in each key
+written before the foreign key's own (`X,GAP` on the next record, `X` on the
+supremum at the end of the table), and none in the keys after it: with an
+`AUTO_INCREMENT` child every other session's insert waits, since each goes at
+the end of the table. Under `READ COMMITTED` nothing is kept. An `UPDATE`
+refused with 1452 keeps the gap of each entry it moved before the foreign key's
+key — the new primary key when it changes it, and the new entry of a key whose
+columns it changes — and none for an entry it left as it was. Before the
+check, the row waits, as InnoDB's insert does, for a gap another session holds
+where it would have been written, and answers 1205 if that session keeps it.
+A row naming two missing parents is refused at the foreign key whose key
+InnoDB reaches first, locking only that parent's gap. The engine checks the
+foreign key before it writes anything, so it takes these gaps without writing
+the row, and each of these was measured and is matched. A refused row's
+`AUTO_INCREMENT` id is spent, as InnoDB spends it.
+
+Some differences remain. A secondary key's entry here ends with the rowid, not
+with the primary key, so an `UPDATE` that changes a primary key that is not
+counted leaves the entries of the keys before the foreign key's in place,
+where InnoDB moves each of them and keeps the gap each new entry was in. The
+key the server makes for a foreign key whose columns no declared key covers
+goes after every key the `CREATE TABLE` declares, where InnoDB places it where
+the `FOREIGN KEY` clause stands, so a key declared after that clause is
+written before the foreign key check here and after it in InnoDB. An `INSERT
+... ON DUPLICATE KEY UPDATE` whose update is refused with 1452 keeps no gap of
+its own. And an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
+child index reaches it, so InnoDB's gap lock stops at the first child it moved;
+here the gap reaches the next child of another parent.
 
 `SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
 counted from one in declaration order, with its `ON DELETE` and `ON UPDATE`

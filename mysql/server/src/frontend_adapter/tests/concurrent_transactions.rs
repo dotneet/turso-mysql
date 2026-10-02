@@ -1351,6 +1351,220 @@ fn a_refused_delete_of_every_parent_keeps_only_the_parents_it_reached() {
     run(&mut one, "ROLLBACK");
 }
 
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: InnoDB
+/// writes a counted child's primary key record before it checks the foreign
+/// key, so a child refused with 1452 under `REPEATABLE READ` keeps the gap at
+/// the end of the table (`X` on the supremum) and another session's insert
+/// waits; under `READ COMMITTED` it keeps nothing. The refused row spent its
+/// id either way.
+#[test]
+fn a_refused_counted_child_keeps_the_end_of_the_table_only_under_repeatable_read() {
+    for (level, keeps_the_gap) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        assert_eq!(
+            one.execute_query("INSERT INTO children (a, parent_id) VALUES (15, 99)")
+                .map(|_| ()),
+            Err(FrontendErrorKind::ForeignKeyViolation),
+            "{level}"
+        );
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        let insert = two
+            .execute_query("INSERT INTO children (a, parent_id) VALUES (40, 10)")
+            .map(|_| ());
+        if keeps_the_gap {
+            assert_eq!(insert, Err(FrontendErrorKind::DatabaseBusy), "{level}");
+        } else {
+            assert_eq!(insert, Ok(()), "{level}");
+            assert_eq!(
+                single_value(&mut two, "SELECT id FROM children WHERE a = 40"),
+                "5"
+            );
+        }
+        run(&mut one, "ROLLBACK");
+    }
+}
+
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: InnoDB
+/// writes a child's primary key and then its keys in order, checking the
+/// foreign key just before the key on its column, so a child refused with
+/// 1452 under `REPEATABLE READ` keeps the gap it would have filled in the
+/// primary key and in `ka` (`X,GAP` on the next entry) and none in `kb`;
+/// under `READ COMMITTED` it keeps nothing.
+#[test]
+fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_its_foreign_key() {
+    for (level, keeps_the_gaps) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        assert_eq!(
+            one.execute_query(
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (5, 15, 99, 150)"
+            )
+            .map(|_| ()),
+            Err(FrontendErrorKind::ForeignKeyViolation),
+            "{level}"
+        );
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        for insert in [
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (6, 40, 10, 400)",
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (20, 16, 10, 400)",
+        ] {
+            let inserted = two.execute_query(insert).map(|_| ());
+            if keeps_the_gaps {
+                assert_eq!(
+                    inserted,
+                    Err(FrontendErrorKind::DatabaseBusy),
+                    "{level}: {insert}"
+                );
+            } else {
+                assert_eq!(inserted, Ok(()), "{level}: {insert}");
+            }
+        }
+        run(
+            &mut two,
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 40, 10, 160)",
+        );
+        run(&mut one, "ROLLBACK");
+    }
+}
+
+/// Measured on MySQL 8.4.11: a child that will be refused with 1452 first
+/// waits, and answers 1205, for a gap another session holds where InnoDB
+/// writes before the foreign key check, while a gap in a key after the
+/// foreign key's own is not in its way.
+#[test]
+fn a_refused_child_first_waits_for_a_gap_held_where_innodb_writes_before_its_foreign_key() {
+    for (holder_reads, child_waits) in [
+        (
+            "SELECT id FROM keyed_children WHERE id > 2 AND id < 10 FOR UPDATE",
+            true,
+        ),
+        (
+            "SELECT id FROM keyed_children WHERE b > 120 AND b < 200 FOR UPDATE",
+            false,
+        ),
+    ] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(&mut two, "BEGIN");
+        run(&mut two, holder_reads);
+        run(&mut one, "SET SESSION innodb_lock_wait_timeout = 1");
+        run(&mut one, "BEGIN");
+        let refused = one
+            .execute_query(
+                "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (5, 15, 99, 150)",
+            )
+            .map(|_| ());
+        if child_waits {
+            assert_eq!(
+                refused,
+                Err(FrontendErrorKind::DatabaseBusy),
+                "{holder_reads}"
+            );
+        } else {
+            assert_eq!(
+                refused,
+                Err(FrontendErrorKind::ForeignKeyViolation),
+                "{holder_reads}"
+            );
+        }
+        run(&mut one, "ROLLBACK");
+        run(&mut two, "ROLLBACK");
+    }
+}
+
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: an update
+/// refused with 1452 has already moved the row's entry in `ka`, a key before
+/// the foreign key's, so under `REPEATABLE READ` it keeps the gap the new
+/// entry was in (`X,GAP` on the next entry) and none in `kb`.
+#[test]
+fn a_refused_child_update_keeps_the_gap_of_the_entry_it_moved_before_its_foreign_key() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = refused_child_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    assert_eq!(
+        one.execute_query("UPDATE keyed_children SET parent_id = 99, a = 25, b = 250 WHERE id = 2")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query(
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (20, 27, 10, 400)"
+        )
+        .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(
+        &mut two,
+        "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 40, 10, 250)",
+    );
+    run(&mut one, "ROLLBACK");
+}
+
+fn refused_child_sessions() -> Option<TwoSessions> {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return None;
+    }
+    let mut sessions = two_sessions();
+    for statement in [
+        "CREATE TABLE parents (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE children (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT, \
+         parent_id INT, KEY ka (a), FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        "CREATE TABLE keyed_children (id INT NOT NULL PRIMARY KEY, a INT, parent_id INT, \
+         b INT, KEY ka (a), KEY kp (parent_id), KEY kb (b), \
+         FOREIGN KEY (parent_id) REFERENCES parents (id))",
+        "INSERT INTO parents (id, v) VALUES (10, 1), (20, 2), (30, 3)",
+        "INSERT INTO children (a, parent_id) VALUES (10, 10), (20, 20), (30, 30)",
+        "INSERT INTO keyed_children (id, a, parent_id, b) \
+         VALUES (1, 10, 10, 100), (2, 20, 20, 200), (10, 30, 30, 300)",
+    ] {
+        run(&mut sessions.one, statement);
+    }
+    Some(sessions)
+}
+
+fn single_value(adapter: &mut Adapter, sql: &str) -> String {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must read back");
+    };
+    String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
+}
+
 fn foreign_key_sessions(action: &str) -> Option<TwoSessions> {
     if !turso_mysql::databases_open_in_mvcc() {
         return None;

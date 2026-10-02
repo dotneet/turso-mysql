@@ -3671,6 +3671,10 @@ impl BTreeTable {
             .find(|(_, column)| column.is_rowid_alias())
     }
 
+    pub fn rowid_is_its_key(&self) -> bool {
+        self.get_rowid_alias_column().is_some() || self.primary_key_columns.is_empty()
+    }
+
     pub fn has_virtual_columns(&self) -> bool {
         self.has_virtual_columns
     }

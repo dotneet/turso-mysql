@@ -19035,6 +19035,51 @@ pub fn op_fk_check(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_refused_write(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(RefusedWrite { cursor_id, key_reg }, *insn);
+    let locks_rows = super::row_lock_hooks::mvcc_cursor(state, cursor_id)
+        .is_some_and(|cursor| cursor.locks_rows());
+    if locks_rows {
+        run_the_hook_before_writing(program, state, cursor_id)?;
+        let key = match &state.registers[key_reg] {
+            Register::Record(record) => RefusedKey::IndexEntry(record.clone()),
+            register => match register.get_value() {
+                Value::Numeric(Numeric::Integer(rowid)) => RefusedKey::TableRow(*rowid),
+                value => {
+                    return Err(LimboError::InternalError(format!(
+                        "a refused write needs a rowid or an index record, got {value:?}"
+                    ))
+                    .into())
+                }
+            },
+        };
+        let cursor = super::row_lock_hooks::mvcc_cursor(state, cursor_id)
+            .expect("the cursor was found just above");
+        let kept = match &key {
+            RefusedKey::TableRow(rowid) => {
+                cursor.gap_a_refused_write_leaves(&BTreeKey::new_table_rowid(*rowid, None))?
+            }
+            RefusedKey::IndexEntry(record) => cursor
+                .gap_a_refused_write_leaves(&BTreeKey::new_index_key(record.as_record_ref()))?,
+        };
+        if let Some(kept) = kept {
+            state.refused_writes.push(kept);
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+enum RefusedKey {
+    TableRow(i64),
+    IndexEntry(ImmutableRecord),
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

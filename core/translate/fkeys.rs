@@ -1065,6 +1065,7 @@ pub fn emit_fk_child_update_counters(
     database_id: usize,
     resolver: &Resolver,
     layout: &ColumnLayout,
+    refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
 ) -> Result<()> {
     // Helper: materialize OLD FK column values.
     // Returns (dml_ctx, fk_col_positions, null_skip_label).
@@ -1107,9 +1108,15 @@ pub fn emit_fk_child_update_counters(
 
     let row_by_row = program.checks_foreign_keys_row_by_row;
     let primary_key_changes = row_by_row && primary_key_is_updated(child_tbl, updated_cols);
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
+    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
+        s.get_indices(child_table_name).cloned().collect()
+    });
+    let mut fk_refs =
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?;
+    if row_by_row {
+        sort_by_the_index_innodb_checks_them_at(&mut fk_refs, child_tbl, &indexes);
+    }
+    for fk_ref in fk_refs {
         // If the child-side FK columns did not change, there is nothing to do.
         if !fk_ref.child_key_changed(updated_cols, child_tbl) && !primary_key_changes {
             continue;
@@ -1323,7 +1330,7 @@ pub fn emit_fk_child_update_counters(
             // missing: violation (immediate HALT or deferred +1)
             program.preassign_label_to_next_insn(violation);
             program.emit_insn(Insn::Close { cursor_id: pcur });
-            emit_fk_violation(program, &fk_ref.fk)?;
+            emit_fk_child_violation(program, &fk_ref, child_tbl, &indexes, refused_writes)?;
         } else {
             let parent_tbl = resolver
                 .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
@@ -1367,10 +1374,7 @@ pub fn emit_fk_child_update_counters(
                 probe,
                 ncols,
                 |_p| Ok(()),
-                |p| {
-                    emit_fk_violation(p, &fk_ref.fk)?;
-                    Ok(())
-                },
+                |p| emit_fk_child_violation(p, &fk_ref, child_tbl, &indexes, refused_writes),
             )?;
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
         }
@@ -1380,6 +1384,22 @@ pub fn emit_fk_child_update_counters(
     }
 
     Ok(())
+}
+
+fn emit_fk_child_violation(
+    program: &mut ProgramBuilder,
+    fk_ref: &ResolvedFkRef,
+    child_tbl: &BTreeTable,
+    indexes: &[Arc<Index>],
+    refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
+) -> Result<()> {
+    if program.checks_foreign_keys_row_by_row && !fk_ref.fk.deferred {
+        refused_writes(
+            program,
+            &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
+        )?;
+    }
+    emit_fk_violation(program, &fk_ref.fk)
 }
 
 fn primary_key_is_updated(table: &BTreeTable, updated_cols: &ColumnMask) -> bool {
@@ -1439,6 +1459,98 @@ fn emit_skip_unless_the_child_index_entry_changes(
         target_pc: unchanged,
     });
     program.preassign_label_to_next_insn(changed);
+}
+
+#[derive(Clone)]
+pub enum RowWrite {
+    TableRow,
+    IndexEntry(Arc<Index>),
+}
+
+pub fn writes_before_the_foreign_key_check(
+    child_tbl: &BTreeTable,
+    indexes: &[Arc<Index>],
+    fk_ref: &ResolvedFkRef,
+) -> Vec<RowWrite> {
+    let mut writes = writes_in_innodb_order(child_tbl, indexes);
+    match writes
+        .iter()
+        .position(|write| leads_with(write, child_tbl, &fk_ref.child_pos))
+    {
+        Some(position) => {
+            writes.truncate(position);
+            writes
+        }
+        None => Vec::new(),
+    }
+}
+
+pub fn sort_by_the_index_innodb_checks_them_at(
+    fk_refs: &mut [ResolvedFkRef],
+    child_tbl: &BTreeTable,
+    indexes: &[Arc<Index>],
+) {
+    let writes = writes_in_innodb_order(child_tbl, indexes);
+    fk_refs.sort_by_key(|fk_ref| {
+        writes
+            .iter()
+            .position(|write| leads_with(write, child_tbl, &fk_ref.child_pos))
+            .unwrap_or(usize::MAX)
+    });
+}
+
+fn writes_in_innodb_order(child_tbl: &BTreeTable, indexes: &[Arc<Index>]) -> Vec<RowWrite> {
+    let primary_key: Vec<usize> = child_tbl
+        .primary_key_columns
+        .iter()
+        .filter_map(|(name, _)| child_tbl.get_column(name).map(|(position, _)| position))
+        .collect();
+    let is_the_primary_key = |index: &Index| {
+        index.unique
+            && index.where_clause.is_none()
+            && index
+                .columns
+                .iter()
+                .map(|column| column.pos_in_table)
+                .eq(primary_key.iter().copied())
+    };
+    let first = if child_tbl.rowid_is_its_key() {
+        RowWrite::TableRow
+    } else {
+        let index = indexes
+            .iter()
+            .find(|index| is_the_primary_key(index))
+            .expect("a primary key that is not the rowid has an index of its own");
+        RowWrite::IndexEntry(index.clone())
+    };
+    let oldest_first = indexes.iter().rev();
+    let others = |unique: bool| {
+        oldest_first
+            .clone()
+            .filter(move |index| index.unique == unique && !is_the_primary_key(index))
+            .map(|index| RowWrite::IndexEntry(index.clone()))
+    };
+    std::iter::once(first)
+        .chain(others(true))
+        .chain(others(false))
+        .collect()
+}
+
+fn leads_with(write: &RowWrite, child_tbl: &BTreeTable, positions: &[usize]) -> bool {
+    match write {
+        RowWrite::TableRow => match child_tbl.get_rowid_alias_column() {
+            Some((rowid_position, _)) => positions == [rowid_position],
+            None => false,
+        },
+        RowWrite::IndexEntry(index) => {
+            index.columns.len() >= positions.len()
+                && index
+                    .columns
+                    .iter()
+                    .zip(positions)
+                    .all(|(column, position)| column.pos_in_table == *position)
+        }
+    }
 }
 
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.

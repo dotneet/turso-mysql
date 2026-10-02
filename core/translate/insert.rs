@@ -23,7 +23,8 @@ use crate::{
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
             emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, ForeignKeyActions,
+            open_read_index, open_read_table, sort_by_the_index_innodb_checks_them_at,
+            writes_before_the_foreign_key_check, ForeignKeyActions, RowWrite,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -953,6 +954,7 @@ pub fn translate_insert(
         // For immediate FKs this emits a direct Halt, so no index entry is written
         // when the parent is missing — matching SQLite's bytecode order.
         let fk_layout = btree_table.column_layout()?;
+        let resolver: &Resolver = resolver;
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -961,6 +963,9 @@ pub fn translate_insert(
             resolver,
             database_id,
             &fk_layout,
+            &mut |program, writes| {
+                emit_refused_writes_of_an_insert(program, resolver, &insertion, &ctx, writes)
+            },
         )?;
     }
 
@@ -1395,6 +1400,43 @@ fn emit_partial_index_check(
     Ok(Some(skip_label))
 }
 
+fn emit_refused_writes_of_an_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    ctx: &InsertEmitCtx,
+    writes: &[RowWrite],
+) -> Result<()> {
+    for write in writes {
+        match write {
+            RowWrite::TableRow => program.emit_insn(Insn::RefusedWrite {
+                cursor_id: ctx.cursor_id,
+                key_reg: insertion.key_register(),
+            }),
+            RowWrite::IndexEntry(index) => {
+                let cursor_id = ctx
+                    .idx_cursors
+                    .iter()
+                    .find(|(name, _, _)| name == &index.name)
+                    .map(|(_, _, cursor_id)| *cursor_id)
+                    .expect("every index of the table has a write cursor");
+                let skip =
+                    emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
+                let (_, record_reg) =
+                    emit_index_record_for_insert(program, resolver, insertion, ctx.table, index)?;
+                program.emit_insn(Insn::RefusedWrite {
+                    cursor_id,
+                    key_reg: record_reg,
+                });
+                if let Some(skip) = skip {
+                    program.preassign_label_to_next_insn(skip);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // COMMIT PHASE: no preflight jumps happened; emit the actual index writes now
 // We re-check partial-index predicates against the NEW image, produce packed records,
 // and insert into all applicable indexes, we do not re-probe uniqueness here, as preflight
@@ -1427,39 +1469,13 @@ fn emit_commit_phase(
         let commit_skip_label =
             emit_partial_index_check(program, resolver, index, insertion, ctx.table)?;
 
-        let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
-
-        // Build [key cols..., rowid] from insertion registers
-        for (i, idx_col) in index.columns.iter().enumerate() {
-            emit_index_column_value_for_insert(
-                program,
-                resolver,
-                insertion,
-                ctx.table,
-                idx_col,
-                idx_start_reg + i,
-            )?;
-        }
-        program.emit_insn(Insn::Copy {
-            src_reg: insertion.key_register(),
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
-
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(idx_start_reg),
-            count: to_u32(num_cols + 1),
-            dest_reg: to_u32(record_reg),
-            index_name: Some(index.name.clone()),
-            affinity_str: None,
-        });
+        let (idx_start_reg, record_reg) =
+            emit_index_record_for_insert(program, resolver, insertion, ctx.table, index)?;
         program.emit_insn(Insn::IdxInsert {
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u32),
+            unpacked_count: Some((index.columns.len() + 1) as u32),
             flags: IdxInsertFlags::new().nchange(true),
         });
 
@@ -1468,6 +1484,44 @@ fn emit_commit_phase(
         }
     }
     Ok(())
+}
+
+fn emit_index_record_for_insert(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+    table: &Arc<BTreeTable>,
+    index: &Index,
+) -> Result<(usize, usize)> {
+    let num_cols = index.columns.len();
+    let idx_start_reg = program.alloc_registers(num_cols + 1);
+
+    // Build [key cols..., rowid] from insertion registers
+    for (i, idx_col) in index.columns.iter().enumerate() {
+        emit_index_column_value_for_insert(
+            program,
+            resolver,
+            insertion,
+            table,
+            idx_col,
+            idx_start_reg + i,
+        )?;
+    }
+    program.emit_insn(Insn::Copy {
+        src_reg: insertion.key_register(),
+        dst_reg: idx_start_reg + num_cols,
+        extra_amount: 0,
+    });
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(idx_start_reg),
+        count: to_u32(num_cols + 1),
+        dest_reg: to_u32(record_reg),
+        index_name: Some(index.name.clone()),
+        affinity_str: None,
+    });
+    Ok((idx_start_reg, record_reg))
 }
 
 #[turso_macros::trace_stack]
@@ -4011,6 +4065,7 @@ fn emit_replace_delete_conflicting_row(
 /// Child-side FK checks for INSERT of a single row:
 /// For each outgoing FK on `child_tbl`, if the NEW tuple's FK columns are all non-NULL,
 /// verify that the referenced parent key exists.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_fk_child_insert_checks(
     program: &mut ProgramBuilder,
     child_tbl: &BTreeTable,
@@ -4019,10 +4074,17 @@ pub fn emit_fk_child_insert_checks(
     resolver: &Resolver,
     database_id: usize,
     layout: &ColumnLayout,
+    refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?
-    {
+    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
+        s.get_indices(&child_tbl.name).cloned().collect()
+    });
+    let mut fk_refs =
+        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&child_tbl.name))?;
+    if program.checks_foreign_keys_row_by_row {
+        sort_by_the_index_innodb_checks_them_at(&mut fk_refs, child_tbl, &indexes);
+    }
+    for fk_ref in fk_refs {
         let is_self_ref = fk_ref.fk.parent_table.eq_ignore_ascii_case(&child_tbl.name);
 
         // Short-circuit if any NEW component is NULL
@@ -4092,7 +4154,7 @@ pub fn emit_fk_child_insert_checks(
             if fk_ref.fk.deferred {
                 emit_fk_violation(program, &fk_ref.fk)?;
             } else {
-                emit_fk_restrict_halt(program)?;
+                emit_refused_child_halt(program, &fk_ref, child_tbl, &indexes, refused_writes)?;
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4190,11 +4252,10 @@ pub fn emit_fk_child_insert_checks(
                 // on_not_found: immediate → Halt; deferred → counter
                 |p| {
                     if fk_ref.fk.deferred {
-                        emit_fk_violation(p, &fk_ref.fk)?;
+                        emit_fk_violation(p, &fk_ref.fk)
                     } else {
-                        emit_fk_restrict_halt(p)?;
+                        emit_refused_child_halt(p, &fk_ref, child_tbl, &indexes, refused_writes)
                     }
-                    Ok(())
                 },
             )?;
             program.emit_insn(Insn::Goto { target_pc: fk_ok });
@@ -4202,6 +4263,22 @@ pub fn emit_fk_child_insert_checks(
         }
     }
     Ok(())
+}
+
+fn emit_refused_child_halt(
+    program: &mut ProgramBuilder,
+    fk_ref: &ResolvedFkRef,
+    child_tbl: &BTreeTable,
+    indexes: &[Arc<Index>],
+    refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
+) -> Result<()> {
+    if program.checks_foreign_keys_row_by_row {
+        refused_writes(
+            program,
+            &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
+        )?;
+    }
+    emit_fk_restrict_halt(program)
 }
 
 /// Build NEW parent key image in FK parent-column order into a contiguous register block.

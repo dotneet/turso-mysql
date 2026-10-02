@@ -1221,7 +1221,11 @@ fn locked_ids_with(
     policy: RowLockWaitPolicy,
 ) -> turso_core::Result<Vec<i64>> {
     let mut statement = conn.prepare(sql)?;
-    let table = if sql.contains(" FROM p") { "p" } else { "t" };
+    let table = sql
+        .split(" FROM ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("a locking read names its table after FROM");
     statement.lock_rows_it_reads(LockingRead {
         mode,
         policy,
@@ -1648,6 +1652,224 @@ fn a_parent_key_update_locks_nothing_around_the_new_key() {
     assert!(waits(&db, "INSERT INTO c VALUES (7, 15, 0)"));
     assert!(!waits(&db, "INSERT INTO c VALUES (8, 25, 0)"));
     writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_the_foreign_key() {
+    for (level, keeps_the_gaps) in [
+        (RowLockLevel::RepeatableRead, true),
+        (RowLockLevel::ReadCommitted, false),
+    ] {
+        let db = database_with_a_child_of_three_keys();
+        let writer = row_by_row_foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute("INSERT INTO c VALUES (5, 15, 20, 150)");
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            waits(&db, "INSERT INTO c VALUES (6, 40, 50, 400)"),
+            keeps_the_gaps,
+            "{level:?}"
+        );
+        assert_eq!(
+            waits(&db, "INSERT INTO c VALUES (20, 16, 50, 400)"),
+            keeps_the_gaps,
+            "{level:?}"
+        );
+        assert!(
+            !waits(&db, "INSERT INTO c VALUES (20, 40, 50, 160)"),
+            "{level:?}"
+        );
+        assert!(
+            !waits(&db, "INSERT INTO c VALUES (20, 40, 50, 400)"),
+            "{level:?}"
+        );
+        writer.execute("ROLLBACK").unwrap();
+        assert!(!waits(&db, "INSERT INTO c VALUES (6, 40, 50, 400)"));
+    }
+}
+
+#[test]
+fn a_child_refused_after_an_inserted_row_keeps_the_gaps_of_both_and_none_past_the_last_rowid() {
+    let db = database_with_a_child_of_three_keys();
+    let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let refused = writer.execute("INSERT INTO c VALUES (4, 12, 1, 120), (7, 35, 20, 350)");
+    assert!(
+        matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+        "{refused:?}"
+    );
+    assert!(waits(&db, "INSERT INTO c VALUES (6, 5, 50, 400)"));
+    assert!(waits(&db, "INSERT INTO c VALUES (30, 40, 50, 400)"));
+    assert!(waits(&db, "INSERT INTO c VALUES (30, 5, 50, 125)"));
+    assert!(!waits(&db, "INSERT INTO c VALUES (30, 5, 50, 400)"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_refused_child_first_waits_for_a_gap_another_holds_where_innodb_writes_before_the_foreign_key()
+{
+    for (holder_reads, writer_waits) in [
+        ("SELECT id FROM c WHERE id > 2 AND id < 10", true),
+        ("SELECT id FROM c WHERE a > 12 AND a < 20", true),
+        ("SELECT id FROM c WHERE b > 120 AND b < 200", false),
+    ] {
+        let db = database_with_a_child_of_three_keys();
+        let holder = session(&db);
+        holder.execute("BEGIN CONCURRENT").unwrap();
+        assert!(locked_ids(&holder, holder_reads, RowLockMode::Exclusive).is_empty());
+        let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);
+        writer.set_busy_timeout(Duration::from_millis(200));
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute("INSERT INTO c VALUES (5, 15, 20, 150)");
+        if writer_waits {
+            assert!(
+                matches!(refused, Err(LimboError::Busy)),
+                "{holder_reads}: {refused:?}"
+            );
+        } else {
+            assert!(
+                matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+                "{holder_reads}: {refused:?}"
+            );
+        }
+        writer.execute("ROLLBACK").unwrap();
+        holder.execute("COMMIT").unwrap();
+    }
+}
+
+#[test]
+fn a_refused_child_update_keeps_the_gap_of_each_entry_it_would_have_moved_before_the_foreign_key() {
+    for (update, waiting, going) in [
+        (
+            "UPDATE c SET pid = 20, a = 25, b = 250 WHERE id = 2",
+            vec!["INSERT INTO c VALUES (20, 27, 50, 400)"],
+            vec![
+                "INSERT INTO c VALUES (20, 40, 50, 250)",
+                "INSERT INTO c VALUES (6, 40, 50, 400)",
+            ],
+        ),
+        (
+            "UPDATE c SET pid = 20 WHERE id = 2",
+            vec![],
+            vec!["INSERT INTO c VALUES (20, 21, 50, 400)"],
+        ),
+        (
+            "UPDATE c SET id = 7, pid = 20 WHERE id = 2",
+            vec!["INSERT INTO c VALUES (6, 40, 50, 400)"],
+            vec!["INSERT INTO c VALUES (20, 40, 50, 400)"],
+        ),
+    ] {
+        let db = database_with_a_child_of_three_keys();
+        let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute(update);
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{update}: {refused:?}"
+        );
+        for insert in waiting {
+            assert!(waits(&db, insert), "{update}: {insert}");
+        }
+        for insert in going {
+            assert!(!waits(&db, insert), "{update}: {insert}");
+        }
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn a_refused_update_of_a_rowid_key_keeps_the_gap_of_the_new_rowid() {
+    let db = database_with_a_child_of_three_keys();
+    let setup = db.connect_limbo();
+    setup
+        .execute("CREATE TABLE q (id INTEGER PRIMARY KEY, pid INT REFERENCES p (id))")
+        .unwrap();
+    setup.execute("CREATE INDEX q_pid ON q (pid)").unwrap();
+    setup
+        .execute("INSERT INTO q VALUES (1, 1), (2, 2), (10, 50)")
+        .unwrap();
+    for (update, keeps_the_gap) in [
+        ("UPDATE q SET id = 7, pid = 20 WHERE id = 2", true),
+        ("UPDATE q SET pid = 20 WHERE id = 2", false),
+    ] {
+        let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        let refused = writer.execute(update);
+        assert!(
+            matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+            "{update}: {refused:?}"
+        );
+        assert_eq!(
+            waits(&db, "INSERT INTO q VALUES (6, 50)"),
+            keeps_the_gap,
+            "{update}"
+        );
+        assert!(!waits(&db, "INSERT INTO q VALUES (20, 50)"), "{update}");
+        writer.execute("ROLLBACK").unwrap();
+    }
+}
+
+#[test]
+fn a_child_naming_two_missing_parents_is_refused_at_the_key_innodb_writes_first() {
+    let db = database_with_a_child_of_three_keys();
+    let setup = db.connect_limbo();
+    setup.execute("INSERT INTO p VALUES (70, 0)").unwrap();
+    setup
+        .execute(
+            "CREATE TABLE c2 (id INT NOT NULL PRIMARY KEY, qid INT REFERENCES p (id), a INT, \
+             pid INT REFERENCES p (id))",
+        )
+        .unwrap();
+    setup.execute("CREATE INDEX c2_a ON c2 (a)").unwrap();
+    setup.execute("CREATE INDEX c2_pid ON c2 (pid)").unwrap();
+    setup.execute("CREATE INDEX c2_qid ON c2 (qid)").unwrap();
+    setup
+        .execute("INSERT INTO c2 VALUES (1, 1, 10, 1), (10, 50, 30, 50)")
+        .unwrap();
+    let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let refused = writer.execute("INSERT INTO c2 VALUES (5, 60, 15, 20)");
+    assert!(
+        matches!(refused, Err(LimboError::ForeignKeyConstraint(_))),
+        "{refused:?}"
+    );
+    assert!(waits(&db, "INSERT INTO p VALUES (20, 0)"));
+    assert!(!waits(&db, "INSERT INTO p VALUES (60, 0)"));
+    assert!(waits(&db, "INSERT INTO c2 VALUES (6, 1, 40, 1)"));
+    assert!(waits(&db, "INSERT INTO c2 VALUES (20, 1, 12, 1)"));
+    assert!(!waits(&db, "INSERT INTO c2 VALUES (20, 1, 40, 2)"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+fn database_with_a_child_of_three_keys() -> TempDatabase {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, v INT)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, a INT, pid INT REFERENCES p (id), b INT)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX c_a ON c (a)").unwrap();
+    conn.execute("CREATE INDEX c_pid ON c (pid)").unwrap();
+    conn.execute("CREATE INDEX c_b ON c (b)").unwrap();
+    conn.execute("INSERT INTO p VALUES (1, 0), (2, 0), (50, 0)")
+        .unwrap();
+    conn.execute("INSERT INTO c VALUES (1, 10, 1, 100), (2, 20, 2, 200), (10, 30, 50, 300)")
+        .unwrap();
+    db
+}
+
+fn row_by_row_foreign_key_session(db: &TempDatabase, level: RowLockLevel) -> Arc<Connection> {
+    let conn = foreign_key_session(db, level);
+    conn.set_foreign_keys_checked_row_by_row(true);
+    conn
 }
 
 fn database_with_foreign_keys(action: &str) -> TempDatabase {

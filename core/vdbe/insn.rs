@@ -2002,6 +2002,10 @@ pub enum Insn {
         deferred: bool,
         target_pc: BranchOffset,
     },
+    RefusedWrite {
+        cursor_id: CursorID,
+        key_reg: usize,
+    },
     // Check if there are any unresolved foreign key constraint violations.
     // If P1 is zero, check the statement constraint-counter (immediate FK violations).
     // If P1 is non-zero, check the database constraint-counter (deferred FK violations).
@@ -2398,6 +2402,7 @@ impl InsnVariants {
             InsnVariants::FkCounter => execute::op_fk_counter,
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
             InsnVariants::FkCheck => execute::op_fk_check,
+            InsnVariants::RefusedWrite => execute::op_refused_write,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,

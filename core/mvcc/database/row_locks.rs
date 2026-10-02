@@ -273,6 +273,10 @@ impl RowLocks {
         holders
     }
 
+    pub(crate) fn holders_of_the_gaps_around(&self, tx_id: TxID, key: &RowID) -> Vec<TxID> {
+        self.table.lock().gap_holders_around(tx_id, key)
+    }
+
     pub(crate) fn forget_inserts(&self, tx_id: TxID, keys: &[RowID]) {
         let mut table = self.table.lock();
         let forgotten: Vec<&RowID> = keys

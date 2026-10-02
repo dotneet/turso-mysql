@@ -1540,20 +1540,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Insert a row into the table or index.
     /// Sets the cursor to the inserted row.
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
-        let row_id = match key {
-            BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
-            BTreeKey::IndexKey(record) => {
-                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                    panic!("BTreeKey::IndexKey requires Index cursor type");
-                };
-                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
-                    record,
-                    index_info.clone(),
-                    self.db.allocator(),
-                )?);
-                RowID::new(self.table_id, RowKey::Record(sortable_key))
-            }
-        };
+        let row_id = self.row_id_of(key)?;
         let row = match &self.mv_cursor_type {
             MvccCursorType::Table => {
                 let BTreeKey::TableRowId((_, record)) = key else {
@@ -1858,6 +1845,23 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
+    pub(crate) fn row_id_of(&self, key: &BTreeKey) -> Result<RowID> {
+        Ok(match key {
+            BTreeKey::TableRowId((rowid, _)) => RowID::new(self.table_id, RowKey::Int(*rowid)),
+            BTreeKey::IndexKey(record) => {
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("BTreeKey::IndexKey requires Index cursor type");
+                };
+                let sortable_key = Arc::new(SortableIndexKey::new_from_payload_in(
+                    record,
+                    index_info.clone(),
+                    self.db.allocator(),
+                )?);
+                RowID::new(self.table_id, RowKey::Record(sortable_key))
+            }
+        })
+    }
+
     fn last_row(&mut self) -> IOResultOr<()> {
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.

@@ -2587,6 +2587,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::RefusedWrite { cursor_id, key_reg } => (
+            "RefusedWrite",
+            *cursor_id as i64,
+            *key_reg as i64,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
         Insn::FkCheck{ deferred } => (
         "FkCheck",
             *deferred as i64,

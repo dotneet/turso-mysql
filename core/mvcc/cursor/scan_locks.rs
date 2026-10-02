@@ -6,7 +6,7 @@ use crate::mvcc::database::{
     RowLockWaitPolicy, SortableIndexKey,
 };
 use crate::numeric::Numeric;
-use crate::storage::btree::CursorTrait;
+use crate::storage::btree::{BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{IOResult, IOResultOr, IndexInfo, SeekKey, SeekOp, SeekResult, Value};
@@ -104,6 +104,7 @@ pub(super) enum Arrived {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UndoneInsertNeighbor {
     Below,
+    AtOrBelow,
     Above,
 }
 
@@ -360,6 +361,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     ) -> IOResultOr<Option<RowKey>> {
         let op = match side {
             UndoneInsertNeighbor::Below => SeekOp::LT,
+            UndoneInsertNeighbor::AtOrBelow => SeekOp::LE { eq_only: false },
             UndoneInsertNeighbor::Above => SeekOp::GT,
         };
         self.neighbor_of(
@@ -372,6 +374,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     pub(crate) fn keeps_gaps(&self) -> bool {
         self.row_locks
             .is_some_and(|row_locks| row_locks.level == RowLockLevel::RepeatableRead)
+    }
+
+    pub(crate) fn locks_rows(&self) -> bool {
+        self.row_locks.is_some()
+    }
+
+    pub(crate) fn gap_a_refused_write_leaves(&self, key: &BTreeKey) -> Result<Option<RowID>> {
+        let row_id = self.row_id_of(key)?;
+        self.db
+            .refuse_a_refused_write_into_a_locked_gap(self.tx_id, &row_id)?;
+        Ok(self.keeps_gaps().then_some(row_id))
     }
 
     pub(crate) fn keep_the_gap_an_undone_insert_left(
