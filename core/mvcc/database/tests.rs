@@ -840,6 +840,51 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
 }
 
 #[test]
+fn an_internal_helper_run_outside_any_statement_ends_the_transaction_it_began() {
+    let db = MvccTestDb::new();
+    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let other = db.db.connect().unwrap();
+
+    db.conn
+        .prepare_internal("SELECT x FROM t")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    assert!(db.conn.get_mv_tx().is_none());
+    db.conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(db.conn.get_mv_tx().is_none());
+
+    db.conn
+        .prepare_internal("INSERT INTO t VALUES (2)")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    assert!(db.conn.get_mv_tx().is_none());
+    assert_eq!(
+        get_rows(&other, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
+fn an_internal_helper_inside_a_transaction_stays_in_it() {
+    let db = MvccTestDb::new();
+    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let other = db.db.connect().unwrap();
+
+    db.conn.execute("BEGIN CONCURRENT").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.conn
+        .prepare_internal("INSERT INTO t VALUES (2)")
+        .unwrap()
+        .run_ignore_rows()
+        .unwrap();
+    assert!(get_rows(&other, "SELECT x FROM t").is_empty());
+    db.conn.execute("ROLLBACK").unwrap();
+    assert!(get_rows(&db.conn, "SELECT x FROM t").is_empty());
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the

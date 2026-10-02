@@ -1272,6 +1272,7 @@ impl Connection {
         }
 
         let needs_nested_guard = origin.needs_nested_guard();
+        let keeps_nested_guard = needs_nested_guard && self.has_a_statement_or_transaction();
         if needs_nested_guard {
             self.start_nested();
         }
@@ -1303,10 +1304,10 @@ impl Connection {
                 mode,
                 byte_offset_end,
                 origin,
-                needs_nested_guard,
+                keeps_nested_guard,
             ))
         })();
-        if result.is_err() && needs_nested_guard {
+        if needs_nested_guard && (result.is_err() || !keeps_nested_guard) {
             self.end_nested();
         }
         result
@@ -1369,6 +1370,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let needs_nested_guard = origin.needs_nested_guard();
+        let keeps_nested_guard = needs_nested_guard && self.has_a_statement_or_transaction();
         if needs_nested_guard {
             self.start_nested();
         }
@@ -1380,13 +1382,21 @@ impl Connection {
                 mode,
                 0,
                 origin,
-                needs_nested_guard,
+                keeps_nested_guard,
             ))
         })();
-        if result.is_err() && needs_nested_guard {
+        if needs_nested_guard && (result.is_err() || !keeps_nested_guard) {
             self.end_nested();
         }
         result
+    }
+
+    fn has_a_statement_or_transaction(&self) -> bool {
+        self.is_nested_stmt()
+            || self.n_active_root_statements.load(Ordering::SeqCst) > 0
+            || !self.get_auto_commit()
+            || self.get_tx_state() != TransactionState::None
+            || self.get_mv_tx().is_some()
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap

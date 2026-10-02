@@ -670,7 +670,7 @@ impl Statement {
                 return Ok(Some(result));
             }
         }
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+        if !self.counted_as_active_root && self.runs_as_a_statement_of_its_own() {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -721,6 +721,14 @@ impl Statement {
             }
         }
         Ok(None)
+    }
+
+    fn runs_as_a_statement_of_its_own(&self) -> bool {
+        match self.origin {
+            StatementOrigin::Root => true,
+            StatementOrigin::InternalHelper => !self.nested_guard_active,
+            StatementOrigin::Subprogram => false,
+        }
     }
 
     /// Everything [`Self::_step`] does after the interpreter returned something

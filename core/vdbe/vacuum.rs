@@ -3395,12 +3395,12 @@ mod tests {
         target_conn.execute("CREATE TABLE seed(x)")?;
 
         let mut context = VacuumTargetBuildContext::new(target_conn.clone());
+        target_conn.execute("BEGIN IMMEDIATE")?;
         let helper_stmt = target_conn.prepare_internal("SELECT 1")?;
         context.phase = VacuumTargetBuildPhase::CollectSchemaRows {
             schema_stmt: Box::new(helper_stmt),
         };
 
-        target_conn.execute("BEGIN IMMEDIATE")?;
         target_conn.execute("INSERT INTO seed VALUES (1)")?;
         let pager = target_conn.pager.load();
 
