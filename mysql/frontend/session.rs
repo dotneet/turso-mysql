@@ -31,10 +31,10 @@ use turso_mysql_parser::{
     CheckedSelectComparisonRhs, CheckedSubqueryComparison, CheckedUpdateAssignmentValue,
     ColumnLiteral, MySqlAlterTableIndexOperation, MySqlAlterTableIndexes, MySqlCreateTableAsSelect,
     MySqlCreateTableAsSelectSource, MySqlCreateTableWithKeys, MySqlDropTableCommand,
-    MySqlDropViewCommand, MySqlSelectSource, MySqlTableName, MySqlTransactionCommand,
-    MySqlTruncateTableCommand, MySqlViewReplacement, OfferedValue, ParseError as MySqlParseError,
-    SessionSqlMode, StaticSelectMetadata, StaticSelectProjectionMetadata, TranslatedDml,
-    WrittenZero,
+    MySqlDropViewCommand, MySqlLockingRead, MySqlRowLockWait, MySqlSelectSource, MySqlTableName,
+    MySqlTransactionCommand, MySqlTruncateTableCommand, MySqlViewReplacement, OfferedValue,
+    ParseError as MySqlParseError, SessionSqlMode, StaticSelectMetadata,
+    StaticSelectProjectionMetadata, TranslatedDml, WrittenZero,
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
@@ -1149,6 +1149,7 @@ enum PreparedExecutionPlan {
         /// does, which MySQL does not count as the transaction's first
         /// consistent read.
         locks_rows: bool,
+        locking_read: Option<MySqlLockingRead>,
         /// Every table the statement reads, which is what says where a
         /// comparison's qualified column comes from.
         source_tables: Vec<MySqlSelectSource>,
@@ -2006,6 +2007,9 @@ impl MySqlConnection {
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 let reads_table = translated.reads_table();
                 let locks_rows = translated.locks_rows();
+                let locking_read = translated
+                    .locking_read()
+                    .filter(|_| self.inner.mvcc_enabled());
                 let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
@@ -2030,6 +2034,7 @@ impl MySqlConnection {
                     PreparedExecutionPlan::Select {
                         reads_table,
                         locks_rows,
+                        locking_read,
                         source_tables,
                         checked_comparisons,
                         row_count_parameters,
@@ -3515,6 +3520,8 @@ impl MySqlConnection {
             PreparedExecutionPlan::Select {
                 reads_table,
                 locks_rows,
+                locking_read,
+                source_tables,
                 ..
             } => {
                 if *reads_table {
@@ -3531,6 +3538,9 @@ impl MySqlConnection {
                 bind_prepared_values(statement, &values)?;
                 if let Some(timeout) = timeout {
                     statement.set_query_timeout_override(Some(Some(timeout)));
+                }
+                if let Some(locking_read) = locking_read {
+                    lock_the_rows_a_select_reads(statement, *locking_read, source_tables)?;
                 }
                 let mut rows = Vec::new();
                 statement.run_with_row_callback(|row| {
@@ -7233,7 +7243,13 @@ impl MySqlConnection {
                 self.note_consistent_read();
             }
         }
-        if translated.locks_rows() {
+        let locking_read = translated.locking_read();
+        if let Some(locking_read) = locking_read.filter(|_| !self.inner.mvcc_enabled()) {
+            if locking_read.wait == MySqlRowLockWait::NoWait {
+                return Err(MySqlQueryError::Unsupported(
+                    "SELECT locking clause option".to_string(),
+                ));
+            }
             self.take_the_write_lock(translated.source_tables())?;
         }
         let stmt = translated
@@ -7242,7 +7258,7 @@ impl MySqlConnection {
         self.validate_session_timestamp_select(&translated, &stmt)?;
         let frozen = self.frozen_select_parser(&translated, rendered_differently, &stmt);
         let options = PrepareOptions::default().with_reprepare_parser(Arc::new(frozen));
-        let stmt = self
+        let mut stmt = self
             .inner
             .prepare_translated_stmt_with_options(stmt, sql, &options)
             .map_err(MySqlQueryError::Engine)?;
@@ -7250,6 +7266,10 @@ impl MySqlConnection {
             return Err(MySqlQueryError::Engine(LimboError::InternalError(
                 "checked SELECT parameter count changed during prepare".to_string(),
             )));
+        }
+        if let Some(locking_read) = locking_read.filter(|_| self.inner.mvcc_enabled()) {
+            lock_the_rows_a_select_reads(&mut stmt, locking_read, translated.source_tables())
+                .map_err(MySqlQueryError::Engine)?;
         }
         let static_result_metadata =
             aligned_static_result_metadata(&stmt, translated.static_result_metadata());
@@ -12277,6 +12297,37 @@ fn bind_prepared_values(statement: &mut Statement, values: &[Value]) -> Result<(
         let index =
             std::num::NonZero::new(index + 1).expect("prepared parameter index starts at one");
         statement.bind_at(index, value.clone())?;
+    }
+    Ok(())
+}
+
+fn lock_the_rows_a_select_reads(
+    statement: &mut Statement,
+    locking_read: MySqlLockingRead,
+    sources: &[MySqlSelectSource],
+) -> Result<()> {
+    let wait = locking_read.wait;
+    statement.lock_rows_it_reads(turso_core::LockingRead {
+        mode: if locking_read.shared {
+            turso_core::RowLockMode::Shared
+        } else {
+            turso_core::RowLockMode::Exclusive
+        },
+        policy: match wait {
+            MySqlRowLockWait::Wait => turso_core::RowLockWaitPolicy::Wait,
+            MySqlRowLockWait::NoWait => turso_core::RowLockWaitPolicy::NoWait,
+            MySqlRowLockWait::SkipLocked => turso_core::RowLockWaitPolicy::SkipLocked,
+        },
+        tables: sources
+            .iter()
+            .filter(|source| {
+                !source.subquery() && source.derived().is_none() && source.catalog().is_none()
+            })
+            .map(|source| source.table().as_str().to_owned())
+            .collect(),
+    });
+    if wait == MySqlRowLockWait::Wait {
+        statement.run_to_lock_rows()?;
     }
     Ok(())
 }

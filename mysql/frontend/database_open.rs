@@ -67,7 +67,11 @@ where
             ))
             // VACUUM remains disabled until the registry owns the real WAL
             // sidecar lifecycle; a pre-opened capability has no path to use.
-            .db_opts(DatabaseOpts::new().with_views(true)),
+            .db_opts(
+                DatabaseOpts::new()
+                    .with_views(true)
+                    .with_mvcc_row_locks(switch_to_mvcc),
+            ),
     )?;
     // One database is one logical database, so the `information_schema` tables
     // it answers know their own name from here rather than from the engine,

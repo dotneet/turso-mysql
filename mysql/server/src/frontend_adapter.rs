@@ -13819,6 +13819,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::WriteWriteConflict | LimboError::SchemaConflict => {
             FrontendErrorKind::SerializationFailure
         }
+        LimboError::RowLocked(_) => FrontendErrorKind::LockNotAvailableNowait,
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::InvalidArgument(message)

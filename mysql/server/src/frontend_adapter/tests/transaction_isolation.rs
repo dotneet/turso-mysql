@@ -152,6 +152,16 @@ fn a_transaction_given_up_with_1213_takes_its_savepoints_with_it() {
     run(&mut one, "SAVEPOINT before_reading");
     assert_eq!(n_of(&mut one, 2), "0");
     run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
+    if turso_mysql::experimental_mvcc_is_on() {
+        // Measured on MySQL 8.4.11: the update changes the row the other
+        // session committed rather than answering 1213, so the transaction
+        // and its savepoint stay, and the savepoint undoes the update.
+        run(&mut one, "UPDATE c SET n = 7 WHERE id = 2");
+        run(&mut one, "ROLLBACK TO SAVEPOINT before_reading");
+        run(&mut one, "COMMIT");
+        assert_eq!(n_of(&mut two, 2), "5");
+        return;
+    }
     assert_eq!(
         one.execute_query("UPDATE c SET n = 7 WHERE id = 2"),
         Err(FrontendErrorKind::SerializationFailure)

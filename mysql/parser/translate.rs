@@ -494,8 +494,8 @@ pub(crate) struct RenderedSelect {
     pub(crate) source_table: Option<MySqlTableName>,
     pub(crate) source_tables: Vec<MySqlSelectSource>,
     pub(crate) checked_comparisons: Vec<CheckedSelectComparison>,
-    /// Whether the statement asked to read the rows it is about to change.
-    pub(crate) locks_rows: bool,
+    /// The lock the statement asked to read its rows under, if any.
+    pub(crate) locking_read: Option<MySqlLockingRead>,
     /// Which parameters stand where a row count is written, so the frontend
     /// can hold each to the whole number a row count has to be.
     pub(crate) row_count_parameters: Vec<usize>,
@@ -538,7 +538,7 @@ pub(crate) fn translate_select_query(
     {
         return unsupported("SELECT query clause");
     }
-    let locks_rows = reads_to_write(&query.locks)?;
+    let locking_read = reads_to_write(&query.locks)?;
     let mut render_context = SelectRenderContext::new(
         sql,
         mode,
@@ -796,7 +796,7 @@ pub(crate) fn translate_select_query(
         source_table,
         source_tables,
         checked_comparisons: render_context.checked_comparisons,
-        locks_rows,
+        locking_read,
         row_count_parameters,
         parameter_count: render_context.parameter_count,
         concatenates_groups: render_context.group_concat_calls > 0,
@@ -806,35 +806,47 @@ pub(crate) fn translate_select_query(
     })
 }
 
-/// Reports whether a statement asked to read the rows it is about to change.
+/// Reads the lock a statement asked to read its rows under.
 ///
 /// `FOR UPDATE` and `FOR SHARE` are the two locks MySQL has — `LOCK IN SHARE
-/// MODE` reaches here spelled as `FOR SHARE` — and both are read the same way
-/// here: the engine holds one write lock over the
-/// whole database rather than a lock for each row, so there is no weaker lock
-/// to take for the sharing one.
-///
-/// `SKIP LOCKED` — Laravel's database queue takes its next job with it — asks
-/// for rows no other session holds. Once this session holds the one lock, no
-/// other session holds any row, so the rows it reads are those; it waits for
-/// the lock where MySQL would skip the rows another session holds. `NOWAIT`
-/// asks to be refused when a row read is held, and which rows another session
-/// holds is not known here, so it is refused, as is naming which tables to
-/// lock.
-fn reads_to_write(locks: &[sqlparser::ast::LockClause]) -> Result<bool, ParseError> {
+/// MODE` reaches here spelled as `FOR SHARE`. `SKIP LOCKED` asks for the rows
+/// no other session holds, and `NOWAIT` to be refused at once when a row read
+/// is held; which of them a frontend can give depends on the locks its engine
+/// holds. Naming which tables to lock is refused.
+fn reads_to_write(
+    locks: &[sqlparser::ast::LockClause],
+) -> Result<Option<MySqlLockingRead>, ParseError> {
     let [lock] = locks else {
         if locks.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         return unsupported("SELECT locking clause written more than once");
     };
-    if lock.of.is_some() || matches!(lock.nonblock, Some(sqlparser::ast::NonBlock::Nowait)) {
+    if lock.of.is_some() {
         return unsupported("SELECT locking clause option");
     }
-    Ok(matches!(
-        lock.lock_type,
-        sqlparser::ast::LockType::Update | sqlparser::ast::LockType::Share
-    ))
+    let wait = match lock.nonblock {
+        None => MySqlRowLockWait::Wait,
+        Some(sqlparser::ast::NonBlock::Nowait) => MySqlRowLockWait::NoWait,
+        Some(sqlparser::ast::NonBlock::SkipLocked) => MySqlRowLockWait::SkipLocked,
+    };
+    Ok(Some(MySqlLockingRead {
+        shared: matches!(lock.lock_type, sqlparser::ast::LockType::Share),
+        wait,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MySqlLockingRead {
+    pub shared: bool,
+    pub wait: MySqlRowLockWait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlRowLockWait {
+    Wait,
+    NoWait,
+    SkipLocked,
 }
 
 /// Renders a `UNION` of three or more branches, each reading the same

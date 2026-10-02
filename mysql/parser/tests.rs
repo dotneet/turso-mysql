@@ -9718,6 +9718,43 @@ fn lock_in_share_mode_is_read_as_for_share() {
     assert!(!quoted.locks_rows());
 }
 
+#[test]
+fn a_locking_read_keeps_its_lock_and_what_it_does_about_a_held_row() {
+    let mode = SessionSqlMode::default();
+    for (sql, shared, wait) in [
+        ("SELECT v FROM a FOR UPDATE", false, MySqlRowLockWait::Wait),
+        ("SELECT v FROM a FOR SHARE", true, MySqlRowLockWait::Wait),
+        (
+            "SELECT v FROM a LOCK IN SHARE MODE",
+            true,
+            MySqlRowLockWait::Wait,
+        ),
+        (
+            "SELECT v FROM a FOR UPDATE NOWAIT",
+            false,
+            MySqlRowLockWait::NoWait,
+        ),
+        (
+            "SELECT v FROM a FOR SHARE SKIP LOCKED",
+            true,
+            MySqlRowLockWait::SkipLocked,
+        ),
+    ] {
+        assert_eq!(
+            parse_select(sql, mode).unwrap().locking_read(),
+            Some(MySqlLockingRead { shared, wait }),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        parse_select("SELECT v FROM a", mode)
+            .unwrap()
+            .locking_read(),
+        None
+    );
+    assert!(parse_select("SELECT v FROM a FOR UPDATE OF a", mode).is_err());
+}
+
 /// A path is read out of a document the way MySQL 8.4.11 reads it: a member
 /// only out of an object, an element out of an array, and `[0]` over anything
 /// else is the value itself.

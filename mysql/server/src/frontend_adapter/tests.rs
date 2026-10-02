@@ -23468,13 +23468,14 @@ fn a_count_takes_the_qualified_column_a_join_has_to_write() {
 /// `SELECT ... FOR UPDATE` reads rows this session is about to change, and
 /// takes a lock that really is held while it does.
 ///
-/// The engine holds one write lock over the whole database rather than a lock
-/// for each row, so the lock is stronger than the one MySQL takes: another
-/// session is kept out of every table rather than out of these rows. It is a
-/// lock all the same, which is what the statement asked for.
+/// In WAL mode the engine holds one write lock over the whole database rather
+/// than a lock for each row, so the lock is stronger than the one MySQL takes:
+/// another session is kept out of every table rather than out of these rows.
+/// In MVCC mode the lock is on the rows read, as MySQL's is.
 #[cfg(unix)]
 #[test]
 fn a_select_for_update_takes_a_lock_that_is_held() {
+    let row_locks = turso_mysql::experimental_mvcc_is_on();
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
     catalog.create("ledger").unwrap();
@@ -23556,15 +23557,25 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
     };
     assert_eq!(after.rows, vec![vec![Some(b"150".to_vec())]]);
 
-    // `FOR SHARE` is MySQL's other spelling and takes the same lock, because
-    // there is no weaker one to take.
+    // `FOR SHARE` is MySQL's other spelling. In WAL mode it takes the same
+    // lock, because there is no weaker one to take. Measured on MySQL 8.4.11,
+    // a shared lock keeps a writer out of the row it covers only.
     one.execute_query("START TRANSACTION").unwrap();
     one.execute_query("SELECT balance FROM accounts WHERE id = 1 FOR SHARE")
         .unwrap();
-    assert_eq!(
-        two.execute_query("UPDATE accounts SET balance = 998 WHERE id = 2"),
-        Err(FrontendErrorKind::DatabaseBusy)
-    );
+    if row_locks {
+        two.execute_query("UPDATE accounts SET balance = 998 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            two.execute_query("UPDATE accounts SET balance = 998 WHERE id = 1"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+    } else {
+        assert_eq!(
+            two.execute_query("UPDATE accounts SET balance = 998 WHERE id = 2"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+    }
     one.execute_query("ROLLBACK").unwrap();
 
     // `LOCK IN SHARE MODE` is MySQL's older spelling of `FOR SHARE`, which
@@ -23577,15 +23588,26 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
         panic!("SELECT must return a result set");
     };
     assert_eq!(shared.rows, vec![vec![Some(b"150".to_vec())]]);
-    assert_eq!(
-        two.execute_query("UPDATE accounts SET balance = 997 WHERE id = 2"),
-        Err(FrontendErrorKind::DatabaseBusy)
-    );
+    if row_locks {
+        two.execute_query("UPDATE accounts SET balance = 997 WHERE id = 2")
+            .unwrap();
+        assert_eq!(
+            two.execute_query("UPDATE accounts SET balance = 997 WHERE id = 1"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+    } else {
+        assert_eq!(
+            two.execute_query("UPDATE accounts SET balance = 997 WHERE id = 2"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+    }
     one.execute_query("ROLLBACK").unwrap();
 
-    // `SKIP LOCKED` asks for rows no other session holds, and once this one
-    // holds the lock no other session holds any: it takes the same lock, and
-    // waits for it rather than skipping the rows another session holds.
+    // `SKIP LOCKED` asks for rows no other session holds. In WAL mode, once
+    // this one holds the lock no other session holds any: it takes the same
+    // lock, and waits for it rather than skipping the rows another session
+    // holds. Measured on MySQL 8.4.11, it leaves out the rows another session
+    // holds, which row locks do too.
     one.execute_query("START TRANSACTION").unwrap();
     let CommandExecutionResult::ResultSet(skipping) = one
         .execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE SKIP LOCKED")
@@ -23594,30 +23616,58 @@ fn a_select_for_update_takes_a_lock_that_is_held() {
         panic!("SELECT must return a result set");
     };
     assert_eq!(skipping.rows, vec![vec![Some(b"150".to_vec())]]);
-    assert_eq!(
-        two.execute_query("UPDATE accounts SET balance = 996 WHERE id = 2"),
-        Err(FrontendErrorKind::DatabaseBusy)
-    );
-    two.execute_query("START TRANSACTION").unwrap();
-    assert_eq!(
-        two.execute_query("SELECT balance FROM accounts WHERE id = 2 FOR UPDATE SKIP LOCKED"),
-        Err(FrontendErrorKind::DatabaseBusy)
-    );
-    two.execute_query("ROLLBACK").unwrap();
+    if row_locks {
+        two.execute_query("UPDATE accounts SET balance = 996 WHERE id = 2")
+            .unwrap();
+        two.execute_query("START TRANSACTION").unwrap();
+        let CommandExecutionResult::ResultSet(unheld) = two
+            .execute_query("SELECT id FROM accounts ORDER BY id FOR UPDATE SKIP LOCKED")
+            .unwrap()
+        else {
+            panic!("SELECT must return a result set");
+        };
+        assert_eq!(unheld.rows, vec![vec![Some(b"2".to_vec())]]);
+        // Measured on MySQL 8.4.11: 3572 at once for a row another session
+        // holds, while a plain read of it does not wait.
+        let refused = std::time::Instant::now();
+        assert_eq!(
+            two.execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE NOWAIT"),
+            Err(FrontendErrorKind::LockNotAvailableNowait)
+        );
+        assert!(refused.elapsed() < Duration::from_secs(1));
+        two.execute_query("SELECT balance FROM accounts WHERE id = 1")
+            .unwrap();
+        two.execute_query("ROLLBACK").unwrap();
+    } else {
+        assert_eq!(
+            two.execute_query("UPDATE accounts SET balance = 996 WHERE id = 2"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+        two.execute_query("START TRANSACTION").unwrap();
+        assert_eq!(
+            two.execute_query("SELECT balance FROM accounts WHERE id = 2 FOR UPDATE SKIP LOCKED"),
+            Err(FrontendErrorKind::DatabaseBusy)
+        );
+        two.execute_query("ROLLBACK").unwrap();
+    }
     one.execute_query("ROLLBACK").unwrap();
 
-    // `NOWAIT` asks to be refused when a row it reads is held, which one lock
-    // over the database cannot say, and naming which tables to lock asks for
-    // something one lock cannot answer. The older spelling takes none of them
-    // at all: MySQL answers 1064.
+    // In WAL mode `NOWAIT` asks to be refused when a row it reads is held,
+    // which one lock over the database cannot say, so it is refused, as is
+    // naming which tables to lock. The older spelling takes none of them at
+    // all: MySQL answers 1064.
     for sql in [
         "SELECT balance FROM accounts LOCK IN SHARE MODE NOWAIT",
         "SELECT balance FROM accounts LOCK IN SHARE MODE SKIP LOCKED",
-        "SELECT balance FROM accounts FOR UPDATE NOWAIT",
         "SELECT balance FROM accounts FOR UPDATE OF accounts",
     ] {
         assert!(one.execute_query(sql).is_err(), "{sql}");
     }
+    assert_eq!(
+        one.execute_query("SELECT balance FROM accounts FOR UPDATE NOWAIT")
+            .is_ok(),
+        row_locks
+    );
 }
 
 /// `LOCK TABLES` takes a lock that is held until `UNLOCK TABLES`, the way

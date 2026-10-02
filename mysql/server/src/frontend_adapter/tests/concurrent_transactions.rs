@@ -184,9 +184,10 @@ fn a_transaction_that_prepared_an_insert_reads_what_was_committed_before_its_fir
     assert_eq!(counted(&mut two, count), 2);
 }
 
-/// The second session's insert comes while the first still holds its write,
-/// so here it waits for the first to commit. MySQL takes both rows without
-/// waiting, since they are different rows.
+/// The second session's insert comes while the first still holds its write.
+/// In WAL mode it waits for the first to commit, since the first holds the
+/// database's one write lock. MySQL takes both rows without waiting, since
+/// they are different rows, and so do row locks in MVCC mode.
 #[test]
 fn an_insert_that_waited_for_another_transaction_writes_once_that_one_commits() {
     let TwoSessions {
@@ -200,8 +201,7 @@ fn an_insert_that_waited_for_another_transaction_writes_once_that_one_commits() 
         "INSERT INTO tags (id, name) VALUES (NULL, 'news')",
     );
     let waiting = insert_in_a_transaction_of_its_own(two, "rust");
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    assert!(!waiting.is_finished());
+    waits_only_without_row_locks(&waiting);
     run(&mut one, "COMMIT");
 
     let (mut two, result) = waiting.join().unwrap();
@@ -246,7 +246,7 @@ fn an_insert_that_waited_for_a_row_with_its_key_answers_1062_and_keeps_the_trans
 /// insert with autocommit on, which commits alone, and the first statement
 /// with it off, which begins the transaction. The counted insert takes a
 /// savepoint, and so its snapshot, before it writes. Measured on MySQL 8.4.11
-/// both write without waiting.
+/// both write without waiting, as they do with row locks in MVCC mode.
 #[test]
 fn a_statement_outside_a_transaction_that_waited_for_another_writes_once_that_one_commits() {
     for (autocommit, still_in_a_transaction) in [("1", false), ("0", true)] {
@@ -267,8 +267,7 @@ fn a_statement_outside_a_transaction_that_waited_for_another_writes_once_that_on
                 .map(|_| ());
             (two, result)
         });
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(!waiting.is_finished());
+        waits_only_without_row_locks(&waiting);
         run(&mut one, "COMMIT");
 
         let (mut two, result) = waiting.join().unwrap();
@@ -280,6 +279,18 @@ fn a_statement_outside_a_transaction_that_waited_for_another_writes_once_that_on
         run(&mut two, "COMMIT");
         assert_eq!(names(&mut one), ["news", "rust"]);
     }
+}
+
+fn waits_only_without_row_locks<T>(waiting: &std::thread::JoinHandle<T>) {
+    let row_locks = turso_mysql::experimental_mvcc_is_on();
+    let started = std::time::Instant::now();
+    while !waiting.is_finished() && started.elapsed() < std::time::Duration::from_secs(5) {
+        if !row_locks && started.elapsed() >= std::time::Duration::from_millis(200) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(waiting.is_finished(), row_locks);
 }
 
 fn insert_in_a_transaction_of_its_own(
@@ -339,4 +350,337 @@ fn two_sessions_inserting_counted_rows_at_once_both_write_every_row() {
     let mut one = first.join().unwrap();
     second.join().unwrap();
     assert_eq!(names(&mut one).len(), 2 * ROUNDS);
+}
+
+/// Measured on MySQL 8.4.11: an update of a row another transaction changed
+/// waits for that transaction, then changes the row it committed, though the
+/// waiting transaction's own reads keep the snapshot they took.
+#[test]
+fn an_update_waits_for_the_row_another_transaction_changed_and_writes_on_what_it_committed() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut two, "BEGIN");
+    assert_eq!(balances(&mut two), ["10", "20", "30"]);
+    run(&mut one, "BEGIN");
+    run(
+        &mut one,
+        "UPDATE accounts SET balance = balance + 100 WHERE id = 1",
+    );
+    run(
+        &mut one,
+        "UPDATE accounts SET balance = balance + 100 WHERE id = 2",
+    );
+
+    let waiting = in_the_background(
+        two,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+    );
+    assert!(still_waiting(&waiting));
+    run(&mut one, "COMMIT");
+    let (mut two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(balances(&mut two), ["111", "20", "30"]);
+    run(&mut two, "COMMIT");
+    assert_eq!(balances(&mut one), ["111", "120", "30"]);
+}
+
+/// Measured on MySQL 8.4.11: an update of a row another transaction changed
+/// and committed after this one's snapshot changes the newer row rather than
+/// failing.
+#[test]
+fn an_update_of_a_row_committed_after_the_snapshot_writes_on_the_newer_row() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut two, "BEGIN");
+    assert_eq!(balances(&mut two), ["10", "20", "30"]);
+    run(&mut one, "UPDATE accounts SET balance = 50 WHERE id = 1");
+    run(
+        &mut two,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+    );
+    assert_eq!(balances(&mut two), ["51", "20", "30"]);
+    run(&mut two, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11 with `innodb_lock_wait_timeout = 1`: the update
+/// waits a second, answers 1205, and only that statement is undone; the
+/// transaction and what it wrote before stay.
+#[test]
+fn a_lock_wait_timeout_answers_1205_and_keeps_the_transaction() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE accounts SET balance = 0 WHERE id = 1");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    run(&mut two, "BEGIN");
+    run(&mut two, "UPDATE accounts SET balance = 99 WHERE id = 2");
+    let waited = std::time::Instant::now();
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 99 WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    assert!(waited.elapsed() >= std::time::Duration::from_secs(1));
+    assert_ne!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    run(&mut two, "COMMIT");
+    run(&mut one, "COMMIT");
+    assert_eq!(balances(&mut one), ["0", "99", "30"]);
+}
+
+/// Measured on MySQL 8.4.11: two transactions that each wrote one row and
+/// then wait for each other's row end in 1213 for the one whose wait closes
+/// the cycle, which is rolled back whole, while the other's wait goes on.
+#[test]
+fn a_deadlock_answers_1213_to_the_session_that_closes_it_and_rolls_it_back() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut two, "BEGIN");
+    run(
+        &mut one,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+    );
+    run(
+        &mut two,
+        "UPDATE accounts SET balance = balance + 10 WHERE id = 2",
+    );
+    let waiting = in_the_background(
+        one,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 2",
+    );
+    assert!(still_waiting(&waiting));
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = balance + 10 WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(two.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    let (mut one, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    run(&mut one, "COMMIT");
+    assert_eq!(balances(&mut two), ["11", "21", "30"]);
+}
+
+/// Measured on MySQL 8.4.11: when the session closing the cycle wrote more
+/// rows than the one already waiting, the waiting one is given up instead.
+#[test]
+fn a_deadlock_rolls_back_the_session_that_wrote_fewer_rows() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut two, "BEGIN");
+    run(
+        &mut one,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 1",
+    );
+    run(
+        &mut two,
+        "UPDATE accounts SET balance = balance + 10 WHERE id = 2",
+    );
+    run(
+        &mut two,
+        "UPDATE accounts SET balance = balance + 10 WHERE id = 3",
+    );
+    let waiting = in_the_background(
+        one,
+        "UPDATE accounts SET balance = balance + 1 WHERE id = 2",
+    );
+    assert!(still_waiting(&waiting));
+    run(
+        &mut two,
+        "UPDATE accounts SET balance = balance + 10 WHERE id = 1",
+    );
+    let (one, result) = waiting.join().unwrap();
+    assert_eq!(result, Err(FrontendErrorKind::SerializationFailure));
+    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    run(&mut two, "COMMIT");
+    assert_eq!(balances(&mut two), ["20", "30", "40"]);
+}
+
+/// Measured on MySQL 8.4.11: a locking read waits for a row another
+/// transaction changed and reads what it committed, while a plain read in the
+/// same transaction keeps its snapshot.
+#[test]
+fn a_locking_read_reads_what_was_committed_and_a_plain_read_keeps_the_snapshot() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut two, "BEGIN");
+    assert_eq!(balances(&mut two), ["10", "20", "30"]);
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE accounts SET balance = 11 WHERE id = 1");
+    let waiting = std::thread::spawn(move || {
+        let read = two.execute_query("SELECT balance FROM accounts WHERE id = 1 FOR UPDATE");
+        (two, read)
+    });
+    assert!(still_waiting(&waiting));
+    run(&mut one, "COMMIT");
+    let (mut two, read) = waiting.join().unwrap();
+    let Ok(CommandExecutionResult::ResultSet(read)) = read else {
+        panic!("the locking read must return rows: {read:?}");
+    };
+    assert_eq!(read.rows, vec![vec![Some(b"11".to_vec())]]);
+    assert_eq!(balances(&mut two), ["10", "20", "30"]);
+    run(&mut two, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11: an `UPDATE` that reads the table through no
+/// index locks every row it reads, the ones it does not change too, so
+/// another session's update of any of them waits and answers 1205.
+#[test]
+fn an_update_through_no_index_keeps_every_row_it_read_from_other_writers() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(
+        &mut one,
+        "UPDATE accounts SET balance = 0 WHERE balance = 999",
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 5 WHERE id = 2")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut one, "COMMIT");
+    run(&mut two, "UPDATE accounts SET balance = 5 WHERE id = 2");
+}
+
+/// Measured on MySQL 8.4.11: an `UPDATE` whose condition matches a row only
+/// as another open transaction changed it waits for that transaction, and
+/// once it commits changes the row.
+#[test]
+fn an_update_waits_for_a_row_another_transaction_changed_to_match() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE accounts SET balance = 77 WHERE id = 2");
+    let waiting = in_the_background(two, "UPDATE accounts SET balance = 777 WHERE balance = 77");
+    assert!(still_waiting(&waiting));
+    run(&mut one, "COMMIT");
+    let (_two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    assert_eq!(balances(&mut one), ["10", "777", "30"]);
+}
+
+/// Measured on MySQL 8.4.11: `INSERT ... SELECT` locks the rows it reads in
+/// share mode, so another session's update of one of them waits.
+#[test]
+fn an_insert_select_keeps_the_rows_it_read_from_other_writers() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = row_lock_sessions()
+    else {
+        return;
+    };
+    run(
+        &mut one,
+        "CREATE TABLE copies (id INT NOT NULL PRIMARY KEY, balance INT)",
+    );
+    run(&mut one, "BEGIN");
+    run(
+        &mut one,
+        "INSERT INTO copies (id, balance) SELECT id, balance FROM accounts WHERE id = 1",
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query("UPDATE accounts SET balance = 9 WHERE id = 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut two, "UPDATE accounts SET balance = 9 WHERE id = 2");
+    run(&mut one, "COMMIT");
+}
+
+fn row_lock_sessions() -> Option<TwoSessions> {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return None;
+    }
+    let mut sessions = two_sessions();
+    run(
+        &mut sessions.one,
+        "CREATE TABLE accounts (id INT NOT NULL PRIMARY KEY, balance INT)",
+    );
+    run(
+        &mut sessions.one,
+        "INSERT INTO accounts (id, balance) VALUES (1, 10), (2, 20), (3, 30)",
+    );
+    Some(sessions)
+}
+
+fn balances(adapter: &mut Adapter) -> Vec<String> {
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        adapter.execute_query("SELECT balance FROM accounts ORDER BY id")
+    else {
+        panic!("the balances must read back");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| String::from_utf8(row[0].clone().unwrap()).unwrap())
+        .collect()
+}
+
+fn in_the_background(
+    mut adapter: Adapter,
+    sql: &'static str,
+) -> std::thread::JoinHandle<(Adapter, Result<(), FrontendErrorKind>)> {
+    std::thread::spawn(move || {
+        let result = adapter.execute_query(sql).map(|_| ());
+        (adapter, result)
+    })
+}
+
+fn still_waiting<T>(waiting: &std::thread::JoinHandle<T>) -> bool {
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    !waiting.is_finished()
 }

@@ -247,7 +247,7 @@ pub use temporal_value::{
 };
 pub use translate::{
     MySqlCatalogTable, MySqlColumnsTheKeysDecide, MySqlDerivedColumns, MySqlJoinedDerivedColumn,
-    MySqlJoinedTable, MySqlNamedColumn, MySqlSelectSource,
+    MySqlJoinedTable, MySqlLockingRead, MySqlNamedColumn, MySqlRowLockWait, MySqlSelectSource,
 };
 pub use trigger_definition::{
     mysql_create_trigger_ddl, trigger_body_readings, trigger_written_as_mysql_keeps_it,
@@ -1143,7 +1143,7 @@ pub struct TranslatedSelect {
     source_tables: Vec<MySqlSelectSource>,
     static_result_metadata: Vec<StaticSelectProjectionMetadata>,
     checked_comparisons: Vec<CheckedSelectComparison>,
-    locks_rows: bool,
+    locking_read: Option<MySqlLockingRead>,
     row_count_parameters: Vec<usize>,
     parameter_count: usize,
 }
@@ -2099,7 +2099,12 @@ impl TranslatedSelect {
     /// change, which `FOR UPDATE` and `LOCK IN SHARE MODE` are the spellings
     /// of.
     pub const fn locks_rows(&self) -> bool {
-        self.locks_rows
+        self.locking_read.is_some()
+    }
+
+    /// Returns the lock the statement asked to read its rows under.
+    pub const fn locking_read(&self) -> Option<MySqlLockingRead> {
+        self.locking_read
     }
 
     /// Reports whether `SQL_CALC_FOUND_ROWS` asked for the rows the statement
@@ -4967,7 +4972,7 @@ fn parse_select_inner(
         source_table,
         source_tables,
         checked_comparisons,
-        locks_rows,
+        locking_read,
         row_count_parameters,
         parameter_count,
         orders_a_bare_column,
@@ -5022,7 +5027,7 @@ fn parse_select_inner(
         source_tables,
         static_result_metadata,
         checked_comparisons,
-        locks_rows,
+        locking_read,
         row_count_parameters,
         parameter_count,
         concatenates_groups,
