@@ -307,3 +307,57 @@ fn a_metadata_lock_cycle_gives_up_the_reader_that_closes_it_however_many_rows_it
     u_defined.unwrap();
     u_definer.release_metadata_locks_outside_a_transaction();
 }
+
+#[test]
+fn a_transaction_whose_snapshot_predates_an_alter_inserts_on_the_new_definition_and_reads_nothing_of_the_table(
+) {
+    let db = database_with_table_locks();
+    let writer = session(&db);
+    let definer = session(&db);
+    let other = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(count(&writer, "u").unwrap(), 2);
+    definer
+        .execute("ALTER TABLE t ADD COLUMN w INTEGER DEFAULT 7")
+        .unwrap();
+    other.execute("INSERT INTO u VALUES (3, 30)").unwrap();
+
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (3, 30)")
+        .unwrap();
+    writer.take_up_the_latest_schema().unwrap();
+    writer
+        .execute("INSERT INTO t (id, v, w) VALUES (4, 40, 70)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t (id, v) VALUES (5, 50) ON CONFLICT (id) DO UPDATE SET v = 0")
+        .unwrap();
+    for refused in [
+        "UPDATE t SET v = 0 WHERE id = 1",
+        "DELETE FROM t WHERE id = 2",
+        "INSERT INTO t (id, v) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET v = 0",
+        "INSERT OR REPLACE INTO t (id, v) VALUES (2, 0)",
+        "INSERT INTO t (id, v) SELECT id + 10, v FROM t",
+    ] {
+        assert!(
+            matches!(
+                writer.execute(refused),
+                Err(LimboError::TableDefinitionChanged(table)) if table == "t"
+            ),
+            "{refused}"
+        );
+    }
+    assert!(matches!(
+        count(&writer, "t"),
+        Err(LimboError::TableDefinitionChanged(_))
+    ));
+    assert_eq!(count(&writer, "u").unwrap(), 2);
+    assert!(!writer.get_auto_commit());
+    writer.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64, i64, i64)> = other.exec_rows("SELECT id, v, w FROM t ORDER BY id");
+    assert_eq!(
+        rows,
+        [(1, 10, 7), (2, 20, 7), (3, 30, 7), (4, 40, 70), (5, 50, 7)]
+    );
+}

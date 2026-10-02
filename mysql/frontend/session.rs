@@ -7205,6 +7205,9 @@ impl MySqlConnection {
             .map_err(MySqlTruncateTableError::Engine)?;
         let result = match counted {
             Some(table) => self.write_the_counted_table_again(&table),
+            None if self.empties_by_writing_the_table_again(command.table().as_str()) => {
+                self.write_the_table_again_empty(command.table().as_str())
+            }
             None => {
                 let sql = format!(
                     "DELETE FROM \"{}\"",
@@ -7224,6 +7227,65 @@ impl MySqlConnection {
                 .map_err(MySqlTruncateTableError::Engine)?;
         }
         result
+    }
+
+    /// Whether `TRUNCATE` empties a table that does not count its ids by
+    /// dropping it and making it again, as MySQL does, rather than by deleting
+    /// its rows.
+    ///
+    /// Under MVCC the difference shows: measured on MySQL 8.4.11, a
+    /// transaction whose read view is older than the `TRUNCATE` answers 1412
+    /// when it reads or deletes from the table, as it does after any other
+    /// definition change, and that needs the engine to see one. A table with
+    /// triggers is emptied by deleting, since the triggers would not come back
+    /// with it.
+    fn empties_by_writing_the_table_again(&self, table: &str) -> bool {
+        self.inner.mvcc_enabled()
+            && self
+                .inner
+                .current_schema()
+                .get_triggers_for_table(table)
+                .next()
+                .is_none()
+    }
+
+    /// Empties a table by writing it again from the MySQL `CREATE TABLE` it
+    /// was stored as, its indexes beside it.
+    fn write_the_table_again_empty(
+        &self,
+        table: &str,
+    ) -> std::result::Result<(), MySqlTruncateTableError> {
+        let statement = self
+            .stored_table_statement(table)
+            .map_err(MySqlTruncateTableError::Engine)?
+            .ok_or_else(|| {
+                MySqlTruncateTableError::Engine(LimboError::Corrupt(format!(
+                    "table {table} has no stored MySQL definition"
+                )))
+            })?;
+        let indexes = self
+            .stored_index_statements(table)
+            .map_err(MySqlTruncateTableError::Engine)?;
+        let dropped = Stmt::DropTable {
+            if_exists: false,
+            tbl_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                table.to_owned(),
+            )),
+        };
+        let sql = format!("DROP TABLE \"{}\"", table.replace('"', "\"\""));
+        self.inner
+            .prepare_translated_stmt(dropped, &sql)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlTruncateTableError::Engine)?;
+        self.prepare(&statement)
+            .and_then(|mut statement| statement.run_ignore_rows())
+            .map_err(MySqlTruncateTableError::Engine)?;
+        for index in &indexes {
+            self.prepare_with_index_origin(&index.sql, index.implicit)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlTruncateTableError::Engine)?;
+        }
+        Ok(())
     }
 
     /// Whether any table's foreign key names this one as its parent.

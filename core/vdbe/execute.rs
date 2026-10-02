@@ -17170,7 +17170,7 @@ pub fn op_open_dup(
 
 fn lock_the_tables_the_statement_uses(
     program: &Program,
-    state: &ProgramState,
+    state: &mut ProgramState,
     mv_store: &MvStore,
     connection: &Connection,
 ) -> Result<()> {
@@ -17184,9 +17184,19 @@ fn lock_the_tables_the_statement_uses(
     let owner = connection.metadata_lock_owner(mv_store);
     let owner_is_a_transaction = connection.get_mv_tx_id() == Some(owner);
     let owner_held_nothing_before = !mv_store.holds_table_metadata(owner);
+    state.inserts_into_redefined_tables.clear();
     for (table, mode) in tables {
-        if owner_is_a_transaction && mv_store.table_definition_changed_since(owner, &table) {
-            return Err(LimboError::TableDefinitionChanged(table));
+        if owner_is_a_transaction {
+            if mv_store.table_definition_changed_since_the_read_view(owner, &table) {
+                if program_reads_the_rows_of(program, &table) {
+                    return Err(LimboError::TableDefinitionChanged(table));
+                }
+                state.inserts_into_redefined_tables.push(table.clone());
+            }
+            if mv_store.table_definition_changed_since_its_schema(owner, &table) {
+                connection.take_up_the_latest_schema()?;
+                return Err(LimboError::SchemaUpdated);
+            }
         }
         if !mv_store.lock_table_metadata(owner, &table, mode).is_empty() {
             return Err(LimboError::TableMetadataLocked(MetadataLockRequest {
@@ -17198,6 +17208,53 @@ fn lock_the_tables_the_statement_uses(
         }
     }
     Ok(())
+}
+
+fn program_reads_the_rows_of(program: &Program, table: &str) -> bool {
+    let of_the_table = |cursor_id: CursorID| {
+        cursor_table_name(&program.cursor_ref, cursor_id)
+            .is_some_and(|name| name.eq_ignore_ascii_case(table))
+    };
+    let inserts_into_the_table = program.insns.iter().any(|(insn, _)| {
+        matches!(insn, Insn::Insert { cursor, flag, .. }
+            if !flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) && of_the_table(*cursor))
+    });
+    let written: Vec<CursorID> = program
+        .insns
+        .iter()
+        .filter_map(|(insn, _)| match insn {
+            Insn::OpenWrite { cursor_id, .. } => Some(*cursor_id),
+            _ => None,
+        })
+        .collect();
+    program.insns.iter().any(|(insn, _)| {
+        let cursor_id = match insn {
+            Insn::Rewind { cursor_id, .. }
+            | Insn::Last { cursor_id, .. }
+            | Insn::SeekGE { cursor_id, .. }
+            | Insn::SeekGT { cursor_id, .. }
+            | Insn::SeekLE { cursor_id, .. }
+            | Insn::SeekLT { cursor_id, .. }
+            | Insn::SeekRowid { cursor_id, .. }
+            | Insn::Count { cursor_id, .. }
+            | Insn::Next { cursor_id, .. }
+            | Insn::Prev { cursor_id, .. } => *cursor_id,
+            _ => return false,
+        };
+        let looks_for_a_conflict = inserts_into_the_table && written.contains(&cursor_id);
+        of_the_table(cursor_id) && !looks_for_a_conflict
+    })
+}
+
+fn cursor_table_name(
+    cursor_ref: &[(Option<CursorKey>, CursorType)],
+    cursor_id: CursorID,
+) -> Option<&str> {
+    match &cursor_ref.get(cursor_id)?.1 {
+        CursorType::BTreeTable(table) => Some(table.name.as_str()),
+        CursorType::BTreeIndex(index) => Some(index.table_name.as_str()),
+        _ => None,
+    }
 }
 
 fn tables_the_statement_uses(

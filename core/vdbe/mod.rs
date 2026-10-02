@@ -938,6 +938,7 @@ pub struct ProgramState {
     pub(crate) steps_with_row_locks: bool,
     pub(crate) row_lock_work: Option<row_lock_hooks::RowLockWork>,
     pub(crate) before_writing: Option<BeforeWriting>,
+    pub(crate) inserts_into_redefined_tables: Vec<String>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1118,6 +1119,7 @@ impl ProgramState {
             steps_with_row_locks: false,
             row_lock_work: None,
             before_writing: None,
+            inserts_into_redefined_tables: Vec::new(),
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1219,6 +1221,7 @@ impl ProgramState {
         self.pc = 0;
         self.row_lock_work = None;
         self.before_writing = None;
+        self.inserts_into_redefined_tables.clear();
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);

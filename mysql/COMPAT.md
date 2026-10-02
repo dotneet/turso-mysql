@@ -3870,7 +3870,14 @@ detectors each see only their half: the metadata lock waiter answers 1205 once
 `innodb_lock_wait_timeout`. A statement that waited for a definition change runs on the new definition.
 A transaction that took its read view before another session changed a table's definition
 answers 1412, `Table definition has changed, please retry transaction`, when it reads that
-table, and keeps going; one that has not taken its read view yet, or reads at `READ
+table, and keeps going — an `UPDATE` or `DELETE` of it, an `INSERT ... SELECT` reading it, and
+an `INSERT ... ON DUPLICATE KEY UPDATE` or `REPLACE` that meets a row already there all answer
+1412, measured on 8.4.11, while an `INSERT` of new rows writes them on the new definition, its
+defaults and columns included, and so does one of those two that meets no row. Every statement
+of such a transaction takes up the definitions committed since, the way MySQL's data dictionary
+always gives the latest ones, and keeps reading other tables at its read view. `TRUNCATE TABLE`
+is such a change: it writes the table again from its stored definition, as MySQL makes it
+again, unless the table has triggers, which it then empties by deleting; one that has not taken its read view yet, or reads at `READ
 COMMITTED`, reads the new table. `LOCK TABLES` itself commits what came before it and holds
 its locks in a transaction of its own until `UNLOCK TABLES`, so the statements in between
 still commit together there, and `START TRANSACTION`, `COMMIT` and `ROLLBACK` stay refused

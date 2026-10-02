@@ -464,3 +464,82 @@ fn a_wait_cycle_through_a_row_lock_and_a_metadata_lock_times_out_with_1205_inste
     };
     assert_eq!(result.rows, [[Some(b"20".to_vec())]]);
 }
+
+#[test]
+fn a_transaction_whose_read_view_predates_an_alter_inserts_on_the_new_definition_and_answers_1412_for_the_rest(
+) {
+    let Some(Sessions {
+        _directory,
+        mut one,
+        mut two,
+        ..
+    }) = sessions()
+    else {
+        return;
+    };
+    run(
+        &mut one,
+        "CREATE TABLE w (id INT NOT NULL PRIMARY KEY, v INT)",
+    );
+    run(&mut one, "INSERT INTO w (id, v) VALUES (1, 1), (2, 2)");
+    run(&mut one, "BEGIN");
+    assert_eq!(count(&mut one, "u").unwrap(), "2");
+    run(&mut two, "ALTER TABLE t ADD COLUMN c INT DEFAULT 7");
+    run(&mut two, "TRUNCATE TABLE w");
+    run(&mut two, "INSERT INTO u (id, v) VALUES (3, 3)");
+
+    run(&mut one, "INSERT INTO t (id, v, c) VALUES (3, 3, 30)");
+    run(&mut one, "INSERT INTO t (id, v) VALUES (4, 4)");
+    run(
+        &mut one,
+        "INSERT INTO t (id, v) VALUES (6, 6) ON DUPLICATE KEY UPDATE v = 60",
+    );
+    run(&mut one, "REPLACE INTO t (id, v) VALUES (7, 7)");
+    run(&mut one, "INSERT INTO w (id, v) VALUES (1, 3)");
+    for refused in [
+        "UPDATE t SET v = 0 WHERE id = 1",
+        "DELETE FROM t WHERE id = 2",
+        "INSERT INTO t (id, v) VALUES (2, 20) ON DUPLICATE KEY UPDATE v = 20",
+        "REPLACE INTO t (id, v) VALUES (1, 50)",
+        "DELETE FROM w WHERE id = 1",
+    ] {
+        assert_eq!(
+            one.execute_query(refused).map(|_| ()),
+            Err(FrontendErrorKind::TableDefinitionChanged),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        count(&mut one, "t"),
+        Err(FrontendErrorKind::TableDefinitionChanged)
+    );
+    assert_eq!(count(&mut one, "u").unwrap(), "2");
+    assert!(in_transaction(&one));
+    run(&mut one, "COMMIT");
+
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        two.execute_query("SELECT id, c FROM t ORDER BY id")
+    else {
+        panic!("the rows must read back");
+    };
+    let read = |rows: &[Vec<Option<Vec<u8>>>]| {
+        rows.iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| String::from_utf8(value.clone().unwrap()).unwrap())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        read(&result.rows),
+        ["1,7", "2,7", "3,30", "4,7", "6,7", "7,7"]
+    );
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        two.execute_query("SELECT id, v FROM w ORDER BY id")
+    else {
+        panic!("the rows must read back");
+    };
+    assert_eq!(read(&result.rows), ["1,3"]);
+}

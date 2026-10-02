@@ -23,7 +23,7 @@ use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
-use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
@@ -1092,6 +1092,13 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     begin_ts: AtomicU64,
     statement_read_ts: AtomicU64,
     latest_read_ts: AtomicU64,
+    /// The moment the transaction last took up the schema committed by
+    /// others, from which it reads `sqlite_schema` while it keeps reading
+    /// every other table at `begin_ts`; 0 while it reads the schema there too.
+    schema_read_ts: AtomicU64,
+    /// The schema cookie of the moment the transaction reads its rows at,
+    /// which stays when the transaction takes up a newer schema.
+    read_view_schema_cookie: AtomicU32,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1149,6 +1156,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
             begin_ts: AtomicU64::new(begin_ts),
             statement_read_ts: AtomicU64::new(0),
             latest_read_ts: AtomicU64::new(0),
+            schema_read_ts: AtomicU64::new(0),
+            read_view_schema_cookie: AtomicU32::new(header.schema_cookie.get()),
             read_mark,
             schema_generation_at_begin,
             write_set: Mutex::new(WriteSet::new()),
@@ -1174,6 +1183,14 @@ impl<A: RowVersionAllocator> Transaction<A> {
             0 => self.begin_ts(),
             statement_read_ts => statement_read_ts,
         }
+    }
+
+    fn read_ts_of(&self, version: &RowVersion) -> u64 {
+        let read_ts = self.read_ts();
+        if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID {
+            return read_ts;
+        }
+        read_ts.max(self.schema_read_ts.load(Ordering::Acquire))
     }
 
     fn conflict_floor(&self) -> u64 {
@@ -7033,6 +7050,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 savepoint.header = header;
             }
             tx.begin_ts.store(ts, Ordering::Release);
+            tx.schema_read_ts.store(0, Ordering::Release);
+            tx.read_view_schema_cookie
+                .store(header.schema_cookie.get(), Ordering::Release);
         });
         if schema_changed_under_writes {
             return Err(LimboError::SchemaConflict);
@@ -7396,13 +7416,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    pub(crate) fn table_definition_changed_since(&self, tx_id: TxID, table: &str) -> bool {
+    pub(crate) fn table_definition_changed_since_the_read_view(
+        &self,
+        tx_id: TxID,
+        table: &str,
+    ) -> bool {
         let Some(tx) = self.txs.get(&tx_id) else {
             return false;
         };
-        let read_with = u64::from(tx.value().header.read().schema_cookie.get());
+        let read_view = u64::from(tx.value().read_view_schema_cookie.load(Ordering::Acquire));
         self.metadata_locks
-            .definition_changed_after(table, read_with)
+            .definition_changed_after(table, read_view)
+    }
+
+    pub(crate) fn table_definition_changed_since_its_schema(
+        &self,
+        tx_id: TxID,
+        table: &str,
+    ) -> bool {
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return false;
+        };
+        let schema = u64::from(tx.value().header.read().schema_cookie.get());
+        self.metadata_locks.definition_changed_after(table, schema)
+    }
+
+    /// Makes an active transaction write with, and read `sqlite_schema` at,
+    /// the schema other transactions have committed by now, while it keeps
+    /// reading every other table at its snapshot. Answers whether the schema
+    /// it had was older.
+    ///
+    /// A transaction holding the exclusive write slot, or one that changed
+    /// the header itself, keeps its own.
+    pub fn take_up_the_latest_schema(&self, tx_id: TxID) -> Result<bool> {
+        if !self.row_locks.enabled() || self.is_exclusive_tx(&tx_id) {
+            return Ok(false);
+        }
+        let entry = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = entry.value();
+        if tx.header_dirty.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        let mut taken_up = false;
+        self.clock.get_timestamp(|ts| {
+            let header = self
+                .global_header
+                .read()
+                .expect("global_header is set once a transaction has begun");
+            if header.schema_cookie == tx.header.read().schema_cookie {
+                return;
+            }
+            *tx.header.write() = header;
+            for savepoint in tx.savepoint_stack.write().iter_mut() {
+                turso_assert!(
+                    !savepoint.header_dirty,
+                    "only an exclusive transaction changes the database header"
+                );
+                savepoint.header = header;
+            }
+            tx.schema_read_ts.store(ts, Ordering::Release);
+            taken_up = true;
+        });
+        Ok(taken_up)
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
@@ -11280,10 +11358,10 @@ impl RowVersion {
             Some(TxTimestampOrID::Timestamp(end_ts)) => {
                 // Row was deleted at end_ts. If we started after end_ts, we shouldn't see it
                 turso_assert!(
-                    tx.read_ts() != end_ts,
+                    tx.read_ts_of(self) != end_ts,
                     "begin_ts and committed end_ts cannot be equal: txn timestamps are strictly monotonic"
                 );
-                tx.read_ts() > end_ts
+                tx.read_ts_of(self) > end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
                 // Row is being deleted/updated by another transaction.
@@ -11295,7 +11373,7 @@ impl RowVersion {
                 match lookup_tx_state(txs, finalized_tx_states, end_tx_id) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         // Same predicate as the Timestamp arm above.
-                        tx.read_ts() > committed_ts
+                        tx.read_ts_of(self) > committed_ts
                     }
                     Some(TransactionState::Preparing(end_ts)) => {
                         // Hekaton speculative read: treat as if W will commit at
@@ -11306,7 +11384,7 @@ impl RowVersion {
                         // `is_begin_visible` and never calls `is_end_visible`.
                         // If W aborts, we must cascade-abort to avoid letting
                         // the reader observe the row reappear.
-                        let speculatively_invalidated = tx.read_ts() > end_ts;
+                        let speculatively_invalidated = tx.read_ts_of(self) > end_ts;
                         if speculatively_invalidated {
                             register_commit_dependency(txs, tx, end_tx_id);
                         }
@@ -11422,10 +11500,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
     match rv.begin() {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => {
             turso_assert!(
-                tx.read_ts() != rv_begin_ts,
+                tx.read_ts_of(rv) != rv_begin_ts,
                 "begin_ts and committed rv_begin_ts cannot be equal: txn timestamps are strictly monotonic"
             );
-            tx.read_ts() > rv_begin_ts
+            tx.read_ts_of(rv) > rv_begin_ts
         }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let visible = match txs.get(&rv_begin) {
@@ -11443,10 +11521,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                                 "a txn cannot read its own row versions during prepare"
                             );
                             turso_assert!(
-                                tx.read_ts() != end_ts,
+                                tx.read_ts_of(rv) != end_ts,
                                 "begin_ts and preparing end_ts cannot be equal: txn timestamps are strictly monotonic"
                             );
-                            if tx.read_ts() > end_ts {
+                            if tx.read_ts_of(rv) > end_ts {
                                 register_commit_dependency(txs, tx, rv_begin);
                                 true
                             } else {
@@ -11455,10 +11533,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                         }
                         TransactionState::Committed(committed_ts) => {
                             turso_assert!(
-                                tx.read_ts() != committed_ts,
+                                tx.read_ts_of(rv) != committed_ts,
                                 "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
                             );
-                            tx.read_ts() > committed_ts
+                            tx.read_ts_of(rv) > committed_ts
                         }
                         TransactionState::Aborted => false,
                         TransactionState::Terminated => {
@@ -11478,10 +11556,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_begin) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         turso_assert!(
-                            tx.read_ts() != committed_ts,
+                            tx.read_ts_of(rv) != committed_ts,
                             "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
                         );
-                        tx.read_ts() > committed_ts
+                        tx.read_ts_of(rv) > committed_ts
                     }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {
@@ -11511,7 +11589,9 @@ fn is_end_visible<A: ConcurrentAllocator>(
     row_version: &RowVersion,
 ) -> bool {
     match row_version.end() {
-        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.read_ts() < rv_end_ts,
+        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => {
+            current_tx.read_ts_of(row_version) < rv_end_ts
+        }
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let visible = match txs.get(&rv_end) {
                 Some(other_tx_entry) => {
@@ -11529,14 +11609,14 @@ fn is_end_visible<A: ConcurrentAllocator>(
                                 current_tx.tx_id != other_tx.tx_id,
                                 "a txn is reading itself while preparing"
                             );
-                            let visible = current_tx.read_ts() < end_ts;
+                            let visible = current_tx.read_ts_of(row_version) < end_ts;
                             if !visible {
                                 register_commit_dependency(txs, current_tx, rv_end);
                             }
                             visible
                         }
                         TransactionState::Committed(committed_ts) => {
-                            current_tx.read_ts() < committed_ts
+                            current_tx.read_ts_of(row_version) < committed_ts
                         }
                         TransactionState::Aborted => true,
                         // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
@@ -11552,7 +11632,7 @@ fn is_end_visible<A: ConcurrentAllocator>(
                 }
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_end) {
                     Some(TransactionState::Committed(committed_ts)) => {
-                        current_tx.read_ts() < committed_ts
+                        current_tx.read_ts_of(row_version) < committed_ts
                     }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => true,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {

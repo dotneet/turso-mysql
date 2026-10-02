@@ -3403,6 +3403,29 @@ impl Connection {
         self.move_read_snapshot_to_now()
     }
 
+    /// Makes the open MVCC transaction write with the schema other
+    /// connections have committed by now, and read `sqlite_schema` as of
+    /// now, while every other table is still read at its snapshot.
+    ///
+    /// This is how MySQL's data dictionary behaves: a statement always sees
+    /// the latest table definitions, and only a consistent read of a table
+    /// whose definition changed after the read view is refused. Nothing
+    /// changes for a transaction holding the exclusive write slot, or when no
+    /// newer schema was committed.
+    pub fn take_up_the_latest_schema(&self) -> Result<()> {
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+        if mv_store.take_up_the_latest_schema(tx_id)? {
+            self.adopt_the_shared_schema_in_the_transaction();
+        }
+        Ok(())
+    }
+
     pub(crate) fn move_snapshot_after_a_lock_wait(&self) -> Result<()> {
         if self.get_auto_commit() || self.n_active_root_statements.load(Ordering::SeqCst) != 0 {
             return Ok(());
@@ -3430,12 +3453,16 @@ impl Connection {
             return Ok(());
         }
         mv_store.refresh_snapshot(tx_id)?;
+        self.adopt_the_shared_schema_in_the_transaction();
+        Ok(())
+    }
+
+    fn adopt_the_shared_schema_in_the_transaction(&self) {
         self.adopt_shared_schema_if_changed();
         let schema = self.schema.read().clone();
         for savepoint in self.named_savepoints.write().iter_mut() {
             savepoint.main_schema_snapshot = schema.clone();
         }
-        Ok(())
     }
 
     fn check_read_snapshot_can_change(&self) -> Result<()> {

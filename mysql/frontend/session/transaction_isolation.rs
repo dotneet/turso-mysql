@@ -128,7 +128,11 @@ impl MySqlConnection {
     /// for `READ COMMITTED` and for a `REPEATABLE READ` transaction that has
     /// not made its first consistent read; a transaction that wrote before
     /// another session changed the schema is rolled back with 1213 there,
-    /// since its writes could no longer commit.
+    /// since its writes could no longer commit. A transaction that keeps its
+    /// read view takes up the table definitions committed since, as MySQL's
+    /// data dictionary always gives the latest ones: an insert into a table
+    /// changed after the read view writes on its new definition, and only a
+    /// read of that table answers 1412.
     pub fn prepare_for_client_statement(
         &self,
         next: MySqlIsolationLevel,
@@ -173,7 +177,10 @@ impl MySqlConnection {
             }
         };
         if !reads_afresh {
-            return Ok(());
+            return self
+                .inner
+                .take_up_the_latest_schema()
+                .map_err(MySqlQueryError::Engine);
         }
         self.inner.set_snapshot_moves_after_a_lock_wait(true);
         match self.inner.refresh_read_snapshot() {

@@ -7,7 +7,9 @@ use crate::numeric::Numeric;
 use crate::storage::pager::Pager;
 use crate::sync::Arc;
 use crate::types::{compare_record, Cursor, IOResult, IOResultOr, IndexInfo, Value};
+use crate::vdbe::builder::CursorType;
 use crate::vdbe::execute::InsnResult;
+use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::{
     CursorID, Insn, InsnFunctionStepResult, InsnReference, Program, ProgramState, RowLockPoint,
 };
@@ -125,6 +127,9 @@ fn before_the_instruction(
     insn: &Insn,
     pc: usize,
 ) -> Result<(), Box<LimboError>> {
+    if !state.inserts_into_redefined_tables.is_empty() {
+        refuse_to_change_a_row_of_a_redefined_table(program, state, insn)?;
+    }
     if let Some(cursor_id) = positions_to_write(insn) {
         if let Some(cursor) = mvcc_cursor(state, cursor_id) {
             cursor.position_to_write(true);
@@ -152,6 +157,33 @@ fn before_the_instruction(
         }
     }
     Ok(())
+}
+
+fn refuse_to_change_a_row_of_a_redefined_table(
+    program: &Program,
+    state: &ProgramState,
+    insn: &Insn,
+) -> Result<(), Box<LimboError>> {
+    let cursor_id = match insn {
+        Insn::Delete { cursor_id, .. } | Insn::IdxDelete { cursor_id, .. } => *cursor_id,
+        Insn::Insert { cursor, flag, .. } if flag.has(InsertFlags::ASSIGNMENT_IS_UPDATE) => *cursor,
+        _ => return Ok(()),
+    };
+    let table = match &program.cursor_ref[cursor_id].1 {
+        CursorType::BTreeTable(table) => table.name.as_str(),
+        CursorType::BTreeIndex(index) => index.table_name.as_str(),
+        _ => return Ok(()),
+    };
+    match state
+        .inserts_into_redefined_tables
+        .iter()
+        .find(|redefined| redefined.eq_ignore_ascii_case(table))
+    {
+        Some(redefined) => Err(Box::new(LimboError::TableDefinitionChanged(
+            redefined.clone(),
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn after_the_instruction(program: &Program, state: &mut ProgramState, insn: &Insn, pc: usize) {
