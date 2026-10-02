@@ -12977,6 +12977,20 @@ pub fn op_insert(
                         let cursor = cursor.as_btree_mut();
                         (cursor.is_mvcc(), cursor.has_rowid())
                     };
+                    if is_mvcc
+                        && has_rowid
+                        && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                        && state.pending_mysql_update_old_record.is_none()
+                    {
+                        let stored_row = {
+                            let cursor = get_cursor!(state, *cursor_id);
+                            let cursor = cursor.as_btree_mut();
+                            let key = return_if_io!(state, cursor.rowid());
+                            let record = return_if_io!(state, cursor.record());
+                            record.map(|record| (key, record.clone()))
+                        };
+                        state.pending_mysql_update_old_record = stored_row;
+                    }
                     if is_mvcc || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
                         let new_key = if has_rowid {
                             match &state.registers[*key_reg].get_value() {

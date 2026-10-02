@@ -2006,3 +2006,8 @@ fn assert_mysql_changed_rows_for_upserts(conn: &Arc<Connection>) -> anyhow::Resu
 fn test_mysql_changed_rows_for_wal_upserts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_mysql_changed_rows_for_upserts(&tmp_db.connect_limbo())
 }
+
+#[turso_macros::test(mvcc)]
+fn test_mysql_changed_rows_for_mvcc_upserts(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_mysql_changed_rows_for_upserts(&tmp_db.connect_limbo())
+}
