@@ -2006,6 +2006,12 @@ pub enum Insn {
         cursor_id: CursorID,
         key_reg: usize,
     },
+    KeepTheGapsOfRefusedWrites,
+    ForeignKeyRefused {
+        child_table: String,
+        foreign_key: Arc<ForeignKey>,
+        refused_row: crate::RefusedRow,
+    },
     // Check if there are any unresolved foreign key constraint violations.
     // If P1 is zero, check the statement constraint-counter (immediate FK violations).
     // If P1 is non-zero, check the database constraint-counter (deferred FK violations).
@@ -2403,6 +2409,8 @@ impl InsnVariants {
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
             InsnVariants::FkCheck => execute::op_fk_check,
             InsnVariants::RefusedWrite => execute::op_refused_write,
+            InsnVariants::KeepTheGapsOfRefusedWrites => execute::op_keep_the_gaps_of_refused_writes,
+            InsnVariants::ForeignKeyRefused => execute::op_foreign_key_refused,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,

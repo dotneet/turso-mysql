@@ -524,6 +524,7 @@ pub struct CheckedAutoIncrementInsert {
     /// Whether the statement carries `ON DUPLICATE KEY UPDATE`, rather than
     /// `IGNORE` or nothing.
     upserts: bool,
+    ignores: bool,
     upsert_columns: Vec<String>,
     /// The columns the upsert clause reads off the row it was offered.
     offered_columns: Vec<String>,
@@ -596,6 +597,10 @@ impl CheckedAutoIncrementInsert {
     /// Whether the statement carries `ON DUPLICATE KEY UPDATE`.
     pub fn upserts(&self) -> bool {
         self.upserts
+    }
+
+    pub fn ignores(&self) -> bool {
+        self.ignores
     }
 
     /// Whether a row writes a reading of the clock, such as `NOW()`.
@@ -703,14 +708,6 @@ impl CheckedAutoIncrementInsert {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        if self.rowwise_conflicts
-            && !self.upserts
-            && row_values
-                .iter()
-                .any(|value| *value != AutoIncrementRowValue::Generated)
-        {
-            return unsupported("multirow IGNORE with explicit AUTO_INCREMENT IDs");
-        }
         let insert = match named_at {
             None => self.with_a_row_to_be_numbered()?,
             Some(at)
@@ -5532,6 +5529,7 @@ fn parse_checked_auto_increment_insert(
         rowwise_conflicts,
         rows_differ_in_their_defaults,
         upserts: insert.on.is_some(),
+        ignores: insert.ignore,
         upsert_columns,
         offered_columns,
         reads_the_clock,

@@ -540,6 +540,19 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ForeignKeyRefusal {
+    pub child_table: String,
+    pub foreign_key: Arc<crate::schema::ForeignKey>,
+    pub refused_row: RefusedRow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedRow {
+    ChildRowWithoutParent,
+    ParentRowWithChildren,
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -715,6 +728,7 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(super) fk_checked_row_by_row: AtomicBool,
+    pub(crate) foreign_key_refusals: Mutex<Vec<ForeignKeyRefusal>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -2252,6 +2266,14 @@ impl Connection {
 
     pub fn foreign_keys_checked_row_by_row(&self) -> bool {
         self.fk_checked_row_by_row.load(Ordering::Acquire)
+    }
+
+    pub fn take_foreign_key_refusals(&self) -> Vec<ForeignKeyRefusal> {
+        std::mem::take(&mut *self.foreign_key_refusals.lock())
+    }
+
+    pub(crate) fn note_foreign_key_refusal(&self, refusal: ForeignKeyRefusal) {
+        self.foreign_key_refusals.lock().push(refusal);
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {

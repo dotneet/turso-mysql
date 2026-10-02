@@ -817,9 +817,13 @@ pub fn emit_upsert(
         .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
-        (true, Some(table)) => {
-            affected_parent_fks_for_update(resolver, table, &updated_positions, upsert_database_id)?
-        }
+        (true, Some(table)) => affected_parent_fks_for_update(
+            resolver,
+            table,
+            &updated_positions,
+            upsert_database_id,
+            program.checks_foreign_keys_row_by_row,
+        )?,
         _ => crate::alloc::vec![],
     };
     let has_parent_fk_checks = affected_parent_fks.iter().any(|fk| {

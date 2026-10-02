@@ -940,6 +940,7 @@ pub struct ProgramState {
     pub(crate) before_writing: Option<BeforeWriting>,
     pub(crate) inserts_into_redefined_tables: Vec<String>,
     pub(crate) refused_writes: Vec<crate::mvcc::database::RowID>,
+    low_neighbor_of_a_refused_write: Option<Option<crate::mvcc::database::RowKey>>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1122,6 +1123,7 @@ impl ProgramState {
             before_writing: None,
             inserts_into_redefined_tables: Vec::new(),
             refused_writes: Vec::new(),
+            low_neighbor_of_a_refused_write: None,
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1225,6 +1227,7 @@ impl ProgramState {
         self.before_writing = None;
         self.inserts_into_redefined_tables.clear();
         self.refused_writes.clear();
+        self.low_neighbor_of_a_refused_write = None;
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -3927,19 +3930,9 @@ impl Program {
         key: &crate::mvcc::database::RowID,
         below: crate::mvcc::cursor::UndoneInsertNeighbor,
     ) -> Result<()> {
-        let Some(cursor_id) = (0..state.cursors.len()).find(|cursor_id| {
-            row_lock_hooks::mvcc_cursor(state, *cursor_id)
-                .is_some_and(|cursor| cursor.table_id() == key.table_id && cursor.keeps_gaps())
-        }) else {
+        let Some(cursor_id) = self.cursor_keeping_the_gap_of(state, key) else {
             return Ok(());
         };
-        let rowid_is_the_key = matches!(
-            &self.cursor_ref[cursor_id].1,
-            CursorType::BTreeTable(table) if table.rowid_is_its_key()
-        );
-        if matches!(key.row_id, crate::mvcc::database::RowKey::Int(_)) && !rowid_is_the_key {
-            return Ok(());
-        }
         let cursor =
             row_lock_hooks::mvcc_cursor(state, cursor_id).expect("the cursor was found just above");
         let low = crate::util::IOExt::block(pager.io.as_ref(), || {
@@ -3956,6 +3949,66 @@ impl Program {
         })?;
         cursor.keep_the_gap_an_undone_insert_left(&key.row_id, low, high);
         Ok(())
+    }
+
+    pub(crate) fn keep_the_gap_of_a_refused_write(
+        &self,
+        state: &mut ProgramState,
+        key: &crate::mvcc::database::RowID,
+    ) -> crate::types::IOResultOr<()> {
+        let Some(cursor_id) = self.cursor_keeping_the_gap_of(state, key) else {
+            return Ok(IOResult::Done(()));
+        };
+        let low = match state.low_neighbor_of_a_refused_write.take() {
+            Some(low) => low,
+            None => {
+                let cursor = row_lock_hooks::mvcc_cursor(state, cursor_id)
+                    .expect("the cursor was found just above");
+                match cursor.neighbor_of_an_undone_insert(
+                    &key.row_id,
+                    crate::mvcc::cursor::UndoneInsertNeighbor::AtOrBelow,
+                )? {
+                    IOResult::Done(low) => low,
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                }
+            }
+        };
+        if low.as_ref() == Some(&key.row_id) {
+            return Ok(IOResult::Done(()));
+        }
+        let cursor =
+            row_lock_hooks::mvcc_cursor(state, cursor_id).expect("the cursor was found just above");
+        let high = match cursor.neighbor_of_an_undone_insert(
+            &key.row_id,
+            crate::mvcc::cursor::UndoneInsertNeighbor::Above,
+        )? {
+            IOResult::Done(high) => high,
+            IOResult::IO(io) => {
+                state.low_neighbor_of_a_refused_write = Some(low);
+                return Ok(IOResult::IO(io));
+            }
+        };
+        cursor.keep_the_gap_an_undone_insert_left(&key.row_id, low, high);
+        Ok(IOResult::Done(()))
+    }
+
+    fn cursor_keeping_the_gap_of(
+        &self,
+        state: &mut ProgramState,
+        key: &crate::mvcc::database::RowID,
+    ) -> Option<CursorID> {
+        let cursor_id = (0..state.cursors.len()).find(|cursor_id| {
+            row_lock_hooks::mvcc_cursor(state, *cursor_id)
+                .is_some_and(|cursor| cursor.table_id() == key.table_id && cursor.keeps_gaps())
+        })?;
+        let rowid_is_the_key = matches!(
+            &self.cursor_ref[cursor_id].1,
+            CursorType::BTreeTable(table) if table.rowid_is_its_key()
+        );
+        if matches!(key.row_id, crate::mvcc::database::RowKey::Int(_)) && !rowid_is_the_key {
+            return None;
+        }
+        Some(cursor_id)
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {

@@ -1712,6 +1712,35 @@ fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_the_foreign_k
 }
 
 #[test]
+fn a_child_insert_or_ignore_skips_keeps_its_gaps_whole_around_the_rows_written_after_it() {
+    for (level, keeps_the_gaps) in [
+        (RowLockLevel::RepeatableRead, true),
+        (RowLockLevel::ReadCommitted, false),
+    ] {
+        let db = database_with_a_child_of_three_keys();
+        let writer = row_by_row_foreign_key_session(&db, level);
+        writer.execute("BEGIN CONCURRENT").unwrap();
+        writer
+            .execute("INSERT OR IGNORE INTO c VALUES (5, 15, 20, 150), (6, 16, 1, 160)")
+            .unwrap();
+        assert_eq!(writer.take_foreign_key_refusals().len(), 1);
+        for insert in [
+            "INSERT INTO c VALUES (7, 40, 50, 400)",
+            "INSERT INTO c VALUES (20, 17, 50, 400)",
+            "INSERT INTO c VALUES (3, 40, 50, 400)",
+        ] {
+            assert_eq!(waits(&db, insert), keeps_the_gaps, "{level:?}: {insert}");
+        }
+        assert!(
+            !waits(&db, "INSERT INTO c VALUES (21, 40, 50, 155)"),
+            "{level:?}"
+        );
+        writer.execute("ROLLBACK").unwrap();
+        assert!(!waits(&db, "INSERT INTO c VALUES (7, 40, 50, 400)"));
+    }
+}
+
+#[test]
 fn a_child_refused_after_an_inserted_row_keeps_the_gaps_of_both_and_none_past_the_last_rowid() {
     let db = database_with_a_child_of_three_keys();
     let writer = row_by_row_foreign_key_session(&db, RowLockLevel::RepeatableRead);

@@ -1489,6 +1489,101 @@ fn a_refused_child_keeps_the_gaps_of_the_keys_innodb_writes_before_its_foreign_k
     }
 }
 
+#[test]
+fn a_counted_child_insert_ignore_skips_keeps_the_end_of_the_table_only_under_repeatable_read() {
+    for (level, keeps_the_gap) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        let Ok(CommandExecutionResult::Ok(skipped)) =
+            one.execute_query("INSERT IGNORE INTO children (a, parent_id) VALUES (15, 99)")
+        else {
+            panic!("{level}: INSERT IGNORE must skip the row");
+        };
+        assert_eq!(
+            (
+                skipped.affected_rows,
+                skipped.last_insert_id,
+                skipped.warnings
+            ),
+            (0, 0, 1),
+            "{level}"
+        );
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        let insert = two
+            .execute_query("INSERT INTO children (a, parent_id) VALUES (40, 10)")
+            .map(|_| ());
+        if keeps_the_gap {
+            assert_eq!(insert, Err(FrontendErrorKind::DatabaseBusy), "{level}");
+        } else {
+            assert_eq!(insert, Ok(()), "{level}");
+            assert_eq!(
+                single_value(&mut two, "SELECT id FROM children WHERE a = 40"),
+                "5"
+            );
+        }
+        run(&mut one, "ROLLBACK");
+    }
+}
+
+#[test]
+fn rows_written_after_an_insert_ignore_skip_leave_the_skipped_rows_gaps_whole() {
+    for (level, keeps_the_gaps) in [("REPEATABLE READ", true), ("READ COMMITTED", false)] {
+        let Some(TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        }) = refused_child_sessions()
+        else {
+            return;
+        };
+        run(
+            &mut one,
+            &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+        );
+        run(&mut one, "BEGIN");
+        let Ok(CommandExecutionResult::Ok(written)) = one.execute_query(
+            "INSERT IGNORE INTO keyed_children (id, a, parent_id, b) \
+             VALUES (5, 15, 99, 150), (6, 16, 10, 160)",
+        ) else {
+            panic!("{level}: INSERT IGNORE must skip the refused row");
+        };
+        assert_eq!((written.affected_rows, written.warnings), (1, 1), "{level}");
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        for insert in [
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (7, 40, 10, 400)",
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (20, 17, 10, 400)",
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (3, 50, 10, 400)",
+        ] {
+            let inserted = two.execute_query(insert).map(|_| ());
+            if keeps_the_gaps {
+                assert_eq!(
+                    inserted,
+                    Err(FrontendErrorKind::DatabaseBusy),
+                    "{level}: {insert}"
+                );
+            } else {
+                assert_eq!(inserted, Ok(()), "{level}: {insert}");
+            }
+        }
+        run(
+            &mut two,
+            "INSERT INTO keyed_children (id, a, parent_id, b) VALUES (21, 50, 10, 155)",
+        );
+        run(&mut one, "ROLLBACK");
+    }
+}
+
 /// Measured on MySQL 8.4.11: a child that will be refused with 1452 first
 /// waits, and answers 1205, for a gap another session holds where InnoDB
 /// writes before the foreign key check, while a gap in a key after the

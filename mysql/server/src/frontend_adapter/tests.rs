@@ -31100,3 +31100,6 @@ mod efcore_statements;
 
 #[cfg(unix)]
 mod gitea_statements;
+
+#[cfg(unix)]
+mod foreign_keys;

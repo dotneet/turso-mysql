@@ -8,7 +8,9 @@ use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
+use turso_core::{
+    CheckpointMode, Connection, LimboError, Numeric, RefusedRow, Row, Statement, Value,
+};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -2073,5 +2075,93 @@ fn assert_foreign_keys_checked_row_by_row(conn: &Arc<Connection>) -> anyhow::Res
     conn.execute("DELETE FROM nodes WHERE id = 1")?;
     let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM c ORDER BY id");
     assert_eq!(rows, [(1, 0), (2, 1)]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn foreign_keys_checked_row_by_row_note_each_row_they_refuse(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_foreign_keys_checked_row_by_row_note_each_refused_row(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn foreign_keys_checked_row_by_row_note_each_row_they_refuse_under_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_foreign_keys_checked_row_by_row_note_each_refused_row(&tmp_db.connect_limbo())
+}
+
+fn assert_foreign_keys_checked_row_by_row_note_each_refused_row(
+    conn: &Arc<Connection>,
+) -> anyhow::Result<()> {
+    conn.set_foreign_keys_checked_row_by_row(true);
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE zz (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id))")?;
+    conn.execute(
+        "CREATE TABLE aa (id INT NOT NULL PRIMARY KEY, pid INT, \
+         CONSTRAINT aa_named FOREIGN KEY (pid) REFERENCES p (id))",
+    )?;
+    conn.execute("CREATE INDEX zz_pid ON zz (pid)")?;
+    conn.execute("CREATE INDEX aa_pid ON aa (pid)")?;
+    conn.execute("INSERT INTO p VALUES (1), (2)")?;
+    let refused = |conn: &Arc<Connection>| -> Vec<(String, Option<String>, RefusedRow)> {
+        conn.take_foreign_key_refusals()
+            .into_iter()
+            .map(|refusal| {
+                (
+                    refusal.child_table,
+                    refusal.foreign_key.name.clone(),
+                    refusal.refused_row,
+                )
+            })
+            .collect()
+    };
+
+    conn.execute("INSERT OR IGNORE INTO zz VALUES (1, 1), (2, 9), (3, 2), (4, 8)")?;
+    let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM zz ORDER BY id");
+    assert_eq!(ids, [(1,), (3,)]);
+    assert_eq!(
+        refused(conn),
+        [
+            ("zz".to_owned(), None, RefusedRow::ChildRowWithoutParent),
+            ("zz".to_owned(), None, RefusedRow::ChildRowWithoutParent),
+        ]
+    );
+
+    assert!(matches!(
+        conn.execute("INSERT INTO aa VALUES (1, 9)"),
+        Err(LimboError::ForeignKeyConstraint(_))
+    ));
+    assert_eq!(
+        refused(conn),
+        [(
+            "aa".to_owned(),
+            Some("aa_named".to_owned()),
+            RefusedRow::ChildRowWithoutParent
+        )]
+    );
+
+    conn.execute("INSERT INTO aa VALUES (1, 1)")?;
+    conn.execute("INSERT INTO zz VALUES (5, 1)")?;
+    for sql in [
+        "DELETE FROM p WHERE id = 1",
+        "UPDATE p SET id = 5 WHERE id = 1",
+    ] {
+        assert!(matches!(
+            conn.execute(sql),
+            Err(LimboError::ForeignKeyConstraint(_))
+        ));
+        assert_eq!(
+            refused(conn),
+            [(
+                "aa".to_owned(),
+                Some("aa_named".to_owned()),
+                RefusedRow::ParentRowWithChildren
+            )],
+            "{sql}"
+        );
+    }
     Ok(())
 }

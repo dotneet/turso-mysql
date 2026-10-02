@@ -4484,6 +4484,7 @@ where
         } else {
             MySqlAffectedRowsMode::Changed
         };
+        connection.take_foreign_key_refusals();
         let result = execute_checked_query(
             connection,
             sql,
@@ -4497,6 +4498,13 @@ where
                 group_concat_max_len: self.session_variables.group_concat_max_len(),
                 raised: &mut self.raised_warnings,
             },
+        );
+        let result = answer_the_foreign_key_refusals(
+            connection,
+            &selected_database,
+            result,
+            &mut self.raised_warnings,
+            &mut self.error_message,
         );
         // A table the statement reads is not on the stand-in, which is how
         // MySQL's 1049 for it is found.
@@ -5113,13 +5121,21 @@ where
             .connection
             .set_group_concat_max_len(statement.group_concat_max_len);
         statement.connection.forget_group_concat_cuts();
+        statement.connection.take_foreign_key_refusals();
         self.raised_warnings.clear();
-        let mut result = execute_database_prepared_statement(
+        let result = execute_database_prepared_statement(
             statement,
             parameter_payload,
             long_data,
             timeout,
             affected_rows_mode,
+        );
+        let mut result = answer_the_foreign_key_refusals_of_a_prepared_statement(
+            &statement.connection,
+            &statement.database,
+            result,
+            &mut self.raised_warnings,
+            &mut self.error_message,
         )?;
         self.raised_warnings.extend(
             statement
@@ -5765,6 +5781,88 @@ fn execute_checked_statement(
         warnings: u16::try_from(raised.len()).unwrap_or(u16::MAX),
         ..CommandOkResult::default()
     }))
+}
+
+fn answer_the_foreign_key_refusals(
+    connection: &MySqlConnection,
+    database: &str,
+    result: Result<CommandExecutionResult, FrontendErrorKind>,
+    raised: &mut Vec<MySqlWarning>,
+    error_message: &mut Option<Vec<u8>>,
+) -> Result<CommandExecutionResult, FrontendErrorKind> {
+    let refusals = connection.take_foreign_key_refusals();
+    match result {
+        Ok(CommandExecutionResult::Ok(mut ok)) => {
+            warn_about_refused_rows(database, &refusals, raised);
+            ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
+            Ok(CommandExecutionResult::Ok(ok))
+        }
+        Err(kind) => Err(name_the_refusing_foreign_key(
+            database,
+            &refusals,
+            kind,
+            error_message,
+        )),
+        result => result,
+    }
+}
+
+fn answer_the_foreign_key_refusals_of_a_prepared_statement(
+    connection: &MySqlConnection,
+    database: &str,
+    result: Result<PreparedStatementExecutionResult, FrontendErrorKind>,
+    raised: &mut Vec<MySqlWarning>,
+    error_message: &mut Option<Vec<u8>>,
+) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
+    let refusals = connection.take_foreign_key_refusals();
+    match result {
+        Ok(PreparedStatementExecutionResult::Ok(mut ok)) => {
+            warn_about_refused_rows(database, &refusals, raised);
+            ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
+            Ok(PreparedStatementExecutionResult::Ok(ok))
+        }
+        Err(kind) => Err(name_the_refusing_foreign_key(
+            database,
+            &refusals,
+            kind,
+            error_message,
+        )),
+        result => result,
+    }
+}
+
+fn warn_about_refused_rows(
+    database: &str,
+    refusals: &[turso_core::ForeignKeyRefusal],
+    raised: &mut Vec<MySqlWarning>,
+) {
+    raised.extend(
+        refusals
+            .iter()
+            .map(|refusal| MySqlWarning::refused_by_a_foreign_key(database, refusal)),
+    );
+}
+
+fn name_the_refusing_foreign_key(
+    database: &str,
+    refusals: &[turso_core::ForeignKeyRefusal],
+    kind: FrontendErrorKind,
+    error_message: &mut Option<Vec<u8>>,
+) -> FrontendErrorKind {
+    if let (
+        FrontendErrorKind::ForeignKeyViolation | FrontendErrorKind::ParentRowReferenced,
+        Some(refusal),
+    ) = (kind, refusals.last())
+    {
+        *error_message = Some(
+            turso_mysql::show_create_table::foreign_key_refusal_message(
+                &database.to_ascii_lowercase(),
+                refusal,
+            )
+            .into_bytes(),
+        );
+    }
+    kind
 }
 
 /// Raises MySQL's warning 1287 once for each `VALUES(col)` the statement's
@@ -12984,6 +13082,20 @@ impl MySqlWarning {
             level: "Warning",
             code: 138,
             message: "InnoDB: WITH CONSISTENT SNAPSHOT was ignored because this phrase can only be used with REPEATABLE READ isolation level.".to_owned(),
+        }
+    }
+
+    fn refused_by_a_foreign_key(database: &str, refusal: &turso_core::ForeignKeyRefusal) -> Self {
+        Self {
+            level: "Warning",
+            code: match refusal.refused_row {
+                turso_core::RefusedRow::ChildRowWithoutParent => 1452,
+                turso_core::RefusedRow::ParentRowWithChildren => 1451,
+            },
+            message: turso_mysql::show_create_table::foreign_key_refusal_message(
+                &database.to_ascii_lowercase(),
+                refusal,
+            ),
         }
     }
 

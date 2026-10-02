@@ -2596,6 +2596,31 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::KeepTheGapsOfRefusedWrites => (
+            "KeepTheGapsOfRefusedWrites",
+            0,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::ForeignKeyRefused {
+            child_table,
+            foreign_key,
+            refused_row,
+        } => (
+            "ForeignKeyRefused",
+            0,
+            0,
+            0,
+            Value::build_text(format!(
+                "{child_table}.{}",
+                foreign_key.child_columns.join(",")
+            )),
+            0,
+            format!("{refused_row:?}"),
+        ),
         Insn::FkCheck{ deferred } => (
         "FkCheck",
             *deferred as i64,

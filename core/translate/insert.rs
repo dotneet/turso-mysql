@@ -1,6 +1,7 @@
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
+use crate::RefusedRow;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
@@ -22,9 +23,10 @@ use crate::{
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
-            emit_guarded_fk_decrement, emit_skip_if_any_null, index_probe, index_scan_match_any,
-            open_read_index, open_read_table, sort_by_the_index_innodb_checks_them_at,
-            writes_before_the_foreign_key_check, ForeignKeyActions, RowWrite,
+            emit_foreign_key_refused, emit_guarded_fk_decrement, emit_skip_if_any_null,
+            index_probe, index_scan_match_any, open_read_index, open_read_table,
+            sort_by_the_index_innodb_checks_them_at, writes_before_the_foreign_key_check,
+            ForeignKeyActions, RowWrite,
         },
         plan::{
             ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
@@ -955,6 +957,8 @@ pub fn translate_insert(
         // when the parent is missing — matching SQLite's bytecode order.
         let fk_layout = btree_table.column_layout()?;
         let resolver: &Resolver = resolver;
+        let skip_a_refused_row =
+            matches!(ctx.on_conflict, ResolveType::Ignore).then_some(ctx.loop_labels.row_done);
         emit_fk_child_insert_checks(
             program,
             &btree_table,
@@ -963,6 +967,7 @@ pub fn translate_insert(
             resolver,
             database_id,
             &fk_layout,
+            skip_a_refused_row,
             &mut |program, writes| {
                 emit_refused_writes_of_an_insert(program, resolver, &insertion, &ctx, writes)
             },
@@ -4074,6 +4079,7 @@ pub fn emit_fk_child_insert_checks(
     resolver: &Resolver,
     database_id: usize,
     layout: &ColumnLayout,
+    skip_a_refused_row: Option<BranchOffset>,
     refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
 ) -> crate::Result<()> {
     let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
@@ -4154,7 +4160,14 @@ pub fn emit_fk_child_insert_checks(
             if fk_ref.fk.deferred {
                 emit_fk_violation(program, &fk_ref.fk)?;
             } else {
-                emit_refused_child_halt(program, &fk_ref, child_tbl, &indexes, refused_writes)?;
+                emit_refused_child_row(
+                    program,
+                    &fk_ref,
+                    child_tbl,
+                    &indexes,
+                    skip_a_refused_row,
+                    refused_writes,
+                )?;
             }
             program.preassign_label_to_next_insn(fk_ok);
         } else {
@@ -4254,7 +4267,14 @@ pub fn emit_fk_child_insert_checks(
                     if fk_ref.fk.deferred {
                         emit_fk_violation(p, &fk_ref.fk)
                     } else {
-                        emit_refused_child_halt(p, &fk_ref, child_tbl, &indexes, refused_writes)
+                        emit_refused_child_row(
+                            p,
+                            &fk_ref,
+                            child_tbl,
+                            &indexes,
+                            skip_a_refused_row,
+                            refused_writes,
+                        )
                     }
                 },
             )?;
@@ -4265,20 +4285,32 @@ pub fn emit_fk_child_insert_checks(
     Ok(())
 }
 
-fn emit_refused_child_halt(
+fn emit_refused_child_row(
     program: &mut ProgramBuilder,
     fk_ref: &ResolvedFkRef,
     child_tbl: &BTreeTable,
     indexes: &[Arc<Index>],
+    skip_a_refused_row: Option<BranchOffset>,
     refused_writes: &mut dyn FnMut(&mut ProgramBuilder, &[RowWrite]) -> Result<()>,
 ) -> Result<()> {
-    if program.checks_foreign_keys_row_by_row {
-        refused_writes(
-            program,
-            &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
-        )?;
+    if !program.checks_foreign_keys_row_by_row {
+        return emit_fk_restrict_halt(program);
     }
-    emit_fk_restrict_halt(program)
+    refused_writes(
+        program,
+        &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
+    )?;
+    emit_foreign_key_refused(program, fk_ref, RefusedRow::ChildRowWithoutParent);
+    match skip_a_refused_row {
+        Some(row_done) => {
+            program.emit_insn(Insn::KeepTheGapsOfRefusedWrites);
+            program.emit_insn(Insn::Goto {
+                target_pc: row_done,
+            });
+            Ok(())
+        }
+        None => emit_fk_restrict_halt(program),
+    }
 }
 
 /// Build NEW parent key image in FK parent-column order into a contiguous register block.

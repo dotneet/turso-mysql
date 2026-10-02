@@ -3094,7 +3094,13 @@ another key leaves the next number at 51. A row naming an id past the counter
 beside one asking for a number is refused: MySQL moves the counter as the rows
 go by, so the number that row takes depends on the ones before it, and the
 numbers here are reserved before any row is written. `IGNORE` over several rows
-naming ids stays refused.
+naming ids is written the same way, a row at a time: measured on 8.4.11 and
+matched, the counter moves past each id once its row is written and past none
+`IGNORE` skips, and a statement that wrote some row reports the id the last row
+named, written or skipped — `(80, ...), (81, <a missing parent>)` reports 81
+and leaves the next number at 81 — while one that wrote nothing reports 0. One
+row naming its own id that `IGNORE` skips leaves the counter alone and reports
+0 as well.
 
 Rows of such an upsert may also give a column `DEFAULT` in some rows and a value
 in others, which is how TypeORM's `repository.upsert` writes entities that set
@@ -3107,17 +3113,20 @@ offering `DEFAULT` writes the column's default, 0.00. A table that does not
 count its own ids writes the rows in one statement, which cannot leave a column
 out of one row only, so there it is refused.
 
-`INSERT IGNORE` into a table that counts its own ids is taken over one row.
-The allocator reserves its range before the rows are written, so a row `IGNORE`
-skips has already taken a number — and that is what MySQL does too: measured on
-8.4.11, the counter moves past a skipped row exactly as it moves past a written
-one, so the table prints `AUTO_INCREMENT=3` where one row stands and one was
-skipped. What such a statement reports is measured now as well: a skipped row
-counts 0 and reports no id at all, leaving `LAST_INSERT_ID()` where it stood,
-and a written one counts 1 and reports the number it took.
+`INSERT IGNORE` into a table that counts its own ids is taken. The allocator
+reserves its range before the rows are written, so a row `IGNORE` skips has
+already taken a number — and that is what MySQL does too: measured on 8.4.11,
+the counter moves past a skipped row exactly as it moves past a written one, so
+the table prints `AUTO_INCREMENT=3` where one row stands and one was skipped.
+What such a statement reports is measured now as well: a skipped row counts 0
+and reports no id at all, leaving `LAST_INSERT_ID()` where it stood, and a
+written one counts 1 and reports the number it took.
 
-A statement of several rows is refused there, the way an upsert of several is:
-which of them the reported id comes from depends on what each of them did.
+A statement of several rows is written a row at a time, the way an upsert of
+several is, and a skipped row hands the number it asked for on to the next row
+asking for one: measured on 8.4.11 and matched, `(pid) VALUES (1), (9), (2)`
+with no parent 9 writes ids 2 and 3 from a counter at 2, reports 2 and leaves
+the next number at 5.
 
 `REPLACE INTO` on such a table is taken as well, and always takes a new number,
 the replaced row being deleted and a new one written — measured, replacing the
@@ -6046,6 +6055,26 @@ InnoDB reaches first, locking only that parent's gap. The engine checks the
 foreign key before it writes anything, so it takes these gaps without writing
 the row, and each of these was measured and is matched. A refused row's
 `AUTO_INCREMENT` id is spent, as InnoDB spends it.
+
+A refused row is answered with MySQL's whole message, which names the child
+table and its constraint the way `SHOW CREATE TABLE` prints it — measured on
+8.4.11 and matched, ``Cannot add or update a child row: a foreign key
+constraint fails (`d`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pid`) REFERENCES
+`p` (`id`))`` for 1452 and ``Cannot delete or update a parent row: ...`` with
+the same naming for 1451. A parent row several children name is refused for the
+child constraint whose name comes first byte by byte (`B_fk` before `a_fk`,
+`aa_ibfk_1` before `zz_ibfk_1`), the order InnoDB checks them in, and the checks
+and the locks they take go in that order here too.
+
+`INSERT IGNORE` skips a child row naming no parent instead of refusing the
+statement, over one row, several rows and the `SET` form, prepared or not, with
+warning 1452 carrying that message for each row it skipped. Measured on 8.4.11
+and matched: the skipped rows count nothing in the affected rows, the
+statement reports the ids it reports for a row skipped as a duplicate, and in
+MVCC under `REPEATABLE READ` a skipped row keeps the gaps a refused row keeps,
+until the transaction ends. A row written later in the same statement into one
+of those gaps leaves it locked on both sides of the new row, as InnoDB's gap
+splits around it.
 
 Some differences remain. A secondary key's entry here ends with the rowid, not
 with the primary key, so an `UPDATE` that changes a primary key that is not

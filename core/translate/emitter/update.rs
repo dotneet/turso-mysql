@@ -1254,6 +1254,7 @@ fn emit_update_insns<'a>(
             table,
             &updated_column_indices,
             update_database_id,
+            program.checks_foreign_keys_row_by_row,
         )?,
         _ => crate::alloc::vec![],
     };

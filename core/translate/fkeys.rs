@@ -14,7 +14,7 @@ use crate::{
         insn::{CmpInsFlags, Insn, Subprogram},
         BranchOffset, PreparedProgram, RowLockPoint,
     },
-    Connection, LimboError, Result,
+    Connection, LimboError, RefusedRow, Result,
 };
 use std::{cell::RefCell, num::NonZero, num::NonZeroUsize, rc::Rc};
 
@@ -180,10 +180,14 @@ pub fn affected_parent_fks_for_update(
     table_btree: &BTreeTable,
     updated_positions: &ColumnMask,
     database_id: usize,
+    checks_row_by_row: bool,
 ) -> Result<crate::alloc::Vec<ResolvedFkRef>> {
     let mut affected_fks = resolver.with_schema(database_id, |s| {
         s.resolved_fks_referencing(&table_btree.name)
     })?;
+    if checks_row_by_row {
+        sort_by_the_name_innodb_gives_them(&mut affected_fks);
+    }
     let affected_positions = if affected_fks.iter().any(|fk| !fk.parent_uses_rowid) {
         table_btree.columns_affected_by_update(updated_positions)?
     } else {
@@ -197,6 +201,17 @@ pub fn affected_parent_fks_for_update(
         )
     });
     Ok(affected_fks)
+}
+
+pub fn sort_by_the_name_innodb_gives_them(fk_refs: &mut [ResolvedFkRef]) {
+    fk_refs.sort_by_cached_key(|fk_ref| match &fk_ref.fk.name {
+        Some(name) => name.clone(),
+        None => format!(
+            "{}_ibfk_{}",
+            fk_ref.child_table.name,
+            fk_ref.fk.decl_order + 1
+        ),
+    });
 }
 
 /// Emit parent-side OLD/NEW key probes when a parent key actually changes.
@@ -925,7 +940,7 @@ fn emit_fk_parent_key_probe(
             // OLD key referenced by a child: removing/changing this parent key
             // creates a violation unless a later statement repairs it.
             (_, ParentProbePass::Old) => {
-                emit_fk_parent_violation(p, &fk_ref.fk, is_restrict)?;
+                emit_fk_parent_violation(p, fk_ref, is_restrict)?;
             }
 
             // NEW key referenced by a child: this parent key may repair a
@@ -1391,8 +1406,21 @@ fn emit_fk_child_violation(
             program,
             &writes_before_the_foreign_key_check(child_tbl, indexes, fk_ref),
         )?;
+        emit_foreign_key_refused(program, fk_ref, RefusedRow::ChildRowWithoutParent);
     }
     emit_fk_violation(program, &fk_ref.fk)
+}
+
+pub fn emit_foreign_key_refused(
+    program: &mut ProgramBuilder,
+    fk_ref: &ResolvedFkRef,
+    refused_row: RefusedRow,
+) {
+    program.emit_insn(Insn::ForeignKeyRefused {
+        child_table: fk_ref.child_table.name.clone(),
+        foreign_key: fk_ref.fk.clone(),
+        refused_row,
+    });
 }
 
 fn primary_key_is_updated(table: &BTreeTable, updated_cols: &ColumnMask) -> bool {
@@ -1591,8 +1619,7 @@ fn emit_fk_delete_parent_existence_check_single(
         child_index_for_foreign_key(s.get_indices(&fk_ref.child_table.name), child_cols)
     });
 
-    let emit_violation =
-        |p: &mut ProgramBuilder| emit_fk_parent_violation(p, &fk_ref.fk, is_restrict);
+    let emit_violation = |p: &mut ProgramBuilder| emit_fk_parent_violation(p, fk_ref, is_restrict);
     let excludes_the_deleted_row = is_self_ref && !program.checks_foreign_keys_row_by_row;
 
     if let Some(ref idx) = child_idx {
@@ -1649,10 +1676,12 @@ fn child_index_for_foreign_key<'a>(
 
 fn emit_fk_parent_violation(
     program: &mut ProgramBuilder,
-    fk: &ForeignKey,
+    fk_ref: &ResolvedFkRef,
     restrict: bool,
 ) -> Result<()> {
+    let fk = &fk_ref.fk;
     if program.checks_foreign_keys_row_by_row && !fk.deferred {
+        emit_foreign_key_refused(program, fk_ref, RefusedRow::ParentRowWithChildren);
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
             description: FOREIGN_KEY_PARENT_ROW_REFERENCED.to_string(),
@@ -2318,9 +2347,13 @@ impl ForeignKeyActions<PreparedFkDeleteAction> {
 
         let mut prepared = Vec::new();
 
-        for fk_ref in resolver.with_schema(database_id, |s| {
+        let mut fk_refs = resolver.with_schema(database_id, |s| {
             s.resolved_fks_referencing(parent_table_name)
-        })? {
+        })?;
+        if program.checks_foreign_keys_row_by_row {
+            sort_by_the_name_innodb_gives_them(&mut fk_refs);
+        }
+        for fk_ref in fk_refs {
             let parent_cols: &[String] = &fk_ref.parent_cols;
             let ncols = parent_cols.len();
             let key_regs_start = program.alloc_registers(ncols);

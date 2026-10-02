@@ -197,15 +197,7 @@ impl MySqlConnection {
                 btree
                     .foreign_keys
                     .iter()
-                    .map(|key| crate::show_create_table::MySqlForeignKey {
-                        name: key.name.clone(),
-                        declaration_order: key.decl_order,
-                        child_columns: key.child_columns.to_vec(),
-                        parent_table: key.parent_table.clone(),
-                        parent_columns: key.parent_columns.to_vec(),
-                        on_delete: mysql_reference_action(key.on_delete),
-                        on_update: mysql_reference_action(key.on_update),
-                    })
+                    .map(|key| crate::show_create_table::MySqlForeignKey::of(key))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -1483,18 +1475,4 @@ pub(crate) fn trigger_metadata(
         create_statement: written.show_create(&creator.username),
         creator,
     })
-}
-
-/// Names a referential action the way MySQL prints it.
-///
-/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` prints nothing for the default
-/// `NO ACTION`, and `RESTRICT` is what MySQL stores for it, so neither is
-/// printed. The rest are printed as written.
-fn mysql_reference_action(action: turso_parser::ast::RefAct) -> Option<String> {
-    match action {
-        turso_parser::ast::RefAct::NoAction | turso_parser::ast::RefAct::Restrict => None,
-        turso_parser::ast::RefAct::Cascade => Some("CASCADE".to_owned()),
-        turso_parser::ast::RefAct::SetNull => Some("SET NULL".to_owned()),
-        turso_parser::ast::RefAct::SetDefault => Some("SET DEFAULT".to_owned()),
-    }
 }

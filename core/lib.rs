@@ -127,8 +127,9 @@ pub use cdc::{
 #[cfg(feature = "simulator")]
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
-    resolve_ext_path, AssignmentOperation, AssignmentValidator, Connection, PrepareOptions,
-    ReprepareContext, ReprepareParser, Row, StepResult, SymbolTable, TriggerRowidSupplier,
+    resolve_ext_path, AssignmentOperation, AssignmentValidator, Connection, ForeignKeyRefusal,
+    PrepareOptions, RefusedRow, ReprepareContext, ReprepareParser, Row, StepResult, SymbolTable,
+    TriggerRowidSupplier,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]

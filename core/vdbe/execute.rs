@@ -19080,6 +19080,45 @@ enum RefusedKey {
     IndexEntry(ImmutableRecord),
 }
 
+pub fn op_keep_the_gaps_of_refused_writes(
+    program: &Program,
+    state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    while let Some(key) = state.refused_writes.first().cloned() {
+        return_if_io!(state, program.keep_the_gap_of_a_refused_write(state, &key));
+        state.refused_writes.remove(0);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_foreign_key_refused(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        ForeignKeyRefused {
+            child_table,
+            foreign_key,
+            refused_row,
+        },
+        insn
+    );
+    program
+        .connection
+        .note_foreign_key_refusal(crate::ForeignKeyRefusal {
+            child_table: child_table.clone(),
+            foreign_key: foreign_key.clone(),
+            refused_row: *refused_row,
+        });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

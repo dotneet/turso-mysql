@@ -4244,6 +4244,10 @@ impl MySqlConnection {
         crate::group_concat::take_cut_rows(&self.inner)
     }
 
+    pub fn take_foreign_key_refusals(&self) -> Vec<turso_core::ForeignKeyRefusal> {
+        self.inner.take_foreign_key_refusals()
+    }
+
     /// How many rows the last `SQL_CALC_FOUND_ROWS` statement would have
     /// answered without its `LIMIT`, if the last statement was one. Reading
     /// it forgets it, so a statement that is not one leaves nothing behind.
@@ -9919,6 +9923,13 @@ impl MySqlConnection {
                 Some(&written.table),
             )?;
             result.last_insert_id = written.reported_id;
+            match written.raised_once_written {
+                Some(_) if self.inner.changes() == 0 => result.last_insert_id = 0,
+                Some(high_water) if high_water > 0 => {
+                    self.advance_auto_increment_past(&written.table, high_water, deadline)?;
+                }
+                _ => {}
+            }
             return Ok(result);
         }
         match parse_auto_increment_insert(sql, self.parser_mode()) {
@@ -10657,13 +10668,17 @@ impl MySqlConnection {
         sql: &str,
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<Option<WrittenAutoIncrementIds>, MySqlQueryError> {
-        // Several rows of an upsert are written one at a time, each row's id
-        // reported as MySQL reports it, which one statement cannot do.
-        if parse_auto_increment_insert(sql, self.parser_mode())
-            .is_ok_and(|insert| insert.rowwise_conflicts() && insert.upserts())
+        // Several rows of an upsert or an `IGNORE` are written one at a time,
+        // each row's id reported as MySQL reports it and the counter moved past
+        // the rows written alone, which one statement cannot do.
+        let insert = parse_auto_increment_insert(sql, self.parser_mode());
+        if insert
+            .as_ref()
+            .is_ok_and(|insert| insert.rowwise_conflicts())
         {
             return Ok(None);
         }
+        let ignores = insert.is_ok_and(|insert| insert.ignores());
         let Some(target) = parse_auto_increment_insert_target(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)?
         else {
@@ -10722,12 +10737,13 @@ impl MySqlConnection {
                 }
             }
         }
-        if high_water > 0 {
+        if high_water > 0 && !ignores {
             self.advance_auto_increment_past(&table, high_water, deadline)?;
         }
         Ok(Some(WrittenAutoIncrementIds {
             table,
             reported_id: last,
+            raised_once_written: ignores.then_some(high_water),
         }))
     }
 
@@ -10909,6 +10925,7 @@ impl MySqlConnection {
         affected_rows_mode: MySqlAffectedRowsMode,
     ) -> Result<MySqlWriteResult> {
         self.check_the_triggers_an_insert_sets_off(&table.name, &[])?;
+        let upserts = insert.upserts();
         let bound = insert
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -10987,6 +11004,9 @@ impl MySqlConnection {
                 // next row asking for one, as MySQL does within a statement.
                 last_row = match (row_value, inserted) {
                     (_, false) if upserted > 0 => Some(RowAnUpsertMet::Matched(upserted)),
+                    (InsertAutoIncrementValue::Explicit(id), false) if !upserts => {
+                        Some(RowAnUpsertMet::Skipped(*id))
+                    }
                     (_, false) => None,
                     (InsertAutoIncrementValue::Explicit(id), true) => {
                         self.advance_auto_increment_past(&table, *id, deadline)
@@ -11015,7 +11035,11 @@ impl MySqlConnection {
             // or left as it stood, and one that wrote nothing reports none.
             let last_insert_id = match (first_inserted, last_row) {
                 (Some(id), _) => id,
-                (None, Some(RowAnUpsertMet::Written(id))) if wrote_a_row => id,
+                (None, Some(RowAnUpsertMet::Written(id) | RowAnUpsertMet::Skipped(id)))
+                    if wrote_a_row =>
+                {
+                    id
+                }
                 (None, Some(RowAnUpsertMet::Matched(rowid))) if wrote_a_row => {
                     self.id_of_counted_row(&table, rowid)?
                 }
@@ -11389,7 +11413,7 @@ impl MySqlConnection {
                         InsertAutoIncrementValue::Generated => {
                             first_generated.get_or_insert(id);
                         }
-                        InsertAutoIncrementValue::Explicit(_) => {
+                        InsertAutoIncrementValue::Explicit(_) if self.inner.changes() > 0 => {
                             if id > current {
                                 current = id;
                                 if id > reserved_end {
@@ -11399,6 +11423,7 @@ impl MySqlConnection {
                             }
                             last_explicit = Some(id);
                         }
+                        InsertAutoIncrementValue::Explicit(_) => {}
                     }
                 }
                 Ok((
@@ -14995,6 +15020,7 @@ fn moments_the_clause_leaves(
 struct WrittenAutoIncrementIds {
     table: AutoIncrementTable,
     reported_id: u64,
+    raised_once_written: Option<u64>,
 }
 
 struct ReservedAutoIncrementRows {
@@ -15009,6 +15035,7 @@ struct ReservedAutoIncrementRows {
 /// engine's number for it.
 enum RowAnUpsertMet {
     Written(u64),
+    Skipped(u64),
     Matched(i64),
 }
 

@@ -81,19 +81,67 @@ pub struct MySqlForeignKey {
     pub on_update: Option<String>,
 }
 
+impl MySqlForeignKey {
+    pub fn of(key: &turso_core::schema::ForeignKey) -> Self {
+        Self {
+            name: key.name.clone(),
+            declaration_order: key.decl_order,
+            child_columns: key.child_columns.to_vec(),
+            parent_table: key.parent_table.clone(),
+            parent_columns: key.parent_columns.to_vec(),
+            on_delete: mysql_reference_action(key.on_delete),
+            on_update: mysql_reference_action(key.on_update),
+        }
+    }
+}
+
+/// Names a referential action the way MySQL prints it.
+///
+/// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` prints nothing for the default
+/// `NO ACTION`, written or not, and prints a `RESTRICT` that was written. The
+/// rest are printed as written.
+fn mysql_reference_action(action: turso_parser::ast::RefAct) -> Option<String> {
+    match action {
+        turso_parser::ast::RefAct::NoAction => None,
+        turso_parser::ast::RefAct::Restrict => Some("RESTRICT".to_owned()),
+        turso_parser::ast::RefAct::Cascade => Some("CASCADE".to_owned()),
+        turso_parser::ast::RefAct::SetNull => Some("SET NULL".to_owned()),
+        turso_parser::ast::RefAct::SetDefault => Some("SET DEFAULT".to_owned()),
+    }
+}
+
+pub fn foreign_key_refusal_message(
+    database: &str,
+    refusal: &turso_core::ForeignKeyRefusal,
+) -> String {
+    let refused = match refusal.refused_row {
+        turso_core::RefusedRow::ChildRowWithoutParent => "Cannot add or update a child row",
+        turso_core::RefusedRow::ParentRowWithChildren => "Cannot delete or update a parent row",
+    };
+    format!(
+        "{refused}: a foreign key constraint fails ({}.{}, {})",
+        quoted(database),
+        quoted(&refusal.child_table),
+        render_foreign_key(
+            &refusal.child_table,
+            &MySqlForeignKey::of(&refusal.foreign_key)
+        ),
+    )
+}
+
 /// Renders one foreign key the way MySQL prints it.
 ///
 /// Measured on MySQL 8.4.11: a constraint written without a name is printed as
-/// `` CONSTRAINT `t_ibfk_1` FOREIGN KEY (`a`) REFERENCES `p` (`id`) ``,
-/// numbered from one in declaration order, and one written with a name is
-/// printed under the name it was given.
+/// `` CONSTRAINT `t_ibfk_1` FOREIGN KEY (`a`, `b`) REFERENCES `p` (`x`, `y`) ``,
+/// numbered from one in declaration order, the columns parted by a comma and a
+/// space, and one written with a name is printed under the name it was given.
 fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
     let columns = |names: &[String]| {
         names
             .iter()
             .map(|name| quoted(name))
             .collect::<Vec<_>>()
-            .join(",")
+            .join(", ")
     };
     let name = match &key.name {
         Some(name) => name.clone(),
