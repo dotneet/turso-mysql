@@ -6298,10 +6298,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_id: MVTableId,
         versions: &[RowVersion],
     ) -> bool {
-        let Some(tx) = self.txs.get(&tx_id) else {
-            return false;
-        };
-        self.btree_covers_chain_for_tx(tx.value(), table_id, versions)
+        self.txs
+            .with_value(&tx_id, |tx| {
+                self.btree_covers_chain_for_tx(tx, table_id, versions)
+            })
+            .unwrap_or(false)
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the
@@ -6318,22 +6319,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &RwLock<RowVersionChain<A>>,
         tx_id: TxID,
     ) -> bool {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-        let versions = versions.read();
-        if versions.is_empty() {
-            return false;
-        }
-        let table_id = versions[0].row.id.table_id;
-        if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-            return false;
-        }
-        versions.iter().rev().any(|version| {
-            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-        })
+        self.txs
+            .with_value(&tx_id, |tx| {
+                let versions = versions.read();
+                if versions.is_empty() {
+                    return false;
+                }
+                let table_id = versions[0].row.id.table_id;
+                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+                    return false;
+                }
+                versions.iter().rev().any(|version| {
+                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
+                })
+            })
+            .expect("transaction should exist in txs map")
     }
 
     /// Check if the B-tree version of a row should be shown to the given transaction.
@@ -6346,57 +6346,47 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row_id: &RowKey,
         tx_id: TxID,
     ) -> bool {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-
         match row_id {
             RowKey::Int(_) => {
                 let row_id_full = RowID {
                     table_id,
                     row_id: row_id.clone(),
                 };
-                let Some(versions) = self.rows.get(&row_id_full) else {
-                    // No MVCC version -> B-tree is valid
-                    return true;
-                };
-                let versions = versions.value().read();
-                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-                    return true;
-                }
-
-                // Check if any version invalidates the B-tree row
-                let btree_is_invalid = versions.iter().rev().any(|version| {
-                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-                });
-
-                !btree_is_invalid
+                self.rows
+                    .with_value(&row_id_full, |versions| {
+                        self.btree_row_is_shown(tx_id, table_id, versions)
+                    })
+                    .unwrap_or(true)
             }
-            RowKey::Record(record) => {
-                // Dont allocate new SkipList here to avoid introducing concerns around error handling
-                let Some(index_rows) = self.index_rows.get(&table_id) else {
-                    return true;
-                };
-                let index_rows = index_rows.value();
-                let Some(versions) = index_rows.get(record.as_ref()) else {
-                    // No MVCC version -> B-tree is valid
-                    return true;
-                };
-                let versions = versions.value().read();
-                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-                    return true;
-                }
-
-                // Check if any version invalidates the B-tree row
-                let btree_is_invalid = versions.iter().rev().any(|version| {
-                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-                });
-
-                !btree_is_invalid
-            }
+            RowKey::Record(record) => self
+                .index_rows
+                .with_value(&table_id, |index_rows| {
+                    index_rows.with_value(record.as_ref(), |versions| {
+                        self.btree_row_is_shown(tx_id, table_id, versions)
+                    })
+                })
+                .flatten()
+                .unwrap_or(true),
         }
+    }
+
+    fn btree_row_is_shown(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        versions: &RwLock<RowVersionChain<A>>,
+    ) -> bool {
+        self.txs
+            .with_value(&tx_id, |tx| {
+                let versions = versions.read();
+                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
+                    return true;
+                }
+                !versions.iter().rev().any(|version| {
+                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
+                })
+            })
+            .expect("transaction should exist in txs map")
     }
 
     fn find_last_visible_version(
@@ -11016,9 +11006,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         read_mark: WalPos,
     ) -> bool {
         self.table_id_to_rootpage
-            .get(table_id)
-            .is_some_and(|entry| {
-                let e = entry.value();
+            .with_value(table_id, |e| {
                 // A not-yet-committed binding (materialized_at == STAGED) is never readable, even
                 // by an untracked/no-WAL reader whose mark is also STAGED.
                 e.root_page.is_some()
@@ -11026,6 +11014,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     && e.covers(begin_ts)
                     && e.materialized_at <= read_mark
             })
+            .unwrap_or(false)
     }
 
     /// Lexicographic minimum WAL read mark over all active/preparing transactions
@@ -11472,9 +11461,8 @@ fn lookup_tx_state<A: ConcurrentAllocator>(
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
-    txs.get(&tx_id)
-        .map(|entry| entry.value().state.load())
-        .or_else(|| finalized_tx_states.get(&tx_id).map(|entry| *entry.value()))
+    txs.with_value(&tx_id, |tx| tx.state.load())
+        .or_else(|| finalized_tx_states.with_value(&tx_id, |state| *state))
 }
 
 fn lookup_finalized_tx_state<A: ConcurrentAllocator>(

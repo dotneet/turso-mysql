@@ -373,6 +373,21 @@ where
         try_pin_loop(|| self.inner.get(key, guard)).map(Entry::new)
     }
 
+    /// Calls `read` with the value of `key`, or returns `None` when the map
+    /// has no such key.
+    ///
+    /// Unlike [`Self::get`] this writes nothing to the entry, so threads that
+    /// read one key at the same time do not slow each other down. The entry's
+    /// memory is kept until `read` returns by the epoch this thread holds.
+    pub fn with_value<Q, R>(&self, key: &Q, read: impl FnOnce(&V) -> R) -> Option<R>
+    where
+        C: Comparator<K, Q>,
+        Q: ?Sized,
+    {
+        let guard = &epoch::pin();
+        self.inner.get(key, guard).map(|entry| read(entry.value()))
+    }
+
     /// Returns an `Entry` pointing to the lowest element whose key is above
     /// the given bound. If no such element is found then `None` is
     /// returned.

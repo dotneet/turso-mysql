@@ -525,6 +525,62 @@ fn get() {
 }
 
 #[test]
+fn with_value_reads_what_get_reads() {
+    let s = SkipMap::new();
+    s.insert(30, 3);
+    s.insert(10, 1);
+    s.insert(20, 2);
+
+    assert_eq!(s.with_value(&10, |value| *value), Some(1));
+    assert_eq!(s.with_value(&20, |value| *value * 10), Some(20));
+    assert_eq!(s.with_value(&30, |value| *value), Some(3));
+    assert_eq!(s.with_value(&7, |value| *value), None);
+    assert_eq!(s.with_value(&27, |value| *value), None);
+
+    s.remove(&20);
+    assert_eq!(s.with_value(&20, |value| *value), None);
+    s.insert(20, 22);
+    assert_eq!(s.with_value(&20, |value| *value), Some(22));
+}
+
+#[test]
+fn with_value_reads_whole_values_while_other_threads_remove_and_insert_them() {
+    let s: SkipMap<u64, Vec<u64>> = SkipMap::new();
+    let keys = 16_u64;
+    let value_of = |key: u64| vec![key; 64];
+    for key in 0..keys {
+        s.insert(key, value_of(key));
+    }
+    thread::scope(|scope| {
+        for writer in 0..2_u64 {
+            let s = &s;
+            scope.spawn(move |_| {
+                for round in 0..2_000_u64 {
+                    let key = (round + writer) % keys;
+                    s.remove(&key);
+                    s.insert(key, value_of(key));
+                }
+            });
+        }
+        for _ in 0..4 {
+            let s = &s;
+            scope.spawn(move |_| {
+                for round in 0..20_000_u64 {
+                    let key = round % keys;
+                    if let Some(read) = s.with_value(&key, Clone::clone) {
+                        assert_eq!(read, value_of(key));
+                    }
+                }
+            });
+        }
+    })
+    .unwrap();
+    for key in 0..keys {
+        assert_eq!(s.with_value(&key, Clone::clone), Some(value_of(key)));
+    }
+}
+
+#[test]
 fn lower_bound() {
     let s = SkipMap::new();
     s.insert(30, 3);
