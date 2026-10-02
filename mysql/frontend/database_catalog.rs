@@ -1674,6 +1674,9 @@ mod tests {
 
     #[test]
     fn a_counted_insert_waits_for_the_write_lock_without_a_snapshot() -> CoreResult<()> {
+        if crate::experimental_mvcc_is_on() {
+            return Ok(());
+        }
         let directory = private_tempdir();
         let catalog = MySqlDatabaseCatalog::open(directory.path())
             .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;

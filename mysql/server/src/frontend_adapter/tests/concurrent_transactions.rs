@@ -476,6 +476,111 @@ fn a_counted_insert_given_up_for_a_deadlock_writes_nothing() {
     assert_eq!(balances(&mut one), ["10", "20", "30"]);
 }
 
+/// Measured on MySQL 8.4.11: a counted insert waiting for a key another
+/// transaction holds takes its ids before it waits, so a third session
+/// inserting meanwhile takes the ids after them. The waiting insert keeps
+/// those ids once the other transaction rolls back, and spends them when it
+/// commits and the insert answers 1062.
+#[test]
+fn a_counted_insert_takes_its_ids_before_it_waits_for_a_key() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    struct Case {
+        ending: &'static str,
+        waiting_rows: &'static str,
+        third_id: u64,
+        waiting_id: Result<u64, FrontendErrorKind>,
+        written: &'static [(u64, &'static str)],
+    }
+    let cases = [
+        Case {
+            ending: "ROLLBACK",
+            waiting_rows: "('held')",
+            third_id: 3,
+            waiting_id: Ok(2),
+            written: &[(2, "held"), (3, "third")],
+        },
+        Case {
+            ending: "ROLLBACK",
+            waiting_rows: "('held'), ('second')",
+            third_id: 4,
+            waiting_id: Ok(2),
+            written: &[(2, "held"), (3, "second"), (4, "third")],
+        },
+        Case {
+            ending: "COMMIT",
+            waiting_rows: "('held')",
+            third_id: 3,
+            waiting_id: Err(FrontendErrorKind::ConstraintViolation),
+            written: &[(1, "held"), (3, "third")],
+        },
+    ];
+    for Case {
+        ending,
+        waiting_rows,
+        third_id,
+        waiting_id,
+        written,
+    } in cases
+    {
+        let (_directory, sessions) = sessions(3);
+        let [mut one, mut two, mut three] = <[Adapter; 3]>::try_from(sessions).ok().unwrap();
+        run(&mut one, "BEGIN");
+        run(&mut one, "INSERT INTO tags (name) VALUES ('held')");
+        run(&mut two, "BEGIN");
+        let waiting = std::thread::spawn(move || {
+            let id = inserted_id(
+                &mut two,
+                &format!("INSERT INTO tags (name) VALUES {waiting_rows}"),
+            );
+            (two, id)
+        });
+        assert!(still_waiting(&waiting));
+        assert_eq!(
+            inserted_id(&mut three, "INSERT INTO tags (name) VALUES ('third')"),
+            Ok(third_id)
+        );
+        run(&mut one, ending);
+
+        let (mut two, id) = waiting.join().unwrap();
+        assert_eq!(id, waiting_id, "{ending} {waiting_rows}");
+        run(&mut two, "COMMIT");
+        assert_eq!(
+            ids_and_names(&mut one),
+            written
+                .iter()
+                .map(|(id, name)| (*id, name.to_string()))
+                .collect::<Vec<_>>(),
+            "{ending} {waiting_rows}"
+        );
+    }
+}
+
+fn inserted_id(adapter: &mut Adapter, sql: &str) -> Result<u64, FrontendErrorKind> {
+    adapter.execute_query(sql).map(|result| match result {
+        CommandExecutionResult::Ok(result) => result.last_insert_id,
+        other => panic!("{sql}: {other:?}"),
+    })
+}
+
+fn ids_and_names(adapter: &mut Adapter) -> Vec<(u64, String)> {
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        adapter.execute_query("SELECT id, name FROM tags ORDER BY id")
+    else {
+        panic!("the rows must read back");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            let id = String::from_utf8(row[0].clone().unwrap()).unwrap();
+            let name = String::from_utf8(row[1].clone().unwrap()).unwrap();
+            (id.parse().unwrap(), name)
+        })
+        .collect()
+}
+
 fn sessions(count: usize) -> (tempfile::TempDir, Vec<Adapter>) {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (directory, catalog, factory) = catalog_factory(authorizer.clone());

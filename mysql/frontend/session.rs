@@ -3891,9 +3891,15 @@ impl MySqlConnection {
         } else {
             Vec::new()
         };
-        let reserved =
-            self.write_counted_rows(&insert.sql, &bound, &table, values, deadline, |reserved| {
+        let reserved = self.write_counted_rows(
+            &insert.sql,
+            &bound,
+            &table,
+            values,
+            deadline,
+            |reserved, take_numbers| {
                 self.check_write_deadline(deadline)?;
+                let take_numbers = std::cell::Cell::new(take_numbers);
                 let statement = bound
                     .inject_row_ids(&reserved.ids)
                     .map_err(|error| LimboError::ParseError(error.to_string()))?;
@@ -3933,6 +3939,9 @@ impl MySqlConnection {
                         ));
                     }
                     bind_prepared_values(&mut engine_statement, &reserved.bound_values)?;
+                    if let Some(take_numbers) = take_numbers.take() {
+                        engine_statement.run_before_writing(&table.name, take_numbers);
+                    }
                     let result = (|| -> Result<()> {
                         let timeout = self
                             .remaining_write_timeout(deadline)
@@ -3951,7 +3960,8 @@ impl MySqlConnection {
                     }
                     result.and(reset_result)
                 })
-            });
+            },
+        );
         match reserved {
             Err(error) => Err(error),
             Ok(reserved) => {
@@ -10668,25 +10678,37 @@ impl MySqlConnection {
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         let stamped = self.moments_an_upsert_stamps(sql)?;
-        let reserved = self.write_counted_rows(sql, &bound, &table, &[], deadline, |reserved| {
-            self.check_write_deadline(deadline)
-                .map_err(Into::<LimboError>::into)?;
-            let statement = bound
-                .inject_row_ids(&reserved.ids)
-                .map_err(|error| LimboError::ParseError(error.to_string()))?;
-            self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
-                let options = injected_auto_increment_prepare_options(&table, statement.clone());
-                let mut statement = self
-                    .inner
-                    .prepare_translated_stmt_with_options(statement, sql, &options)?;
-                let timeout = self
-                    .remaining_write_timeout(deadline)
+        let reserved = self.write_counted_rows(
+            sql,
+            &bound,
+            &table,
+            &[],
+            deadline,
+            |reserved, take_numbers| {
+                self.check_write_deadline(deadline)
                     .map_err(Into::<LimboError>::into)?;
-                run_checked_write_statement(&mut statement, timeout).map_err(|error| {
-                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                let take_numbers = std::cell::Cell::new(take_numbers);
+                let statement = bound
+                    .inject_row_ids(&reserved.ids)
+                    .map_err(|error| LimboError::ParseError(error.to_string()))?;
+                self.write_stamping_the_row_an_upsert_changes(statement, &stamped, |statement| {
+                    let options =
+                        injected_auto_increment_prepare_options(&table, statement.clone());
+                    let mut statement = self
+                        .inner
+                        .prepare_translated_stmt_with_options(statement, sql, &options)?;
+                    if let Some(take_numbers) = take_numbers.take() {
+                        statement.run_before_writing(&table.name, take_numbers);
+                    }
+                    let timeout = self
+                        .remaining_write_timeout(deadline)
+                        .map_err(Into::<LimboError>::into)?;
+                    run_checked_write_statement(&mut statement, timeout).map_err(|error| {
+                        self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                    })
                 })
-            })
-        })?;
+            },
+        )?;
         // Measured on MySQL 8.4.11: an upsert that changed a row reports that
         // row's own id back to the client and leaves `LAST_INSERT_ID()` where
         // it stood, one that left the row as it stood reports no id at all,
@@ -11279,15 +11301,23 @@ impl MySqlConnection {
         table: &AutoIncrementTable,
         values: &[Value],
         deadline: Option<turso_core::MonotonicInstant>,
-        write: impl Fn(&ReservedAutoIncrementRows) -> Result<()>,
+        write: impl Fn(&ReservedAutoIncrementRows, Option<TakeNumbersBeforeWriting>) -> Result<()>,
     ) -> Result<ReservedAutoIncrementRows> {
         let reserve_first = || -> Result<ReservedAutoIncrementRows> {
             let reserved = self.reserve_insert_row_ids(bound, table, values, deadline)?;
-            write(&reserved)?;
+            write(&reserved, None)?;
             Ok(reserved)
         };
         if !self.counter_numbers_can_be_predicted(bound, table) {
             return reserve_first();
+        }
+        if self.inner.mvcc_enabled() {
+            return match self
+                .write_counted_rows_taking_numbers_before_writing(bound, table, values, &write)?
+            {
+                Some(written) => Ok(written),
+                None => reserve_first(),
+            };
         }
         let begins_a_transaction = self.inner.get_auto_commit();
         if begins_a_transaction {
@@ -11312,6 +11342,101 @@ impl MySqlConnection {
         }
     }
 
+    /// Under MVCC an insert waits for a key another open transaction holds,
+    /// and measured on MySQL 8.4.11 InnoDB takes the statement's numbers
+    /// before that wait: a session inserting meanwhile takes the numbers after
+    /// them. So the rows are written with the numbers the counter would hand
+    /// out next, and the engine takes the numbers once the first row is
+    /// filled, right before the statement first looks up or writes a key of
+    /// the table, which is where it can wait. A first row that fails to fill
+    /// ends the statement before then and spends nothing.
+    ///
+    /// When another session took those numbers in between, the statement
+    /// ends there, before it wrote anything, and is written again with the
+    /// numbers it took. Answers `None` when the batch would pass the column's
+    /// highest value, which the reserving path refuses.
+    fn write_counted_rows_taking_numbers_before_writing(
+        &self,
+        bound: &BoundAutoIncrementInsert,
+        table: &AutoIncrementTable,
+        values: &[Value],
+        write: &impl Fn(&ReservedAutoIncrementRows, Option<TakeNumbersBeforeWriting>) -> Result<()>,
+    ) -> Result<Option<ReservedAutoIncrementRows>> {
+        let capability = self.auto_increment.as_ref().ok_or_else(|| {
+            LimboError::ParseError(
+                "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
+            )
+        })?;
+        let high_water = self.when_the_counter_is_free(|| {
+            let mut peek = capability.allocator.peek_high_water(table.key)?;
+            capability.io.block(|| peek.step())
+        })?;
+        if !the_batch_fits_the_column(table, high_water, bound.row_count().get() as u64) {
+            return Ok(None);
+        }
+        let row_values = self.auto_increment_row_values(bound, table, values)?;
+        let predicted = self.row_ids_after(bound, table, values, row_values.clone(), high_water)?;
+        let taken_after = Arc::new(std::sync::OnceLock::new());
+        let take_numbers = {
+            let allocator = capability.allocator.clone();
+            let io = capability.io.clone();
+            let key = table.key;
+            let row_values = row_values.clone();
+            let busy_timeout = self.inner.get_busy_timeout();
+            let generated_ceiling = generated_ceiling(table);
+            let taken_after = taken_after.clone();
+            Box::new(move || {
+                let reserved = when_the_counter_is_free_within(busy_timeout, || {
+                    let mut reservation =
+                        allocator.reserve_insert_values(key, row_values.clone())?;
+                    io.block(|| reservation.step())
+                })?;
+                taken_after
+                    .set(reserved.high_water_before)
+                    .expect("a statement takes its numbers once");
+                if reserved.high_water_after > generated_ceiling {
+                    return Err(LimboError::Constraint(
+                        "AUTO_INCREMENT value is outside the column's type".to_string(),
+                    ));
+                }
+                if reserved.high_water_before != high_water {
+                    return Err(LimboError::RefusedBeforeWriting(
+                        "another session took the AUTO_INCREMENT numbers the rows were written with"
+                            .to_string(),
+                    ));
+                }
+                Ok(())
+            })
+        };
+        let written = write(&predicted, Some(take_numbers));
+        let Some(&taken_after) = taken_after.get() else {
+            return match written {
+                Ok(()) => Err(LimboError::InternalError(
+                    "a counted insert wrote its rows without taking their numbers".to_string(),
+                )),
+                Err(error) => Err(error),
+            };
+        };
+        if taken_after == high_water {
+            return written.map(|()| Some(predicted));
+        }
+        match written {
+            Err(LimboError::RefusedBeforeWriting(_)) => {}
+            Err(error) => return Err(error),
+            Ok(()) => {
+                return Err(LimboError::InternalError(
+                    "a counted insert wrote numbers another session took".to_string(),
+                ))
+            }
+        }
+        let taken = self.row_ids_after(bound, table, values, row_values, taken_after)?;
+        #[cfg(test)]
+        self.counted_rows_written_again
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        write(&taken, None)?;
+        Ok(Some(taken))
+    }
+
     /// Writes the rows with the numbers the counter would hand out next, and
     /// answers the statement's own outcome once its savepoint is released, or
     /// `None` when the counter cannot tell them after all.
@@ -11322,7 +11447,7 @@ impl MySqlConnection {
         table: &AutoIncrementTable,
         values: &[Value],
         deadline: Option<turso_core::MonotonicInstant>,
-        write: &impl Fn(&ReservedAutoIncrementRows) -> Result<()>,
+        write: &impl Fn(&ReservedAutoIncrementRows, Option<TakeNumbersBeforeWriting>) -> Result<()>,
     ) -> Result<Option<Result<ReservedAutoIncrementRows>>> {
         self.hold_the_write_lock_on(table)?;
         self.run_counted_rows_statement(SET_THE_COUNTED_ROWS_SAVEPOINT)?;
@@ -11339,7 +11464,7 @@ impl MySqlConnection {
         };
         let rollback = || self.roll_back_to_the_counted_rows_savepoint();
         let written = (|| -> Result<std::result::Result<ReservedAutoIncrementRows, LimboError>> {
-            let failure = match write(&predicted) {
+            let failure = match write(&predicted, None) {
                 Ok(()) => None,
                 Err(error) => {
                     rollback()?;
@@ -11367,7 +11492,7 @@ impl MySqlConnection {
             if failure.is_none() {
                 rollback()?;
             }
-            write(&taken)?;
+            write(&taken, None)?;
             Ok(Ok(taken))
         })();
         if written.is_err() {
@@ -11479,13 +11604,9 @@ impl MySqlConnection {
             Err(LimboError::Busy) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let rows = bound.row_count().get() as u64;
         // Numbers past the column's highest are answered by the reserving
         // path, which is where that refusal is made.
-        if high_water
-            .checked_add(rows)
-            .is_none_or(|last| last > auto_increment_ceiling(table) || last > i64::MAX as u64)
-        {
+        if !the_batch_fits_the_column(table, high_water, bound.row_count().get() as u64) {
             return Ok(None);
         }
         let row_values = self.auto_increment_row_values(bound, table, values)?;
@@ -11602,13 +11723,7 @@ impl MySqlConnection {
                     .reserve_insert_values(table.key, row_values.clone())?;
                 capability.io.block(|| reservation.step())
             })?;
-            let generated_ceiling = if table.definition.allocator_column_type
-                == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
-            {
-                u64::MAX - 2
-            } else {
-                auto_increment_ceiling(table)
-            };
+            let generated_ceiling = generated_ceiling(table);
             let has_explicit_above_generated_ceiling = row_values.iter().any(|value| {
                 matches!(value, InsertAutoIncrementValue::Explicit(id) if *id > generated_ceiling)
             });
@@ -11636,18 +11751,8 @@ impl MySqlConnection {
     /// long as it waits for any other lock, the way MySQL's inserts wait their
     /// turn at a table's AUTO-INC lock. Answering 1205 at once failed one of
     /// Prisma's two concurrent `tag.create` calls in the framework harness.
-    fn when_the_counter_is_free<T>(&self, mut step: impl FnMut() -> Result<T>) -> Result<T> {
-        let deadline = std::time::Instant::now().checked_add(self.inner.get_busy_timeout());
-        loop {
-            match step() {
-                Err(LimboError::Busy)
-                    if deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) =>
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                answer => return answer,
-            }
-        }
+    fn when_the_counter_is_free<T>(&self, step: impl FnMut() -> Result<T>) -> Result<T> {
+        when_the_counter_is_free_within(self.inner.get_busy_timeout(), step)
     }
 
     /// The ids a `VALUES` insert's rows take when the counter stands at
@@ -14632,6 +14737,41 @@ fn found_before_a_number_is_taken(error: &LimboError) -> bool {
         _ => false,
     }
 }
+
+fn the_batch_fits_the_column(table: &AutoIncrementTable, high_water: u64, rows: u64) -> bool {
+    high_water
+        .checked_add(rows)
+        .is_some_and(|last| last <= auto_increment_ceiling(table) && last <= i64::MAX as u64)
+}
+
+fn generated_ceiling(table: &AutoIncrementTable) -> u64 {
+    if table.definition.allocator_column_type
+        == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
+    {
+        u64::MAX - 2
+    } else {
+        auto_increment_ceiling(table)
+    }
+}
+
+fn when_the_counter_is_free_within<T>(
+    busy_timeout: Duration,
+    mut step: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now().checked_add(busy_timeout);
+    loop {
+        match step() {
+            Err(LimboError::Busy)
+                if deadline.is_some_and(|deadline| std::time::Instant::now() < deadline) =>
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            answer => return answer,
+        }
+    }
+}
+
+type TakeNumbersBeforeWriting = Box<dyn FnOnce() -> Result<()> + Send + Sync>;
 
 /// One counted table and the id an INSERT that wrote its own reports.
 /// One name written the way the engine's own parser reads one.

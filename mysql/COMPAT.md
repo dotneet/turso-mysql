@@ -3198,7 +3198,11 @@ takes one back, so the rows are written first, inside a savepoint, with the numb
 would hand out next, and the numbers are taken afterwards — never, when the first row failed to
 fill. Should another session take those numbers in between, the statement is undone and written
 again with the numbers it was actually handed, so no row is ever written with a number the
-counter did not hand this statement. The other counted paths reserve before they write, and still
+counter did not hand this statement. With databases in MVCC mode the numbers are taken while the
+statement runs, once its first row is filled and before it looks up or writes a key, which is where
+it can wait for another transaction as InnoDB's insert does; a statement whose numbers another
+session took in between stops there, having written nothing, and runs again with the numbers it
+was handed. The other counted paths reserve before they write, and still
 spend a number on such a failure; see TODO.md.
 
 A table that counts its own ids may carry a trigger, and a trigger may write into one — a
@@ -3766,11 +3770,12 @@ another transaction holds reads the row's latest committed version and waits onl
 version matches, while a `DELETE`, a locking read, or an `UPDATE` through a secondary index
 waits. Which rows and gaps are locked follows from the index a statement reads, which the
 engine chooses and MySQL's optimizer may choose differently.
-An `INSERT` into an `AUTO_INCREMENT` table takes its id before it waits for a key another
-transaction holds, so measured on 8.4.11 an insert by a third session meanwhile takes the next
-id after it; here the waiting insert takes its id only once the wait ends, so the third
-session's insert takes the id MySQL gave the waiting one. Either way no id is written twice and
-an insert given up for a deadlock writes nothing.
+An `INSERT` into an `AUTO_INCREMENT` table takes its ids once its first row is filled and
+before it waits for a key or a gap another transaction holds, as InnoDB does: measured on 8.4.11,
+and here, an insert by a third session meanwhile takes the ids after them, the waiting insert
+keeps its ids when the other transaction rolls back, and spends them when it commits and the
+insert answers 1062. A first row that fails to fill still spends no id, no id is written twice,
+and an insert given up for a deadlock writes nothing.
 
 `LOCK IN SHARE MODE`, MySQL's older spelling of `FOR SHARE` — the one Laravel's
 `sharedLock()` and Rails' `lock("LOCK IN SHARE MODE")` write — is read as `FOR SHARE` and takes
