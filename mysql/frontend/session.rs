@@ -38,7 +38,7 @@ use turso_mysql_parser::{
 };
 use turso_parser::ast::{
     AlterTableBody, Cmd, ColumnConstraint, CreateTableBody, Expr, InsertBody, Literal, OneSelect,
-    ResultColumn, SelectTable, Stmt, UnaryOperator,
+    ResultColumn, SelectTable, SortedColumn, Stmt, UnaryOperator,
 };
 
 use crate::alter_table_indexes::MySqlAlterTableIndexError;
@@ -300,6 +300,7 @@ struct StoredIndexStatement {
     /// The name the engine holds the index under.
     stored_name: String,
     implicit: bool,
+    kept_in_insert_order: bool,
 }
 
 /// What a table's rewrite runs once its rows are in the new table.
@@ -4910,6 +4911,7 @@ impl MySqlConnection {
             self.reject_a_second_trigger_for_one_event(&stmt)?;
         }
         if let Stmt::CreateIndex {
+            unique,
             idx_name,
             tbl_name,
             columns,
@@ -4937,9 +4939,22 @@ impl MySqlConnection {
                     "Duplicate key name '{logical_name}'"
                 )));
             }
+            let primary_key = if *unique {
+                Vec::new()
+            } else {
+                primary_key_a_plain_index_ends_with(&self.inner.current_schema(), table)
+            };
+            columns.extend(primary_key.iter().map(|column| SortedColumn {
+                expr: Box::new(Expr::Id(turso_parser::ast::Name::exact(column.clone()))),
+                order: None,
+                nulls: None,
+            }));
             idx_name.name = turso_parser::ast::Name::exact(physical_mysql_index_name(
                 logical_name,
-                implicit_index,
+                StoredIndexKind {
+                    implicit: implicit_index,
+                    ends_with_primary_key: !primary_key.is_empty(),
+                },
             )?);
         }
         let input = match &stmt {
@@ -5906,8 +5921,9 @@ impl MySqlConnection {
     ///
     /// Measured on MySQL 8.4.11: the table is rebuilt and nothing a client can
     /// see changes — its rows, its keys and where its counter stands are as
-    /// they were — so there is nothing to do but commit what came before, as
-    /// every DDL statement does.
+    /// they were. Here it commits what came before, as every DDL statement
+    /// does, and writes again each plain index made before plain indexes ended
+    /// with the primary key, so its equal values come back in primary key order.
     pub fn execute_table_engine_restated(
         &self,
         table: &MySqlTableName,
@@ -5915,6 +5931,46 @@ impl MySqlConnection {
         self.a_base_table_named(table)?;
         if !self.inner.get_auto_commit() {
             self.run_internal("COMMIT")?;
+        }
+        let indexes = self
+            .stored_index_statements(table.as_str())
+            .map_err(MySqlQueryError::Engine)?;
+        let Some(first) = indexes.iter().position(|index| index.kept_in_insert_order) else {
+            return Ok(());
+        };
+        self.run_internal("BEGIN")?;
+        let written = self.write_the_indexes_again(&indexes[first..]);
+        if written.is_err() {
+            self.run_internal("ROLLBACK")?;
+            return written;
+        }
+        self.run_internal("COMMIT")?;
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
+    }
+
+    fn write_the_indexes_again(
+        &self,
+        indexes: &[StoredIndexStatement],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        for index in indexes {
+            let stmt = Stmt::DropIndex {
+                if_exists: false,
+                idx_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    index.stored_name.clone(),
+                )),
+            };
+            self.inner
+                .prepare_translated_stmt(stmt, &format!("DROP INDEX \"{}\"", index.stored_name))
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        for index in indexes {
+            self.prepare_with_index_origin(&index.sql, index.implicit)
+                .and_then(|mut statement| statement.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
         }
         Ok(())
     }
@@ -6602,9 +6658,13 @@ impl MySqlConnection {
         for foreign_key in &btree.foreign_keys {
             let primary_covers =
                 primary_key_covers_columns(&btree.primary_key_columns, &foreign_key.child_columns);
-            let index_covers = schema
-                .get_indices(table.as_str())
-                .any(|index| index_covers_columns(index, &foreign_key.child_columns));
+            let index_covers = schema.get_indices(table.as_str()).any(|index| {
+                index_covers_columns(
+                    index,
+                    &btree.primary_key_columns,
+                    &foreign_key.child_columns,
+                )
+            });
             if !primary_covers && !index_covers {
                 return Err(MySqlAlterTableIndexError::RequiredByForeignKey);
             }
@@ -6737,7 +6797,7 @@ impl MySqlConnection {
             let primary_covers = primary_key_covers_columns(&btree.primary_key_columns, &columns);
             let index_covers = schema
                 .get_indices(table.as_str())
-                .any(|index| index_covers_columns(index, &columns));
+                .any(|index| index_covers_columns(index, &btree.primary_key_columns, &columns));
             if primary_covers || index_covers {
                 continue;
             }
@@ -6793,13 +6853,17 @@ impl MySqlConnection {
         })?;
         let redundant = schema
             .get_indices(table.as_str())
-            .filter(|index| index.name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX))
+            .filter(|index| is_implicit_index(&index.name))
             .filter(|candidate| {
                 let using_candidate = btree
                     .foreign_keys
                     .iter()
                     .filter(|foreign_key| {
-                        index_covers_columns(candidate, &foreign_key.child_columns)
+                        index_covers_columns(
+                            candidate,
+                            &btree.primary_key_columns,
+                            &foreign_key.child_columns,
+                        )
                     })
                     .collect::<Vec<_>>();
                 !using_candidate.is_empty()
@@ -6809,8 +6873,12 @@ impl MySqlConnection {
                             &foreign_key.child_columns,
                         ) || schema.get_indices(table.as_str()).any(|other| {
                             other.name != candidate.name
-                                && !other.name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX)
-                                && index_covers_columns(other, &foreign_key.child_columns)
+                                && !is_implicit_index(&other.name)
+                                && index_covers_columns(
+                                    other,
+                                    &btree.primary_key_columns,
+                                    &foreign_key.child_columns,
+                                )
                         })
                     })
             })
@@ -7409,13 +7477,24 @@ impl MySqlConnection {
             };
             let mut statement = parse_schema_ddl_ast(decoded.normalized_ddl, self.parser_mode())
                 .map_err(|error| LimboError::Corrupt(error.to_string()))?;
-            let Stmt::CreateIndex { idx_name, .. } = &mut statement else {
+            let Stmt::CreateIndex {
+                unique,
+                idx_name,
+                columns,
+                ..
+            } = &mut statement
+            else {
                 return Err(LimboError::Corrupt(
                     "marked index SQL did not describe an index".to_string(),
                 ));
             };
             let stored_name = idx_name.name.as_str().to_owned();
-            let implicit = stored_name.starts_with(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX);
+            columns.truncate(self.columns_mysql_shows_of(table, &stored_name)?);
+            let implicit = is_implicit_index(&stored_name);
+            let kept_in_insert_order = !*unique
+                && !stored_index_kind(&stored_name).is_some_and(|kind| kind.ends_with_primary_key)
+                && !primary_key_a_plain_index_ends_with(&self.inner.current_schema(), table)
+                    .is_empty();
             if let Some(logical_name) = logical_mysql_index_name(&stored_name) {
                 idx_name.name = turso_parser::ast::Name::exact(logical_name);
             }
@@ -7424,9 +7503,24 @@ impl MySqlConnection {
                     .map_err(|error| LimboError::Corrupt(error.to_string()))?,
                 stored_name,
                 implicit,
+                kept_in_insert_order,
             });
         }
         Ok(statements)
+    }
+
+    fn columns_mysql_shows_of(&self, table: &str, stored_name: &str) -> Result<usize> {
+        let schema = self.inner.current_schema();
+        let btree = schema.get_btree_table(table).ok_or_else(|| {
+            LimboError::Corrupt(format!("index {stored_name} names a missing table {table}"))
+        })?;
+        let index = schema
+            .get_indices(table)
+            .find(|index| index.name == stored_name)
+            .ok_or_else(|| {
+                LimboError::Corrupt(format!("stored index {stored_name} is not in the schema"))
+            })?;
+        Ok(mysql_index_columns(index, &btree.primary_key_columns).len())
     }
 
     fn prepare_auto_increment_create_table(
@@ -12362,9 +12456,13 @@ fn reject_incompatible_legacy_tables(connection: &Arc<Connection>) -> Result<()>
         for foreign_key in &table.foreign_keys {
             let primary_covers =
                 primary_key_covers_columns(&table.primary_key_columns, &foreign_key.child_columns);
-            let index_covers = schema
-                .get_indices(name)
-                .any(|index| index_covers_columns(index, &foreign_key.child_columns));
+            let index_covers = schema.get_indices(name).any(|index| {
+                index_covers_columns(
+                    index,
+                    &table.primary_key_columns,
+                    &foreign_key.child_columns,
+                )
+            });
             if !primary_covers && !index_covers {
                 return Err(LimboError::InvalidArgument(format!(
                     "table '{name}' has a legacy foreign key without a child index; rebuild or re-import this table with the current MySQL frontend"
@@ -15079,25 +15177,123 @@ fn primary_key_covers_columns(
             .all(|((name, _), column)| name.eq_ignore_ascii_case(column))
 }
 
-fn index_covers_columns(index: &turso_core::schema::Index, columns: &[String]) -> bool {
-    index.columns.len() >= columns.len()
-        && index
-            .columns
+fn index_covers_columns(
+    index: &turso_core::schema::Index,
+    primary_key: &[(String, turso_parser::ast::SortOrder)],
+    columns: &[String],
+) -> bool {
+    let shown = mysql_index_columns(index, primary_key);
+    shown.len() >= columns.len()
+        && shown
             .iter()
             .zip(columns)
             .all(|(indexed, column)| indexed.name.eq_ignore_ascii_case(column))
 }
 
-const MYSQL_INDEX_STORAGE_PREFIX: &str = "__turso_mysql_index_namespace_v1__";
-const MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX: &str = "__turso_mysql_implicit_index_namespace_v1__";
+pub(crate) fn mysql_index_columns<'a>(
+    index: &'a turso_core::schema::Index,
+    primary_key: &[(String, turso_parser::ast::SortOrder)],
+) -> &'a [turso_core::schema::IndexColumn] {
+    if !stored_index_kind(&index.name).is_some_and(|kind| kind.ends_with_primary_key) {
+        return &index.columns;
+    }
+    let shown = index
+        .columns
+        .len()
+        .checked_sub(primary_key.len())
+        .filter(|shown| *shown > 0 && !primary_key.is_empty())
+        .unwrap_or_else(|| {
+            panic!(
+                "index {} ends with the primary key but has {} columns for a key of {}",
+                index.name,
+                index.columns.len(),
+                primary_key.len()
+            )
+        });
+    assert!(
+        index.columns[shown..]
+            .iter()
+            .zip(primary_key)
+            .all(|(column, (key, _))| column.name.eq_ignore_ascii_case(key)),
+        "index {} does not end with its table's primary key",
+        index.name
+    );
+    &index.columns[..shown]
+}
 
-fn physical_mysql_index_name(logical_name: &str, implicit: bool) -> Result<String> {
-    let identity = new_allocator_identity()?;
-    let prefix = if implicit {
-        MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX
-    } else {
-        MYSQL_INDEX_STORAGE_PREFIX
+fn primary_key_a_plain_index_ends_with(
+    schema: &turso_core::schema::Schema,
+    table: &str,
+) -> Vec<String> {
+    let Some(btree) = schema.get_btree_table(table) else {
+        return Vec::new();
     };
+    if btree.get_rowid_alias_column().is_some() {
+        return Vec::new();
+    }
+    btree
+        .primary_key_columns
+        .iter()
+        .map(|(name, order)| {
+            assert_eq!(
+                *order,
+                turso_parser::ast::SortOrder::Asc,
+                "a MySQL primary key column is kept in ascending order"
+            );
+            let (_, column) = btree
+                .get_column(name)
+                .unwrap_or_else(|| panic!("primary key column {name} is not in its table"));
+            column
+                .name
+                .clone()
+                .unwrap_or_else(|| panic!("primary key column {name} has no name"))
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StoredIndexKind {
+    implicit: bool,
+    ends_with_primary_key: bool,
+}
+
+const MYSQL_INDEX_STORAGE_PREFIXES: [(&str, StoredIndexKind); 4] = [
+    (
+        "__turso_mysql_index_namespace_v1__",
+        StoredIndexKind {
+            implicit: false,
+            ends_with_primary_key: false,
+        },
+    ),
+    (
+        "__turso_mysql_implicit_index_namespace_v1__",
+        StoredIndexKind {
+            implicit: true,
+            ends_with_primary_key: false,
+        },
+    ),
+    (
+        "__turso_mysql_index_ending_with_primary_key_v1__",
+        StoredIndexKind {
+            implicit: false,
+            ends_with_primary_key: true,
+        },
+    ),
+    (
+        "__turso_mysql_implicit_index_ending_with_primary_key_v1__",
+        StoredIndexKind {
+            implicit: true,
+            ends_with_primary_key: true,
+        },
+    ),
+];
+
+fn physical_mysql_index_name(logical_name: &str, kind: StoredIndexKind) -> Result<String> {
+    let identity = new_allocator_identity()?;
+    let (prefix, _) = MYSQL_INDEX_STORAGE_PREFIXES
+        .iter()
+        .find(|(_, prefix_kind)| *prefix_kind == kind)
+        .expect("every kind of stored index has a prefix");
     let mut name =
         String::with_capacity(prefix.len() + (identity.len() + logical_name.len()) * 2 + 1);
     name.push_str(prefix);
@@ -15111,10 +15307,21 @@ fn physical_mysql_index_name(logical_name: &str, implicit: bool) -> Result<Strin
     Ok(name)
 }
 
+fn is_implicit_index(stored_name: &str) -> bool {
+    stored_index_kind(stored_name).is_some_and(|kind| kind.implicit)
+}
+
+fn stored_index_kind(stored_name: &str) -> Option<StoredIndexKind> {
+    MYSQL_INDEX_STORAGE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| stored_name.starts_with(prefix))
+        .map(|(_, kind)| *kind)
+}
+
 fn logical_mysql_index_name(stored_name: &str) -> Option<String> {
-    let suffix = stored_name
-        .strip_prefix(MYSQL_INDEX_STORAGE_PREFIX)
-        .or_else(|| stored_name.strip_prefix(MYSQL_IMPLICIT_INDEX_STORAGE_PREFIX))?;
+    let suffix = MYSQL_INDEX_STORAGE_PREFIXES
+        .iter()
+        .find_map(|(prefix, _)| stored_name.strip_prefix(prefix))?;
     let (identity, logical) = suffix.split_at_checked(32)?;
     if !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;

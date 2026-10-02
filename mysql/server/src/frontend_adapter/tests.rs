@@ -31022,6 +31022,9 @@ mod prisma_client_reads;
 mod indexed_stored_forms;
 
 #[cfg(unix)]
+mod secondary_index_order;
+
+#[cfg(unix)]
 mod dropped_databases;
 
 /// How many times each kind of reading read a statement of `length` bytes

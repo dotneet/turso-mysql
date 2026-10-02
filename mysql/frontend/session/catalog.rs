@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::catalog_tables::{foreign_key_name, indexes_beside_the_primary_key};
-use crate::session::is_the_primary_keys_own_index;
+use crate::session::{is_the_primary_keys_own_index, mysql_index_columns};
 
 /// What each column of a view kept in the text MySQL prints reads, with the
 /// columns of each table it reads, in the order its `FROM` names them.
@@ -452,8 +452,11 @@ impl MySqlConnection {
                 continue;
             }
             let key_name = mysql_index_name(index);
-            let rows = index
-                .columns
+            let primary_key = core_table
+                .btree()
+                .map(|btree| btree.primary_key_columns.clone())
+                .unwrap_or_default();
+            let rows = mysql_index_columns(index, &primary_key)
                 .iter()
                 .enumerate()
                 .map(|(position, column)| MySqlIndexEntry {

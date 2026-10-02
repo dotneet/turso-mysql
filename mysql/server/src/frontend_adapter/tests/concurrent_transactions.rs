@@ -1084,6 +1084,45 @@ fn two_sessions_that_lock_one_gap_and_insert_into_it_end_in_a_deadlock() {
     assert_eq!(balances(&mut one), ["10", "20", "30", "50"]);
 }
 
+#[test]
+fn a_range_read_through_a_plain_index_stops_on_the_lowest_primary_key_among_equal_values() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(
+        &mut one,
+        "CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT, v INT, KEY q_k (k))",
+    );
+    for row in ["(30, 5, 0)", "(10, 5, 0)", "(1, 1, 0)", "(20, 5, 0)"] {
+        run(&mut one, &format!("INSERT INTO q (id, k, v) VALUES {row}"));
+    }
+    run(&mut one, "BEGIN");
+    run(&mut one, "SELECT id FROM q WHERE k < 5 FOR UPDATE");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    for (sql, waits) in [
+        ("UPDATE q SET v = 9 WHERE id = 10", true),
+        ("UPDATE q SET v = 9 WHERE id = 30", false),
+        ("INSERT INTO q (id, k, v) VALUES (5, 5, 0)", true),
+        ("INSERT INTO q (id, k, v) VALUES (15, 5, 0)", false),
+        ("INSERT INTO q (id, k, v) VALUES (2, 3, 0)", true),
+    ] {
+        run(&mut two, "BEGIN");
+        let expected = if waits {
+            Err(FrontendErrorKind::DatabaseBusy)
+        } else {
+            Ok(())
+        };
+        assert_eq!(two.execute_query(sql).map(|_| ()), expected, "{sql}");
+        run(&mut two, "ROLLBACK");
+    }
+    run(&mut one, "COMMIT");
+}
+
 /// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: a child
 /// row's insert locks its parent row in share mode (`S,REC_NOT_GAP`) under
 /// both levels, so another session's delete or update of that parent waits

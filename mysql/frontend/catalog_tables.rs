@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::session::{is_the_primary_keys_own_index, mysql_index_name};
+use crate::session::{is_the_primary_keys_own_index, mysql_index_columns, mysql_index_name};
 use turso_core::{
     schema::is_system_table, Connection, Database, InternalVirtualTable,
     InternalVirtualTableCursor, LimboError, Result, Value,
@@ -645,7 +645,10 @@ impl InternalVirtualTable for InformationSchemaStatistics {
             }
             for index in indexes_beside_the_primary_key(&schema, name, &btree) {
                 let index_name = mysql_index_name(index);
-                for (position, column) in index.columns.iter().enumerate() {
+                for (position, column) in mysql_index_columns(index, &btree.primary_key_columns)
+                    .iter()
+                    .enumerate()
+                {
                     rows.push(StatisticsRow {
                         table: name.clone(),
                         non_unique: i64::from(!index.unique),

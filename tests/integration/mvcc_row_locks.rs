@@ -1299,16 +1299,19 @@ fn a_locking_read_through_an_in_subquery_locks_the_rows_the_subquery_read() {
 }
 
 #[test]
-fn a_secondary_index_of_a_table_without_a_rowid_key_orders_equal_values_by_rowid_not_by_key() {
+fn a_range_read_through_an_index_ending_with_the_primary_key_stops_on_the_lowest_key_among_equal_values(
+) {
     let db = database_with_gaps_to_lock();
     let setup = db.connect_limbo();
     setup
         .execute("CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT, v INT)")
         .unwrap();
-    setup.execute("CREATE INDEX q_k ON q (k)").unwrap();
-    setup.execute("INSERT INTO q VALUES (30, 5, 0)").unwrap();
-    setup.execute("INSERT INTO q VALUES (10, 5, 0)").unwrap();
-    setup.execute("INSERT INTO q VALUES (1, 1, 0)").unwrap();
+    setup.execute("CREATE INDEX q_k ON q (k, id)").unwrap();
+    for row in ["(30, 5, 0)", "(10, 5, 0)", "(1, 1, 0)", "(20, 5, 0)"] {
+        setup
+            .execute(format!("INSERT INTO q VALUES {row}"))
+            .unwrap();
+    }
 
     let reader = session(&db);
     reader.execute("BEGIN CONCURRENT").unwrap();
@@ -1327,8 +1330,11 @@ fn a_secondary_index_of_a_table_without_a_rowid_key_orders_equal_values_by_rowid
     drop(statement);
     assert_eq!(ids, [1]);
 
-    assert!(waits(&db, "UPDATE q SET v = 9 WHERE id = 30"));
-    assert!(!waits(&db, "UPDATE q SET v = 9 WHERE id = 10"));
+    assert!(waits(&db, "UPDATE q SET v = 9 WHERE id = 10"));
+    assert!(!waits(&db, "UPDATE q SET v = 9 WHERE id = 30"));
+    assert!(waits(&db, "INSERT INTO q VALUES (5, 5, 0)"));
+    assert!(!waits(&db, "INSERT INTO q VALUES (15, 5, 0)"));
+    assert!(waits(&db, "INSERT INTO q VALUES (2, 3, 0)"));
     reader.execute("COMMIT").unwrap();
 }
 

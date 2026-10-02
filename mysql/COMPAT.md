@@ -3778,13 +3778,30 @@ keeps a table it reads as a constant, while an `UPDATE` or a `DELETE` lets it go
 another transaction holds reads the row's latest committed version and waits only if that
 version matches, while a `DELETE`, a locking read, or an `UPDATE` through a secondary index
 waits. Which rows and gaps are locked follows from the index a statement reads, which the
-engine chooses and MySQL's optimizer may choose differently. And one difference remains: on a table whose primary
-key is not the engine's rowid — every primary key but a counted one, which lowers to `INT NOT
-NULL PRIMARY KEY` — a secondary index keeps entries with equal values in the order of the rowid
-the engine gave each row, the order the rows were inserted in, where InnoDB keeps them in
-primary key order; so a range that stops among equal values stops on, and locks, another row
-than InnoDB's, and the gaps between equal values lie between other rows. Fixing it needs an
-index that holds the primary key, which changes what such an index stores.
+engine chooses and MySQL's optimizer may choose differently.
+A plain index on a table whose primary key is not the engine's rowid — every primary key but a
+counted one, which lowers to `INT NOT NULL PRIMARY KEY` — holds the primary key's columns after
+its own, as InnoDB's does, so entries with equal values stand in primary key order. Measured on
+8.4.11, and here, rows `(30, k=5)`, `(10, k=5)`, `(1, k=1)` and `(20, k=5)` inserted in that order
+come back 10, 20, 30 from `WHERE k = 5` with no `ORDER BY`; `k < 5 FOR UPDATE` stops on row 10
+and locks it and the gap below it, so another transaction's update of row 10 and its inserts of
+`(5, k=5)` and `(2, k=3)` wait while an update of row 30 and an insert of `(15, k=5)` go ahead. A
+key over several columns orders equal values by each of them in turn — `KEY (k, b)` under
+`PRIMARY KEY (a, b)` by `k`, `b`, then `a` — and a key over a word does so without regard to
+case. `SHOW INDEX`, `SHOW CREATE TABLE`, `information_schema.STATISTICS` and a foreign key's
+search for an index over its columns see only the columns the index was declared with, so a
+foreign key over `(k, id)` beside a `KEY (k)` gets an index of its own, as it does in MySQL. A
+plain index made before this, which holds no primary key and keeps equal values in the order
+they were inserted, keeps that order and reads as it always did until it is written again:
+`ALTER TABLE t ENGINE=InnoDB`, MySQL's way of rebuilding a table, writes again every such index
+of the table, and so does any statement that writes the table or the index again —
+`TRUNCATE`, an `ALTER TABLE` that writes the table again, `RENAME INDEX`. Two differences
+remain. A unique index keeps its NULLs, the one value it may hold more than once, in the order
+they were inserted, where InnoDB keeps them in primary key order: measured on 8.4.11, NULLs
+inserted for rows 30, 10 and 20 come back 10, 20, 30 from `WHERE u IS NULL` there and 30, 10,
+20 here. And a table without a primary key but with a unique key over columns that are all
+`NOT NULL`, which InnoDB keeps its rows by in place of a primary key, orders a plain index's
+equal values by insertion here and by that unique key there.
 An `INSERT` into an `AUTO_INCREMENT` table takes its ids once its first row is filled and
 before it waits for a key or a gap another transaction holds, as InnoDB does: measured on 8.4.11,
 and here, an insert by a third session meanwhile takes the ids after them, the waiting insert

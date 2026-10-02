@@ -3284,11 +3284,11 @@ fn legacy_foreign_key_without_child_index_is_rejected_on_reopen() -> Result<()> 
         connection
             .prepare("CREATE TABLE child (id INT NOT NULL PRIMARY KEY, parent_id INT, CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id))")?
             .run_ignore_rows()?;
-        assert!(!connection
-            .inner()
-            .current_schema()
+        let schema = connection.inner().current_schema();
+        let primary_key = &schema.get_btree_table("child").unwrap().primary_key_columns;
+        assert!(!schema
             .get_indices("child")
-            .any(|index| index_covers_columns(index, &["parent_id".to_owned()])));
+            .any(|index| index_covers_columns(index, primary_key, &["parent_id".to_owned()])));
         connection.close()?;
     }
     let db = open_database(io, path, OpenFlags::None)?;
@@ -7838,4 +7838,99 @@ fn refused_value_ends_only_its_statement_inside_a_transaction() -> Result<()> {
     );
     connection.close()?;
     Ok(())
+}
+
+#[test]
+fn a_plain_index_kept_in_insert_order_is_written_again_in_primary_key_order_by_engine_innodb(
+) -> Result<()> {
+    for (path, journal_mode) in [
+        ("mysql-session-index-kept-in-insert-order-wal.db", "wal"),
+        ("mysql-session-index-kept-in-insert-order-mvcc.db", "mvcc"),
+    ] {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let table = MySqlTableName::parse("q").unwrap();
+        {
+            let db = open_database(io.clone(), path, OpenFlags::Create)?;
+            let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+            connection
+                .inner()
+                .execute(format!("PRAGMA journal_mode = '{journal_mode}'"))?;
+            connection
+                .prepare("CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT)")?
+                .run_ignore_rows()?;
+            create_an_index_kept_in_insert_order(&connection, "q_k", "CREATE INDEX q_k ON q (k)")?;
+            for id in [30, 10, 20] {
+                connection.execute(&format!("INSERT INTO q (id, k) VALUES ({id}, 5)"))?;
+            }
+            assert_eq!(ids_with_k_5(&connection)?, [30, 10, 20], "{journal_mode}");
+            assert_eq!(index_columns(&connection, &table), ["PRIMARY.id", "q_k.k"]);
+
+            connection
+                .execute_table_engine_restated(&table)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            assert_eq!(ids_with_k_5(&connection)?, [10, 20, 30], "{journal_mode}");
+            assert_eq!(index_columns(&connection, &table), ["PRIMARY.id", "q_k.k"]);
+            connection.close()?;
+        }
+        let db = open_database(io, path, OpenFlags::None)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        assert_eq!(connection.inner().mvcc_enabled(), journal_mode == "mvcc");
+        connection.execute("INSERT INTO q (id, k) VALUES (15, 5)")?;
+        assert_eq!(
+            ids_with_k_5(&connection)?,
+            [10, 15, 20, 30],
+            "{journal_mode}"
+        );
+        assert_eq!(index_columns(&connection, &table), ["PRIMARY.id", "q_k.k"]);
+        connection.close()?;
+    }
+    Ok(())
+}
+
+fn create_an_index_kept_in_insert_order(
+    connection: &MySqlConnection,
+    name: &str,
+    sql: &str,
+) -> Result<()> {
+    let mode = connection.parser_mode();
+    let mut statement = parse_schema_ddl_ast(sql, mode)
+        .map_err(|error| LimboError::ParseError(error.to_string()))?;
+    let Stmt::CreateIndex { idx_name, .. } = &mut statement else {
+        panic!("{sql} must create an index");
+    };
+    idx_name.name = turso_parser::ast::Name::exact(physical_mysql_index_name(
+        name,
+        StoredIndexKind {
+            implicit: false,
+            ends_with_primary_key: false,
+        },
+    )?);
+    let input = render_create_index_mysql_with_mode(&statement, mode)
+        .map_err(|error| LimboError::ParseError(error.to_string()))?;
+    let options =
+        PrepareOptions::default().with_schema_sql_formatter(Arc::new(connection.schema_context));
+    connection
+        .inner()
+        .prepare_translated_stmt_with_options(statement, &input, &options)?
+        .run_ignore_rows()?;
+    Ok(())
+}
+
+fn ids_with_k_5(connection: &MySqlConnection) -> Result<Vec<i64>> {
+    Ok(connection
+        .prepare_select("SELECT id FROM q WHERE k = 5")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .run_collect_rows()?
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect())
+}
+
+fn index_columns(connection: &MySqlConnection, table: &MySqlTableName) -> Vec<String> {
+    connection
+        .list_indexes(table)
+        .unwrap()
+        .iter()
+        .map(|entry| format!("{}.{}", entry.key_name(), entry.column_name()))
+        .collect()
 }
