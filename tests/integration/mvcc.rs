@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use turso_core::{
     mvcc::persistent_storage::logical_log::LogTxFrameInfo, Database, DatabaseOpts, EncryptionKey,
-    EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
+    EncryptionOpts, LimboError, OpenFlags, SqliteDialect, StepResult,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -1644,4 +1644,239 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         vec![(2,)],
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
+}
+
+#[test]
+fn test_a_refreshed_snapshot_reads_later_commits_and_keeps_its_own_writes() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup
+        .execute("INSERT INTO t VALUES (1, 0), (2, 0)")
+        .unwrap();
+    let reader = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    reader.execute("UPDATE t SET n = 1 WHERE id = 1").unwrap();
+    writer.execute("UPDATE t SET n = 9 WHERE id = 2").unwrap();
+    writer.execute("INSERT INTO t VALUES (3, 3)").unwrap();
+    let before: Vec<(i64, i64)> = reader.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(before, vec![(1, 1), (2, 0)]);
+
+    reader.refresh_read_snapshot().unwrap();
+    let after: Vec<(i64, i64)> = reader.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(after, vec![(1, 1), (2, 9), (3, 3)]);
+    let elsewhere: Vec<(i64, i64)> = writer.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(elsewhere, vec![(1, 0), (2, 9), (3, 3)]);
+
+    writer.execute("DELETE FROM t WHERE id = 3").unwrap();
+    reader.refresh_read_snapshot().unwrap();
+    let after_delete: Vec<(i64, i64)> = reader.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(after_delete, vec![(1, 1), (2, 9)]);
+    reader.execute("COMMIT").unwrap();
+
+    let committed: Vec<(i64, i64)> = writer.exec_rows("SELECT id, n FROM t ORDER BY id");
+    assert_eq!(committed, vec![(1, 1), (2, 9)]);
+}
+
+#[test]
+fn test_a_refreshed_snapshot_writes_a_row_another_transaction_committed_after_it_began() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+    let stale = tmp_db.connect_limbo();
+    let refreshed = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    stale.execute("BEGIN CONCURRENT").unwrap();
+    refreshed.execute("BEGIN CONCURRENT").unwrap();
+    let read: Vec<(i64,)> = refreshed.exec_rows("SELECT n FROM t WHERE id = 1");
+    assert_eq!(read, vec![(0,)]);
+    writer.execute("UPDATE t SET n = 3 WHERE id = 1").unwrap();
+
+    assert!(matches!(
+        stale.execute("UPDATE t SET n = n + 1 WHERE id = 1"),
+        Err(LimboError::WriteWriteConflict)
+    ));
+
+    refreshed.refresh_read_snapshot().unwrap();
+    refreshed
+        .execute("UPDATE t SET n = n + 1 WHERE id = 1")
+        .unwrap();
+    refreshed.execute("COMMIT").unwrap();
+    let committed: Vec<(i64,)> = writer.exec_rows("SELECT n FROM t WHERE id = 1");
+    assert_eq!(committed, vec![(4,)]);
+}
+
+#[test]
+fn test_garbage_collection_keeps_the_rows_a_refreshed_snapshot_reads() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+    let reader = tmp_db.connect_limbo();
+    let writer = tmp_db.connect_limbo();
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET n = 1 WHERE id = 1").unwrap();
+    reader.refresh_read_snapshot().unwrap();
+    for n in 2..10 {
+        writer
+            .execute(format!("UPDATE t SET n = {n} WHERE id = 1"))
+            .unwrap();
+    }
+    let mv_store = tmp_db.db.get_mv_store();
+    let mv_store = mv_store.as_ref().expect("the database runs in MVCC mode");
+    assert!(mv_store.drop_unused_row_versions() > 0);
+
+    let read: Vec<(i64,)> = reader.exec_rows("SELECT n FROM t WHERE id = 1");
+    assert_eq!(read, vec![(1,)]);
+    reader.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn test_a_transaction_that_wrote_cannot_refresh_past_a_schema_change() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    let writing = tmp_db.connect_limbo();
+    let reading = tmp_db.connect_limbo();
+    let ddl = tmp_db.connect_limbo();
+
+    writing.execute("BEGIN CONCURRENT").unwrap();
+    writing.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    reading.execute("BEGIN CONCURRENT").unwrap();
+    let read: Vec<(i64,)> = reading.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(read, vec![(0,)]);
+    ddl.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    ddl.execute("INSERT INTO u VALUES (7)").unwrap();
+
+    assert!(matches!(
+        writing.refresh_read_snapshot(),
+        Err(LimboError::SchemaConflict)
+    ));
+    let still_own: Vec<(i64,)> = writing.exec_rows("SELECT COUNT(*) FROM t");
+    assert_eq!(still_own, vec![(1,)]);
+    writing.execute("ROLLBACK").unwrap();
+
+    reading.refresh_read_snapshot().unwrap();
+    let new_table: Vec<(i64,)> = reading.exec_rows("SELECT id FROM u");
+    assert_eq!(new_table, vec![(7,)]);
+    reading.execute("INSERT INTO u VALUES (8)").unwrap();
+    reading.execute("COMMIT").unwrap();
+    let committed: Vec<(i64,)> = ddl.exec_rows("SELECT id FROM u ORDER BY id");
+    assert_eq!(committed, vec![(7,), (8,)]);
+}
+
+#[test]
+fn test_a_savepoint_taken_before_a_refresh_past_a_schema_change_still_commits() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn = tmp_db.connect_limbo();
+    let ddl = tmp_db.connect_limbo();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("SAVEPOINT early").unwrap();
+    ddl.execute("CREATE TABLE u(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.refresh_read_snapshot().unwrap();
+    conn.execute("INSERT INTO u VALUES (1)").unwrap();
+    conn.execute("ROLLBACK TO early").unwrap();
+    conn.execute("INSERT INTO u VALUES (2)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let committed: Vec<(i64,)> = ddl.exec_rows("SELECT id FROM u");
+    assert_eq!(committed, vec![(2,)]);
+}
+
+#[test]
+fn test_refreshing_leaves_an_exclusive_transaction_as_it_is() {
+    let tmp_db = mvcc_database();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let exclusive = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+
+    exclusive.execute("BEGIN").unwrap();
+    exclusive.execute("INSERT INTO t VALUES (1)").unwrap();
+    exclusive.refresh_read_snapshot().unwrap();
+    let own: Vec<(i64,)> = exclusive.exec_rows("SELECT id FROM t");
+    assert_eq!(own, vec![(1,)]);
+    exclusive.execute("COMMIT").unwrap();
+    let committed: Vec<(i64,)> = reader.exec_rows("SELECT id FROM t");
+    assert_eq!(committed, vec![(1,)]);
+}
+
+#[test]
+fn test_a_snapshot_refreshes_only_inside_a_transaction_with_no_statement_running() {
+    let tmp_db = mvcc_database();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    assert!(matches!(
+        conn.refresh_read_snapshot(),
+        Err(LimboError::TxError(_))
+    ));
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    let mut running = conn.prepare("SELECT id FROM t").unwrap();
+    assert!(matches!(running.step().unwrap(), StepResult::Row));
+    assert!(matches!(
+        conn.refresh_read_snapshot(),
+        Err(LimboError::StatementsInProgress(_))
+    ));
+    drop(running);
+    conn.refresh_read_snapshot().unwrap();
+    conn.execute("COMMIT").unwrap();
+}
+
+#[turso_macros::test]
+fn test_a_snapshot_refreshes_only_in_mvcc_mode(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    assert!(matches!(
+        conn.refresh_read_snapshot(),
+        Err(LimboError::TxError(_))
+    ));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn test_a_snapshot_does_not_refresh_with_passive_checkpoints() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true))
+        .with_mvcc(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert!(matches!(
+        conn.refresh_read_snapshot(),
+        Err(LimboError::TxError(_))
+    ));
+    conn.execute("ROLLBACK").unwrap();
+}
+
+fn mvcc_database() -> TempDatabase {
+    TempDatabase::builder().with_mvcc(true).build()
 }

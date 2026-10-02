@@ -2276,6 +2276,10 @@ impl Connection {
         if !self.has_no_open_transaction_state() {
             return;
         }
+        self.adopt_shared_schema_if_changed();
+    }
+
+    fn adopt_shared_schema_if_changed(&self) {
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         // MVCC checkpoint can publish physical btree roots into the shared
@@ -3234,15 +3238,67 @@ impl Connection {
         Ok(())
     }
 
-    fn check_read_snapshot_can_change(&self) -> Result<()> {
-        if self.get_auto_commit() {
+    /// Moves what an explicit MVCC transaction reads to now, so its next
+    /// statement reads every row committed by then along with its own
+    /// uncommitted writes.
+    ///
+    /// This is how a READ COMMITTED transaction reads under MVCC. Unlike
+    /// [`Self::release_read_snapshot`], it also moves a transaction that has
+    /// written: MVCC lets other transactions commit meanwhile, and the
+    /// transaction keeps every row it wrote. A transaction that holds the
+    /// exclusive write slot is left as it is, since nothing else can commit
+    /// while it holds it, and one that has not begun its MVCC transaction yet
+    /// takes a fresh snapshot at its next statement anyway.
+    ///
+    /// A schema another connection committed meanwhile becomes the one the
+    /// transaction reads with, and the one its savepoints roll back to, since
+    /// a transaction without the exclusive write slot changed no schema of
+    /// its own. Fails with [`LimboError::SchemaConflict`], leaving the
+    /// transaction as it was, when the transaction has written and a schema
+    /// change committed after its snapshot: its writes can no longer commit.
+    pub fn refresh_read_snapshot(&self) -> Result<()> {
+        self.check_no_statement_runs_in_explicit_transaction()?;
+        let mv_store = self.mv_store();
+        let Some(mv_store) = mv_store.as_ref() else {
             return Err(LimboError::TxError(
-                "a read snapshot belongs to an explicit transaction".to_string(),
+                "refreshing a read snapshot needs MVCC".to_string(),
+            ));
+        };
+        if !self.attached_mv_txs.read().is_empty() {
+            return Err(LimboError::TxError(
+                "refreshing a read snapshot is not supported with attached MVCC databases"
+                    .to_string(),
             ));
         }
+        let Some(tx_id) = self.get_mv_tx_id() else {
+            return Ok(());
+        };
+        if mv_store.is_exclusive_tx(&tx_id) {
+            return Ok(());
+        }
+        mv_store.refresh_snapshot(tx_id)?;
+        self.adopt_shared_schema_if_changed();
+        let schema = self.schema.read().clone();
+        for savepoint in self.named_savepoints.write().iter_mut() {
+            savepoint.main_schema_snapshot = schema.clone();
+        }
+        Ok(())
+    }
+
+    fn check_read_snapshot_can_change(&self) -> Result<()> {
+        self.check_no_statement_runs_in_explicit_transaction()?;
         if self.mv_store().is_some() {
             return Err(LimboError::TxError(
                 "moving a read snapshot is not supported with MVCC".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn check_no_statement_runs_in_explicit_transaction(&self) -> Result<()> {
+        if self.get_auto_commit() {
+            return Err(LimboError::TxError(
+                "a read snapshot belongs to an explicit transaction".to_string(),
             ));
         }
         if self.n_active_root_statements.load(Ordering::SeqCst) != 0 {

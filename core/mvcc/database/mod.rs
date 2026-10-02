@@ -1073,8 +1073,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     state: AtomicTransactionState,
     /// The transaction ID.
     tx_id: u64,
-    /// The transaction begin timestamp.
-    begin_ts: u64,
+    /// The timestamp of what the transaction reads: the moment it began, or
+    /// the last moment [MvStore::refresh_snapshot] moved it to.
+    begin_ts: AtomicU64,
     /// The transaction write set. Only writer is the [Transaction]'s own connection.
     write_set: Mutex<WriteSet<A>>,
     /// The transaction header.
@@ -1127,7 +1128,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
         Transaction {
             state: TransactionState::Active.into(),
             tx_id,
-            begin_ts,
+            begin_ts: AtomicU64::new(begin_ts),
             read_mark,
             schema_generation_at_begin,
             write_set: Mutex::new(WriteSet::new()),
@@ -1141,6 +1142,10 @@ impl<A: RowVersionAllocator> Transaction<A> {
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
         }
+    }
+
+    fn begin_ts(&self) -> u64 {
+        self.begin_ts.load(Ordering::Acquire)
     }
 
     fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
@@ -1386,7 +1391,7 @@ impl<A: RowVersionAllocator> std::fmt::Display for Transaction<A> {
             "{{ state: {}, id: {}, begin_ts: {}, write_set: ",
             self.state.load(),
             self.tx_id,
-            self.begin_ts,
+            self.begin_ts(),
         )?;
 
         match self.write_set.try_lock() {
@@ -2267,10 +2272,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             // version is now "ended", this is still a write-write conflict.
             if let Some(TxTimestampOrID::Timestamp(end_ts)) = version.end() {
                 turso_assert!(
-                    end_ts != tx.begin_ts,
+                    end_ts != tx.begin_ts(),
                     "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
                 );
-                if end_ts > tx.begin_ts {
+                if end_ts > tx.begin_ts() {
                     return Err(LimboError::WriteWriteConflict);
                 }
             }
@@ -2321,7 +2326,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     // the row versions in reverse. If end_ts < our
                     // begin_ts, the deletion predates our snapshot — no conflict.
                     turso_assert!(
-                        end_ts < tx.begin_ts,
+                        end_ts < tx.begin_ts(),
                         "row version's end_ts cannot be greater than txns begin_ts"
                     );
                     continue;
@@ -2340,10 +2345,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     ) {
                         Some(TransactionState::Committed(committed_end_ts)) => {
                             turso_assert!(
-                                committed_end_ts != tx.begin_ts,
+                                committed_end_ts != tx.begin_ts(),
                                 "committed end_ts and begin_ts cannot be equal: txn timestamps are strictly monotonic"
                             );
-                            if committed_end_ts > tx.begin_ts {
+                            if committed_end_ts > tx.begin_ts() {
                                 return Err(LimboError::WriteWriteConflict);
                             }
                             continue;
@@ -3178,7 +3183,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 let end_ts = mvcc_store.get_commit_timestamp(|ts| {
                     turso_assert!(
-                        ts > tx.begin_ts,
+                        ts > tx.begin_ts(),
                         "end_ts must be strictly greater than begin_ts"
                     );
 
@@ -3195,7 +3200,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     let schema_updated = mvcc_store
                         .last_committed_schema_change_ts
                         .load(Ordering::Acquire)
-                        > tx.begin_ts;
+                        > tx.begin_ts();
                     // last_committed_schema_ts is not enough, we need to check schema cookie
                     // is the same because e.g:
                     // T1 CREATE INDEX
@@ -4756,7 +4761,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn read_snapshot_ts(&self, tx_id: TxID) -> u64 {
         self.txs
             .get(&tx_id)
-            .map(|tx| tx.value().begin_ts)
+            .map(|tx| tx.value().begin_ts())
             .unwrap_or(u64::MAX)
     }
 
@@ -6054,7 +6059,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
         }
-        if !self.is_btree_readable_at(&table_id, tx.begin_ts, tx.read_mark) {
+        if !self.is_btree_readable_at(&table_id, tx.begin_ts(), tx.read_mark) {
             return false;
         }
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
@@ -6472,7 +6477,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .get(&tx_id)
                 .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?
                 .value()
-                .begin_ts
+                .begin_ts()
         } else {
             // Fresh path: publish the transaction into `txs` atomically with
             // begin_ts allocation, under the clock lock — same begin-publish
@@ -6752,6 +6757,75 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tracing::trace!("begin_tx(tx_id={}, begin_ts={})", tx_id, begin_ts);
 
         Ok(tx_id)
+    }
+
+    /// Moves what an active transaction reads to now: from here on it reads
+    /// every row committed before this call, and still reads its own
+    /// uncommitted writes.
+    ///
+    /// Conflict checks at commit compare against the new timestamp, so a row
+    /// another transaction committed before the move is one this transaction
+    /// may go on to change. The caller must have no statement running on the
+    /// transaction, since a running cursor would mix rows from two moments.
+    ///
+    /// The transaction must not hold the exclusive write slot: nothing else
+    /// commits while it holds it, so there is nothing new to read, and its
+    /// own uncommitted schema changes must not be swapped for the shared
+    /// header. A transaction that has written is refused with [LimboError::SchemaConflict] when a schema
+    /// change committed after its timestamp, because its writes were made
+    /// against the schema it began with and it could no longer commit.
+    pub fn refresh_snapshot(&self, tx_id: TxID) -> Result<()> {
+        if self.experimental_mvcc_passive_checkpoint {
+            return Err(LimboError::TxError(
+                "moving a read snapshot is not supported with passive MVCC checkpoints".to_string(),
+            ));
+        }
+        let entry = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = entry.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
+        turso_assert!(
+            !self.is_exclusive_tx(&tx_id),
+            "a transaction holding the exclusive write slot has no newer commits to read"
+        );
+        turso_assert!(
+            !tx.header_dirty.load(Ordering::Acquire),
+            "only an exclusive transaction changes the database header"
+        );
+        let has_written = !tx.write_set.lock().is_empty();
+        let mut schema_changed_under_writes = false;
+        self.clock.get_timestamp(|ts| {
+            let schema_changed =
+                self.last_committed_schema_change_ts.load(Ordering::Acquire) > tx.begin_ts();
+            if schema_changed && has_written {
+                schema_changed_under_writes = true;
+                return;
+            }
+            let header = self
+                .global_header
+                .read()
+                .expect("global_header is set once a transaction has begun");
+            *tx.header.write() = header;
+            for savepoint in tx.savepoint_stack.write().iter_mut() {
+                turso_assert!(
+                    !savepoint.header_dirty,
+                    "only an exclusive transaction changes the database header"
+                );
+                savepoint.header = header;
+            }
+            tx.begin_ts.store(ts, Ordering::Release);
+        });
+        if schema_changed_under_writes {
+            return Err(LimboError::SchemaConflict);
+        }
+        tracing::trace!(
+            "refresh_snapshot(tx_id={}, begin_ts={})",
+            tx_id,
+            tx.begin_ts()
+        );
+        Ok(())
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
@@ -7569,7 +7643,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // txn gets exclusive txn status. check below after the CAS
         if let Some(tx) = self.txs.get(tx_id) {
             let tx = tx.value();
-            if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+            if tx.begin_ts() < self.last_committed_tx_ts.load(Ordering::Acquire) {
                 // Another transaction committed after this transaction's begin timestamp, do not allow exclusive lock.
                 // This mimics regular (non-CONCURRENT) sqlite transaction behavior.
                 return Err(LimboError::Busy);
@@ -7620,7 +7694,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // `CommitState::Initial`.
                 if let Some(tx) = self.txs.get(tx_id) {
                     let tx = tx.value();
-                    if tx.begin_ts < self.last_committed_tx_ts.load(Ordering::Acquire) {
+                    if tx.begin_ts() < self.last_committed_tx_ts.load(Ordering::Acquire) {
                         self.release_exclusive_tx(tx_id);
                         return Err(LimboError::Busy);
                     }
@@ -7743,7 +7817,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .filter_map(|entry| {
                 let tx = entry.value();
                 match tx.state.load() {
-                    TransactionState::Active | TransactionState::Preparing(_) => Some(tx.begin_ts),
+                    TransactionState::Active | TransactionState::Preparing(_) => {
+                        Some(tx.begin_ts())
+                    }
                     _ => None,
                 }
             })
@@ -8444,13 +8520,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
-            Some(TxTimestampOrID::TxID(tx_id)) => {
-                self.txs
-                    .get(tx_id)
-                    .expect("transaction should exist in txs map")
-                    .value()
-                    .begin_ts
-            }
+            Some(TxTimestampOrID::TxID(tx_id)) => self
+                .txs
+                .get(tx_id)
+                .expect("transaction should exist in txs map")
+                .value()
+                .begin_ts(),
             // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
             //
             // The row version chain should be append-only (aside from garbage collection),
@@ -10441,7 +10516,7 @@ fn is_write_write_conflict<A: ConcurrentAllocator>(
         // 2.6. Updating a Version.
         // B-tree deletion markers also reach this check. A deletion committed before
         // our snapshot does not conflict; one committed after our snapshot does.
-        Some(TxTimestampOrID::Timestamp(end_ts)) => end_ts > tx.begin_ts,
+        Some(TxTimestampOrID::Timestamp(end_ts)) => end_ts > tx.begin_ts(),
         None => false,
     }
 }
@@ -10560,10 +10635,10 @@ impl RowVersion {
             Some(TxTimestampOrID::Timestamp(end_ts)) => {
                 // Row was deleted at end_ts. If we started after end_ts, we shouldn't see it
                 turso_assert!(
-                    tx.begin_ts != end_ts,
+                    tx.begin_ts() != end_ts,
                     "begin_ts and committed end_ts cannot be equal: txn timestamps are strictly monotonic"
                 );
-                tx.begin_ts > end_ts
+                tx.begin_ts() > end_ts
             }
             Some(TxTimestampOrID::TxID(end_tx_id)) => {
                 // Row is being deleted/updated by another transaction.
@@ -10575,7 +10650,7 @@ impl RowVersion {
                 match lookup_tx_state(txs, finalized_tx_states, end_tx_id) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         // Same predicate as the Timestamp arm above.
-                        tx.begin_ts > committed_ts
+                        tx.begin_ts() > committed_ts
                     }
                     Some(TransactionState::Preparing(end_ts)) => {
                         // Hekaton speculative read: treat as if W will commit at
@@ -10586,7 +10661,7 @@ impl RowVersion {
                         // `is_begin_visible` and never calls `is_end_visible`.
                         // If W aborts, we must cascade-abort to avoid letting
                         // the reader observe the row reappear.
-                        let speculatively_invalidated = tx.begin_ts > end_ts;
+                        let speculatively_invalidated = tx.begin_ts() > end_ts;
                         if speculatively_invalidated {
                             register_commit_dependency(txs, tx, end_tx_id);
                         }
@@ -10702,10 +10777,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
     match rv.begin() {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => {
             turso_assert!(
-                tx.begin_ts != rv_begin_ts,
+                tx.begin_ts() != rv_begin_ts,
                 "begin_ts and committed rv_begin_ts cannot be equal: txn timestamps are strictly monotonic"
             );
-            tx.begin_ts > rv_begin_ts
+            tx.begin_ts() > rv_begin_ts
         }
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let visible = match txs.get(&rv_begin) {
@@ -10723,10 +10798,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                                 "a txn cannot read its own row versions during prepare"
                             );
                             turso_assert!(
-                                tx.begin_ts != end_ts,
+                                tx.begin_ts() != end_ts,
                                 "begin_ts and preparing end_ts cannot be equal: txn timestamps are strictly monotonic"
                             );
-                            if tx.begin_ts > end_ts {
+                            if tx.begin_ts() > end_ts {
                                 register_commit_dependency(txs, tx, rv_begin);
                                 true
                             } else {
@@ -10735,10 +10810,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                         }
                         TransactionState::Committed(committed_ts) => {
                             turso_assert!(
-                                tx.begin_ts != committed_ts,
+                                tx.begin_ts() != committed_ts,
                                 "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
                             );
-                            tx.begin_ts > committed_ts
+                            tx.begin_ts() > committed_ts
                         }
                         TransactionState::Aborted => false,
                         TransactionState::Terminated => {
@@ -10758,10 +10833,10 @@ fn is_begin_visible<A: ConcurrentAllocator>(
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_begin) {
                     Some(TransactionState::Committed(committed_ts)) => {
                         turso_assert!(
-                            tx.begin_ts != committed_ts,
+                            tx.begin_ts() != committed_ts,
                             "begin_ts and committed_ts cannot be equal: txn timestamps are strictly monotonic"
                         );
-                        tx.begin_ts > committed_ts
+                        tx.begin_ts() > committed_ts
                     }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => false,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {
@@ -10791,7 +10866,7 @@ fn is_end_visible<A: ConcurrentAllocator>(
     row_version: &RowVersion,
 ) -> bool {
     match row_version.end() {
-        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
+        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts() < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
             let visible = match txs.get(&rv_end) {
                 Some(other_tx_entry) => {
@@ -10809,14 +10884,14 @@ fn is_end_visible<A: ConcurrentAllocator>(
                                 current_tx.tx_id != other_tx.tx_id,
                                 "a txn is reading itself while preparing"
                             );
-                            let visible = current_tx.begin_ts < end_ts;
+                            let visible = current_tx.begin_ts() < end_ts;
                             if !visible {
                                 register_commit_dependency(txs, current_tx, rv_end);
                             }
                             visible
                         }
                         TransactionState::Committed(committed_ts) => {
-                            current_tx.begin_ts < committed_ts
+                            current_tx.begin_ts() < committed_ts
                         }
                         TransactionState::Aborted => true,
                         // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
@@ -10832,7 +10907,7 @@ fn is_end_visible<A: ConcurrentAllocator>(
                 }
                 None => match lookup_finalized_tx_state(finalized_tx_states, rv_end) {
                     Some(TransactionState::Committed(committed_ts)) => {
-                        current_tx.begin_ts < committed_ts
+                        current_tx.begin_ts() < committed_ts
                     }
                     Some(TransactionState::Aborted) | Some(TransactionState::Terminated) => true,
                     Some(TransactionState::Active) | Some(TransactionState::Preparing(_)) => {

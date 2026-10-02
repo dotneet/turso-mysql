@@ -2608,9 +2608,9 @@ fn test_recovery_clock_monotonicity() {
         .expect("transaction should exist");
     let tx = tx_entry.value();
     assert!(
-        tx.begin_ts > max_commit_ts,
+        tx.begin_ts() > max_commit_ts,
         "expected begin_ts {} to be > max_commit_ts {}",
-        tx.begin_ts,
+        tx.begin_ts(),
         max_commit_ts
     );
 }
@@ -3637,9 +3637,9 @@ fn test_empty_log_recovery_loads_checkpoint_watermark() {
         .get(&tx_id)
         .expect("transaction should exist");
     assert!(
-        tx_entry.value().begin_ts > persistent_tx_ts_max,
+        tx_entry.value().begin_ts() > persistent_tx_ts_max,
         "expected begin_ts {} > persistent_tx_ts_max {}",
-        tx_entry.value().begin_ts,
+        tx_entry.value().begin_ts(),
         persistent_tx_ts_max
     );
 }
@@ -7712,7 +7712,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
     Transaction {
         state,
         tx_id,
-        begin_ts,
+        begin_ts: AtomicU64::new(begin_ts),
         write_set: Mutex::new(WriteSet::new()),
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -9403,7 +9403,7 @@ fn transaction_display() {
     let tx = Transaction {
         state,
         tx_id,
-        begin_ts,
+        begin_ts: AtomicU64::new(begin_ts),
         write_set,
         header: RwLock::new(DatabaseHeader::default()),
         header_dirty: AtomicBool::new(false),
@@ -11653,7 +11653,7 @@ fn test_gc_active_reader_pins_lwm() {
     // T2 begins a read transaction — pins LWM at T2's begin_ts.
     let conn2 = db.db.connect().unwrap();
     let tx2 = db.mvcc_store.begin_tx(conn2.pager.load().clone()).unwrap();
-    let tx2_begin_ts = db.mvcc_store.txs.get(&tx2).unwrap().value().begin_ts;
+    let tx2_begin_ts = db.mvcc_store.txs.get(&tx2).unwrap().value().begin_ts();
 
     // T3 updates the row and commits, creating a superseded version.
     let conn3 = db.db.connect().unwrap();
@@ -21706,7 +21706,7 @@ fn test_create_index_exclusive_acquire_rechecks_timestamp_after_cas() {
         .get(&ddl_tx_id)
         .expect("DDL transaction should be tracked")
         .value()
-        .begin_ts;
+        .begin_ts();
     assert!(
         ddl_begin_ts >= mvcc_store.last_committed_tx_ts.load(Ordering::Acquire),
         "pre-CAS timestamp check should pass before the injected writer commit"
