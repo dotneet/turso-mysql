@@ -6437,6 +6437,75 @@ mod tests {
     }
 
     #[test]
+    fn a_hook_before_writing_runs_after_the_row_is_filled_and_can_refuse_the_statement() {
+        a_hook_before_writing_runs_after_the_row_is_filled_and_can_refuse_the_statement_in(
+            "hook-before-writing-wal.db",
+            false,
+        );
+    }
+
+    #[test]
+    fn a_hook_before_writing_runs_after_the_row_is_filled_and_can_refuse_the_statement_under_mvcc()
+    {
+        a_hook_before_writing_runs_after_the_row_is_filled_and_can_refuse_the_statement_in(
+            "hook-before-writing-mvcc.db",
+            true,
+        );
+    }
+
+    fn a_hook_before_writing_runs_after_the_row_is_filled_and_can_refuse_the_statement_in(
+        file_name: &str,
+        mvcc: bool,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let conn = open_connection(&temp_dir.path().join(file_name));
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL UNIQUE)")
+            .unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'kept')").unwrap();
+        let runs = Arc::new(AtomicI64::new(0));
+        let run_with_hook = |sql: &str, table: &str, refuse: bool| {
+            let mut statement = conn.prepare(sql).unwrap();
+            let runs = runs.clone();
+            statement.run_before_writing(table, move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                if refuse {
+                    return Err(LimboError::RefusedBeforeWriting("refused".to_string()));
+                }
+                Ok(())
+            });
+            statement.run_ignore_rows()
+        };
+
+        assert!(matches!(
+            run_with_hook("INSERT INTO t VALUES (2, NULL)", "t", false),
+            Err(LimboError::NotNullConstraint { .. })
+        ));
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+        run_with_hook("INSERT INTO other VALUES (1)", "t", true).unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            run_with_hook("INSERT INTO t VALUES (2, 'a'), (3, 'b')", "t", true),
+            Err(LimboError::RefusedBeforeWriting(_))
+        ));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        run_with_hook("INSERT INTO t VALUES (2, 'a'), (3, 'b')", "T", false).unwrap();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(!conn.get_auto_commit());
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 3);
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM other"), 1);
+    }
+
+    #[test]
     fn assignment_validation_is_opt_in_for_sqlite_prepares() {
         let temp_dir = TempDir::new().unwrap();
         let conn = open_connection(&temp_dir.path().join("assignment-validator.db"));

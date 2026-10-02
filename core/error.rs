@@ -193,6 +193,8 @@ pub enum LimboError {
     TableMetadataLocked(crate::MetadataLockRequest),
     #[error("Table definition has changed, please retry transaction: {0}")]
     TableDefinitionChanged(String),
+    #[error("Statement refused before it wrote anything: {0}")]
+    RefusedBeforeWriting(String),
     #[error("Commit dependency aborted")]
     CommitDependencyAborted,
     #[error("No such transaction ID: {0}")]

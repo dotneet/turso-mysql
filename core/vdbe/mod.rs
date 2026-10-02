@@ -872,6 +872,11 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+pub(crate) struct BeforeWriting {
+    pub(crate) table: String,
+    pub(crate) hook: Box<dyn FnOnce() -> Result<()> + Send + Sync>,
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -932,6 +937,7 @@ pub struct ProgramState {
     pub(crate) locking_read: Option<crate::mvcc::database::LockingRead>,
     pub(crate) steps_with_row_locks: bool,
     pub(crate) row_lock_work: Option<row_lock_hooks::RowLockWork>,
+    pub(crate) before_writing: Option<BeforeWriting>,
     commit_state: CommitState,
     /// In-flight commit-state-machine for an autonomous sequence
     /// inner-tx. `Insn::SequenceCommitInnerTx` constructs this on first
@@ -1111,6 +1117,7 @@ impl ProgramState {
             locking_read: None,
             steps_with_row_locks: false,
             row_lock_work: None,
+            before_writing: None,
             commit_state: CommitState::Ready,
             sequence_inner_commit: None,
             sequence_inner_tx_pending: None,
@@ -1211,6 +1218,7 @@ impl ProgramState {
         self.io_completions = None;
         self.pc = 0;
         self.row_lock_work = None;
+        self.before_writing = None;
 
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
@@ -3610,7 +3618,9 @@ impl Program {
                 Some(LimboError::TableMetadataLocked(_)) => {
                     self.connection.set_changes(0);
                 }
-                Some(LimboError::TableDefinitionChanged(_)) => {
+                Some(
+                    LimboError::TableDefinitionChanged(_) | LimboError::RefusedBeforeWriting(_),
+                ) => {
                     if must_rollback_tx_if_needed {
                         self.rollback_current_txn(pager);
                     }

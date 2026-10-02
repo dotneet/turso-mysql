@@ -524,6 +524,20 @@ impl Statement {
         self.query_timeout_override = timeout;
     }
 
+    /// Runs `hook` once in the next execution, right before the statement
+    /// first looks up or writes a row or key of `table`. An error from it
+    /// ends the statement there, before it wrote anything.
+    pub fn run_before_writing(
+        &mut self,
+        table: &str,
+        hook: impl FnOnce() -> Result<()> + Send + Sync + 'static,
+    ) {
+        self.state.before_writing = Some(vdbe::BeforeWriting {
+            table: table.to_string(),
+            hook: Box::new(hook),
+        });
+    }
+
     pub fn execution_state(&self) -> ProgramExecutionState {
         self.state.execution_state
     }
@@ -1456,6 +1470,7 @@ impl Statement {
 
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
+        let before_writing = self.state.before_writing.take();
         let (max_registers, cursor_count) = match self.query_mode {
             QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -1477,6 +1492,7 @@ impl Statement {
         self.program = new_program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
+        self.state.before_writing = before_writing;
         Ok(())
     }
 

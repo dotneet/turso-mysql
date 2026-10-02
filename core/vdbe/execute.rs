@@ -12855,6 +12855,7 @@ pub fn op_insert(
         },
         insn
     );
+    run_the_hook_before_writing(program, state, *cursor_id)?;
 
     loop {
         match state.active_op_state.insert().sub_state {
@@ -13477,6 +13478,7 @@ pub fn op_delete(
         },
         insn
     );
+    run_the_hook_before_writing(program, state, *cursor_id)?;
 
     loop {
         match state.active_op_state.delete().sub_state {
@@ -13606,6 +13608,7 @@ pub fn op_idx_delete(
         },
         insn
     );
+    run_the_hook_before_writing(program, state, *cursor_id)?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(
@@ -13730,6 +13733,7 @@ pub fn op_idx_insert(
         },
         *insn
     );
+    run_the_hook_before_writing(program, state, cursor_id)?;
 
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
@@ -14292,6 +14296,7 @@ pub fn op_no_conflict(
         },
         insn
     );
+    run_the_hook_before_writing(program, state, *cursor_id)?;
 
     loop {
         match *state.active_op_state.no_conflict() {
@@ -14379,6 +14384,7 @@ pub fn op_not_exists(
         },
         insn
     );
+    run_the_hook_before_writing(program, state, *cursor)?;
     let cursor = must_be_btree_cursor!(*cursor, program.cursor_ref, state, "NotExists");
     let cursor = cursor.as_btree_mut();
     let exists = return_if_io!(
@@ -17496,6 +17502,7 @@ pub fn op_found(
     };
 
     let not = matches!(insn, Insn::NotFound { .. });
+    run_the_hook_before_writing(program, state, *cursor_id)?;
 
     let record_source = if *num_regs == 0 {
         RecordSource::Packed {
@@ -17531,6 +17538,29 @@ pub fn op_found(
     }
 
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn run_the_hook_before_writing(
+    program: &Program,
+    state: &mut ProgramState,
+    cursor_id: CursorID,
+) -> Result<()> {
+    let Some(before_writing) =
+        state
+            .before_writing
+            .take_if(|before_writing| match program.cursor_ref.get(cursor_id) {
+                Some((_, CursorType::BTreeTable(table))) => {
+                    table.name.eq_ignore_ascii_case(&before_writing.table)
+                }
+                Some((_, CursorType::BTreeIndex(index))) => {
+                    index.table_name.eq_ignore_ascii_case(&before_writing.table)
+                }
+                _ => false,
+            })
+    else {
+        return Ok(());
+    };
+    (before_writing.hook)()
 }
 
 pub fn op_affinity(
