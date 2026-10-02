@@ -174,6 +174,10 @@ struct AllocatorShared {
     operation_in_progress: AtomicBool,
     operations_finished: LockReleaseSignal,
     poisoned: AtomicBool,
+    /// A sync of the sidecar failed. The kernel may have dropped the pages
+    /// it could not write and report a later sync as a success, so no later
+    /// sync is trusted to make a mark durable.
+    sync_failed: Arc<AtomicBool>,
     /// What the log held as this process last read or wrote it, so that an
     /// operation reads only the records appended since. Without it every
     /// reservation read and checked every record ever written, which made
@@ -254,6 +258,7 @@ impl DurableRangeAllocator {
             operation_in_progress: AtomicBool::new(false),
             operations_finished: LockReleaseSignal::default(),
             poisoned: AtomicBool::new(false),
+            sync_failed: Arc::new(AtomicBool::new(false)),
             scanned: Mutex::new(None),
             compact_after: AtomicU64::new(COMPACT_AFTER_LOG_BYTES),
             commits: Mutex::new(Weak::new()),
@@ -341,6 +346,7 @@ impl DurableRangeAllocator {
                 operation_in_progress: AtomicBool::new(false),
                 operations_finished: LockReleaseSignal::default(),
                 poisoned: AtomicBool::new(false),
+                sync_failed: Arc::new(AtomicBool::new(false)),
                 scanned: Mutex::new(None),
                 compact_after: AtomicU64::new(COMPACT_AFTER_LOG_BYTES),
                 commits: Mutex::new(Weak::new()),
@@ -499,7 +505,7 @@ impl DurableRangeAllocator {
             not_yet_logged: Mutex::new(BTreeMap::new()),
             records_written: AtomicU64::new(0),
             records_synced: Arc::new(AtomicU64::new(0)),
-            sync_failed: Arc::new(AtomicBool::new(false)),
+            sync_failed: self.shared.sync_failed.clone(),
         });
         *commits = Arc::downgrade(&logged_marks);
         Ok(logged_marks)
@@ -552,12 +558,7 @@ impl DurableRangeAllocator {
     }
 
     fn ensure_usable(&self) -> Result<()> {
-        if self.shared.poisoned.load(Ordering::Acquire) {
-            return Err(LimboError::InternalError(
-                "auto-increment allocator was dropped with I/O still pending".to_owned(),
-            ));
-        }
-        Ok(())
+        self.shared.ensure_usable()
     }
 }
 
@@ -620,6 +621,9 @@ impl AllocatorSidecarOperation {
     }
 
     fn start(&mut self) -> IOResultOr<()> {
+        if let Err(error) = self.shared.ensure_usable() {
+            return self.fail(error);
+        }
         if self
             .shared
             .operation_in_progress
@@ -752,8 +756,7 @@ impl AllocatorSidecarOperation {
     }
 
     fn begin_sync_header(&mut self) -> IOResultOr<()> {
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -1142,6 +1145,9 @@ impl RangeReservation {
     }
 
     fn start(&mut self) -> IOResultOr<ReservedRange> {
+        if let Err(error) = self.shared.ensure_usable() {
+            return self.fail(error);
+        }
         if self
             .shared
             .operation_in_progress
@@ -1322,8 +1328,7 @@ impl RangeReservation {
         if short_write.load(Ordering::Acquire) {
             return self.fail(CompletionError::ShortWrite.into());
         }
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -1611,8 +1616,7 @@ impl RangeReservation {
         if let Some(error) = completion.get_error() {
             return self.fail(error.into());
         }
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -1830,8 +1834,7 @@ impl RangeReservation {
         compaction: Compaction,
         high_water: u64,
     ) -> IOResultOr<ReservedRange> {
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -1963,8 +1966,7 @@ impl RangeReservation {
             return self.finish_record(range, append_offset);
         }
 
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -2016,8 +2018,7 @@ impl RangeReservation {
     }
 
     fn begin_sync_existing(&mut self, high_water: u64) -> IOResultOr<ReservedRange> {
-        let completion = Completion::new_sync(|_| {});
-        let completion = match self.shared.file.sync(completion, self.shared.sync_type) {
+        let completion = match self.shared.sync() {
             Ok(completion) => completion,
             Err(error) => return self.fail(error),
         };
@@ -2332,9 +2333,6 @@ pub struct CommitLoggedMarks {
     records_written: AtomicU64,
     /// How many of those a finished sync covers.
     records_synced: Arc<AtomicU64>,
-    /// A sync of the sidecar failed. The kernel may have dropped the pages
-    /// it could not write and report a later sync as a success, so no later
-    /// sync is trusted to make a mark durable.
     sync_failed: Arc<AtomicBool>,
 }
 
@@ -2369,9 +2367,7 @@ impl CommitLoggedMarks {
     pub fn sync_sidecar(&self) -> Result<Completion> {
         let written = self.records_written.load(Ordering::Acquire);
         if self.sync_failed.load(Ordering::Acquire) {
-            return Err(LimboError::InternalError(
-                "an earlier sync of the auto-increment sidecar failed".to_owned(),
-            ));
+            return Err(an_earlier_sync_failed());
         }
         let synced = self.records_synced.clone();
         let failed = self.sync_failed.clone();
@@ -2411,6 +2407,42 @@ impl CommitLoggedMarks {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+impl AllocatorShared {
+    fn ensure_usable(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(LimboError::InternalError(
+                "auto-increment allocator was dropped with I/O still pending".to_owned(),
+            ));
+        }
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(an_earlier_sync_failed());
+        }
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<Completion> {
+        if self.sync_failed.load(Ordering::Acquire) {
+            return Err(an_earlier_sync_failed());
+        }
+        let failed = self.sync_failed.clone();
+        let completion = Completion::new_sync(move |result| {
+            if result.is_err() {
+                failed.store(true, Ordering::Release);
+            }
+        });
+        self.file
+            .sync(completion, self.sync_type)
+            .inspect_err(|_| self.sync_failed.store(true, Ordering::Release))
+    }
+}
+
+fn an_earlier_sync_failed() -> LimboError {
+    LimboError::CompletionError(CompletionError::IOError(
+        std::io::ErrorKind::Other,
+        "an earlier sync of the auto-increment sidecar failed; reopen the database",
+    ))
 }
 
 fn let_the_next_operation_start(shared: &AllocatorShared) {
@@ -3037,11 +3069,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let failing = Arc::new(FailingSyncFile {
-            inner,
-            sync_calls: AtomicUsize::new(0),
-            fail_on_sync_call: 1,
-        });
+        let failing = FailingSyncFile::new(inner, 1, SyncFailure::OnSubmit);
         let allocator = DurableRangeAllocator::from_file(
             failing,
             DATABASE_A,
@@ -3058,12 +3086,20 @@ mod tests {
         assert!(commits.has_unsynced_records());
         assert!(matches!(
             commits.sync_written_records(),
-            Err(LimboError::InternalError(_))
+            Err(error) if is_the_earlier_sync_failure(&error)
         ));
         assert!(matches!(
             commits.sync_sidecar(),
-            Err(LimboError::InternalError(_))
+            Err(error) if is_the_earlier_sync_failure(&error)
         ));
+        assert!(matches!(
+            allocator.reserve(KEY_A, 1),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+    }
+
+    fn is_the_earlier_sync_failure(error: &LimboError) -> bool {
+        error.to_string() == an_earlier_sync_failed().to_string()
     }
 
     #[test]
@@ -4221,7 +4257,34 @@ mod tests {
     struct FailingSyncFile {
         inner: Arc<dyn File>,
         sync_calls: AtomicUsize,
-        fail_on_sync_call: usize,
+        fail_on_sync_call: AtomicUsize,
+        failure: SyncFailure,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SyncFailure {
+        OnSubmit,
+        InCompletion,
+    }
+
+    impl FailingSyncFile {
+        fn new(inner: Arc<dyn File>, fail_on_sync_call: usize, failure: SyncFailure) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                sync_calls: AtomicUsize::new(0),
+                fail_on_sync_call: AtomicUsize::new(fail_on_sync_call),
+                failure,
+            })
+        }
+
+        fn fail_the_next_sync(&self) {
+            self.fail_on_sync_call
+                .store(self.syncs(), Ordering::Release);
+        }
+
+        fn syncs(&self) -> usize {
+            self.sync_calls.load(Ordering::Acquire)
+        }
     }
 
     struct FailingUnlockIo {
@@ -4330,12 +4393,22 @@ mod tests {
         }
 
         fn sync(&self, completion: Completion, sync_type: FileSyncType) -> Result<Completion> {
-            if self.sync_calls.fetch_add(1, Ordering::AcqRel) == self.fail_on_sync_call {
-                return Err(LimboError::InternalError(
-                    "injected sync failure".to_owned(),
-                ));
+            let call = self.sync_calls.fetch_add(1, Ordering::AcqRel);
+            if call != self.fail_on_sync_call.load(Ordering::Acquire) {
+                return self.inner.sync(completion, sync_type);
             }
-            self.inner.sync(completion, sync_type)
+            match self.failure {
+                SyncFailure::OnSubmit => Err(LimboError::InternalError(
+                    "injected sync failure".to_owned(),
+                )),
+                SyncFailure::InCompletion => {
+                    completion.error(CompletionError::IOError(
+                        std::io::ErrorKind::Other,
+                        "injected sync failure",
+                    ));
+                    Ok(completion)
+                }
+            }
         }
 
         fn size(&self) -> Result<u64> {
@@ -4357,11 +4430,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let failing = Arc::new(FailingSyncFile {
-            inner: inner.clone(),
-            sync_calls: AtomicUsize::new(0),
-            fail_on_sync_call: 1,
-        });
+        let failing = FailingSyncFile::new(inner.clone(), 1, SyncFailure::OnSubmit);
         let allocator = DurableRangeAllocator::from_file(
             failing,
             DATABASE_A,
@@ -4389,6 +4458,213 @@ mod tests {
     }
 
     #[test]
+    fn after_a_record_sync_fails_nothing_reads_writes_or_syncs_until_reopen() {
+        for failure in [SyncFailure::OnSubmit, SyncFailure::InCompletion] {
+            let io = MemoryIO::new();
+            let inner = io
+                .open_file(
+                    "record-sync-failure.test",
+                    OpenFlags::Create | OpenFlags::NoLock,
+                    false,
+                )
+                .unwrap();
+            let failing = FailingSyncFile::new(inner.clone(), 2, failure);
+            let allocator = DurableRangeAllocator::from_file(
+                failing.clone(),
+                DATABASE_A,
+                AllocatorOpenMode::Create,
+                FileSyncType::Fsync,
+            )
+            .unwrap();
+            assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 1);
+            let made_before_the_failure = allocator.reserve(KEY_B, 1).unwrap();
+            let mut failing_reservation = allocator.reserve(KEY_A, 1).unwrap();
+            assert!(
+                io.block(|| failing_reservation.step()).is_err(),
+                "{failure:?}"
+            );
+
+            let size = inner.size().unwrap();
+            let syncs = failing.syncs();
+            assert_every_operation_is_refused(&io, &allocator.clone(), made_before_the_failure);
+            assert_eq!(inner.size().unwrap(), size);
+            assert_eq!(failing.syncs(), syncs);
+            drop(allocator);
+
+            let reopened = DurableRangeAllocator::from_file(
+                inner,
+                DATABASE_A,
+                AllocatorOpenMode::Reopen,
+                FileSyncType::Fsync,
+            )
+            .unwrap();
+            assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 3);
+            assert_eq!(reserve(&io, &reopened, KEY_B, 1).first(), 1);
+        }
+    }
+
+    #[test]
+    fn after_a_rewrite_sync_fails_nothing_reads_writes_or_syncs_until_reopen() {
+        for failure in [SyncFailure::OnSubmit, SyncFailure::InCompletion] {
+            for commits_log_marks in [false, true] {
+                let io = MemoryIO::new();
+                let inner = io
+                    .open_file(
+                        "rewrite-sync-failure.test",
+                        OpenFlags::Create | OpenFlags::NoLock,
+                        false,
+                    )
+                    .unwrap();
+                let failing = FailingSyncFile::new(inner.clone(), usize::MAX, failure);
+                let allocator = DurableRangeAllocator::from_file(
+                    failing.clone(),
+                    DATABASE_A,
+                    AllocatorOpenMode::Create,
+                    FileSyncType::Fsync,
+                )
+                .unwrap();
+                allocator.set_compaction_threshold(SMALL_LOG);
+                let commits = commits_log_marks.then(|| allocator.let_commits_log_marks().unwrap());
+                for number in 1..=8 {
+                    assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), number);
+                }
+                let size_before_the_rewrite = inner.size().unwrap();
+                let made_before_the_failure = allocator.reserve(KEY_B, 1).unwrap();
+                failing.fail_the_next_sync();
+                let mut rewriting = allocator.reserve(KEY_A, 1).unwrap();
+                assert!(io.block(|| rewriting.step()).is_err());
+                assert!(
+                    inner.size().unwrap() > size_before_the_rewrite,
+                    "the failed sync was not a rewrite's"
+                );
+
+                let size = inner.size().unwrap();
+                let syncs = failing.syncs();
+                assert_every_operation_is_refused(&io, &allocator, made_before_the_failure);
+                if let Some(commits) = &commits {
+                    assert!(matches!(
+                        commits.sync_sidecar(),
+                        Err(error) if is_the_earlier_sync_failure(&error)
+                    ));
+                }
+                assert_eq!(inner.size().unwrap(), size);
+                assert_eq!(failing.syncs(), syncs);
+                drop(commits);
+                drop(allocator);
+
+                let reopened = DurableRangeAllocator::from_file(
+                    inner,
+                    DATABASE_A,
+                    AllocatorOpenMode::Reopen,
+                    FileSyncType::Fsync,
+                )
+                .unwrap();
+                reopened.set_compaction_threshold(SMALL_LOG);
+                assert_eq!(peek_high_water(&io, &reopened, KEY_A), 8);
+                assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 9);
+                assert_eq!(reserve(&io, &reopened, KEY_B, 1).first(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn after_the_sync_of_a_cut_torn_tail_fails_nothing_reads_writes_or_syncs_until_reopen() {
+        for failure in [SyncFailure::OnSubmit, SyncFailure::InCompletion] {
+            let io = MemoryIO::new();
+            let allocator = open_allocator(&io);
+            assert_eq!(reserve(&io, &allocator, KEY_A, 2).last(), 2);
+            assert_eq!(reserve(&io, &allocator, KEY_A, 1).last(), 3);
+            drop(allocator);
+            let inner = io
+                .open_file(
+                    "auto-increment.test",
+                    OpenFlags::Create | OpenFlags::NoLock,
+                    false,
+                )
+                .unwrap();
+            let second_record = (HEADER_LEN + RECORD_LEN) as u64;
+            write_bytes(&io, inner.clone(), second_record, vec![0; RECORD_LEN]);
+            write_bytes(
+                &io,
+                inner.clone(),
+                second_record + RECORD_LEN as u64,
+                encode_record(KEY_A, 1).to_vec(),
+            );
+
+            let failing = FailingSyncFile::new(inner.clone(), 0, failure);
+            let allocator = DurableRangeAllocator::from_file(
+                failing.clone(),
+                DATABASE_A,
+                AllocatorOpenMode::Reopen,
+                FileSyncType::Fsync,
+            )
+            .unwrap();
+            let made_before_the_failure = allocator.reserve(KEY_B, 1).unwrap();
+            let mut cutting = allocator.reserve(KEY_A, 1).unwrap();
+            assert!(io.block(|| cutting.step()).is_err());
+            assert_eq!(inner.size().unwrap(), second_record);
+
+            let syncs = failing.syncs();
+            assert_every_operation_is_refused(&io, &allocator, made_before_the_failure);
+            assert_eq!(inner.size().unwrap(), second_record);
+            assert_eq!(failing.syncs(), syncs);
+            drop(allocator);
+
+            let reopened = DurableRangeAllocator::from_file(
+                inner,
+                DATABASE_A,
+                AllocatorOpenMode::Reopen,
+                FileSyncType::Fsync,
+            )
+            .unwrap();
+            assert_eq!(reserve(&io, &reopened, KEY_A, 1).first(), 3);
+        }
+    }
+
+    fn assert_every_operation_is_refused(
+        io: &dyn IO,
+        allocator: &DurableRangeAllocator,
+        mut made_before_the_failure: RangeReservation,
+    ) {
+        assert!(matches!(
+            io.block(|| made_before_the_failure.step()),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.reserve(KEY_A, 1),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.reserve_insert_values(KEY_A, vec![InsertAutoIncrementValue::Generated]),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.advance_past(KEY_A, 100),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.peek_high_water(KEY_A),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.lease_high_water(KEY_A),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.last_seen_high_water(KEY_A),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.verify(),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+        assert!(matches!(
+            allocator.let_commits_log_marks(),
+            Err(error) if is_the_earlier_sync_failure(&error)
+        ));
+    }
+
+    #[test]
     fn lease_sync_failure_releases_the_lock_and_preserves_the_written_mark() {
         let io = MemoryIO::new();
         let inner = io
@@ -4398,11 +4674,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let failing = Arc::new(FailingSyncFile {
-            inner: inner.clone(),
-            sync_calls: AtomicUsize::new(0),
-            fail_on_sync_call: 2,
-        });
+        let failing = FailingSyncFile::new(inner.clone(), 2, SyncFailure::OnSubmit);
         let allocator = DurableRangeAllocator::from_file(
             failing,
             DATABASE_A,
@@ -4439,11 +4711,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        let failing = Arc::new(FailingSyncFile {
-            inner: inner.clone(),
-            sync_calls: AtomicUsize::new(0),
-            fail_on_sync_call: 0,
-        });
+        let failing = FailingSyncFile::new(inner.clone(), 0, SyncFailure::OnSubmit);
         let allocator = DurableRangeAllocator::from_file(
             failing,
             DATABASE_A,
