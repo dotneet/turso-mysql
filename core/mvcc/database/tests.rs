@@ -4294,6 +4294,77 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
 }
 
 #[test]
+fn a_forward_scan_finds_the_changed_rows_without_a_lookup_for_each_b_tree_row() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=1000 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("UPDATE t SET v = v + 1000 WHERE id % 10 = 0")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id % 10 = 5").unwrap();
+    let rows_and_checks = |conn: &Arc<Connection>, sql: &str| -> (Vec<i64>, u64) {
+        crate::mvcc::cursor::BTREE_ROWS_CHECKED.with(|checked| checked.set(0));
+        let rows = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        (
+            rows,
+            crate::mvcc::cursor::BTREE_ROWS_CHECKED.with(|checked| checked.get()),
+        )
+    };
+    let expected_sum = (1..=1000_i64)
+        .filter(|id| id % 10 != 5)
+        .map(|id| if id % 10 == 0 { id + 1000 } else { id })
+        .sum::<i64>();
+
+    let (rows, checked) = rows_and_checks(&conn, "SELECT sum(v) FROM t");
+    assert_eq!(rows, vec![expected_sum]);
+    assert!(
+        checked <= 2,
+        "the scan looked up {checked} B-tree rows one by one"
+    );
+    assert_eq!(
+        rows_and_checks(&conn, "SELECT count(*) FROM t WHERE id BETWEEN 101 AND 200").0,
+        vec![90]
+    );
+
+    let other = db.connect();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other.execute("UPDATE t SET v = 0 WHERE id = 7").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        rows_and_checks(&conn, "SELECT sum(v) FROM t").0,
+        vec![expected_sum]
+    );
+    conn.execute("UPDATE t SET v = v + 1 WHERE id <> 7")
+        .unwrap();
+    assert_eq!(
+        rows_and_checks(&conn, "SELECT sum(v) FROM t").0,
+        vec![expected_sum + 899]
+    );
+    conn.execute("COMMIT").unwrap();
+    other.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        rows_and_checks(&conn, "SELECT count(*) FROM t WHERE v = id + 1").0,
+        vec![799]
+    );
+}
+
+#[test]
 fn reads_among_rows_changed_since_the_checkpoint_check_only_the_b_tree_rows_they_reach() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();

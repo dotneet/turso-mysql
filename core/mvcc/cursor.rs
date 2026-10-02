@@ -531,6 +531,102 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     }
 }
 
+pub(crate) struct TableShadowScan<A: ConcurrentAllocator = TursoAllocator> {
+    state: TableShadowScanState<A>,
+    epoch: u64,
+    last_checked: Option<i64>,
+}
+
+impl<A: ConcurrentAllocator> Default for TableShadowScan<A> {
+    fn default() -> Self {
+        Self {
+            state: TableShadowScanState::default(),
+            epoch: 0,
+            last_checked: None,
+        }
+    }
+}
+
+#[derive(Default)]
+enum TableShadowScanState<A: ConcurrentAllocator = TursoAllocator> {
+    #[default]
+    Uninitialized,
+    Peeked {
+        iter: MvccIterator<'static, RowID, A>,
+        row_id: i64,
+        versions: RowVersions<A>,
+    },
+    Exhausted,
+}
+
+impl<A: ConcurrentAllocator> TableShadowScan<A> {
+    fn reset(&mut self) {
+        self.state = TableShadowScanState::Uninitialized;
+        self.last_checked = None;
+    }
+
+    pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
+        &mut self,
+        db: &MvStore<Clock, A>,
+        table_id: MVTableId,
+        tx_id: u64,
+        row_id: i64,
+    ) -> bool {
+        let epoch = db.table_rows_epoch();
+        if self.epoch != epoch || self.last_checked.is_some_and(|last| row_id < last) {
+            self.reset();
+            self.epoch = epoch;
+        }
+        self.last_checked = Some(row_id);
+        if matches!(self.state, TableShadowScanState::Uninitialized) {
+            let iter = {
+                let start = RowID::new(table_id, RowKey::Int(row_id));
+                let iter_box: Box<dyn Iterator<Item = MvccEntry<'_, RowID, A>> + Send + Sync> =
+                    Box::new(db.rows.range((Bound::Included(start), Bound::Unbounded)));
+                static_iterator_hack!(iter_box, RowID, A)
+            };
+            self.state = Self::advance(iter, table_id);
+        }
+        loop {
+            match &self.state {
+                TableShadowScanState::Exhausted => return true,
+                TableShadowScanState::Uninitialized => unreachable!("created just above"),
+                TableShadowScanState::Peeked {
+                    row_id: scan_row_id,
+                    versions,
+                    ..
+                } => match scan_row_id.cmp(&row_id) {
+                    std::cmp::Ordering::Greater => return true,
+                    std::cmp::Ordering::Equal => {
+                        return db.btree_row_is_shown(tx_id, table_id, versions);
+                    }
+                    std::cmp::Ordering::Less => {}
+                },
+            }
+            let TableShadowScanState::Peeked { iter, .. } =
+                std::mem::replace(&mut self.state, TableShadowScanState::Uninitialized)
+            else {
+                unreachable!("Less arm matched Peeked")
+            };
+            self.state = Self::advance(iter, table_id);
+        }
+    }
+
+    fn advance(
+        mut iter: MvccIterator<'static, RowID, A>,
+        table_id: MVTableId,
+    ) -> TableShadowScanState<A> {
+        match iter.next() {
+            Some(entry) if entry.key().table_id == table_id => TableShadowScanState::Peeked {
+                row_id: entry.key().row_id.to_int_or_panic(),
+                versions: entry.value().clone(),
+                iter,
+            },
+            _ => TableShadowScanState::Exhausted,
+        }
+    }
+}
+
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
     pub db: Arc<MvStore<Clock, A>>,
     /// Weak so a cursor retained past its statement (an index-method cursor
@@ -563,6 +659,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
+    table_shadow_scan: TableShadowScan<A>,
     row_locks: Option<CursorRowLocks>,
     scan: scan_locks::ScanLocks,
 }
@@ -654,6 +751,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
+            table_shadow_scan: TableShadowScan::default(),
             row_locks: None,
             scan: scan_locks::ScanLocks::default(),
         })
@@ -686,8 +784,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
     /// cursors, the authoritative per-row lookup for table cursors.
     fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> bool {
-        let RowKey::Record(rec) = key else {
-            return self.query_btree_version_is_valid(key);
+        let rec = match key {
+            RowKey::Int(row_id) => return self.table_row_is_valid_forward(*row_id),
+            RowKey::Record(rec) => rec,
         };
         let valid =
             self.index_shadow_scan
@@ -703,6 +802,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.tx_id
             ),
             "index shadow scan diverged from query_btree_version_is_valid"
+        );
+        valid
+    }
+
+    fn table_row_is_valid_forward(&mut self, row_id: i64) -> bool {
+        let valid =
+            self.table_shadow_scan
+                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, row_id);
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            valid,
+            self.db
+                .query_btree_version_is_valid(self.table_id, &RowKey::Int(row_id), self.tx_id),
+            "table shadow scan diverged from query_btree_version_is_valid"
         );
         valid
     }
@@ -1207,6 +1320,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
         self.index_shadow_scan.reset();
+        self.table_shadow_scan.reset();
     }
 
     /// Seek btree cursor and set btree_peek to the result.

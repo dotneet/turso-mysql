@@ -4485,6 +4485,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a key inserted at or behind an already-positioned scan would otherwise
     /// be skipped (#7578).
     index_rows_epoch: AtomicU64,
+    table_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
@@ -4723,6 +4724,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
+            table_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
@@ -5023,6 +5025,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Drop empty buckets left by checkpoint GC: their table_ids reference
         // pre-VACUUM root pages and can alias new objects after root-page
         // reuse, corrupting `index_rows` lookups and SkipMap ordering.
+        self.bump_table_rows_epoch();
         self.rows.clear();
         self.index_rows.clear();
         let root_pages = schema
@@ -6368,7 +6371,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    fn btree_row_is_shown(
+    pub(crate) fn btree_row_is_shown(
         &self,
         tx_id: TxID,
         table_id: MVTableId,
@@ -8777,6 +8780,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     drop_current_if_in_btree,
                 );
                 if !passive && versions.is_empty() {
+                    self.bump_table_rows_epoch();
                     entry.remove();
                 }
             }
@@ -8964,6 +8968,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             );
             Self::collect_referenced_txids(&versions, referenced_tx_ids);
             if remove_empty_slots && versions.is_empty() {
+                self.bump_table_rows_epoch();
                 entry.remove();
             }
         }
@@ -9274,6 +9279,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<RowVersions<A>, TryReserveError> {
         let alloc = self.alloc.clone();
         let versions = self.rows.try_get_or_insert_with(id, move || {
+            self.bump_table_rows_epoch();
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
                 RowVersion,
                 A,
@@ -9325,6 +9331,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             drop(versions);
             return Ok((canonical_key, row_versions));
         }
+    }
+
+    pub(crate) fn table_rows_epoch(&self) -> u64 {
+        self.table_rows_epoch.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn bump_table_rows_epoch(&self) {
+        self.table_rows_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Current epoch of `index_rows` key-set mutations; see the field docs.
