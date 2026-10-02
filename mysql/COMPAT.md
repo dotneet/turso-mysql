@@ -5022,6 +5022,33 @@ change and its place in the WAL from the transaction's first write, both on
 the snapshot the transaction writes from, so `ROLLBACK TO` it undoes the
 transaction's writes and none of what other sessions committed meanwhile.
 
+With `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` writers do not wait for one another,
+and the levels are kept by moving a transaction's snapshot to the latest
+commit before a statement, which keeps every row the transaction wrote.
+`READ COMMITTED` moves it before every statement, also after the transaction
+wrote: measured on 8.4.11, such a transaction reads the rows other sessions
+update, insert and delete beside its own, and so it does there. `REPEATABLE
+READ` moves it until the transaction's first plain `SELECT` of a table and
+holds it from then on, which is where InnoDB takes the read view: measured on
+8.4.11, a write, a `SELECT ... FOR UPDATE` or `FOR SHARE`, `SELECT 1`, a
+`SAVEPOINT` or a prepare before it leaves the transaction reading what other
+sessions commit, while `WITH CONSISTENT SNAPSHOT` takes the view at once. A
+write to a row nobody else changed goes ahead, and the transaction goes on
+reading the other rows as its snapshot found them, as MySQL does; a write to a
+row another session changed after the snapshot is still given up with 1213. A
+transaction that wrote and then meets another session's table definition change
+is given up with 1213 at its next statement, its rows having been written for
+the tables as they were; MySQL makes the definition change wait for it
+instead. `SERIALIZABLE` runs as one exclusive transaction there: it reads from
+its first statement and takes the database's one exclusive write slot at its
+first write, so the two transactions above still end with one committed and
+the other answered 1213. It is also given up with 1213 at its first write when
+any other session committed since its first read, even to rows it never read —
+measured on 8.4.11 that write goes ahead, InnoDB's shared locks only keeping
+others off the rows read — and while it holds the slot a `BEGIN CONCURRENT`
+writer in another session is answered 1213 at commit where MySQL lets it
+commit, or waits, if it touched those rows.
+
 A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
 with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and
 the binary flag, and `SHOW CREATE TABLE` prints `date`. `CURDATE()` and

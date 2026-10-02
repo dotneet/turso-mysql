@@ -23,6 +23,23 @@
 //! the engine's stale-snapshot error instead, which the server answers the way
 //! MySQL answers a transaction it cannot finish: 1213, with the transaction
 //! rolled back.
+//!
+//! In MVCC mode (`TURSO_MYSQL_EXPERIMENTAL_MVCC`) writers do not wait for one
+//! another, so the levels are kept by moving the transaction's snapshot to
+//! the latest commit before a statement, which keeps the rows the transaction
+//! wrote:
+//!
+//! - `READ COMMITTED` moves it before every statement, written or not.
+//! - `REPEATABLE READ` moves it before every statement until the first plain
+//!   `SELECT` of a table, and holds it from then on. Measured on MySQL
+//!   8.4.11, that `SELECT` is where InnoDB takes the read view: writes,
+//!   locking reads, savepoints and prepares before it do not take it. `WITH
+//!   CONSISTENT SNAPSHOT` holds the snapshot `BEGIN` took.
+//! - `SERIALIZABLE` begins with the engine's plain `BEGIN` instead of `BEGIN
+//!   CONCURRENT`, and its snapshot is never moved: it reads from its first
+//!   statement and takes the database's one exclusive write slot at its first
+//!   write, which is refused with 1213 once another transaction has
+//!   committed since it began reading.
 
 use super::*;
 
@@ -36,7 +53,8 @@ pub enum MySqlIsolationLevel {
     /// MySQL's default level.
     #[default]
     RepeatableRead,
-    /// Run as `REPEATABLE READ` is; see the module's notes.
+    /// Run as `REPEATABLE READ` is, or in MVCC mode as an exclusive
+    /// transaction; see the module's notes.
     Serializable,
 }
 
@@ -76,6 +94,10 @@ pub(super) struct TransactionIsolation {
     next: MySqlIsolationLevel,
     /// Whether the statement running now began a transaction.
     began_transaction: bool,
+    /// Whether the transaction has made its first consistent read, the
+    /// plain `SELECT` of a table where MySQL fixes what a `REPEATABLE READ`
+    /// transaction reads from then on.
+    read_view_taken: bool,
 }
 
 /// What a transaction command left for the client to be told.
@@ -96,7 +118,11 @@ impl MySqlConnection {
     /// `written_zero` what a 0 written into a counted column means under the
     /// session's `sql_mode`. Inside a `READ COMMITTED` transaction the
     /// snapshot the last statement read from is let go, so this one reads what
-    /// is committed now.
+    /// is committed now. In MVCC mode the snapshot is moved to now instead,
+    /// for `READ COMMITTED` and for a `REPEATABLE READ` transaction that has
+    /// not made its first consistent read; a transaction that wrote before
+    /// another session changed the schema is rolled back with 1213 there,
+    /// since its writes could no longer commit.
     pub fn prepare_for_client_statement(
         &self,
         next: MySqlIsolationLevel,
@@ -105,23 +131,50 @@ impl MySqlConnection {
     ) -> std::result::Result<(), MySqlQueryError> {
         *self.written_zero.lock().unwrap() = written_zero;
         *self.session_read_only.lock().unwrap() = session_read_only;
-        let current = {
+        let (current, read_view_taken) = {
             let mut isolation = self.transaction_isolation.lock().unwrap();
             isolation.next = next;
             isolation.began_transaction = false;
-            isolation.current
+            (isolation.current, isolation.read_view_taken)
         };
-        // MVCC keeps one snapshot for the whole transaction, so READ
-        // COMMITTED runs as REPEATABLE READ there for now.
-        if current == MySqlIsolationLevel::ReadCommitted
-            && !self.inner.get_auto_commit()
-            && !self.inner.mvcc_enabled()
-        {
-            self.inner
-                .release_read_snapshot()
-                .map_err(MySqlQueryError::Engine)?;
+        if self.inner.get_auto_commit() {
+            return Ok(());
         }
-        Ok(())
+        if !self.inner.mvcc_enabled() {
+            if current == MySqlIsolationLevel::ReadCommitted {
+                self.inner
+                    .release_read_snapshot()
+                    .map_err(MySqlQueryError::Engine)?;
+            }
+            return Ok(());
+        }
+        let reads_afresh = match current {
+            MySqlIsolationLevel::ReadCommitted => true,
+            MySqlIsolationLevel::RepeatableRead => !read_view_taken,
+            MySqlIsolationLevel::Serializable => false,
+        };
+        if !reads_afresh {
+            return Ok(());
+        }
+        match self.inner.refresh_read_snapshot() {
+            Err(LimboError::SchemaConflict) => {
+                self.roll_back_after_serialization_failure()?;
+                Err(MySqlQueryError::Engine(LimboError::SchemaConflict))
+            }
+            refreshed => refreshed.map_err(MySqlQueryError::Engine),
+        }
+    }
+
+    /// Records that the statement running now is a consistent read of a
+    /// table: a plain `SELECT`, not one that locks the rows it reads.
+    ///
+    /// Measured on MySQL 8.4.11: a `REPEATABLE READ` transaction takes its
+    /// read view at its first such read. A write, a `SELECT ... FOR UPDATE`
+    /// or `FOR SHARE`, a `SAVEPOINT`, a `SELECT` of no table and a prepare
+    /// before it all leave the transaction reading what other sessions
+    /// commit.
+    pub(super) fn note_consistent_read(&self) {
+        self.transaction_isolation.lock().unwrap().read_view_taken = true;
     }
 
     /// Runs `prepare`, a `COM_STMT_PREPARE`, so that a transaction that had
@@ -213,6 +266,7 @@ impl MySqlConnection {
         let mut isolation = self.transaction_isolation.lock().unwrap();
         isolation.current = isolation.next;
         isolation.began_transaction = true;
+        isolation.read_view_taken = false;
     }
 
     /// Takes the read snapshot of a transaction just begun, for `WITH
@@ -225,8 +279,8 @@ impl MySqlConnection {
                 consistent_snapshot_ignored: true,
             });
         }
-        // `BEGIN CONCURRENT` took the snapshot already.
         if self.inner.mvcc_enabled() {
+            self.note_consistent_read();
             return Ok(MySqlTransactionOutcome::default());
         }
         self.inner

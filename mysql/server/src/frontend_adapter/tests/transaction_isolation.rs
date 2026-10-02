@@ -69,6 +69,9 @@ fn level_of(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>)
     String::from_utf8(result.rows[0][0].clone().unwrap()).unwrap()
 }
 
+/// In MVCC mode the write goes ahead, as it does on MySQL 8.4.11, since no
+/// other session wrote row 1, and the transaction goes on reading row 2 as
+/// its first read found it.
 #[test]
 fn repeatable_read_keeps_its_snapshot_and_gives_up_a_stale_write_with_1213() {
     let TwoSessions {
@@ -82,6 +85,15 @@ fn repeatable_read_keeps_its_snapshot_and_gives_up_a_stale_write_with_1213() {
     assert_eq!(n_of(&mut one, 1), "0");
     run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
     assert_eq!(n_of(&mut one, 2), "0");
+    if turso_mysql::experimental_mvcc_is_on() {
+        run(&mut one, "UPDATE c SET n = 7 WHERE id = 1");
+        assert_eq!(n_of(&mut one, 2), "0");
+        assert_eq!(n_of(&mut two, 1), "0");
+        run(&mut one, "COMMIT");
+        assert_eq!(n_of(&mut two, 1), "7");
+        assert_eq!(n_of(&mut one, 2), "5");
+        return;
+    }
 
     // MySQL writes here and goes on reading row 2 as 0, which a snapshot of
     // the whole database cannot do, so the transaction is given up instead.
@@ -100,7 +112,8 @@ fn repeatable_read_keeps_its_snapshot_and_gives_up_a_stale_write_with_1213() {
 /// after another session committed a row into a second table, and goes on
 /// reading the second table as its first read found it (no rows). Here the
 /// write goes ahead too, because nothing the transaction read changed; it
-/// then reads the row, as a transaction begun after that commit would.
+/// then reads the row, as a transaction begun after that commit would. In
+/// MVCC mode it reads no rows, as on MySQL.
 #[test]
 fn repeatable_read_writes_after_another_session_committed_to_a_table_it_did_not_read() {
     let TwoSessions {
@@ -118,7 +131,12 @@ fn repeatable_read_writes_after_another_session_committed_to_a_table_it_did_not_
     else {
         panic!("the count must read back");
     };
-    assert_eq!(result.rows[0][0].as_deref(), Some(&b"1"[..]));
+    let counted: &[u8] = if turso_mysql::experimental_mvcc_is_on() {
+        b"0"
+    } else {
+        b"1"
+    };
+    assert_eq!(result.rows[0][0].as_deref(), Some(counted));
     run(&mut one, "COMMIT");
     assert_eq!(n_of(&mut two, 1), "7");
 }
@@ -132,10 +150,10 @@ fn a_transaction_given_up_with_1213_takes_its_savepoints_with_it() {
     } = two_sessions();
     run(&mut one, "START TRANSACTION");
     run(&mut one, "SAVEPOINT before_reading");
-    assert_eq!(n_of(&mut one, 1), "0");
+    assert_eq!(n_of(&mut one, 2), "0");
     run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
     assert_eq!(
-        one.execute_query("UPDATE c SET n = 7 WHERE id = 1"),
+        one.execute_query("UPDATE c SET n = 7 WHERE id = 2"),
         Err(FrontendErrorKind::SerializationFailure)
     );
     // The whole transaction is rolled back, the way MySQL rolls back one it
@@ -446,4 +464,191 @@ fn a_transaction_reads_after_another_session_created_a_table() {
     run(&mut one, "START TRANSACTION");
     assert_eq!(n_of(&mut one, 1), "0");
     run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11: `SELECT 1` reads no table, so the transaction
+/// takes its read view at the `SELECT` of a table after it.
+#[test]
+fn a_select_of_no_table_takes_no_snapshot() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "SELECT 1");
+    run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "5");
+    run(&mut two, "UPDATE c SET n = 6 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "5");
+    run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11: a write before the first `SELECT` takes no read
+/// view, so the transaction reads what another session committed after the
+/// write, and holds what that first `SELECT` read from then on. Only MVCC
+/// lets the other session write meanwhile.
+#[test]
+fn repeatable_read_takes_its_snapshot_at_the_first_select_and_not_at_a_write() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
+    run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
+    assert_eq!(rows_of(&mut one), ["1 1", "2 5"]);
+    run(&mut two, "UPDATE c SET n = 6 WHERE id = 2");
+    assert_eq!(rows_of(&mut one), ["1 1", "2 5"]);
+    run(&mut one, "COMMIT");
+    assert_eq!(rows_of(&mut two), ["1 1", "2 6"]);
+}
+
+/// Measured on MySQL 8.4.11: `SELECT ... FOR UPDATE` and `FOR SHARE` read
+/// the latest rows and take no read view, so the transaction's first plain
+/// `SELECT` after them reads what another session committed meanwhile.
+#[test]
+fn a_locking_read_takes_no_snapshot() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "SELECT n FROM c WHERE id = 1 FOR UPDATE");
+    run(&mut two, "UPDATE c SET n = 8 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "8");
+    run(&mut two, "UPDATE c SET n = 9 WHERE id = 2");
+    assert_eq!(n_of(&mut one, 2), "8");
+    run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11: a `READ COMMITTED` transaction that wrote still
+/// reads every row other sessions commit, insert and delete, along with its
+/// own.
+#[test]
+fn read_committed_reads_other_sessions_commits_after_it_wrote() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(
+        &mut one,
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    );
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
+    run(&mut two, "UPDATE c SET n = 9 WHERE id = 2");
+    assert_eq!(rows_of(&mut one), ["1 1", "2 9"]);
+    run(&mut two, "INSERT INTO c (id, n) VALUES (3, 3)");
+    assert_eq!(rows_of(&mut one), ["1 1", "2 9", "3 3"]);
+    run(&mut two, "DELETE FROM c WHERE id = 3");
+    assert_eq!(rows_of(&mut one), ["1 1", "2 9"]);
+    assert_eq!(rows_of(&mut two), ["1 0", "2 9"]);
+    run(&mut one, "COMMIT");
+    assert_eq!(rows_of(&mut two), ["1 1", "2 9"]);
+}
+
+/// A `READ COMMITTED` transaction that wrote cannot read past another
+/// session's table definition change: its rows were written for the tables
+/// as they were, and could no longer commit. It is rolled back with 1213.
+/// MySQL instead makes the other session's DDL wait for the transaction.
+#[test]
+fn read_committed_gives_up_a_transaction_that_wrote_before_another_sessions_ddl() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(
+        &mut one,
+        "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    );
+    run(&mut one, "START TRANSACTION");
+    run(&mut one, "UPDATE c SET n = 1 WHERE id = 1");
+    run(&mut two, "CREATE TABLE d (id INT NOT NULL PRIMARY KEY)");
+    assert_eq!(
+        one.execute_query("SELECT COUNT(*) FROM d"),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+    assert_eq!(rows_of(&mut one), ["1 0", "2 0"]);
+
+    run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
+    run(&mut two, "CREATE TABLE e (id INT NOT NULL PRIMARY KEY)");
+    run(&mut two, "INSERT INTO e (id) VALUES (4)");
+    let Ok(CommandExecutionResult::ResultSet(read)) = one.execute_query("SELECT id FROM e") else {
+        panic!("a transaction that has not written reads the new table");
+    };
+    assert_eq!(read.rows, [[Some(b"4".to_vec())]]);
+    run(&mut one, "COMMIT");
+}
+
+/// A `SERIALIZABLE` transaction runs as the engine's exclusive transaction
+/// in MVCC mode, so it is given up with 1213 at its first write once any
+/// other session committed after its first read, even a row it never read.
+/// Measured on MySQL 8.4.11, the write goes ahead there: InnoDB's locks only
+/// keep other sessions off the rows it read.
+#[test]
+fn serializable_gives_up_a_write_after_any_other_commit_since_its_first_read() {
+    if !turso_mysql::experimental_mvcc_is_on() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(&mut two, "INSERT INTO c (id, n) VALUES (3, 0)");
+    run(
+        &mut one,
+        "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    run(&mut one, "START TRANSACTION");
+    run(&mut two, "UPDATE c SET n = 6 WHERE id = 3");
+    assert_eq!(n_of(&mut one, 1), "0");
+    assert_eq!(n_of(&mut one, 3), "6");
+    run(&mut two, "UPDATE c SET n = 7 WHERE id = 3");
+    assert_eq!(
+        one.execute_query("UPDATE c SET n = 6 WHERE id = 1"),
+        Err(FrontendErrorKind::SerializationFailure)
+    );
+    assert_eq!(one.status_flags() & SERVER_STATUS_IN_TRANS, 0);
+
+    run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
+    run(&mut one, "UPDATE c SET n = 6 WHERE id = 1");
+    run(&mut one, "COMMIT");
+    assert_eq!(n_of(&mut two, 1), "6");
+}
+
+fn rows_of(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) -> Vec<String> {
+    let Ok(CommandExecutionResult::ResultSet(result)) =
+        adapter.execute_query("SELECT id, n FROM c ORDER BY id")
+    else {
+        panic!("the rows must read back");
+    };
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            let text = |cell: &Option<Vec<u8>>| String::from_utf8(cell.clone().unwrap()).unwrap();
+            format!("{} {}", text(&row[0]), text(&row[1]))
+        })
+        .collect()
 }

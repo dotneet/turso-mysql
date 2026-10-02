@@ -34,6 +34,7 @@ pub use database_catalog::{
     canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
     MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
 };
+pub use database_open::experimental_mvcc_is_on;
 pub use database_users::{
     MySqlDatabaseDropped, MySqlStatementNotStarted, DEFAULT_METADATA_LOCK_WAIT,
 };

@@ -1145,6 +1145,10 @@ struct PreparedStatement {
 enum PreparedExecutionPlan {
     Select {
         reads_table: bool,
+        /// Whether the statement locks the rows it reads, as `FOR UPDATE`
+        /// does, which MySQL does not count as the transaction's first
+        /// consistent read.
+        locks_rows: bool,
         /// Every table the statement reads, which is what says where a
         /// comparison's qualified column comes from.
         source_tables: Vec<MySqlSelectSource>,
@@ -2001,6 +2005,7 @@ impl MySqlConnection {
                 self.validate_session_timestamp_select(&translated, &statement)
                     .map_err(MySqlPreparedStatementError::Prepare)?;
                 let reads_table = translated.reads_table();
+                let locks_rows = translated.locks_rows();
                 let row_count_parameters = translated.row_count_parameters().to_vec();
                 let source_tables = translated.source_tables().to_vec();
                 let checked_comparisons = translated.checked_comparisons().to_vec();
@@ -2024,6 +2029,7 @@ impl MySqlConnection {
                     Some(statement),
                     PreparedExecutionPlan::Select {
                         reads_table,
+                        locks_rows,
                         source_tables,
                         checked_comparisons,
                         row_count_parameters,
@@ -3506,9 +3512,16 @@ impl MySqlConnection {
         let values = self.core_values_for(&prepared.execution_plan, values)?;
 
         match &prepared.execution_plan {
-            PreparedExecutionPlan::Select { reads_table, .. } => {
+            PreparedExecutionPlan::Select {
+                reads_table,
+                locks_rows,
+                ..
+            } => {
                 if *reads_table {
                     self.begin_implicit_transaction_for_table_read()?;
+                    if !*locks_rows {
+                        self.note_consistent_read();
+                    }
                 }
                 let statement = prepared.statement.as_mut().ok_or_else(|| {
                     LimboError::InternalError(
@@ -4305,28 +4318,39 @@ impl MySqlConnection {
     ///
     /// In MVCC mode a plain `BEGIN` writes under the database's one exclusive
     /// write slot, so writers would still run one at a time; `BEGIN
-    /// CONCURRENT` lets them run side by side.
+    /// CONCURRENT` lets them run side by side. A `SERIALIZABLE` transaction
+    /// takes the plain `BEGIN` on purpose: it reads from the moment of its
+    /// first statement and takes the exclusive slot at its first write, which
+    /// it is refused once another transaction has committed since it began
+    /// reading. So nothing it read can have changed by the time it writes,
+    /// and two transactions that each write what the other read cannot both
+    /// commit.
     fn engine_begin(&self) -> Stmt {
         Stmt::Begin {
             typ: self
-                .inner
-                .mvcc_enabled()
+                .begins_concurrently()
                 .then_some(turso_parser::ast::TransactionType::Concurrent),
             name: None,
         }
     }
 
     fn engine_begin_sql(&self) -> &'static str {
-        if self.inner.mvcc_enabled() {
+        if self.begins_concurrently() {
             "BEGIN CONCURRENT"
         } else {
             "BEGIN"
         }
     }
 
+    fn begins_concurrently(&self) -> bool {
+        self.inner.mvcc_enabled()
+            && self.transaction_isolation() != MySqlIsolationLevel::Serializable
+    }
+
     /// Runs a write that autocommit makes a transaction of its own inside
     /// `BEGIN CONCURRENT` in MVCC mode, where the engine would otherwise run
-    /// it under the one exclusive write slot.
+    /// it under the one exclusive write slot. A `SERIALIZABLE` one is left to
+    /// that slot, as a `SERIALIZABLE` transaction is.
     fn in_a_concurrent_statement_transaction<T, E>(
         &self,
         run: impl FnOnce() -> std::result::Result<T, E>,
@@ -4337,6 +4361,9 @@ impl MySqlConnection {
             return run();
         }
         self.begin_transaction_isolation();
+        if !self.begins_concurrently() {
+            return run();
+        }
         // The statement is a transaction of its own, so a read-only flag an
         // earlier `START TRANSACTION READ ONLY` left does not hold for it.
         *self.read_only_transaction.lock().unwrap() = self.session_read_only();
@@ -7202,6 +7229,9 @@ impl MySqlConnection {
         .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         if translated.reads_table() {
             self.begin_implicit_transaction_for_table_read()?;
+            if !translated.locks_rows() {
+                self.note_consistent_read();
+            }
         }
         if translated.locks_rows() {
             self.take_the_write_lock(translated.source_tables())?;
