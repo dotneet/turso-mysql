@@ -19732,6 +19732,7 @@ pub enum OpJournalModeSubState {
     UpdateHeader,
     /// Write page 1 to disk
     WritePage,
+    SyncHeader,
     /// Finalize - clear cache and setup new mode
     Finalize,
     /// Bootstrap the MV store after switching to MVCC mode
@@ -20042,6 +20043,12 @@ fn op_journal_mode_inner(
                     .as_ref()
                     .expect("page_ref should be set");
                 let completion = begin_write_btree_page(pager, page, None)?;
+                state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::SyncHeader;
+                return Ok(state.suspend_on_io(IOCompletions(completion)));
+            }
+
+            OpJournalModeSubState::SyncHeader => {
+                let completion = pager.sync_database_file()?;
                 state.active_op_state.journal_mode().sub_state = OpJournalModeSubState::Finalize;
                 return Ok(state.suspend_on_io(IOCompletions(completion)));
             }

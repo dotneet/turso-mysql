@@ -2103,6 +2103,14 @@ impl Pager {
         }
     }
 
+    pub(crate) fn sync_database_file(&self) -> Result<Completion> {
+        sqlite3_ondisk::begin_sync(
+            self.db_file.as_ref(),
+            self.syncing.clone(),
+            self.get_sync_type(),
+        )
+    }
+
     /// Get the sync type setting.
     /// On non-Apple platforms, always returns Fsync (compile-time constant).
     #[cfg(target_vendor = "apple")]

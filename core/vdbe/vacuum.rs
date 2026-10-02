@@ -3158,6 +3158,37 @@ mod tests {
     }
 
     #[test]
+    fn switching_the_journal_mode_syncs_the_header_it_wrote() -> Result<()> {
+        let io = Arc::new(SyncCountingIo::new("journal-mode-switch.db"));
+        let io_dyn: Arc<dyn IO> = io.clone();
+        let db = Database::open_file_with_flags(
+            io_dyn,
+            "journal-mode-switch.db",
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect()?;
+        conn.set_sync_mode(crate::SyncMode::Off);
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let before = io.counts();
+        conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        let after = io.counts();
+        assert_eq!(
+            after.db - before.db,
+            1,
+            "the header naming the new journal mode must be durable before the mode is used, \
+             even with synchronous=OFF"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn in_place_vacuum_with_sync_full_adds_pre_publish_wal_sync() -> Result<()> {
         let io = Arc::new(SyncCountingIo::new("vacuum-source-full.db"));
         let io_dyn: Arc<dyn IO> = io.clone();
