@@ -6113,8 +6113,18 @@ child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
 `SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
-counted from one in declaration order, with its `ON DELETE` and `ON UPDATE`
-where they were written. The earlier slice refused a named constraint —
+counted from one in declaration order over the keys written without a name,
+with its `ON DELETE` and `ON UPDATE` where they were written. Measured on 8.4.11
+and matched: `CONSTRAINT zz ..., CONSTRAINT B_fk ..., CONSTRAINT a_fk ...,
+FOREIGN KEY (e) ...` names the last `c_ibfk_1`, a key `ALTER TABLE` adds without
+a name takes the next number, and the constraints are printed by name without
+regard to case, `a_fk`, `B_fk`, `c_ibfk_1`, `zz`, as
+`information_schema.TABLE_CONSTRAINTS`, `KEY_COLUMN_USAGE` and
+`REFERENTIAL_CONSTRAINTS` list them, each table's primary and unique keys first,
+then its foreign keys, then its checks. MySQL numbers a key `ALTER TABLE` adds
+past the highest `t_ibfk_<n>` the table has, where this counts the keys written
+without a name, which differs only where a key was given such a name
+explicitly. The earlier slice refused a named constraint —
 `CONSTRAINT fk_parent FOREIGN KEY ...` — because the engine dropped the name.
 The current frontend preserves the name. MySQL's InnoDB creates an index on
 the child column and prints it — measured, `` KEY `a` (`a`) `` — and the

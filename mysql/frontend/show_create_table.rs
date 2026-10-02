@@ -6,6 +6,8 @@
 //! spaces of indent, `,\n` between items, no trailing newline, lower-case type
 //! names, and DEFAULT literals in single quotes even when they are numbers.
 
+use std::sync::Arc;
+
 use turso_mysql_parser::{MySqlTableCollation, MySqlTableOptions};
 
 use crate::session::{MySqlColumnDefault, MySqlColumnMetadata, MySqlIndexEntry};
@@ -30,11 +32,9 @@ pub fn render_create_table(
         items.push(render_column(column, options.collation)?);
     }
     items.extend(render_keys(indexes));
-    items.extend(
-        foreign_keys
-            .iter()
-            .map(|key| render_foreign_key(table, key)),
-    );
+    let mut foreign_keys = foreign_keys.iter().collect::<Vec<_>>();
+    foreign_keys.sort_by_key(|key| key.name.to_ascii_lowercase());
+    items.extend(foreign_keys.into_iter().map(render_foreign_key));
     let body = items
         .iter()
         .map(|item| format!("  {item}"))
@@ -67,11 +67,7 @@ pub fn render_create_table(
 /// One foreign key of a table, as the schema holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlForeignKey {
-    /// The name a `CONSTRAINT` clause gave it, or `None` where it was written
-    /// without one and MySQL's own naming applies.
-    pub name: Option<String>,
-    /// Where this key sits among the table's, counted from zero.
-    pub declaration_order: usize,
+    pub name: String,
     pub child_columns: Vec<String>,
     pub parent_table: String,
     pub parent_columns: Vec<String>,
@@ -82,22 +78,38 @@ pub struct MySqlForeignKey {
 }
 
 impl MySqlForeignKey {
-    pub fn name_in(&self, table: &str) -> String {
-        match &self.name {
-            Some(name) => name.clone(),
-            None => format!("{table}_ibfk_{}", self.declaration_order + 1),
-        }
-    }
-
-    pub fn of(key: &turso_core::schema::ForeignKey) -> Self {
+    pub fn of(
+        table: &str,
+        key: &turso_core::schema::ForeignKey,
+        keys_of_the_table: &[Arc<turso_core::schema::ForeignKey>],
+    ) -> Self {
         Self {
-            name: key.name.clone(),
-            declaration_order: key.decl_order,
+            name: foreign_key_name(table, key, keys_of_the_table),
             child_columns: key.child_columns.to_vec(),
             parent_table: key.parent_table.clone(),
             parent_columns: key.parent_columns.to_vec(),
             on_delete: mysql_reference_action(key.on_delete),
             on_update: mysql_reference_action(key.on_update),
+        }
+    }
+}
+
+/// Measured on MySQL 8.4.11: a constraint written without a name is named
+/// `t_ibfk_1`, `t_ibfk_2`, ... in declaration order, counting only the ones
+/// written without a name.
+pub fn foreign_key_name(
+    table: &str,
+    key: &turso_core::schema::ForeignKey,
+    keys_of_the_table: &[Arc<turso_core::schema::ForeignKey>],
+) -> String {
+    match &key.name {
+        Some(name) => name.clone(),
+        None => {
+            let unnamed_before = keys_of_the_table
+                .iter()
+                .filter(|other| other.name.is_none() && other.decl_order < key.decl_order)
+                .count();
+            format!("{table}_ibfk_{}", unnamed_before + 1)
         }
     }
 }
@@ -120,6 +132,7 @@ fn mysql_reference_action(action: turso_parser::ast::RefAct) -> Option<String> {
 pub fn foreign_key_refusal_message(
     database: &str,
     refusal: &turso_core::ForeignKeyRefusal,
+    keys_of_the_child_table: &[Arc<turso_core::schema::ForeignKey>],
 ) -> String {
     let refused = match refusal.refused_row {
         turso_core::RefusedRow::ChildRowWithoutParent => "Cannot add or update a child row",
@@ -129,10 +142,11 @@ pub fn foreign_key_refusal_message(
         "{refused}: a foreign key constraint fails ({}.{}, {})",
         quoted(database),
         quoted(&refusal.child_table),
-        render_foreign_key(
+        render_foreign_key(&MySqlForeignKey::of(
             &refusal.child_table,
-            &MySqlForeignKey::of(&refusal.foreign_key)
-        ),
+            &refusal.foreign_key,
+            keys_of_the_child_table
+        )),
     )
 }
 
@@ -142,7 +156,7 @@ pub fn foreign_key_refusal_message(
 /// `` CONSTRAINT `t_ibfk_1` FOREIGN KEY (`a`, `b`) REFERENCES `p` (`x`, `y`) ``,
 /// numbered from one in declaration order, the columns parted by a comma and a
 /// space, and one written with a name is printed under the name it was given.
-fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
+fn render_foreign_key(key: &MySqlForeignKey) -> String {
     let columns = |names: &[String]| {
         names
             .iter()
@@ -150,10 +164,9 @@ fn render_foreign_key(table: &str, key: &MySqlForeignKey) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let name = key.name_in(table);
     let mut rendered = format!(
         "CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
-        quoted(&name),
+        quoted(&key.name),
         columns(&key.child_columns),
         quoted(&key.parent_table),
         columns(&key.parent_columns),

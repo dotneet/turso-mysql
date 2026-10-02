@@ -740,3 +740,98 @@ fn a_foreign_key_mysql_cannot_make_is_refused_with_mysqls_error() {
         FrontendErrorKind::DuplicateForeignKeyName
     );
 }
+
+fn constraints_printed(adapter: &mut Adapter, table: &str) -> Vec<String> {
+    rows(adapter, &format!("SHOW CREATE TABLE {table}"))[0][1]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("CONSTRAINT"))
+        .map(|line| line.trim_end_matches(',').to_owned())
+        .collect()
+}
+
+#[test]
+fn foreign_keys_written_without_a_name_are_counted_among_themselves() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT PRIMARY KEY)",
+        "CREATE TABLE c (id INT PRIMARY KEY, a INT, b INT, d INT, e INT, \
+         CONSTRAINT zz FOREIGN KEY (a) REFERENCES p (id), \
+         CONSTRAINT B_fk FOREIGN KEY (b) REFERENCES p (id), \
+         CONSTRAINT a_fk FOREIGN KEY (d) REFERENCES p (id), FOREIGN KEY (e) REFERENCES p (id))",
+    ] {
+        run(&mut adapter, sql);
+    }
+    assert_eq!(
+        constraints_printed(&mut adapter, "c"),
+        [
+            "CONSTRAINT `a_fk` FOREIGN KEY (`d`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `B_fk` FOREIGN KEY (`b`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `c_ibfk_1` FOREIGN KEY (`e`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `zz` FOREIGN KEY (`a`) REFERENCES `p` (`id`)",
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS \
+             WHERE TABLE_SCHEMA = 'd' AND TABLE_NAME = 'c'"
+        )
+        .concat(),
+        ["PRIMARY", "a_fk", "B_fk", "c_ibfk_1", "zz"]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = 'd' AND TABLE_NAME = 'c'"
+        )
+        .concat(),
+        ["PRIMARY", "a_fk", "B_fk", "c_ibfk_1", "zz"]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS \
+             WHERE CONSTRAINT_SCHEMA = 'd'"
+        )
+        .concat(),
+        ["a_fk", "B_fk", "c_ibfk_1", "zz"]
+    );
+    assert_eq!(
+        refused(&mut adapter, "INSERT INTO c (id, e) VALUES (1, 9)").1,
+        format!(
+            "{CHILD_ROW_WITHOUT_PARENT} (`d`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`e`) \
+             REFERENCES `p` (`id`))"
+        )
+    );
+    assert_eq!(
+        refused(
+            &mut adapter,
+            "CREATE TABLE v (id INT PRIMARY KEY, x INT, CONSTRAINT v_ibfk_1 FOREIGN KEY (x) \
+             REFERENCES p (id), FOREIGN KEY (x) REFERENCES p (id))"
+        ),
+        (
+            FrontendErrorKind::DuplicateForeignKeyName,
+            "Duplicate foreign key constraint name 'v_ibfk_1'".to_owned()
+        )
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE c ADD FOREIGN KEY (a) REFERENCES p (id)",
+    );
+    assert_eq!(
+        constraints_printed(&mut adapter, "c")[3],
+        "CONSTRAINT `c_ibfk_2` FOREIGN KEY (`a`) REFERENCES `p` (`id`)"
+    );
+    run(&mut adapter, "ALTER TABLE c DROP FOREIGN KEY c_ibfk_1");
+    assert_eq!(
+        constraints_printed(&mut adapter, "c"),
+        [
+            "CONSTRAINT `a_fk` FOREIGN KEY (`d`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `B_fk` FOREIGN KEY (`b`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `c_ibfk_2` FOREIGN KEY (`a`) REFERENCES `p` (`id`)",
+            "CONSTRAINT `zz` FOREIGN KEY (`a`) REFERENCES `p` (`id`)",
+        ]
+    );
+}

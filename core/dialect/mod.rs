@@ -188,11 +188,11 @@ pub trait Dialect: Send + Sync + 'static {
     }
 
     /// The name a foreign key declared without one answers to, which
-    /// `ALTER TABLE ... DROP CONSTRAINT` finds it by. `declaration_order`
-    /// counts the table's foreign keys from zero in the order they are
-    /// declared, those written on a column first. `None`, the default, leaves
-    /// such a key without a name.
-    fn unnamed_foreign_key_name(&self, _table: &str, _declaration_order: usize) -> Option<String> {
+    /// `ALTER TABLE ... DROP CONSTRAINT` finds it by. `unnamed_order` counts
+    /// the table's foreign keys declared without a name from zero in the order
+    /// they are declared, those written on a column first. `None`, the
+    /// default, leaves such a key without a name.
+    fn unnamed_foreign_key_name(&self, _table: &str, _unnamed_order: usize) -> Option<String> {
         None
     }
 

@@ -4325,6 +4325,24 @@ impl MySqlConnection {
         self.inner.take_foreign_key_refusals()
     }
 
+    pub fn foreign_key_refusal_message(
+        &self,
+        database: &str,
+        refusal: &turso_core::ForeignKeyRefusal,
+    ) -> String {
+        let keys_of_the_child_table = self
+            .inner
+            .current_schema()
+            .get_btree_table(&refusal.child_table)
+            .map(|table| table.foreign_keys.clone())
+            .unwrap_or_else(|| vec![refusal.foreign_key.clone()]);
+        crate::show_create_table::foreign_key_refusal_message(
+            database,
+            refusal,
+            &keys_of_the_child_table,
+        )
+    }
+
     pub fn take_explained_error(&self) -> Option<String> {
         self.explained_error.lock().unwrap().take()
     }
@@ -6349,9 +6367,12 @@ impl MySqlConnection {
         };
         if let Some(name) = &named.name {
             let taken = btree.foreign_keys.iter().any(|foreign_key| {
-                crate::show_create_table::MySqlForeignKey::of(foreign_key)
-                    .name_in(table.as_str())
-                    .eq_ignore_ascii_case(name.as_str())
+                crate::show_create_table::foreign_key_name(
+                    table.as_str(),
+                    foreign_key,
+                    &btree.foreign_keys,
+                )
+                .eq_ignore_ascii_case(name.as_str())
             });
             if taken {
                 return Err(self.foreign_key_definition_error(
@@ -7028,8 +7049,11 @@ impl MySqlConnection {
             .list_columns(table)
             .map_err(|_| MySqlQueryError::MissingTable)?;
         for foreign_key in &new_keys {
-            let constraint =
-                crate::show_create_table::MySqlForeignKey::of(foreign_key).name_in(table.as_str());
+            let constraint = crate::show_create_table::foreign_key_name(
+                table.as_str(),
+                foreign_key,
+                &btree.foreign_keys,
+            );
             let Some(parent) = schema.get_btree_table(&foreign_key.parent_table) else {
                 if self.inner.foreign_keys_enabled() {
                     return Err(self.foreign_key_definition_error(
@@ -7122,16 +7146,20 @@ impl MySqlConnection {
                 let is_new = name.eq_ignore_ascii_case(table.as_str())
                     && foreign_key.decl_order >= first_new;
                 if !is_new {
-                    taken.push(
-                        crate::show_create_table::MySqlForeignKey::of(foreign_key)
-                            .name_in(&other_btree.name),
-                    );
+                    taken.push(crate::show_create_table::foreign_key_name(
+                        &other_btree.name,
+                        foreign_key,
+                        &other_btree.foreign_keys,
+                    ));
                 }
             }
         }
         for foreign_key in &new_keys {
-            let name =
-                crate::show_create_table::MySqlForeignKey::of(foreign_key).name_in(table.as_str());
+            let name = crate::show_create_table::foreign_key_name(
+                table.as_str(),
+                foreign_key,
+                &btree.foreign_keys,
+            );
             if taken.iter().any(|other| other.eq_ignore_ascii_case(&name)) {
                 return Err(self.foreign_key_definition_error(
                     MySqlForeignKeyDefinitionError::DuplicateName { name },

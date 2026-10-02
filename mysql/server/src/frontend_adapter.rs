@@ -5795,7 +5795,7 @@ fn answer_the_foreign_key_refusals(
     let refusals = connection.take_foreign_key_refusals();
     match result {
         Ok(CommandExecutionResult::Ok(mut ok)) => {
-            warn_about_refused_rows(database, &refusals, raised);
+            warn_about_refused_rows(connection, database, &refusals, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(CommandExecutionResult::Ok(ok))
         }
@@ -5805,6 +5805,7 @@ fn answer_the_foreign_key_refusals(
                 return Err(kind);
             }
             Err(name_the_refusing_foreign_key(
+                connection,
                 database,
                 &refusals,
                 kind,
@@ -5825,11 +5826,12 @@ fn answer_the_foreign_key_refusals_of_a_prepared_statement(
     let refusals = connection.take_foreign_key_refusals();
     match result {
         Ok(PreparedStatementExecutionResult::Ok(mut ok)) => {
-            warn_about_refused_rows(database, &refusals, raised);
+            warn_about_refused_rows(connection, database, &refusals, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(PreparedStatementExecutionResult::Ok(ok))
         }
         Err(kind) => Err(name_the_refusing_foreign_key(
+            connection,
             database,
             &refusals,
             kind,
@@ -5840,18 +5842,21 @@ fn answer_the_foreign_key_refusals_of_a_prepared_statement(
 }
 
 fn warn_about_refused_rows(
+    connection: &MySqlConnection,
     database: &str,
     refusals: &[turso_core::ForeignKeyRefusal],
     raised: &mut Vec<MySqlWarning>,
 ) {
-    raised.extend(
-        refusals
-            .iter()
-            .map(|refusal| MySqlWarning::refused_by_a_foreign_key(database, refusal)),
-    );
+    raised.extend(refusals.iter().map(|refusal| {
+        MySqlWarning::refused_by_a_foreign_key(
+            refusal.refused_row,
+            connection.foreign_key_refusal_message(&database.to_ascii_lowercase(), refusal),
+        )
+    }));
 }
 
 fn name_the_refusing_foreign_key(
+    connection: &MySqlConnection,
     database: &str,
     refusals: &[turso_core::ForeignKeyRefusal],
     kind: FrontendErrorKind,
@@ -5863,11 +5868,9 @@ fn name_the_refusing_foreign_key(
     ) = (kind, refusals.last())
     {
         *error_message = Some(
-            turso_mysql::show_create_table::foreign_key_refusal_message(
-                &database.to_ascii_lowercase(),
-                refusal,
-            )
-            .into_bytes(),
+            connection
+                .foreign_key_refusal_message(&database.to_ascii_lowercase(), refusal)
+                .into_bytes(),
         );
     }
     kind
@@ -13120,17 +13123,14 @@ impl MySqlWarning {
         }
     }
 
-    fn refused_by_a_foreign_key(database: &str, refusal: &turso_core::ForeignKeyRefusal) -> Self {
+    fn refused_by_a_foreign_key(refused_row: turso_core::RefusedRow, message: String) -> Self {
         Self {
             level: "Warning",
-            code: match refusal.refused_row {
+            code: match refused_row {
                 turso_core::RefusedRow::ChildRowWithoutParent => 1452,
                 turso_core::RefusedRow::ParentRowWithChildren => 1451,
             },
-            message: turso_mysql::show_create_table::foreign_key_refusal_message(
-                &database.to_ascii_lowercase(),
-                refusal,
-            ),
+            message,
         }
     }
 

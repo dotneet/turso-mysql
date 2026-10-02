@@ -7,8 +7,9 @@
 //! schema cannot produce an unbounded listing.
 
 use super::*;
-use crate::catalog_tables::{foreign_key_name, indexes_beside_the_primary_key};
+use crate::catalog_tables::indexes_beside_the_primary_key;
 use crate::session::{is_the_primary_keys_own_index, mysql_index_columns};
+use crate::show_create_table::foreign_key_name;
 
 /// What each column of a view kept in the text MySQL prints reads, with the
 /// columns of each table it reads, in the order its `FROM` names them.
@@ -197,11 +198,16 @@ impl MySqlConnection {
                 btree
                     .foreign_keys
                     .iter()
-                    .map(|key| crate::show_create_table::MySqlForeignKey::of(key))
+                    .map(|key| {
+                        crate::show_create_table::MySqlForeignKey::of(
+                            named,
+                            key,
+                            &btree.foreign_keys,
+                        )
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        foreign_keys.sort_by_key(|key| key.declaration_order);
         let columns = self.list_columns(table).map_err(|error| match error {
             MySqlColumnMetadataError::Engine(error) => MySqlShowCreateTableError::Engine(error),
             MySqlColumnMetadataError::TableNotFound => MySqlShowCreateTableError::MissingTable,
@@ -521,7 +527,10 @@ impl MySqlConnection {
         let foreign = btree
             .foreign_keys
             .iter()
-            .filter(|key| foreign_key_name(table.as_str(), key).eq_ignore_ascii_case(name))
+            .filter(|key| {
+                foreign_key_name(table.as_str(), key, &btree.foreign_keys)
+                    .eq_ignore_ascii_case(name)
+            })
             .count();
         let checks = match schema.table_sql(table.as_str()) {
             Some(stored) => crate::schema_sql::stored_table_checks(stored)

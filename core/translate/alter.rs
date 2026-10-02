@@ -2593,12 +2593,15 @@ fn unnamed_foreign_key_at(
     constraints
         .iter()
         .enumerate()
-        .filter(|(_, held)| matches!(held.constraint, ast::TableConstraint::ForeignKey { .. }))
+        .filter(|(_, held)| {
+            held.name.is_none()
+                && matches!(held.constraint, ast::TableConstraint::ForeignKey { .. })
+        })
         .enumerate()
-        .find_map(|(order, (at, held))| {
+        .find_map(|(order, (at, _))| {
             let answers_to =
                 dialect.unnamed_foreign_key_name(table_name, column_foreign_keys + order)?;
-            (held.name.is_none() && answers_to.eq_ignore_ascii_case(wanted)).then_some(at)
+            answers_to.eq_ignore_ascii_case(wanted).then_some(at)
         })
 }
 
@@ -2613,12 +2616,12 @@ fn name_unnamed_foreign_keys(
     let dialect = connection.dialect();
     for (order, held) in constraints
         .iter_mut()
-        .filter(|held| matches!(held.constraint, ast::TableConstraint::ForeignKey { .. }))
+        .filter(|held| {
+            held.name.is_none()
+                && matches!(held.constraint, ast::TableConstraint::ForeignKey { .. })
+        })
         .enumerate()
     {
-        if held.name.is_some() {
-            continue;
-        }
         if let Some(answers_to) =
             dialect.unnamed_foreign_key_name(table_name, column_foreign_keys + order)
         {

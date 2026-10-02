@@ -16,6 +16,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::session::{is_the_primary_keys_own_index, mysql_index_columns, mysql_index_name};
+use crate::show_create_table::foreign_key_name;
 use turso_core::{
     schema::is_system_table, Connection, Database, InternalVirtualTable,
     InternalVirtualTableCursor, LimboError, Result, Value,
@@ -839,7 +840,7 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
                 }
             }
             for key in &btree.foreign_keys {
-                let constraint = foreign_key_name(name, key);
+                let constraint = foreign_key_name(name, key, &btree.foreign_keys);
                 let parent_table = schema.get_btree_table(&key.parent_table);
                 // MySQL writes the parent columns in the constraint, so there
                 // is one for each child column; a key stored without them came
@@ -860,12 +861,13 @@ impl InternalVirtualTable for InformationSchemaKeyColumnUsage {
                 }
             }
         }
-        rows.sort_by(|left, right| {
-            (&left.table, &left.constraint, left.ordinal).cmp(&(
-                &right.table,
-                &right.constraint,
-                right.ordinal,
-            ))
+        rows.sort_by_cached_key(|row| {
+            (
+                row.table.clone(),
+                row.referenced.is_some(),
+                row.constraint.to_ascii_lowercase(),
+                row.ordinal,
+            )
         });
         Ok(Arc::new(RwLock::new(
             InformationSchemaKeyColumnUsageCursor {
@@ -1045,7 +1047,7 @@ impl InternalVirtualTable for InformationSchemaTableConstraints {
             }
             for key in &btree.foreign_keys {
                 rows.push(TableConstraintRow {
-                    constraint: foreign_key_name(name, key),
+                    constraint: foreign_key_name(name, key, &btree.foreign_keys),
                     table: name.clone(),
                     kind: "FOREIGN KEY",
                 });
@@ -1058,8 +1060,13 @@ impl InternalVirtualTable for InformationSchemaTableConstraints {
                 });
             }
         }
-        rows.sort_by(|left, right| {
-            (&left.table, &left.constraint).cmp(&(&right.table, &right.constraint))
+        rows.sort_by_cached_key(|row| {
+            let kind = match row.kind {
+                "PRIMARY KEY" | "UNIQUE" => 0,
+                "FOREIGN KEY" => 1,
+                _ => 2,
+            };
+            (row.table.clone(), kind, row.constraint.to_ascii_lowercase())
         });
         Ok(Arc::new(RwLock::new(
             InformationSchemaTableConstraintsCursor {
@@ -1088,18 +1095,6 @@ fn stored_checks(
         Some(stored) => crate::schema_sql::stored_table_checks(stored)
             .map_err(|error| LimboError::Corrupt(error.to_string())),
         None => Ok(Vec::new()),
-    }
-}
-
-/// The name MySQL reports for one foreign key.
-///
-/// A key written without a `CONSTRAINT` name is named after the table it is on,
-/// counted from one in declaration order — the same name `SHOW CREATE TABLE`
-/// prints for it.
-pub(crate) fn foreign_key_name(table: &str, key: &turso_core::schema::ForeignKey) -> String {
-    match &key.name {
-        Some(name) => name.clone(),
-        None => format!("{table}_ibfk_{}", key.decl_order + 1),
     }
 }
 
@@ -1206,7 +1201,7 @@ impl InternalVirtualTable for InformationSchemaReferentialConstraints {
             }
             for key in &btree.foreign_keys {
                 rows.push(ReferentialConstraintRow {
-                    constraint: foreign_key_name(name, key),
+                    constraint: foreign_key_name(name, key, &btree.foreign_keys),
                     table: name.clone(),
                     parent_table: key.parent_table.clone(),
                     parent_key: referenced_key_name(&schema, key),
@@ -1215,9 +1210,7 @@ impl InternalVirtualTable for InformationSchemaReferentialConstraints {
                 });
             }
         }
-        rows.sort_by(|left, right| {
-            (&left.table, &left.constraint).cmp(&(&right.table, &right.constraint))
-        });
+        rows.sort_by_cached_key(|row| (row.table.clone(), row.constraint.to_ascii_lowercase()));
         Ok(Arc::new(RwLock::new(
             InformationSchemaReferentialConstraintsCursor {
                 database: self.database.clone(),
