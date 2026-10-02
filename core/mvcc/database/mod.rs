@@ -4825,8 +4825,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// lookups snapshot-consistent.
     pub fn read_snapshot_ts(&self, tx_id: TxID) -> u64 {
         self.txs
-            .get(&tx_id)
-            .map(|tx| tx.value().begin_ts())
+            .with_value(&tx_id, |tx| tx.begin_ts())
             .unwrap_or(u64::MAX)
     }
 
@@ -4835,8 +4834,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// [`Self::is_btree_readable_at`].
     pub fn read_tx_mark(&self, tx_id: TxID) -> WalPos {
         self.txs
-            .get(&tx_id)
-            .map(|tx| tx.value().read_mark)
+            .with_value(&tx_id, |tx| tx.read_mark)
             .unwrap_or(WalPos::STAGED)
     }
 
@@ -10999,6 +10997,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ///
     /// When this is false the transaction stays version-store-only; the GC floor
     /// ([`Self::compute_min_reader_mark`]) guarantees the version-store copy is still present.
+    pub fn is_btree_readable_by(&self, table_id: &MVTableId, tx_id: TxID) -> bool {
+        let (begin_ts, read_mark) = self
+            .txs
+            .with_value(&tx_id, |tx| (tx.begin_ts(), tx.read_mark))
+            .unwrap_or((u64::MAX, WalPos::STAGED));
+        self.is_btree_readable_at(table_id, begin_ts, read_mark)
+    }
+
     pub fn is_btree_readable_at(
         &self,
         table_id: &MVTableId,

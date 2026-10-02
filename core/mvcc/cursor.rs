@@ -885,12 +885,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
-        let begin_ts = self.db.read_snapshot_ts(self.tx_id);
-        let read_mark = self.db.read_tx_mark(self.tx_id);
-        if !self
-            .db
-            .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
-        {
+        if !self.db.is_btree_readable_by(&self.table_id, self.tx_id) {
             return false;
         }
         if self.btree_cursor.root_page() < 0 {
