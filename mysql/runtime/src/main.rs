@@ -225,6 +225,7 @@ impl Configuration {
 
 #[cfg(unix)]
 fn main() -> ExitCode {
+    stop_the_process_on_any_panic();
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         eprintln!("turso-mysql-server is unsupported on this platform");
         return ExitCode::FAILURE;
@@ -252,6 +253,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(unix)]
+fn stop_the_process_on_any_panic() {
+    let report_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report_panic(info);
+        std::process::abort();
+    }));
 }
 
 #[cfg(not(unix))]
@@ -468,15 +478,15 @@ fn the_server_allocates_through_mimalloc() {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{path::Path, time::Duration};
+    use std::{os::unix::process::ExitStatusExt, path::Path, time::Duration};
 
     use clap::Parser;
 
     use turso_mysql::JournalModeError;
 
     use super::{
-        duration_from_millis, run, shutdown_result, Arguments, Configuration, DaemonError,
-        DEFAULT_MAX_PREPARED_STMT_COUNT,
+        duration_from_millis, run, shutdown_result, stop_the_process_on_any_panic, Arguments,
+        Configuration, DaemonError, DEFAULT_MAX_PREPARED_STMT_COUNT,
     };
 
     const ARGUMENTS: [&str; 41] = [
@@ -753,5 +763,28 @@ mod tests {
     fn reports_an_incomplete_shutdown_for_process_exit() {
         assert_eq!(shutdown_result(true), Ok(()));
         assert_eq!(shutdown_result(false), Err(DaemonError::Shutdown));
+    }
+
+    const PANICKING_CHILD: &str = "TURSO_MYSQL_RUNTIME_TEST_PANIC_IN_A_WORKER";
+
+    #[test]
+    fn a_panic_in_a_connection_worker_stops_the_whole_server_process() {
+        if std::env::var_os(PANICKING_CHILD).is_some() {
+            stop_the_process_on_any_panic();
+            let _ = std::thread::spawn(|| panic!("fsync of the WAL failed")).join();
+            std::process::exit(0);
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::a_panic_in_a_connection_worker_stops_the_whole_server_process",
+                "--test-threads=1",
+            ])
+            .env(PANICKING_CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGABRT), "{status}");
     }
 }
