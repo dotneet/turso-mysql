@@ -2011,3 +2011,67 @@ fn test_mysql_changed_rows_for_wal_upserts(tmp_db: TempDatabase) -> anyhow::Resu
 fn test_mysql_changed_rows_for_mvcc_upserts(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_mysql_changed_rows_for_upserts(&tmp_db.connect_limbo())
 }
+
+#[turso_macros::test]
+fn foreign_keys_checked_row_by_row_refuse_at_the_first_row_as_innodb_does(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_foreign_keys_checked_row_by_row(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn foreign_keys_checked_row_by_row_refuse_at_the_first_row_as_innodb_does_under_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_foreign_keys_checked_row_by_row(&tmp_db.connect_limbo())
+}
+
+fn assert_foreign_keys_checked_row_by_row(conn: &Arc<Connection>) -> anyhow::Result<()> {
+    conn.set_foreign_keys_checked_row_by_row(true);
+    conn.execute(
+        "CREATE TABLE nodes (id INT NOT NULL PRIMARY KEY, parent_id INT REFERENCES nodes (id))",
+    )?;
+    conn.execute("CREATE INDEX nodes_parent ON nodes (parent_id)")?;
+    conn.execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id), v INT)")?;
+    conn.execute("CREATE INDEX c_pid ON c (pid)")?;
+    conn.execute("INSERT INTO nodes VALUES (1, NULL), (2, 1), (3, 3)")?;
+    conn.execute("INSERT INTO p VALUES (1)")?;
+    conn.execute("INSERT INTO c VALUES (1, 1, 0), (2, 999, 0)")?;
+    conn.execute("PRAGMA foreign_keys = ON")?;
+
+    let refused_parent = |sql: &str| match conn.execute(sql) {
+        Err(LimboError::ForeignKeyConstraint(message)) => {
+            assert_eq!(
+                message,
+                turso_core::FOREIGN_KEY_PARENT_ROW_REFERENCED,
+                "{sql}"
+            )
+        }
+        other => panic!("{sql}: {other:?}"),
+    };
+    refused_parent("DELETE FROM nodes WHERE id = 3");
+    refused_parent("DELETE FROM nodes WHERE id IN (1, 2)");
+    refused_parent("UPDATE nodes SET id = 4, parent_id = 4 WHERE id = 3");
+    refused_parent("DELETE FROM p WHERE id = 1");
+    let ids: Vec<(i64,)> = conn.exec_rows("SELECT id FROM nodes ORDER BY id");
+    assert_eq!(ids, [(1,), (2,), (3,)]);
+
+    conn.execute("UPDATE c SET pid = 999, v = 1 WHERE id = 2")?;
+    for sql in [
+        "UPDATE c SET pid = 998 WHERE id = 2",
+        "UPDATE c SET id = 3 WHERE id = 2",
+    ] {
+        match conn.execute(sql) {
+            Err(LimboError::ForeignKeyConstraint(message)) => {
+                assert_eq!(message, "FOREIGN KEY constraint failed", "{sql}")
+            }
+            other => panic!("{sql}: {other:?}"),
+        }
+    }
+    conn.execute("DELETE FROM nodes WHERE id = 2")?;
+    conn.execute("DELETE FROM nodes WHERE id = 1")?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM c ORDER BY id");
+    assert_eq!(rows, [(1, 0), (2, 1)]);
+    Ok(())
+}

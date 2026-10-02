@@ -1654,6 +1654,7 @@ impl MySqlConnection {
         // a table already stored: the constraint was refused until now, so no
         // durable MySQL table carries one.
         inner.set_foreign_keys_enabled(true);
+        inner.set_foreign_keys_checked_row_by_row(true);
         Ok(Self {
             _closes_on_last_drop: Arc::new(CloseOnLastDrop {
                 connection: Arc::clone(&inner),

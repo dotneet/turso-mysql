@@ -492,6 +492,8 @@ pub const SQLITE_CONSTRAINT_CHECK: usize = SQLITE_CONSTRAINT | (1 << 8);
 pub const SQLITE_CONSTRAINT_PRIMARYKEY: usize = SQLITE_CONSTRAINT | (6 << 8);
 #[allow(dead_code)]
 pub const SQLITE_CONSTRAINT_FOREIGNKEY: usize = SQLITE_CONSTRAINT | (3 << 8);
+pub const FOREIGN_KEY_PARENT_ROW_REFERENCED: &str =
+    "FOREIGN KEY constraint failed: a child row names the parent row";
 pub const SQLITE_CONSTRAINT_NOTNULL: usize = SQLITE_CONSTRAINT | (5 << 8);
 pub const SQLITE_CONSTRAINT_TRIGGER: usize = SQLITE_CONSTRAINT | (7 << 8);
 pub const SQLITE_FULL: usize = 13; // we want this in autoincrement - incase if user inserts max allowed int

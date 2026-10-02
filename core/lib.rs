@@ -146,7 +146,9 @@ pub use dialect::{
     DatabaseFileOwner, Dialect, SchemaCatalogValidationContext, SchemaSqlFormatter, SchemaSqlKind,
     SqliteDialect,
 };
-pub use error::{io_error, AssignmentError, CompletionError, LimboError};
+pub use error::{
+    io_error, AssignmentError, CompletionError, LimboError, FOREIGN_KEY_PARENT_ROW_REFERENCED,
+};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;

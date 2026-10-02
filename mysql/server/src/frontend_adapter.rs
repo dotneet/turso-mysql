@@ -13847,6 +13847,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::RowLocked(_) => FrontendErrorKind::LockNotAvailableNowait,
         LimboError::TableMetadataLocked(_) => FrontendErrorKind::DatabaseBusy,
         LimboError::TableDefinitionChanged(_) => FrontendErrorKind::TableDefinitionChanged,
+        LimboError::ForeignKeyConstraint(message)
+            if message == turso_core::FOREIGN_KEY_PARENT_ROW_REFERENCED =>
+        {
+            FrontendErrorKind::ParentRowReferenced
+        }
         LimboError::ForeignKeyConstraint(_) => FrontendErrorKind::ForeignKeyViolation,
         LimboError::IntegerOverflow => FrontendErrorKind::NumericOverflow,
         LimboError::InvalidArgument(message)

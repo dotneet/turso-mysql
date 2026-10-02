@@ -1215,7 +1215,7 @@ fn a_refused_parent_delete_keeps_the_child_entry_it_found() {
     assert_eq!(
         one.execute_query("DELETE FROM parents WHERE id = 20")
             .map(|_| ()),
-        Err(FrontendErrorKind::ForeignKeyViolation)
+        Err(FrontendErrorKind::ParentRowReferenced)
     );
     run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
     assert_eq!(
@@ -1291,6 +1291,64 @@ fn a_cascade_keeps_the_children_it_deleted_and_lets_other_children_in() {
     );
     run(&mut two, "UPDATE children SET v = 9 WHERE id = 3");
     run(&mut one, "COMMIT");
+}
+
+/// Measured on MySQL 8.4.11 with `performance_schema.data_locks`: an update
+/// that writes a child's parent key as it stood, the way an ORM writes every
+/// column, locks no parent row, while one that changes the child's primary
+/// key checks its parent again and locks it in share mode.
+#[test]
+fn an_update_that_keeps_a_childs_keys_locks_no_parent() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = foreign_key_sessions("")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    run(
+        &mut one,
+        "UPDATE children SET parent_id = 20, v = 1 WHERE id = 1",
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    run(&mut two, "UPDATE parents SET v = 9 WHERE id = 20");
+    run(&mut one, "UPDATE children SET id = 7 WHERE id = 3");
+    assert_eq!(
+        two.execute_query("UPDATE parents SET v = 9 WHERE id = 30")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut one, "ROLLBACK");
+}
+
+/// Measured on MySQL 8.4.11: a delete of every parent stops at the first
+/// parent a child names and answers 1451, so it keeps the parents it reached
+/// and leaves the ones after it to other sessions.
+#[test]
+fn a_refused_delete_of_every_parent_keeps_only_the_parents_it_reached() {
+    let Some(TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    }) = foreign_key_sessions("")
+    else {
+        return;
+    };
+    run(&mut one, "BEGIN");
+    assert_eq!(
+        one.execute_query("DELETE FROM parents").map(|_| ()),
+        Err(FrontendErrorKind::ParentRowReferenced)
+    );
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    assert_eq!(
+        two.execute_query("UPDATE parents SET v = 9 WHERE id = 20")
+            .map(|_| ()),
+        Err(FrontendErrorKind::DatabaseBusy)
+    );
+    run(&mut two, "UPDATE parents SET v = 9 WHERE id = 30");
+    run(&mut one, "ROLLBACK");
 }
 
 fn foreign_key_sessions(action: &str) -> Option<TwoSessions> {

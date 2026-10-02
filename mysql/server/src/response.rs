@@ -405,6 +405,8 @@ pub enum FrontendErrorKind {
     ConstraintViolation,
     /// A foreign key rejected the row.
     ForeignKeyViolation,
+    /// A child row still names the parent row a statement deleted or changed.
+    ParentRowReferenced,
     /// A `TRUNCATE TABLE` named a table another table's foreign key names.
     TruncateReferencedByForeignKey,
     /// A `DROP TABLE` named a table another table's foreign key names.
@@ -689,13 +691,16 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::InvalidJsonText => (3140, *b"22032", b"Invalid JSON text".as_slice()),
         // Measured on MySQL 8.4.11: a child row naming a parent that is not
         // there answers 1452 and a parent row still named by a child answers
-        // 1451, both SQLSTATE 23000. The engine reports one failure for both
-        // directions, so this answers the child one, which is the direction a
-        // client meets first.
+        // 1451, both SQLSTATE 23000.
         FrontendErrorKind::ForeignKeyViolation => (
             1452,
             *b"23000",
             b"Cannot add or update a child row: a foreign key constraint fails".as_slice(),
+        ),
+        FrontendErrorKind::ParentRowReferenced => (
+            1451,
+            *b"23000",
+            b"Cannot delete or update a parent row: a foreign key constraint fails".as_slice(),
         ),
         // Measured on MySQL 8.4.11: truncating a table another table's foreign
         // key names answers 1701, SQLSTATE 42000, whatever the table holds.

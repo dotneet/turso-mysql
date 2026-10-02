@@ -8902,7 +8902,8 @@ fn varbinary_holds_bytes() {
 
 /// A foreign key is enforced, which is what makes taking the syntax honest.
 /// Measured on MySQL 8.4.11: a child row naming a parent that is not there
-/// answers 1452, and the constraint prints as `<table>_ibfk_<n>`.
+/// answers 1452, a parent row a child still names answers 1451, and the
+/// constraint prints as `<table>_ibfk_<n>`.
 #[cfg(unix)]
 #[test]
 fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
@@ -8939,7 +8940,7 @@ fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
     );
     assert_eq!(
         adapter.execute_query("DELETE FROM parent WHERE id = 1"),
-        Err(FrontendErrorKind::ForeignKeyViolation)
+        Err(FrontendErrorKind::ParentRowReferenced)
     );
 
     let CommandExecutionResult::ResultSet(created) =
@@ -8976,6 +8977,78 @@ fn a_foreign_key_is_enforced_the_way_mysql_enforces_one() {
     assert!(String::from_utf8(created.rows[0][1].clone().unwrap())
         .unwrap()
         .contains("CONSTRAINT `fk_parent` FOREIGN KEY (`parent_id`) REFERENCES `parent` (`id`)"));
+}
+
+/// Measured on MySQL 8.4.11: InnoDB checks a foreign key on each row as the
+/// row is written and refuses the statement at the first row that breaks it,
+/// so a statement deleting a parent and its child together answers 1451 and
+/// deletes neither, a row naming itself cannot be deleted, and a `REPLACE`
+/// of a parent a child names answers 1451. A row whose
+/// foreign key and primary key keep their values is not checked, so an
+/// update of a row whose parent went missing while the checks were off goes
+/// ahead, while one changing its primary key answers 1452.
+#[cfg(unix)]
+#[test]
+fn foreign_keys_are_checked_row_by_row_the_way_innodb_checks_them() {
+    let authorizer = Arc::new(RecordingAuthorizer::default());
+    let (_directory, _catalog, factory) = catalog_factory(authorizer);
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([38; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("REPORTS").unwrap();
+    for sql in [
+        "CREATE TABLE nodes (id INT NOT NULL PRIMARY KEY, parent_id INT, \
+         FOREIGN KEY (parent_id) REFERENCES nodes (id))",
+        "INSERT INTO nodes (id, parent_id) VALUES (1, NULL), (2, 1), (3, 3)",
+        "CREATE TABLE p (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT, v INT, \
+         FOREIGN KEY (pid) REFERENCES p (id))",
+        "INSERT INTO p (id) VALUES (1)",
+        "INSERT INTO c (id, pid, v) VALUES (1, 1, 0)",
+        "SET foreign_key_checks = 0",
+        "INSERT INTO c (id, pid, v) VALUES (2, 999, 0)",
+        "SET foreign_key_checks = 1",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+
+    for refused in [
+        "DELETE FROM nodes WHERE id = 3",
+        "DELETE FROM nodes WHERE id IN (1, 2)",
+        "DELETE FROM p WHERE id = 1",
+        "REPLACE INTO p (id) VALUES (1)",
+    ] {
+        assert_eq!(
+            adapter.execute_query(refused).map(|_| ()),
+            Err(FrontendErrorKind::ParentRowReferenced),
+            "{refused}"
+        );
+    }
+    adapter
+        .execute_query("UPDATE c SET pid = 999, v = 1 WHERE id = 2")
+        .unwrap();
+    for refused in [
+        "UPDATE c SET pid = 998 WHERE id = 2",
+        "UPDATE c SET id = 3 WHERE id = 2",
+    ] {
+        assert_eq!(
+            adapter.execute_query(refused).map(|_| ()),
+            Err(FrontendErrorKind::ForeignKeyViolation),
+            "{refused}"
+        );
+    }
+    let CommandExecutionResult::ResultSet(nodes) = adapter
+        .execute_query("SELECT id FROM nodes ORDER BY id")
+        .unwrap()
+    else {
+        panic!("the nodes must read back");
+    };
+    assert_eq!(nodes.rows.len(), 3);
 }
 
 /// MySQL takes several operations in one `ALTER TABLE` and the engine takes

@@ -3683,19 +3683,6 @@ hexadecimal in `SHOW COLUMNS` and `information_schema.COLUMNS` —
 `DEFAULT 'J'` as `0x4A`, an empty one as nothing — as MySQL does, where it
 used to report the word.
 
-A `FOREIGN KEY` is refused, and refused at the door rather than taken and left
-to do nothing. The parser can translate one; the frontend is what says no. The
-engine runs with `PRAGMA foreign_keys` off, so a constraint accepted here would
-not be enforced, where MySQL answers 1452 for a child row whose parent does not
-exist — measured on 8.4.11. A client that wrote the constraint would be
-reasoning about integrity it does not have, which is the same reason a lock is
-never handed out here unless it is really held.
-
-The inline column spelling, `parent_id INT REFERENCES parent(id)`, is refused
-too, and that one is a divergence rather than a gap: measured on 8.4.11, MySQL
-parses it and ignores it — `SHOW CREATE TABLE` shows no key and a row with no
-parent inserts — so MySQL takes a schema here that this refuses.
-
 `SELECT ... FOR UPDATE` and `SELECT ... FOR SHARE` are taken, and the lock they ask for is
 really held. The engine holds one write lock over the whole database and takes it when a
 statement writes, so the statement that asks for the lock takes it by writing no row — an
@@ -5946,10 +5933,60 @@ these connections now run with it on, which is what makes taking the syntax
 honest: until now the constraint was refused precisely because a stored one
 would never have been checked. Measured on 8.4.11: a child row naming a
 parent that is not there answers 1452 and a parent row still named by a child
-answers 1451, both SQLSTATE 23000. The engine reports one failure for both
-directions, so this answers 1452 either way — the direction a client meets
-first. Turning enforcement on took nothing away from a table already stored
-in that earlier slice: the constraint was refused at the time.
+answers 1451, both SQLSTATE 23000, and so does this. Turning enforcement on
+took nothing away from a table already stored in that earlier slice: the
+constraint was refused at the time.
+
+A foreign key is checked on each row as the row is written, and the statement
+is refused at the first row that breaks it, the way InnoDB checks one, where
+the engine on its own counts violations until the statement ends. Measured on
+8.4.11 and matched: a `DELETE` reaching a parent before the child it would
+also delete answers 1451 and deletes neither — `DELETE FROM t WHERE id IN (1,
+2)` with row 2 naming row 1 — a row naming itself cannot be deleted, a key
+`UPDATE` of such a row answers 1451 too, and so does a `REPLACE` of a parent a
+child names, which deletes the parent before it writes the new row. A row an `UPDATE` writes is
+checked only when its foreign key or its primary key takes another value, so
+an ORM's update that writes every column as it stood checks nothing, and a row
+whose parent went missing while the checks were off can still be updated, but
+not moved to another primary key (1452).
+
+With `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` the checks take InnoDB's row locks, and
+each of the following was measured on 8.4.11 with `performance_schema.data_locks`
+and is matched, under `REPEATABLE READ` and `READ COMMITTED` alike unless
+said. A child row's `INSERT`, or an `UPDATE` that changes its foreign key or
+primary key, locks the parent row it names in share mode, the row alone
+(`S,REC_NOT_GAP`), so another session's `DELETE` of that parent, an `UPDATE`
+of any of its columns and a `FOR UPDATE` read of it wait and answer 1205,
+while a `FOR SHARE` read of it and another child's insert go ahead. A parent
+named through a unique key that is not its primary key is locked on that key
+alone. A child naming a parent another open transaction inserted or deleted
+waits for that transaction, and is taken or answers 1452 by how it ends. A
+child naming a missing parent answers 1452 and under `REPEATABLE READ` keeps
+the gap the parent key would be in (`S,GAP` on the next parent), so another
+session's insert of that parent waits; under `READ COMMITTED` it keeps
+nothing. A parent's `DELETE`, or an `UPDATE` of its key, looks for a child
+through the child's index: one it finds is locked there in share mode, the
+index entry alone and not the child row, so another session's delete of that
+child or change of its parent key waits while an update of its other columns
+goes ahead; finding none, it locks under `REPEATABLE READ` the gap the key
+would be in, in the child's index. The key a parent `UPDATE` moves to is not
+looked up. `ON DELETE CASCADE`, `SET NULL` and the `ON UPDATE` actions lock
+each child row they change, read the child index as that check does, and
+under `REPEATABLE READ` lock the gap where that read stops and no gap below
+the children they changed, so another session's insert of a child of another
+parent goes ahead. Two transactions that each inserted a child of one parent
+and then both update that parent end in 1213 for the one whose wait closes
+the cycle.
+
+Two differences remain, both from the order InnoDB writes a row in. InnoDB
+writes a child row's primary key record, and every index before the foreign
+key's own, before it checks the key, so under `REPEATABLE READ` a child
+refused with 1452 keeps the gaps that row would have filled there (`X` on the
+next record) and another session's child insert into one waits; the engine
+checks before it writes anything, so nothing of a refused child is kept. And
+an `ON UPDATE CASCADE` changes each child as InnoDB's read of the child index
+reaches it, so InnoDB's gap lock stops at the first child it moved; here the
+gap reaches the next child of another parent.
 
 `SHOW CREATE TABLE` prints the constraint as MySQL names it, `` `t_ibfk_1` ``,
 counted from one in declaration order, with its `ON DELETE` and `ON UPDATE`
@@ -5964,7 +6001,7 @@ MySQL does with it. Measured on 8.4.11: `parent_id INT REFERENCES p(id)`
 stores a child row naming a parent that does not exist, and `SHOW CREATE
 TABLE` prints no constraint at all, whatever `ON DELETE` or `ON UPDATE` was
 written beside it. The table-level `FOREIGN KEY (a) REFERENCES p(id)` is a
-different statement, which MySQL does enforce, and it stays refused.
+different statement, which MySQL does enforce, and so does this.
 
 ### `GROUP_CONCAT` and `group_concat_max_len`
 

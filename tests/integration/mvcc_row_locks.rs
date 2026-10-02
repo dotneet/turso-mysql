@@ -1572,6 +1572,51 @@ fn a_child_insert_locks_its_parent_row_by_every_column_of_a_composite_key() {
     writer.execute("ROLLBACK").unwrap();
 }
 
+#[test]
+fn a_child_update_that_keeps_its_index_entry_locks_no_parent_when_checked_row_by_row() {
+    let db = database_with_foreign_keys("");
+    let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.set_foreign_keys_checked_row_by_row(true);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE c SET pid = 20, v = 1 WHERE id = 1")
+        .unwrap();
+    assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 20"));
+    writer.execute("UPDATE c SET id = 7 WHERE id = 3").unwrap();
+    assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 30"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_parent_delete_checked_row_by_row_stops_at_the_first_parent_a_child_names() {
+    let db = database_with_foreign_keys("");
+    let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.set_foreign_keys_checked_row_by_row(true);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let refused = writer.execute("DELETE FROM p");
+    assert!(
+        matches!(&refused, Err(LimboError::ForeignKeyConstraint(message)) if message == turso_core::FOREIGN_KEY_PARENT_ROW_REFERENCED),
+        "{refused:?}"
+    );
+    assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 10"));
+    assert!(waits(&db, "UPDATE p SET v = 9 WHERE id = 20"));
+    assert!(!waits(&db, "UPDATE p SET v = 9 WHERE id = 30"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
+#[test]
+fn a_parent_key_update_locks_nothing_around_the_new_key() {
+    let db = database_with_foreign_keys("");
+    let writer = foreign_key_session(&db, RowLockLevel::RepeatableRead);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer
+        .execute("UPDATE p SET id = 25 WHERE id = 10")
+        .unwrap();
+    assert!(waits(&db, "INSERT INTO c VALUES (7, 15, 0)"));
+    assert!(!waits(&db, "INSERT INTO c VALUES (8, 25, 0)"));
+    writer.execute("ROLLBACK").unwrap();
+}
+
 fn database_with_foreign_keys(action: &str) -> TempDatabase {
     let db = TempDatabase::builder()
         .with_opts(DatabaseOpts::new().with_mvcc_row_locks(true))

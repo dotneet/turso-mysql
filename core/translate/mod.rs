@@ -211,6 +211,8 @@ pub fn translate_inner(
         bail_parse_error!("Cannot execute write statement in query_only mode")
     }
 
+    program.checks_foreign_keys_row_by_row = connection.foreign_keys_checked_row_by_row();
+
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(
         stmt,

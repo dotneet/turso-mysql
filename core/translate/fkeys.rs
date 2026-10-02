@@ -5,7 +5,7 @@ use crate::translate::emitter::emit_columns_and_dependencies;
 use crate::translate::expr::emit_table_column_for_dml;
 use crate::translate::plan::ColumnMask;
 use crate::{
-    error::SQLITE_CONSTRAINT_FOREIGNKEY,
+    error::{FOREIGN_KEY_PARENT_ROW_REFERENCED, SQLITE_CONSTRAINT_FOREIGNKEY},
     schema::{BTreeTable, ColumnLayout, ForeignKey, Index, ResolvedFkRef},
     sync::{Arc, OnceLock, Weak},
     translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
@@ -587,6 +587,9 @@ pub fn build_index_affinity_string(idx: &Index, table: &BTreeTable) -> String {
 /// on the connection; for immediate FKs, this is a per-statement counter in the program state.
 /// Used for NO ACTION behavior where violation is checked at statement/transaction end.
 pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Result<()> {
+    if program.checks_foreign_keys_row_by_row && !fk.deferred {
+        return emit_fk_restrict_halt(program);
+    }
     program.emit_insn(Insn::FkCounter {
         increment_value: 1,
         deferred: fk.deferred,
@@ -804,10 +807,11 @@ pub fn emit_fk_parent_pk_change_counters(
         // can still see the old parent row in the table. The child-key-changed
         // condition prevents that stale row from masking a parent-key-only
         // orphan.
-        let self_exclude_rowid = if fk_ref
-            .child_table
-            .name
-            .eq_ignore_ascii_case(&parent_table.name)
+        let self_exclude_rowid = if !program.checks_foreign_keys_row_by_row
+            && fk_ref
+                .child_table
+                .name
+                .eq_ignore_ascii_case(&parent_table.name)
             && fk_ref.child_key_changed(updated_positions, parent_table)
         {
             Some(current_rowid_reg)
@@ -825,7 +829,7 @@ pub fn emit_fk_parent_pk_change_counters(
             resolver,
         )?;
 
-        if matches!(new_key_probe_mode, ParentKeyNewProbeMode::BeforeWrite) {
+        if fk_ref.fk.deferred && matches!(new_key_probe_mode, ParentKeyNewProbeMode::BeforeWrite) {
             emit_fk_parent_key_probe(
                 program,
                 fk_ref,
@@ -918,13 +922,7 @@ fn emit_fk_parent_key_probe(
             // OLD key referenced by a child: removing/changing this parent key
             // creates a violation unless a later statement repairs it.
             (_, ParentProbePass::Old) => {
-                if is_restrict {
-                    // RESTRICT: immediate halt
-                    emit_fk_restrict_halt(p)?;
-                } else {
-                    // NO ACTION: increment counter (checked at statement/transaction end)
-                    emit_fk_violation(p, &fk_ref.fk)?;
-                }
+                emit_fk_parent_violation(p, &fk_ref.fk, is_restrict)?;
             }
 
             // NEW key referenced by a child: this parent key may repair a
@@ -1107,11 +1105,13 @@ pub fn emit_fk_child_update_counters(
         Ok(Some((dml_ctx, fk_col_positions, null_skip_label)))
     };
 
+    let row_by_row = program.checks_foreign_keys_row_by_row;
+    let primary_key_changes = row_by_row && primary_key_is_updated(child_tbl, updated_cols);
     for fk_ref in
         resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
     {
         // If the child-side FK columns did not change, there is nothing to do.
-        if !fk_ref.child_key_changed(updated_cols, child_tbl) {
+        if !fk_ref.child_key_changed(updated_cols, child_tbl) && !primary_key_changes {
             continue;
         }
 
@@ -1217,6 +1217,18 @@ pub fn emit_fk_child_update_counters(
                 reg: src,
                 target_pc: fk_ok,
             });
+        }
+        if row_by_row {
+            emit_skip_unless_the_child_index_entry_changes(
+                program,
+                child_tbl,
+                &fk_ref,
+                child_cursor_id,
+                new_start_reg,
+                new_rowid_reg,
+                layout,
+                fk_ok,
+            );
         }
 
         // A child NEW-key check normally probes the parent table before this
@@ -1370,6 +1382,65 @@ pub fn emit_fk_child_update_counters(
     Ok(())
 }
 
+fn primary_key_is_updated(table: &BTreeTable, updated_cols: &ColumnMask) -> bool {
+    table
+        .primary_key_columns
+        .iter()
+        .filter_map(|(name, _)| table.get_column(name))
+        .any(|(position, _)| updated_cols.get(position))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_skip_unless_the_child_index_entry_changes(
+    program: &mut ProgramBuilder,
+    child_tbl: &BTreeTable,
+    fk_ref: &ResolvedFkRef,
+    child_cursor_id: usize,
+    new_start_reg: usize,
+    new_rowid_reg: usize,
+    layout: &ColumnLayout,
+    unchanged: BranchOffset,
+) {
+    let compared: Vec<usize> = fk_ref
+        .child_pos
+        .iter()
+        .copied()
+        .chain(
+            child_tbl
+                .primary_key_columns
+                .iter()
+                .filter_map(|(name, _)| child_tbl.get_column(name).map(|(position, _)| position)),
+        )
+        .collect();
+    if compared
+        .iter()
+        .any(|position| child_tbl.columns()[*position].is_generated())
+    {
+        return;
+    }
+    let changed = program.allocate_label();
+    for position in compared {
+        let new_reg = if child_tbl.columns()[position].is_rowid_alias() {
+            new_rowid_reg
+        } else {
+            layout.to_register(new_start_reg, position)
+        };
+        let old_reg = program.alloc_register();
+        program.emit_column_or_rowid(child_cursor_id, position, old_reg);
+        program.emit_insn(Insn::Ne {
+            lhs: new_reg,
+            rhs: old_reg,
+            target_pc: changed,
+            flags: CmpInsFlags::default().jump_if_null(),
+            collation: Some(CollationSeq::Binary),
+        });
+    }
+    program.emit_insn(Insn::Goto {
+        target_pc: unchanged,
+    });
+    program.preassign_label_to_next_insn(changed);
+}
+
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
 /// Raises a violation if any child row references the parent key.
 /// For RESTRICT: emits immediate HALT
@@ -1423,20 +1494,14 @@ fn emit_fk_delete_parent_existence_check_single(
                 .all(|(ic, cc)| ic.name.eq_ignore_ascii_case(cc))
     });
 
-    // Closure to emit the appropriate violation based on action type
-    let emit_violation = |p: &mut ProgramBuilder| -> Result<()> {
-        if is_restrict {
-            emit_fk_restrict_halt(p)?;
-        } else {
-            emit_fk_violation(p, &fk_ref.fk)?;
-        }
-        Ok(())
-    };
+    let emit_violation =
+        |p: &mut ProgramBuilder| emit_fk_parent_violation(p, &fk_ref.fk, is_restrict);
+    let excludes_the_deleted_row = is_self_ref && !program.checks_foreign_keys_row_by_row;
 
     if let Some(ref idx) = child_idx {
         let icur = open_read_index(program, idx, database_id);
         let probe = copy_with_affinity(program, parent_key_start, ncols, idx, &fk_ref.child_table);
-        if is_self_ref {
+        if excludes_the_deleted_row {
             index_scan_match_any(
                 program,
                 icur,
@@ -1454,20 +1519,34 @@ fn emit_fk_delete_parent_existence_check_single(
             &fk_ref.child_table,
             child_cols,
             parent_key_start,
-            if is_self_ref {
-                Some(parent_rowid_reg)
-            } else {
-                None
-            },
+            excludes_the_deleted_row.then_some(parent_rowid_reg),
             database_id,
-            |p| {
-                emit_violation(p)?;
-                Ok(())
-            },
+            emit_violation,
         )?;
     }
     program.preassign_label_to_next_insn(skip_check);
     Ok(())
+}
+
+fn emit_fk_parent_violation(
+    program: &mut ProgramBuilder,
+    fk: &ForeignKey,
+    restrict: bool,
+) -> Result<()> {
+    if program.checks_foreign_keys_row_by_row && !fk.deferred {
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
+            description: FOREIGN_KEY_PARENT_ROW_REFERENCED.to_string(),
+            on_error: None,
+            description_reg: None,
+        });
+        return Ok(());
+    }
+    if restrict {
+        emit_fk_restrict_halt(program)
+    } else {
+        emit_fk_violation(program, fk)
+    }
 }
 
 /// Parent-side FK counter checks for UPDATE.
