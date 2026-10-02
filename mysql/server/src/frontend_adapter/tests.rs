@@ -23548,7 +23548,7 @@ fn a_count_takes_the_qualified_column_a_join_has_to_write() {
 #[cfg(unix)]
 #[test]
 fn a_select_for_update_takes_a_lock_that_is_held() {
-    let row_locks = turso_mysql::experimental_mvcc_is_on();
+    let row_locks = turso_mysql::databases_open_in_mvcc();
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, catalog, factory) = catalog_factory(authorizer.clone());
     catalog.create("ledger").unwrap();

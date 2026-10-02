@@ -9,17 +9,79 @@ use turso_core::{
 
 use crate::MySqlDialect;
 
-/// The environment variable that opens every database in MVCC mode, where
-/// writers run side by side instead of one at a time. Off unless set to `1`.
-///
-/// Experimental: MVCC gives snapshot isolation with row-level write conflicts,
-/// which is not what the server's isolation levels promise yet.
-pub const EXPERIMENTAL_MVCC_VARIABLE: &str = "TURSO_MYSQL_EXPERIMENTAL_MVCC";
+/// The environment variable that picks how every database opens: `mvcc`, the
+/// default, where writers run side by side and a write to a row another open
+/// transaction changed waits for it, or `wal`, where writers take the
+/// database's one write lock in turn.
+pub const JOURNAL_MODE_VARIABLE: &str = "TURSO_MYSQL_JOURNAL_MODE";
 
-/// Whether databases open in MVCC mode, read once per process.
-pub fn experimental_mvcc_is_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var(EXPERIMENTAL_MVCC_VARIABLE).is_ok_and(|value| value == "1"))
+/// The variable that turned MVCC on while WAL was the default. It is refused
+/// whatever its value, because a server started with it unset or `0` expected
+/// WAL and would now get MVCC without a word.
+pub const REMOVED_MVCC_VARIABLE: &str = "TURSO_MYSQL_EXPERIMENTAL_MVCC";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalMode {
+    Mvcc,
+    Wal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalModeError {
+    UnknownMode,
+    RemovedMvccVariable,
+}
+
+impl std::fmt::Display for JournalModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMode => write!(
+                f,
+                "{JOURNAL_MODE_VARIABLE} must be `mvcc` (the default) or `wal`"
+            ),
+            Self::RemovedMvccVariable => write!(
+                f,
+                "{REMOVED_MVCC_VARIABLE} is no longer read: databases open in MVCC by default; \
+                 unset it, and set {JOURNAL_MODE_VARIABLE}=wal to keep them in WAL"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for JournalModeError {}
+
+/// Whether databases open in MVCC mode, read once per process. A refused
+/// setting panics here, so the server and the offline commands check
+/// [`journal_mode_from_environment`] before they open any database.
+pub fn databases_open_in_mvcc() -> bool {
+    static MODE: std::sync::OnceLock<JournalMode> = std::sync::OnceLock::new();
+    let mode = MODE
+        .get_or_init(|| journal_mode_from_environment().unwrap_or_else(|error| panic!("{error}")));
+    *mode == JournalMode::Mvcc
+}
+
+pub fn journal_mode_from_environment() -> std::result::Result<JournalMode, JournalModeError> {
+    journal_mode_from(
+        std::env::var_os(JOURNAL_MODE_VARIABLE).as_deref(),
+        std::env::var_os(REMOVED_MVCC_VARIABLE).is_some(),
+    )
+}
+
+fn journal_mode_from(
+    selected: Option<&std::ffi::OsStr>,
+    removed_mvcc_variable_is_set: bool,
+) -> std::result::Result<JournalMode, JournalModeError> {
+    if removed_mvcc_variable_is_set {
+        return Err(JournalModeError::RemovedMvccVariable);
+    }
+    let Some(selected) = selected else {
+        return Ok(JournalMode::Mvcc);
+    };
+    match selected.to_str() {
+        Some(mode) if mode.eq_ignore_ascii_case("mvcc") => Ok(JournalMode::Mvcc),
+        Some(mode) if mode.eq_ignore_ascii_case("wal") => Ok(JournalMode::Wal),
+        _ => Err(JournalModeError::UnknownMode),
+    }
 }
 
 /// Opens a MySQL database from already-open main and WAL descriptors.
@@ -519,6 +581,45 @@ mod tests {
         assert!(matches!(identity_error, LimboError::InvalidArgument(_)));
         assert!(!identity_error.to_string().contains(pathless_identity));
         Ok(())
+    }
+
+    #[test]
+    fn databases_open_in_mvcc_unless_wal_is_asked_for() {
+        use std::ffi::OsStr;
+        assert_eq!(journal_mode_from(None, false), Ok(JournalMode::Mvcc));
+        assert_eq!(
+            journal_mode_from(Some(OsStr::new("mvcc")), false),
+            Ok(JournalMode::Mvcc)
+        );
+        assert_eq!(
+            journal_mode_from(Some(OsStr::new("wal")), false),
+            Ok(JournalMode::Wal)
+        );
+        assert_eq!(
+            journal_mode_from(Some(OsStr::new("WAL")), false),
+            Ok(JournalMode::Wal)
+        );
+        for refused in ["", "1", "delete", "experimental_mvcc"] {
+            assert_eq!(
+                journal_mode_from(Some(OsStr::new(refused)), false),
+                Err(JournalModeError::UnknownMode),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_mvcc_switch_is_refused_whatever_else_is_set() {
+        use std::ffi::OsStr;
+        for selected in [None, Some(OsStr::new("mvcc")), Some(OsStr::new("wal"))] {
+            assert_eq!(
+                journal_mode_from(selected, true),
+                Err(JournalModeError::RemovedMvccVariable)
+            );
+        }
+        assert!(JournalModeError::RemovedMvccVariable
+            .to_string()
+            .contains("TURSO_MYSQL_JOURNAL_MODE=wal"));
     }
 
     #[test]

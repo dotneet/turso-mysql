@@ -85,7 +85,7 @@ fn repeatable_read_keeps_its_snapshot_and_gives_up_a_stale_write_with_1213() {
     assert_eq!(n_of(&mut one, 1), "0");
     run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
     assert_eq!(n_of(&mut one, 2), "0");
-    if turso_mysql::experimental_mvcc_is_on() {
+    if turso_mysql::databases_open_in_mvcc() {
         run(&mut one, "UPDATE c SET n = 7 WHERE id = 1");
         assert_eq!(n_of(&mut one, 2), "0");
         assert_eq!(n_of(&mut two, 1), "0");
@@ -131,7 +131,7 @@ fn repeatable_read_writes_after_another_session_committed_to_a_table_it_did_not_
     else {
         panic!("the count must read back");
     };
-    let counted: &[u8] = if turso_mysql::experimental_mvcc_is_on() {
+    let counted: &[u8] = if turso_mysql::databases_open_in_mvcc() {
         b"0"
     } else {
         b"1"
@@ -152,7 +152,7 @@ fn a_transaction_given_up_with_1213_takes_its_savepoints_with_it() {
     run(&mut one, "SAVEPOINT before_reading");
     assert_eq!(n_of(&mut one, 2), "0");
     run(&mut two, "UPDATE c SET n = 5 WHERE id = 2");
-    if turso_mysql::experimental_mvcc_is_on() {
+    if turso_mysql::databases_open_in_mvcc() {
         // Measured on MySQL 8.4.11: the update changes the row the other
         // session committed rather than answering 1213, so the transaction
         // and its savepoint stay, and the savepoint undoes the update.
@@ -452,7 +452,7 @@ fn serializable_refuses_one_of_two_transactions_that_each_write_what_the_other_r
         assert_eq!(n_of(session, 1), "0");
         assert_eq!(n_of(session, 2), "0");
     }
-    if turso_mysql::experimental_mvcc_is_on() {
+    if turso_mysql::databases_open_in_mvcc() {
         let waiting = std::thread::spawn(move || {
             let result = one
                 .execute_query("UPDATE c SET n = 1 WHERE id = 1")
@@ -522,7 +522,7 @@ fn a_select_of_no_table_takes_no_snapshot() {
 /// lets the other session write meanwhile.
 #[test]
 fn repeatable_read_takes_its_snapshot_at_the_first_select_and_not_at_a_write() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {
@@ -545,7 +545,7 @@ fn repeatable_read_takes_its_snapshot_at_the_first_select_and_not_at_a_write() {
 /// `SELECT` after them reads what another session committed meanwhile.
 #[test]
 fn a_locking_read_takes_no_snapshot() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {
@@ -567,7 +567,7 @@ fn a_locking_read_takes_no_snapshot() {
 /// own.
 #[test]
 fn read_committed_reads_other_sessions_commits_after_it_wrote() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {
@@ -596,7 +596,7 @@ fn read_committed_reads_other_sessions_commits_after_it_wrote() {
 /// reads a table another session created after the write, and commits.
 #[test]
 fn read_committed_reads_a_table_another_session_created_after_it_wrote() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {
@@ -638,7 +638,7 @@ fn read_committed_reads_a_table_another_session_created_after_it_wrote() {
 /// writing.
 #[test]
 fn serializable_reads_the_latest_rows_and_keeps_them_from_other_writers() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {
@@ -673,7 +673,7 @@ fn serializable_reads_the_latest_rows_and_keeps_them_from_other_writers() {
 /// row, waits, and answers 1205.
 #[test]
 fn a_serializable_select_locks_only_inside_a_transaction() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let TwoSessions {

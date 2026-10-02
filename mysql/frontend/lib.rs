@@ -35,7 +35,10 @@ pub use database_catalog::{
     MySqlAdminCommandResult, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
     MySqlMvccToWal, MySqlMvccToWalError,
 };
-pub use database_open::experimental_mvcc_is_on;
+pub use database_open::{
+    databases_open_in_mvcc, journal_mode_from_environment, JournalMode, JournalModeError,
+    JOURNAL_MODE_VARIABLE,
+};
 pub use database_users::{
     MySqlDatabaseDropped, MySqlStatementNotStarted, DEFAULT_METADATA_LOCK_WAIT,
 };

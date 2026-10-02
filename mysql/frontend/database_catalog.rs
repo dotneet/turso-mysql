@@ -220,7 +220,7 @@ pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlD
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlMvccToWal {
     /// Every committed row is in the database's main file, its MVCC log is
-    /// gone, and it opens in WAL while the experimental MVCC switch is off.
+    /// gone, and it opens in WAL while `TURSO_MYSQL_JOURNAL_MODE=wal` is set.
     Converted,
     /// The database had no MVCC log and opened in WAL, so nothing changed.
     AlreadyWal,
@@ -1390,7 +1390,7 @@ mod tests {
     /// session stays open and goes on writing.
     #[test]
     fn the_catalogs_keeper_empties_a_wal_while_the_session_stays_open() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -1443,7 +1443,7 @@ mod tests {
     /// the database's write lock.
     #[test]
     fn the_keeper_leaves_a_wal_kept_busy_alone_for_a_while() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -1500,7 +1500,7 @@ mod tests {
     /// copy does not need the write lock.
     #[test]
     fn the_keeper_copies_the_wal_while_another_session_writes() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -1558,7 +1558,7 @@ mod tests {
     #[test]
     fn the_keeper_empties_a_wal_once_the_session_holding_the_write_lock_commits() -> CoreResult<()>
     {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -1646,7 +1646,7 @@ mod tests {
             let waiter = waiter.clone();
             move || waiter.execute("INSERT INTO users (name) VALUES ('waited')")
         });
-        let in_the_order_written = if crate::experimental_mvcc_is_on() {
+        let in_the_order_written = if crate::databases_open_in_mvcc() {
             let started = std::time::Instant::now();
             while !inserting.is_finished() && started.elapsed() < Duration::from_secs(5) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -1690,7 +1690,7 @@ mod tests {
 
     #[test]
     fn a_counted_insert_waits_for_the_write_lock_without_a_snapshot() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -1740,7 +1740,7 @@ mod tests {
     /// large as the last write made it and the next open reads all of it.
     #[test]
     fn a_session_that_ends_leaves_an_empty_wal() -> CoreResult<()> {
-        if crate::experimental_mvcc_is_on() {
+        if crate::databases_open_in_mvcc() {
             return Ok(());
         }
         let directory = private_tempdir();
@@ -2649,7 +2649,7 @@ mod tests {
         let connection = session.connection().unwrap();
         assert_eq!(
             connection.inner().mvcc_enabled(),
-            crate::experimental_mvcc_is_on()
+            crate::databases_open_in_mvcc()
         );
         assert_eq!(users_of(connection)?, the_committed_users());
         connection.execute("INSERT INTO users (name) VALUES ('eve')")?;

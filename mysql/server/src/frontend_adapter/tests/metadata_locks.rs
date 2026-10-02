@@ -10,7 +10,7 @@ struct Sessions {
 }
 
 fn sessions() -> Option<Sessions> {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return None;
     }
     let authorizer = Arc::new(RecordingAuthorizer::default());

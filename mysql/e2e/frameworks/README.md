@@ -26,6 +26,11 @@ mysql/e2e/frameworks/run.sh --down            # stop and remove the servers
 `--up` rebuilds the server from the checkout, so after a server change run
 `--up` again before `--dev`.
 
+The turso server opens its databases in MVCC, its default.
+`TURSO_MYSQL_JOURNAL_MODE=wal` on a full run or on `--up` opens them in WAL
+instead; run the apps both ways after a change to locking or transactions, and
+compare the two `summary.md` files.
+
 For benchmarks against MySQL — sysbench on an optimized build of the server,
 and `perf` on the server while one runs — see [bench/README.md](bench/README.md).
 

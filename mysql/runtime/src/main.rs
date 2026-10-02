@@ -18,6 +18,8 @@ use std::{
 #[cfg(unix)]
 use clap::{error::ErrorKind, Parser};
 #[cfg(unix)]
+use turso_mysql::{journal_mode_from_environment, JournalMode, JournalModeError};
+#[cfg(unix)]
 use turso_mysql_checkpoint_authority::{
     AuthorityId, UnixCheckpointAuthorityClient, UnixCheckpointAuthorityClientConfig,
 };
@@ -243,7 +245,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(arguments) {
+    match run(arguments, journal_mode_from_environment()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("MySQL server failed: {error}");
@@ -276,7 +278,11 @@ impl RuntimeShutdownHandle {
 }
 
 #[cfg(unix)]
-fn run(arguments: Arguments) -> Result<(), DaemonError> {
+fn run(
+    arguments: Arguments,
+    journal_mode: Result<JournalMode, JournalModeError>,
+) -> Result<(), DaemonError> {
+    journal_mode.map_err(DaemonError::JournalMode)?;
     let configuration = Configuration::from_arguments(arguments)?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let shutdown: Arc<OnceLock<RuntimeShutdownHandle>> = Arc::new(OnceLock::new());
@@ -426,6 +432,7 @@ fn duration_from_millis(milliseconds: u64) -> Result<Duration, DaemonError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DaemonError {
     Configuration,
+    JournalMode(JournalModeError),
     Authority,
     Bind,
     Signal,
@@ -438,6 +445,7 @@ impl fmt::Display for DaemonError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Configuration => f.write_str("configuration is invalid"),
+            Self::JournalMode(error) => write!(f, "{error}"),
             Self::Authority => f.write_str("checkpoint authority client is unavailable"),
             Self::Bind => f.write_str("server could not be started"),
             Self::Signal => f.write_str("shutdown signal handler is unavailable"),
@@ -464,8 +472,10 @@ mod tests {
 
     use clap::Parser;
 
+    use turso_mysql::JournalModeError;
+
     use super::{
-        duration_from_millis, shutdown_result, Arguments, Configuration, DaemonError,
+        duration_from_millis, run, shutdown_result, Arguments, Configuration, DaemonError,
         DEFAULT_MAX_PREPARED_STMT_COUNT,
     };
 
@@ -717,6 +727,25 @@ mod tests {
         assert_eq!(
             duration_from_millis(24 * 60 * 60 * 1000 + 1),
             Err(DaemonError::Configuration)
+        );
+    }
+
+    #[test]
+    fn a_refused_journal_mode_stops_the_server_before_it_starts() {
+        for refused in [
+            JournalModeError::UnknownMode,
+            JournalModeError::RemovedMvccVariable,
+        ] {
+            let arguments = Arguments::try_parse_from(ARGUMENTS).unwrap();
+            assert_eq!(
+                run(arguments, Err(refused)),
+                Err(DaemonError::JournalMode(refused))
+            );
+        }
+        assert!(
+            DaemonError::JournalMode(JournalModeError::RemovedMvccVariable)
+                .to_string()
+                .contains("TURSO_MYSQL_JOURNAL_MODE=wal")
         );
     }
 

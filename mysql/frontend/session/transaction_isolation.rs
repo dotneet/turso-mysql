@@ -1,9 +1,9 @@
 //! What a transaction sees of what other sessions commit while it runs.
 //!
-//! The engine gives an explicit transaction one read snapshot, taken at its
-//! first read and held until it ends, and one write lock over the whole
-//! database, taken at its first write. MySQL's two levels come out of those
-//! two facts:
+//! In WAL mode (`TURSO_MYSQL_JOURNAL_MODE=wal`) the engine gives an explicit
+//! transaction one read snapshot, taken at its first read and held until it
+//! ends, and one write lock over the whole database, taken at its first
+//! write. MySQL's two levels come out of those two facts:
 //!
 //! - `REPEATABLE READ` is the snapshot held for the whole transaction.
 //! - `READ COMMITTED` lets the snapshot go at every statement until the
@@ -24,7 +24,7 @@
 //! MySQL answers a transaction it cannot finish: 1213, with the transaction
 //! rolled back.
 //!
-//! In MVCC mode (`TURSO_MYSQL_EXPERIMENTAL_MVCC`) writers do not wait for one
+//! In MVCC mode, the default, writers do not wait for one
 //! another, so the levels are kept by moving the transaction's snapshot to
 //! the latest commit before a statement, which keeps the rows the transaction
 //! wrote, and by InnoDB's row locks:

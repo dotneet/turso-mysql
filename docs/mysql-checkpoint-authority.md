@@ -193,6 +193,13 @@ root, account-store root, and socket directory with the ownership and exact
 modes in the table above before starting it. The MySQL socket path, and the
 authority socket path, must each fit the Linux/macOS 103-byte pathname limit.
 
+Databases open in MVCC by default. `TURSO_MYSQL_JOURNAL_MODE=wal` in the
+runtime's environment opens them in WAL instead, and any other value stops it
+before it starts. So does `TURSO_MYSQL_EXPERIMENTAL_MVCC`, the variable that
+turned MVCC on while WAL was the default, whatever its value. A database that
+has opened in MVCC stays in MVCC until
+`turso-mysql-offline-mvcc-to-wal` turns it back; see `mysql/COMPAT.md`.
+
 Runtime numeric bounds are strict:
 
 - `--reload-interval-ms` is from `1000` through `60000`.

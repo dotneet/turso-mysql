@@ -282,7 +282,7 @@ fn a_statement_outside_a_transaction_that_waited_for_another_writes_once_that_on
 }
 
 fn waits_only_without_row_locks<T>(waiting: &std::thread::JoinHandle<T>) {
-    let row_locks = turso_mysql::experimental_mvcc_is_on();
+    let row_locks = turso_mysql::databases_open_in_mvcc();
     let started = std::time::Instant::now();
     while !waiting.is_finished() && started.elapsed() < std::time::Duration::from_secs(5) {
         if !row_locks && started.elapsed() >= std::time::Duration::from_millis(200) {
@@ -443,7 +443,7 @@ fn several_sessions_inserting_counted_rows_at_once_write_every_row_with_its_own_
 /// the key is free again.
 #[test]
 fn a_counted_insert_given_up_for_a_deadlock_writes_nothing() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     let (_directory, sessions) = sessions(3);
@@ -483,7 +483,7 @@ fn a_counted_insert_given_up_for_a_deadlock_writes_nothing() {
 /// commits and the insert answers 1062.
 #[test]
 fn a_counted_insert_takes_its_ids_before_it_waits_for_a_key() {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return;
     }
     struct Case {
@@ -680,7 +680,7 @@ fn a_write_beside_a_serializable_writer_waits_for_it_only_without_row_locks() {
     run(&mut one, "UPDATE tags SET name = 'held' WHERE id = 1");
     run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
     run(&mut two, "BEGIN");
-    if turso_mysql::experimental_mvcc_is_on() {
+    if turso_mysql::databases_open_in_mvcc() {
         run(&mut two, "UPDATE tags SET name = 'beside' WHERE id = 2");
         run(&mut two, "COMMIT");
         run(&mut one, "COMMIT");
@@ -1352,7 +1352,7 @@ fn a_refused_delete_of_every_parent_keeps_only_the_parents_it_reached() {
 }
 
 fn foreign_key_sessions(action: &str) -> Option<TwoSessions> {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return None;
     }
     let mut sessions = two_sessions();
@@ -1379,7 +1379,7 @@ fn foreign_key_sessions(action: &str) -> Option<TwoSessions> {
 }
 
 fn row_lock_sessions() -> Option<TwoSessions> {
-    if !turso_mysql::experimental_mvcc_is_on() {
+    if !turso_mysql::databases_open_in_mvcc() {
         return None;
     }
     let mut sessions = two_sessions();

@@ -42,7 +42,7 @@ const WAL_SUFFIX: &str = "-wal";
 const MAIN_INFO_SUFFIX: &str = ".turso-mysql-main-info";
 const WAL_INFO_SUFFIX: &str = ".turso-mysql-wal-info";
 const ALLOCATOR_SUFFIX: &str = ".turso-mysql-auto-increment";
-/// The logical log a database keeps while the experimental MVCC switch is on.
+/// The logical log a database keeps once it has opened in MVCC.
 const MVCC_LOG_SUFFIX: &str = ".turso-mysql-mvcc-log";
 const PRIVATE_TEMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
@@ -1482,7 +1482,7 @@ impl OsDataRoot {
             }
             return Ok(Some(file));
         }
-        if !crate::database_open::experimental_mvcc_is_on() {
+        if !crate::database_open::databases_open_in_mvcc() {
             return Ok(None);
         }
         self.open_child(&name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600)

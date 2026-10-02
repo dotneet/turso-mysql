@@ -120,9 +120,14 @@ MySQL 名とエンジン名が食い違うものが多い。実装前に `core/f
 
 ```bash
 cargo test -p turso_mysql -p turso_mysql_server -p turso_mysql_parser -p turso_mysql_runtime
+TURSO_MYSQL_JOURNAL_MODE=wal cargo test -p turso_mysql -p turso_mysql_server -p turso_mysql_parser -p turso_mysql_runtime
 cargo clippy -p turso_mysql -p turso_mysql_server -p turso_mysql_parser -p turso_mysql_runtime \
   --all-features --all-targets -- --deny=warnings
 ```
+
+データベースは既定で MVCC で開くので、素の `cargo test` は MVCC を試す。WAL でだけ意味のあるテストは
+`turso_mysql::databases_open_in_mvcc()` を見て飛ばすので、WAL は `TURSO_MYSQL_JOURNAL_MODE=wal`
+を付けた 2 回目でしか試されない。2 回とも通すこと。
 
 `git add` した後に `git diff --cached` で index を必ず確認してからコミットする。
 
