@@ -1375,6 +1375,7 @@ mod tests {
             keeper.wait_for_the_requests_before();
         }
         assert_eq!(attempts(), 1);
+        assert_eq!(keeper.refusals.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(
             keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
             0
@@ -1446,6 +1447,60 @@ mod tests {
             "the committed rows were not copied into the database file"
         );
         holder.execute_transaction_command("ROLLBACK").unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn the_keeper_empties_a_wal_once_the_session_holding_the_write_lock_commits() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        let catalog = MySqlDatabaseCatalog::open(directory.path())
+            .map_err(|_| turso_core::LimboError::InternalError("open catalog".into()))?;
+        catalog.create("kept").unwrap();
+        let mut writing = catalog.new_session(binary_context());
+        writing.select_database("kept").unwrap();
+        let writer = writing.connection().unwrap().clone();
+        let mut holding = catalog.new_session(binary_context());
+        holding.select_database("kept").unwrap();
+        let holder = holding.connection().unwrap().clone();
+        writer.execute("CREATE TABLE records (id INT, label TEXT)")?;
+        for id in 0..20 {
+            writer.execute(&format!(
+                "INSERT INTO records (id, label) VALUES ({id}, 'x')"
+            ))?;
+        }
+        let wal_length = || {
+            fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| entry.file_name().to_string_lossy().ends_with("-wal"))
+                .map(|entry| entry.metadata().unwrap().len())
+                .unwrap()
+        };
+
+        holder
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        holder.execute("INSERT INTO records (id, label) VALUES (20, 'held')")?;
+        writer.truncate_the_wal_past(0)?;
+        let keeper = catalog.wal_keeper.handle();
+        while keeper.refusals.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.execute_transaction_command("COMMIT").unwrap();
+        keeper.wait_for_the_requests_before();
+
+        assert_eq!(
+            keeper.truncated.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(wal_length(), 0);
+        assert_eq!(
+            writer
+                .prepare_select("SELECT COUNT(*) FROM records")?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(21)]]
+        );
         Ok(())
     }
 

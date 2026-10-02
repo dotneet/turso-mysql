@@ -36,6 +36,9 @@ pub(crate) struct WalKeeperHandle {
     /// How many times the thread has tried to empty one.
     #[cfg(test)]
     pub(crate) attempts: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many times the thread's try to empty one was refused.
+    #[cfg(test)]
+    pub(crate) refusals: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 enum Request {
@@ -59,6 +62,8 @@ impl WalKeeper {
             truncated: Arc::default(),
             #[cfg(test)]
             attempts: Arc::default(),
+            #[cfg(test)]
+            refusals: Arc::default(),
         };
         let thread = std::thread::Builder::new()
             .name("turso-mysql-wal-keeper".to_owned())
@@ -136,6 +141,15 @@ impl WalKeeperHandle {
 /// time, about 1,200 attempts a second, nearly all of them refused.
 pub(crate) const PAUSE_AFTER_A_BUSY_WAL: Duration = Duration::from_millis(50);
 
+/// How long the keeper goes on trying a WAL that sessions keep busy, trying
+/// again each time a session lets go of the write lock.
+///
+/// Under a steady write load some session holds the write lock nearly all
+/// the time. Measured with eight sessions inserting, a keeper that tried once
+/// found it held in nine tries out of ten, and the WAL grew past 150 MB in
+/// eight seconds without being emptied once.
+pub(crate) const TIME_TO_WAIT_FOR_A_BUSY_WAL: Duration = Duration::from_millis(100);
+
 fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
     let mut left_busy: Vec<(Weak<Database>, Instant)> = Vec::new();
     while let Ok(request) = received.recv() {
@@ -181,7 +195,12 @@ fn keep(received: Receiver<Request>, handle: WalKeeperHandle) {
             handle
                 .attempts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let truncated = truncate(&database);
+            let truncated = truncate(&database, || {
+                #[cfg(test)]
+                handle
+                    .refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            });
             drop(user);
             match truncated {
                 Ok(Emptied::Yes) => {
@@ -214,33 +233,66 @@ enum Emptied {
     KeptBusy,
 }
 
-/// Empties one database's WAL over a connection of its own. Another session
-/// reading at the same moment keeps the WAL busy, and a later request tries
-/// again.
+/// Empties one database's WAL over a connection of its own. A session that
+/// holds the write lock keeps the WAL busy until it lets go, which the keeper
+/// waits for during [`TIME_TO_WAIT_FOR_A_BUSY_WAL`]. A session reading a
+/// snapshot older than the WAL keeps it busy until that snapshot ends, which
+/// the keeper does not wait for; a later request tries again.
 ///
 /// The frames are first copied into the database file without the write
 /// lock, so the truncation, which holds it, has little left to copy.
-fn truncate(database: &Arc<Database>) -> Result<Emptied> {
+fn truncate(database: &Arc<Database>, on_refusal: impl Fn()) -> Result<Emptied> {
     let connection = database.connect()?;
-    let result = copy_then_truncate(&connection);
+    let result = copy_then_truncate(&connection, on_refusal);
     connection.close()?;
     result
 }
 
-fn copy_then_truncate(connection: &Arc<turso_core::Connection>) -> Result<Emptied> {
-    for mode in [
-        CheckpointMode::Passive {
+fn copy_then_truncate(
+    connection: &Arc<turso_core::Connection>,
+    on_refusal: impl Fn(),
+) -> Result<Emptied> {
+    let copied = copy_into_the_database_file(connection)?;
+    let started = Instant::now();
+    loop {
+        match connection.checkpoint(CheckpointMode::Truncate {
             upper_bound_inclusive: None,
-        },
-        CheckpointMode::Truncate {
-            upper_bound_inclusive: None,
-        },
-    ] {
-        match connection.checkpoint(mode) {
-            Ok(_) => {}
-            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => return Ok(Emptied::KeptBusy),
+        }) {
+            Ok(_) => return Ok(Emptied::Yes),
+            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => on_refusal(),
             Err(error) => return Err(error),
         }
+        if copied.is_some_and(|wal_end| a_snapshot_ends_before(connection, wal_end)) {
+            return Ok(Emptied::KeptBusy);
+        }
+        let Some(left) = TIME_TO_WAIT_FOR_A_BUSY_WAL.checked_sub(started.elapsed()) else {
+            return Ok(Emptied::KeptBusy);
+        };
+        if connection.get_pager().wait_for_lock_release(left).is_none() {
+            return Ok(Emptied::KeptBusy);
+        }
     }
-    Ok(Emptied::Yes)
+}
+
+/// Copies what it can into the database file without the write lock, and
+/// answers the last frame the WAL held when it was done, or `None` when
+/// another checkpoint kept it from starting.
+fn copy_into_the_database_file(connection: &Arc<turso_core::Connection>) -> Result<Option<u64>> {
+    match connection.checkpoint(CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    }) {
+        Ok(copied) => Ok(Some(copied.wal_max_frame)),
+        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a session reads a snapshot that ends before `wal_end`. The frames
+/// after its end cannot be copied into the database file while it reads, so
+/// waiting for the write lock cannot empty the WAL.
+fn a_snapshot_ends_before(connection: &Arc<turso_core::Connection>, wal_end: u64) -> bool {
+    connection
+        .get_pager()
+        .min_pinned_read_frame()
+        .is_some_and(|snapshot_end| snapshot_end < wal_end)
 }
