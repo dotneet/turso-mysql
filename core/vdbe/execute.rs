@@ -13930,9 +13930,9 @@ fn new_rowid_inner(
         match *state.active_op_state.new_rowid() {
             OpNewRowidState::Start => {
                 if let Some(rowid) = trigger_supplied_rowid(program, state, *cursor)? {
-                    if has_mv_store || *prev_largest_reg > 0 {
+                    if *prev_largest_reg > 0 {
                         return Err(LimboError::InternalError(
-                            "a supplied rowid for a trigger's insert needs a plain rowid table"
+                            "a supplied rowid for a trigger's insert needs a table without AUTOINCREMENT"
                                 .to_string(),
                         )
                         .into());

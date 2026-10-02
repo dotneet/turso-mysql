@@ -6245,8 +6245,29 @@ mod tests {
 
     #[test]
     fn a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts() {
+        a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts_in(
+            "trigger-rowid-supplier-wal.db",
+            false,
+        );
+    }
+
+    #[test]
+    fn a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts_under_mvcc() {
+        a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts_in(
+            "trigger-rowid-supplier-mvcc.db",
+            true,
+        );
+    }
+
+    fn a_trigger_rowid_supplier_numbers_only_the_rows_a_trigger_inserts_in(
+        file_name: &str,
+        mvcc: bool,
+    ) {
         let temp_dir = TempDir::new().unwrap();
-        let conn = open_connection(&temp_dir.path().join("trigger-rowid-supplier.db"));
+        let conn = open_connection(&temp_dir.path().join(file_name));
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
         conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
         conn.execute("CREATE TABLE log(id INTEGER PRIMARY KEY, v TEXT)")
