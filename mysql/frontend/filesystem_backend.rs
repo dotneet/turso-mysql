@@ -2707,6 +2707,31 @@ impl RegistryRoot for OsDataRoot {
         Ok(())
     }
 
+    fn remove_the_empty_mvcc_log(
+        &mut self,
+        expected: &DatabaseFileExpectation,
+    ) -> Result<(), RegistryError> {
+        let main = self.open_child(
+            &Self::artifact_name(expected, DatabaseArtifact::Main),
+            libc::O_RDWR,
+            0,
+        )?;
+        if !Self::main_header_matches(&main, expected)? || !main_header_says_wal(&main)? {
+            return Err(RegistryError::Backend);
+        }
+        main.sync_all().map_err(|_| RegistryError::Backend)?;
+        let log_name = Self::artifact_name(expected, DatabaseArtifact::MvccLog);
+        let Some(log) = self.open_child_optional(&log_name, libc::O_RDONLY)? else {
+            return Ok(());
+        };
+        let log = log.metadata().map_err(|_| RegistryError::Backend)?;
+        if !log.is_file() || log.len() != 0 {
+            return Err(RegistryError::Backend);
+        }
+        self.unlink_if_present(&log_name)?;
+        self.fsync_dir()
+    }
+
     fn fsync_dir(&mut self) -> Result<(), RegistryError> {
         #[cfg(test)]
         self.fail_database_artifact_operation(DatabaseArtifactOperation::DirectorySync)?;
@@ -2725,4 +2750,12 @@ impl RegistryRoot for OsDataRoot {
             Err(RegistryError::Backend)
         }
     }
+}
+
+/// Whether a database file's header gives WAL as both its read and its write
+/// file format version.
+fn main_header_says_wal(main: &File) -> Result<bool, RegistryError> {
+    let bytes = OsDataRoot::read_at_start(main, SQLITE_HEADER_BYTES)?;
+    let wal = turso_core::storage::sqlite3_ondisk::Version::Wal as u8;
+    Ok(bytes.len() == SQLITE_HEADER_BYTES && bytes[18..20] == [wal, wal])
 }

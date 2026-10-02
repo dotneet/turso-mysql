@@ -31,8 +31,9 @@ pub use alter_table_indexes::MySqlAlterTableIndexError;
 pub use create_table_as_select::MySqlCreateTableAsSelectError;
 #[cfg(unix)]
 pub use database_catalog::{
-    canonicalize_database_name, MySqlAdminCommandError, MySqlAdminCommandResult,
-    MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+    canonicalize_database_name, convert_database_from_mvcc_to_wal, MySqlAdminCommandError,
+    MySqlAdminCommandResult, MySqlDatabaseCatalog, MySqlDatabaseError, MySqlDatabaseSession,
+    MySqlMvccToWal, MySqlMvccToWalError,
 };
 pub use database_open::experimental_mvcc_is_on;
 pub use database_users::{

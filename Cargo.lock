@@ -7563,6 +7563,7 @@ version = "0.8.1"
 dependencies = [
  "clap",
  "libc",
+ "tempfile",
  "turso_mysql",
  "turso_mysql_checkpoint_authority",
  "turso_mysql_parser",

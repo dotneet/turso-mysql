@@ -306,6 +306,8 @@ pub(crate) enum RegistryError {
     DatabaseNotFound(DatabaseName),
     DatabaseNotReady(DatabaseName),
     DatabaseMarkerMismatch(DatabaseName),
+    /// The engine still has the database open in this process.
+    DatabaseInUse(DatabaseName),
     InvalidRegistryState,
 }
 
@@ -414,6 +416,18 @@ pub(crate) trait RegistryRoot {
     /// and so must the MVCC log of a database that keeps one, which is removed
     /// after the others.
     fn unlink_database(&mut self, expected: &DatabaseFileExpectation) -> Result<(), RegistryError>;
+    /// Removes the MVCC log of a database whose main file says it is in WAL
+    /// mode, after syncing the main file so that the header saying so is on
+    /// disk before the log is gone. The log must be empty. Success when
+    /// there is no log.
+    ///
+    /// The log goes in one unlink and leaves no tombstone: a tombstone beside
+    /// the log the experimental switch makes again would stop the database
+    /// from being dropped.
+    fn remove_the_empty_mvcc_log(
+        &mut self,
+        expected: &DatabaseFileExpectation,
+    ) -> Result<(), RegistryError>;
     fn fsync_dir(&mut self) -> Result<(), RegistryError>;
 }
 
@@ -718,6 +732,26 @@ impl<R: RegistryRoot> DatabaseRegistry<R> {
         self.poison_on_backend_error(unlink)?;
         self.snapshot.entries.remove(&name);
         self.persist_snapshot()
+    }
+
+    /// Removes the MVCC log of a ready database the engine switched back to
+    /// WAL, so that it opens in WAL from then on.
+    ///
+    /// The engine must have let the database go: one still holding it open
+    /// would go on writing the log it was given.
+    pub(crate) fn remove_the_mvcc_log(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<(), RegistryError> {
+        self.ensure_active()?;
+        let name = DatabaseName::parse(requested_name)?;
+        let file_key = self.ready_entry(&name)?.file_key.clone();
+        if self.leases.contains(&name) {
+            return Err(RegistryError::DatabaseInUse(name));
+        }
+        let expected = DatabaseFileExpectation::new(file_key, self.owner_marker());
+        let removal = self.root.remove_the_empty_mvcc_log(&expected);
+        self.poison_on_backend_error(removal)
     }
 
     /// The collation a ready database gives the tables made in it.
@@ -1170,6 +1204,14 @@ mod tests {
             }
             self.files.remove(expected.file_key());
             self.mutations.set(self.mutations.get() + 1);
+            Ok(())
+        }
+
+        fn remove_the_empty_mvcc_log(
+            &mut self,
+            _expected: &DatabaseFileExpectation,
+        ) -> Result<(), RegistryError> {
+            self.event("remove_mvcc_log");
             Ok(())
         }
 

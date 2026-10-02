@@ -191,6 +191,7 @@ impl From<RegistryError> for MySqlDatabaseError {
                 Self::DatabaseNotReady(name.as_str().to_owned())
             }
             RegistryError::DatabaseMarkerMismatch(_) => Self::DatabaseIntegrity,
+            RegistryError::DatabaseInUse(name) => Self::DatabaseBusy(name.as_str().to_owned()),
             RegistryError::InvalidOpaqueFileKey
             | RegistryError::DuplicateOpaqueFileKey
             | RegistryError::UnsupportedManifestVersion(_)
@@ -213,6 +214,58 @@ pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlD
         .map_err(MySqlDatabaseError::from)?
         .as_str()
         .to_owned())
+}
+
+/// What turning a database from MVCC back to WAL did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlMvccToWal {
+    /// Every committed row is in the database's main file, its MVCC log is
+    /// gone, and it opens in WAL while the experimental MVCC switch is off.
+    Converted,
+    /// The database had no MVCC log and opened in WAL, so nothing changed.
+    AlreadyWal,
+}
+
+/// Why a database was not turned from MVCC back to WAL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlMvccToWalError {
+    /// Another catalog, such as a running server's, has the data root open.
+    DataRootInUse,
+    /// The catalog refused the database or the change.
+    Database(MySqlDatabaseError),
+}
+
+impl fmt::Display for MySqlMvccToWalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DataRootInUse => f.write_str("the data root is open in another process"),
+            Self::Database(error) => error.fmt(f),
+        }
+    }
+}
+
+impl Error for MySqlMvccToWalError {}
+
+/// Turns a database that was opened in MVCC back to WAL, offline.
+///
+/// The engine checkpoints the MVCC log into the main file and switches the
+/// file's header to WAL; the log is removed only after that header is synced.
+/// The data root must not be open anywhere else, which is what keeps every
+/// session off the database while this runs: a running server holds the
+/// root's lock until it stops, and this holds it until it returns. A crash at
+/// any point leaves a database that opens with every committed row, and
+/// running this again finishes the change.
+pub fn convert_database_from_mvcc_to_wal(
+    root_path: impl AsRef<Path>,
+    requested_name: &str,
+) -> Result<MySqlMvccToWal, MySqlMvccToWalError> {
+    let mut catalog = DatabaseCatalog::open(root_path).map_err(|error| match error {
+        RegistryError::RegistryAlreadyOpen => MySqlMvccToWalError::DataRootInUse,
+        error => MySqlMvccToWalError::Database(error.into()),
+    })?;
+    catalog
+        .convert_from_mvcc_to_wal(requested_name)
+        .map_err(|error| MySqlMvccToWalError::Database(error.into()))
 }
 
 /// Public, pathless owner of one trusted MySQL logical-database catalog.
@@ -983,6 +1036,33 @@ impl DatabaseCatalog {
     /// Reports whether a canonical logical database is ready.
     pub(crate) fn contains(&self, requested_name: &str) -> Result<bool, RegistryError> {
         self.registry.contains(requested_name)
+    }
+
+    /// Switches a database opened in MVCC back to WAL and removes its log.
+    ///
+    /// No other connection may have the database open: the engine's switch
+    /// leaves no MVCC store behind for one.
+    pub(crate) fn convert_from_mvcc_to_wal(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<MySqlMvccToWal, RegistryError> {
+        let database = self.acquire(requested_name)?;
+        if !database.mvcc_enabled() {
+            return Ok(MySqlMvccToWal::AlreadyWal);
+        }
+        let connection = database.connect().map_err(|_| RegistryError::Backend)?;
+        let switched = connection
+            .pragma_update("journal_mode", "'wal'")
+            .map_err(|_| RegistryError::Backend)?;
+        assert_eq!(
+            switched,
+            vec![vec![turso_core::Value::from_text("wal")]],
+            "the engine did not switch the database to WAL"
+        );
+        connection.close().map_err(|_| RegistryError::Backend)?;
+        drop((connection, database));
+        self.registry.remove_the_mvcc_log(requested_name)?;
+        Ok(MySqlMvccToWal::Converted)
     }
 }
 
@@ -2490,5 +2570,208 @@ mod tests {
             }
         }
         held
+    }
+
+    #[test]
+    fn a_database_turned_back_from_mvcc_to_wal_keeps_its_rows_schema_and_counter() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        an_mvcc_database_with_rows(directory.path())?;
+        assert!(fs::metadata(mvcc_log_of(directory.path())).unwrap().len() > 0);
+
+        assert_eq!(
+            convert_database_from_mvcc_to_wal(directory.path(), "kept"),
+            Ok(MySqlMvccToWal::Converted)
+        );
+        let key = file_key_in(directory.path());
+        let mut files = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.contains(&key))
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        assert_eq!(
+            files,
+            [
+                key.clone(),
+                format!("{key}-wal"),
+                format!("{key}.turso-mysql-auto-increment"),
+                format!("{key}.turso-mysql-main-info"),
+                format!("{key}.turso-mysql-wal-info"),
+            ]
+        );
+        assert_eq!(header_versions_of(directory.path()), [2, 2]);
+
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let connection = session.connection().unwrap();
+        assert_eq!(
+            connection.inner().mvcc_enabled(),
+            crate::experimental_mvcc_is_on()
+        );
+        assert_eq!(users_of(connection)?, the_committed_users());
+        connection.execute("INSERT INTO users (name) VALUES ('eve')")?;
+        assert_eq!(connection.last_insert_id(), 5);
+        assert!(connection
+            .execute("INSERT INTO users (name) VALUES ('ann')")
+            .is_err());
+        Ok(())
+    }
+
+    /// The engine has switched the database to WAL and the log is still
+    /// there, empty: what a crash before the log is removed leaves.
+    #[test]
+    fn a_database_left_switched_to_wal_with_its_log_opens_and_is_turned_back_again(
+    ) -> CoreResult<()> {
+        let directory = private_tempdir();
+        an_mvcc_database_with_rows(directory.path())?;
+        switch_to_wal_and_stop_before_the_log_goes(directory.path())?;
+        assert_eq!(header_versions_of(directory.path()), [2, 2]);
+        assert_eq!(
+            fs::metadata(mvcc_log_of(directory.path())).unwrap().len(),
+            0
+        );
+
+        assert_eq!(users_in(directory.path())?, the_committed_users());
+        assert_eq!(
+            convert_database_from_mvcc_to_wal(directory.path(), "kept"),
+            Ok(MySqlMvccToWal::Converted)
+        );
+        assert!(!mvcc_log_of(directory.path()).exists());
+        assert_eq!(users_in(directory.path())?, the_committed_users());
+        Ok(())
+    }
+
+    #[test]
+    fn a_database_is_not_turned_back_to_wal_while_a_server_has_its_data_root_open() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        an_mvcc_database_with_rows(directory.path())?;
+        let log_length = fs::metadata(mvcc_log_of(directory.path())).unwrap().len();
+        let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+
+        assert_eq!(
+            convert_database_from_mvcc_to_wal(directory.path(), "kept"),
+            Err(MySqlMvccToWalError::DataRootInUse)
+        );
+        let connection = session.connection().unwrap();
+        assert_eq!(users_of(connection)?, the_committed_users());
+        assert_eq!(
+            fs::metadata(mvcc_log_of(directory.path())).unwrap().len(),
+            log_length
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_registry_keeps_the_mvcc_log_of_an_open_database_or_one_still_in_mvcc() -> CoreResult<()>
+    {
+        let directory = private_tempdir();
+        an_mvcc_database_with_rows(directory.path())?;
+        let log_length = fs::metadata(mvcc_log_of(directory.path())).unwrap().len();
+        let mut catalog = DatabaseCatalog::open(directory.path()).unwrap();
+        let database = catalog.acquire("kept").unwrap();
+        assert_eq!(
+            catalog.registry.remove_the_mvcc_log("kept"),
+            Err(RegistryError::DatabaseInUse(
+                DatabaseName::parse("kept").unwrap()
+            ))
+        );
+        drop(database);
+
+        assert_eq!(
+            catalog.registry.remove_the_mvcc_log("kept"),
+            Err(RegistryError::Backend)
+        );
+        assert_eq!(
+            fs::metadata(mvcc_log_of(directory.path())).unwrap().len(),
+            log_length
+        );
+        drop(catalog);
+        assert_eq!(users_in(directory.path())?, the_committed_users());
+        Ok(())
+    }
+
+    /// Writes rows into a database the catalog opens in MVCC: the catalog
+    /// hands the engine a log it finds there whatever the switch says.
+    fn an_mvcc_database_with_rows(directory: &Path) -> CoreResult<()> {
+        let catalog = MySqlDatabaseCatalog::open(directory).unwrap();
+        catalog.create("kept").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(mvcc_log_of(directory))
+            .unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let connection = session.connection().unwrap();
+        assert!(connection.inner().mvcc_enabled());
+        connection.execute(
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))",
+        )?;
+        connection.execute("CREATE UNIQUE INDEX by_name ON users (name)")?;
+        connection.execute("INSERT INTO users (name) VALUES ('ann'), ('bob'), ('cy')")?;
+        connection.execute("DELETE FROM users WHERE id = 3")?;
+        connection
+            .execute_transaction_command("START TRANSACTION")
+            .unwrap();
+        connection.execute("INSERT INTO users (name) VALUES ('dee')")?;
+        connection.execute_transaction_command("COMMIT").unwrap();
+        Ok(())
+    }
+
+    fn switch_to_wal_and_stop_before_the_log_goes(directory: &Path) -> CoreResult<()> {
+        let catalog = MySqlDatabaseCatalog::open(directory).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        let switched = session
+            .connection()
+            .unwrap()
+            .inner()
+            .pragma_update("journal_mode", "'wal'")?;
+        assert_eq!(switched, vec![vec![Value::from_text("wal")]]);
+        Ok(())
+    }
+
+    fn mvcc_log_of(directory: &Path) -> std::path::PathBuf {
+        directory.join(format!("{}.turso-mysql-mvcc-log", file_key_in(directory)))
+    }
+
+    fn header_versions_of(directory: &Path) -> [u8; 2] {
+        let header = fs::read(directory.join(file_key_in(directory))).unwrap();
+        [header[18], header[19]]
+    }
+
+    fn file_key_in(directory: &Path) -> String {
+        fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .find(|name| name.starts_with("db_") && !name.contains(['.', '-']))
+            .unwrap()
+    }
+
+    fn users_in(directory: &Path) -> CoreResult<Vec<Vec<Value>>> {
+        let catalog = MySqlDatabaseCatalog::open(directory).unwrap();
+        let mut session = catalog.new_session(binary_context());
+        session.select_database("kept").unwrap();
+        users_of(session.connection().unwrap())
+    }
+
+    fn users_of(connection: &MySqlConnection) -> CoreResult<Vec<Vec<Value>>> {
+        connection
+            .prepare_select("SELECT id, name FROM users ORDER BY id")?
+            .run_collect_rows()
+    }
+
+    fn the_committed_users() -> Vec<Vec<Value>> {
+        vec![
+            vec![Value::from_i64(1), Value::from_text("ann")],
+            vec![Value::from_i64(2), Value::from_text("bob")],
+            vec![Value::from_i64(4), Value::from_text("dee")],
+        ]
     }
 }

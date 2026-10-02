@@ -13,12 +13,19 @@ description = "Offline account-store initialization and recovery for Turso MySQL
 name = "turso-mysql-offline-provision"
 path = "src/main.rs"
 
+[[bin]]
+name = "turso-mysql-offline-mvcc-to-wal"
+path = "src/mvcc_to_wal.rs"
+
 [dependencies]
 clap = { workspace = true, features = ["derive"] }
 turso_mysql.workspace = true
 turso_mysql_parser.workspace = true
 turso_mysql_server.workspace = true
 zeroize = "=1.8.2"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.172"

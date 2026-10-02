@@ -5071,6 +5071,28 @@ others off the rows read — and while it holds the slot a `BEGIN CONCURRENT`
 writer in another session is answered 1213 at commit where MySQL lets it
 commit, or waits, if it touched those rows.
 
+A database opened while `TURSO_MYSQL_EXPERIMENTAL_MVCC=1` is set gets a
+`<file key>.turso-mysql-mvcc-log` file beside its other files, and it keeps
+opening in MVCC after the switch is turned off, because that log can hold
+committed rows its main file does not have yet. To turn it back to WAL, stop
+the server, unset the switch, and run
+
+```sh
+turso-mysql-offline-mvcc-to-wal --data-root <data root> --database <name>
+```
+
+It copies every row in the log into the main file, has the engine mark the
+file as WAL, syncs the main file, and only then removes the log, in one
+unlink. It refuses (exit 3) while another process has the data root open — a
+running server holds the root's lock until it stops, so no session can use
+the database meanwhile — and refuses (exit 2) while the switch is set in its
+own environment, since a server started with the switch would open the
+database in MVCC again. A database that already opens in WAL is left as it
+is. A crash at any point leaves a database that opens with every committed
+row: before the log is removed it opens in MVCC again from its empty log,
+and running the command again finishes the change. The schema and the
+`AUTO_INCREMENT` counters come through unchanged.
+
 A `DATE` holds the day alone. Measured on 8.4.11: the column reports type 10
 with length 10, the width of `YYYY-MM-DD`, decimals 0, the binary collation and
 the binary flag, and `SHOW CREATE TABLE` prints `date`. `CURDATE()` and
