@@ -83,7 +83,7 @@ where
         connection.close()?;
     }
     if let Some(store) = database.get_mv_store().as_ref() {
-        store.set_exclusive_tx_and_writers_wait(true);
+        store.set_writers_wait_for_exclusive_tx(true);
     }
     Ok(database)
 }

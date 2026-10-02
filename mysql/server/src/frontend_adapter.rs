@@ -5255,7 +5255,7 @@ fn execute_checked_query(
     options: CheckedQueryOptions<'_>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     if changes_a_table_definition(sql) {
-        return connection.waiting_for_metadata_locks(|| {
+        return connection.waiting_for_metadata_locks(!makes_a_new_table_or_view(sql), || {
             execute_checked_statement(connection, sql, selected_database, source_tables, options)
         });
     }
@@ -5284,6 +5284,24 @@ fn changes_a_table_definition(sql: &str) -> bool {
     ["CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME"]
         .iter()
         .any(|word| first_word.eq_ignore_ascii_case(word))
+}
+
+/// Whether a definition statement makes a table or a view, which no other
+/// transaction can be using yet. Measured on MySQL 8.4.11: `CREATE TABLE d`
+/// goes ahead at once while another transaction has written to `t`, where
+/// `ALTER TABLE t` waits for it.
+fn makes_a_new_table_or_view(sql: &str) -> bool {
+    let mut words = strip_leading_sql_comments(sql)
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty());
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("CREATE"))
+        && words.next().is_some_and(|word| {
+            ["TABLE", "TEMPORARY", "VIEW", "OR"]
+                .iter()
+                .any(|kind| word.eq_ignore_ascii_case(kind))
+        })
 }
 
 fn first_word(sql: &str) -> &str {

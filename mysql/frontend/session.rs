@@ -244,6 +244,7 @@ struct RestoresLockWait<'a> {
 impl Drop for RestoresLockWait<'_> {
     fn drop(&mut self) {
         self.connection.set_busy_timeout(self.wait);
+        self.connection.set_exclusive_tx_waits_for_writers(false);
     }
 }
 
@@ -4063,10 +4064,20 @@ impl MySqlConnection {
     /// `TRUNCATE TABLE`, `CREATE INDEX`, `RENAME TABLE` and `LOCK TABLES` on a
     /// table another open transaction wrote each answer 1205 after one
     /// second. Such a statement waits only for the table's metadata lock, and
-    /// here the engine's one write lock stands for it.
-    pub fn waiting_for_metadata_locks<T>(&self, run: impl FnOnce() -> T) -> T {
+    /// here the engine's one write lock stands for it: under MVCC its
+    /// exclusive transaction, which waits for every transaction that has
+    /// begun writing, when `changes_what_others_use` says the statement changes
+    /// or locks a table other transactions can be using. A `CREATE TABLE` of a
+    /// new table is not one, and waits for no writer, as MySQL's does not.
+    pub fn waiting_for_metadata_locks<T>(
+        &self,
+        changes_what_others_use: bool,
+        run: impl FnOnce() -> T,
+    ) -> T {
         let row_lock_wait = self.inner.get_busy_timeout();
         self.inner.set_busy_timeout(self.metadata_lock_wait());
+        self.inner
+            .set_exclusive_tx_waits_for_writers(changes_what_others_use);
         let restores = RestoresLockWait {
             connection: &self.inner,
             wait: row_lock_wait,
@@ -4149,7 +4160,7 @@ impl MySqlConnection {
     /// — a write transaction cannot be opened inside another.
     pub fn lock_tables(&self) -> std::result::Result<(), MySqlQueryError> {
         self.unlock_tables()?;
-        self.waiting_for_metadata_locks(|| self.run_engine_statement("BEGIN IMMEDIATE"))?;
+        self.waiting_for_metadata_locks(true, || self.run_engine_statement("BEGIN IMMEDIATE"))?;
         *self.tables_locked.lock().unwrap() = true;
         Ok(())
     }

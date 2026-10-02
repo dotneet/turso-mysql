@@ -394,6 +394,51 @@ fn an_update_of_a_row_another_transaction_holds_waits_and_gives_up_with_1205() {
     assert_eq!(names(&mut two), ["waited"]);
 }
 
+/// A `SERIALIZABLE` transaction that wrote holds the database's one
+/// exclusive write, under WAL and under MVCC alike, so a write of another
+/// transaction waits for it to end rather than failing when it commits, and
+/// gives up with 1205 after `innodb_lock_wait_timeout`. MySQL lets a write
+/// to a row the `SERIALIZABLE` transaction did not touch go ahead at once.
+#[test]
+fn a_write_beside_a_serializable_writer_waits_for_it_to_end() {
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions();
+    run(
+        &mut one,
+        "INSERT INTO tags (id, name) VALUES (1, 'news'), (2, 'rust')",
+    );
+    run(
+        &mut one,
+        "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    run(&mut one, "BEGIN");
+    run(&mut one, "UPDATE tags SET name = 'held' WHERE id = 1");
+    run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+    run(&mut two, "BEGIN");
+    assert_eq!(
+        two.execute_query("UPDATE tags SET name = 'gave up' WHERE id = 2")
+            .err(),
+        Some(FrontendErrorKind::DatabaseBusy)
+    );
+
+    let waiting = std::thread::spawn(move || {
+        let result = two
+            .execute_query("UPDATE tags SET name = 'waited' WHERE id = 2")
+            .map(|_| ());
+        (two, result)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!waiting.is_finished());
+    run(&mut one, "COMMIT");
+    let (mut two, result) = waiting.join().unwrap();
+    assert_eq!(result, Ok(()));
+    run(&mut two, "COMMIT");
+    assert_eq!(names(&mut two), ["held", "waited"]);
+}
+
 /// Measured on MySQL 8.4.11: an update of a row another transaction changed
 /// waits for that transaction, then changes the row it committed, though the
 /// waiting transaction's own reads keep the snapshot they took.

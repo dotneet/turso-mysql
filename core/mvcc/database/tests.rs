@@ -887,7 +887,7 @@ fn an_internal_helper_inside_a_transaction_stays_in_it() {
 #[test]
 fn a_concurrent_write_waits_for_an_exclusive_transaction_when_asked_to() {
     let db = MvccTestDb::new();
-    db.mvcc_store.set_exclusive_tx_and_writers_wait(true);
+    db.mvcc_store.set_writers_wait_for_exclusive_tx(true);
     db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
     let writer = db.db.connect().unwrap();
 
@@ -917,7 +917,8 @@ fn a_concurrent_write_waits_for_an_exclusive_transaction_when_asked_to() {
 #[test]
 fn an_exclusive_transaction_waits_for_a_concurrent_writer_when_asked_to() {
     let db = MvccTestDb::new();
-    db.mvcc_store.set_exclusive_tx_and_writers_wait(true);
+    db.mvcc_store.set_writers_wait_for_exclusive_tx(true);
+    db.conn.set_exclusive_tx_waits_for_writers(true);
     db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
     let writer = db.db.connect().unwrap();
     let reader = db.db.connect().unwrap();
@@ -938,6 +939,35 @@ fn an_exclusive_transaction_waits_for_a_concurrent_writer_when_asked_to() {
     reader.execute("COMMIT").unwrap();
     assert_eq!(
         get_rows(&reader, "SELECT x FROM t ORDER BY x"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
+fn a_concurrent_commit_waits_for_an_exclusive_transaction_when_asked_to() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_writers_wait_for_exclusive_tx(true);
+    db.conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    let writer = db.db.connect().unwrap();
+    writer.set_busy_timeout(std::time::Duration::from_secs(30));
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.conn.execute("BEGIN IMMEDIATE").unwrap();
+    db.conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    let committing = std::thread::spawn(move || {
+        let committed = writer.execute("COMMIT");
+        (writer, committed)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!committing.is_finished());
+    db.conn.execute("COMMIT").unwrap();
+
+    let (writer, committed) = committing.join().unwrap();
+    committed.unwrap();
+    assert!(writer.get_auto_commit());
+    assert_eq!(
+        get_rows(&db.conn, "SELECT x FROM t ORDER BY x"),
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
     );
 }
@@ -9032,7 +9062,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
     // Now try to acquire exclusive lock for the tx that started before the
     // read-only dependent committed. Should succeed because the read-only tx
     // did not advance last_committed_tx_ts.
-    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, None);
+    let acquire_result = mvcc_store.acquire_exclusive_tx(&exclusive_tx_id, false, None);
     assert!(
         acquire_result.is_ok(),
         "acquire_exclusive_tx should not return Busy after a read-only dependent committed: {acquire_result:?}",

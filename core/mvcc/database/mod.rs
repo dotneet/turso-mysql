@@ -3243,6 +3243,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 });
                 // We allow reads from happening. Exlusive means there is a single writer.
                 if exclusive_conflict && !read_only {
+                    if mvcc_store
+                        .writers_wait_for_exclusive_tx
+                        .load(Ordering::SeqCst)
+                    {
+                        return Err(LimboError::Busy);
+                    }
                     return Err(LimboError::WriteWriteConflict);
                 }
                 if schema_conflict && !read_only {
@@ -4467,12 +4473,13 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// If there is no exclusive transaction, the field is set to `NO_EXCLUSIVE_TX`.
     exclusive_tx: AtomicU64,
-    /// When set, an exclusive transaction starts only once no `BEGIN CONCURRENT`
-    /// transaction has begun writing, and a write statement of a `BEGIN
-    /// CONCURRENT` transaction waits while another transaction is exclusive.
+    /// When set, a `BEGIN CONCURRENT` transaction waits while another
+    /// transaction is exclusive, both to start writing and to commit what it
+    /// wrote, and an exclusive transaction of a connection that asks for it
+    /// starts only once no `BEGIN CONCURRENT` transaction has begun writing.
     /// Off, a concurrent writer runs beside an exclusive transaction and fails
     /// when it commits.
-    exclusive_tx_and_writers_wait: AtomicBool,
+    writers_wait_for_exclusive_tx: AtomicBool,
     commit_coordinator: Arc<CommitCoordinator>,
     global_header: Arc<RwLock<Option<DatabaseHeader>>>,
     /// Held by checkpoints only during the brief in-memory publish phase; the I/O-heavy
@@ -4681,7 +4688,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             clock,
             storage,
             exclusive_tx: AtomicU64::new(NO_EXCLUSIVE_TX),
-            exclusive_tx_and_writers_wait: AtomicBool::new(false),
+            writers_wait_for_exclusive_tx: AtomicBool::new(false),
             commit_coordinator: Arc::new(CommitCoordinator::new()),
             global_header: Arc::new(RwLock::new(None)),
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
@@ -6567,8 +6574,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         expected_schema_generation: Option<u64>,
         checkpoint_read_guard: CheckpointReadLockState,
     ) -> Result<TxID> {
-        #[cfg(not(any(test, injected_yields)))]
-        let _ = connection;
         turso_assert!(
             maybe_existing_tx_id.is_none() || !checkpoint_read_guard.is_held(),
             "checkpoint read guard is only passed for fresh MVCC begins"
@@ -6674,16 +6679,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         let already_exclusive = self.is_exclusive_tx(&tx_id);
         if !already_exclusive {
-            self.acquire_exclusive_tx(&tx_id, exclusive_yield_context)
-                .inspect_err(|_| {
-                    // Fresh txns were already published into `txs` above; undo
-                    // that so a failed begin doesn't leave a phantom Active txn
-                    // pinning the LWM forever.
-                    if maybe_existing_tx_id.is_none() {
-                        self.txs.remove(&tx_id);
-                    }
-                    unlock_checkpoint_guard();
-                })?;
+            self.acquire_exclusive_tx(
+                &tx_id,
+                connection.exclusive_tx_waits_for_writers(),
+                exclusive_yield_context,
+            )
+            .inspect_err(|_| {
+                // Fresh txns were already published into `txs` above; undo
+                // that so a failed begin doesn't leave a phantom Active txn
+                // pinning the LWM forever.
+                if maybe_existing_tx_id.is_none() {
+                    self.txs.remove(&tx_id);
+                }
+                unlock_checkpoint_guard();
+            })?;
         }
 
         // Hoist: validate the existing tx still exists and snapshot the
@@ -7853,16 +7862,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         })
     }
 
-    /// Makes exclusive transactions and the writes of `BEGIN CONCURRENT`
-    /// transactions wait for each other, rather than letting a concurrent
-    /// writer run beside an exclusive transaction and fail when it commits.
-    pub fn set_exclusive_tx_and_writers_wait(&self, wait: bool) {
-        self.exclusive_tx_and_writers_wait
+    /// Makes the writes and commits of `BEGIN CONCURRENT` transactions wait
+    /// for an exclusive transaction, rather than letting a concurrent writer
+    /// run beside it and fail when it commits; see
+    /// [`Connection::set_exclusive_tx_waits_for_writers`] for the other way.
+    pub fn set_writers_wait_for_exclusive_tx(&self, wait: bool) {
+        self.writers_wait_for_exclusive_tx
             .store(wait, Ordering::SeqCst);
     }
 
     pub(crate) fn begin_writing_in_concurrent_tx(&self, tx_id: TxID) -> Result<()> {
-        if !self.exclusive_tx_and_writers_wait.load(Ordering::SeqCst) {
+        if !self.writers_wait_for_exclusive_tx.load(Ordering::SeqCst) {
             return Ok(());
         }
         let tx = self
@@ -7895,6 +7905,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn acquire_exclusive_tx(
         &self,
         tx_id: &TxID,
+        waits_for_writers: bool,
         yield_context: Option<&YieldContext>,
     ) -> Result<()> {
         #[cfg(not(any(test, injected_yields)))]
@@ -7947,7 +7958,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.release_exclusive_tx(tx_id);
                     return Err(LimboError::Busy);
                 }
-                if self.exclusive_tx_and_writers_wait.load(Ordering::SeqCst) {
+                if waits_for_writers {
                     std::sync::atomic::fence(Ordering::SeqCst);
                     if self.has_writing_tx_other_than(*tx_id) {
                         self.release_exclusive_tx(tx_id);
