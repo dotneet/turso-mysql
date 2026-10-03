@@ -1816,3 +1816,84 @@ fn a_security_keys_binary_id_reaches_the_client_as_its_bytes() {
     crate::dispatcher::encode_binary_result_set(PacketCodec::new(16_777_215).unwrap(), 0, found)
         .expect("the row crosses to the client");
 }
+
+/// Gitea's CRAN registry lists each package's newest version by joining
+/// every version to the ones published after it and keeping those nothing
+/// joined to, a tie in time going to the larger id.
+#[test]
+fn the_cran_index_lists_each_packages_newest_version() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `package` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NOT NULL, `repo_id` BIGINT(20) NULL, `type` VARCHAR(255) NOT NULL, `name` VARCHAR(255) NOT NULL, `lower_name` VARCHAR(255) NOT NULL, `semver_compatible` TINYINT(1) DEFAULT false NOT NULL, `is_internal` TINYINT(1) DEFAULT false NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_version` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `package_id` BIGINT(20) NOT NULL, `creator_id` BIGINT(20) DEFAULT 0 NOT NULL, `version` VARCHAR(255) NOT NULL, `lower_version` VARCHAR(255) NOT NULL, `created_unix` BIGINT(20) NOT NULL, `is_internal` TINYINT(1) DEFAULT false NOT NULL, `metadata_json` LONGTEXT NULL, `download_count` BIGINT(20) DEFAULT 0 NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_file` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `version_id` BIGINT(20) NOT NULL, `blob_id` BIGINT(20) NOT NULL, `name` VARCHAR(255) NOT NULL, `lower_name` VARCHAR(255) NOT NULL, `composite_key` VARCHAR(255) NULL, `is_lead` TINYINT(1) DEFAULT false NOT NULL, `created_unix` BIGINT(20) NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_property` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `ref_type` BIGINT(20) NOT NULL, `ref_id` BIGINT(20) NOT NULL, `name` VARCHAR(255) NOT NULL, `value` LONGTEXT NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "INSERT INTO package (owner_id, repo_id, type, name, lower_name) VALUES (1, 0, 'cran', 'zeta', 'zeta'), (1, 0, 'cran', 'alpha', 'alpha'), (2, 0, 'cran', 'other', 'other')",
+        "INSERT INTO package_version (package_id, version, lower_version, created_unix, is_internal) VALUES (1, '1.0', '1.0', 100, 0), (1, '1.1', '1.1', 300, 0), (2, '0.1', '0.1', 200, 0), (2, '0.2', '0.2', 200, 0), (2, '0.3', '0.3', 900, 1), (3, '9', '9', 5, 0)",
+        "INSERT INTO package_file (version_id, blob_id, name, lower_name, created_unix) VALUES (1, 1, 'a', 'a', 1), (2, 1, 'b', 'b', 1), (3, 1, 'c', 'c', 1), (4, 1, 'd', 'd', 1), (4, 1, 'e', 'e', 1), (5, 1, 'f', 'f', 1), (6, 1, 'g', 'g', 1)",
+        "INSERT INTO package_property (ref_type, ref_id, name, value) VALUES (2, 1, 'cran.platform', 'source'), (2, 2, 'cran.platform', 'source'), (2, 3, 'cran.platform', 'source'), (2, 4, 'cran.platform', 'source'), (2, 5, 'cran.platform', 'source'), (2, 6, 'cran.platform', 'source'), (2, 7, 'cran.platform', 'source'), (2, 4, 'cran.platform', 'source')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let found = prepared_rows(
+        &mut adapter,
+        "SELECT package_version.* FROM `package_version` LEFT JOIN `package_version` `pv2` ON package_version.package_id = pv2.package_id AND pv2.is_internal = ? AND (package_version.created_unix < pv2.created_unix OR (package_version.created_unix = pv2.created_unix AND package_version.id < pv2.id)) INNER JOIN `package` ON package.id = package_version.package_id INNER JOIN `package_file` ON package_file.version_id = package_version.id WHERE package.owner_id=? AND package.type=? AND package_version.is_internal=? AND 1=(SELECT COUNT(*) FROM package_property WHERE package_property.ref_type=? AND (package_property.ref_id = package_file.id) AND package_property.name=? AND package_property.value=?) AND (pv2.id IS NULL) ORDER BY `package`.`name` ASC",
+        &[
+            Bound::Whole(0),
+            Bound::Whole(1),
+            Bound::Word("cran"),
+            Bound::Whole(0),
+            Bound::Whole(2),
+            Bound::Word("cran.platform"),
+            Bound::Word("source"),
+        ],
+    );
+    let whole = BinaryResultValue::Integer;
+    let text = |value: &str| BinaryResultValue::Text(value.to_owned());
+    let version = |id, package_id, name: &str, created_unix| {
+        vec![
+            whole(id),
+            whole(package_id),
+            whole(0),
+            text(name),
+            text(name),
+            whole(created_unix),
+            whole(0),
+            BinaryResultValue::Null,
+            whole(0),
+        ]
+    };
+    assert_eq!(
+        found.rows,
+        [version(4, 2, "0.2", 200), version(2, 1, "1.1", 300)],
+        "MySQL 8.4.11 keeps 0.2 over 0.1 published at the same moment, and leaves out 0.3 as internal"
+    );
+    let shapes = found
+        .columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_str(),
+                column.column_type,
+                column.flags
+                    & (MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG | MYSQL_BLOB_FLAG),
+            )
+        })
+        .collect::<Vec<_>>();
+    let required = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    assert_eq!(
+        shapes,
+        [
+            ("id", MYSQL_TYPE_LONGLONG, MYSQL_NOT_NULL_FLAG),
+            ("package_id", MYSQL_TYPE_LONGLONG, required),
+            ("creator_id", MYSQL_TYPE_LONGLONG, MYSQL_NOT_NULL_FLAG),
+            ("version", MYSQL_TYPE_VAR_STRING, required),
+            ("lower_version", MYSQL_TYPE_VAR_STRING, required),
+            ("created_unix", MYSQL_TYPE_LONGLONG, required),
+            ("is_internal", MYSQL_TYPE_TINY, MYSQL_NOT_NULL_FLAG),
+            ("metadata_json", MYSQL_TYPE_BLOB, MYSQL_BLOB_FLAG),
+            ("download_count", MYSQL_TYPE_LONGLONG, MYSQL_NOT_NULL_FLAG),
+        ],
+        "MySQL 8.4.11 reports each column as the version table declares it"
+    );
+}

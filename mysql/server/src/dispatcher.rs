@@ -1560,9 +1560,6 @@ fn binary_result_value_to_row_value<'a>(
         BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::Bytes) => {
             Ok(BinaryRowValue::Bytes(value))
         }
-        // A `VARBINARY` or `BINARY` column reports the type a `VARCHAR` does
-        // and crosses as its bytes, length-encoded, the way the `VARCHAR`'s
-        // text does — Gitea's `webauthn_credential.credential_id`.
         BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::String) => {
             Ok(BinaryRowValue::Bytes(value))
         }

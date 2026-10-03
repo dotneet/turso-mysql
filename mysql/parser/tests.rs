@@ -1957,6 +1957,32 @@ fn a_join_names_its_tables_and_equates_whole_columns() {
     }
 }
 
+/// An `ON` may offer its join either of two conditions, each checked the way
+/// it would be on its own — how a statement keeps the newest row of each
+/// group by joining every row to the ones after it.
+#[test]
+fn a_join_matches_rows_on_either_of_two_conditions() {
+    let translated = parse_select(
+        "SELECT v.id FROM versions AS v LEFT JOIN versions AS later ON v.package_id = later.package_id AND (v.created < later.created OR (v.created = later.created AND v.id < later.id)) WHERE later.id IS NULL",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "SELECT \"v\".\"id\" FROM \"versions\" AS \"v\" LEFT JOIN \"versions\" AS \"later\" ",
+            "ON ((\"v\".\"package_id\" = \"later\".\"package_id\") AND (((\"v\".\"created\" < \"later\".\"created\") ",
+            "OR (((\"v\".\"created\" = \"later\".\"created\") AND (\"v\".\"id\" < \"later\".\"id\")))))) ",
+            "WHERE (\"later\".\"id\" IS NULL)"
+        )
+    );
+    assert!(parse_select(
+        "SELECT v.id FROM versions AS v LEFT JOIN versions AS later ON v.id = later.id OR later.name LIKE 'a%'",
+        SessionSqlMode::default(),
+    )
+    .is_err());
+}
+
 /// A subquery naming the outer statement's column is a correlated one, and it
 /// is written with the same predicate a join is: a column on each side, each
 /// saying which table it came from.

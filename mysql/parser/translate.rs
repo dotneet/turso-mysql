@@ -2031,6 +2031,15 @@ fn render_join_predicate(
             render_join_predicate(left, render_context.as_deref_mut())?,
             render_join_predicate(right, render_context)?
         )),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Or,
+            right,
+        } => Ok(format!(
+            "({} OR {})",
+            render_join_predicate(left, render_context.as_deref_mut())?,
+            render_join_predicate(right, render_context)?
+        )),
         // Inside a `SELECT` the two columns are recorded and held to each other
         // below; an `UPDATE` or a `DELETE` has nowhere to record them.
         Expr::BinaryOp {

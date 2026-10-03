@@ -251,7 +251,7 @@ the rest, by the tests it ends:
 
 | Statement | State |
 |---|---|
-| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package`, `package_version LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` | refused: a derived table cut by a `LIMIT` joined beside another table, and an `ON` that is not an equality. Most `TestPackage*` tests. The blob read comparing a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` is taken |
+| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package` | refused: a derived table cut by a `LIMIT` joined beside another table. Most `TestPackage*` tests. The blob read comparing a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` and the newest-version join `LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` are taken |
 | `ALTER DATABASE ... COLLATE utf8mb4_bin`, `utf8mb4_0900_as_cs` | refused, a database collation other than `utf8mb4_0900_ai_ci` and `utf8mb4_unicode_ci`; Gitea logs it and runs on a case-insensitive database, and `TestDatabaseCollation` fails |
 
 ### DDL
@@ -442,6 +442,7 @@ speaks; anything measured here from now on has to pass that flag.
 | `SET group_concat_max_len` below 4, or read from a user variable | refused; measured, MySQL takes anything below 4 as 4 with warning 1292 (`Truncated incorrect group_concat_max_len value: '0'`) |
 | `SET @x = @@group_concat_max_len` past the largest `BIGINT` | refused; a user variable here holds no unsigned number |
 | A `GROUP_CONCAT` column of a statement sorting its groups by anything but the grouped columns, or of `SELECT DISTINCT` over groups | reports the shape it has unsorted; measured, MySQL reads it out of a table it sorts through — a `VAR_STRING` with 0 decimals up to 512, past it a `BLOB` of 16 bytes to each (16384 at 1024) with the blob flag — and every other aggregate column of the statement loses its binary flag there too |
+| A statement joining tables ordered by the columns of one table it does not read first — `SELECT package_version.* FROM package_version INNER JOIN package ON ... ORDER BY package.name` | reports each column with its keys; measured on 8.4.11, MySQL sorts such rows through a table of its own and reports the columns without `PRI_KEY`, `PART_KEY` and `AUTO_INCREMENT`. Which table it reads first turns on how many rows each holds, so the shape cannot be told from the statement alone. The values and every other flag match |
 | A `GROUP_CONCAT` in a `UNION`, `EXCEPT` or `INTERSECT` branch | refused; it used to be answered with a column of type NULL, and measured, MySQL reports a `VAR_STRING` with 0 decimals up to 512 and a `BLOB` of 65536 with the blob flag at 1024. Each branch counts its cuts for itself: `UNION ALL` of two cut calls warns `Row 3` twice |
 | `SHOW TABLE STATUS` with a `WHERE` other than `Name = 'table'` | refused; the `FROM`/`IN`, `LIKE` and TablePlus's `WHERE Name = 'table'` forms work, and any other `WHERE` is a predicate over the eighteen columns rather than a pattern |
 | `SHOW TABLE STATUS` storage figures | answered NULL; InnoDB keeps them and this does not |
