@@ -361,6 +361,7 @@ pub enum FrontendErrorKind {
     IncorrectValue,
     /// An integer result left `BIGINT`'s range.
     NumericOverflow,
+    DivisionByZero,
     /// A `GROUP_CONCAT` a statement writes was longer than the session's
     /// `group_concat_max_len`.
     GroupConcatCut,
@@ -611,6 +612,7 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
         FrontendErrorKind::NumericOverflow => {
             (1690, *b"22003", b"BIGINT value is out of range".as_slice())
         }
+        FrontendErrorKind::DivisionByZero => (1365, *b"22012", b"Division by 0".as_slice()),
         // Measured on MySQL 8.4.11: the warning a `SELECT` raises becomes this
         // error under strict mode when the value is written, and MySQL's
         // message names the row, where the message here stays fixed.

@@ -23424,11 +23424,23 @@ fn an_update_assigns_arithmetic_over_the_row_it_changes() {
         panic!("SELECT must return a result set");
     };
     assert_eq!(halved.rows, vec![vec![Some(b"10".to_vec())]]);
-    // One that does not is refused: MySQL rounds the fraction into the column
-    // and the engine will not store it.
-    assert!(adapter
+    adapter
         .execute_query("UPDATE counters SET b = b / 3 WHERE id = 2")
-        .is_err());
+        .unwrap();
+    let CommandExecutionResult::ResultSet(rounded) = adapter
+        .execute_query("SELECT b FROM counters WHERE id = 2")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rounded.rows,
+        vec![vec![Some(b"3".to_vec())]],
+        "measured on MySQL 8.4.11: 10 / 3 rounds into the column as 3"
+    );
+    adapter
+        .execute_query("UPDATE counters SET b = 10 WHERE id = 2")
+        .unwrap();
 
     // The other order is answered, because nothing reads what was assigned.
     adapter
@@ -26919,13 +26931,34 @@ fn a_set_scales_a_column_down_by_dividing_it() {
         "UPDATE t SET ratio = n / 0 WHERE id = 1",
         // Only a written divisor says which of the two a statement would get.
         "UPDATE t SET ratio = n / id WHERE id = 1",
-        // MySQL rounds a fraction into a whole-number column and the engine
-        // refuses the value, so the shape is refused rather than answered
-        // differently.
-        "UPDATE t SET n = n / 3 WHERE id = 1",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
     }
+
+    for sql in [
+        "UPDATE t SET n = n / 3 WHERE id = 1",
+        "UPDATE t SET n = n / 2 WHERE id = 2",
+        "UPDATE t SET n = n / 3 WHERE id = 3",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let CommandExecutionResult::ResultSet(rounded) = adapter
+        .execute_query("SELECT n FROM t ORDER BY id")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        rounded.rows,
+        vec![
+            vec![Some(b"3".to_vec())],
+            vec![Some(b"3".to_vec())],
+            vec![Some(b"2".to_vec())],
+        ],
+        "measured on MySQL 8.4.11: 10 / 3, 5 / 2 and 7 / 3 round into an INT as 3, 3 and 2"
+    );
 }
 
 /// `ON t.id = u.team_id AND t.name = 'red'` is how a statement narrows the

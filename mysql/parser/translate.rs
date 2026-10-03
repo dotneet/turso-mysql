@@ -5858,6 +5858,20 @@ fn render_update_assignment_value(
             }
             Ok(format!("numeric_sub('0', {})", render_update_assignment_value(expr, written, assigned, render_context)?))
         }
+        _ if divides_whole_numbers(value)
+            && !render_context
+                .decimal_columns
+                .iter()
+                .any(|(column, _)| column.eq_ignore_ascii_case(written))
+            && (!render_context.knows_the_integer_columns
+                || render_context
+                    .integer_columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(written))) =>
+        {
+            render_context.falls_back_in_a_set = true;
+            render_quotient_rounded_into_a_whole_number(value, assigned, render_context)
+        }
         // `SET ratio = score / 2` is how a statement scales a column down.
         // MySQL's `/` is decimal division where the engine's is integer
         // division, and what lands in the column is rounded to the column's
@@ -6070,6 +6084,174 @@ fn render_update_assignment_value(
             }
             Ok(rendered)
         }
+    }
+}
+
+fn divides_whole_numbers(value: &Expr) -> bool {
+    match value {
+        Expr::Nested(inner) => divides_whole_numbers(inner),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Divide,
+            right,
+        } => whole_number_operand(left) && whole_number_operand(right),
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } => {
+            let branches = conditions
+                .iter()
+                .map(|when| &when.result)
+                .chain(std::iter::once(otherwise.as_ref()));
+            let mut divides = false;
+            for branch in branches {
+                if divides_whole_numbers(branch) {
+                    divides = true;
+                } else if !whole_number_operand(branch) {
+                    return false;
+                }
+            }
+            divides
+        }
+        _ => false,
+    }
+}
+
+fn whole_number_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => whole_number_operand(inner),
+        Expr::Identifier(_) => true,
+        Expr::CompoundIdentifier(parts) => parts.len() == 2,
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply,
+            right,
+        } => whole_number_operand(left) && whole_number_operand(right),
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } => conditions
+            .iter()
+            .map(|when| &when.result)
+            .chain(std::iter::once(otherwise.as_ref()))
+            .all(whole_number_operand),
+        _ => direct_signed_integer(expr).is_some(),
+    }
+}
+
+fn render_quotient_rounded_into_a_whole_number(
+    value: &Expr,
+    assigned: &[String],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    match value {
+        Expr::Nested(inner) => {
+            render_quotient_rounded_into_a_whole_number(inner, assigned, render_context)
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Divide,
+            right,
+        } => Ok(format!(
+            "CAST(mysql_decimal_div_round({}, {}, 0) AS INTEGER)",
+            render_whole_number_operand(left, assigned, render_context)?,
+            render_whole_number_operand(right, assigned, render_context)?
+        )),
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } => {
+            let mut rendered = String::from("(CASE");
+            for when in conditions {
+                let condition = render_dml_predicate(&when.condition, render_context)?;
+                let result = render_quotient_rounded_into_a_whole_number(
+                    &when.result,
+                    assigned,
+                    render_context,
+                )?;
+                rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
+            }
+            let otherwise =
+                render_quotient_rounded_into_a_whole_number(otherwise, assigned, render_context)?;
+            rendered.push_str(&format!(" ELSE {otherwise} END)"));
+            Ok(rendered)
+        }
+        _ => render_whole_number_operand(value, assigned, render_context),
+    }
+}
+
+fn render_whole_number_operand(
+    expr: &Expr,
+    assigned: &[String],
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    match expr {
+        Expr::Nested(inner) => Ok(format!(
+            "({})",
+            render_whole_number_operand(inner, assigned, render_context)?
+        )),
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+            let Some((qualifier, column)) = named_column(expr) else {
+                return unsupported("UPDATE quotient over a name that is not a column");
+            };
+            if assigned
+                .iter()
+                .any(|earlier| earlier.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported("UPDATE assignment reading a column it has already assigned");
+            }
+            if render_context.knows_the_integer_columns
+                && !render_context
+                    .integer_columns
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&column.value))
+            {
+                return unsupported("UPDATE quotient over a column that holds no whole number");
+            }
+            Ok(match qualifier {
+                Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
+                None => render_ident(column),
+            })
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let operator = match op {
+                BinaryOperator::Plus => "+",
+                BinaryOperator::Minus => "-",
+                BinaryOperator::Multiply => "*",
+                _ => return unsupported("UPDATE quotient over this operator"),
+            };
+            Ok(format!(
+                "({} {operator} {})",
+                render_whole_number_operand(left, assigned, render_context)?,
+                render_whole_number_operand(right, assigned, render_context)?
+            ))
+        }
+        Expr::Case {
+            operand: None,
+            conditions,
+            else_result: Some(otherwise),
+            ..
+        } => {
+            let mut rendered = String::from("(CASE");
+            for when in conditions {
+                let condition = render_dml_predicate(&when.condition, render_context)?;
+                let result = render_whole_number_operand(&when.result, assigned, render_context)?;
+                rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
+            }
+            let otherwise = render_whole_number_operand(otherwise, assigned, render_context)?;
+            rendered.push_str(&format!(" ELSE {otherwise} END)"));
+            Ok(rendered)
+        }
+        _ => match direct_signed_integer(expr) {
+            Some(number) => Ok(number.to_string()),
+            None => unsupported("UPDATE quotient over something that is not a whole number"),
+        },
     }
 }
 

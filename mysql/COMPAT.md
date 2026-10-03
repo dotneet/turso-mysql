@@ -473,11 +473,15 @@ the way in, which is what makes the two agree: measured on 8.4.11, 10 divided by
 `DECIMAL(10,2)` is 3.33, 5 by 2 is 2.50, and a scaled column halved is 1.50, all of which this
 now writes.
 
-The divisor has to be a written number that is not zero. Dividing by zero answers NULL in the
-engine where MySQL raises 1365 for a write, and only a written divisor says which of the two a
-statement would get. A fraction written into a whole-number column is refused as well: MySQL
-rounds it into the column and the engine will not store it. One that divides evenly writes the
-number MySQL writes — measured, 20 halved is 10 in both.
+Into a `DECIMAL` the divisor has to be a written number that is not zero. Dividing by zero
+answers NULL in the engine where MySQL raises 1365 for a write, and only a written divisor says
+which of the two a statement would get. Into a whole-number column MySQL rounds the quotient
+half away from zero, and so does this, for any quotient of whole-number columns and written
+whole numbers — a divisor read from the row included, and inside a `CASE`, which is how Gitea
+keeps a milestone's completeness: `SET completeness = (CASE WHEN is_closed = ? AND num_issues
+= 0 THEN 100 ELSE 100*num_closed_issues/(CASE WHEN num_issues > 0 THEN num_issues ELSE 1 END)
+END)`. Measured on 8.4.11, 2 of 3 is 67, 1 of 8 is 13, -1 of 8 is -13 and 9999 of 2000000 is
+0, and a zero divisor is 1365, `Division by 0`, leaving the row as it was, as here.
 
 One shape is refused for a reason worth knowing. MySQL reads the columns a `SET` has already
 assigned in the values after them: measured, `SET a = 100, b = a` leaves `b` at 100, where the

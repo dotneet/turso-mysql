@@ -14052,6 +14052,9 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
         LimboError::Constraint(message) if message.starts_with("CHECK constraint failed") => {
             FrontendErrorKind::CheckConstraintViolated
         }
+        LimboError::Constraint(message) if message == "division by zero" => {
+            FrontendErrorKind::DivisionByZero
+        }
         LimboError::Constraint(_) | LimboError::Raise(..) | LimboError::NullValue => {
             FrontendErrorKind::ConstraintViolation
         }

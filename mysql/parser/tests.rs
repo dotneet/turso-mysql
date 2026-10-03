@@ -3210,6 +3210,42 @@ fn a_membership_test_reads_a_derived_table_as_the_body_it_passes_through() {
 }
 
 #[test]
+fn a_quotient_written_into_a_whole_number_column_is_rounded_there() {
+    let mode = SessionSqlMode::default();
+    let sql = "UPDATE `milestone` SET completeness=(CASE WHEN is_closed = ? AND num_issues = 0 THEN 100 ELSE 100*num_closed_issues/(CASE WHEN num_issues > 0 THEN num_issues ELSE 1 END) END) WHERE id=?";
+    let first = parse_dml(sql, mode).unwrap();
+    assert!(first.falls_back_in_a_set());
+    let known = parse_dml_knowing_column_types(
+        sql,
+        mode,
+        &[],
+        &[],
+        &[
+            "id".to_owned(),
+            "is_closed".to_owned(),
+            "num_issues".to_owned(),
+            "num_closed_issues".to_owned(),
+            "completeness".to_owned(),
+        ],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        known.as_sql(),
+        "UPDATE \"milestone\" SET \"completeness\" = ((CASE WHEN ((\"is_closed\" = ?) AND (\"num_issues\" = 0)) THEN 100 ELSE CAST(mysql_decimal_div_round((100 * \"num_closed_issues\"), ((CASE WHEN (\"num_issues\" > 0) THEN \"num_issues\" ELSE 1 END)), 0) AS INTEGER) END)) WHERE (\"id\" = ?)"
+    );
+    assert!(parse_dml_knowing_column_types(
+        "UPDATE milestone SET completeness = num_closed_issues / name",
+        mode,
+        &[],
+        &[],
+        &["num_closed_issues".to_owned(), "completeness".to_owned()],
+        &["name".to_owned()],
+    )
+    .is_err());
+}
+
+#[test]
 fn a_distinct_count_reads_its_column_through_parentheses() {
     let translated = parse_select(
         "SELECT owner_id AS org_id, COUNT(DISTINCT(repository.id)) as repo_count FROM `repository` INNER JOIN `org_user` ON owner_id = org_user.org_id WHERE (org_user.uid = ?) AND (repository.is_private=? OR repository.id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id WHERE team_user.uid=?)) GROUP BY owner_id",
@@ -5692,12 +5728,6 @@ fn rejects_dml_and_numeric_forms_outside_the_strict_signed_slice() {
     for sql in [
         "INSERT INTO t VALUES (1)",
         "UPDATE t SET value = 1 LIMIT 1",
-        // Dividing a column is taken when the divisor is a written number that
-        // is not zero. Dividing by zero answers NULL in the engine where MySQL
-        // raises 1365 for a write, and a divisor read from the row says which
-        // of the two a statement would get only when it runs.
-        "UPDATE t SET value = value / 0",
-        "UPDATE t SET value = value / other",
         "UPDATE t SET value = CONCAT('1', '2')",
     ] {
         assert!(matches!(

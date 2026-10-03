@@ -1575,3 +1575,94 @@ fn a_milestone_is_found_by_any_of_its_names_without_regard_to_case() {
         ["3"]
     );
 }
+
+#[test]
+fn a_milestones_completeness_rounds_its_share_of_closed_issues() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `milestone` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL, `is_closed` TINYINT(1) NULL, `num_issues` INT NULL, `num_closed_issues` INT NULL, `completeness` INT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "INSERT INTO milestone (is_closed, num_issues, num_closed_issues) VALUES (0, 3, 2), (0, 3, 1), (1, 0, 0), (0, 6, 1), (0, 0, 0), (0, 8, 1), (0, 2000000, 9999), (0, 8, -1), (0, NULL, 1), (0, 5, NULL), (1, 4, 4), (0, 7, 3)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for id in 1..=12 {
+        let result = prepared(
+            &mut adapter,
+            "UPDATE `milestone` SET completeness=(CASE WHEN is_closed = ? AND num_issues = 0 THEN 100 ELSE 100*num_closed_issues/(CASE WHEN num_issues > 0 THEN num_issues ELSE 1 END) END) WHERE id=?",
+            &[Bound::Whole(1), Bound::Whole(id)],
+        );
+        assert!(
+            matches!(result, Ok(PreparedStatementExecutionResult::Ok(_))),
+            "{result:?}"
+        );
+    }
+    let completeness = |adapter: &mut Adapter| {
+        rows(adapter, "SELECT completeness FROM milestone ORDER BY id")
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>()
+    };
+    let numbers = |numbers: &[Option<&str>]| {
+        numbers
+            .iter()
+            .map(|number| number.map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        completeness(&mut adapter),
+        numbers(&[
+            Some("67"),
+            Some("33"),
+            Some("100"),
+            Some("17"),
+            Some("0"),
+            Some("13"),
+            Some("0"),
+            Some("-13"),
+            Some("100"),
+            None,
+            Some("100"),
+            Some("43")
+        ]),
+        "MySQL 8.4.11 rounds each share half away from zero into the column"
+    );
+    run(
+        &mut adapter,
+        "UPDATE milestone SET completeness = num_closed_issues / 2",
+    );
+    assert_eq!(
+        completeness(&mut adapter),
+        numbers(&[
+            Some("1"),
+            Some("1"),
+            Some("0"),
+            Some("1"),
+            Some("0"),
+            Some("1"),
+            Some("5000"),
+            Some("-1"),
+            Some("1"),
+            None,
+            Some("2"),
+            Some("2")
+        ]),
+        "MySQL 8.4.11 writes 9999 / 2 as 5000 and -1 / 2 as -1"
+    );
+    assert_eq!(
+        adapter.execute_query(
+            "UPDATE milestone SET completeness = num_closed_issues / num_issues WHERE id = 5"
+        ),
+        Err(FrontendErrorKind::DivisionByZero),
+        "MySQL 8.4.11 answers 1365 and leaves the row as it was"
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT completeness FROM milestone WHERE id = 5"
+        ),
+        [vec![Some("0".to_owned())]]
+    );
+    assert!(adapter
+        .execute_query("UPDATE milestone SET completeness = num_closed_issues / (num_issues / 2)")
+        .is_err());
+}
