@@ -4564,6 +4564,156 @@ fn a_lookup_by_key_steps_over_no_b_tree_rows_past_that_key() {
     assert_eq!(rows_and_steps("SELECT count(*) FROM t").0, vec![999]);
 }
 
+#[test]
+fn a_range_scan_checks_only_the_b_tree_rows_it_returns_or_passes() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INT PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=1000 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 400..=600 {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id} + 1000)"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let rows_and_steps = |sql: &str| -> (Vec<i64>, u64) {
+        crate::mvcc::cursor::BTREE_ROWS_STEPPED.with(|stepped| stepped.set(0));
+        let rows = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        (
+            rows,
+            crate::mvcc::cursor::BTREE_ROWS_STEPPED.with(|stepped| stepped.get()),
+        )
+    };
+
+    let (rows, stepped) = rows_and_steps("SELECT v FROM t WHERE id BETWEEN 450 AND 453");
+    assert_eq!(rows, vec![1450, 1451, 1452, 1453]);
+    assert!(stepped <= 6, "the scan stepped over {stepped} B-tree rows");
+    let (rows, stepped) =
+        rows_and_steps("SELECT v FROM t WHERE id BETWEEN 450 AND 453 ORDER BY id DESC");
+    assert_eq!(rows, vec![1453, 1452, 1451, 1450]);
+    assert!(stepped <= 6, "the scan stepped over {stepped} B-tree rows");
+}
+
+#[test]
+fn index_scans_over_rows_split_between_the_b_tree_and_the_version_store_return_every_visible_row() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INT PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in (2..=400).step_by(2) {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let mut expected: std::collections::BTreeMap<i64, i64> =
+        (2..=400).step_by(2).map(|id| (id, id)).collect();
+    conn.execute("BEGIN").unwrap();
+    for id in 100..=300 {
+        let change = match id % 6 {
+            0 => format!("UPDATE t SET v = {} WHERE id = {id}", id + 1000),
+            1 | 5 => format!("INSERT INTO t VALUES ({id}, {})", id + 2000),
+            2 => format!("DELETE FROM t WHERE id = {id}"),
+            _ => continue,
+        };
+        conn.execute(&change).unwrap();
+        match id % 6 {
+            0 => {
+                expected.insert(id, id + 1000);
+            }
+            1 | 5 => {
+                expected.insert(id, id + 2000);
+            }
+            _ => {
+                expected.remove(&id);
+            }
+        }
+    }
+    for id in (150..=250).step_by(2) {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id} + 3000)"))
+            .unwrap();
+        expected.insert(id, id + 3000);
+    }
+    conn.execute("COMMIT").unwrap();
+    let other = db.connect();
+    other.execute("BEGIN CONCURRENT").unwrap();
+    other
+        .execute("INSERT INTO t VALUES (201, 0), (207, 0), (1001, 0)")
+        .unwrap();
+    other.execute("DELETE FROM t WHERE id = 202").unwrap();
+
+    let pairs = |sql: &str| -> Vec<(i64, i64)> {
+        conn.prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row[0].as_int().unwrap(), row[1].as_int().unwrap()))
+            .collect()
+    };
+    for (low, high) in [
+        (1, 1000),
+        (95, 105),
+        (149, 251),
+        (180, 182),
+        (199, 204),
+        (290, 310),
+    ] {
+        let wanted: Vec<(i64, i64)> = expected
+            .range(low..=high)
+            .map(|(id, v)| (*id, *v))
+            .collect();
+        assert_eq!(
+            pairs(&format!(
+                "SELECT id, v FROM t WHERE id BETWEEN {low} AND {high} ORDER BY id"
+            )),
+            wanted
+        );
+        let mut descending = wanted.clone();
+        descending.reverse();
+        assert_eq!(
+            pairs(&format!(
+                "SELECT id, v FROM t WHERE id BETWEEN {low} AND {high} ORDER BY id DESC"
+            )),
+            descending
+        );
+        assert_eq!(
+            pairs(&format!(
+                "SELECT id, v FROM t WHERE id > {low} AND id < {high} ORDER BY id"
+            )),
+            wanted
+                .iter()
+                .copied()
+                .filter(|(id, _)| *id != low && *id != high)
+                .collect::<Vec<_>>()
+        );
+    }
+    other.execute("ROLLBACK").unwrap();
+}
+
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]

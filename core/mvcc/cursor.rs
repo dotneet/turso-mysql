@@ -244,6 +244,17 @@ impl<A: ConcurrentAllocator> DualCursorPeek<A> {
             self.mvcc_peek.get_row_key(),
             self.btree_peek.get_row_key()
         );
+        if let CursorPeek::PastTheVersionStorePeek { key: btree_key } = &self.btree_peek {
+            let mvcc_key = self
+                .mvcc_peek
+                .get_row_key()
+                .expect("a B-tree row is left unchecked only behind a version store row");
+            turso_assert!(
+                comes_before(mvcc_key, btree_key, dir),
+                "a B-tree row left unchecked was not checked once the version store reached it"
+            );
+            return Some((mvcc_key.clone(), false, self.mvcc_peek.get_versions()));
+        }
         match (self.mvcc_peek.get_row_key(), self.btree_peek.get_row_key()) {
             (Some(mvcc_key), Some(btree_key)) => {
                 if dir == IterationDirection::Forwards {
@@ -315,6 +326,9 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
         /// Resolved MVCC version chain, set when this peek came from the MVCC
         /// table iterator. `None` for btree peeks and index peeks.
         versions: Option<RowVersions<A>>,
+    },
+    PastTheVersionStorePeek {
+        key: RowKey,
     },
     Exhausted,
 }
@@ -1093,6 +1107,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
+                        Some(k)
+                            if self.btree_key_is_past_the_version_store_peek(
+                                &k,
+                                IterationDirection::Forwards,
+                            ) =>
+                        {
+                            self.dual_peek.btree_peek =
+                                CursorPeek::PastTheVersionStorePeek { key: k };
+                            self.btree_advance_state = None;
+                            return Ok(IOResult::Done(()));
+                        }
                         Some(_) => {
                             // shadowed by MVCC, continue to next
                             self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
@@ -1119,9 +1144,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextCheckBtreeKey) => {
                     let key = self.get_btree_current_key()?;
-                    if let Some(key) = key {
-                        if self.version_store_peeks_at(&key)
-                            || self.btree_row_is_valid_forward(&key)
+                    match key {
+                        Some(key)
+                            if self.version_store_peeks_at(&key)
+                                || self.btree_row_is_valid_forward(&key) =>
                         {
                             self.dual_peek.btree_peek = CursorPeek::Row {
                                 key,
@@ -1130,13 +1156,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
-                        // Row is shadowed by MVCC, continue to next
-                        // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next` call
-                        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                    } else {
-                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
+                        Some(k)
+                            if self.btree_key_is_past_the_version_store_peek(
+                                &k,
+                                IterationDirection::Forwards,
+                            ) =>
+                        {
+                            self.dual_peek.btree_peek =
+                                CursorPeek::PastTheVersionStorePeek { key: k };
+                            self.btree_advance_state = None;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(_) => {
+                            // Row is shadowed by MVCC, continue to next
+                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
+                        }
+                        None => {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            self.btree_advance_state = None;
+                            return Ok(IOResult::Done(()));
+                        }
                     }
                 }
             }
@@ -1187,6 +1226,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
+                        Some(k)
+                            if self.btree_key_is_past_the_version_store_peek(
+                                &k,
+                                IterationDirection::Backwards,
+                            ) =>
+                        {
+                            self.dual_peek.btree_peek =
+                                CursorPeek::PastTheVersionStorePeek { key: k };
+                            self.btree_advance_state = None;
+                            return Ok(IOResult::Done(()));
+                        }
                         Some(_) => {
                             // shadowed by MVCC, continue to prev
                             self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
@@ -1222,6 +1272,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                                 key: k,
                                 versions: None,
                             };
+                            self.btree_advance_state = None;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(k)
+                            if self.btree_key_is_past_the_version_store_peek(
+                                &k,
+                                IterationDirection::Backwards,
+                            ) =>
+                        {
+                            self.dual_peek.btree_peek =
+                                CursorPeek::PastTheVersionStorePeek { key: k };
                             self.btree_advance_state = None;
                             return Ok(IOResult::Done(()));
                         }
@@ -1421,6 +1482,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                                 key: k,
                                 versions: None,
                             };
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(k) if self.btree_key_is_past_the_version_store_peek(&k, direction) => {
+                            self.dual_peek.btree_peek =
+                                CursorPeek::PastTheVersionStorePeek { key: k };
                             return Ok(IOResult::Done(()));
                         }
                         Some(_) => {
@@ -2039,6 +2105,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.state
                     .replace(MvccLazyCursorState::Next(NextState::Advance));
                 inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
+            } else if self
+                .version_store_reached_the_unchecked_btree_row(IterationDirection::Forwards)
+            {
+                self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
+                self.state
+                    .replace(MvccLazyCursorState::Next(NextState::Advance));
+                inject_io_yield!(self, CursorYieldPoint::NextBtreeAdvance);
             }
         }
 
@@ -2130,6 +2203,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 self.state
                     .replace(MvccLazyCursorState::Prev(PrevState::Advance));
                 inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
+            } else if self
+                .version_store_reached_the_unchecked_btree_row(IterationDirection::Backwards)
+            {
+                self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
+                self.state
+                    .replace(MvccLazyCursorState::Prev(PrevState::Advance));
+                inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
             }
         }
 
@@ -2144,6 +2224,30 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.state = None;
 
         Ok(IOResult::Done(()))
+    }
+
+    fn btree_key_is_past_the_version_store_peek(
+        &self,
+        key: &RowKey,
+        direction: IterationDirection,
+    ) -> bool {
+        matches!(self.mv_cursor_type, MvccCursorType::Index(_))
+            && self
+                .dual_peek
+                .mvcc_peek
+                .get_row_key()
+                .is_some_and(|peek| comes_before(peek, key, direction))
+    }
+
+    fn version_store_reached_the_unchecked_btree_row(&self, direction: IterationDirection) -> bool {
+        let CursorPeek::PastTheVersionStorePeek { key } = &self.dual_peek.btree_peek else {
+            return false;
+        };
+        !self
+            .dual_peek
+            .mvcc_peek
+            .get_row_key()
+            .is_some_and(|peek| comes_before(peek, key, direction))
     }
 
     fn seek_row(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
@@ -2614,4 +2718,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
 fn count_a_b_tree_step() {
     #[cfg(test)]
     BTREE_ROWS_STEPPED.with(|stepped| stepped.set(stepped.get() + 1));
+}
+
+fn comes_before(key: &RowKey, other: &RowKey, direction: IterationDirection) -> bool {
+    match direction {
+        IterationDirection::Forwards => key < other,
+        IterationDirection::Backwards => key > other,
+    }
 }
