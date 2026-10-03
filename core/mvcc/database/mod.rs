@@ -4396,6 +4396,7 @@ pub struct RecoverCtx {
     schema_rows: HashMap<i64, ImmutableRecord>,
     dropped_root_pages: HashSet<i64>,
     current_schema: Arc<Schema>,
+    current_schema_is_behind: bool,
     index_infos: HashMap<(MVTableId, IndexOpKind), Arc<IndexInfo>>,
 }
 
@@ -10335,6 +10336,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             schema_rows,
                             dropped_root_pages: HashSet::default(),
                             current_schema,
+                            current_schema_is_behind: false,
                             index_infos: HashMap::default(),
                         }),
                     };
@@ -10352,6 +10354,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                             break;
                         };
                         self.recover_process_frame(connection, ctx, frame)?;
+                    }
+                    if ctx.current_schema_is_behind {
+                        let schema = self.recover_build_schema(
+                            connection,
+                            &ctx.schema_rows,
+                            ctx.cookie,
+                            &ctx.preserved_table_valued_functions,
+                        )?;
+                        *connection.schema.write() = schema.clone();
+                        *connection.db.schema.lock() = schema.clone();
+                        ctx.current_schema = schema;
+                        ctx.current_schema_is_behind = false;
                     }
                     let max_commit_ts_seen = ctx.max_commit_ts_seen;
                     let persistent_tx_ts_max = ctx.persistent_tx_ts_max;
@@ -10405,6 +10419,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut schema_rows = std::mem::take(&mut ctx.schema_rows);
         let mut dropped_root_pages = std::mem::take(&mut ctx.dropped_root_pages);
         let mut current_schema = ctx.current_schema.clone();
+        let mut current_schema_is_behind = ctx.current_schema_is_behind;
         let mut index_infos = std::mem::take(&mut ctx.index_infos);
 
         let install_schema = |schema: Arc<Schema>| {
@@ -10518,14 +10533,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // schema_rows_after is Some if the frame changes the schema
             let schema_rows_after = schema_rows_after;
 
-            let schema_after = match schema_rows_after.as_ref() {
-                Some(schema_rows_after) => Some(self.recover_build_schema(
+            let frame_decodes_index_entries = frame.iter().any(|op| {
+                matches!(
+                    op,
+                    ParsedOp::UpsertIndex { .. } | ParsedOp::DeleteIndex { .. }
+                )
+            });
+            if frame_decodes_index_entries && current_schema_is_behind {
+                current_schema = self.recover_build_schema(
                     connection,
-                    schema_rows_after,
+                    &schema_rows,
                     cookie,
                     &ctx.preserved_table_valued_functions,
-                )?),
-                None => None,
+                )?;
+                install_schema(current_schema.clone());
+                current_schema_is_behind = false;
+                index_infos.clear();
+            }
+            let schema_after = match schema_rows_after.as_ref() {
+                Some(schema_rows_after) if frame_decodes_index_entries => {
+                    Some(self.recover_build_schema(
+                        connection,
+                        schema_rows_after,
+                        cookie,
+                        &ctx.preserved_table_valued_functions,
+                    )?)
+                }
+                _ => None,
             };
 
             if schema_rows_after.is_some() {
@@ -10977,17 +11011,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
             }
 
-            if schema_rows_after.is_some() {
+            if let Some(schema_rows_after) = schema_rows_after {
                 // Now that all table and index ops from this transaction have
                 // been replayed, publish the frame's final schema. No later index
                 // op from this frame can observe a half-applied sqlite_schema.
-                let schema_rows_after =
-                    schema_rows_after.expect("schema_rows_after must exist when schema changed");
-                let schema_after = schema_after
-                    .expect("schema_after must exist when frame_changes_schema is true");
                 schema_rows = schema_rows_after;
-                install_schema(schema_after.clone());
-                current_schema = schema_after;
+                match schema_after {
+                    Some(schema_after) => {
+                        install_schema(schema_after.clone());
+                        current_schema = schema_after;
+                    }
+                    None => current_schema_is_behind = true,
+                }
                 // The frame may have decoded DROP INDEX entries using the
                 // pre-frame schema. Do not carry those IndexInfo values into
                 // later frames after current_schema has changed.
@@ -10999,6 +11034,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         ctx.schema_rows = schema_rows;
         ctx.dropped_root_pages = dropped_root_pages;
         ctx.current_schema = current_schema;
+        ctx.current_schema_is_behind = current_schema_is_behind;
         ctx.index_infos = index_infos;
         Ok(())
     }

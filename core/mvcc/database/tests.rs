@@ -2862,6 +2862,66 @@ fn test_recovery_replays_schema_op_after_data_op_in_frame() {
     assert_eq!(rows, vec![vec![Value::Text(Text::new("data".to_string()))]]);
 }
 
+#[test]
+fn recovery_reads_each_table_a_bounded_number_of_times_however_many_schema_changes_it_replays() {
+    const TABLES: usize = 40;
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("schema_changes.db");
+    let path = path.to_str().unwrap().to_owned();
+    let dialect = CatalogValidationDialect::new(CatalogValidationFailure::ForeignIdentity);
+    let open = |dialect: Arc<CatalogValidationDialect>| {
+        Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            &path,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            dialect,
+        )
+        .unwrap()
+    };
+    {
+        let db = open(dialect.clone());
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        for table in 0..TABLES {
+            conn.execute(format!(
+                "CREATE TABLE t{table}(id INTEGER PRIMARY KEY, v TEXT)"
+            ))
+            .unwrap();
+            conn.execute(format!("CREATE INDEX t{table}_v ON t{table}(v)"))
+                .unwrap();
+            if table % 10 == 0 {
+                conn.execute(format!("INSERT INTO t{table} VALUES (1, 'a{table}')"))
+                    .unwrap();
+            }
+        }
+        conn.execute("DROP INDEX t0_v").unwrap();
+        conn.execute("INSERT INTO t0 VALUES (2, 'b0')").unwrap();
+        conn.close().unwrap();
+    }
+    forget_registered_database(&path);
+    dialect.parse_table_calls.store(0, Ordering::SeqCst);
+    let db = open(dialect.clone());
+    let conn = db.connect().unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t0 ORDER BY id"),
+        vec![
+            vec![Value::Text(Text::new("a0".to_string()))],
+            vec![Value::Text(Text::new("b0".to_string()))],
+        ]
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t30 WHERE v = 'a30'"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    let parsed = dialect.parse_table_calls.load(Ordering::SeqCst);
+    assert!(
+        parsed <= 6 * TABLES,
+        "recovery parsed table definitions {parsed} times for {TABLES} tables"
+    );
+}
+
 /// What this test checks: Checkpoint transitions preserve DB/WAL/log ordering and watermark updates for the tested edge case.
 /// Why this matters: Incorrect ordering breaks crash safety, replay boundaries, or durability guarantees.
 #[test]
