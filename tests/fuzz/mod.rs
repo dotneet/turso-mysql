@@ -4230,6 +4230,11 @@ mod fuzz_tests {
             "SELECT log(0.5, 3.0)",
             "SELECT log(1.0, 3.0)",
             "SELECT mod(cosh(-2.0 - (0.5) * (-2.0 / 2.0 + (0.5) - degrees(1.0))), log10(2.0))",
+            "SELECT mod(2.0, atanh(tanh(-2.0)))",
+            "SELECT atanh(-0.999), atanh(-0.5), atanh(-0.3), atanh(0.9)",
+            "SELECT acosh(1.0000001), acosh(1.001), acosh(3.7)",
+            "SELECT asinh(-0.001), asinh(3.7), asinh(1e10)",
+            "SELECT degrees(123.456), radians(-7.25), degrees(1743.5298099852134), degrees(6511.78412554583)",
         ] {
             helpers::assert_differential(&limbo_conn, &sqlite_conn, query, "");
         }

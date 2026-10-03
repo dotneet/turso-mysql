@@ -9,110 +9,105 @@ use crate::{
     LimboError, Result, Value,
 };
 
-// we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
-#[cfg(not(test))]
-mod cmath {
-    pub fn exp(x: f64) -> f64 {
-        x.exp()
-    }
-    pub fn log(x: f64) -> f64 {
-        x.ln()
-    }
-    // Use log10/log2 directly rather than log(x, base): the latter computes
-    // ln(x)/ln(base), which can be 1 ulp off from the dedicated functions
-    // SQLite calls, and e.g. mod() amplifies that into visible divergence.
-    pub fn log10(x: f64) -> f64 {
-        x.log10()
-    }
-    pub fn log2(x: f64) -> f64 {
-        x.log2()
-    }
-    pub fn pow(x: f64, y: f64) -> f64 {
-        x.powf(y)
-    }
-    pub fn sin(x: f64) -> f64 {
-        x.sin()
-    }
-    pub fn sinh(x: f64) -> f64 {
-        x.sinh()
-    }
-    pub fn asin(x: f64) -> f64 {
-        x.asin()
-    }
-    pub fn asinh(x: f64) -> f64 {
-        x.asinh()
-    }
-    pub fn cos(x: f64) -> f64 {
-        x.cos()
-    }
-    pub fn cosh(x: f64) -> f64 {
-        x.cosh()
-    }
-    pub fn acos(x: f64) -> f64 {
-        x.acos()
-    }
-    pub fn acosh(x: f64) -> f64 {
-        x.acosh()
-    }
-    pub fn tan(x: f64) -> f64 {
-        x.tan()
-    }
-    pub fn tanh(x: f64) -> f64 {
-        x.tanh()
-    }
-    pub fn atan(x: f64) -> f64 {
-        x.atan()
-    }
-    pub fn atanh(x: f64) -> f64 {
-        x.atanh()
-    }
-    pub fn atan2(x: f64, y: f64) -> f64 {
-        x.atan2(y)
-    }
-    pub fn degrees(x: f64) -> f64 {
-        x.to_degrees()
-    }
-    pub fn radians(x: f64) -> f64 {
-        x.to_radians()
-    }
-}
-
-// we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
-#[cfg(test)]
+#[cfg(not(target_family = "wasm"))]
 mod cmath {
     extern "C" {
         pub fn exp(x: f64) -> f64;
         pub fn log(x: f64) -> f64;
         pub fn log10(x: f64) -> f64;
         pub fn log2(x: f64) -> f64;
-        pub fn pow(x: f64, y: f64) -> f64;
-
         pub fn sin(x: f64) -> f64;
         pub fn sinh(x: f64) -> f64;
         pub fn asin(x: f64) -> f64;
         pub fn asinh(x: f64) -> f64;
-
         pub fn cos(x: f64) -> f64;
         pub fn cosh(x: f64) -> f64;
         pub fn acos(x: f64) -> f64;
         pub fn acosh(x: f64) -> f64;
-
         pub fn tan(x: f64) -> f64;
         pub fn tanh(x: f64) -> f64;
         pub fn atan(x: f64) -> f64;
         pub fn atanh(x: f64) -> f64;
+        pub fn pow(x: f64, y: f64) -> f64;
         pub fn atan2(x: f64, y: f64) -> f64;
     }
 
-    // SQLite's M_PI constant (same value as SQLite's func.c)
     #[allow(clippy::excessive_precision)]
     const M_PI: f64 = 3.141592653589793238462643383279502884;
 
     pub fn degrees(x: f64) -> f64 {
-        x * 180.0 / M_PI
+        x * (180.0 / M_PI)
     }
     pub fn radians(x: f64) -> f64 {
-        x * M_PI / 180.0
+        x * (M_PI / 180.0)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+mod cmath {
+    pub fn exp(x: f64) -> f64 {
+        libm::exp(x)
+    }
+    pub fn log(x: f64) -> f64 {
+        libm::log(x)
+    }
+    pub fn log10(x: f64) -> f64 {
+        libm::log10(x)
+    }
+    pub fn log2(x: f64) -> f64 {
+        libm::log2(x)
+    }
+    pub fn sin(x: f64) -> f64 {
+        libm::sin(x)
+    }
+    pub fn sinh(x: f64) -> f64 {
+        libm::sinh(x)
+    }
+    pub fn asin(x: f64) -> f64 {
+        libm::asin(x)
+    }
+    pub fn asinh(x: f64) -> f64 {
+        libm::asinh(x)
+    }
+    pub fn cos(x: f64) -> f64 {
+        libm::cos(x)
+    }
+    pub fn cosh(x: f64) -> f64 {
+        libm::cosh(x)
+    }
+    pub fn acos(x: f64) -> f64 {
+        libm::acos(x)
+    }
+    pub fn acosh(x: f64) -> f64 {
+        libm::acosh(x)
+    }
+    pub fn tan(x: f64) -> f64 {
+        libm::tan(x)
+    }
+    pub fn tanh(x: f64) -> f64 {
+        libm::tanh(x)
+    }
+    pub fn atan(x: f64) -> f64 {
+        libm::atan(x)
+    }
+    pub fn atanh(x: f64) -> f64 {
+        libm::atanh(x)
+    }
+    pub fn pow(x: f64, y: f64) -> f64 {
+        libm::pow(x, y)
+    }
+    pub fn atan2(x: f64, y: f64) -> f64 {
+        libm::atan2(x, y)
+    }
+
+    #[allow(clippy::excessive_precision)]
+    const M_PI: f64 = 3.141592653589793238462643383279502884;
+
+    pub fn degrees(x: f64) -> f64 {
+        x * (180.0 / M_PI)
+    }
+    pub fn radians(x: f64) -> f64 {
+        x * (M_PI / 180.0)
     }
 }
 
