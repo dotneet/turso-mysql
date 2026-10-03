@@ -6289,7 +6289,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
         tx_id: TxID,
-    ) -> Option<RowID> {
+    ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
         );
@@ -6485,7 +6485,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction<A>,
-        row: IndexRowEntry<'_, A>,
+        row: &IndexRowEntry<'_, A>,
     ) -> Option<RowID> {
         let versions = row.value().read();
         if versions.is_empty() {
@@ -6498,14 +6498,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|version| version.row.id.clone())
     }
 
-    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
+    fn find_next_visible_index_row<'a, I>(
+        &self,
+        tx: &Transaction<A>,
+        mut rows: I,
+    ) -> Option<(RowID, RowVersions<A>)>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
     {
         loop {
             let row = rows.next()?;
-            if let Some(visible_row) = self.find_last_visible_index_version(tx, row) {
-                return Some(visible_row);
+            if let Some(visible_row) = self.find_last_visible_index_version(tx, &row) {
+                return Some((visible_row, row.value().clone()));
             }
         }
     }
@@ -6597,7 +6601,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         direction: IterationDirection,
         tx_id: TxID,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-    ) -> Result<Option<RowID>> {
+    ) -> Result<Option<(RowID, RowVersions<A>)>> {
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
@@ -9761,7 +9765,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         Ok(self
             .find_next_visible_index_row(tx, iter)
-            .map(|row| row.row_id))
+            .map(|(row, _)| row.row_id))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {

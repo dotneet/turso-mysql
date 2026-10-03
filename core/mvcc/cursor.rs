@@ -33,6 +33,7 @@ pub(crate) use scan_locks::{RangeEnd, RecordLock, UndoneInsertNeighbor};
 thread_local! {
     pub(crate) static BTREE_ROWS_CHECKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     pub(crate) static BTREE_ROWS_STEPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static VERSION_STORE_ROWS_LOOKED_UP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone)]
@@ -45,9 +46,10 @@ enum CursorPosition<A: ConcurrentAllocator = TursoAllocator> {
         /// Indicates whether the rowid is pointing BTreeCursor or MVCC index.
         in_btree: bool,
         /// Resolved MVCC version chain for this row, captured from the range
-        /// iterator so `read_mvcc_current_row` can skip a second `self.rows.get`.
-        /// `Some` only for MVCC table rows reached via the scan path; `None`
-        /// (btree rows, index rows, seek/insert positions) falls back to a lookup.
+        /// iterator so `read_mvcc_current_row` can skip a second lookup.
+        /// `Some` for MVCC table rows reached via the scan path and for MVCC
+        /// index rows; `None` (btree rows, table seek and insert positions)
+        /// falls back to a lookup.
         versions: Option<RowVersions<A>>,
     },
     /// We have reached the end of the table.
@@ -324,7 +326,7 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     Row {
         key: RowKey,
         /// Resolved MVCC version chain, set when this peek came from the MVCC
-        /// table iterator. `None` for btree peeks and index peeks.
+        /// table iterator or from an index scan or seek. `None` for btree peeks.
         versions: Option<RowVersions<A>>,
     },
     PastTheVersionStorePeek {
@@ -871,6 +873,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         MvccCursorType::Index(_) => Some(self.table_id),
                         MvccCursorType::Table => None,
                     };
+                    count_a_version_store_row_lookup();
                     match self
                         .db
                         .read_from_table_or_index(self.tx_id, &row_id, maybe_index_id)?
@@ -931,6 +934,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
+        count_a_version_store_row_lookup();
         self.db
             .read_from_table_or_index(self.tx_id, row_id, maybe_index_id)
     }
@@ -1054,9 +1058,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 .db
                 .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id)
             {
-                Some(row_id) => CursorPeek::Row {
+                Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
-                    versions: None,
+                    versions: Some(versions),
                 },
                 None => CursorPeek::Exhausted,
             },
@@ -1349,6 +1353,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn position_from_peeks(&mut self, dir: IterationDirection) -> CursorPosition<A> {
         loop {
             let pos = self.dual_peek.cursor_position_from_next(self.table_id, dir);
+            if matches!(self.mv_cursor_type, MvccCursorType::Index(_)) {
+                return pos;
+            }
             let CursorPosition::Loaded {
                 row_id,
                 in_btree: false,
@@ -2394,10 +2401,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
                             // Set MVCC peek
                             {
-                                self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row {
-                                        key: rid.row_id.clone(),
-                                        versions: None,
+                                self.dual_peek.mvcc_peek = match mvcc_rowid {
+                                    Some((rid, versions)) => CursorPeek::Row {
+                                        key: rid.row_id,
+                                        versions: Some(versions),
                                     },
                                     None => CursorPeek::Exhausted,
                                 };
@@ -2725,4 +2732,9 @@ fn comes_before(key: &RowKey, other: &RowKey, direction: IterationDirection) -> 
         IterationDirection::Forwards => key < other,
         IterationDirection::Backwards => key > other,
     }
+}
+
+fn count_a_version_store_row_lookup() {
+    #[cfg(test)]
+    VERSION_STORE_ROWS_LOOKED_UP.with(|looked_up| looked_up.set(looked_up.get() + 1));
 }

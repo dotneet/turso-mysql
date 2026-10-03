@@ -4613,6 +4613,57 @@ fn a_range_scan_checks_only_the_b_tree_rows_it_returns_or_passes() {
 }
 
 #[test]
+fn an_index_scan_reads_its_version_store_rows_without_looking_each_one_up_again() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t(k)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=200 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {}, {id})", id % 50))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let rows_and_lookups = |sql: &str| -> (Vec<i64>, u64) {
+        crate::mvcc::cursor::VERSION_STORE_ROWS_LOOKED_UP.with(|looked_up| looked_up.set(0));
+        let rows = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        (
+            rows,
+            crate::mvcc::cursor::VERSION_STORE_ROWS_LOOKED_UP.with(|looked_up| looked_up.get()),
+        )
+    };
+
+    let (rows, looked_up) = rows_and_lookups("SELECT count(*) FROM t WHERE k BETWEEN 10 AND 19");
+    assert_eq!(rows, vec![40]);
+    assert_eq!(looked_up, 0, "the scan looked up {looked_up} rows again");
+    let (rows, looked_up) = rows_and_lookups("SELECT k FROM t WHERE k = 7 ORDER BY k");
+    assert_eq!(rows, vec![7, 7, 7, 7]);
+    assert_eq!(looked_up, 0, "the lookup looked up {looked_up} rows again");
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM t WHERE k = 12").unwrap();
+    conn.execute("UPDATE t SET k = 99 WHERE k = 13").unwrap();
+    assert_eq!(
+        rows_and_lookups("SELECT count(*) FROM t WHERE k BETWEEN 10 AND 19").0,
+        vec![32]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        rows_and_lookups("SELECT count(*) FROM t WHERE k BETWEEN 10 AND 19").0,
+        vec![40]
+    );
+}
+
+#[test]
 fn index_scans_over_rows_split_between_the_b_tree_and_the_version_store_return_every_visible_row() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
