@@ -1,6 +1,7 @@
 //! Blocking TCP listener ownership for the TLS protocol runtime.
 
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     error::Error,
     fmt,
@@ -242,6 +243,8 @@ impl RuntimeTcpListener {
             tls_deadline,
             limits: self.config.limits(),
             timeouts: self.config.timeouts(),
+            read_timeout_in_force: Cell::new(Some(self.config.timeouts().tls())),
+            write_timeout_in_force: Cell::new(Some(self.config.timeouts().write())),
         })
     }
 
@@ -459,6 +462,8 @@ pub(crate) struct AcceptedTcpStream {
     tls_deadline: Instant,
     limits: RuntimeLimits,
     timeouts: RuntimeTimeouts,
+    read_timeout_in_force: Cell<Option<Duration>>,
+    write_timeout_in_force: Cell<Option<Duration>>,
 }
 
 impl AcceptedTcpStream {
@@ -526,13 +531,40 @@ impl AcceptedTcpStream {
 
     /// Applies one blocking read timeout for the protocol owner's current phase.
     pub(crate) fn set_read_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.stream.set_read_timeout(Some(timeout))
+        set_timeout_unless_in_force(&self.read_timeout_in_force, timeout, |timeout| {
+            self.stream.set_read_timeout(Some(timeout))
+        })
     }
 
     /// Applies one blocking write timeout for the protocol owner's current phase.
     pub(crate) fn set_write_timeout(&self, timeout: Duration) -> io::Result<()> {
-        self.stream.set_write_timeout(Some(timeout))
+        set_timeout_unless_in_force(&self.write_timeout_in_force, timeout, |timeout| {
+            self.stream.set_write_timeout(Some(timeout))
+        })
     }
+}
+
+const TIMEOUT_LATENESS: Duration = Duration::from_millis(1);
+
+fn set_timeout_unless_in_force(
+    in_force: &Cell<Option<Duration>>,
+    timeout: Duration,
+    set: impl FnOnce(Duration) -> io::Result<()>,
+) -> io::Result<()> {
+    if in_force
+        .get()
+        .is_some_and(|in_force| ends_no_earlier_and_barely_later(in_force, timeout))
+    {
+        return Ok(());
+    }
+    let applied = timeout + TIMEOUT_LATENESS;
+    set(applied)?;
+    in_force.set(Some(applied));
+    Ok(())
+}
+
+fn ends_no_earlier_and_barely_later(in_force: Duration, timeout: Duration) -> bool {
+    in_force >= timeout && in_force - timeout <= 2 * TIMEOUT_LATENESS
 }
 
 impl fmt::Debug for AcceptedTcpStream {
@@ -1339,6 +1371,7 @@ fn allocate_connection_id(state: &mut RuntimeTcpListenerState) -> u32 {
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         collections::VecDeque,
         fs,
         io::{Read, Write},
@@ -1830,6 +1863,33 @@ mod tests {
             connection.complete_io(&mut client).expect("TLS handshake");
         }
         rustls::StreamOwned::new(connection, client)
+    }
+
+    #[test]
+    fn a_socket_timeout_is_set_again_only_when_the_one_in_force_ends_too_early_or_too_late() {
+        let in_force = Cell::new(None);
+        let sets = Cell::new(0);
+        let apply = |timeout: Duration| {
+            set_timeout_unless_in_force(&in_force, timeout, |_| {
+                sets.set(sets.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+            (sets.get(), in_force.get())
+        };
+        let minute = Duration::from_secs(60);
+        let applied = Some(minute + TIMEOUT_LATENESS);
+        assert_eq!(apply(minute), (1, applied));
+        assert_eq!(apply(minute - Duration::from_micros(30)), (1, applied));
+        assert_eq!(apply(minute - TIMEOUT_LATENESS), (1, applied));
+        assert_eq!(
+            apply(minute + Duration::from_micros(1500)),
+            (2, Some(minute + Duration::from_micros(2500)))
+        );
+        assert_eq!(
+            apply(minute - Duration::from_millis(10)),
+            (3, Some(minute - Duration::from_millis(9)))
+        );
     }
 
     /// Measured on MySQL 8.4.11: a wrong password is answered 1045, numbered
