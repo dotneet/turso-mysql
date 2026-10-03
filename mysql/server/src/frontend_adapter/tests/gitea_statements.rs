@@ -1666,3 +1666,118 @@ fn a_milestones_completeness_rounds_its_share_of_closed_issues() {
         .execute_query("UPDATE milestone SET completeness = num_closed_issues / (num_issues / 2)")
         .is_err());
 }
+
+/// Gitea reads a package blob only when its owner is the user, is public, or
+/// is an organization one of whose teams holds the user.
+#[test]
+fn a_package_blob_is_read_through_its_owners_teams() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `name` VARCHAR(255) NOT NULL, `type` INT NULL, `visibility` INT DEFAULT 0 NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NOT NULL, `name` VARCHAR(255) NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_version` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `package_id` BIGINT(20) NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_file` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `version_id` BIGINT(20) NOT NULL, `blob_id` BIGINT(20) NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `package_blob` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `size` BIGINT(20) DEFAULT 0 NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `team` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL, `authorize` INT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `team_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `uid` BIGINT(20) NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE TABLE IF NOT EXISTS `team_unit` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `type` INT NULL, `access_mode` INT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "INSERT INTO `user` (name, type, visibility) VALUES ('alice', 0, 0), ('org', 1, 2), ('bob', 0, 2), ('carol', 0, 2)",
+        "INSERT INTO package (owner_id, name) VALUES (2, 'img'), (3, 'g')",
+        "INSERT INTO package_version (package_id) VALUES (1), (2)",
+        "INSERT INTO package_blob (size) VALUES (5), (6)",
+        "INSERT INTO package_file (version_id, blob_id) VALUES (1, 1), (2, 2)",
+        "INSERT INTO team (org_id, name, authorize) VALUES (2, 'Owners', 4), (2, 'Readers', 0)",
+        "INSERT INTO team_user (org_id, team_id, uid) VALUES (2, 1, 1), (2, 2, 3)",
+        "INSERT INTO team_unit (org_id, team_id, type, access_mode) VALUES (2, 2, 9, 1)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let blob = "SELECT * FROM `package_blob` INNER JOIN `package_file` ON package_file.blob_id = package_blob.id INNER JOIN `package_version` ON package_version.id = package_file.version_id INNER JOIN `package` ON package.id = package_version.package_id INNER JOIN `user` ON `user`.id = package.owner_id WHERE package_blob.id=? AND (`user`.id=? OR `user`.visibility IN (?,?) OR (`user`.type=? AND (1<=(SELECT max(team.authorize) FROM team INNER JOIN team_user ON team_user.team_id = team.id WHERE team_user.uid=? AND (team_user.org_id = `user`.id)) OR 1<=(SELECT max(team_unit.access_mode) FROM team INNER JOIN team_user ON team_user.team_id = team.id INNER JOIN team_unit ON team_unit.team_id = team.id WHERE team_unit.type=? AND team_user.uid=? AND (team_user.org_id = `user`.id))))) LIMIT 1";
+    let read_by = |adapter: &mut Adapter, user: i64| {
+        prepared_rows(
+            adapter,
+            blob,
+            &[
+                Bound::Whole(1),
+                Bound::Whole(user),
+                Bound::Whole(0),
+                Bound::Whole(1),
+                Bound::Whole(1),
+                Bound::Whole(user),
+                Bound::Whole(9),
+                Bound::Whole(user),
+            ],
+        )
+    };
+    let found = read_by(&mut adapter, 3);
+    let whole = BinaryResultValue::Integer;
+    let text = |value: &str| BinaryResultValue::Text(value.to_owned());
+    assert_eq!(
+        found.rows,
+        [vec![
+            whole(1),
+            whole(5),
+            whole(1),
+            whole(1),
+            whole(1),
+            whole(1),
+            whole(1),
+            whole(1),
+            whole(2),
+            text("img"),
+            whole(2),
+            text("org"),
+            whole(1),
+            whole(2)
+        ]],
+        "MySQL 8.4.11 lets bob read it through his team's package unit"
+    );
+    let names = found
+        .columns
+        .iter()
+        .map(|column| (column.original_table.as_str(), column.name.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            ("package_blob", "id"),
+            ("package_blob", "size"),
+            ("package_file", "id"),
+            ("package_file", "version_id"),
+            ("package_file", "blob_id"),
+            ("package_version", "id"),
+            ("package_version", "package_id"),
+            ("package", "id"),
+            ("package", "owner_id"),
+            ("package", "name"),
+            ("user", "id"),
+            ("user", "name"),
+            ("user", "type"),
+            ("user", "visibility"),
+        ]
+    );
+    let owner_name = &found.columns[11];
+    assert_eq!(
+        (
+            owner_name.column_type,
+            owner_name.flags
+                & (MYSQL_NOT_NULL_FLAG | MYSQL_PRI_KEY_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG)
+        ),
+        (
+            MYSQL_TYPE_VAR_STRING,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG
+        )
+    );
+    assert_eq!(
+        read_by(&mut adapter, 1).rows.len(),
+        1,
+        "MySQL 8.4.11 lets alice read it as one of the owners"
+    );
+    assert!(
+        read_by(&mut adapter, 4).rows.is_empty(),
+        "MySQL 8.4.11 finds no team of carol's, and the NULL it answers holds no comparison"
+    );
+    assert!(adapter
+        .execute_query("SELECT id FROM `user` WHERE 1 <= (SELECT max(team.name) FROM team INNER JOIN team_user ON team_user.team_id = team.id WHERE team_user.org_id = `user`.id)")
+        .is_err());
+}

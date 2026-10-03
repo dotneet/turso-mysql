@@ -3061,7 +3061,33 @@ fn a_comparison_renders_a_subquery_that_answers_one_value() {
         [(None, "score"), (Some("users"), "score")]
     );
 
+    // The largest of a joined table's column answers that column's kind, so a
+    // written whole number meets it with the column held to a whole number.
+    let translated = parse_select(
+        "SELECT id FROM users WHERE 1 <= (SELECT MAX(t.level) FROM teams AS t INNER JOIN members ON members.team_id = t.id WHERE members.user_id = users.id)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\" FROM \"users\" WHERE (1 <= (SELECT MAX(\"t\".\"level\") AS \"MAX(t.level)\" FROM \"teams\" AS \"t\" JOIN \"members\" ON (\"members\".\"team_id\" = \"t\".\"id\") WHERE (\"members\".\"user_id\" = \"users\".\"id\")))"
+    );
+    assert_eq!(
+        translated
+            .checked_comparisons()
+            .iter()
+            .map(|comparison| (comparison.qualifier(), comparison.column_name()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("members"), "team_id"),
+            (Some("members"), "user_id"),
+            (Some("t"), "level")
+        ]
+    );
+
     for sql in [
+        // A joined column has only been measured against a written number.
+        "SELECT id FROM users WHERE score <= (SELECT MAX(t.level) FROM teams AS t INNER JOIN members ON members.team_id = t.id)",
         // 1242 in MySQL: a plain column can answer more than one row.
         "SELECT id FROM users WHERE id = (SELECT owner_id FROM teams)",
         // A total has not been measured against a column.

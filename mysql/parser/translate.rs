@@ -12186,6 +12186,16 @@ fn render_comparison_over_a_scalar_subquery(
             render_context,
         );
     }
+    if let ScalarSubqueryAnswer::TheJoinedColumnsOwnKind { reference, column } = &answered {
+        return render_written_number_against_a_joined_column(
+            left,
+            op,
+            query,
+            other,
+            (reference, column),
+            render_context,
+        );
+    }
     let rendered_other = match (&answered, other) {
         // MIN and MAX answer the column's own kind, and so does a column read
         // out of the one row a key picks, so the two columns are held to the
@@ -12266,6 +12276,50 @@ fn render_comparison_over_a_scalar_subquery(
                 fixed_columns,
             });
     }
+    let rendered_subquery = format!("({rendered_subquery})");
+    let (rendered_left, rendered_right) = if matches!(left, Expr::Subquery(_)) {
+        (rendered_subquery, rendered_other)
+    } else {
+        (rendered_other, rendered_subquery)
+    };
+    Ok(Some(format!(
+        "({rendered_left} {} {rendered_right})",
+        checked_select_comparison_sql_operator(op)
+    )))
+}
+
+/// Renders a written whole number compared against the smallest or largest
+/// of a joined table's column, which is how Gitea asks whether a user is in
+/// one of an organization's teams: `1 <= (SELECT max(team.authorize) FROM
+/// team INNER JOIN team_user ON ... WHERE team_user.org_id = user.id)`.
+///
+/// `MIN` and `MAX` answer the column's own kind, and no rows answer NULL,
+/// which no comparison holds for. Measured on MySQL 8.4.11 that is what
+/// MySQL answers, so the column is held to a whole number and the engine
+/// compares the two as it would the column itself.
+fn render_written_number_against_a_joined_column(
+    left: &Expr,
+    op: &BinaryOperator,
+    query: &sqlparser::ast::Query,
+    other: &Expr,
+    (reference, column): (&str, &str),
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<Option<String>, ParseError> {
+    if !names_a_whole_number(other) {
+        return Ok(None);
+    }
+    render_context.renders_a_membership_subquery = true;
+    let rendered = render_subquery(query, render_context);
+    render_context.renders_a_membership_subquery = false;
+    render_context.joined_membership_tables.clear();
+    let (rendered_subquery, projected) = rendered?;
+    if projected.is_none() {
+        return unsupported("SELECT comparison against a subquery answering no one column");
+    }
+    render_context
+        .checked_comparisons
+        .push(held_to_a_whole_number(Some(reference.to_owned()), column));
+    let rendered_other = render_dml_expr(other)?;
     let rendered_subquery = format!("({rendered_subquery})");
     let (rendered_left, rendered_right) = if matches!(left, Expr::Subquery(_)) {
         (rendered_subquery, rendered_other)
@@ -12385,6 +12439,9 @@ fn held_to_plain_whole_numbers(
 enum ScalarSubqueryAnswer {
     /// `MIN(c)` or `MAX(c)`, which answer `c`'s own kind.
     TheColumnsOwnKind(String),
+    /// `MIN(t.c)` or `MAX(t.c)` over joined tables, which answer the kind of
+    /// the column `c` of the table read as `reference`.
+    TheJoinedColumnsOwnKind { reference: String, column: String },
     /// `COUNT(...)`, which answers a whole number whatever it counts.
     AWholeNumber,
     /// `AVG(c)`, which MySQL answers as a decimal four places past `c`'s own.
@@ -12420,6 +12477,16 @@ fn subquery_answering_one_value(select: &sqlparser::ast::Select) -> Option<Scala
     };
     if static_select_metadata::is_count_call(function) {
         return Some(ScalarSubqueryAnswer::AWholeNumber);
+    }
+    if let Some((ColumnAggregateKind::MinMax, reference, column)) =
+        static_select_metadata::qualified_aggregate_argument(function)
+    {
+        let joins_tables =
+            select.from.len() > 1 || select.from.iter().any(|source| !source.joins.is_empty());
+        return joins_tables.then(|| ScalarSubqueryAnswer::TheJoinedColumnsOwnKind {
+            reference: reference.value.clone(),
+            column: column.value.clone(),
+        });
     }
     let (kind, column) = static_select_metadata::column_aggregate_argument(function)?;
     match kind {

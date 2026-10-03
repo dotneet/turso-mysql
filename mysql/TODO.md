@@ -251,7 +251,7 @@ the rest, by the tests it ends:
 
 | Statement | State |
 |---|---|
-| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package`, `package_version LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)`, and the blob read whose `WHERE` compares a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` | refused: a derived table cut by a `LIMIT` joined beside another table, an `ON` that is not an equality, and a scalar subquery joining tables. Most `TestPackage*` tests |
+| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package`, `package_version LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` | refused: a derived table cut by a `LIMIT` joined beside another table, and an `ON` that is not an equality. Most `TestPackage*` tests. The blob read comparing a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` is taken |
 | `ALTER DATABASE ... COLLATE utf8mb4_bin`, `utf8mb4_0900_as_cs` | refused, a database collation other than `utf8mb4_0900_ai_ci` and `utf8mb4_unicode_ci`; Gitea logs it and runs on a case-insensitive database, and `TestDatabaseCollation` fails |
 
 ### DDL
