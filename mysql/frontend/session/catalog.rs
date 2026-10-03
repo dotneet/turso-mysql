@@ -392,113 +392,8 @@ impl MySqlConnection {
             Some(MySqlTableKind::View) => return Err(MySqlShowCreateTableError::NotTable),
             Some(MySqlTableKind::BaseTable) => {}
         }
-        let schema = self.inner.current_schema();
-        let core_table = schema
-            .get_table(table.as_str())
-            .ok_or(MySqlShowCreateTableError::MissingTable)?;
-        let nullable = |column_name: &str| {
-            core_table
-                .columns()
-                .iter()
-                .find(|column| {
-                    column
-                        .name
-                        .as_deref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
-                })
-                .is_none_or(|column| !column.notnull())
-        };
-
-        let mut primary = Vec::new();
-        if let Some(btree) = core_table.btree() {
-            for (position, (column_name, _)) in btree.primary_key_columns.iter().enumerate() {
-                // MySQL holds every key column NOT NULL. The engine does not
-                // mark the column its rowid stands for, which is the counted
-                // key of an `AUTO_INCREMENT` table, so it is not asked.
-                primary.push(MySqlIndexEntry {
-                    key_name: "PRIMARY".to_owned(),
-                    column_name: column_name.clone(),
-                    sequence_in_index: position as u32 + 1,
-                    unique: true,
-                    nullable: false,
-                });
-            }
-        }
-
-        // MySQL lists the unique indexes before the non-unique ones and keeps
-        // each group in creation order, which is the order their rows stand in
-        // the schema: an index written again goes last there, as a dropped and
-        // added one does in MySQL, where the page it lands on may be one an
-        // older index let go of.
         let created = self.index_creation_order(table.as_str())?;
-        let mut indexes = schema.get_indices(table.as_str()).collect::<Vec<_>>();
-        indexes.sort_by_key(|index| {
-            created
-                .iter()
-                .position(|name| name.eq_ignore_ascii_case(&index.name))
-        });
-
-        let mut unique = Vec::new();
-        let mut secondary = Vec::new();
-        for index in indexes {
-            // The engine's own index behind a primary key is already reported.
-            // Its columns are named as the engine folds them, so `Id INT
-            // PRIMARY KEY` is behind an index over `id`.
-            if core_table.btree().is_some_and(|btree| {
-                is_the_primary_keys_own_index(index, &btree.primary_key_columns)
-            }) {
-                continue;
-            }
-            let key_name = mysql_index_name(index);
-            let primary_key = core_table
-                .btree()
-                .map(|btree| btree.primary_key_columns.clone())
-                .unwrap_or_default();
-            let rows = mysql_index_columns(index, &primary_key)
-                .iter()
-                .enumerate()
-                .map(|(position, column)| MySqlIndexEntry {
-                    key_name: key_name.clone(),
-                    column_name: column.name.clone(),
-                    sequence_in_index: position as u32 + 1,
-                    unique: index.unique,
-                    nullable: nullable(&column.name),
-                });
-            if index.unique {
-                unique.extend(rows);
-            } else {
-                secondary.extend(rows);
-            }
-        }
-        primary.extend(unique);
-        primary.extend(secondary);
-        Ok(primary)
-    }
-
-    /// The stored names of one table's indexes, in the order their schema rows
-    /// were written.
-    fn index_creation_order(
-        &self,
-        table: &str,
-    ) -> std::result::Result<Vec<String>, MySqlShowCreateTableError> {
-        let sql = format!(
-            "SELECT name FROM sqlite_schema WHERE type = 'index' AND lower(tbl_name) = '{}'",
-            table.to_lowercase().replace('\'', "''")
-        );
-        let rows = self
-            .inner
-            .prepare(&sql)
-            .map_err(MySqlShowCreateTableError::Engine)?
-            .run_collect_rows()
-            .map_err(MySqlShowCreateTableError::Engine)?;
-        rows.iter()
-            .map(|row| match row.as_slice() {
-                [Value::Text(name)] => Ok(name.as_str().to_owned()),
-                _ => Err(MySqlShowCreateTableError::Engine(LimboError::Corrupt(
-                    "sqlite_schema index row has an invalid shape".to_string(),
-                ))),
-            })
-            .collect()
+        self.list_base_table_indexes(table, &created)
     }
 
     /// Counts the named rows in `information_schema.TABLE_CONSTRAINTS` for one table.
@@ -888,7 +783,13 @@ impl MySqlConnection {
         if auto_increment_column_ordinal.is_none() && rowid_alias_ordinal.is_some() {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
-        self.verify_column_indexes(table_name, &metadata, rowid_alias_ordinal)?;
+        let index_names = self
+            .index_creation_order(table_name)
+            .map_err(|error| match error {
+                MySqlShowCreateTableError::Engine(error) => MySqlColumnMetadataError::Engine(error),
+                _ => MySqlColumnMetadataError::CorruptDefinition,
+            })?;
+        Self::verify_column_indexes(&index_names, &metadata, rowid_alias_ordinal)?;
         if core_columns
             .iter()
             .zip(&metadata)
@@ -902,7 +803,7 @@ impl MySqlConnection {
         {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
-        self.mark_indexed_columns(table, &mut metadata)?;
+        self.mark_indexed_columns(table, &index_names, &mut metadata)?;
         Ok(metadata)
     }
 
@@ -916,10 +817,11 @@ impl MySqlConnection {
     fn mark_indexed_columns(
         &self,
         table: &MySqlTableName,
+        index_names: &[String],
         metadata: &mut [MySqlColumnMetadata],
     ) -> std::result::Result<(), MySqlColumnMetadataError> {
         let indexes = self
-            .list_indexes(table)
+            .list_base_table_indexes(table, index_names)
             .map_err(|_| MySqlColumnMetadataError::UnsupportedDefinition)?;
         let mut leading = Vec::new();
         for (position, entry) in indexes.iter().enumerate() {
@@ -948,6 +850,121 @@ impl MySqlConnection {
             }
         }
         Ok(())
+    }
+
+    /// Lists the indexes of a table already known to be a base table, given
+    /// the names of its indexes in the order their schema rows were written.
+    fn list_base_table_indexes(
+        &self,
+        table: &MySqlTableName,
+        created: &[String],
+    ) -> std::result::Result<Vec<MySqlIndexEntry>, MySqlShowCreateTableError> {
+        let schema = self.inner.current_schema();
+        let core_table = schema
+            .get_table(table.as_str())
+            .ok_or(MySqlShowCreateTableError::MissingTable)?;
+        let nullable = |column_name: &str| {
+            core_table
+                .columns()
+                .iter()
+                .find(|column| {
+                    column
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(column_name))
+                })
+                .is_none_or(|column| !column.notnull())
+        };
+
+        let mut primary = Vec::new();
+        if let Some(btree) = core_table.btree() {
+            for (position, (column_name, _)) in btree.primary_key_columns.iter().enumerate() {
+                // MySQL holds every key column NOT NULL. The engine does not
+                // mark the column its rowid stands for, which is the counted
+                // key of an `AUTO_INCREMENT` table, so it is not asked.
+                primary.push(MySqlIndexEntry {
+                    key_name: "PRIMARY".to_owned(),
+                    column_name: column_name.clone(),
+                    sequence_in_index: position as u32 + 1,
+                    unique: true,
+                    nullable: false,
+                });
+            }
+        }
+
+        // MySQL lists the unique indexes before the non-unique ones and keeps
+        // each group in creation order, which is the order their rows stand in
+        // the schema: an index written again goes last there, as a dropped and
+        // added one does in MySQL, where the page it lands on may be one an
+        // older index let go of.
+        let mut indexes = schema.get_indices(table.as_str()).collect::<Vec<_>>();
+        indexes.sort_by_key(|index| {
+            created
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(&index.name))
+        });
+
+        let mut unique = Vec::new();
+        let mut secondary = Vec::new();
+        for index in indexes {
+            // The engine's own index behind a primary key is already reported.
+            // Its columns are named as the engine folds them, so `Id INT
+            // PRIMARY KEY` is behind an index over `id`.
+            if core_table.btree().is_some_and(|btree| {
+                is_the_primary_keys_own_index(index, &btree.primary_key_columns)
+            }) {
+                continue;
+            }
+            let key_name = mysql_index_name(index);
+            let primary_key = core_table
+                .btree()
+                .map(|btree| btree.primary_key_columns.clone())
+                .unwrap_or_default();
+            let rows = mysql_index_columns(index, &primary_key)
+                .iter()
+                .enumerate()
+                .map(|(position, column)| MySqlIndexEntry {
+                    key_name: key_name.clone(),
+                    column_name: column.name.clone(),
+                    sequence_in_index: position as u32 + 1,
+                    unique: index.unique,
+                    nullable: nullable(&column.name),
+                });
+            if index.unique {
+                unique.extend(rows);
+            } else {
+                secondary.extend(rows);
+            }
+        }
+        primary.extend(unique);
+        primary.extend(secondary);
+        Ok(primary)
+    }
+
+    /// The stored names of one table's indexes, in the order their schema rows
+    /// were written.
+    fn index_creation_order(
+        &self,
+        table: &str,
+    ) -> std::result::Result<Vec<String>, MySqlShowCreateTableError> {
+        let sql = format!(
+            "SELECT name FROM sqlite_schema WHERE type = 'index' AND lower(tbl_name) = '{}'",
+            table.to_lowercase().replace('\'', "''")
+        );
+        let rows = self
+            .inner
+            .prepare(&sql)
+            .map_err(MySqlShowCreateTableError::Engine)?
+            .run_collect_rows()
+            .map_err(MySqlShowCreateTableError::Engine)?;
+        rows.iter()
+            .map(|row| match row.as_slice() {
+                [Value::Text(name)] => Ok(name.as_str().to_owned()),
+                _ => Err(MySqlShowCreateTableError::Engine(LimboError::Corrupt(
+                    "sqlite_schema index row has an invalid shape".to_string(),
+                ))),
+            })
+            .collect()
     }
 
     fn list_view_columns(
@@ -1314,40 +1331,20 @@ impl MySqlConnection {
     }
 
     fn verify_column_indexes(
-        &self,
-        table_name: &str,
+        index_names: &[String],
         columns: &[MySqlColumnMetadata],
         rowid_alias_ordinal: Option<usize>,
     ) -> std::result::Result<(), MySqlColumnMetadataError> {
-        let sql = format!(
-            "SELECT name FROM sqlite_schema \
-             WHERE type = 'index' AND lower(tbl_name) = '{table_name}' \
-             LIMIT {COLUMN_INDEX_SCAN_LIMIT}"
-        );
-        let rows = self
-            .inner
-            .prepare(&sql)
-            .map_err(MySqlColumnMetadataError::Engine)?
-            .run_collect_rows()
-            .map_err(MySqlColumnMetadataError::Engine)?;
-        if Self::column_index_scan_is_truncated(rows.len()) {
+        if Self::column_index_scan_is_truncated(index_names.len()) {
             return Err(MySqlColumnMetadataError::UnsupportedDefinition);
         }
         // A named index is a separate object that says nothing about how the
         // columns were declared, so it is counted out rather than refused. Only
         // the engine's own indexes have to match the inline declarations.
-        let mut automatic_index_count = 0;
-        for row in rows {
-            let [name] = row.as_slice() else {
-                return Err(MySqlColumnMetadataError::CorruptDefinition);
-            };
-            let name = name
-                .to_text()
-                .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
-            if name.starts_with("sqlite_autoindex_") {
-                automatic_index_count += 1;
-            }
-        }
+        let automatic_index_count = index_names
+            .iter()
+            .filter(|name| name.starts_with("sqlite_autoindex_"))
+            .count();
         let inline_unique_count = columns
             .iter()
             .filter(|column| column.key == MySqlColumnKey::Unique)
@@ -1451,7 +1448,7 @@ impl MySqlConnection {
     }
 
     pub(super) fn column_index_scan_is_truncated(row_count: usize) -> bool {
-        row_count == COLUMN_INDEX_SCAN_LIMIT
+        row_count >= COLUMN_INDEX_SCAN_LIMIT
     }
 
     pub(super) fn table_list_is_truncated(row_count: usize) -> bool {
