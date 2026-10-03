@@ -166,6 +166,7 @@ services:
       BENCH_THREADS: ${BENCH_THREADS:-}
       BENCH_TIME: ${BENCH_TIME:-}
       BENCH_TABLE_SIZE: ${BENCH_TABLE_SIZE:-}
+      BENCH_SYSBENCH_ARGS: ${BENCH_SYSBENCH_ARGS:-}
     volumes:
       - .:/e2e/src:ro
       - ${E2E_RUN_DIR:-./.run}/results:/results

@@ -23,7 +23,10 @@ export COMPOSE_PROJECT_NAME=turso-e2e-bench \
 Knobs: `BENCH_TARGETS` (`turso mysql`), `BENCH_WORKLOADS` (sysbench Lua
 scripts: `oltp_point_select oltp_read_only oltp_write_only oltp_read_write
 oltp_insert`), `BENCH_THREADS` (`1 8`), `BENCH_TIME` (seconds, 30) and
-`BENCH_TABLE_SIZE` (rows, 100000). The raw sysbench outputs and `summary.md`
+`BENCH_TABLE_SIZE` (rows, 100000). `BENCH_SYSBENCH_ARGS` is added to every
+sysbench command, `prepare` included: `BENCH_SYSBENCH_ARGS=--auto_inc=off`
+creates the table with a plain `INTEGER NOT NULL` primary key instead of an
+`AUTO_INCREMENT` one. The raw sysbench outputs and `summary.md`
 are in `.run/results/bench/`.
 
 Both servers keep their data on tmpfs by default, where an fsync costs nothing.

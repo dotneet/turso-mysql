@@ -22,7 +22,8 @@ seconds="${BENCH_TIME:-30}"
 rows="${BENCH_TABLE_SIZE:-100000}"
 for target in ${BENCH_TARGETS:-turso mysql}; do
   common="--db-driver=mysql --mysql-host=${target} --mysql-port=3306 --mysql-user=e2e \
-    --mysql-password=${E2E_PASSWORD} --mysql-db=sbtest --mysql-ssl=on --tables=1 --table-size=${rows}"
+    --mysql-password=${E2E_PASSWORD} --mysql-db=sbtest --mysql-ssl=on --tables=1 --table-size=${rows} \
+    ${BENCH_SYSBENCH_ARGS:-}"
   # shellcheck disable=SC2086
   sysbench oltp_common ${common} prepare >"${out}/${target}-prepare.txt" 2>&1 \
     || { echo "${target}: prepare failed"; tail -5 "${out}/${target}-prepare.txt"; continue; }
