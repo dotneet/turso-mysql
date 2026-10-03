@@ -1904,3 +1904,92 @@ fn still_waiting<T>(waiting: &std::thread::JoinHandle<T>) -> bool {
     std::thread::sleep(std::time::Duration::from_millis(300));
     !waiting.is_finished()
 }
+
+#[test]
+#[ignore = "a stress run of about half a minute; run it with --ignored and TURSO_MYSQL_JOURNAL_MODE=mvcc"]
+fn sysbench_write_only_transactions_keep_every_row_they_put_back() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    let (_directory, mut sessions) = sessions(24);
+    run(
+        &mut sessions[0],
+        "CREATE TABLE sb (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, k INT NOT NULL DEFAULT 0, c CHAR(120) NOT NULL DEFAULT '', KEY k_1 (k))",
+    );
+    for chunk in 0..400 {
+        let rows = (1..=100)
+            .map(|n| {
+                let id = chunk * 100 + n;
+                format!("({id}, {id}, '{}')", "c".repeat(119))
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        run(
+            &mut sessions[0],
+            &format!("INSERT INTO sb (id, k, c) VALUES {rows}"),
+        );
+    }
+    let workers: Vec<_> = sessions
+        .into_iter()
+        .enumerate()
+        .map(|(n, session)| std::thread::spawn(move || write_only_transactions(session, n as u64)))
+        .collect();
+    let mut sessions = Vec::new();
+    let mut wrong = Vec::new();
+    for worker in workers {
+        let (session, found) = worker.join().unwrap();
+        sessions.push(session);
+        wrong.extend(found);
+    }
+    assert_eq!(wrong, Vec::<String>::new());
+    let Ok(CommandExecutionResult::ResultSet(count)) =
+        sessions[0].execute_query("SELECT COUNT(*) FROM sb")
+    else {
+        panic!("the rows must be counted");
+    };
+    assert_eq!(count.rows, vec![vec![Some(b"40000".to_vec())]]);
+}
+
+fn write_only_transactions(mut session: Adapter, seed: u64) -> (Adapter, Vec<String>) {
+    let mut seed = seed * 7919 + 17;
+    let mut hot_id = move || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % 300 + 20000
+    };
+    let mut wrong = Vec::new();
+    for _ in 0..3000 {
+        let (a, b, d) = (hot_id(), hot_id(), hot_id());
+        let statements = [
+            "BEGIN".to_string(),
+            format!("UPDATE sb SET k = k + 1 WHERE id = {a}"),
+            format!("UPDATE sb SET c = 'x' WHERE id = {b}"),
+            format!("DELETE FROM sb WHERE id = {d}"),
+            format!("INSERT INTO sb (id, k, c) VALUES ({d}, {a}, 'y')"),
+            "COMMIT".to_string(),
+        ];
+        for sql in &statements {
+            match session.execute_query(sql) {
+                Ok(CommandExecutionResult::Ok(ok))
+                    if sql.starts_with("DELETE") && ok.affected_rows != 1 =>
+                {
+                    wrong.push(format!("{sql} deleted {} rows", ok.affected_rows));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let message = session.take_error_message();
+                    if error == FrontendErrorKind::ConstraintViolation {
+                        wrong.push(format!(
+                            "{sql}: {:?}",
+                            message.map(|m| String::from_utf8_lossy(&m).into_owned())
+                        ));
+                    }
+                    run(&mut session, "ROLLBACK");
+                    break;
+                }
+            }
+        }
+    }
+    (session, wrong)
+}

@@ -9333,23 +9333,27 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    // Extracts the begin timestamp from a transaction
+    /// The moment a version begins, by which `insert_version_raw` keeps a
+    /// chain in commit order. A running writer's versions go last: it commits
+    /// after every version committed so far, and under row locks its write
+    /// statements read the latest committed rows, so it can replace a version
+    /// committed after its snapshot.
     #[inline]
     fn resolve_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
         match ts_or_id {
             Some(TxTimestampOrID::Timestamp(ts)) => *ts,
-            Some(TxTimestampOrID::TxID(tx_id)) => self
+            Some(TxTimestampOrID::TxID(tx_id)) => match self
                 .txs
                 .get(tx_id)
                 .expect("transaction should exist in txs map")
                 .value()
-                .begin_ts(),
-            // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
-            //
-            // The row version chain should be append-only (aside from garbage collection),
-            // so the specific ordering handled by this function may not be critical. We might
-            // be able to append directly to the row version chain in the future.
-            //
+                .state
+                .load()
+            {
+                TransactionState::Committed(ts) | TransactionState::Preparing(ts) => ts,
+                TransactionState::Active => u64::MAX,
+                TransactionState::Aborted | TransactionState::Terminated => 0,
+            },
             // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
             // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
             // while actual timestamps will start from 1.

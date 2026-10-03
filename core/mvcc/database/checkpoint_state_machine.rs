@@ -961,6 +961,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut versions_to_checkpoint: smallvec::SmallVec<[_; 1]> =
             smallvec::SmallVec::with_capacity(1);
         let mut exists_in_db_file = false;
+        let mut previous_begin_ts = 0;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
         for version in versions.iter() {
             // A row is in the database file if:
@@ -979,6 +980,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
                 None => None,
             };
+            if let Some(begin_ts) = begin_ts {
+                turso_assert!(
+                    begin_ts >= previous_begin_ts,
+                    "a row's committed versions are in commit order",
+                    { "begin_ts": begin_ts, "previous_begin_ts": previous_begin_ts }
+                );
+                previous_begin_ts = begin_ts;
+            }
             let mut end_ts = match version.end() {
                 Some(TxTimestampOrID::Timestamp(e)) => Some(e),
                 Some(TxTimestampOrID::TxID(t)) => {

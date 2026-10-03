@@ -125,6 +125,96 @@ fn an_update_of_a_row_another_transaction_committed_since_the_snapshot_writes_on
 }
 
 #[test]
+fn a_row_written_on_a_row_committed_since_the_snapshot_survives_a_checkpoint() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET balance = 50 WHERE id = 1")
+        .unwrap();
+
+    writer
+        .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(i64, i64)> = other.exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(rows, vec![(1, 51), (2, 20), (3, 30)]);
+    let rows: Vec<(i64, i64)> = db
+        .connect_limbo()
+        .exec_rows("SELECT id, balance FROM accounts ORDER BY id");
+    assert_eq!(rows, vec![(1, 51), (2, 20), (3, 30)]);
+}
+
+#[test]
+fn an_index_key_written_on_a_key_committed_since_the_snapshot_survives_a_checkpoint() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET note = 'z' WHERE id = 1")
+        .unwrap();
+    other
+        .execute("UPDATE accounts SET note = 'a' WHERE id = 1")
+        .unwrap();
+
+    writer
+        .execute("UPDATE accounts SET note = 'a', balance = 11 WHERE id = 1")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String,)> = other.exec_rows("PRAGMA integrity_check");
+    assert_eq!(rows, vec![("ok".to_string(),)]);
+    let rows: Vec<(i64, String)> =
+        other.exec_rows("SELECT id, note FROM accounts INDEXED BY accounts_note WHERE note = 'a'");
+    assert_eq!(rows, vec![(1, "a".to_string())]);
+    other.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+}
+
+#[test]
+fn a_row_found_through_an_index_after_a_checkpoint_still_has_its_table_row() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other
+        .execute("CREATE TABLE sb (id INT NOT NULL, k INT NOT NULL, c TEXT NOT NULL)")
+        .unwrap();
+    other
+        .execute("CREATE UNIQUE INDEX sb_id ON sb (id)")
+        .unwrap();
+    other.execute("CREATE INDEX sb_k ON sb (k)").unwrap();
+    other
+        .execute("INSERT INTO sb VALUES (1, 10, 'a'), (2, 20, 'b')")
+        .unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    let rows: Vec<(i64,)> = writer.exec_rows("SELECT k FROM sb WHERE id = 1");
+    assert_eq!(rows, vec![(10,)]);
+    other.execute("UPDATE sb SET c = 'x' WHERE id = 1").unwrap();
+
+    writer
+        .execute("UPDATE sb SET c = 'y' WHERE id = 1")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let rows: Vec<(String, String)> =
+        other.exec_rows("SELECT quote(k), quote(c) FROM sb WHERE id = 1");
+    assert_eq!(rows, vec![("10".to_string(), "'y'".to_string())]);
+    other.execute("DELETE FROM sb WHERE id = 1").unwrap();
+    let rows: Vec<(i64, i64, String)> = other.exec_rows("SELECT id, k, c FROM sb ORDER BY id");
+    assert_eq!(rows, vec![(2, 20, "b".to_string())]);
+}
+
+#[test]
 fn a_wait_longer_than_the_busy_timeout_fails_only_the_statement() {
     let db = database_with_row_locks();
     let holder = session(&db);
