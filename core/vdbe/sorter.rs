@@ -1233,7 +1233,8 @@ mod tests {
                 CollationSeq::Binary,
                 CollationSeq::MySqlUca9,
                 CollationSeq::MySqlUca400,
-            ][(rng.next_u64() % 3) as usize],
+                CollationSeq::MySqlUtf8mb4GeneralCi,
+            ][(rng.next_u64() % 4) as usize],
             nulls_order: match rng.next_u64() % 3 {
                 0 => None,
                 1 => Some(NullsOrder::First),

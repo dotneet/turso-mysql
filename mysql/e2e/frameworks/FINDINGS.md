@@ -539,6 +539,10 @@ What still fails on turso alone:
 
 # Gitea's own integration suite
 
+2026-10-04, `E2E_GITEA_RUN='^TestDatabaseCollation$'` after `utf8mb4_general_ci`
+databases, tables and `CONVERT TO`: `TestDatabaseCollation` passes on turso
+and on MySQL, all four of its subtests among it.
+
 2026-10-04, turso alone (`E2E_TARGETS=turso E2E_GITEA_SHARDS=60`), after
 `utf8mb4_bin` databases and `CONVERT TO`: 385 of the 395 tests that pass on
 MySQL pass, and every test is reported (485). Gitea now gives its database

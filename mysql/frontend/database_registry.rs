@@ -252,17 +252,20 @@ pub(crate) struct RegistryEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum StoredDatabaseCollation {
     #[serde(rename = "utf8mb4_unicode_ci")]
-    Utf8mb4UnicodeCi,
+    UnicodeCi,
     #[serde(rename = "utf8mb4_bin")]
-    Utf8mb4Bin,
+    Bin,
+    #[serde(rename = "utf8mb4_general_ci")]
+    GeneralCi,
 }
 
 impl StoredDatabaseCollation {
     fn stored(collation: MySqlTableCollation) -> Option<Self> {
         match collation {
             MySqlTableCollation::Utf8mb40900AiCi => None,
-            MySqlTableCollation::Utf8mb4UnicodeCi => Some(Self::Utf8mb4UnicodeCi),
-            MySqlTableCollation::Utf8mb4Bin => Some(Self::Utf8mb4Bin),
+            MySqlTableCollation::Utf8mb4UnicodeCi => Some(Self::UnicodeCi),
+            MySqlTableCollation::Utf8mb4Bin => Some(Self::Bin),
+            MySqlTableCollation::Utf8mb4GeneralCi => Some(Self::GeneralCi),
             // A database takes `utf8mb4` alone, which the statement naming it
             // is refused for otherwise.
             MySqlTableCollation::Utf8mb3UnicodeCi => {
@@ -274,8 +277,9 @@ impl StoredDatabaseCollation {
     fn read(stored: Option<Self>) -> MySqlTableCollation {
         match stored {
             None => MySqlTableCollation::Utf8mb40900AiCi,
-            Some(Self::Utf8mb4UnicodeCi) => MySqlTableCollation::Utf8mb4UnicodeCi,
-            Some(Self::Utf8mb4Bin) => MySqlTableCollation::Utf8mb4Bin,
+            Some(Self::UnicodeCi) => MySqlTableCollation::Utf8mb4UnicodeCi,
+            Some(Self::Bin) => MySqlTableCollation::Utf8mb4Bin,
+            Some(Self::GeneralCi) => MySqlTableCollation::Utf8mb4GeneralCi,
         }
     }
 }
@@ -1604,9 +1608,26 @@ mod tests {
             ),
             MySqlTableCollation::Utf8mb4Bin
         );
+        let general = RegistryEntry {
+            collation: StoredDatabaseCollation::stored(MySqlTableCollation::Utf8mb4GeneralCi),
+            ..binary
+        };
+        let written = serde_json::to_string(&general).unwrap();
+        assert_eq!(
+            written,
+            format!(r#"{{"file_key":"{KEY}","state":"Ready","collation":"utf8mb4_general_ci"}}"#)
+        );
+        assert_eq!(
+            StoredDatabaseCollation::read(
+                serde_json::from_str::<RegistryEntry>(&written)
+                    .unwrap()
+                    .collation
+            ),
+            MySqlTableCollation::Utf8mb4GeneralCi
+        );
         for unknown in [
             "utf8mb4_0900_ai_ci",
-            "utf8mb4_general_ci",
+            "utf8mb4_0900_as_cs",
             "latin1_swedish_ci",
         ] {
             assert!(serde_json::from_str::<RegistryEntry>(&format!(

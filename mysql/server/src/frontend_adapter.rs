@@ -6293,6 +6293,7 @@ fn apply_raw_column_collations(
             Some("utf8mb4_0900_ai_ci") => 255,
             Some("utf8mb4_bin") => 46,
             Some("utf8mb4_unicode_ci") => 224,
+            Some("utf8mb4_general_ci") => 45,
             _ => return Err(FrontendErrorKind::Unsupported),
         };
     }

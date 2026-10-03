@@ -8462,6 +8462,9 @@ pub(crate) fn engine_collation_of(column: &ColumnDef) -> &'static str {
         Some(name) if unqualified_name_is(name, &["utf8mb3_unicode_ci", "utf8_unicode_ci"]) => {
             " COLLATE MYSQL_UTF8MB3_UCA400_CI"
         }
+        Some(name) if unqualified_name_is(name, &["utf8mb4_general_ci"]) => {
+            " COLLATE MYSQL_UTF8MB4_GENERAL_CI"
+        }
         _ => WORDS_COLLATION,
     }
 }
@@ -8933,6 +8936,7 @@ fn render_column_option(
                         "utf8mb4_0900_ai_ci",
                         "utf8mb4_bin",
                         "utf8mb4_unicode_ci",
+                        "utf8mb4_general_ci",
                         "utf8mb3_unicode_ci",
                         "utf8_unicode_ci",
                     ],

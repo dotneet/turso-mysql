@@ -37,6 +37,9 @@ pub enum CollationSeq {
     /// It is a collation of its own so that the column says which character
     /// set it belongs to.
     MySqlUtf8mb3Uca400,
+    /// MySQL's `utf8mb4_general_ci`: one weight for each character, measured
+    /// on MySQL, and the shorter string padded with spaces.
+    MySqlUtf8mb4GeneralCi,
     Locale(LocaleCollationId),
     /// Name/id token for a connection-owned callback. The comparison itself
     /// must be resolved through `Connection` at runtime.
@@ -67,6 +70,9 @@ impl CollationSeq {
             "mysql_utf8mb3_uca400_ci" | "utf8mb3_unicode_ci" => {
                 return Ok(Self::MySqlUtf8mb3Uca400)
             }
+            "mysql_utf8mb4_general_ci" | "utf8mb4_general_ci" => {
+                return Ok(Self::MySqlUtf8mb4GeneralCi)
+            }
             _ => {}
         }
 
@@ -92,6 +98,7 @@ impl CollationSeq {
             Self::Binary => 1,
             Self::NoCase => 2,
             Self::Rtrim => 3,
+            Self::MySqlUtf8mb4GeneralCi => 4091,
             Self::MySqlUtf8mb3Uca400 => 4092,
             Self::MySqlUca400 => 4093,
             Self::MySqlUtf8mb4Bin => 4094,
@@ -108,6 +115,7 @@ impl CollationSeq {
             1 => Self::Binary,
             2 => Self::NoCase,
             3 => Self::Rtrim,
+            4091 => Self::MySqlUtf8mb4GeneralCi,
             4092 => Self::MySqlUtf8mb3Uca400,
             4093 => Self::MySqlUca400,
             4094 => Self::MySqlUtf8mb4Bin,
@@ -166,6 +174,7 @@ impl CollationSeq {
             Self::MySqlUca9 => "MYSQL_UCA9_AI_CI".to_string(),
             Self::MySqlUca400 => "MYSQL_UCA400_CI".to_string(),
             Self::MySqlUtf8mb3Uca400 => "MYSQL_UTF8MB3_UCA400_CI".to_string(),
+            Self::MySqlUtf8mb4GeneralCi => "MYSQL_UTF8MB4_GENERAL_CI".to_string(),
             Self::Locale(id) => LocaleCollationRegistry::global().name(id),
             Self::Custom(id) => CUSTOM_COLLATION_NAMES
                 .lock()
@@ -185,6 +194,7 @@ impl CollationSeq {
             Self::MySqlUtf8mb4Bin => Self::rtrim_cmp(lhs, rhs),
             Self::MySqlUca9 => super::mysql_uca9::compare(lhs, rhs),
             Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => super::mysql_uca400::compare(lhs, rhs),
+            Self::MySqlUtf8mb4GeneralCi => super::mysql_general_ci::compare(lhs, rhs),
             Self::Locale(id) => LocaleCollationRegistry::global().compare(id, lhs, rhs),
             // Immutable comparison paths have no connection to fetch the external
             // callback from. Runtime VDBE paths dispatch custom collations via
@@ -226,6 +236,7 @@ impl CollationSeq {
             Self::MySqlUtf8mb4Bin => text.trim_end_matches(' ').as_bytes().to_vec(),
             Self::MySqlUca9 => super::mysql_uca9::sort_key(text),
             Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => super::mysql_uca400::sort_key(text),
+            Self::MySqlUtf8mb4GeneralCi => super::mysql_general_ci::sort_key(text),
             Self::Locale(id) => LocaleCollationRegistry::global().sort_key(*id, text),
             // Hash joins using custom collations are disabled during planning
             // because the callback is connection-owned and may define arbitrary equality.
@@ -239,6 +250,7 @@ impl CollationSeq {
             Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => {
                 Some(super::mysql_uca400::leading_weights(text))
             }
+            Self::MySqlUtf8mb4GeneralCi => Some(super::mysql_general_ci::leading_weights(text)),
             _ => None,
         }
     }
@@ -249,6 +261,7 @@ impl CollationSeq {
             Self::MySqlUca400 | Self::MySqlUtf8mb3Uca400 => {
                 super::mysql_uca400::write_sort_key(text, hasher)
             }
+            Self::MySqlUtf8mb4GeneralCi => super::mysql_general_ci::write_sort_key(text, hasher),
             _ => hasher.write(&self.hash_key(text)),
         }
     }
@@ -343,7 +356,7 @@ pub struct LocaleCollationId(u16);
 
 impl LocaleCollationId {
     const FIRST_STORAGE_BIT: u16 = 4;
-    const LAST_STORAGE_BIT: u16 = 4091;
+    const LAST_STORAGE_BIT: u16 = 4090;
 
     fn from_index(index: usize) -> Result<Self> {
         if index > (Self::LAST_STORAGE_BIT - Self::FIRST_STORAGE_BIT) as usize {
@@ -790,6 +803,7 @@ mod tests {
             CollationSeq::MySqlUca9,
             CollationSeq::MySqlUca400,
             CollationSeq::MySqlUtf8mb3Uca400,
+            CollationSeq::MySqlUtf8mb4GeneralCi,
         ] {
             for text in &texts {
                 let mut pieces = WrittenPieces::default();
@@ -827,6 +841,21 @@ mod tests {
                 CollationSeq::MySqlUca400.hash_key(lhs)
             );
         }
+    }
+
+    #[test]
+    fn mysql_utf8mb4_general_ci_has_pad_space_a_stable_storage_id_and_matching_hash_key() {
+        let collation = CollationSeq::new("utf8mb4_general_ci").unwrap();
+        assert_eq!(collation, CollationSeq::MySqlUtf8mb4GeneralCi);
+        assert_eq!(collation.to_bits(), 4091);
+        assert_eq!(CollationSeq::from_storage_bits(4091), collation);
+        assert_eq!(CollationSeq::new(&collation.name()).unwrap(), collation);
+        assert_eq!(
+            collation.compare_strings("Straße", "STRASE  "),
+            Ordering::Equal
+        );
+        assert_eq!(collation.hash_key("Straße"), collation.hash_key("STRASE  "));
+        assert_eq!(collation.compare_strings("a\t", "a"), Ordering::Less);
     }
 
     #[test]

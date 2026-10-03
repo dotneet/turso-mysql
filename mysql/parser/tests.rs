@@ -8755,6 +8755,12 @@ fn reads_the_collation_create_database_gives_its_database() {
             false,
             MySqlTableCollation::Utf8mb4Bin,
         ),
+        (
+            "CREATE DATABASE o9 COLLATE utf8mb4_general_ci",
+            "o9",
+            false,
+            MySqlTableCollation::Utf8mb4GeneralCi,
+        ),
     ] {
         assert_eq!(
             parse_admin_command(sql, mode),
@@ -8803,7 +8809,7 @@ fn reads_the_collation_create_database_gives_its_database() {
         "CREATE DATABASE l2 CHARSET utf8",
         "CREATE DATABASE l3 COLLATE utf8_general_ci",
         "CREATE DATABASE l4 COLLATE utf8mb4_0900_as_cs",
-        "CREATE DATABASE l5 COLLATE utf8mb4_general_ci",
+        "CREATE DATABASE l5 COLLATE utf8mb4_0900_bin",
         "CREATE DATABASE l6 COLLATE binary",
         "CREATE DATABASE e1 ENCRYPTION 'Y'",
     ] {

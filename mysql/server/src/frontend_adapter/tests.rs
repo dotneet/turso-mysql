@@ -8599,8 +8599,8 @@ fn show_table_status_answers_what_it_knows_and_nulls_the_rest() {
 
 /// A dumped schema spells out the charset and collation on every text column,
 /// so refusing them stops a mysqldump from being restored. Naming the default
-/// UCA9 collation or the binary collation is taken; other collation rules are
-/// refused.
+/// UCA9 collation, the binary collation or `utf8mb4_general_ci` is taken; a
+/// character set this server does not have is refused.
 ///
 /// Measured on MySQL 8.4.11: `SHOW CREATE TABLE` echoes a column's explicit
 /// binary collation. The checked DDL renderer keeps that distinction.
@@ -8717,13 +8717,25 @@ fn a_column_charset_and_collation_are_taken_when_they_name_this_server() {
         [45, 45, 45]
     );
 
-    // A collation with different weights is refused rather than ignored.
-    assert!(adapter
-        .execute_query("CREATE TABLE n (a VARCHAR(10) COLLATE utf8mb4_general_ci)")
-        .is_err());
+    // A character set this server does not have is refused rather than
+    // ignored.
     assert!(adapter
         .execute_query("CREATE TABLE n (a VARCHAR(10) CHARACTER SET latin1)")
         .is_err());
+
+    // Measured on MySQL 8.4.11: a `utf8mb4_general_ci` column read with
+    // `character_set_results` NULL reports 45.
+    adapter
+        .execute_query("CREATE TABLE n (a VARCHAR(10) COLLATE utf8mb4_general_ci)")
+        .unwrap();
+    adapter
+        .execute_query("SET character_set_results = NULL")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(raw) = adapter.execute_query("SELECT a FROM n").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(raw.columns[0].character_set, 45);
 }
 
 /// `START TRANSACTION READ ONLY` is a promise MySQL keeps. Measured on MySQL

@@ -292,7 +292,7 @@ fn create_database_reads_every_spelling_prisma_laravel_and_mysqldump_write() {
             FrontendErrorKind::Unsupported,
         ),
         (
-            "CREATE DATABASE u3 COLLATE utf8mb4_general_ci",
+            "CREATE DATABASE u3 COLLATE utf8mb4_0900_bin",
             FrontendErrorKind::Unsupported,
         ),
         (
@@ -706,6 +706,10 @@ fn a_database_keeps_its_collation_across_a_restart() {
         &mut adapter,
         "CREATE DATABASE binary_words COLLATE utf8mb4_bin",
     );
+    run(
+        &mut adapter,
+        "CREATE DATABASE general_words COLLATE utf8mb4_general_ci",
+    );
     drop(adapter);
     drop(factory);
     drop(catalog);
@@ -717,6 +721,7 @@ fn a_database_keeps_its_collation_across_a_restart() {
         ("altered", "utf8mb4_unicode_ci"),
         ("back", "utf8mb4_0900_ai_ci"),
         ("binary_words", "utf8mb4_bin"),
+        ("general_words", "utf8mb4_general_ci"),
         ("reports", "utf8mb4_0900_ai_ci"),
     ] {
         assert_eq!(
@@ -1039,17 +1044,273 @@ fn convert_to_gives_the_table_and_every_column_of_words_the_collation() {
             FrontendErrorKind::Unsupported,
         ),
         (
-            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs",
             FrontendErrorKind::Unsupported,
         ),
     ] {
         assert_eq!(adapter.execute_query(sql), Err(error), "{sql}");
     }
+    let with_extra = |collation: &str| {
+        converted_to(collation).replace(
+            "  `n` int DEFAULT NULL,\n",
+            &format!(
+                "  `n` int DEFAULT NULL,\n  `extra` varchar(3) COLLATE {collation} DEFAULT NULL,\n"
+            ),
+        )
+    };
     assert_eq!(
         show_create_table(&mut adapter, "t"),
-        converted_to("utf8mb4_bin").replace(
-            "  `n` int DEFAULT NULL,\n",
-            "  `n` int DEFAULT NULL,\n  `extra` varchar(3) COLLATE utf8mb4_bin DEFAULT NULL,\n"
-        )
+        with_extra("utf8mb4_bin")
     );
+
+    // Gitea's last conversion is to `utf8mb4_general_ci`, which holds `main`
+    // and `MAIN` as one word.
+    run(&mut adapter, "INSERT INTO t (id, name) VALUES (3, 'MAIN')");
+    assert_eq!(
+        adapter.execute_query(
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci"
+        ),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    assert_eq!(
+        show_create_table(&mut adapter, "t"),
+        with_extra("utf8mb4_bin")
+    );
+    run(&mut adapter, "DELETE FROM t WHERE id = 3");
+    run(
+        &mut adapter,
+        "ALTER TABLE `t` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+    );
+    assert_eq!(
+        show_create_table(&mut adapter, "t"),
+        with_extra("utf8mb4_general_ci")
+    );
+    for duplicate in ["MAIN", "máin", "main "] {
+        assert_eq!(
+            adapter.execute_query(&format!(
+                "INSERT INTO t (id, name) VALUES (4, '{duplicate}')"
+            )),
+            Err(FrontendErrorKind::ConstraintViolation),
+            "{duplicate}"
+        );
+    }
+    run(
+        &mut adapter,
+        "ALTER DATABASE conv COLLATE utf8mb4_general_ci",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE t CONVERT TO CHARACTER SET DEFAULT",
+    );
+    assert_eq!(
+        show_create_table(&mut adapter, "t"),
+        with_extra("utf8mb4_general_ci")
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COLUMN_NAME, COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'conv' AND TABLE_NAME = 't' AND COLLATION_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"
+        ),
+        [
+            row(&["name", "utf8mb4_general_ci"]),
+            row(&["body", "utf8mb4_general_ci"]),
+            row(&["kind", "utf8mb4_general_ci"]),
+            row(&["extra", "utf8mb4_general_ci"]),
+        ]
+    );
+}
+
+/// Gitea's `TestDatabaseCollation` converts its database to
+/// `utf8mb4_general_ci`, which gives every character one weight: case and most
+/// accents weigh nothing, `ß` weighs as `s`, every character past the Basic
+/// Multilingual Plane weighs as U+FFFD, and the shorter of two words is padded
+/// with spaces. Every expectation here was measured on MySQL 8.4.11 over the
+/// same statements.
+#[test]
+fn a_utf8mb4_general_ci_database_compares_words_by_their_general_ci_weights() {
+    let (_directory, catalog, _factory) = catalog_factory(Arc::new(RecordingAuthorizer::default()));
+    let mut adapter = session(&catalog);
+    run(
+        &mut adapter,
+        "CREATE DATABASE app COLLATE utf8mb4_general_ci",
+    );
+    run(&mut adapter, "USE app");
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT @@collation_database, @@character_set_database"
+        ),
+        [row(&["utf8mb4_general_ci", "utf8mb4"])]
+    );
+    assert_eq!(
+        show_create_database(&mut adapter, "app"),
+        created_as("utf8mb4_general_ci")
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'app'"
+        ),
+        [row(&["utf8mb4", "utf8mb4_general_ci"])]
+    );
+
+    run(
+        &mut adapter,
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20), b VARCHAR(5) COLLATE utf8mb4_bin, c VARCHAR(5) CHARACTER SET utf8mb4, UNIQUE KEY u (name))",
+    );
+    assert_eq!(
+        show_create_table(&mut adapter, "t"),
+        "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `name` varchar(20) COLLATE utf8mb4_general_ci DEFAULT NULL,\n  `b` varchar(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT NULL,\n  `c` varchar(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  UNIQUE KEY `u` (`name`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT COLUMN_NAME, CHARACTER_SET_NAME, COLLATION_NAME, CHARACTER_OCTET_LENGTH FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'app' AND TABLE_NAME = 't' AND COLLATION_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"
+        ),
+        [
+            row(&["name", "utf8mb4", "utf8mb4_general_ci", "80"]),
+            row(&["b", "utf8mb4", "utf8mb4_bin", "20"]),
+            row(&["c", "utf8mb4", "utf8mb4_0900_ai_ci", "20"]),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA = 'app' AND TABLE_NAME = 't'"
+        ),
+        [row(&["utf8mb4_general_ci"])]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW FULL COLUMNS FROM t")[1][2],
+        Some("utf8mb4_general_ci".to_owned())
+    );
+
+    run(&mut adapter, "INSERT INTO t (id, name) VALUES (1, 'main')");
+    for duplicate in ["Main", "main ", "máin", "MAİN"] {
+        assert_eq!(
+            adapter.execute_query(&format!(
+                "INSERT INTO t (id, name) VALUES (2, '{duplicate}')"
+            )),
+            Err(FrontendErrorKind::ConstraintViolation),
+            "{duplicate}"
+        );
+    }
+    run(
+        &mut adapter,
+        "INSERT INTO t (id, name) VALUES (4, 'straße'), (5, 'stras'), (6, '😀'), (8, 'b'), (9, 'a\t'), (10, 'a'), (13, '_x'), (14, 'strasse')",
+    );
+    for duplicate in ["😃", "\u{fffd}", "Ä", "A"] {
+        assert_eq!(
+            adapter.execute_query(&format!(
+                "INSERT INTO t (id, name) VALUES (20, '{duplicate}')"
+            )),
+            Err(FrontendErrorKind::ConstraintViolation),
+            "{duplicate}"
+        );
+    }
+    let ids = |adapter: &mut Adapter, sql: &str| {
+        rows(adapter, sql)
+            .into_iter()
+            .map(|row| row[0].clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(&mut adapter, "SELECT id, name FROM t ORDER BY name, id"),
+        ["9", "10", "8", "1", "5", "4", "14", "13", "6"]
+    );
+    assert_eq!(
+        ids(&mut adapter, "SELECT id FROM t WHERE name = 'MAIN'"),
+        ["1"]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM t WHERE name IN ('B', 'STRASSE', 'STRAS') ORDER BY id"
+        ),
+        ["5", "8", "14"]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM t WHERE name BETWEEN 'a' AND 'B' ORDER BY id"
+        ),
+        ["8", "10"]
+    );
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM t WHERE name LIKE 'STRA%' ORDER BY id"
+        ),
+        ["4", "5", "14"]
+    );
+    assert_eq!(
+        ids(&mut adapter, "SELECT id FROM t WHERE name LIKE '😃'"),
+        ["6"]
+    );
+
+    // Gitea reads its tables through calls and an ordering `CASE`, each of
+    // which compares under the collation of the column it reads.
+    run(&mut adapter, "CREATE TABLE w (id INT, s VARCHAR(10))");
+    run(
+        &mut adapter,
+        "INSERT INTO w VALUES (1, 'Owners'), (2, 'alpha'), (3, 'Beta'), (4, 'owners2'), (5, 'ä'), (6, 'Z'), (7, '_x'), (8, 'ss'), (9, 'ß')",
+    );
+    // `LOWER` of a character past ASCII is refused here, so the calls read
+    // words of ASCII alone.
+    run(&mut adapter, "CREATE TABLE v (id INT, s VARCHAR(10))");
+    run(
+        &mut adapter,
+        "INSERT INTO v VALUES (1, 'Owners'), (2, 'alpha'), (3, 'Beta'), (4, 'owners2'), (6, 'Z'), (7, '_x'), (8, 'ss')",
+    );
+    run(&mut adapter, "CREATE TABLE d (id INT, s VARCHAR(10))");
+    run(
+        &mut adapter,
+        "INSERT INTO d VALUES (1, 'a'), (2, 'A'), (3, 'á'), (4, 'b'), (5, 'a '), (6, '😀'), (7, '😃')",
+    );
+    for (sql, expected) in [
+        (
+            "SELECT id FROM w ORDER BY CASE WHEN s LIKE 'owners' THEN '' ELSE s END, id",
+            &["1", "5", "2", "3", "4", "9", "8", "6", "7"][..],
+        ),
+        (
+            "SELECT id FROM v WHERE LOWER(s) IN ('BETA', 'ALPHA') ORDER BY id",
+            &["2", "3"],
+        ),
+        ("SELECT id FROM v WHERE LOWER(s) = 'OWNERS'", &["1"]),
+        (
+            "SELECT id FROM v ORDER BY LOWER(s), id",
+            &["2", "3", "1", "4", "8", "6", "7"],
+        ),
+        (
+            "SELECT id FROM w WHERE s > 'a' ORDER BY id",
+            &["1", "2", "3", "4", "6", "7", "8", "9"],
+        ),
+        (
+            "SELECT id FROM w WHERE s BETWEEN 'A' AND 'b' ORDER BY id",
+            &["2", "5"],
+        ),
+        (
+            "SELECT id FROM w WHERE s LIKE '%S%' ORDER BY id",
+            &["1", "4", "8", "9"],
+        ),
+        ("SELECT id FROM w WHERE s LIKE 's' ORDER BY id", &["9"]),
+        (
+            "SELECT s, COUNT(*) FROM w GROUP BY s ORDER BY s",
+            &[
+                "ä", "alpha", "Beta", "Owners", "owners2", "ß", "ss", "Z", "_x",
+            ],
+        ),
+        ("SELECT COUNT(DISTINCT s) FROM d", &["3"]),
+        ("SELECT COUNT(*) FROM (SELECT DISTINCT s FROM d) x", &["3"]),
+        (
+            "SELECT COUNT(*) FROM d GROUP BY s ORDER BY COUNT(*)",
+            &["1", "2", "4"],
+        ),
+    ] {
+        assert_eq!(ids(&mut adapter, sql), expected, "{sql}");
+    }
 }

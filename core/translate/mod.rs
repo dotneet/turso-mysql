@@ -26,6 +26,8 @@ pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
+pub mod mysql_general_ci;
+mod mysql_general_ci_weights;
 pub mod mysql_like;
 pub mod mysql_uca400;
 pub mod mysql_uca9;

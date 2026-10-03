@@ -7325,6 +7325,7 @@ impl<'a> SelectRenderContext<'a> {
             "utf8mb4_bin" => Some("MYSQL_UTF8MB4_BIN"),
             "utf8mb4_unicode_ci" => Some("MYSQL_UCA400_CI"),
             "utf8mb3_unicode_ci" => Some("MYSQL_UTF8MB3_UCA400_CI"),
+            "utf8mb4_general_ci" => Some("MYSQL_UTF8MB4_GENERAL_CI"),
             _ => None,
         }
     }

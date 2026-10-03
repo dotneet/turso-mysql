@@ -42,6 +42,9 @@ pub enum MySqlTableCollation {
     /// its database the first case-sensitive collation the server lists, and
     /// this is the one this server has.
     Utf8mb4Bin,
+    /// `utf8mb4_general_ci`, which gives each character one weight and
+    /// ignores case and most accents. Gitea converts its database to it.
+    Utf8mb4GeneralCi,
 }
 
 impl MySqlTableCollation {
@@ -52,6 +55,8 @@ impl MySqlTableCollation {
             Some(Self::Utf8mb4UnicodeCi)
         } else if name.eq_ignore_ascii_case("utf8mb4_bin") {
             Some(Self::Utf8mb4Bin)
+        } else if name.eq_ignore_ascii_case("utf8mb4_general_ci") {
+            Some(Self::Utf8mb4GeneralCi)
         } else if name.eq_ignore_ascii_case("utf8mb3_unicode_ci")
             || name.eq_ignore_ascii_case("utf8_unicode_ci")
         {
@@ -69,13 +74,17 @@ impl MySqlTableCollation {
             Self::Utf8mb4UnicodeCi => "utf8mb4_unicode_ci",
             Self::Utf8mb3UnicodeCi => "utf8mb3_unicode_ci",
             Self::Utf8mb4Bin => "utf8mb4_bin",
+            Self::Utf8mb4GeneralCi => "utf8mb4_general_ci",
         }
     }
 
     /// The character set the collation belongs to.
     pub const fn character_set(self) -> &'static str {
         match self {
-            Self::Utf8mb40900AiCi | Self::Utf8mb4UnicodeCi | Self::Utf8mb4Bin => "utf8mb4",
+            Self::Utf8mb40900AiCi
+            | Self::Utf8mb4UnicodeCi
+            | Self::Utf8mb4Bin
+            | Self::Utf8mb4GeneralCi => "utf8mb4",
             Self::Utf8mb3UnicodeCi => "utf8mb3",
         }
     }
@@ -88,6 +97,7 @@ impl MySqlTableCollation {
             Self::Utf8mb4UnicodeCi => " COLLATE=utf8mb4_unicode_ci",
             Self::Utf8mb3UnicodeCi => " COLLATE=utf8mb3_unicode_ci",
             Self::Utf8mb4Bin => " COLLATE=utf8mb4_bin",
+            Self::Utf8mb4GeneralCi => " COLLATE=utf8mb4_general_ci",
         }
     }
 }
@@ -935,6 +945,10 @@ mod tests {
                 MySqlTableConversion::To(MySqlTableCollation::Utf8mb4UnicodeCi),
             ),
             (
+                "ALTER TABLE `access` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+                MySqlTableConversion::To(MySqlTableCollation::Utf8mb4GeneralCi),
+            ),
+            (
                 "ALTER TABLE access CONVERT TO CHARACTER SET utf8mb4",
                 MySqlTableConversion::To(MySqlTableCollation::Utf8mb40900AiCi),
             ),
@@ -967,7 +981,7 @@ mod tests {
         }
         for sql in [
             "ALTER TABLE t CONVERT TO CHARACTER SET latin1",
-            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs",
         ] {
             assert!(
                 matches!(converted(sql), Err(ParseError::Unsupported { .. })),

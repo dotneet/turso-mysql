@@ -3631,14 +3631,16 @@ spells out on every text column, so refusing them stopped a `mysqldump` from
 being restored. `utf8mb4` is the accepted character set, and `utf8mb3` with
 its `utf8mb3_unicode_ci` alone (see below). Text columns take
 `utf8mb4_0900_ai_ci` by default and may explicitly name `utf8mb4_bin`, which
-uses its own PAD SPACE byte collation, `utf8mb4_unicode_ci` or
-`utf8mb3_unicode_ci`. Other names are refused rather than ignored.
+uses its own PAD SPACE byte collation, `utf8mb4_unicode_ci`,
+`utf8mb4_general_ci` or `utf8mb3_unicode_ci`. Other names are refused rather
+than ignored.
 With `character_set_results=utf8mb4`, a selected text column reports the
 connection's collation ID on the wire — 45 until the session names another —
 including a `utf8mb4_bin` column.
 With `SET character_set_results = NULL`, the original column IDs are reported:
-255 for `utf8mb4_0900_ai_ci`, 46 for `utf8mb4_bin` and 224 for
-`utf8mb4_unicode_ci`, as measured on MySQL 8.4.
+255 for `utf8mb4_0900_ai_ci`, 46 for `utf8mb4_bin`, 224 for
+`utf8mb4_unicode_ci` and 45 for `utf8mb4_general_ci`, as measured on MySQL
+8.4.
 
 The accepted collation is stored in the engine schema. `SHOW FULL COLUMNS` and
 `information_schema.COLUMNS.COLLATION_NAME` report it. `SHOW CREATE TABLE`
@@ -3671,7 +3673,7 @@ while `'ß' LIKE 'ss'`, `'a ' LIKE 'a'` and two different emoji do not. The
 engine picks the matcher from the collation of the column being matched, so a
 query reading a `utf8mb4_unicode_ci` column and a `utf8mb4_0900_ai_ci` column
 matches each under its own. `FIELD`, `GREATEST`, `LEAST` and `NULLIF` over a
-`utf8mb4_unicode_ci` or `utf8mb4_bin` column are refused: each compares under
+`utf8mb4_unicode_ci`, `utf8mb4_general_ci` or `utf8mb4_bin` column are refused: each compares under
 `utf8mb4_0900_ai_ci`'s weights, where MySQL compares under the collation of
 the column it read. A `SELECT` ordering by a call answering words — `ORDER BY
 LOWER(name)`, `ORDER BY CONCAT(name, 'x')` — or by a `CASE` choosing among
@@ -3683,6 +3685,28 @@ read and a column's wins over a written word's, so over a `utf8mb4_bin` table
 `LOWER(name) IN ('V1.0')` finds nothing and `'b '` sorts before `'beta'`. One
 reading columns of two collations is refused, as is the same in an `UPDATE`
 or a `DELETE`.
+
+`utf8mb4_general_ci` is the collation Gitea's `TestDatabaseCollation` converts
+its database and every table to. It gives each character one weight, and its
+weights here are MySQL 8.4.11's own, measured: `WEIGHT_STRING(c COLLATE
+utf8mb4_general_ci)` of every code point, which `generate_mysql_general_ci.py`
+in `core/translate` asks a pinned MySQL for and writes out as a table; no MySQL
+source is copied. 1,108 characters of the Basic Multilingual Plane weigh
+something other than their own code point, and every character past it weighs
+U+FFFD's. Measured and matched: it ignores case and most accents (`'á' = 'A'`,
+`'ı' = 'İ' = 'i'`); `'ß'` weighs as `'s'`, so `'ß' = 's'` and `'ß' < 'ss'`,
+where `utf8mb4_unicode_ci` has `'ß' = 'ss'`; `'æ'` has a weight of its own and
+`'ae'` is not it; nothing weighs nothing, so a NUL or a tab counts and, weighing
+less than a space, sorts `'a\0'` and `'a\t'` before `'a'`; it pads with
+spaces, so `'a' = 'a '`; and all emoji are equal to one another and to U+FFFD.
+Keys and `UNIQUE` constraints compare the same way. `LIKE` over a
+`utf8mb4_general_ci` column matches one character at a time under those
+weights, without padding: `'ß' LIKE 's'`, `'é' LIKE 'E'` and two different
+emoji match, where under `utf8mb4_unicode_ci` emoji match only themselves, and
+`'ß' LIKE 'ss'` and `'a ' LIKE 'a'` do not. A call or an ordering `CASE` over
+such a column orders and compares under it, as over a `utf8mb4_bin` one. An
+explicit `COLLATE utf8mb4_general_ci` inside a query is refused, as an
+explicit `utf8mb4_unicode_ci` is.
 
 `utf8mb3_unicode_ci` is taken too, the one `utf8mb3` collation this server
 has: Sequelize keeps its migrations in a table written `DEFAULT CHARSET=utf8
@@ -3730,9 +3754,10 @@ naming only `CHARACTER SET utf8mb4` takes `utf8mb4_0900_ai_ci`, that character
 set's own default. The table's collation is kept with its stored definition, so
 `SHOW CREATE TABLE` ends with `DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_unicode_ci`, and `information_schema.TABLES.TABLE_COLLATION`
-and `SHOW TABLE STATUS` report it. A table takes `COLLATE=utf8mb4_bin` the same
-way, measured the same: each column taking it prints ` COLLATE utf8mb4_bin`
-and the table ends `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`.
+and `SHOW TABLE STATUS` report it. A table takes `COLLATE=utf8mb4_bin` and
+`COLLATE=utf8mb4_general_ci` the same way, measured the same: each column
+taking it prints ` COLLATE <it>` and the table ends `DEFAULT CHARSET=utf8mb4
+COLLATE=<it>`.
 
 `ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 [COLLATE c]` — what Gitea
 runs over every table when it converts a database — gives the table and every
@@ -4975,8 +5000,9 @@ a collation — what Prisma and Laravel create their database with: `CREATE
 DATABASE app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`, and Laravel's
 ``create database `app` default character set `utf8mb4` default collate
 `utf8mb4_unicode_ci` ``. `utf8mb4_0900_ai_ci`, the default,
-`utf8mb4_unicode_ci` and `utf8mb4_bin` are the three a database may have,
-being the three a table here may have as its own. Gitea gives an empty
+`utf8mb4_unicode_ci`, `utf8mb4_general_ci` and `utf8mb4_bin` are the four a
+database may have, being the four `utf8mb4` collations a table here may have
+as its own. Gitea gives an empty
 database the first case-sensitive collation the server lists, `ALTER DATABASE
 CHARACTER SET utf8mb4 COLLATE <it>`: MySQL lists `utf8mb4_0900_as_cs` first,
 and this server `utf8mb4_bin`, so Gitea's tables here compare their words by
@@ -4997,7 +5023,7 @@ two agree on which words are equal but for trailing spaces, which
   character sets 1302, each before the database is looked for. `utf8` is read
   as `utf8mb3`, and `utf8_bin` as `utf8mb3_bin`, as MySQL reads them. Every
   other character set and collation MySQL has — `utf8mb4_0900_as_cs` and
-  `utf8mb4_general_ci` among them — and any `ENCRYPTION` but `'N'` are
+  `utf8mb3_general_ci` among them — and any `ENCRYPTION` but `'N'` are
   refused, a table here being unable to take one.
 - A table made in the database naming neither a character set nor a collation
   is exactly the table written `COLLATE=<the database's>`: `SHOW CREATE

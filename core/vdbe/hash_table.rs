@@ -100,7 +100,8 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     CollationSeq::Locale(_)
                     | CollationSeq::MySqlUca9
                     | CollationSeq::MySqlUca400
-                    | CollationSeq::MySqlUtf8mb3Uca400 => {
+                    | CollationSeq::MySqlUtf8mb3Uca400
+                    | CollationSeq::MySqlUtf8mb4GeneralCi => {
                         collation.write_hash_key(text.as_str(), &mut hasher);
                     }
                     CollationSeq::Custom(_) => {

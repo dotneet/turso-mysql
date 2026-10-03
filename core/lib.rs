@@ -184,6 +184,7 @@ pub use storage::{
 };
 pub use translate::collate::CollationSeq;
 pub use translate::expr::{walk_expr_mut, WalkControl};
+pub use translate::mysql_general_ci::like as mysql_general_ci_like;
 pub use translate::mysql_like::binary_like as mysql_binary_like;
 pub use translate::mysql_uca400::like as mysql_uca400_like;
 pub use translate::mysql_uca9::compare as mysql_uca9_compare;

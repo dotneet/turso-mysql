@@ -3841,6 +3841,9 @@ impl BTreeTable {
                     CollationSeq::MySqlUtf8mb3Uca400 => {
                         sql.push_str(" COLLATE MYSQL_UTF8MB3_UCA400_CI")
                     }
+                    CollationSeq::MySqlUtf8mb4GeneralCi => {
+                        sql.push_str(" COLLATE MYSQL_UTF8MB4_GENERAL_CI")
+                    }
                     CollationSeq::Locale(_) => {
                         sql.push_str(" COLLATE ");
                         sql.push_str(&quote_ident(&collation.name()));

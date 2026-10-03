@@ -613,8 +613,9 @@ impl Dialect for MySqlDialect {
 
     /// MySQL matches `LIKE` under the collation of the column it reads: a
     /// `utf8mb4_unicode_ci` or `utf8mb3_unicode_ci` column matches under
-    /// Unicode 4.0.0's weights, and a `utf8mb4_bin` column each character
-    /// only to itself.
+    /// Unicode 4.0.0's weights, a `utf8mb4_bin` column each character only to
+    /// itself, and a `utf8mb4_general_ci` column each character to every
+    /// character of the same weight.
     fn function_for_collation(&self, name: &str, collation: CollationSeq) -> Option<String> {
         if !name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
             return None;
@@ -624,6 +625,7 @@ impl Dialect for MySqlDialect {
                 Some(MYSQL_UCA400_LIKE.to_owned())
             }
             CollationSeq::MySqlUtf8mb4Bin => Some(MYSQL_BINARY_LIKE.to_owned()),
+            CollationSeq::MySqlUtf8mb4GeneralCi => Some(MYSQL_GENERAL_CI_LIKE.to_owned()),
             _ => None,
         }
     }
@@ -774,6 +776,8 @@ impl Dialect for MySqlDialect {
             Some(turso_core::mysql_uca400_like as fn(&str, &str, Option<char>) -> Result<bool>)
         } else if name.eq_ignore_ascii_case(MYSQL_BINARY_LIKE) {
             Some(turso_core::mysql_binary_like as fn(&str, &str, Option<char>) -> Result<bool>)
+        } else if name.eq_ignore_ascii_case(MYSQL_GENERAL_CI_LIKE) {
+            Some(turso_core::mysql_general_ci_like as fn(&str, &str, Option<char>) -> Result<bool>)
         } else {
             None
         };
@@ -1688,6 +1692,7 @@ pub(crate) const MYSQL_ELT: &str = "mysql_elt";
 pub(crate) const MYSQL_REGEXP: &str = "mysql_regexp";
 pub(crate) const MYSQL_UCA9_LIKE: &str = "mysql_uca9_like";
 pub(crate) const MYSQL_UCA400_LIKE: &str = "mysql_uca400_like";
+pub(crate) const MYSQL_GENERAL_CI_LIKE: &str = "mysql_general_ci_like";
 /// `LIKE` under a binary collation, which the text a JSON reading unquotes
 /// carries.
 pub(crate) const MYSQL_BINARY_LIKE: &str = "mysql_binary_like";
