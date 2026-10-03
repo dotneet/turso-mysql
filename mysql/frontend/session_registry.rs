@@ -9,12 +9,13 @@ use std::time::{Duration, Instant};
 /// Every session logged in to one server, and when the server opened.
 pub struct MySqlSessionRegistry {
     opened: Instant,
-    sessions: Mutex<BTreeMap<u32, SessionActivity>>,
-    /// Numbers each registration, so one outliving its connection's ID —
-    /// the listener lets an ID go when the stream closes, which can be
-    /// before the session is dropped — never touches the session that ID
-    /// went to next.
-    next_registration: AtomicU64,
+    /// Each session keeps its activity behind a lock of its own, so a
+    /// session noting what it runs never waits for another doing the same.
+    /// A registration outliving its connection's ID — the listener lets an
+    /// ID go when the stream closes, which can be before the session is
+    /// dropped — holds the activity it was given, never the one that ID went
+    /// to next.
+    sessions: Mutex<BTreeMap<u32, Arc<Mutex<SessionActivity>>>>,
     /// How many commands the sessions sent, each statement of a query that
     /// holds several counted on its own, which `COM_STATISTICS` reports as
     /// `Questions`.
@@ -24,7 +25,6 @@ pub struct MySqlSessionRegistry {
 /// What one session is doing, as `SHOW PROCESSLIST` describes it.
 #[derive(Debug, Clone)]
 struct SessionActivity {
-    registration: u64,
     account: String,
     host: String,
     database: Option<String>,
@@ -59,7 +59,6 @@ impl Default for MySqlSessionRegistry {
         Self {
             opened: Instant::now(),
             sessions: Mutex::new(BTreeMap::new()),
-            next_registration: AtomicU64::new(1),
             questions: AtomicU64::new(0),
         }
     }
@@ -75,22 +74,18 @@ impl MySqlSessionRegistry {
         host: String,
         database: Option<String>,
     ) -> MySqlSessionRegistration {
-        let registration = self.next_registration.fetch_add(1, Ordering::Relaxed);
-        self.lock().insert(
-            id,
-            SessionActivity {
-                registration,
-                account,
-                host,
-                database,
-                running: None,
-                since: Instant::now(),
-            },
-        );
+        let activity = Arc::new(Mutex::new(SessionActivity {
+            account,
+            host,
+            database,
+            running: None,
+            since: Instant::now(),
+        }));
+        self.lock().insert(id, Arc::clone(&activity));
         MySqlSessionRegistration {
             registry: Arc::clone(self),
             id,
-            registration,
+            activity,
         }
     }
 
@@ -115,32 +110,24 @@ impl MySqlSessionRegistry {
         let now = Instant::now();
         self.lock()
             .iter()
-            .filter(|(_, activity)| activity.account == account)
-            .map(|(id, activity)| MySqlSessionSnapshot {
-                id: *id,
-                account: activity.account.clone(),
-                host: activity.host.clone(),
-                database: activity.database.clone(),
-                running: activity.running.clone(),
-                seconds: now.saturating_duration_since(activity.since).as_secs(),
+            .filter_map(|(id, activity)| {
+                let activity = lock_activity(activity);
+                (activity.account == account).then(|| MySqlSessionSnapshot {
+                    id: *id,
+                    account: activity.account.clone(),
+                    host: activity.host.clone(),
+                    database: activity.database.clone(),
+                    running: activity.running.clone(),
+                    seconds: now.saturating_duration_since(activity.since).as_secs(),
+                })
             })
             .collect()
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, SessionActivity>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<u32, Arc<Mutex<SessionActivity>>>> {
         self.sessions
             .lock()
             .expect("the session registry is never left half-changed")
-    }
-
-    fn update(&self, id: u32, registration: u64, change: impl FnOnce(&mut SessionActivity)) {
-        if let Some(activity) = self
-            .lock()
-            .get_mut(&id)
-            .filter(|activity| activity.registration == registration)
-        {
-            change(activity);
-        }
     }
 }
 
@@ -148,16 +135,13 @@ impl MySqlSessionRegistry {
 pub struct MySqlSessionRegistration {
     registry: Arc<MySqlSessionRegistry>,
     id: u32,
-    registration: u64,
+    activity: Arc<Mutex<SessionActivity>>,
 }
 
 impl MySqlSessionRegistration {
     /// Notes that a command arrived, which restarts the session's clock.
     pub fn command_arrived(&self) {
-        self.registry
-            .update(self.id, self.registration, |activity| {
-                activity.since = Instant::now()
-            });
+        lock_activity(&self.activity).since = Instant::now();
     }
 
     /// Counts one command, or one more statement of a query holding several.
@@ -167,30 +151,25 @@ impl MySqlSessionRegistration {
 
     /// Notes that the session began running `statement`.
     pub fn statement_began(&self, statement: RunningStatement) {
-        self.registry
-            .update(self.id, self.registration, |activity| {
-                activity.running = Some(statement);
-                activity.since = Instant::now();
-            });
+        let mut activity = lock_activity(&self.activity);
+        activity.running = Some(statement);
+        activity.since = Instant::now();
     }
 
     /// Notes that the session finished a statement, and which database it
     /// has selected afterwards.
     pub fn statement_ended(&self, database: Option<&str>) {
-        self.registry
-            .update(self.id, self.registration, |activity| {
-                activity.running = None;
-                activity.database = database.map(str::to_owned);
-                activity.since = Instant::now();
-            });
+        let mut activity = lock_activity(&self.activity);
+        activity.running = None;
+        if activity.database.as_deref() != database {
+            activity.database = database.map(str::to_owned);
+        }
+        activity.since = Instant::now();
     }
 
     /// Notes the database the session selected.
     pub fn database_selected(&self, database: &str) {
-        self.registry
-            .update(self.id, self.registration, |activity| {
-                activity.database = Some(database.to_owned());
-            });
+        lock_activity(&self.activity).database = Some(database.to_owned());
     }
 }
 
@@ -199,11 +178,17 @@ impl Drop for MySqlSessionRegistration {
         let mut sessions = self.registry.lock();
         if sessions
             .get(&self.id)
-            .is_some_and(|activity| activity.registration == self.registration)
+            .is_some_and(|activity| Arc::ptr_eq(activity, &self.activity))
         {
             sessions.remove(&self.id);
         }
     }
+}
+
+fn lock_activity(activity: &Mutex<SessionActivity>) -> MutexGuard<'_, SessionActivity> {
+    activity
+        .lock()
+        .expect("a session's activity is never left half-changed")
 }
 
 #[cfg(test)]
