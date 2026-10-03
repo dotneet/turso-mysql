@@ -854,3 +854,88 @@ fn a_rollup_answers_each_total_where_mysql_does() {
         );
     }
 }
+
+#[test]
+fn grouping_by_whole_number_arithmetic_stores_a_long_only_up_to_nine_characters() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE ranks (m MEDIUMINT NULL)",
+        "INSERT INTO ranks VALUES (5), (6), (7), (NULL)",
+    ] {
+        adapter
+            .execute_query(sql)
+            .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    }
+    let count = (
+        MYSQL_TYPE_LONGLONG,
+        21,
+        0,
+        MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG,
+    );
+    for (sql, bucket, answered) in [
+        (
+            "SELECT views DIV 5 * 5 AS bucket, COUNT(*) FROM posts GROUP BY bucket ORDER BY bucket",
+            (MYSQL_TYPE_LONGLONG, 12, 0, MYSQL_NUM_FLAG),
+            rows(&[
+                &[Some("0"), Some("2")],
+                &[Some("5"), Some("2")],
+                &[Some("10"), Some("1")],
+            ]),
+        ),
+        (
+            "SELECT published DIV 2 * 2 AS bucket, COUNT(*) FROM posts GROUP BY bucket ORDER BY bucket",
+            (MYSQL_TYPE_LONG, 5, 0, MYSQL_NUM_FLAG),
+            rows(&[&[None, Some("1")], &[Some("0"), Some("4")]]),
+        ),
+        (
+            "SELECT m DIV 2 * 2 AS bucket, COUNT(*) FROM ranks GROUP BY bucket ORDER BY bucket",
+            (MYSQL_TYPE_LONGLONG, 10, 0, MYSQL_NUM_FLAG),
+            rows(&[
+                &[None, Some("1")],
+                &[Some("4"), Some("1")],
+                &[Some("6"), Some("2")],
+            ]),
+        ),
+    ] {
+        let (shapes, found) = report(&mut adapter, sql);
+        assert_eq!(shapes, [bucket, count], "measured on MySQL 8.4.11: {sql}");
+        assert_eq!(found, answered, "measured on MySQL 8.4.11: {sql}");
+    }
+    let (shapes, found) = report(
+        &mut adapter,
+        "SELECT views DIV 5 * 5 AS bucket FROM posts ORDER BY id",
+    );
+    assert_eq!(
+        shapes,
+        [(
+            MYSQL_TYPE_LONGLONG,
+            12,
+            0,
+            MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        )],
+        "measured on MySQL 8.4.11: nullable over a NOT NULL column"
+    );
+    assert_eq!(
+        found,
+        rows(&[
+            &[Some("10")],
+            &[Some("0")],
+            &[Some("5")],
+            &[Some("0")],
+            &[Some("5")]
+        ])
+    );
+    for sql in [
+        "SELECT user_id DIV 2 * 2 AS bucket, COUNT(*) FROM posts GROUP BY bucket",
+        "SELECT balance DIV 2 * 2 AS bucket, COUNT(*) FROM users GROUP BY bucket",
+        "SELECT title, COUNT(*) FROM posts GROUP BY views DIV 5 * 5",
+    ] {
+        assert!(
+            matches!(
+                adapter.execute_query(sql),
+                Err(FrontendErrorKind::Syntax | FrontendErrorKind::Unsupported)
+            ),
+            "{sql}"
+        );
+    }
+}

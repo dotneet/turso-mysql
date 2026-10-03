@@ -3131,6 +3131,51 @@ fn a_comparison_between_whole_numbers_renders_as_written() {
     }
 }
 
+#[test]
+fn div_binds_as_tightly_as_a_product_and_groups_by_its_alias() {
+    for (sql, normalized) in [
+        (
+            "SELECT created_unix DIV 900 * 900 AS timestamp, count(user_id) as contributions FROM `action` WHERE user_id=? AND act_user_id=? AND (created_unix > ?) GROUP BY timestamp ORDER BY timestamp",
+            "SELECT ((\"created_unix\" / 900) * 900) AS \"timestamp\", count(\"user_id\") AS \"contributions\" FROM \"action\" WHERE (((\"user_id\" = ?) AND (\"act_user_id\" = ?)) AND ((\"created_unix\" > ?))) GROUP BY \"timestamp\" ORDER BY \"timestamp\" ASC",
+        ),
+        (
+            "SELECT n DIV 2 + 1 FROM s",
+            "SELECT ((\"n\" / 2) + 1) AS \"n DIV 2 + 1\" FROM \"s\"",
+        ),
+    ] {
+        let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+        assert_eq!(translated.as_sql(), normalized, "{sql}");
+        assert!(translated.parse_ast().is_ok(), "{sql}");
+    }
+    for sql in [
+        "SELECT n FROM s GROUP BY n DIV 2 * 2",
+        "SELECT n DIV 2 * 2 AS t, COUNT(*) FROM s GROUP BY t HAVING t > 0",
+        "SELECT n DIV 2 * 2.5 AS t, COUNT(*) FROM s GROUP BY t",
+        "SELECT n DIV 2 * 2 AS t, COUNT(*) FROM s GROUP BY t + 1",
+    ] {
+        assert!(
+            parse_select(sql, SessionSqlMode::default()).is_err(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_defaulted_aggregate_over_a_joined_column_renders_inside_the_call() {
+    let sql = "SELECT COALESCE(sum(`tracked_time`.`time`),0) FROM `tracked_time` INNER JOIN `issue` ON tracked_time.issue_id = issue.id WHERE (tracked_time.deleted = ?) AND (issue.repo_id = ?)";
+    let translated = parse_select(sql, SessionSqlMode::default()).unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT coalesce(sum(\"tracked_time\".\"time\"), 0) AS \"COALESCE(sum(`tracked_time`.`time`),0)\" FROM \"tracked_time\" JOIN \"issue\" ON (\"tracked_time\".\"issue_id\" = \"issue\".\"id\") WHERE (((\"tracked_time\".\"deleted\" = ?)) AND ((\"issue\".\"repo_id\" = ?)))"
+    );
+    assert!(translated.parse_ast().is_ok());
+    assert!(parse_select(
+        "SELECT COALESCE(sum(t.n), 'none') FROM t JOIN u ON t.id = u.id",
+        SessionSqlMode::default()
+    )
+    .is_err());
+}
+
 /// `IFNULL` and `COALESCE` take an aggregate as the thing they default, which
 /// is how a report writes a total over rows that may not be there. The engine
 /// spells both calls the same way, so the aggregate is written inside as it

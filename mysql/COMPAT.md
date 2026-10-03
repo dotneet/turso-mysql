@@ -2093,9 +2093,17 @@ binary flag the same way; words lose the 31 decimals a call's words carry; a day
 keeps its shape; and an `AVG`, worked out afterwards from a sum and a count,
 keeps its own, as does a `ROUND` over a total or an average. A grouping key carries the group flag, 32768 — the bit MySQL also
 sends as the numeric flag, so a client reads a `DATE` or a `DATE_FORMAT` key as
-flagged numeric. What the temporary table does to any other answer has not been
+flagged numeric. Arithmetic over signed whole-number columns, written whole
+numbers and `col DIV n` may be a key too — Gitea's activity heatmap, `SELECT
+created_unix DIV 900 * 900 AS timestamp, count(user_id) ... GROUP BY timestamp
+ORDER BY timestamp` — and the engine groups it by the number it answers, as
+MySQL does. Measured on 8.4.11, the table stores such an answer as a `LONG`
+only when it is nine characters or fewer, unlike a column's `MIN` or `MAX`:
+`m DIV 2 * 2` over a `MEDIUMINT` answers a `LONGLONG` of 10, over a `TINYINT`
+a `LONG` of 5, and the heatmap's bucket a `LONGLONG` of 23, each without the
+binary flag. What the temporary table does to any other answer has not been
 measured and is refused: a `GROUP_CONCAT`, a `MIN` over a moment, a literal,
-arithmetic. MySQL uses the same table for a statement grouping by a
+arithmetic over a `DECIMAL`, an unsigned column or an aggregate. MySQL uses the same table for a statement grouping by a
 column no index covers, and reports the same shapes there; this keeps the
 shapes MySQL reports when an index answers the grouping instead — measured,
 `SELECT user_id, COUNT(*) ... GROUP BY user_id` reports the count's binary flag
@@ -2678,7 +2686,13 @@ is NOT_NULL, and a widening of any whole number to a BIGINT that leaves the
 length alone — `IFNULL(MAX(s), 0)` over a `SMALLINT` answers LONGLONG with the
 SMALLINT's length 6. That is the same widening `IFNULL` over a plain column
 does, so the two forms are one rule. Over no rows at all the answer is the
-fallback rather than NULL, which is the whole reason the call is written.
+fallback rather than NULL, which is the whole reason the call is written. The
+aggregate may read a joined table's column named with its table — Gitea totals
+an issue list's time with `COALESCE(sum(tracked_time.time), 0) FROM
+tracked_time INNER JOIN issue ON ...`, measured on 8.4.11 as the NEWDECIMAL of
+42 a `SUM` over a `BIGINT` answers, never NULL — except over a `DECIMAL`,
+whose fallback is not worked out through a join, and with a word for the
+fallback.
 
 The count may also have been worked out by a derived table the statement
 reads, and be named through it: Prisma counts a relation with

@@ -404,6 +404,17 @@ impl Dialect for SessionMySqlDialect {
         expr: &Expr,
         precedence: u8,
     ) -> Option<Result<Expr, ParserError>> {
+        if parser.parse_keyword(Keyword::DIV) {
+            return Some(
+                parser
+                    .parse_subexpr(precedence)
+                    .map(|divisor| Expr::BinaryOp {
+                        left: Box::new(expr.clone()),
+                        op: BinaryOperator::MyIntegerDivide,
+                        right: Box::new(divisor),
+                    }),
+            );
+        }
         MySqlDialect {}.parse_infix(parser, expr, precedence)
     }
 

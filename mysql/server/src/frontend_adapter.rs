@@ -7804,6 +7804,7 @@ struct SourceTableColumns {
     /// A subquery standing as a result column names this table's columns,
     /// which takes the `NOT NULL` flag off the columns read straight from it.
     read_by_a_result_subquery: bool,
+    read_only_by_a_condition_subquery: bool,
     /// MySQL sorts the statement's rows through a table of its own, which
     /// takes the key flags off this table's columns.
     sorted_through_a_table: bool,
@@ -7893,7 +7894,11 @@ impl TableResultMetadata {
     /// surfaces, which name a column and no table.
     fn column_named(&self, name: &str) -> Result<(&SourceTableColumns, usize), FrontendErrorKind> {
         let mut found: Option<(&SourceTableColumns, usize)> = None;
-        for table in &self.tables {
+        for table in self
+            .tables
+            .iter()
+            .filter(|table| !table.read_only_by_a_condition_subquery)
+        {
             let position = match table.catalog_columns.is_empty() {
                 true => table
                     .columns
@@ -9182,6 +9187,26 @@ impl TableResultMetadata {
                     decimal: source.decimal_size().is_some(),
                     float: false,
                     not_null,
+                })
+            }
+            ArithmeticOperand::Quotient { column_name } => {
+                let source_metadata = source_metadata.ok_or(FrontendErrorKind::Unsupported)?;
+                let (table, ordinal) = source_metadata.column_named(column_name)?;
+                let source = table
+                    .columns
+                    .get(ordinal)
+                    .ok_or(FrontendErrorKind::Unsupported)?;
+                if source.decimal_size().is_some() {
+                    return Err(FrontendErrorKind::Unsupported);
+                }
+                let (precision, _) =
+                    decimal_shape_of(source).ok_or(FrontendErrorKind::Unsupported)?;
+                Ok(ArithmeticOperandShape {
+                    precision,
+                    scale: 0,
+                    decimal: false,
+                    float: false,
+                    not_null: false,
                 })
             }
             // Measured on MySQL 8.4.11: `COUNT(*)` reports a LONGLONG of
@@ -11996,7 +12021,9 @@ fn written_out_through_a_table(
 /// binary flag, a `COUNT` included. Words lose their 31 decimals, which is
 /// what MySQL writes for a call's words on their own. A day keeps its shape.
 /// An `AVG` is worked out after the grouping from a sum and a count and keeps
-/// the shape it has on its own.
+/// the shape it has on its own. Whole-number arithmetic is stored as a `LONG`
+/// only when it is nine characters or fewer: `m DIV 2 AS t` over a `MEDIUMINT`
+/// answers a `LONG` of 9, `m * 2` a `LONGLONG` of 10.
 ///
 /// Anything else has not been measured there and is refused.
 #[cfg(unix)]
@@ -12007,6 +12034,14 @@ fn read_out_of_the_grouping_table(
     use turso_mysql_parser::StaticSelectMetadata;
     let stored = match answer {
         StaticSelectMetadata::Count => true,
+        StaticSelectMetadata::Arithmetic(_) if definition.column_type == MYSQL_TYPE_LONGLONG => {
+            if definition.column_length <= 9 {
+                definition.column_type = MYSQL_TYPE_LONG;
+            }
+            let flags = definition.flags & (MYSQL_NOT_NULL_FLAG | MYSQL_UNSIGNED_FLAG);
+            set_column_flags(definition, flags);
+            return Ok(());
+        }
         // Measured: a written word or whole number is not stored, and keeps
         // the shape it has on its own.
         StaticSelectMetadata::RoundedAggregate { .. }
@@ -12180,6 +12215,7 @@ fn table_result_metadata_for_references(
                 view_columns: Vec::new(),
                 outer: source.outer(),
                 read_by_a_result_subquery: source.read_by_a_result_subquery(),
+                read_only_by_a_condition_subquery: source.read_only_by_a_condition_subquery(),
                 sorted_through_a_table: source.sorted_through_a_table(),
                 projected_columns: source.projected_columns().to_vec(),
                 derived: source.derived().cloned(),
@@ -12236,6 +12272,7 @@ fn table_result_metadata_for_references(
             view_columns,
             outer: source.outer(),
             read_by_a_result_subquery: source.read_by_a_result_subquery(),
+            read_only_by_a_condition_subquery: source.read_only_by_a_condition_subquery(),
             sorted_through_a_table: source.sorted_through_a_table(),
             projected_columns,
             derived: source.derived().cloned(),
@@ -12384,6 +12421,7 @@ fn written_view_columns(
                 projected_columns: Vec::new(),
                 outer: source.outer(),
                 read_by_a_result_subquery: false,
+                read_only_by_a_condition_subquery: false,
                 sorted_through_a_table: false,
                 derived: None,
             })

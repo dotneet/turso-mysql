@@ -227,12 +227,16 @@ pub(super) fn render_select_group_by(
         let Some(joins) = joined_tables(&select.from) else {
             return unsupported("GROUP BY keys deciding a column over this FROM");
         };
+        let keys = group_by
+            .iter()
+            .filter_map(grouped_column)
+            .map(MySqlNamedColumn::written)
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return unsupported("GROUP BY leaves a projected column out of the grouping");
+        }
         render_context.columns_the_keys_decide = Some(MySqlColumnsTheKeysDecide {
-            keys: group_by
-                .iter()
-                .filter_map(grouped_column)
-                .map(MySqlNamedColumn::written)
-                .collect(),
+            keys,
             columns: decided,
             joins,
         });
@@ -527,8 +531,14 @@ pub(super) fn columns_named_in(expr: &Expr, columns: &mut Vec<MySqlNamedColumn>)
 /// and `A` are one group, and the engine groups the answer by its bytes.
 /// `DATE_FORMAT` and the day and month names answer words too, but only
 /// words one format writes, and two of those that differ in case or accent
-/// alone do not come out of it.
+/// alone do not come out of it. Whole-number arithmetic over columns and
+/// written numbers groups by the number it answers in both.
 fn groups_the_way_mysql_does(key: &Expr) -> bool {
+    if let Some(StaticSelectMetadata::Arithmetic(shape)) =
+        static_select_metadata::classify_static_select_expr(key)
+    {
+        return answers_a_whole_number_from_columns(&shape);
+    }
     matches!(
         static_select_metadata::classify_static_select_expr(key),
         Some(StaticSelectMetadata::ScalarCall {
@@ -548,6 +558,23 @@ fn groups_the_way_mysql_does(key: &Expr) -> bool {
             ..
         }) if !columns.is_empty()
     )
+}
+
+fn answers_a_whole_number_from_columns(shape: &static_select_metadata::ArithmeticShape) -> bool {
+    use static_select_metadata::{ArithmeticOperand, ArithmeticOperator};
+    shape.operator != ArithmeticOperator::Divide
+        && shape.names_a_column()
+        && [&shape.left, &shape.right]
+            .into_iter()
+            .all(|operand| match operand {
+                ArithmeticOperand::Literal { .. }
+                | ArithmeticOperand::Column { .. }
+                | ArithmeticOperand::Quotient { .. } => true,
+                ArithmeticOperand::Nested(inner) => answers_a_whole_number_from_columns(inner),
+                ArithmeticOperand::DecimalLiteral { .. }
+                | ArithmeticOperand::Count
+                | ArithmeticOperand::Aggregate { .. } => false,
+            })
 }
 
 /// Holds a grouped statement's `HAVING` to what MySQL lets it name.

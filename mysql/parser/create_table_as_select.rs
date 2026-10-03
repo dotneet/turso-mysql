@@ -196,6 +196,7 @@ fn checked_arithmetic_columns(expr: &Expr) -> Option<Vec<String>> {
                 // column, which this has not measured.
                 ArithmeticOperand::DecimalLiteral { .. }
                 | ArithmeticOperand::Count
+                | ArithmeticOperand::Quotient { .. }
                 | ArithmeticOperand::Aggregate { .. } => false,
             })
     }

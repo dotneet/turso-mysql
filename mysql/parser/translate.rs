@@ -37,6 +37,7 @@ pub struct MySqlSelectSource {
     /// Whether a subquery standing as a result column names this table's
     /// columns from inside it.
     read_by_a_result_subquery: bool,
+    read_only_by_a_condition_subquery: bool,
     branch: usize,
     subquery: bool,
     projected_columns: Vec<String>,
@@ -429,6 +430,10 @@ impl MySqlSelectSource {
     /// its own shape, and an `EXISTS` naming the table changes nothing.
     pub const fn read_by_a_result_subquery(&self) -> bool {
         self.read_by_a_result_subquery
+    }
+
+    pub const fn read_only_by_a_condition_subquery(&self) -> bool {
+        self.read_only_by_a_condition_subquery
     }
 
     /// Returns the columns a `WITH` name projects, in order.
@@ -1130,7 +1135,13 @@ fn render_select_body(
     let row_filter = having_filters_rows(having.as_ref(), select, group_by);
     let mut predicates = Vec::new();
     if let Some(selection) = &select.selection {
+        let held_before = render_context.subquery_tables.len();
         predicates.push(render_select_predicate(selection, render_context)?);
+        if outer_projection {
+            for source in render_context.subquery_tables.iter_mut().skip(held_before) {
+                source.read_only_by_a_condition_subquery = true;
+            }
+        }
     }
     if row_filter {
         if !render_context.group_concat_counts.is_empty() {
@@ -1276,12 +1287,40 @@ fn note_what_result_subqueries_read(
 }
 
 /// Reports whether a projection item is a `MIN`, `MAX`, `SUM` or
-/// `GROUP_CONCAT` over a column named with its table, standing on its own.
+/// `GROUP_CONCAT` over a column named with its table, standing on its own or
+/// inside an `IFNULL` or a `COALESCE`.
 fn is_an_aggregate_over_a_joined_column(item: &SelectItem) -> bool {
-    matches!(item,
-        SelectItem::UnnamedExpr(Expr::Function(function))
-        | SelectItem::ExprWithAlias { expr: Expr::Function(function), .. }
-            if static_select_metadata::qualified_aggregate_argument(function).is_some())
+    let (SelectItem::UnnamedExpr(Expr::Function(function))
+    | SelectItem::ExprWithAlias {
+        expr: Expr::Function(function),
+        ..
+    }) = item
+    else {
+        return false;
+    };
+    static_select_metadata::qualified_aggregate_argument(function).is_some()
+        || defaulted_aggregate(function).is_some_and(|aggregate| {
+            static_select_metadata::qualified_aggregate_argument(aggregate).is_some()
+        })
+}
+
+fn defaulted_aggregate(function: &sqlparser::ast::Function) -> Option<&sqlparser::ast::Function> {
+    let [ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else {
+        return None;
+    };
+    if !name.value.eq_ignore_ascii_case("COALESCE") && !name.value.eq_ignore_ascii_case("IFNULL") {
+        return None;
+    }
+    let sqlparser::ast::FunctionArguments::List(arguments) = &function.args else {
+        return None;
+    };
+    let [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+        Expr::Function(aggregate),
+    )), _] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    Some(aggregate)
 }
 
 /// Reports whether a statement answers the count of its one derived table's
@@ -2080,6 +2119,7 @@ fn render_derived_table(
             branch: 0,
             subquery: false,
             read_by_a_result_subquery: false,
+            read_only_by_a_condition_subquery: false,
             projected_columns,
             derived: Some(derived),
             catalog: source.catalog,
@@ -2236,6 +2276,7 @@ fn render_counted_derived_table(
             branch: 0,
             subquery: false,
             read_by_a_result_subquery: false,
+            read_only_by_a_condition_subquery: false,
             projected_columns: Vec::new(),
             catalog: source.catalog,
             hinted_indexes: Vec::new(),
@@ -2323,6 +2364,7 @@ fn render_common_table_expressions(
             branch: 0,
             subquery: false,
             read_by_a_result_subquery: false,
+            read_only_by_a_condition_subquery: false,
             projected_columns,
             derived: Some(derived),
             catalog: source.catalog,
@@ -7610,6 +7652,7 @@ fn render_select_table(
             branch: 0,
             subquery: false,
             read_by_a_result_subquery: false,
+            read_only_by_a_condition_subquery: false,
             projected_columns: Vec::new(),
             derived: None,
             catalog,
@@ -10246,6 +10289,13 @@ fn rendered_scalar_arguments(
                         || static_select_metadata::column_aggregate_argument(inner).is_some() =>
                 {
                     Ok(render_aggregate_call(inner, render_context))
+                }
+                Expr::Function(inner)
+                    if render_context.takes_a_joined_aggregate
+                        && static_select_metadata::qualified_aggregate_argument(inner)
+                            .is_some() =>
+                {
+                    Ok(render_qualified_aggregate(inner, render_context))
                 }
                 // `COALESCE((SELECT SUM(n) FROM ...), 0)` falls a scalar
                 // subquery back the same way.

@@ -444,6 +444,7 @@ pub(super) fn render_derived_table_joining_tables(
             branch: 0,
             subquery: false,
             read_by_a_result_subquery: false,
+            read_only_by_a_condition_subquery: false,
             projected_columns: joined.iter().map(|column| column.column.clone()).collect(),
             derived: Some(MySqlDerivedColumns {
                 inner_reference: first.reference,

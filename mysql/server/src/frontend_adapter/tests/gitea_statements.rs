@@ -1136,3 +1136,148 @@ fn a_call_answering_a_word_meets_a_bound_word() {
     )
     .is_err());
 }
+
+const HEATMAP: &str = "SELECT created_unix DIV 900 * 900 AS timestamp, count(user_id) as contributions FROM `action` WHERE user_id=? AND act_user_id=? AND (created_unix > ?) GROUP BY timestamp ORDER BY timestamp";
+
+const VISIBLE_HEATMAP: &str = "SELECT created_unix DIV 900 * 900 AS timestamp, count(user_id) as contributions FROM `action` WHERE act_user_id IN (SELECT `user`.id FROM `user` WHERE visibility IN (?,?) OR id=?) AND user_id=? AND (created_unix > ?) GROUP BY timestamp ORDER BY timestamp";
+
+#[test]
+fn the_activity_heatmap_counts_actions_in_quarter_hours() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `action` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `user_id` BIGINT(20) NULL, `op_type` INT NULL, `act_user_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL, `is_private` TINYINT(1) DEFAULT false NOT NULL, `created_unix` BIGINT(20) NULL)",
+        "CREATE TABLE `user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `visibility` INT DEFAULT 0 NOT NULL, `created_unix` BIGINT(20) NULL)",
+        "INSERT INTO `user` (`visibility`, `created_unix`) VALUES (0, 5), (2, 6), (0, 7)",
+        "INSERT INTO `action` (`user_id`, `act_user_id`, `repo_id`, `created_unix`) VALUES (1, 1, 1, 1700000000), (1, 1, 1, 1700000100), (1, 1, 1, 1700000500), (1, 1, 1, 1700001000), (2, 2, 1, 1700000000), (1, 1, 2, NULL), (1, 2, 1, 1700000200)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let bucket = |timestamp: i64, contributions: i64| {
+        vec![
+            BinaryResultValue::Integer(timestamp),
+            BinaryResultValue::Integer(contributions),
+        ]
+    };
+    let own = prepared_rows(
+        &mut adapter,
+        HEATMAP,
+        &[
+            Bound::Whole(1),
+            Bound::Whole(1),
+            Bound::Whole(1_699_999_000),
+        ],
+    );
+    assert_eq!(
+        own.rows,
+        [
+            bucket(1_699_999_200, 1),
+            bucket(1_700_000_100, 2),
+            bucket(1_700_001_000, 1)
+        ],
+        "MySQL 8.4.11 answers these buckets over the same rows"
+    );
+    let visible = prepared_rows(
+        &mut adapter,
+        VISIBLE_HEATMAP,
+        &[
+            Bound::Whole(0),
+            Bound::Whole(1),
+            Bound::Whole(2),
+            Bound::Whole(1),
+            Bound::Whole(1_699_999_000),
+        ],
+    );
+    assert_eq!(
+        visible.rows,
+        [
+            bucket(1_699_999_200, 1),
+            bucket(1_700_000_100, 3),
+            bucket(1_700_001_000, 1)
+        ],
+        "MySQL 8.4.11 answers these buckets over the same rows"
+    );
+    for result in [&own, &visible] {
+        let [timestamp, contributions] = result.columns.as_slice() else {
+            panic!("two columns: {:?}", result.columns);
+        };
+        assert_eq!(
+            (
+                timestamp.name.as_str(),
+                timestamp.column_type,
+                timestamp.column_length,
+                timestamp.flags
+            ),
+            ("timestamp", MYSQL_TYPE_LONGLONG, 23, MYSQL_NUM_FLAG),
+            "MySQL 8.4.11 reports a nullable LONGLONG of 23 without the binary flag"
+        );
+        assert_eq!(
+            (
+                contributions.column_type,
+                contributions.column_length,
+                contributions.flags
+            ),
+            (
+                MYSQL_TYPE_LONGLONG,
+                21,
+                MYSQL_NOT_NULL_FLAG | MYSQL_NUM_FLAG
+            ),
+            "MySQL 8.4.11 reports the count without the binary flag"
+        );
+    }
+}
+
+#[test]
+fn an_issue_lists_total_time_falls_back_on_zero_over_a_join() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `issue` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `is_closed` TINYINT(1) NULL, `is_pull` TINYINT(1) NULL)",
+        "CREATE TABLE `tracked_time` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `issue_id` BIGINT(20) NULL, `user_id` BIGINT(20) NULL, `time` BIGINT(20) NOT NULL, `deleted` TINYINT(1) DEFAULT false NOT NULL)",
+        "INSERT INTO `issue` (`repo_id`, `is_closed`, `is_pull`) VALUES (1, 0, 0), (1, 1, 0), (2, 0, 0)",
+        "INSERT INTO `tracked_time` (`issue_id`, `user_id`, `time`, `deleted`) VALUES (1, 1, 30, 0), (1, 1, 40, 0), (1, 2, 1000, 1), (2, 1, 5, 0), (3, 1, 7, 0)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let total = |adapter: &mut Adapter, repository: i64| {
+        prepared_rows(
+            adapter,
+            "SELECT COALESCE(sum(`tracked_time`.`time`),0) FROM `tracked_time` INNER JOIN `issue` ON tracked_time.issue_id = issue.id WHERE (tracked_time.deleted = ?) AND (issue.repo_id = ?) AND (issue.is_pull=?) AND (issue.is_closed = ?)",
+            &[
+                Bound::Whole(0),
+                Bound::Whole(repository),
+                Bound::Whole(0),
+                Bound::Whole(0),
+            ],
+        )
+    };
+    let found = total(&mut adapter, 1);
+    assert_eq!(
+        found.rows,
+        [vec![BinaryResultValue::Text("70".to_owned())]],
+        "MySQL 8.4.11 totals 70 over the same rows"
+    );
+    assert_eq!(
+        total(&mut adapter, 9).rows,
+        [vec![BinaryResultValue::Text("0".to_owned())]],
+        "MySQL 8.4.11 falls back on 0 where no row joins"
+    );
+    let [column] = found.columns.as_slice() else {
+        panic!("one column: {:?}", found.columns);
+    };
+    assert_eq!(
+        (
+            column.name.as_str(),
+            column.column_type,
+            column.column_length,
+            column.decimals,
+            column.flags
+        ),
+        (
+            "COALESCE(sum(`tracked_time`.`time`),0)",
+            MYSQL_TYPE_NEWDECIMAL,
+            42,
+            0,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        ),
+        "MySQL 8.4.11 reports a NEWDECIMAL of 42 that is never NULL"
+    );
+}

@@ -202,7 +202,9 @@ impl ArithmeticShape {
                 ArithmeticOperand::Literal { .. }
                 | ArithmeticOperand::DecimalLiteral { .. }
                 | ArithmeticOperand::Count => false,
-                ArithmeticOperand::Column { .. } | ArithmeticOperand::Aggregate { .. } => true,
+                ArithmeticOperand::Column { .. }
+                | ArithmeticOperand::Quotient { .. }
+                | ArithmeticOperand::Aggregate { .. } => true,
                 ArithmeticOperand::Nested(shape) => shape.names_a_column(),
             })
     }
@@ -218,6 +220,8 @@ pub enum ArithmeticOperand {
     DecimalLiteral { precision: u32, scale: u32 },
     /// A column, whose precision and nullability live in the table.
     Column { column_name: String },
+    /// `col DIV n`, as wide as its column.
+    Quotient { column_name: String },
     /// A nested arithmetic expression.
     Nested(Box<ArithmeticShape>),
     /// A `COUNT`, whose shape is the same whatever it counts.
@@ -1034,6 +1038,17 @@ fn classify_arithmetic_operand(expr: &Expr) -> Option<ArithmeticOperand> {
             })
         }
         Expr::Nested(inner) => classify_arithmetic_operand(inner),
+        Expr::BinaryOp {
+            op: sqlparser::ast::BinaryOperator::MyIntegerDivide,
+            ..
+        } => match classify_whole_division(expr)? {
+            StaticSelectMetadata::ScalarCall { mut columns, .. } => {
+                Some(ArithmeticOperand::Quotient {
+                    column_name: columns.pop()?,
+                })
+            }
+            _ => None,
+        },
         Expr::Value(value) => {
             if let Value::Number(written, false) = &value.value {
                 if let Some((precision, scale)) = decimal_literal_shape(written) {
@@ -2020,7 +2035,9 @@ pub(super) fn scalar_call(function: &sqlparser::ast::Function) -> Option<StaticS
             let inner = classify_static_select_expr(defaulted)?;
             if !matches!(
                 inner,
-                StaticSelectMetadata::Count | StaticSelectMetadata::ColumnAggregate { .. }
+                StaticSelectMetadata::Count
+                    | StaticSelectMetadata::ColumnAggregate { .. }
+                    | StaticSelectMetadata::QualifiedAggregate { .. }
             ) {
                 return None;
             }
