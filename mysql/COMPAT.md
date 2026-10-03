@@ -699,6 +699,23 @@ a plain `COUNT(*)` answers, and which rows a limit without an order keeps does n
 many it keeps. An `ORDER BY` in such a body and a bound row count are refused, and a statement
 reading anything more of the derived table is held to the rules above.
 
+A membership test may read a derived table, which is how a client reads the table a `DELETE`
+or an `UPDATE` changes: measured on 8.4.11, `DELETE FROM t WHERE id IN (SELECT t.id FROM t
+JOIN u ...)` is 1093, and the same through `(SELECT * FROM t) t` deletes the rows the join
+finds — Gitea's runner and label cleanups — and Gitea's package cleanup reads `package.id IN
+(SELECT id FROM (SELECT package.id FROM package LEFT JOIN package_version ON ... WHERE
+package_version.id IS NULL) temp)`. A membership test compares one column and nothing about
+the rows' order or count, so `SELECT x.c FROM (body) x` is read as the body projecting `c`,
+and `(SELECT * FROM t) alias` as `t AS alias`; a body that groups, orders or cuts its rows is
+refused, and a `DELETE` or `UPDATE` naming its own table in a subquery outside a derived table
+still is, as MySQL's 1093. A membership test projecting `MAX` or `MIN` of a joined table's
+column — Gitea's `package_version.id IN (SELECT MAX(package_version.id) FROM package_version
+INNER JOIN package ON ... GROUP BY package_version.package_id)` — compares that column. A join
+narrowed by membership tests alone and ordered by columns of two of its tables is sorted
+through a table of MySQL's own as an unnarrowed one is, measured: `ORDER BY package.name,
+package_version.id` drops the key flags of `package_version.*` and ordering by
+`package_version`'s columns alone keeps them.
+
 A shift by months keeps the day inside the month it lands in. MySQL takes the last day of the
 target month where that month has no such day, and the engine's own month arithmetic overflows
 into the next one instead: measured on 8.4.11, `2026-01-31` a month on is `2026-02-28` where

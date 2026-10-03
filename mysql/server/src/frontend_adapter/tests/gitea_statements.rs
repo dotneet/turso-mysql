@@ -1281,3 +1281,189 @@ fn an_issue_lists_total_time_falls_back_on_zero_over_a_join() {
         "MySQL 8.4.11 reports a NEWDECIMAL of 42 that is never NULL"
     );
 }
+
+const PRIMARY_KEY: u16 =
+    MYSQL_NOT_NULL_FLAG | MYSQL_PRI_KEY_FLAG | MYSQL_AUTO_INCREMENT_FLAG | MYSQL_PART_KEY_FLAG;
+
+fn package_tables(adapter: &mut Adapter) {
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `package` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NOT NULL, `repo_id` BIGINT(20) NULL, `type` VARCHAR(255) NOT NULL, `name` VARCHAR(255) NOT NULL, `lower_name` VARCHAR(255) NOT NULL, `semver_compatible` TINYINT(1) DEFAULT false NOT NULL, `is_internal` TINYINT(1) DEFAULT false NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE UNIQUE INDEX `UQE_package_s` ON `package` (`owner_id`,`type`,`lower_name`)",
+        "CREATE INDEX `IDX_package_owner_id` ON `package` (`owner_id`)",
+        "CREATE INDEX `IDX_package_repo_id` ON `package` (`repo_id`)",
+        "CREATE INDEX `IDX_package_type` ON `package` (`type`)",
+        "CREATE INDEX `IDX_package_lower_name` ON `package` (`lower_name`)",
+        "CREATE TABLE IF NOT EXISTS `package_version` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `package_id` BIGINT(20) NOT NULL, `creator_id` BIGINT(20) DEFAULT 0 NOT NULL, `version` VARCHAR(255) NOT NULL, `lower_version` VARCHAR(255) NOT NULL, `created_unix` BIGINT(20) NOT NULL, `is_internal` TINYINT(1) DEFAULT false NOT NULL, `metadata_json` LONGTEXT NULL, `download_count` BIGINT(20) DEFAULT 0 NOT NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "CREATE UNIQUE INDEX `UQE_package_version_s` ON `package_version` (`package_id`,`lower_version`)",
+        "CREATE INDEX `IDX_package_version_lower_version` ON `package_version` (`lower_version`)",
+        "CREATE INDEX `IDX_package_version_created_unix` ON `package_version` (`created_unix`)",
+        "CREATE INDEX `IDX_package_version_is_internal` ON `package_version` (`is_internal`)",
+        "CREATE INDEX `IDX_package_version_package_id` ON `package_version` (`package_id`)",
+        "INSERT INTO package (owner_id, repo_id, type, name, lower_name) VALUES (1, 0, 'npm', 'Left', 'left'), (1, 0, 'npm', 'Beta', 'beta'), (2, NULL, 'pypi', 'Gone', 'gone'), (1, 0, 'npm', 'alpha', 'alpha'), (3, 1, 'go', 'Orphan', 'orphan')",
+        "INSERT INTO package_version (package_id, version, lower_version, created_unix, is_internal) VALUES (2, '1.0', '1.0', 100, 0), (2, '1.1', '1.1', 300, 0), (4, '0.1', '0.1', 200, 0), (4, '0.2', '0.2', 250, 1), (3, '9', '9', 50, 0)",
+    ] {
+        run(adapter, sql);
+    }
+}
+
+fn answer(adapter: &mut Adapter, sql: &str) -> (Vec<u16>, Vec<Vec<Option<String>>>) {
+    let result = adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    let CommandExecutionResult::ResultSet(result) = result else {
+        panic!("{sql} must return a result set");
+    };
+    let flags = result.columns.iter().map(|column| column.flags).collect();
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.map(|value| String::from_utf8(value).unwrap()))
+                .collect()
+        })
+        .collect();
+    (flags, rows)
+}
+
+fn words(row: &[&str]) -> Vec<Option<String>> {
+    row.iter().map(|value| Some((*value).to_owned())).collect()
+}
+
+#[test]
+fn the_package_cleanup_reads_its_unused_packages_through_a_derived_table() {
+    let (_directory, mut adapter) = adapter();
+    package_tables(&mut adapter);
+    let (flags, found) = answer(
+        &mut adapter,
+        "SELECT `id`, `owner_id`, `repo_id`, `type`, `name`, `lower_name`, `semver_compatible`, `is_internal` FROM `package` WHERE package.id IN (SELECT id FROM (SELECT package.id FROM package LEFT JOIN package_version ON package_version.package_id = package.id WHERE package_version.id IS NULL) temp)",
+    );
+    assert_eq!(
+        found,
+        [
+            words(&["1", "1", "0", "npm", "Left", "left", "0", "0"]),
+            words(&["5", "3", "1", "go", "Orphan", "orphan", "0", "0"]),
+        ],
+        "MySQL 8.4.11 finds the two packages no version names"
+    );
+    let key = MYSQL_MULTIPLE_KEY_FLAG | MYSQL_PART_KEY_FLAG;
+    let no_default = MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG;
+    assert_eq!(
+        flags,
+        [
+            PRIMARY_KEY,
+            no_default | key,
+            key,
+            no_default | key,
+            no_default,
+            no_default | key,
+            MYSQL_NOT_NULL_FLAG,
+            MYSQL_NOT_NULL_FLAG,
+        ],
+        "MySQL 8.4.11 reports the table's own columns"
+    );
+}
+
+#[test]
+fn a_package_listing_reads_each_packages_latest_version_through_a_grouped_join() {
+    let (_directory, mut adapter) = adapter();
+    package_tables(&mut adapter);
+    let latest = "SELECT package_version.id, package_version.package_id, package_version.lower_version FROM `package_version` INNER JOIN `package` ON package.id = package_version.package_id WHERE package_version.id IN (SELECT MAX(package_version.id) FROM package_version INNER JOIN package ON package.id = package_version.package_id WHERE package_version.is_internal=0 AND package.owner_id=1 AND package.type='npm' GROUP BY package_version.package_id)";
+    let (by_name, found) = answer(
+        &mut adapter,
+        &format!("{latest} ORDER BY `package`.`name` ASC, `package_version`.`id` DESC LIMIT 50"),
+    );
+    assert_eq!(
+        found,
+        [words(&["3", "4", "0.1"]), words(&["2", "2", "1.1"])],
+        "MySQL 8.4.11 orders alpha before Beta"
+    );
+    assert_eq!(
+        by_name,
+        [
+            MYSQL_NOT_NULL_FLAG,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+            MYSQL_NOT_NULL_FLAG | MYSQL_NO_DEFAULT_VALUE_FLAG,
+        ],
+        "MySQL 8.4.11 sorts across both tables through a table of its own, without keys"
+    );
+    let (by_time, found) = answer(
+        &mut adapter,
+        &format!(
+            "{latest} ORDER BY `package_version`.`created_unix` DESC, `package_version`.`id` DESC LIMIT 50"
+        ),
+    );
+    assert_eq!(
+        found,
+        [words(&["2", "2", "1.1"]), words(&["3", "4", "0.1"])]
+    );
+    assert_eq!(
+        by_time,
+        [
+            PRIMARY_KEY,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_MULTIPLE_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+            MYSQL_NOT_NULL_FLAG
+                | MYSQL_MULTIPLE_KEY_FLAG
+                | MYSQL_NO_DEFAULT_VALUE_FLAG
+                | MYSQL_PART_KEY_FLAG,
+        ],
+        "MySQL 8.4.11 keeps the keys ordered by one table"
+    );
+}
+
+#[test]
+fn a_delete_reads_its_own_table_through_a_derived_table() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `action_runner` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `name` VARCHAR(255) NULL, `ephemeral` TINYINT(1) DEFAULT false NOT NULL)",
+        "CREATE TABLE `action_task` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `runner_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+        "INSERT INTO action_runner (name, ephemeral) VALUES ('a', 1), ('b', 1), ('c', 0), ('d', 1)",
+        "INSERT INTO action_task (runner_id, repo_id) VALUES (1, 7), (2, 8), (3, 7), (1, 7), (4, 7)",
+        "CREATE TABLE `issue` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL)",
+        "CREATE TABLE `issue_label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `issue_id` BIGINT(20) NULL, `label_id` BIGINT(20) NULL)",
+        "CREATE TABLE `label` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `org_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL)",
+        "INSERT INTO issue (repo_id) VALUES (1), (1), (2)",
+        "INSERT INTO label (repo_id, org_id, name) VALUES (1, 0, 'own'), (2, 0, 'other repo'), (0, 5, 'own org'), (0, 6, 'other org')",
+        "INSERT INTO issue_label (issue_id, label_id) VALUES (1, 1), (1, 2), (2, 3), (2, 4), (3, 2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let deleted = |result| match result {
+        Ok(PreparedStatementExecutionResult::Ok(ok)) => ok.affected_rows,
+        other => panic!("a DELETE answers OK, answered {other:?}"),
+    };
+    assert_eq!(
+        deleted(prepared(
+            &mut adapter,
+            "DELETE FROM `action_runner` WHERE id IN (SELECT `action_runner`.id FROM (SELECT * FROM `action_runner`) `action_runner` INNER JOIN `action_task` ON `action_task`.`runner_id` = `action_runner`.`id` WHERE `action_runner`.`ephemeral`=? AND `action_task`.`repo_id`=?)",
+            &[Bound::Whole(1), Bound::Whole(7)],
+        )),
+        2,
+        "MySQL 8.4.11 deletes the two ephemeral runners with a task in the repository"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM action_runner ORDER BY id"),
+        [words(&["2"]), words(&["3"])]
+    );
+    assert_eq!(
+        deleted(prepared(
+            &mut adapter,
+            "DELETE FROM issue_label WHERE issue_label.id IN (\n\t\t\tSELECT il_too.id FROM (\n\t\t\t\tSELECT il_too_too.id\n\t\t\t\t\tFROM issue_label AS il_too_too\n\t\t\t\t\t\tINNER JOIN label ON il_too_too.label_id = label.id\n\t\t\t\t\t\tINNER JOIN issue on issue.id = il_too_too.issue_id\n\t\t\t\t\tWHERE\n\t\t\t\t\t\tissue.repo_id = ? AND ((label.org_id = 0 AND issue.repo_id != label.repo_id) OR (label.repo_id = 0 AND label.org_id != ?))\n\t\t) AS il_too )",
+            &[Bound::Whole(1), Bound::Whole(5)],
+        )),
+        2,
+        "MySQL 8.4.11 deletes the two labels from another repository or organisation"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM issue_label ORDER BY id"),
+        [words(&["1"]), words(&["3"]), words(&["5"])]
+    );
+    assert!(adapter
+        .execute_query(
+            "DELETE FROM `action_runner` WHERE id IN (SELECT `action_runner`.id FROM `action_runner` INNER JOIN `action_task` ON `action_task`.`runner_id` = `action_runner`.`id`)"
+        )
+        .is_err());
+}

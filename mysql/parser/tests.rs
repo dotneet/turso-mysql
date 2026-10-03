@@ -3161,6 +3161,55 @@ fn div_binds_as_tightly_as_a_product_and_groups_by_its_alias() {
 }
 
 #[test]
+fn a_membership_test_reads_a_derived_table_as_the_body_it_passes_through() {
+    let mode = SessionSqlMode::default();
+    let cleanup = parse_select(
+        "SELECT `id` FROM `package` WHERE package.id IN (SELECT id FROM (SELECT package.id FROM package LEFT JOIN package_version ON package_version.package_id = package.id WHERE package_version.id IS NULL) temp)",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        cleanup.as_sql(),
+        "SELECT \"id\" FROM \"package\" WHERE (\"package\".\"id\" IN (SELECT \"package\".\"id\" FROM \"package\" LEFT JOIN \"package_version\" ON (\"package_version\".\"package_id\" = \"package\".\"id\") WHERE (\"package_version\".\"id\" IS NULL)))"
+    );
+    let runners = parse_dml(
+        "DELETE FROM `action_runner` WHERE id IN (SELECT `action_runner`.id FROM (SELECT * FROM `action_runner`) `action_runner` INNER JOIN `action_task` ON `action_task`.`runner_id` = `action_runner`.`id` WHERE `action_runner`.`ephemeral`=? AND `action_task`.`repo_id`=?)",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        runners.as_sql(),
+        "DELETE FROM \"action_runner\" WHERE (\"id\" IN (SELECT \"action_runner\".\"id\" FROM \"action_runner\" AS \"action_runner\" JOIN \"action_task\" ON (\"action_task\".\"runner_id\" = \"action_runner\".\"id\") WHERE ((\"action_runner\".\"ephemeral\" = ?) AND (\"action_task\".\"repo_id\" = ?))))"
+    );
+    let labels = parse_dml(
+        "DELETE FROM issue_label WHERE issue_label.id IN (SELECT il_too.id FROM (SELECT il_too_too.id FROM issue_label AS il_too_too INNER JOIN label ON il_too_too.label_id = label.id WHERE label.repo_id = ?) AS il_too)",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        labels.as_sql(),
+        "DELETE FROM \"issue_label\" WHERE (\"issue_label\".\"id\" IN (SELECT \"il_too_too\".\"id\" FROM \"issue_label\" AS \"il_too_too\" JOIN \"label\" ON (\"il_too_too\".\"label_id\" = \"label\".\"id\") WHERE (\"label\".\"repo_id\" = ?)))"
+    );
+    let latest = parse_select(
+        "SELECT package_version.* FROM `package_version` INNER JOIN `package` ON package.id = package_version.package_id WHERE package_version.id IN (SELECT MAX(package_version.id) FROM package_version INNER JOIN package ON package.id = package_version.package_id WHERE package.owner_id=? GROUP BY package_version.package_id) ORDER BY `package`.`name` ASC, `package_version`.`id` DESC LIMIT 50",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        latest.as_sql(),
+        "SELECT \"package_version\".* FROM \"package_version\" JOIN \"package\" ON (\"package\".\"id\" = \"package_version\".\"package_id\") WHERE (\"package_version\".\"id\" IN (SELECT MAX(\"package_version\".\"id\") AS \"MAX(package_version.id)\" FROM \"package_version\" JOIN \"package\" ON (\"package\".\"id\" = \"package_version\".\"package_id\") WHERE (\"package\".\"owner_id\" = ?) GROUP BY \"package_version\".\"package_id\")) ORDER BY \"package\".\"name\" ASC, \"package_version\".\"id\" DESC LIMIT 50"
+    );
+    for sql in [
+        "DELETE FROM t WHERE id IN (SELECT t.id FROM t JOIN u ON t.id = u.t_id)",
+        "DELETE FROM t WHERE id IN (SELECT x.id FROM (SELECT * FROM t) x) OR id IN (SELECT id FROM t WHERE n = 1)",
+        "DELETE FROM t WHERE id IN (SELECT x.id FROM (SELECT id FROM t ORDER BY id LIMIT 2) x)",
+        "DELETE FROM t WHERE id IN (SELECT x.id FROM (SELECT id, COUNT(*) AS c FROM t GROUP BY id HAVING c > 1) x)",
+    ] {
+        assert!(parse_dml(sql, mode).is_err(), "{sql}");
+    }
+}
+
+#[test]
 fn a_defaulted_aggregate_over_a_joined_column_renders_inside_the_call() {
     let sql = "SELECT COALESCE(sum(`tracked_time`.`time`),0) FROM `tracked_time` INNER JOIN `issue` ON tracked_time.issue_id = issue.id WHERE (tracked_time.deleted = ?) AND (issue.repo_id = ?)";
     let translated = parse_select(sql, SessionSqlMode::default()).unwrap();

@@ -12,10 +12,14 @@
 
 use super::*;
 
+pub(crate) use derived_membership::{
+    write_derived_tables_out_of_membership_tests, DerivedMembership,
+};
 pub(crate) use grouping::name_the_columns_grouped_by_place;
 pub(crate) use one_table_columns::leave_the_one_table_out;
 
 mod derived;
+mod derived_membership;
 mod grouping;
 mod json_condition;
 mod one_table_columns;
@@ -1026,6 +1030,7 @@ fn render_select_body(
     // else — a subquery, a branch of a `UNION` — the engine would read the
     // text it is worked out to.
     let outer_projection = std::mem::take(&mut render_context.renders_the_outer_projection);
+    let membership_projection = std::mem::take(&mut render_context.renders_a_membership_subquery);
     render_context.calculates_found_rows |= select
         .select_modifiers
         .as_ref()
@@ -1048,8 +1053,9 @@ fn render_select_body(
         .iter()
         .map(|item| {
             render_context.renders_a_projection_item = true;
-            render_context.takes_a_joined_aggregate =
-                outer_projection && is_an_aggregate_over_a_joined_column(item);
+            render_context.takes_a_joined_aggregate = (outer_projection
+                && is_an_aggregate_over_a_joined_column(item))
+                || (membership_projection && is_the_smallest_or_largest_of_a_joined_column(item));
             let rendered = match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
                     if outer_projection =>
@@ -1302,6 +1308,14 @@ fn is_an_aggregate_over_a_joined_column(item: &SelectItem) -> bool {
         || defaulted_aggregate(function).is_some_and(|aggregate| {
             static_select_metadata::qualified_aggregate_argument(aggregate).is_some()
         })
+}
+
+fn is_the_smallest_or_largest_of_a_joined_column(item: &SelectItem) -> bool {
+    matches!(
+        item,
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }
+            if matches!(smallest_or_largest_of(expr), Some(Expr::CompoundIdentifier(parts)) if parts.len() == 2)
+    )
 }
 
 fn defaulted_aggregate(function: &sqlparser::ast::Function) -> Option<&sqlparser::ast::Function> {
@@ -2397,6 +2411,7 @@ fn render_in_subquery(
         ),
         _ => return unsupported("SELECT IN requires one column"),
     };
+    render_context.renders_a_membership_subquery = true;
     let (rendered, projected) = render_subquery(subquery, render_context)?;
     let Some((inner_table, inner_column_name)) = projected else {
         return unsupported("SELECT IN requires a subquery projecting one column");
@@ -2470,10 +2485,12 @@ fn render_subquery_select(
     // named through one of them — Gitea's `repository.id IN (SELECT
     // team_repo.repo_id FROM team_repo INNER JOIN team_user ON ...)` — which
     // is held to its table's column the way a one-table subquery's is.
-    let joined_projection = match select.projection.as_slice() {
-        [SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))]
-            if sources.len() > 1 && parts.len() == 2 =>
-        {
+    let joined_column = match select.projection.as_slice() {
+        [SelectItem::UnnamedExpr(expr)] => smallest_or_largest_of(expr).or(Some(expr)),
+        _ => None,
+    };
+    let joined_projection = match joined_column {
+        Some(Expr::CompoundIdentifier(parts)) if sources.len() > 1 && parts.len() == 2 => {
             let mut named = sources
                 .iter()
                 .filter(|source| source.reference.eq_ignore_ascii_case(&parts[0].value));
@@ -5281,10 +5298,12 @@ fn dml_subquery_tables(
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<Vec<MySqlSelectSource>, ParseError> {
     let read = std::mem::take(&mut render_context.subquery_tables);
-    if read
-        .iter()
-        .any(|source| source.table.as_str().eq_ignore_ascii_case(target))
-    {
+    if read.iter().any(|source| {
+        source.table.as_str().eq_ignore_ascii_case(target)
+            && !render_context
+                .derived_membership
+                .reads_through_a_derived_table(target, &source.reference)
+    }) {
         return unsupported("DML subquery reading the table the statement changes");
     }
     Ok(read)
@@ -6769,6 +6788,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Every table a subquery reads, which the statement authorizes alongside
     /// its own.
     subquery_tables: Vec<MySqlSelectSource>,
+    pub(crate) derived_membership: DerivedMembership,
     /// The columns the caller knows to be text, when it knows.
     ///
     /// Only the frontend can see a column's type, so a first parse renders
@@ -6875,6 +6895,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Whether the subquery about to be rendered stands in a `WHERE`'s
     /// `EXISTS`, the one subquery that may join tables.
     an_exists_may_join: bool,
+    renders_a_membership_subquery: bool,
     /// Whether the statement is read knowing the kinds of every table's
     /// columns by name, which the frontend gives a statement over several
     /// tables only when each name is of one kind in all of them.
@@ -6938,6 +6959,7 @@ impl<'a> SelectRenderContext<'a> {
             moment_columns,
             rewritten_on_update,
             subquery_tables: Vec::new(),
+            derived_membership: DerivedMembership::default(),
             renders_the_outer_projection: false,
             renders_the_statements_own_from: false,
             counts_the_rows_of_the_derived_table: false,
@@ -6968,6 +6990,7 @@ impl<'a> SelectRenderContext<'a> {
             takes_a_joined_aggregate: false,
             renders_a_joined_derived_body: false,
             an_exists_may_join: false,
+            renders_a_membership_subquery: false,
             knows_the_kinds_of_joined_columns: false,
             collation_sensitive_joined_columns: Vec::new(),
             writes_its_rows: false,

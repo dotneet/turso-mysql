@@ -5103,6 +5103,14 @@ fn parse_select_inner(
     };
     let mut query = query.clone();
     translate::name_the_columns_grouped_by_place(&mut query)?;
+    if let SetExpr::Select(select) = query.body.as_mut() {
+        if let Some(selection) = &mut select.selection {
+            translate::write_derived_tables_out_of_membership_tests(
+                selection,
+                &mut translate::DerivedMembership::default(),
+            );
+        }
+    }
     translate::leave_the_one_table_out(&mut query);
     let tokens = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
@@ -5307,7 +5315,13 @@ fn translate_dml(
             // checked against.
             (rendered.sqlite_sql, None, rendered.compared_table)
         }
-        Statement::Update(update) => {
+        Statement::Update(mut update) => {
+            if let Some(selection) = &mut update.selection {
+                translate::write_derived_tables_out_of_membership_tests(
+                    selection,
+                    &mut render_context.derived_membership,
+                );
+            }
             let (rendered, tables, checked) = translate_update(&update, &mut render_context)?;
             read_tables = tables;
             let table = checked.table_name().to_owned();
@@ -5319,7 +5333,13 @@ fn translate_dml(
             }
             (rendered, Some(checked), Some(table))
         }
-        Statement::Delete(delete) => {
+        Statement::Delete(mut delete) => {
+            if let Some(selection) = &mut delete.selection {
+                translate::write_derived_tables_out_of_membership_tests(
+                    selection,
+                    &mut render_context.derived_membership,
+                );
+            }
             let (rendered, tables) = translate_delete(&delete, &mut render_context)?;
             read_tables = tables;
             (rendered, None, delete_source_table(&delete))

@@ -610,7 +610,7 @@ fn hold_a_statement_sorted_through_a_table(
     query: &sqlparser::ast::Query,
     sources: &mut [MySqlSelectSource],
 ) -> Result<(), ParseError> {
-    if let Err(feature) = sorted_across_its_tables(query, sources) {
+    if let Err(feature) = sorted_across_its_tables(query, sources, false) {
         return unsupported(feature);
     }
     note_the_sort_through_a_table(sources);
@@ -634,7 +634,7 @@ pub(super) fn note_a_join_sorted_across_its_tables(
     if read.len() < 2 || read.iter().any(|source| source.derived.is_some()) {
         return;
     }
-    if sorted_across_its_tables(query, sources).is_ok() {
+    if sorted_across_its_tables(query, sources, true).is_ok() {
         note_the_sort_through_a_table(sources);
     }
 }
@@ -644,6 +644,7 @@ pub(super) fn note_a_join_sorted_across_its_tables(
 fn sorted_across_its_tables(
     query: &sqlparser::ast::Query,
     sources: &[MySqlSelectSource],
+    plain_tables: bool,
 ) -> Result<(), &'static str> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return Err("statement joining tables in a set operation");
@@ -653,7 +654,10 @@ fn sorted_across_its_tables(
     };
     if query.with.is_some()
         || !query.locks.is_empty()
-        || select.selection.is_some()
+        || select
+            .selection
+            .as_ref()
+            .is_some_and(|condition| !plain_tables || !tests_only_membership(condition))
         || !group_by.is_empty()
         || select.having.is_some()
         || select.distinct.is_some()
@@ -663,10 +667,11 @@ fn sorted_across_its_tables(
     // A column is traced through the name of the table it is read from, so
     // two tables read under one name would leave it unsaid which.
     for (at, source) in sources.iter().enumerate() {
-        if sources[..at]
-            .iter()
-            .any(|earlier| earlier.reference.eq_ignore_ascii_case(&source.reference))
-        {
+        if sources[..at].iter().any(|earlier| {
+            earlier.reference.eq_ignore_ascii_case(&source.reference)
+                && (!plain_tables
+                    || (is_read_by_the_statement(earlier) && is_read_by_the_statement(source)))
+        }) {
             return Err("statement reading two tables under one name");
         }
     }
@@ -686,6 +691,9 @@ fn sorted_across_its_tables(
         }
     }
     for item in &select.projection {
+        if plain_tables && names_a_table_read_by_the_statement(item, sources) {
+            continue;
+        }
         let (SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. }) = item else {
             return Err("statement joining tables projecting a wildcard");
         };
@@ -713,6 +721,39 @@ fn sorted_across_its_tables(
         return Err("statement joining a derived table ordered by one table's columns");
     }
     Ok(())
+}
+
+fn tests_only_membership(condition: &Expr) -> bool {
+    match condition {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => tests_only_membership(left) && tests_only_membership(right),
+        Expr::Nested(inner) => tests_only_membership(inner),
+        Expr::InSubquery { expr, .. } => matches!(expr.as_ref(), Expr::CompoundIdentifier(_)),
+        _ => false,
+    }
+}
+
+fn names_a_table_read_by_the_statement(item: &SelectItem, sources: &[MySqlSelectSource]) -> bool {
+    let SelectItem::QualifiedWildcard(
+        sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+        options,
+    ) = item
+    else {
+        return false;
+    };
+    let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
+        return false;
+    };
+    wildcard_options_are_empty(options)
+        && sources.iter().any(|source| {
+            is_read_by_the_statement(source)
+                && source.derived.is_none()
+                && source.catalog.is_none()
+                && source.reference.eq_ignore_ascii_case(&table.value)
+        })
 }
 
 fn note_the_sort_through_a_table(sources: &mut [MySqlSelectSource]) {
