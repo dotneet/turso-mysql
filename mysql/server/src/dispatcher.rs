@@ -1560,6 +1560,12 @@ fn binary_result_value_to_row_value<'a>(
         BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::Bytes) => {
             Ok(BinaryRowValue::Bytes(value))
         }
+        // A `VARBINARY` or `BINARY` column reports the type a `VARCHAR` does
+        // and crosses as its bytes, length-encoded, the way the `VARCHAR`'s
+        // text does — Gitea's `webauthn_credential.credential_id`.
+        BinaryResultValue::Blob(value) if column_type == Some(BinaryRowColumnType::String) => {
+            Ok(BinaryRowValue::Bytes(value))
+        }
         _ => Err(CommandDispatcherError::BinaryResultValueTypeMismatch {
             row,
             column,
@@ -2856,6 +2862,45 @@ mod tests {
                 .values,
             [BinaryRowValue::UInt64(u64::MAX)]
         );
+    }
+
+    #[test]
+    fn statement_execute_sends_a_binary_word_as_its_bytes() {
+        let capabilities = REQUIRED_CLIENT_HANDSHAKE_RESPONSE_CAPABILITIES | CLIENT_DEPRECATE_EOF;
+        let mut connection = ready_connection(capabilities);
+        let mut column = ColumnDefinitionConfig::new("credential_id", MYSQL_TYPE_VAR_STRING);
+        column.character_set = 63;
+        let mut executor = TestExecutor {
+            execute_result: Some(Ok(PreparedStatementExecutionResult::ResultSet(
+                BinaryResultSet {
+                    columns: vec![column],
+                    rows: vec![vec![BinaryResultValue::Blob(b"\xff\0key".to_vec())]],
+                    warnings: 0,
+                    status_flags: SERVER_STATUS_AUTOCOMMIT,
+                },
+            ))),
+            ..TestExecutor::default()
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(&7u32.to_le_bytes());
+        body.push(crate::CURSOR_TYPE_NO_CURSOR);
+        body.extend_from_slice(&1u32.to_le_bytes());
+
+        let frames = dispatch_command_frame(
+            &mut connection,
+            &mut executor,
+            &command(crate::COM_STMT_EXECUTE, &body),
+        )
+        .unwrap();
+
+        assert_eq!(frames.len(), 4);
+        assert_eq!(
+            BinaryRowPacket::decode(CODEC, &frames[2], &[crate::BinaryRowColumnType::Bytes])
+                .unwrap()
+                .values,
+            [BinaryRowValue::Bytes(b"\xff\0key")]
+        );
+        assert_eq!(connection.state(), ConnectionState::Ready);
     }
 
     #[test]

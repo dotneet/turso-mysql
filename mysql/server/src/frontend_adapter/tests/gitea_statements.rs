@@ -1781,3 +1781,38 @@ fn a_package_blob_is_read_through_its_owners_teams() {
         .execute_query("SELECT id FROM `user` WHERE 1 <= (SELECT max(team.name) FROM team INNER JOIN team_user ON team_user.team_id = team.id WHERE team_user.org_id = `user`.id)")
         .is_err());
 }
+
+/// Gitea looks up a user's security keys before it lets the user sign in,
+/// and each key's `credential_id` is a `VARBINARY`.
+#[test]
+fn a_security_keys_binary_id_reaches_the_client_as_its_bytes() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `webauthn_credential` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `name` VARCHAR(255) NULL, `lower_name` VARCHAR(255) NULL, `user_id` BIGINT(20) NULL, `credential_id` VARBINARY(1024) NULL, `public_key` BLOB NULL, `attestation_type` VARCHAR(255) NULL, `aaguid` BLOB NULL, `sign_count` BIGINT(20) NULL, `clone_warning` TINYINT(1) NULL, `created_unix` BIGINT(20) NULL, `updated_unix` BIGINT(20) NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "INSERT INTO `webauthn_credential` (`name`,`lower_name`,`user_id`,`credential_id`,`public_key`,`attestation_type`,`aaguid`,`sign_count`,`clone_warning`,`created_unix`,`updated_unix`) VALUES ('test-key', 'test-key', 32, X'776562FF00', NULL, '', NULL, 0, 0, 946684800, 946684800)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let found = prepared_rows(
+        &mut adapter,
+        "SELECT `id`, `name`, `lower_name`, `user_id`, `credential_id`, `public_key`, `attestation_type`, `aaguid`, `sign_count`, `clone_warning`, `created_unix`, `updated_unix` FROM `webauthn_credential` WHERE (user_id = ?) LIMIT 1",
+        &[Bound::Whole(32)],
+    );
+    let credential_id = &found.columns[4];
+    assert_eq!(
+        (
+            credential_id.column_type,
+            credential_id.character_set,
+            credential_id.column_length,
+            credential_id.flags
+        ),
+        (MYSQL_TYPE_VAR_STRING, 63, 1024, MYSQL_BINARY_FLAG),
+        "MySQL 8.4.11 reports a VAR_STRING of 1024 in the binary collation"
+    );
+    assert_eq!(
+        found.rows[0][4],
+        BinaryResultValue::Blob(b"web\xff\0".to_vec())
+    );
+    crate::dispatcher::encode_binary_result_set(PacketCodec::new(16_777_215).unwrap(), 0, found)
+        .expect("the row crosses to the client");
+}
