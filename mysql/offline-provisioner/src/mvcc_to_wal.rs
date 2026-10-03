@@ -18,8 +18,8 @@ use turso_mysql::{
 #[command(name = "turso-mysql-offline-mvcc-to-wal")]
 #[command(
     about = "Turn a database that was opened in MVCC back to WAL while the server is stopped",
-    after_help = "Run it, and the server afterwards, with TURSO_MYSQL_JOURNAL_MODE=wal: \
-                  a server started without it opens the database in MVCC again."
+    after_help = "Run it, and the server afterwards, without TURSO_MYSQL_JOURNAL_MODE=mvcc: \
+                  a server started with it opens the database in MVCC again."
 )]
 struct Arguments {
     /// Existing private directory holding MySQL database data.
@@ -120,8 +120,8 @@ impl fmt::Display for CommandError {
             Self::Input => f.write_str("the data root or the database name is invalid"),
             Self::JournalMode(error) => write!(f, "{error}"),
             Self::MvccSelected => f.write_str(
-                "databases open in MVCC unless TURSO_MYSQL_JOURNAL_MODE=wal is set; set it here \
-                 and for the server, or the server opens the database in MVCC again",
+                "TURSO_MYSQL_JOURNAL_MODE=mvcc is set; unset it or set TURSO_MYSQL_JOURNAL_MODE=wal \
+                 here and for the server, or the server opens the database in MVCC again",
             ),
             Self::DataRootInUse => f.write_str(
                 "the data root is open in another process; stop the server and run this again",

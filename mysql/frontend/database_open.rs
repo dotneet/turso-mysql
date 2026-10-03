@@ -9,15 +9,17 @@ use turso_core::{
 
 use crate::MySqlDialect;
 
-/// The environment variable that picks how every database opens: `mvcc`, the
-/// default, where writers run side by side and a write to a row another open
-/// transaction changed waits for it, or `wal`, where writers take the
-/// database's one write lock in turn.
+/// The environment variable that picks how every database opens: `wal`, the
+/// default, where writers take the database's one write lock in turn, or
+/// `mvcc`, where writers run side by side and a write to a row another open
+/// transaction changed waits for it. WAL is the default until MVCC no longer
+/// loses rows a transaction committed under concurrent explicit-id inserts
+/// into a counted table.
 pub const JOURNAL_MODE_VARIABLE: &str = "TURSO_MYSQL_JOURNAL_MODE";
 
-/// The variable that turned MVCC on while WAL was the default. It is refused
-/// whatever its value, because a server started with it unset or `0` expected
-/// WAL and would now get MVCC without a word.
+/// The variable that turned MVCC on before `TURSO_MYSQL_JOURNAL_MODE` took its
+/// place. It is refused whatever its value, so a setting that no longer means
+/// what it did is never read silently.
 pub const REMOVED_MVCC_VARIABLE: &str = "TURSO_MYSQL_EXPERIMENTAL_MVCC";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,12 +39,13 @@ impl std::fmt::Display for JournalModeError {
         match self {
             Self::UnknownMode => write!(
                 f,
-                "{JOURNAL_MODE_VARIABLE} must be `mvcc` (the default) or `wal`"
+                "{JOURNAL_MODE_VARIABLE} must be `wal` (the default) or `mvcc`"
             ),
             Self::RemovedMvccVariable => write!(
                 f,
-                "{REMOVED_MVCC_VARIABLE} is no longer read: databases open in MVCC by default; \
-                 unset it, and set {JOURNAL_MODE_VARIABLE}=wal to keep them in WAL"
+                "{REMOVED_MVCC_VARIABLE} is no longer read: databases open in WAL by default; \
+                 unset it, and set {JOURNAL_MODE_VARIABLE}=mvcc for MVCC or \
+                 {JOURNAL_MODE_VARIABLE}=wal for WAL"
             ),
         }
     }
@@ -75,7 +78,7 @@ fn journal_mode_from(
         return Err(JournalModeError::RemovedMvccVariable);
     }
     let Some(selected) = selected else {
-        return Ok(JournalMode::Mvcc);
+        return Ok(JournalMode::Wal);
     };
     match selected.to_str() {
         Some(mode) if mode.eq_ignore_ascii_case("mvcc") => Ok(JournalMode::Mvcc),
@@ -584,9 +587,9 @@ mod tests {
     }
 
     #[test]
-    fn databases_open_in_mvcc_unless_wal_is_asked_for() {
+    fn databases_open_in_wal_unless_mvcc_is_asked_for() {
         use std::ffi::OsStr;
-        assert_eq!(journal_mode_from(None, false), Ok(JournalMode::Mvcc));
+        assert_eq!(journal_mode_from(None, false), Ok(JournalMode::Wal));
         assert_eq!(
             journal_mode_from(Some(OsStr::new("mvcc")), false),
             Ok(JournalMode::Mvcc)

@@ -220,7 +220,7 @@ pub fn canonicalize_database_name(requested_name: &str) -> Result<String, MySqlD
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MySqlMvccToWal {
     /// Every committed row is in the database's main file, its MVCC log is
-    /// gone, and it opens in WAL while `TURSO_MYSQL_JOURNAL_MODE=wal` is set.
+    /// gone, and it opens in WAL unless `TURSO_MYSQL_JOURNAL_MODE=mvcc` is set.
     Converted,
     /// The database had no MVCC log and opened in WAL, so nothing changed.
     AlreadyWal,
