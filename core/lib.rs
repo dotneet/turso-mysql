@@ -78,6 +78,7 @@ mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
+mod shared_schema;
 mod stack;
 mod statement;
 mod stats;

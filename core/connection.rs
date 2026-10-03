@@ -1503,7 +1503,7 @@ impl Connection {
             on_disk_schema_version
         };
 
-        let db_schema_version = self.db.schema.lock().schema_version;
+        let db_schema_version = self.db.schema.published().schema_version;
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
             self.db.path,
@@ -2332,10 +2332,7 @@ impl Connection {
             return;
         }
         // Inside a transaction the schema cannot change under the
-        // connection, so there is nothing to adopt. This runs on every step
-        // of every statement in MVCC mode, and the check below takes the
-        // database's shared schema lock, which every connection contends
-        // for: decide without it whenever possible.
+        // connection, so there is nothing to adopt.
         if !self.has_no_open_transaction_state() {
             return;
         }
@@ -2344,7 +2341,7 @@ impl Connection {
 
     fn adopt_shared_schema_if_changed(&self) {
         let current_schema = self.schema.read().clone();
-        let schema = self.db.schema.lock();
+        let schema = self.db.schema.published();
         // MVCC checkpoint can publish physical btree roots into the shared
         // schema without changing SQLite's schema cookie. If this connection
         // still has the older schema snapshot, prepared statements must be
@@ -2386,7 +2383,7 @@ impl Connection {
         if !self.has_no_open_transaction_state() {
             return false;
         }
-        let schema = self.db.schema.lock();
+        let schema = self.db.schema.published();
         let current_schema = self.schema.read();
         self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
     }
@@ -2412,7 +2409,7 @@ impl Connection {
         // schema after this read is caught by the comparison below (it changes the Arc), and any
         // publish that lands during begin is caught by the clock re-check (it bumps the generation).
         let generation = mv.schema_generation();
-        let schema = self.db.schema.lock();
+        let schema = self.db.schema.published();
         let current_schema = self.schema.read();
         if self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema) {
             return Err(LimboError::SchemaUpdated);

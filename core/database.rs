@@ -3,6 +3,7 @@
 //! keeps a single `Database` per file, and the per-connection catalog of
 //! attached databases.
 
+use crate::shared_schema::{OwnedSharedSchemaGuard, SharedSchema};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
 #[cfg(feature = "io_memory_yield")]
@@ -37,7 +38,6 @@ use crate::{
         sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion, TextEncoding, Version},
     },
     sync::{
-        self,
         atomic::{
             AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
             AtomicUsize, Ordering,
@@ -788,7 +788,7 @@ pub struct OpenDbAsyncState {
     encryption_key: Option<EncryptionKey>,
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
-    schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
+    schema_guard: Option<OwnedSharedSchemaGuard>,
     /// Registry key for insertion (computed once at start)
     pub(crate) registry_key: Option<DatabaseKey>,
     /// The database being built, held across the ValidatingHeader phase yields
@@ -906,7 +906,7 @@ pub struct Database<
 > {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
     pub(crate) allocators: DatabaseAllocators<A, F>,
-    pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
+    pub(crate) schema: Arc<SharedSchema>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
     wal_path: String,
@@ -1128,7 +1128,7 @@ impl Database {
             allocators,
             path,
             wal_path,
-            schema: Arc::new(Mutex::new(Arc::new({
+            schema: Arc::new(SharedSchema::new(Arc::new({
                 let mut s = Schema::with_options(enable_custom_types, dialect.as_ref())?;
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s

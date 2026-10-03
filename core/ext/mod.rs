@@ -9,8 +9,8 @@ use crate::index_method::{
     BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
 };
 use crate::schema::{Schema, Table};
+use crate::shared_schema::SharedSchema;
 use crate::sync::atomic::{AtomicU64, Ordering};
-use crate::sync::Mutex;
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
@@ -77,8 +77,8 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
         if kind == VTabKind::TableValuedFunction {
             if let Ok(vtab) = VirtualTable::function(&name_str, syms) {
                 let table = Arc::new(Table::Virtual(vtab));
-                let mutex = &*(ext_ctx.schema as *mut Mutex<Arc<Schema>>);
-                let mut guard = mutex.lock();
+                let shared = &*(ext_ctx.schema as *const SharedSchema);
+                let mut guard = shared.lock();
                 let Ok(schema) = Schema::try_make_mut(&mut guard) else {
                     return ResultCode::Error;
                 };
@@ -260,8 +260,7 @@ impl Database {
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
-        let schema_mutex_ptr =
-            &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        let schema_mutex_ptr = &*self.schema as *const SharedSchema as *mut SharedSchema;
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
             syms,
             schema: schema_mutex_ptr as *mut c_void,
@@ -335,8 +334,7 @@ impl Connection {
     /// }
     ///```
     pub unsafe fn _build_turso_ext(&self) -> ExtensionApi {
-        let schema_mutex_ptr =
-            &*self.db.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        let schema_mutex_ptr = &*self.db.schema as *const SharedSchema as *mut SharedSchema;
         let ctx = ExtensionCtx {
             syms: self.syms.data_ptr(),
             schema: schema_mutex_ptr as *mut c_void,
