@@ -3210,6 +3210,42 @@ fn a_membership_test_reads_a_derived_table_as_the_body_it_passes_through() {
 }
 
 #[test]
+fn a_distinct_count_reads_its_column_through_parentheses() {
+    let translated = parse_select(
+        "SELECT owner_id AS org_id, COUNT(DISTINCT(repository.id)) as repo_count FROM `repository` INNER JOIN `org_user` ON owner_id = org_user.org_id WHERE (org_user.uid = ?) AND (repository.is_private=? OR repository.id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id WHERE team_user.uid=?)) GROUP BY owner_id",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"owner_id\" AS \"org_id\", COUNT(DISTINCT \"repository\".\"id\") AS \"repo_count\" FROM \"repository\" JOIN \"org_user\" ON (\"owner_id\" = \"org_user\".\"org_id\") WHERE (((\"org_user\".\"uid\" = ?)) AND (((\"repository\".\"is_private\" = ?) OR (\"repository\".\"id\" IN (SELECT \"repo_id\" FROM \"team_repo\" JOIN \"team_user\" ON (\"team_user\".\"team_id\" = \"team_repo\".\"team_id\") WHERE (\"team_user\".\"uid\" = ?)))))) GROUP BY \"owner_id\""
+    );
+    let [membership] = translated.checked_subquery_comparisons() else {
+        panic!("one membership test");
+    };
+    assert_eq!(membership.inner_table(), "");
+    assert_eq!(membership.inner_candidates(), ["team_repo", "team_user"]);
+}
+
+#[test]
+fn a_membership_test_over_a_call_answering_a_word_compares_each_member() {
+    let translated = parse_select(
+        "SELECT `id` FROM `milestone` WHERE LOWER(name) IN (?,?)",
+        SessionSqlMode::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        "SELECT \"id\" FROM \"milestone\" WHERE (((mysql_lower(\"name\") COLLATE MYSQL_UCA9_AI_CI = ?) OR (mysql_lower(\"name\") COLLATE MYSQL_UCA9_AI_CI = ?)))"
+    );
+    assert!(parse_select(
+        "SELECT `id` FROM `milestone` WHERE LOWER(name) IN (name)",
+        SessionSqlMode::default()
+    )
+    .is_err());
+}
+
+#[test]
 fn a_defaulted_aggregate_over_a_joined_column_renders_inside_the_call() {
     let sql = "SELECT COALESCE(sum(`tracked_time`.`time`),0) FROM `tracked_time` INNER JOIN `issue` ON tracked_time.issue_id = issue.id WHERE (tracked_time.deleted = ?) AND (issue.repo_id = ?)";
     let translated = parse_select(sql, SessionSqlMode::default()).unwrap();

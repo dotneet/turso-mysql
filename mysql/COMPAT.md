@@ -708,7 +708,13 @@ package_version.id IS NULL) temp)`. A membership test compares one column and no
 the rows' order or count, so `SELECT x.c FROM (body) x` is read as the body projecting `c`,
 and `(SELECT * FROM t) alias` as `t AS alias`; a body that groups, orders or cuts its rows is
 refused, and a `DELETE` or `UPDATE` naming its own table in a subquery outside a derived table
-still is, as MySQL's 1093. A membership test projecting `MAX` or `MIN` of a joined table's
+still is, as MySQL's 1093. A membership test over a join may also project a column without its table when one of the
+joined tables alone holds it — Gitea's `repository.id IN (SELECT repo_id FROM team_repo INNER
+JOIN team_user ON ...)`; a name two of them hold is MySQL's 1052, measured, and refused. A
+call answering words may be tested against a list — Gitea's `LOWER(name) IN (?, ?)` — and
+each member is compared as `LOWER(name) = ?` is, without regard to case and without padding:
+measured on 8.4.11, `'next'` does not find `'next '`. A count's column may stand in
+parentheses, `COUNT(DISTINCT(repository.id))`. A membership test projecting `MAX` or `MIN` of a joined table's
 column — Gitea's `package_version.id IN (SELECT MAX(package_version.id) FROM package_version
 INNER JOIN package ON ... GROUP BY package_version.package_id)` — compares that column. A join
 narrowed by membership tests alone and ordered by columns of two of its tables is sorted

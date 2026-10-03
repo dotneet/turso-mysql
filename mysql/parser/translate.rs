@@ -2412,6 +2412,7 @@ fn render_in_subquery(
         _ => return unsupported("SELECT IN requires one column"),
     };
     render_context.renders_a_membership_subquery = true;
+    render_context.joined_membership_tables.clear();
     let (rendered, projected) = render_subquery(subquery, render_context)?;
     let Some((inner_table, inner_column_name)) = projected else {
         return unsupported("SELECT IN requires a subquery projecting one column");
@@ -2424,6 +2425,7 @@ fn render_in_subquery(
             column_name: column.value.clone(),
             inner_table,
             inner_column_name,
+            inner_candidates: std::mem::take(&mut render_context.joined_membership_tables),
             fixed_columns: Vec::new(),
         });
     Ok(format!(
@@ -2466,6 +2468,7 @@ fn render_subquery_select(
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, Option<(String, String)>), ParseError> {
     let may_join = std::mem::take(&mut render_context.an_exists_may_join);
+    let membership = render_context.renders_a_membership_subquery;
     let comparisons_before = render_context.checked_comparisons.len();
     let memberships_before = render_context.checked_subquery_comparisons.len();
     let (rendered, mut sources) = render_select_body(select, render_context)?;
@@ -2500,6 +2503,19 @@ fn render_subquery_select(
                 }
                 _ => None,
             }
+        }
+        Some(Expr::Identifier(column))
+            if membership
+                && sources.len() > 1
+                && sources
+                    .iter()
+                    .all(|source| source.catalog.is_none() && source.derived.is_none()) =>
+        {
+            render_context.joined_membership_tables = sources
+                .iter()
+                .map(|source| source.table.as_str().to_owned())
+                .collect();
+            Some((String::new(), column.value.clone()))
         }
         _ => None,
     };
@@ -6032,6 +6048,7 @@ fn render_update_assignment_value(
                     column_name: written.to_owned(),
                     inner_table: source.as_str().to_owned(),
                     inner_column_name: read,
+                    inner_candidates: Vec::new(),
                     fixed_columns: Vec::new(),
                 });
             Ok(format!("({rendered})"))
@@ -6896,6 +6913,7 @@ pub(crate) struct SelectRenderContext<'a> {
     /// `EXISTS`, the one subquery that may join tables.
     an_exists_may_join: bool,
     renders_a_membership_subquery: bool,
+    joined_membership_tables: Vec<String>,
     /// Whether the statement is read knowing the kinds of every table's
     /// columns by name, which the frontend gives a statement over several
     /// tables only when each name is of one kind in all of them.
@@ -6991,6 +7009,7 @@ impl<'a> SelectRenderContext<'a> {
             renders_a_joined_derived_body: false,
             an_exists_may_join: false,
             renders_a_membership_subquery: false,
+            joined_membership_tables: Vec::new(),
             knows_the_kinds_of_joined_columns: false,
             collation_sensitive_joined_columns: Vec::new(),
             writes_its_rows: false,
@@ -7514,14 +7533,13 @@ fn aggregate_argument_name(function: &sqlparser::ast::Function) -> String {
         ))] if static_select_metadata::counts_every_row(argument) => {
             format!("{prefix}{}", value.value)
         }
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        ))] => format!("{prefix}{}", column.value),
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::CompoundIdentifier(parts),
-        ))] if parts.len() == 2 => {
-            format!("{prefix}{}.{}", parts[0].value, parts[1].value)
-        }
+        [argument] => match static_select_metadata::counted_column(argument) {
+            Some(Expr::Identifier(column)) => format!("{prefix}{}", column.value),
+            Some(Expr::CompoundIdentifier(parts)) => {
+                format!("{prefix}{}.{}", parts[0].value, parts[1].value)
+            }
+            _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
+        },
         _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
     }
 }
@@ -7543,27 +7561,22 @@ fn render_aggregate_argument(
             format!("{prefix}*")
         }
         [argument] if static_select_metadata::counts_every_row(argument) => "*".to_owned(),
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::Identifier(column),
-        ))] => {
+        [argument] => {
             if is_distinct {
                 render_context.counts_distinct_column = true;
             }
-            format!("{prefix}{}", render_ident(column))
-        }
-        // Only a count reaches here qualified, and a count does not depend on
-        // what the column holds, so there is no collation to ask for.
-        [sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-            Expr::CompoundIdentifier(parts),
-        ))] if parts.len() == 2 => {
-            if is_distinct {
-                render_context.counts_distinct_column = true;
+            match static_select_metadata::counted_column(argument) {
+                Some(Expr::Identifier(column)) => format!("{prefix}{}", render_ident(column)),
+                // Only a count reaches here qualified, and a count does not
+                // depend on what the column holds, so there is no collation to
+                // ask for.
+                Some(Expr::CompoundIdentifier(parts)) => format!(
+                    "{prefix}{}.{}",
+                    render_ident(&parts[0]),
+                    render_ident(&parts[1])
+                ),
+                _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
             }
-            format!(
-                "{prefix}{}.{}",
-                render_ident(&parts[0]),
-                render_ident(&parts[1])
-            )
         }
         _ => unreachable!("a checked aggregate was checked to take one wildcard or column"),
     }
@@ -10936,6 +10949,10 @@ fn render_checked_in_list(
     {
         return Ok(rendered);
     }
+    if static_select_metadata::comparison_answer(expr) == Some(crate::CheckedComparisonAnswer::Text)
+    {
+        return render_membership_of_a_call_answering_a_word(expr, list, negated, render_context);
+    }
     let (qualifier, column) = match expr {
         Expr::Identifier(ident) => (None, ident),
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => (Some(&parts[0]), &parts[1]),
@@ -11048,6 +11065,31 @@ fn render_checked_in_list(
             });
     }
     Ok(rendered)
+}
+
+fn render_membership_of_a_call_answering_a_word(
+    call: &Expr,
+    list: &[Expr],
+    negated: bool,
+    render_context: &mut SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if list.is_empty() {
+        return unsupported("SELECT IN over an empty list");
+    }
+    let mut members = Vec::with_capacity(list.len());
+    for member in list {
+        let Some(rendered) =
+            render_comparison_over_a_call(call, &BinaryOperator::Eq, member, render_context)?
+        else {
+            return unsupported("SELECT IN over a call with a member that is not a value");
+        };
+        members.push(rendered);
+    }
+    Ok(format!(
+        "({}({}))",
+        if negated { "NOT " } else { "" },
+        members.join(" OR ")
+    ))
 }
 
 /// Renders `(a, b) IN ((1, 'x'), (2, 'y'))`, which asks whether the columns
@@ -12038,6 +12080,7 @@ fn render_comparison_over_a_scalar_subquery(
                 column_name: column.value.clone(),
                 inner_table: inner_table.as_str().to_owned(),
                 inner_column_name: inner_column_name.clone(),
+                inner_candidates: Vec::new(),
                 fixed_columns,
             });
     }

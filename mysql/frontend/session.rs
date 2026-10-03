@@ -8390,15 +8390,12 @@ impl MySqlConnection {
                     "a column compared with a subquery has to be one of {source_table}"
                 )));
             }
+            let inner_table = self.membership_inner_table(comparison)?;
             if !comparison.fixed_columns().is_empty() {
-                self.hold_a_subquery_to_one_row(
-                    comparison.inner_table(),
-                    comparison.fixed_columns(),
-                )?;
+                self.hold_a_subquery_to_one_row(&inner_table, comparison.fixed_columns())?;
             }
             let outer = self.column_kind(source_table, comparison.column_name())?;
-            let inner =
-                self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
+            let inner = self.column_kind(&inner_table, comparison.inner_column_name())?;
             if outer != inner {
                 return Err(LimboError::InvalidArgument(format!(
                     "SELECT IN compares {} with {}, whose types are not the same kind",
@@ -8475,15 +8472,12 @@ impl MySqlConnection {
                 }
             }
             let outer_table = outer_table.ok_or(LimboError::SchemaUpdated)?;
+            let inner_table = self.membership_inner_table(comparison)?;
             if !comparison.fixed_columns().is_empty() {
-                self.hold_a_subquery_to_one_row(
-                    comparison.inner_table(),
-                    comparison.fixed_columns(),
-                )?;
+                self.hold_a_subquery_to_one_row(&inner_table, comparison.fixed_columns())?;
             }
             let outer = self.column_kind(outer_table.as_str(), comparison.column_name())?;
-            let inner =
-                self.column_kind(comparison.inner_table(), comparison.inner_column_name())?;
+            let inner = self.column_kind(&inner_table, comparison.inner_column_name())?;
             if outer != inner {
                 return Err(LimboError::InvalidArgument(format!(
                     "SELECT IN compares {} with {}, whose types are not the same kind",
@@ -8545,6 +8539,31 @@ impl MySqlConnection {
 
     /// Returns whether one column holds signed integers or text, refusing the
     /// types this has no comparison rule for.
+    fn membership_inner_table(&self, comparison: &CheckedSubqueryComparison) -> Result<String> {
+        if comparison.inner_candidates().is_empty() {
+            return Ok(comparison.inner_table().to_owned());
+        }
+        let mut holding = Vec::new();
+        for candidate in comparison.inner_candidates() {
+            let table = MySqlTableName::parse(candidate)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?;
+            if self
+                .compared_column_metadata(&table, comparison.inner_column_name())?
+                .is_some()
+                && !holding.contains(candidate)
+            {
+                holding.push(candidate.clone());
+            }
+        }
+        match holding.as_slice() {
+            [table] => Ok(table.clone()),
+            _ => Err(LimboError::InvalidArgument(format!(
+                "SELECT IN over a join projecting {}, which no one of its tables alone holds",
+                comparison.inner_column_name()
+            ))),
+        }
+    }
+
     fn column_kind(&self, table: &str, column_name: &str) -> Result<ColumnKind> {
         // An `information_schema` table declares its columns itself rather
         // than in stored DDL.

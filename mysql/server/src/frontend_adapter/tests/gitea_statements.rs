@@ -560,13 +560,19 @@ fn giteas_access_checks_read_a_column_of_a_joined_subquery() {
         ),
         ["5"]
     );
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT id FROM repository WHERE id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id) ORDER BY id"
+        ),
+        ["3", "5"]
+    );
     for sql in [
         // A word against a whole number is a coercion MySQL makes and this
         // does not.
         "SELECT id FROM repository WHERE lower_name IN (SELECT team_repo.repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)",
-        // Which of the joined tables an unqualified name belongs to is not
-        // worked out here.
-        "SELECT id FROM repository WHERE id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)",
+        // Measured on MySQL 8.4.11: a name both joined tables hold is 1052.
+        "SELECT id FROM repository WHERE id IN (SELECT org_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)",
     ] {
         assert!(
             matches!(
@@ -1466,4 +1472,106 @@ fn a_delete_reads_its_own_table_through_a_derived_table() {
             "DELETE FROM `action_runner` WHERE id IN (SELECT `action_runner`.id FROM `action_runner` INNER JOIN `action_task` ON `action_task`.`runner_id` = `action_runner`.`id`)"
         )
         .is_err());
+}
+
+#[test]
+fn the_dashboard_counts_each_organisations_visible_repositories() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE `repository` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `owner_id` BIGINT(20) NULL, `is_private` TINYINT(1) NULL)",
+        "CREATE INDEX `IDX_repository_owner_id` ON `repository` (`owner_id`)",
+        "CREATE TABLE `org_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `uid` BIGINT(20) NULL, `org_id` BIGINT(20) NULL)",
+        "CREATE UNIQUE INDEX `UQE_org_user_s` ON `org_user` (`uid`,`org_id`)",
+        "CREATE INDEX `IDX_org_user_org_id` ON `org_user` (`org_id`)",
+        "CREATE TABLE `collaboration` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NOT NULL, `user_id` BIGINT(20) NOT NULL)",
+        "CREATE TABLE `team_repo` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `repo_id` BIGINT(20) NULL)",
+        "CREATE TABLE `team_user` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `org_id` BIGINT(20) NULL, `team_id` BIGINT(20) NULL, `uid` BIGINT(20) NULL)",
+        "INSERT INTO repository (owner_id, is_private) VALUES (3, 0), (3, 1), (3, 0), (4, 1), (4, 0), (5, 1)",
+        "INSERT INTO org_user (uid, org_id) VALUES (1, 3), (1, 4), (2, 5), (1, 5)",
+        "INSERT INTO collaboration (repo_id, user_id) VALUES (4, 1)",
+        "INSERT INTO team_user (org_id, team_id, uid) VALUES (3, 7, 1)",
+        "INSERT INTO team_repo (org_id, team_id, repo_id) VALUES (3, 7, 2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let counted = prepared_rows(
+        &mut adapter,
+        "SELECT owner_id AS org_id, COUNT(DISTINCT(repository.id)) as repo_count FROM `repository` INNER JOIN `org_user` ON owner_id = org_user.org_id WHERE (org_user.uid = ?) AND (repository.is_private=? OR repository.id IN (SELECT repo_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id WHERE team_user.uid=?) OR repository.id IN (SELECT repo_id FROM collaboration WHERE user_id=?)) GROUP BY owner_id",
+        &[
+            Bound::Whole(1),
+            Bound::Whole(0),
+            Bound::Whole(1),
+            Bound::Whole(1),
+        ],
+    );
+    assert_eq!(
+        counted.rows,
+        [
+            vec![BinaryResultValue::Integer(3), BinaryResultValue::Integer(3)],
+            vec![BinaryResultValue::Integer(4), BinaryResultValue::Integer(2)],
+        ],
+        "MySQL 8.4.11 counts three repositories of organisation 3 and two of 4"
+    );
+    let count = &counted.columns[1];
+    assert_eq!(
+        (count.column_type, count.column_length, count.flags),
+        (
+            MYSQL_TYPE_LONGLONG,
+            21,
+            MYSQL_NOT_NULL_FLAG | MYSQL_BINARY_FLAG | MYSQL_NUM_FLAG
+        ),
+        "MySQL 8.4.11 reports the count as a LONGLONG of 21"
+    );
+    assert!(adapter
+        .execute_query(
+            "SELECT id FROM repository WHERE id IN (SELECT org_id FROM team_repo INNER JOIN team_user ON team_user.team_id = team_repo.team_id)"
+        )
+        .is_err());
+}
+
+#[test]
+fn a_milestone_is_found_by_any_of_its_names_without_regard_to_case() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE IF NOT EXISTS `milestone` (`id` BIGINT(20) PRIMARY KEY AUTO_INCREMENT NOT NULL, `repo_id` BIGINT(20) NULL, `name` VARCHAR(255) NULL, `is_closed` TINYINT(1) NULL) ENGINE=InnoDB ROW_FORMAT=DYNAMIC",
+        "INSERT INTO milestone (repo_id, name, is_closed) VALUES (1, 'V1.0', 0), (1, 'Beta', 0), (1, 'next ', 1), (1, NULL, 0)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let found = |adapter: &mut Adapter, names: &[&str]| {
+        let marks = vec!["?"; names.len()].join(",");
+        let values = names
+            .iter()
+            .map(|name| Bound::Word(name))
+            .collect::<Vec<_>>();
+        prepared_rows(
+            adapter,
+            &format!("SELECT `id` FROM `milestone` WHERE LOWER(name) IN ({marks})"),
+            &values,
+        )
+        .rows
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>()
+    };
+    let ids = |ids: &[i64]| {
+        ids.iter()
+            .map(|id| BinaryResultValue::Integer(*id))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(found(&mut adapter, &["v1.0"]), ids(&[1]));
+    assert_eq!(found(&mut adapter, &["BETA", "NEXT"]), ids(&[2]));
+    assert_eq!(
+        found(&mut adapter, &["next"]),
+        ids(&[]),
+        "MySQL 8.4.11 compares without padding: next is not 'next '"
+    );
+    assert_eq!(found(&mut adapter, &["next "]), ids(&[3]));
+    assert_eq!(
+        first_column(
+            &mut adapter,
+            "SELECT `id` FROM `milestone` WHERE LOWER(name) NOT IN ('beta', 'v1.0')"
+        ),
+        ["3"]
+    );
 }

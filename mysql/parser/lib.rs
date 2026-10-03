@@ -1374,6 +1374,7 @@ pub struct CheckedSubqueryComparison {
     column_name: String,
     inner_table: String,
     inner_column_name: String,
+    inner_candidates: Vec<String>,
     /// The columns the subquery's `WHERE` fixes to one value each, for a
     /// subquery answering a plain column rather than an aggregate. MySQL
     /// answers 1242 when such a subquery finds more than one row, where the
@@ -1418,6 +1419,10 @@ impl CheckedSubqueryComparison {
     /// Returns the table the subquery reads.
     pub fn inner_table(&self) -> &str {
         &self.inner_table
+    }
+
+    pub fn inner_candidates(&self) -> &[String] {
+        &self.inner_candidates
     }
 
     /// Returns the column the subquery projects.
