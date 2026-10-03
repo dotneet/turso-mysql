@@ -4135,55 +4135,57 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     pub fn arithmetic_expression_fuzz(db: TempDatabase) {
-        let (mut rng, _seed) = helpers::init_fuzz_test("arithmetic_expression_fuzz");
-        let g = GrammarGenerator::new();
-        let (expr, expr_builder) = g.create_handle();
-        let (bin_op, bin_op_builder) = g.create_handle();
-        let (unary_op, unary_op_builder) = g.create_handle();
-        let (paren, paren_builder) = g.create_handle();
+        helpers::run_on_a_stack_deep_expressions_fit(move || {
+            let (mut rng, _seed) = helpers::init_fuzz_test("arithmetic_expression_fuzz");
+            let g = GrammarGenerator::new();
+            let (expr, expr_builder) = g.create_handle();
+            let (bin_op, bin_op_builder) = g.create_handle();
+            let (unary_op, unary_op_builder) = g.create_handle();
+            let (paren, paren_builder) = g.create_handle();
 
-        paren_builder
-            .concat("")
-            .push_str("(")
-            .push(expr)
-            .push_str(")")
-            .build();
+            paren_builder
+                .concat("")
+                .push_str("(")
+                .push(expr)
+                .push_str(")")
+                .build();
 
-        unary_op_builder
-            .concat(" ")
-            .push(g.create().choice().options_str(["~", "+", "-"]).build())
-            .push(expr)
-            .build();
+            unary_op_builder
+                .concat(" ")
+                .push(g.create().choice().options_str(["~", "+", "-"]).build())
+                .push(expr)
+                .build();
 
-        bin_op_builder
-            .concat(" ")
-            .push(expr)
-            .push(
-                g.create()
-                    .choice()
-                    .options_str(["+", "-", "*", "/", "%", "&", "|", "<<", ">>"])
-                    .build(),
-            )
-            .push(expr)
-            .build();
+            bin_op_builder
+                .concat(" ")
+                .push(expr)
+                .push(
+                    g.create()
+                        .choice()
+                        .options_str(["+", "-", "*", "/", "%", "&", "|", "<<", ">>"])
+                        .build(),
+                )
+                .push(expr)
+                .build();
 
-        expr_builder
-            .choice()
-            .option_w(unary_op, 1.0)
-            .option_w(bin_op, 1.0)
-            .option_w(paren, 1.0)
-            .option_symbol_w(rand_int(-10..10), 1.0)
-            .build();
+            expr_builder
+                .choice()
+                .option_w(unary_op, 1.0)
+                .option_w(bin_op, 1.0)
+                .option_w(paren, 1.0)
+                .option_symbol_w(rand_int(-10..10), 1.0)
+                .build();
 
-        let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
+            let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let limbo_conn = db.connect_limbo();
-        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..helpers::fuzz_iterations(1024) {
-            let query = g.generate(&mut rng, sql, 50);
-            helpers::assert_differential(&limbo_conn, &sqlite_conn, &query, "");
-        }
+            for _ in 0..helpers::fuzz_iterations(1024) {
+                let query = g.generate(&mut rng, sql, 50);
+                helpers::assert_differential(&limbo_conn, &sqlite_conn, &query, "");
+            }
+        });
     }
 
     #[turso_macros::test(mvcc)]
@@ -4253,250 +4255,254 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     pub fn math_expression_fuzz_run(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("math_expression_fuzz_run");
-        let g = GrammarGenerator::new();
-        let (expr, expr_builder) = g.create_handle();
-        let (bin_op, bin_op_builder) = g.create_handle();
-        let (scalar, scalar_builder) = g.create_handle();
-        let (paren, paren_builder) = g.create_handle();
+        helpers::run_on_a_stack_deep_expressions_fit(move || {
+            let (mut rng, seed) = helpers::init_fuzz_test("math_expression_fuzz_run");
+            let g = GrammarGenerator::new();
+            let (expr, expr_builder) = g.create_handle();
+            let (bin_op, bin_op_builder) = g.create_handle();
+            let (scalar, scalar_builder) = g.create_handle();
+            let (paren, paren_builder) = g.create_handle();
 
-        paren_builder
-            .concat("")
-            .push_str("(")
-            .push(expr)
-            .push_str(")")
-            .build();
+            paren_builder
+                .concat("")
+                .push_str("(")
+                .push(expr)
+                .push_str(")")
+                .build();
 
-        bin_op_builder
-            .concat(" ")
-            .push(expr)
-            .push(
-                g.create()
-                    .choice()
-                    .options_str(["+", "-", "/", "*"])
-                    .build(),
-            )
-            .push(expr)
-            .build();
+            bin_op_builder
+                .concat(" ")
+                .push(expr)
+                .push(
+                    g.create()
+                        .choice()
+                        .options_str(["+", "-", "/", "*"])
+                        .build(),
+                )
+                .push(expr)
+                .build();
 
-        scalar_builder
-            .choice()
-            .option(
-                g.create()
-                    .concat("")
-                    .push(
-                        g.create()
-                            .choice()
-                            .options_str([
-                                "acos", "acosh", "asin", "asinh", "atan", "atanh", "ceil",
-                                "ceiling", "cos", "cosh", "degrees", "exp", "floor", "ln", "log",
-                                "log10", "log2", "radians", "sin", "sinh", "sqrt", "tan", "tanh",
-                                "trunc",
-                            ])
-                            .build(),
-                    )
-                    .push_str("(")
-                    .push(expr)
-                    .push_str(")")
-                    .build(),
-            )
-            .option(
-                g.create()
-                    .concat("")
-                    .push(
-                        g.create()
-                            .choice()
-                            .options_str(["atan2", "log", "mod", "pow", "power"])
-                            .build(),
-                    )
-                    .push_str("(")
-                    .push(g.create().concat("").push(expr).repeat(2..3, ", ").build())
-                    .push_str(")")
-                    .build(),
-            )
-            .build();
+            scalar_builder
+                .choice()
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(
+                            g.create()
+                                .choice()
+                                .options_str([
+                                    "acos", "acosh", "asin", "asinh", "atan", "atanh", "ceil",
+                                    "ceiling", "cos", "cosh", "degrees", "exp", "floor", "ln",
+                                    "log", "log10", "log2", "radians", "sin", "sinh", "sqrt",
+                                    "tan", "tanh", "trunc",
+                                ])
+                                .build(),
+                        )
+                        .push_str("(")
+                        .push(expr)
+                        .push_str(")")
+                        .build(),
+                )
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(
+                            g.create()
+                                .choice()
+                                .options_str(["atan2", "log", "mod", "pow", "power"])
+                                .build(),
+                        )
+                        .push_str("(")
+                        .push(g.create().concat("").push(expr).repeat(2..3, ", ").build())
+                        .push_str(")")
+                        .build(),
+                )
+                .build();
 
-        expr_builder
-            .choice()
-            .options_str(["-2.0", "-1.0", "0.0", "0.5", "1.0", "2.0"])
-            .option_w(bin_op, 10.0)
-            .option_w(paren, 10.0)
-            .option_w(scalar, 10.0)
-            .build();
+            expr_builder
+                .choice()
+                .options_str(["-2.0", "-1.0", "0.0", "0.5", "1.0", "2.0"])
+                .option_w(bin_op, 10.0)
+                .option_w(paren, 10.0)
+                .option_w(scalar, 10.0)
+                .build();
 
-        let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
+            let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let limbo_conn = db.connect_limbo();
-        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..helpers::fuzz_iterations(1024) {
-            let query = g.generate(&mut rng, sql, 50);
-            let limbo = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
-            match (&limbo[0][0], &sqlite[0][0]) {
-                // compare only finite results because some evaluations are not so stable around infinity
-                (rusqlite::types::Value::Real(limbo), rusqlite::types::Value::Real(sqlite))
-                    if limbo.is_finite() && sqlite.is_finite() =>
-                {
-                    // Rust and C libm may differ by 1 ulp, and inverse functions with
-                    // singular derivatives amplify that near domain boundaries: e.g.
-                    // atanh(tanh(-1.0)) is -1.0 in Rust but 1 ulp inside in glibc, and
-                    // asin turns that into a ~1.5e-8 difference. Hence the loose epsilon.
-                    assert!(
-                        (limbo - sqlite).abs() < 1e-6
-                            || (limbo - sqlite).abs() / (limbo.abs().max(sqlite.abs())) < 1e-6,
-                        "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
-                    )
+            for _ in 0..helpers::fuzz_iterations(1024) {
+                let query = g.generate(&mut rng, sql, 50);
+                let limbo = limbo_exec_rows(&limbo_conn, &query);
+                let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+                match (&limbo[0][0], &sqlite[0][0]) {
+                    // compare only finite results because some evaluations are not so stable around infinity
+                    (rusqlite::types::Value::Real(limbo), rusqlite::types::Value::Real(sqlite))
+                        if limbo.is_finite() && sqlite.is_finite() =>
+                    {
+                        // Rust and C libm may differ by 1 ulp, and inverse functions with
+                        // singular derivatives amplify that near domain boundaries: e.g.
+                        // atanh(tanh(-1.0)) is -1.0 in Rust but 1 ulp inside in glibc, and
+                        // asin turns that into a ~1.5e-8 difference. Hence the loose epsilon.
+                        assert!(
+                            (limbo - sqlite).abs() < 1e-6
+                                || (limbo - sqlite).abs() / (limbo.abs().max(sqlite.abs())) < 1e-6,
+                            "query: {query}, limbo: {limbo:?}, sqlite: {sqlite:?} seed: {seed}"
+                        )
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
+        });
     }
 
     #[turso_macros::test(mvcc)]
     pub fn string_expression_fuzz_run(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("string_expression_fuzz_run");
-        let g = GrammarGenerator::new();
-        let (expr, expr_builder) = g.create_handle();
-        let (bin_op, bin_op_builder) = g.create_handle();
-        let (scalar, scalar_builder) = g.create_handle();
-        let (paren, paren_builder) = g.create_handle();
-        let (number, number_builder) = g.create_handle();
+        helpers::run_on_a_stack_deep_expressions_fit(move || {
+            let (mut rng, seed) = helpers::init_fuzz_test("string_expression_fuzz_run");
+            let g = GrammarGenerator::new();
+            let (expr, expr_builder) = g.create_handle();
+            let (bin_op, bin_op_builder) = g.create_handle();
+            let (scalar, scalar_builder) = g.create_handle();
+            let (paren, paren_builder) = g.create_handle();
+            let (number, number_builder) = g.create_handle();
 
-        number_builder
-            .choice()
-            .option_symbol(rand_int(-5..10))
-            .option(
-                g.create()
-                    .concat(" ")
-                    .push(number)
-                    .push(g.create().choice().options_str(["+", "-", "*"]).build())
-                    .push(number)
-                    .build(),
-            )
-            .build();
+            number_builder
+                .choice()
+                .option_symbol(rand_int(-5..10))
+                .option(
+                    g.create()
+                        .concat(" ")
+                        .push(number)
+                        .push(g.create().choice().options_str(["+", "-", "*"]).build())
+                        .push(number)
+                        .build(),
+                )
+                .build();
 
-        paren_builder
-            .concat("")
-            .push_str("(")
-            .push(expr)
-            .push_str(")")
-            .build();
+            paren_builder
+                .concat("")
+                .push_str("(")
+                .push(expr)
+                .push_str(")")
+                .build();
 
-        bin_op_builder
-            .concat(" ")
-            .push(expr)
-            .push(g.create().choice().options_str(["||"]).build())
-            .push(expr)
-            .build();
+            bin_op_builder
+                .concat(" ")
+                .push(expr)
+                .push(g.create().choice().options_str(["||"]).build())
+                .push(expr)
+                .build();
 
-        scalar_builder
-            .choice()
-            .option(
-                g.create()
-                    .concat("")
-                    .push_str("char(")
-                    .push(
-                        g.create()
-                            .concat("")
-                            .push_symbol(rand_int(65..91))
-                            .repeat(1..8, ", ")
-                            .build(),
-                    )
-                    .push_str(")")
-                    .build(),
-            )
-            .option(
-                g.create()
-                    .concat("")
-                    .push(
-                        g.create()
-                            .choice()
-                            .options_str(["ltrim", "rtrim", "trim"])
-                            .build(),
-                    )
-                    .push_str("(")
-                    .push(g.create().concat("").push(expr).repeat(2..3, ", ").build())
-                    .push_str(")")
-                    .build(),
-            )
-            .option(
-                g.create()
-                    .concat("")
-                    .push(
-                        g.create()
-                            .choice()
-                            .options_str([
-                                "ltrim", "rtrim", "lower", "upper", "quote", "hex", "trim",
-                            ])
-                            .build(),
-                    )
-                    .push_str("(")
-                    .push(expr)
-                    .push_str(")")
-                    .build(),
-            )
-            .option(
-                g.create()
-                    .concat("")
-                    .push(g.create().choice().options_str(["replace"]).build())
-                    .push_str("(")
-                    .push(g.create().concat("").push(expr).repeat(3..4, ", ").build())
-                    .push_str(")")
-                    .build(),
-            )
-            .option(
-                g.create()
-                    .concat("")
-                    .push(
-                        g.create()
-                            .choice()
-                            .options_str(["substr", "substring"])
-                            .build(),
-                    )
-                    .push_str("(")
-                    .push(expr)
-                    .push_str(", ")
-                    .push(
-                        g.create()
-                            .concat("")
-                            .push(number)
-                            .repeat(1..3, ", ")
-                            .build(),
-                    )
-                    .push_str(")")
-                    .build(),
-            )
-            .build();
+            scalar_builder
+                .choice()
+                .option(
+                    g.create()
+                        .concat("")
+                        .push_str("char(")
+                        .push(
+                            g.create()
+                                .concat("")
+                                .push_symbol(rand_int(65..91))
+                                .repeat(1..8, ", ")
+                                .build(),
+                        )
+                        .push_str(")")
+                        .build(),
+                )
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(
+                            g.create()
+                                .choice()
+                                .options_str(["ltrim", "rtrim", "trim"])
+                                .build(),
+                        )
+                        .push_str("(")
+                        .push(g.create().concat("").push(expr).repeat(2..3, ", ").build())
+                        .push_str(")")
+                        .build(),
+                )
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(
+                            g.create()
+                                .choice()
+                                .options_str([
+                                    "ltrim", "rtrim", "lower", "upper", "quote", "hex", "trim",
+                                ])
+                                .build(),
+                        )
+                        .push_str("(")
+                        .push(expr)
+                        .push_str(")")
+                        .build(),
+                )
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(g.create().choice().options_str(["replace"]).build())
+                        .push_str("(")
+                        .push(g.create().concat("").push(expr).repeat(3..4, ", ").build())
+                        .push_str(")")
+                        .build(),
+                )
+                .option(
+                    g.create()
+                        .concat("")
+                        .push(
+                            g.create()
+                                .choice()
+                                .options_str(["substr", "substring"])
+                                .build(),
+                        )
+                        .push_str("(")
+                        .push(expr)
+                        .push_str(", ")
+                        .push(
+                            g.create()
+                                .concat("")
+                                .push(number)
+                                .repeat(1..3, ", ")
+                                .build(),
+                        )
+                        .push_str(")")
+                        .build(),
+                )
+                .build();
 
-        expr_builder
-            .choice()
-            .option_w(bin_op, 1.0)
-            .option_w(paren, 1.0)
-            .option_w(scalar, 1.0)
-            .option(
-                g.create()
-                    .concat("")
-                    .push_str("'")
-                    .push_symbol(rand_str("", 2))
-                    .push_str("'")
-                    .build(),
-            )
-            .build();
+            expr_builder
+                .choice()
+                .option_w(bin_op, 1.0)
+                .option_w(paren, 1.0)
+                .option_w(scalar, 1.0)
+                .option(
+                    g.create()
+                        .concat("")
+                        .push_str("'")
+                        .push_symbol(rand_str("", 2))
+                        .push_str("'")
+                        .build(),
+                )
+                .build();
 
-        let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
+            let sql = g.create().concat(" ").push_str("SELECT").push(expr).build();
 
-        let limbo_conn = db.connect_limbo();
-        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-        for _ in 0..helpers::fuzz_iterations(1024) {
-            let query = g.generate(&mut rng, sql, 50);
-            helpers::assert_differential(
-                &limbo_conn,
-                &sqlite_conn,
-                &query,
-                &format!("query: {query}, seed: {seed}"),
-            );
-        }
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            for _ in 0..helpers::fuzz_iterations(1024) {
+                let query = g.generate(&mut rng, sql, 50);
+                helpers::assert_differential(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &query,
+                    &format!("query: {query}, seed: {seed}"),
+                );
+            }
+        });
     }
 
     struct TestTable {
@@ -4843,31 +4849,33 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     pub fn logical_expression_fuzz_run(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("logical_expression_fuzz_run");
-        let g = GrammarGenerator::new();
-        let builders = common_builders(&g, None);
-        let expr = build_logical_expr(&g, &builders, None);
+        helpers::run_on_a_stack_deep_expressions_fit(move || {
+            let (mut rng, seed) = helpers::init_fuzz_test("logical_expression_fuzz_run");
+            let g = GrammarGenerator::new();
+            let builders = common_builders(&g, None);
+            let expr = build_logical_expr(&g, &builders, None);
 
-        let sql = g
-            .create()
-            .concat(" ")
-            .push_str("SELECT ")
-            .push(expr)
-            .build();
+            let sql = g
+                .create()
+                .concat(" ")
+                .push_str("SELECT ")
+                .push(expr)
+                .build();
 
-        let limbo_conn = db.connect_limbo();
-        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        for _ in 0..helpers::fuzz_iterations(1024) {
-            let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {query}");
-            helpers::assert_differential(
-                &limbo_conn,
-                &sqlite_conn,
-                &query,
-                &format!("query: {query}, seed: {seed}"),
-            );
-        }
+            for _ in 0..helpers::fuzz_iterations(1024) {
+                let query = g.generate(&mut rng, sql, 50);
+                log::info!("query: {query}");
+                helpers::assert_differential(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &query,
+                    &format!("query: {query}, seed: {seed}"),
+                );
+            }
+        });
     }
 
     #[turso_macros::test(mvcc)]
@@ -5254,127 +5262,134 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc)]
     pub fn table_logical_expression_fuzz_run(db: TempDatabase) {
-        let (mut rng, seed) = helpers::init_fuzz_test("table_logical_expression_fuzz_run");
-        let g = GrammarGenerator::new();
-        let tables = vec![TestTable {
-            name: "t",
-            columns: vec!["x", "y", "z"],
-        }];
-        let builders = common_builders(&g, Some(&tables));
-        let predicate = predicate_builders(&g, &builders, Some(&tables));
-        let expr = build_logical_expr(&g, &builders, Some(&predicate));
+        helpers::run_on_a_stack_deep_expressions_fit(move || {
+            let (mut rng, seed) = helpers::init_fuzz_test("table_logical_expression_fuzz_run");
+            let g = GrammarGenerator::new();
+            let tables = vec![TestTable {
+                name: "t",
+                columns: vec!["x", "y", "z"],
+            }];
+            let builders = common_builders(&g, Some(&tables));
+            let predicate = predicate_builders(&g, &builders, Some(&tables));
+            let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
-        let limbo_conn = db.connect_limbo();
-        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
-        for table in tables.iter() {
-            let columns_with_first_column_as_pk = {
-                let mut columns = vec![];
-                columns.push(format!("{} PRIMARY KEY", table.columns[0]));
-                columns.extend(table.columns[1..].iter().map(|c| c.to_string()));
-                columns.join(", ")
-            };
-            let query = format!(
-                "CREATE TABLE {} ({})",
-                table.name, columns_with_first_column_as_pk
-            );
-            helpers::execute_on_both(&limbo_conn, &sqlite_conn, &query, &format!("SEED: {seed}"));
-        }
-        // Add secondary indexes so IN-list/subquery optimizations are exercised
-        helpers::execute_on_both(
-            &limbo_conn,
-            &sqlite_conn,
-            "CREATE INDEX idx_y ON t(y)",
-            &format!("SEED: {seed}"),
-        );
-        helpers::execute_on_both(
-            &limbo_conn,
-            &sqlite_conn,
-            "CREATE INDEX idx_z ON t(z)",
-            &format!("SEED: {seed}"),
-        );
-
-        let mut i = 0;
-        let mut primary_key_set = HashSet::with_capacity(100);
-        while i < 1000 {
-            let x = g.generate(&mut rng, builders.number, 1);
-            if primary_key_set.contains(&x) {
-                continue;
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+            for table in tables.iter() {
+                let columns_with_first_column_as_pk = {
+                    let mut columns = vec![];
+                    columns.push(format!("{} PRIMARY KEY", table.columns[0]));
+                    columns.extend(table.columns[1..].iter().map(|c| c.to_string()));
+                    columns.join(", ")
+                };
+                let query = format!(
+                    "CREATE TABLE {} ({})",
+                    table.name, columns_with_first_column_as_pk
+                );
+                helpers::execute_on_both(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &query,
+                    &format!("SEED: {seed}"),
+                );
             }
-            primary_key_set.insert(x.clone());
-            let (y, z) = (
-                g.generate(&mut rng, builders.number, 1),
-                g.generate(&mut rng, builders.number, 1),
+            // Add secondary indexes so IN-list/subquery optimizations are exercised
+            helpers::execute_on_both(
+                &limbo_conn,
+                &sqlite_conn,
+                "CREATE INDEX idx_y ON t(y)",
+                &format!("SEED: {seed}"),
             );
             helpers::execute_on_both(
                 &limbo_conn,
                 &sqlite_conn,
-                &format!("INSERT INTO t VALUES ({x}, {y}, {z})"),
+                "CREATE INDEX idx_z ON t(z)",
                 &format!("SEED: {seed}"),
             );
-            i += 1;
-        }
-        // verify the same number of rows in both tables
-        helpers::assert_differential(
-            &limbo_conn,
-            &sqlite_conn,
-            "SELECT COUNT(*) FROM t",
-            &format!("SEED: {seed}"),
-        );
-        let sql = g
-            .create()
-            .concat(" ")
-            .push_str("SELECT ")
-            .push(
-                g.create()
-                    .choice()
-                    .option_str("*")
-                    .option_str("COUNT(*)")
-                    .build(),
-            )
-            .push_str(" FROM t WHERE ")
-            .push(expr)
-            .build();
 
-        for _ in 0..helpers::fuzz_iterations(1024) {
-            let query = g.generate(&mut rng, sql, 50);
-            log::info!("query: {query}");
-            let limbo = limbo_exec_rows(&limbo_conn, &query);
-            let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
-
-            if limbo.len() != sqlite.len() {
-                panic!(
-                    "MISMATCHING ROW COUNT (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}",
-                    limbo.len(),
-                    sqlite.len(),
-                    query,
-                    limbo,
-                    sqlite
+            let mut i = 0;
+            let mut primary_key_set = HashSet::with_capacity(100);
+            while i < 1000 {
+                let x = g.generate(&mut rng, builders.number, 1);
+                if primary_key_set.contains(&x) {
+                    continue;
+                }
+                primary_key_set.insert(x.clone());
+                let (y, z) = (
+                    g.generate(&mut rng, builders.number, 1),
+                    g.generate(&mut rng, builders.number, 1),
                 );
+                helpers::execute_on_both(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &format!("INSERT INTO t VALUES ({x}, {y}, {z})"),
+                    &format!("SEED: {seed}"),
+                );
+                i += 1;
             }
-            // find first row where limbo and sqlite differ
-            let diff_rows = limbo
-                .iter()
-                .zip(sqlite.iter())
-                .filter(|(l, s)| l != s)
-                .collect::<Vec<_>>();
-            if !diff_rows.is_empty() {
-                // due to different choices in index usage (usually in these cases sqlite is smart enough to use an index and we aren't),
-                // sqlite might return rows in a different order
-                // check if all limbo rows are present in sqlite
-                let all_present = limbo.iter().all(|l| sqlite.iter().any(|s| l == s));
-                if !all_present {
+            // verify the same number of rows in both tables
+            helpers::assert_differential(
+                &limbo_conn,
+                &sqlite_conn,
+                "SELECT COUNT(*) FROM t",
+                &format!("SEED: {seed}"),
+            );
+            let sql = g
+                .create()
+                .concat(" ")
+                .push_str("SELECT ")
+                .push(
+                    g.create()
+                        .choice()
+                        .option_str("*")
+                        .option_str("COUNT(*)")
+                        .build(),
+                )
+                .push_str(" FROM t WHERE ")
+                .push(expr)
+                .build();
+
+            for _ in 0..helpers::fuzz_iterations(1024) {
+                let query = g.generate(&mut rng, sql, 50);
+                log::info!("query: {query}");
+                let limbo = limbo_exec_rows(&limbo_conn, &query);
+                let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
+
+                if limbo.len() != sqlite.len() {
                     panic!(
-                        "MISMATCHING ROWS (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}\n\n differences: {:?}",
+                        "MISMATCHING ROW COUNT (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}",
                         limbo.len(),
                         sqlite.len(),
                         query,
                         limbo,
-                        sqlite,
-                        diff_rows
+                        sqlite
                     );
                 }
+                // find first row where limbo and sqlite differ
+                let diff_rows = limbo
+                    .iter()
+                    .zip(sqlite.iter())
+                    .filter(|(l, s)| l != s)
+                    .collect::<Vec<_>>();
+                if !diff_rows.is_empty() {
+                    // due to different choices in index usage (usually in these cases sqlite is smart enough to use an index and we aren't),
+                    // sqlite might return rows in a different order
+                    // check if all limbo rows are present in sqlite
+                    let all_present = limbo.iter().all(|l| sqlite.iter().any(|s| l == s));
+                    if !all_present {
+                        panic!(
+                            "MISMATCHING ROWS (limbo: {}, sqlite: {}) for query: {}\n\n limbo: {:?}\n\n sqlite: {:?}\n\n differences: {:?}",
+                            limbo.len(),
+                            sqlite.len(),
+                            query,
+                            limbo,
+                            sqlite,
+                            diff_rows
+                        );
+                    }
+                }
             }
-        }
+        });
     }
 
     #[turso_macros::test(mvcc)]

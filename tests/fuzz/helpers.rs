@@ -22,6 +22,19 @@ pub fn fuzz_iterations(base: usize) -> usize {
 
 /// Initialize a fuzz test: set up env_logger, create an RNG, and print the seed.
 /// Returns `(rng, seed)`.
+const DEEP_EXPRESSION_STACK: usize = 64 << 20;
+
+pub fn run_on_a_stack_deep_expressions_fit(body: impl FnOnce() + Send + 'static) {
+    let outcome = std::thread::Builder::new()
+        .stack_size(DEEP_EXPRESSION_STACK)
+        .spawn(body)
+        .expect("failed to spawn a thread for deep expressions")
+        .join();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 pub fn init_fuzz_test(name: &str) -> (ChaCha8Rng, u64) {
     let _ = env_logger::try_init();
     let (rng, seed) = rng_from_time_or_env();
