@@ -1429,9 +1429,11 @@ one letter for one, which under that collation matches the same rows.
 folding and remains accent-sensitive. The dialect accepts its checked ASCII
 forms. It refuses a non-ASCII subject or pattern rather than return a wrong
 row, because Rust regex does not reproduce ICU expansions such as
-`ß REGEXP 'ss'`. A `LIKE` over an explicit `utf8mb4_bin` column is refused
-until a matching PAD SPACE pattern matcher is available; `LIKE` over a view is
-also refused when its source column collation cannot be checked.
+`ß REGEXP 'ss'`. A `LIKE` over a `utf8mb4_bin` column matches each character
+only to itself, one at a time and without padding, measured on 8.4.11: `'a '`
+does not match `'a'`, `'A'` does not match `'a%'`, an emoji is one `_`, and
+`LOWER(s) LIKE 'e'` finds `E` and not `é`. `LIKE` over a view is refused when
+its source column collation cannot be checked.
 
 The scalar calls taken so far are `LOWER`, `UPPER`, `REVERSE`, `REPEAT`,
 `REPLACE`, `LPAD`, `RPAD`, `INSTR`, `LOCATE` (2 arguments), `HEX` (text columns),
@@ -3669,12 +3671,18 @@ while `'ß' LIKE 'ss'`, `'a ' LIKE 'a'` and two different emoji do not. The
 engine picks the matcher from the collation of the column being matched, so a
 query reading a `utf8mb4_unicode_ci` column and a `utf8mb4_0900_ai_ci` column
 matches each under its own. `FIELD`, `GREATEST`, `LEAST` and `NULLIF` over a
-`utf8mb4_unicode_ci` or `utf8mb4_bin` column are refused, and so is ordering
-by a call over one that answers text — `ORDER BY LOWER(name)`, `ORDER BY
-CONCAT(name, 'x')` — or comparing such a call with written text, in a `SELECT`,
-an `UPDATE` or a `DELETE`: each compares under `utf8mb4_0900_ai_ci`'s weights,
-where MySQL compares a call's answer under the collation of the column it
-read.
+`utf8mb4_unicode_ci` or `utf8mb4_bin` column are refused: each compares under
+`utf8mb4_0900_ai_ci`'s weights, where MySQL compares under the collation of
+the column it read. A `SELECT` ordering by a call answering words — `ORDER BY
+LOWER(name)`, `ORDER BY CONCAT(name, 'x')` — or by a `CASE` choosing among
+words, Gitea's `ORDER BY CASE WHEN name LIKE 'Owners' THEN '' ELSE name END`,
+or comparing such a call with a word or another call — `LOWER(name) IN (?)`,
+`lower(path) = ?` — orders and compares under the collation the columns it
+reads share, measured on 8.4.11: a call answers the collation of the column it
+read and a column's wins over a written word's, so over a `utf8mb4_bin` table
+`LOWER(name) IN ('V1.0')` finds nothing and `'b '` sorts before `'beta'`. One
+reading columns of two collations is refused, as is the same in an `UPDATE`
+or a `DELETE`.
 
 `utf8mb3_unicode_ci` is taken too, the one `utf8mb3` collation this server
 has: Sequelize keeps its migrations in a table written `DEFAULT CHARSET=utf8
@@ -3722,7 +3730,25 @@ naming only `CHARACTER SET utf8mb4` takes `utf8mb4_0900_ai_ci`, that character
 set's own default. The table's collation is kept with its stored definition, so
 `SHOW CREATE TABLE` ends with `DEFAULT CHARSET=utf8mb4
 COLLATE=utf8mb4_unicode_ci`, and `information_schema.TABLES.TABLE_COLLATION`
-and `SHOW TABLE STATUS` report it.
+and `SHOW TABLE STATUS` report it. A table takes `COLLATE=utf8mb4_bin` the same
+way, measured the same: each column taking it prints ` COLLATE utf8mb4_bin`
+and the table ends `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`.
+
+`ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 [COLLATE c]` — what Gitea
+runs over every table when it converts a database — gives the table and every
+column of words, `ENUM` and `SET` in it the collation, whatever each named
+before; a `JSON` column keeps its own. Measured on 8.4.11 and matched:
+`CHARSET` stands for `CHARACTER SET`, the names may be bare, in backticks or
+strings in any case, a character set named alone gives its own default,
+`utf8mb4_0900_ai_ci`, whatever the database's collation, and `CHARACTER SET
+DEFAULT` gives the database's; an unknown collation is 1273, an unknown
+character set 1115, a collation of another character set 1253 and a table
+that is not there 1146. The table is written again with its rows carried
+across and its keys built again under the new collation, so a unique key that
+would then hold two equal values is 1062 and the table stays as it was, as in
+MySQL. MySQL goes on printing `CHARACTER SET utf8mb4 COLLATE <name>` on a
+column first written with a character set or collation of its own, where this
+prints ` COLLATE <name>`, as it does for such a column in a `CREATE TABLE`.
 
 `VARBINARY(n)` is taken. It holds bytes rather than characters, which is the
 whole of the difference from a `VARCHAR`: measured on 8.4.11, a
@@ -4948,9 +4974,17 @@ every table made in it takes when the table names neither a character set nor
 a collation — what Prisma and Laravel create their database with: `CREATE
 DATABASE app CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`, and Laravel's
 ``create database `app` default character set `utf8mb4` default collate
-`utf8mb4_unicode_ci` ``. `utf8mb4_0900_ai_ci`, the default, and
-`utf8mb4_unicode_ci` are the two a database may have, being the two a table
-here may have. Measured on 8.4.11:
+`utf8mb4_unicode_ci` ``. `utf8mb4_0900_ai_ci`, the default,
+`utf8mb4_unicode_ci` and `utf8mb4_bin` are the three a database may have,
+being the three a table here may have as its own. Gitea gives an empty
+database the first case-sensitive collation the server lists, `ALTER DATABASE
+CHARACTER SET utf8mb4 COLLATE <it>`: MySQL lists `utf8mb4_0900_as_cs` first,
+and this server `utf8mb4_bin`, so Gitea's tables here compare their words by
+code point and pad with spaces where MySQL's compare them case- and
+accent-sensitively under Unicode 9 without padding. Measured on 8.4.11, the
+two agree on which words are equal but for trailing spaces, which
+`utf8mb4_0900_as_cs` tells apart, and sort words of mixed case differently:
+`a, A, b, B` there and `A, B, a, b` here. Measured on 8.4.11:
 
 - The options may each start with `DEFAULT`, take an `=`, come in any order
   and more than once, and name their value bare, in backticks or as a string,
@@ -4962,7 +4996,7 @@ here may have. Measured on 8.4.11:
   1115, a collation beside another character set 1253, and two different
   character sets 1302, each before the database is looked for. `utf8` is read
   as `utf8mb3`, and `utf8_bin` as `utf8mb3_bin`, as MySQL reads them. Every
-  other character set and collation MySQL has — `utf8mb4_bin` and
+  other character set and collation MySQL has — `utf8mb4_0900_as_cs` and
   `utf8mb4_general_ci` among them — and any `ENCRYPTION` but `'N'` are
   refused, a table here being unable to take one.
 - A table made in the database naming neither a character set nor a collation

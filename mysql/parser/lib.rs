@@ -239,9 +239,9 @@ pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column, character_set_of_collation,
     create_table_with_its_collation_on_each_text_column, create_table_with_the_database_collation,
-    table_collation_of, table_comment_change, table_counter_change, table_engine_restated,
-    table_options_of, table_row_format_change, widest_character_of_collation, MySqlTableCollation,
-    MySqlTableOptions,
+    table_collation_of, table_comment_change, table_conversion, table_counter_change,
+    table_engine_restated, table_options_of, table_row_format_change, table_with_its_words_in,
+    widest_character_of_collation, MySqlTableCollation, MySqlTableConversion, MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,
@@ -4982,6 +4982,7 @@ pub fn parse_select_knowing_decimal_columns(
         decimal_columns,
         &[],
         &[],
+        &[],
     )
 }
 
@@ -4997,6 +4998,7 @@ pub fn parse_select_knowing_numeric_columns(
     decimal_columns: &[(String, u32)],
     integer_columns: &[String],
     real_columns: &[String],
+    word_collations: &[(String, String)],
 ) -> Result<TranslatedSelect, ParseError> {
     parse_select_inner(
         sql,
@@ -5012,6 +5014,7 @@ pub fn parse_select_knowing_numeric_columns(
         &[],
         false,
         false,
+        word_collations,
     )
 }
 
@@ -5028,6 +5031,7 @@ pub fn parse_select_knowing_json_columns(
     integer_columns: &[String],
     real_columns: &[String],
     json_columns: &[String],
+    word_collations: &[(String, String)],
 ) -> Result<TranslatedSelect, ParseError> {
     parse_select_inner(
         sql,
@@ -5043,6 +5047,7 @@ pub fn parse_select_knowing_json_columns(
         json_columns,
         false,
         true,
+        word_collations,
     )
 }
 
@@ -5058,6 +5063,7 @@ pub fn parse_select_knowing_the_kinds_of_joined_columns(
     text_columns: &[String],
     integer_columns: &[String],
     exact_columns: &[(String, u32)],
+    word_collations: &[(String, String)],
 ) -> Result<TranslatedSelect, ParseError> {
     parse_select_inner(
         sql,
@@ -5073,6 +5079,7 @@ pub fn parse_select_knowing_the_kinds_of_joined_columns(
         &[],
         true,
         false,
+        word_collations,
     )
 }
 
@@ -5104,13 +5111,16 @@ pub fn parse_select_with_column_types(
         &[],
         false,
         false,
+        &[],
     )
 }
 
 /// Parses a checked `SELECT` — what [`parse_select_knowing_json_columns`] and
 /// the narrower readings share. `knows_every_column_kind` says the caller
 /// named the kind of every column of every table the statement reads by name,
-/// which a lateral derived table's documents are written by.
+/// which a lateral derived table's documents are written by, and
+/// `word_collations` the collation of each column of words declared with one
+/// other than `utf8mb4_0900_ai_ci`, which an ordering over words follows.
 #[allow(clippy::too_many_arguments)]
 fn parse_select_inner(
     sql: &str,
@@ -5126,6 +5136,7 @@ fn parse_select_inner(
     json_columns: &[String],
     knows_the_kinds_of_joined_columns: bool,
     knows_every_column_kind: bool,
+    word_collations: &[(String, String)],
 ) -> Result<TranslatedSelect, ParseError> {
     let sql = &*without_utf8mb4_introducers(sql, mode)?;
     let read_statement = read_one_statement(sql, mode);
@@ -5203,6 +5214,7 @@ fn parse_select_inner(
         knows_the_kinds_of_joined_columns,
         knows_every_column_kind,
         lateral_tables,
+        word_collations,
     )?;
     if let SetExpr::Select(select) = query.body.as_ref() {
         for (item, metadata) in select.projection.iter().zip(&mut static_result_metadata) {

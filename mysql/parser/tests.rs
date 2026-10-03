@@ -226,6 +226,7 @@ fn scalar_numbers_and_mixed_numeric_columns_keep_their_kinds() {
         &[("amount".to_string(), 2)],
         &[],
         &[],
+        &[],
     )
     .unwrap();
     assert!(decimal_truncate
@@ -250,6 +251,7 @@ fn scalar_numbers_and_mixed_numeric_columns_keep_their_kinds() {
             &[("amount".to_string(), 2)],
             &["n".to_string()],
             &["d".to_string()],
+            &[],
         )
         .unwrap();
         assert!(
@@ -269,6 +271,7 @@ fn scalar_numbers_and_mixed_numeric_columns_keep_their_kinds() {
         &[("amount".to_string(), 2)],
         &["n".to_string()],
         &["d".to_string()],
+        &[],
     )
     .is_err());
 }
@@ -4207,6 +4210,7 @@ fn unsigned_bigint_arithmetic_checks_its_result_range() {
         &[("v".to_string(), 0)],
         &["v".to_string()],
         &[],
+        &[],
     )
     .unwrap();
     assert!(translated
@@ -4228,6 +4232,7 @@ fn unsigned_bigint_arithmetic_checks_its_result_range() {
         &[],
         &[("v".to_string(), 0)],
         &["v".to_string()],
+        &[],
         &[],
     )
     .unwrap();
@@ -4694,6 +4699,7 @@ fn a_lateral_table_answering_one_document_is_read_as_a_subquery() {
             &names(&["id", "post_id", "tag_id", "user_id"]),
             &[],
             &[],
+            &[],
         )
     };
     let typed = parse(sql).unwrap();
@@ -4733,6 +4739,70 @@ fn a_lateral_table_answering_one_document_is_read_as_a_subquery() {
     }
 }
 
+/// Gitea's `ORDER BY CASE WHEN name LIKE 'Owners' THEN '' ELSE name END`
+/// over a `utf8mb4_bin` table, and an ordering by a call over one, order under
+/// the collation of the columns they read once the caller has said it.
+#[test]
+fn an_ordering_over_words_is_written_with_the_collation_of_its_columns() {
+    let mode = SessionSqlMode::default();
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let parse = |sql: &str, word_collations: &[(String, String)]| {
+        parse_select_knowing_json_columns(
+            sql,
+            mode,
+            &names(&["name", "lower_name", "title"]),
+            &names(&["id", "name", "lower_name", "title"]),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names(&["id"]),
+            &[],
+            &[],
+            word_collations,
+        )
+        .unwrap()
+    };
+    let binary = [
+        ("name".to_owned(), "utf8mb4_bin".to_owned()),
+        ("lower_name".to_owned(), "utf8mb4_bin".to_owned()),
+    ];
+    let case = "SELECT id FROM team ORDER BY CASE WHEN name = 'Owners' THEN '' ELSE lower_name END";
+    let read = parse(case, &binary);
+    assert!(
+        read.as_sql()
+            .ends_with("ELSE \"lower_name\" END COLLATE MYSQL_UTF8MB4_BIN ASC"),
+        "{}",
+        read.as_sql()
+    );
+    assert!(read.collation_sensitive_call_columns().is_empty());
+    let call = parse("SELECT id FROM team ORDER BY LOWER(name)", &binary);
+    assert!(call.as_sql().ends_with("COLLATE MYSQL_UTF8MB4_BIN ASC"));
+    assert!(call.collation_sensitive_call_columns().is_empty());
+    // Without the collations, or over columns of two, the ordering is
+    // written under `utf8mb4_0900_ai_ci` and its columns are handed back to
+    // be held to that.
+    let unknown = parse(case, &[]);
+    assert!(unknown
+        .as_sql()
+        .ends_with("END COLLATE MYSQL_UCA9_AI_CI ASC"));
+    assert_eq!(unknown.collation_sensitive_call_columns(), ["lower_name"]);
+    let mixed = parse(
+        "SELECT id FROM team ORDER BY CASE WHEN id = 1 THEN '' WHEN id = 2 THEN title ELSE lower_name END",
+        &binary,
+    );
+    assert!(mixed.as_sql().ends_with("END COLLATE MYSQL_UCA9_AI_CI ASC"));
+    assert_eq!(
+        mixed.collation_sensitive_call_columns(),
+        ["title", "lower_name"]
+    );
+}
+
 #[test]
 fn json_string_where_compares_the_document_string_as_bytes() {
     let json_columns = vec!["doc".to_owned()];
@@ -4749,6 +4819,7 @@ fn json_string_where_compares_the_document_string_as_bytes() {
             &[],
             &[],
             &json_columns,
+            &[],
         )
         .unwrap()
     };
@@ -6324,7 +6395,7 @@ fn takes_the_table_options_that_name_what_a_table_is_written_back_as() {
 
     for sql in [
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
-        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
+        "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_0900_as_cs",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
         "CREATE TABLE t (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=COMPACT",
         // The same option twice says nothing more the second time, and MySQL
@@ -8678,6 +8749,12 @@ fn reads_the_collation_create_database_gives_its_database() {
             unicode,
         ),
         ("CREATE DATABASE o7 CHARSET utf8mb4", "o7", false, uca9),
+        (
+            "CREATE DATABASE o8 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            "o8",
+            false,
+            MySqlTableCollation::Utf8mb4Bin,
+        ),
     ] {
         assert_eq!(
             parse_admin_command(sql, mode),
@@ -8725,7 +8802,7 @@ fn reads_the_collation_create_database_gives_its_database() {
         "CREATE DATABASE l1 CHARACTER SET latin1",
         "CREATE DATABASE l2 CHARSET utf8",
         "CREATE DATABASE l3 COLLATE utf8_general_ci",
-        "CREATE DATABASE l4 COLLATE utf8mb4_bin",
+        "CREATE DATABASE l4 COLLATE utf8mb4_0900_as_cs",
         "CREATE DATABASE l5 COLLATE utf8mb4_general_ci",
         "CREATE DATABASE l6 COLLATE binary",
         "CREATE DATABASE e1 ENCRYPTION 'Y'",
@@ -8773,6 +8850,18 @@ fn reads_alter_database_and_show_create_database() {
             Some(MySqlTableCollation::Utf8mb4UnicodeCi),
         ),
         ("ALTER DATABASE `app` ENCRYPTION 'N'", Some("app"), None),
+        // What Gitea writes to give an empty database a case-sensitive
+        // collation, and to convert one.
+        (
+            "ALTER DATABASE CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            None,
+            Some(MySqlTableCollation::Utf8mb4Bin),
+        ),
+        (
+            "ALTER DATABASE `giteatest` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            Some("giteatest"),
+            Some(MySqlTableCollation::Utf8mb4Bin),
+        ),
     ] {
         assert_eq!(
             parse_admin_command(sql, mode),

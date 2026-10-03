@@ -81,14 +81,15 @@ use turso_mysql_parser::{
     parse_optional_show_columns, parse_optional_show_create_table,
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
-    renamed_tables, select_projection_origins, table_comment_change, table_counter_change,
-    table_engine_restated, table_row_format_change, ArithmeticOperand, ArithmeticOperator,
-    ArithmeticShape, Branch, ColumnAggregateKind, ConnectorJInformationSchemaQuery,
-    ConnectorJSchemataListingQuery, ConnectorJTables, GormInformationSchemaPreparedQuery,
-    MySqlAccountAdminCommand, MySqlCatalogTable, MySqlDatabaseName, MySqlDerivedColumns,
-    MySqlInformationSchemaColumnsColumn, MySqlInformationSchemaTablesColumn,
-    MySqlJoinedDerivedColumn, MySqlLikePattern, MySqlLockTablesCommand,
-    MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName, ScalarFunction,
+    renamed_tables, select_projection_origins, table_comment_change, table_conversion,
+    table_counter_change, table_engine_restated, table_row_format_change, ArithmeticOperand,
+    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
+    ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery, ConnectorJTables,
+    GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
+    MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
+    MySqlInformationSchemaTablesColumn, MySqlJoinedDerivedColumn, MySqlLikePattern,
+    MySqlLockTablesCommand, MySqlSelectProjectionOrigin, MySqlSelectSource, MySqlTableName,
+    ScalarFunction,
 };
 use turso_mysql_parser::{
     parse_optional_drop_table, parse_optional_drop_view, parse_optional_show_character_sets,
@@ -5517,6 +5518,20 @@ fn execute_checked_statement(
     if let Some((table, change)) = option_change {
         connection
             .execute_table_option(&table, change)
+            .map_err(|error| match error {
+                MySqlQueryError::MissingTable => FrontendErrorKind::MissingObject,
+                error => frontend_query_error(error),
+            })?;
+        return Ok(CommandExecutionResult::Ok(CommandOkResult {
+            status_flags: connection_status_flags(connection),
+            ..CommandOkResult::default()
+        }));
+    }
+    if let Some((table, conversion)) =
+        table_conversion(sql, connection.parser_mode()).map_err(conversion_error_kind)?
+    {
+        connection
+            .execute_table_conversion(&table, conversion)
             .map_err(|error| match error {
                 MySqlQueryError::MissingTable => FrontendErrorKind::MissingObject,
                 error => frontend_query_error(error),
@@ -14142,6 +14157,23 @@ fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
+    }
+}
+
+/// What MySQL answers for the names an `ALTER TABLE ... CONVERT TO` gives:
+/// 1273 for an unknown collation, 1115 for an unknown character set and 1253
+/// for a collation of another character set.
+#[cfg(unix)]
+fn conversion_error_kind(error: turso_mysql_parser::ParseError) -> FrontendErrorKind {
+    match error {
+        turso_mysql_parser::ParseError::UnknownCollation => FrontendErrorKind::UnknownCollation,
+        turso_mysql_parser::ParseError::UnknownCharacterSet => {
+            FrontendErrorKind::UnknownCharacterSet
+        }
+        turso_mysql_parser::ParseError::CollationOfAnotherCharacterSet => {
+            FrontendErrorKind::CollationOfAnotherCharacterSet
+        }
+        _ => FrontendErrorKind::Unsupported,
     }
 }
 

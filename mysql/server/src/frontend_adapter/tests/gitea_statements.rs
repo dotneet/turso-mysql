@@ -1088,8 +1088,8 @@ fn an_ordering_case_over_words_orders_under_the_columns_collation() {
     for sql in [
         // Words beside numbers is a coercion MySQL makes by rules of its own.
         "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id ORDER BY CASE WHEN name = 'Owners' THEN 0 ELSE lower_name END",
-        // A column under another collation orders by that one.
-        "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id ORDER BY CASE WHEN name = 'Owners' THEN '' ELSE code END",
+        // Columns of two collations, whose order has not been worked out.
+        "SELECT team.id FROM `team` LEFT JOIN `team_user` ON team_user.team_id = team.id ORDER BY CASE WHEN name = 'Owners' THEN '' WHEN team.id = 2 THEN lower_name ELSE code END",
     ] {
         assert!(
             matches!(

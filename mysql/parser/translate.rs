@@ -547,6 +547,7 @@ pub(crate) fn translate_select_query(
     knows_the_kinds_of_joined_columns: bool,
     knows_every_column_kind: bool,
     lateral_tables: LateralTables,
+    word_collations: &[(String, String)],
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -575,6 +576,7 @@ pub(crate) fn translate_select_query(
     render_context.knows_the_kinds_of_joined_columns = knows_the_kinds_of_joined_columns;
     render_context.knows_every_column_kind = knows_every_column_kind;
     render_context.lateral_tables = lateral_tables;
+    render_context.word_collations = word_collations;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     let mut sequence = None;
     if let Some(with) = &query.with {
@@ -3411,20 +3413,35 @@ fn render_order_by_expr(
                 .chain(std::iter::once(otherwise.as_ref()))
                 .collect::<Vec<_>>();
             let kind = ordering_case_kind(&results).expect("the guard read the branches");
+            // Measured on MySQL 8.4.11: the answer takes the collation of the
+            // columns among the branches, a word written out yielding to them.
+            if matches!(kind, OrderingCaseKind::Words) {
+                render_context.checks_type_sensitive_expression = true;
+            }
+            let collation = match kind {
+                OrderingCaseKind::WholeNumbers => None,
+                OrderingCaseKind::Words => render_context.collation_the_words_share(
+                    results
+                        .iter()
+                        .filter_map(|result| named_column(result))
+                        .map(|(_, column)| column.value.as_str()),
+                ),
+            };
             let mut rendered = String::from("CASE");
             for when in conditions {
                 let condition = render_select_predicate(&when.condition, render_context)?;
-                let result = render_ordering_branch(&when.result, kind, render_context)?;
+                let result = render_ordering_branch(&when.result, kind, collation, render_context)?;
                 rendered.push_str(&format!(" WHEN {condition} THEN {result}"));
             }
-            let otherwise = render_ordering_branch(otherwise, kind, render_context)?;
+            let otherwise = render_ordering_branch(otherwise, kind, collation, render_context)?;
             return Ok(match kind {
                 OrderingCaseKind::WholeNumbers => {
                     format!("{rendered} ELSE {otherwise} END {direction}")
                 }
-                OrderingCaseKind::Words => {
-                    format!("{rendered} ELSE {otherwise} END COLLATE MYSQL_UCA9_AI_CI {direction}")
-                }
+                OrderingCaseKind::Words => format!(
+                    "{rendered} ELSE {otherwise} END COLLATE {} {direction}",
+                    collation.unwrap_or("MYSQL_UCA9_AI_CI")
+                ),
             });
         }
         // `ORDER BY LOWER(name)` is how a report asks for an order it has
@@ -3449,9 +3466,9 @@ fn render_order_by_expr(
             ) {
                 return unsupported("SELECT ORDER BY a random number");
             }
-            record_the_columns_a_text_call_reads(expr, render_context);
+            let collation = collation_of_the_words_read(&[expr], &[], render_context);
             return Ok(format!(
-                "{} COLLATE MYSQL_UCA9_AI_CI {direction}",
+                "{} COLLATE {collation} {direction}",
                 render_select_expr(expr, render_context)?
             ));
         }
@@ -3565,10 +3582,12 @@ fn ordering_case_kind(results: &[&Expr]) -> Option<OrderingCaseKind> {
 
 /// One branch of an ordering `CASE`: a written value as it stands, a column
 /// held to what the branches answer — plain whole numbers, or words under
-/// the collation the ordering is written with.
+/// the collation the ordering is written with, which is the columns' own
+/// when `collation` names it.
 fn render_ordering_branch(
     result: &Expr,
     kind: OrderingCaseKind,
+    collation: Option<&str>,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
     if let Some((qualifier, column)) = named_column(result) {
@@ -3576,9 +3595,11 @@ fn render_ordering_branch(
         let held = match kind {
             OrderingCaseKind::WholeNumbers => held_to_plain_whole_numbers(qualifier, &column.value),
             OrderingCaseKind::Words => {
-                render_context
-                    .collation_sensitive_call_columns
-                    .push(column.value.clone());
+                if collation.is_none() {
+                    render_context
+                        .collation_sensitive_call_columns
+                        .push(column.value.clone());
+                }
                 CheckedSelectComparison {
                     qualifier,
                     inner_sources: Vec::new(),
@@ -3975,6 +3996,7 @@ pub(crate) fn translate_insert(
                     false,
                     false,
                     LateralTables::default(),
+                    &[],
                 )?;
                 // A SELECT that needs a second rendering pass to learn its
                 // column types is rendered by the frontend, which knows them,
@@ -7159,6 +7181,9 @@ pub(crate) struct SelectRenderContext<'a> {
     knows_every_column_kind: bool,
     /// The lateral derived tables taken out of the statement's `FROM`.
     lateral_tables: LateralTables,
+    /// The collation of each column of words the caller knows to be declared
+    /// with one other than `utf8mb4_0900_ai_ci`, by the column's name.
+    word_collations: &'a [(String, String)],
     lateral_columns: Vec<LateralColumn>,
     renders_a_lateral_table_without_column_kinds: bool,
 }
@@ -7236,6 +7261,7 @@ impl<'a> SelectRenderContext<'a> {
             bare_names_in_result_subqueries: Vec::new(),
             knows_every_column_kind: false,
             lateral_tables: LateralTables::default(),
+            word_collations: &[],
             lateral_columns: Vec::new(),
             renders_a_lateral_table_without_column_kinds: false,
         }
@@ -7276,6 +7302,31 @@ impl<'a> SelectRenderContext<'a> {
         self.integer_columns
             .iter()
             .any(|column| column.eq_ignore_ascii_case(name))
+    }
+
+    /// The collation, as the engine names it, that every one of `columns`
+    /// is declared with, when the caller said each one's and they share one
+    /// other than `utf8mb4_0900_ai_ci`.
+    fn collation_the_words_share<'c>(
+        &self,
+        mut columns: impl Iterator<Item = &'c str>,
+    ) -> Option<&'static str> {
+        let collation_of = |column: &str| {
+            self.word_collations
+                .iter()
+                .find(|(named, _)| named.eq_ignore_ascii_case(column))
+                .map(|(_, collation)| collation.as_str())
+        };
+        let shared = collation_of(columns.next()?)?;
+        if !columns.all(|column| collation_of(column) == Some(shared)) {
+            return None;
+        }
+        match shared {
+            "utf8mb4_bin" => Some("MYSQL_UTF8MB4_BIN"),
+            "utf8mb4_unicode_ci" => Some("MYSQL_UCA400_CI"),
+            "utf8mb3_unicode_ci" => Some("MYSQL_UTF8MB3_UCA400_CI"),
+            _ => None,
+        }
     }
 
     fn decimal_scale(&self, name: &str) -> Option<u32> {
@@ -10482,24 +10533,45 @@ fn record_collation_sensitive_call_column(
     }
 }
 
-/// Records the columns a call reads, where its answer is ordered or compared
-/// under `utf8mb4_0900_ai_ci`'s weights and may be text. MySQL orders and
-/// compares a text answer under the collation of the column it came from, so
-/// the frontend refuses the call over a column declared with another.
-fn record_the_columns_a_text_call_reads(call: &Expr, render_context: &mut SelectRenderContext<'_>) {
-    if matches!(
-        static_select_metadata::comparison_answer(call),
-        Some(answer) if answer != crate::CheckedComparisonAnswer::Text
-    ) {
-        return;
+/// The collation words read through `calls`, and out of `columns` named
+/// alone, are ordered or compared under, as the engine names it.
+///
+/// Measured on MySQL 8.4.11: a call answering words carries the collation of
+/// the column it reads, and a column's collation wins over a written word's.
+/// That is the one the columns share once the caller has said each one's and
+/// it is not `utf8mb4_0900_ai_ci`; otherwise it is `utf8mb4_0900_ai_ci`'s,
+/// and the columns are handed back for the frontend to hold to that one.
+fn collation_of_the_words_read(
+    calls: &[&Expr],
+    columns: &[&str],
+    render_context: &mut SelectRenderContext<'_>,
+) -> &'static str {
+    render_context.checks_type_sensitive_expression = true;
+    let mut read = columns
+        .iter()
+        .map(|column| (*column).to_owned())
+        .collect::<Vec<_>>();
+    for call in calls {
+        if matches!(
+            static_select_metadata::comparison_answer(call),
+            Some(answer) if answer != crate::CheckedComparisonAnswer::Text
+        ) {
+            continue;
+        }
+        if let Some(StaticSelectMetadata::ScalarCall {
+            columns: call_columns,
+            ..
+        }) = static_select_metadata::classify_static_select_expr(call)
+        {
+            read.extend(call_columns);
+        }
     }
-    if let Some(StaticSelectMetadata::ScalarCall { columns, .. }) =
-        static_select_metadata::classify_static_select_expr(call)
+    if let Some(shared) = render_context.collation_the_words_share(read.iter().map(String::as_str))
     {
-        render_context
-            .collation_sensitive_call_columns
-            .extend(columns);
+        return shared;
     }
+    render_context.collation_sensitive_call_columns.extend(read);
+    "MYSQL_UCA9_AI_CI"
 }
 
 fn record_all_collation_sensitive_call_columns(
@@ -12070,13 +12142,12 @@ fn render_column_against_a_call(
     let rendered_call = render_select_expr(call, render_context)?;
     let collated = answers == crate::CheckedComparisonAnswer::Text;
     let collation = if collated {
-        record_the_columns_a_text_call_reads(call, render_context);
-        render_context
-            .collation_sensitive_call_columns
-            .push(column.value.clone());
-        " COLLATE MYSQL_UCA9_AI_CI"
+        format!(
+            " COLLATE {}",
+            collation_of_the_words_read(&[call], &[column.value.as_str()], render_context)
+        )
     } else {
-        ""
+        String::new()
     };
     let rendered_column = match qualifier {
         Some(qualifier) => format!("{}.{}", render_ident(qualifier), render_ident(column)),
@@ -12730,10 +12801,12 @@ fn render_comparison_over_a_call(
             CheckedSelectComparisonRhs::Text(_) | CheckedSelectComparisonRhs::Placeholder { .. }
         );
     let collation = if collated {
-        record_the_columns_a_text_call_reads(call, render_context);
-        " COLLATE MYSQL_UCA9_AI_CI"
+        format!(
+            " COLLATE {}",
+            collation_of_the_words_read(&[call], &[], render_context)
+        )
     } else {
-        ""
+        String::new()
     };
     let rendered = format!(
         "({rendered_call}{collation} {} {rendered_rhs})",
@@ -12786,11 +12859,12 @@ fn render_comparison_of_two_calls(
     let rendered_other = render_select_expr(other, render_context)?;
     let collated = answers == CheckedComparisonAnswer::Text;
     let collation = if collated {
-        record_the_columns_a_text_call_reads(call, render_context);
-        record_the_columns_a_text_call_reads(other, render_context);
-        " COLLATE MYSQL_UCA9_AI_CI"
+        format!(
+            " COLLATE {}",
+            collation_of_the_words_read(&[call, other], &[], render_context)
+        )
     } else {
-        ""
+        String::new()
     };
     render_context
         .checked_comparisons

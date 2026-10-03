@@ -2625,9 +2625,21 @@ fn fresh_text_collations_keep_equality_like_and_unique_keys_after_reopen() -> Re
                 .run_collect_rows()?,
             vec![vec![Value::from_i64(2)], vec![Value::from_i64(1)]]
         );
-        assert!(connection
-            .prepare_select("SELECT id FROM names WHERE exact LIKE 'a%'")
-            .is_err());
+        // A `utf8mb4_bin` column matches each character only to itself.
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM names WHERE exact LIKE 'b%'")
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            Vec::<Vec<Value>>::new()
+        );
+        assert_eq!(
+            connection
+                .prepare_select("SELECT id FROM names WHERE exact LIKE 'a%'")
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?,
+            vec![vec![Value::from_i64(1)]]
+        );
         assert!(connection
             .execute("INSERT INTO names (id, name, exact) VALUES (3, 'CAFE', 'c')")
             .is_err());

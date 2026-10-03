@@ -82,6 +82,39 @@ pub(crate) fn consume_database_options(
         })
 }
 
+/// The collation a character set and a collation written beside it name, the
+/// way an `ALTER TABLE ... CONVERT TO` names them: the collation when one is
+/// written, the character set's own default otherwise.
+///
+/// Measured on MySQL 8.4.11: an unknown collation is 1273, an unknown
+/// character set 1115, and a collation of another character set 1253. Every
+/// character set but `utf8mb4`, and a collation a table here cannot take, are
+/// refused.
+pub(crate) fn table_collation_named(
+    character_set: &str,
+    collation: Option<&str>,
+) -> Result<MySqlTableCollation, ParseError> {
+    let character_set = known_character_set(character_set)?;
+    let collation = match collation {
+        Some(collation) => {
+            let (named, its_character_set) = known_collation(collation)?;
+            if its_character_set != character_set {
+                return Err(ParseError::CollationOfAnotherCharacterSet);
+            }
+            named
+        }
+        None => "utf8mb4_0900_ai_ci".to_owned(),
+    };
+    if character_set != "utf8mb4" {
+        return Err(ParseError::Unsupported {
+            feature: "table character set other than utf8mb4",
+        });
+    }
+    MySqlTableCollation::from_name(&collation).ok_or(ParseError::Unsupported {
+        feature: "table collation a table here cannot take",
+    })
+}
+
 /// Reads an option's value after its optional `=`.
 ///
 /// Measured on MySQL 8.4.11: `CHARACTER SET = DEFAULT` is 1064, so the word

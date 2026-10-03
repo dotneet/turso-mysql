@@ -117,12 +117,29 @@ fn laravel_connects_and_migrates_under_utf8mb4_unicode_ci() {
         ),
         [[text("1")]]
     );
+    // A call's answer carries the collation of the column it read, and is
+    // ordered and compared under it: measured on 8.4.11, `lower(email)`
+    // meets a word with trailing spaces as `utf8mb4_unicode_ci` pads it.
+    for (sql, answered) in [
+        (
+            "select `id` from `users` where lower(`email`) = 'ANN@EXAMPLE.COM'",
+            vec![[text("1")]],
+        ),
+        (
+            "select `id` from `users` where lower(`email`) = 'ann@example.com  '",
+            vec![[text("1")]],
+        ),
+        (
+            "select `id` from `users` order by concat(`name`, 'x'), `id`",
+            vec![[text("1")]],
+        ),
+    ] {
+        assert_eq!(rows(&mut adapter, sql), answered, "{sql}");
+    }
     // These compare under utf8mb4_0900_ai_ci's weights, where MySQL compares
     // a call's answer under the collation of the column it read.
     for sql in [
         "select field(`name`, 'xay') from `users`",
-        "select `id` from `users` order by concat(`name`, 'x'), `id`",
-        "select `id` from `users` where lower(`email`) = 'ann@example.com'",
         "update `users` set `nick` = 'a' where lower(`email`) = 'ann@example.com'",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");

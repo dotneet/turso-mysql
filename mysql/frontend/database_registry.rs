@@ -253,6 +253,8 @@ pub(crate) struct RegistryEntry {
 pub(crate) enum StoredDatabaseCollation {
     #[serde(rename = "utf8mb4_unicode_ci")]
     Utf8mb4UnicodeCi,
+    #[serde(rename = "utf8mb4_bin")]
+    Utf8mb4Bin,
 }
 
 impl StoredDatabaseCollation {
@@ -260,6 +262,7 @@ impl StoredDatabaseCollation {
         match collation {
             MySqlTableCollation::Utf8mb40900AiCi => None,
             MySqlTableCollation::Utf8mb4UnicodeCi => Some(Self::Utf8mb4UnicodeCi),
+            MySqlTableCollation::Utf8mb4Bin => Some(Self::Utf8mb4Bin),
             // A database takes `utf8mb4` alone, which the statement naming it
             // is refused for otherwise.
             MySqlTableCollation::Utf8mb3UnicodeCi => {
@@ -272,6 +275,7 @@ impl StoredDatabaseCollation {
         match stored {
             None => MySqlTableCollation::Utf8mb40900AiCi,
             Some(Self::Utf8mb4UnicodeCi) => MySqlTableCollation::Utf8mb4UnicodeCi,
+            Some(Self::Utf8mb4Bin) => MySqlTableCollation::Utf8mb4Bin,
         }
     }
 }
@@ -1583,7 +1587,28 @@ mod tests {
             serde_json::from_str::<RegistryEntry>(&written).unwrap(),
             unicode
         );
-        for unknown in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "latin1_swedish_ci"] {
+        let binary = RegistryEntry {
+            collation: StoredDatabaseCollation::stored(MySqlTableCollation::Utf8mb4Bin),
+            ..unicode
+        };
+        let written = serde_json::to_string(&binary).unwrap();
+        assert_eq!(
+            written,
+            format!(r#"{{"file_key":"{KEY}","state":"Ready","collation":"utf8mb4_bin"}}"#)
+        );
+        assert_eq!(
+            StoredDatabaseCollation::read(
+                serde_json::from_str::<RegistryEntry>(&written)
+                    .unwrap()
+                    .collation
+            ),
+            MySqlTableCollation::Utf8mb4Bin
+        );
+        for unknown in [
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_general_ci",
+            "latin1_swedish_ci",
+        ] {
             assert!(serde_json::from_str::<RegistryEntry>(&format!(
                 r#"{{"file_key":"{KEY}","state":"Ready","collation":"{unknown}"}}"#
             ))

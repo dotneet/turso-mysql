@@ -611,16 +611,21 @@ impl Dialect for MySqlDialect {
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
-    /// MySQL matches `LIKE` under the collation of the column it reads, and a
+    /// MySQL matches `LIKE` under the collation of the column it reads: a
     /// `utf8mb4_unicode_ci` or `utf8mb3_unicode_ci` column matches under
-    /// Unicode 4.0.0's weights.
+    /// Unicode 4.0.0's weights, and a `utf8mb4_bin` column each character
+    /// only to itself.
     fn function_for_collation(&self, name: &str, collation: CollationSeq) -> Option<String> {
-        (name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE)
-            && matches!(
-                collation,
-                CollationSeq::MySqlUca400 | CollationSeq::MySqlUtf8mb3Uca400
-            ))
-        .then(|| MYSQL_UCA400_LIKE.to_owned())
+        if !name.eq_ignore_ascii_case(MYSQL_UCA9_LIKE) {
+            return None;
+        }
+        match collation {
+            CollationSeq::MySqlUca400 | CollationSeq::MySqlUtf8mb3Uca400 => {
+                Some(MYSQL_UCA400_LIKE.to_owned())
+            }
+            CollationSeq::MySqlUtf8mb4Bin => Some(MYSQL_BINARY_LIKE.to_owned()),
+            _ => None,
+        }
     }
 
     fn exec_scalar_function(

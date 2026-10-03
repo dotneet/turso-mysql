@@ -6019,6 +6019,29 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Runs one `ALTER TABLE t CONVERT TO CHARACTER SET ...`: the table is
+    /// written again with every column of words in the new collation and its
+    /// rows carried across, so its keys are built again under it.
+    pub fn execute_table_conversion(
+        &self,
+        table: &MySqlTableName,
+        conversion: turso_mysql_parser::MySqlTableConversion,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.a_base_table_named(table)?;
+        let collation = match conversion {
+            turso_mysql_parser::MySqlTableConversion::To(collation) => collation,
+            turso_mysql_parser::MySqlTableConversion::ToTheDatabases => self.database_collation(),
+        };
+        let stored = self
+            .stored_table_statement(table.as_str())
+            .map_err(MySqlQueryError::Engine)?
+            .ok_or(MySqlQueryError::MissingTable)?;
+        let rewrite =
+            turso_mysql_parser::table_with_its_words_in(&stored, collation, self.parser_mode())
+                .map_err(mysql_query_parse_error)?;
+        self.write_the_table_again_with(table.as_str(), &rewrite)
+    }
+
     /// Runs an `ALTER TABLE t ENGINE=InnoDB`, which names the engine the table
     /// already has.
     ///
@@ -9017,6 +9040,7 @@ impl MySqlConnection {
             .filter(|column| column.type_name() == "JSON")
             .map(|column| column.name().to_owned())
             .collect::<Vec<_>>();
+        let word_collations = collations_other_than_the_default(&columns);
         if text_columns.is_empty()
             && member_columns.is_empty()
             && set_columns.is_empty()
@@ -9041,6 +9065,7 @@ impl MySqlConnection {
             &integer_columns,
             &real_columns,
             &json_columns,
+            &word_collations,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
@@ -9069,11 +9094,14 @@ impl MySqlConnection {
         // the kind of that column, which is the one order a join is read
         // knowing its kinds for.
         let orders_a_joined_column = translated.renders_a_condition_without_column_types();
-        if !orders_a_joined_column
-            && !self.compares_an_exact_number_column_by_kind(&translated)
-            && !self.compares_a_column_of_words_with_a_bound_value(&translated)
-            && !compares_a_written_number
-        {
+        let needs_the_kinds = orders_a_joined_column
+            || self.compares_an_exact_number_column_by_kind(&translated)
+            || self.compares_a_column_of_words_with_a_bound_value(&translated)
+            || compares_a_written_number;
+        // Words ordered or compared through a call are read under the
+        // collation of the columns they come from, which a second reading
+        // knowing each column's collation writes out.
+        if !needs_the_kinds && translated.collation_sensitive_call_columns().is_empty() {
             return Ok(translated);
         }
         let mut columns = Vec::new();
@@ -9125,6 +9153,10 @@ impl MySqlConnection {
                 "a column of words shares its name with a column of another kind".to_string(),
             ));
         }
+        let word_collations = collations_other_than_the_default(&columns);
+        if !needs_the_kinds && word_collations.is_empty() {
+            return Ok(translated);
+        }
         if orders_a_joined_column {
             let whole_numbers = columns
                 .iter()
@@ -9148,6 +9180,7 @@ impl MySqlConnection {
                 &words,
                 &whole_numbers,
                 &exact,
+                &word_collations,
             )
             .map_err(|error| MySqlQueryError::Syntax(error.to_string()));
         }
@@ -9182,6 +9215,7 @@ impl MySqlConnection {
             &exact,
             &whole_numbers,
             &[],
+            &word_collations,
         )
         .map_err(|error| MySqlQueryError::Syntax(error.to_string()))
     }
@@ -9543,11 +9577,7 @@ impl MySqlConnection {
                 continue;
             }
             for table in comparison_tables(source_tables, comparison)? {
-                refuse_binary_column_like(
-                    &self.inner.current_schema(),
-                    table.as_str(),
-                    comparison,
-                )?;
+                refuse_like_over_a_view(&self.inner.current_schema(), table.as_str(), comparison)?;
                 if let Some((type_name, temporal_precision)) =
                     self.comparison_column_type(&table, comparison)?
                 {
@@ -9954,7 +9984,7 @@ impl MySqlConnection {
                 }
                 continue;
             }
-            refuse_binary_column_like(&self.inner.current_schema(), table.as_str(), comparison)?;
+            refuse_like_over_a_view(&self.inner.current_schema(), table.as_str(), comparison)?;
             let Some((type_name, temporal_precision)) =
                 self.comparison_column_type(&table, comparison)?
             else {
@@ -13717,6 +13747,30 @@ fn columns_under_derived_names(
     Ok(named)
 }
 
+/// The collation of each column of words declared with one other than
+/// `utf8mb4_0900_ai_ci`, by name. A name two of the columns hold under
+/// different collations is left out, which leaves an ordering over it to the
+/// check that refuses one over another collation.
+fn collations_other_than_the_default(columns: &[MySqlColumnMetadata]) -> Vec<(String, String)> {
+    let collation_of = |column: &MySqlColumnMetadata| {
+        is_text_type(column.type_name())
+            .then(|| column.collation_name())
+            .flatten()
+            .unwrap_or("utf8mb4_0900_ai_ci")
+    };
+    columns
+        .iter()
+        .filter(|column| collation_of(column) != "utf8mb4_0900_ai_ci")
+        .filter(|column| {
+            columns.iter().all(|other| {
+                !other.name().eq_ignore_ascii_case(column.name())
+                    || collation_of(other) == collation_of(column)
+            })
+        })
+        .map(|column| (column.name().to_owned(), collation_of(column).to_owned()))
+        .collect()
+}
+
 /// Reports whether two columns land in the same lists a `SELECT` is read
 /// knowing, and so are rendered alike wherever the statement names them.
 fn read_alike(first: &MySqlColumnMetadata, second: &MySqlColumnMetadata) -> bool {
@@ -14812,7 +14866,7 @@ fn validate_frozen_select_comparison_columns(
             {
                 continue;
             }
-            refuse_binary_column_like(schema, source_table, comparison)?;
+            refuse_like_over_a_view(schema, source_table, comparison)?;
             let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
                 return Err(LimboError::SchemaUpdated);
             };
@@ -14845,7 +14899,7 @@ fn validate_frozen_select_comparison_columns(
                 "a comparison of two columns reads base tables only".to_string(),
             ));
         }
-        refuse_binary_column_like(schema, source_table, comparison)?;
+        refuse_like_over_a_view(schema, source_table, comparison)?;
         let Some(column) = view.columns.iter().find(|column| {
             column
                 .name
@@ -14866,7 +14920,7 @@ fn validate_frozen_select_comparison_columns(
     Ok(())
 }
 
-fn refuse_binary_column_like(
+fn refuse_like_over_a_view(
     schema: &turso_core::schema::Schema,
     table_name: &str,
     comparison: &CheckedSelectComparison,
@@ -14877,16 +14931,7 @@ fn refuse_binary_column_like(
     ) {
         return Ok(());
     }
-    if let Some(table) = schema.get_table(table_name) {
-        let Some((_, column)) = table.get_column_by_name(comparison.column_name()) else {
-            return Err(LimboError::SchemaUpdated);
-        };
-        if column.collation().name() == "MYSQL_UTF8MB4_BIN" {
-            return Err(LimboError::InvalidArgument(
-                "LIKE over utf8mb4_bin needs a binary pattern matcher".to_string(),
-            ));
-        }
-    } else if schema.get_view(table_name).is_some() {
+    if schema.get_table(table_name).is_none() && schema.get_view(table_name).is_some() {
         return Err(LimboError::InvalidArgument(
             "LIKE over a view needs its source column collation".to_string(),
         ));

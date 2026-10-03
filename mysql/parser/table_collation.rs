@@ -15,7 +15,8 @@
 
 use crate::statement_reads;
 use sqlparser::ast::{
-    AlterTableOperation, ColumnOption, CreateTableOptions, DataType, Ident, SqlOption, Statement,
+    AlterTableOperation, ColumnOption, ColumnOptionDef, CreateTableOptions, DataType, Expr, Ident,
+    ObjectName, SqlOption, Statement,
 };
 use sqlparser::tokenizer::Token;
 
@@ -37,6 +38,10 @@ pub enum MySqlTableCollation {
     /// which holds no character past the Basic Multilingual Plane. Sequelize
     /// asks for it as `DEFAULT CHARSET=utf8 COLLATE utf8_unicode_ci`.
     Utf8mb3UnicodeCi,
+    /// `utf8mb4_bin`, which compares the characters' code points. Gitea gives
+    /// its database the first case-sensitive collation the server lists, and
+    /// this is the one this server has.
+    Utf8mb4Bin,
 }
 
 impl MySqlTableCollation {
@@ -45,6 +50,8 @@ impl MySqlTableCollation {
             Some(Self::Utf8mb40900AiCi)
         } else if name.eq_ignore_ascii_case("utf8mb4_unicode_ci") {
             Some(Self::Utf8mb4UnicodeCi)
+        } else if name.eq_ignore_ascii_case("utf8mb4_bin") {
+            Some(Self::Utf8mb4Bin)
         } else if name.eq_ignore_ascii_case("utf8mb3_unicode_ci")
             || name.eq_ignore_ascii_case("utf8_unicode_ci")
         {
@@ -61,13 +68,14 @@ impl MySqlTableCollation {
             Self::Utf8mb40900AiCi => "utf8mb4_0900_ai_ci",
             Self::Utf8mb4UnicodeCi => "utf8mb4_unicode_ci",
             Self::Utf8mb3UnicodeCi => "utf8mb3_unicode_ci",
+            Self::Utf8mb4Bin => "utf8mb4_bin",
         }
     }
 
     /// The character set the collation belongs to.
     pub const fn character_set(self) -> &'static str {
         match self {
-            Self::Utf8mb40900AiCi | Self::Utf8mb4UnicodeCi => "utf8mb4",
+            Self::Utf8mb40900AiCi | Self::Utf8mb4UnicodeCi | Self::Utf8mb4Bin => "utf8mb4",
             Self::Utf8mb3UnicodeCi => "utf8mb3",
         }
     }
@@ -79,6 +87,7 @@ impl MySqlTableCollation {
             Self::Utf8mb40900AiCi => "",
             Self::Utf8mb4UnicodeCi => " COLLATE=utf8mb4_unicode_ci",
             Self::Utf8mb3UnicodeCi => " COLLATE=utf8mb3_unicode_ci",
+            Self::Utf8mb4Bin => " COLLATE=utf8mb4_bin",
         }
     }
 }
@@ -295,6 +304,159 @@ pub fn table_counter_change(
         feature: "ALTER TABLE AUTO_INCREMENT value",
     })?;
     Ok(Some((table, next)))
+}
+
+/// The collation an `ALTER TABLE t CONVERT TO CHARACTER SET ...` gives a table
+/// and every column of words, `ENUM` or `SET` in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MySqlTableConversion {
+    /// The collation the statement names, or its character set's default.
+    To(MySqlTableCollation),
+    /// `CHARACTER SET DEFAULT`, which is the database's collation.
+    ToTheDatabases,
+}
+
+/// Reads an `ALTER TABLE t CONVERT TO CHARACTER SET c [COLLATE x]` that does
+/// nothing else, as the table and what it is converted to.
+///
+/// Gitea converts every table this way when it converts a database. Measured
+/// on MySQL 8.4.11: `CHARSET` stands for `CHARACTER SET`, either name may be
+/// bare, in backticks or a string, in any case, a character set named alone
+/// gives its own default collation whatever the database's is, and `DEFAULT`
+/// gives the database's. Answers `None` for any other statement, the
+/// conversion beside some other operation among them.
+pub fn table_conversion(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<(super::MySqlTableName, MySqlTableConversion)>, ParseError> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let Ok(tokens) = statement_reads::tokens(&dialect, sql) else {
+        return Ok(None);
+    };
+    let mut words = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+    let named = |token: Option<&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next(), "ALTER") || !named(words.next(), "TABLE") {
+        return Ok(None);
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return Ok(None);
+    };
+    if !named(words.next(), "CONVERT") || !named(words.next(), "TO") {
+        return Ok(None);
+    }
+    match words.next() {
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("CHARSET") => {}
+        Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("CHARACTER") =>
+        {
+            if !named(words.next(), "SET") {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    }
+    let character_set = words.next();
+    let collation = match words.next() {
+        None => None,
+        Some(token) if named(Some(token), "COLLATE") => match words.next().and_then(written_name) {
+            Some(collation) => Some(collation),
+            None => return Ok(None),
+        },
+        Some(_) => return Ok(None),
+    };
+    if words.next().is_some() {
+        return Ok(None);
+    }
+    let conversion = if named(character_set, "DEFAULT") && collation.is_none() {
+        MySqlTableConversion::ToTheDatabases
+    } else {
+        let Some(character_set) = character_set.and_then(written_name) else {
+            return Ok(None);
+        };
+        MySqlTableConversion::To(super::database_options::table_collation_named(
+            &character_set,
+            collation.as_deref(),
+        )?)
+    };
+    let table =
+        super::MySqlTableName::parse(&table.value).map_err(|_| ParseError::Unsupported {
+            feature: "ALTER TABLE name",
+        })?;
+    Ok(Some((table, conversion)))
+}
+
+/// A name written bare, in backticks or as a string.
+fn written_name(token: &Token) -> Option<String> {
+    match token {
+        Token::Word(word) => Some(word.value.clone()),
+        Token::SingleQuotedString(name) | Token::DoubleQuotedString(name) => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// The table a `CONVERT TO` makes of a stored one: every column of words,
+/// `ENUM` or `SET` takes the collation, whatever it named before, and so does
+/// the table. A `JSON` column has a collation of its own and keeps it.
+///
+/// Measured on MySQL 8.4.11. The table is written again with its rows carried
+/// across, so a unique key that holds two equal values under the new
+/// collation is 1062 and the table stays as it was.
+pub fn table_with_its_words_in(
+    stored_ddl: &str,
+    collation: MySqlTableCollation,
+    mode: SessionSqlMode,
+) -> Result<super::MySqlTableRewrite, ParseError> {
+    let Statement::CreateTable(mut table) = super::parse_one_statement(stored_ddl, mode)? else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    for column in &mut table.columns {
+        if !a_column_of_words(&column.data_type) {
+            continue;
+        }
+        column.options.retain(|option| {
+            !matches!(
+                option.option,
+                ColumnOption::CharacterSet(_) | ColumnOption::Collation(_)
+            )
+        });
+        if collation != MySqlTableCollation::default() {
+            column.options.push(ColumnOptionDef {
+                name: None,
+                option: ColumnOption::Collation(ObjectName::from(vec![Ident::new(
+                    collation.name(),
+                )])),
+            });
+        }
+    }
+    let mut options = match std::mem::replace(&mut table.table_options, CreateTableOptions::None) {
+        CreateTableOptions::None => Vec::new(),
+        CreateTableOptions::Plain(options) => options,
+        _ => return unsupported("a stored table's options written another way"),
+    };
+    options.retain(|option| {
+        !matches!(option, SqlOption::KeyValue { key, .. }
+            if super::names_a_collation(key) || super::names_a_character_set(key))
+    });
+    options.push(SqlOption::KeyValue {
+        key: Ident::new("COLLATE"),
+        value: Expr::Identifier(Ident::new(collation.name())),
+    });
+    table.table_options = CreateTableOptions::Plain(options);
+    let carried_columns = table
+        .columns
+        .iter()
+        .map(|column| (column.name.value.clone(), column.name.value.clone()))
+        .collect();
+    Ok(super::MySqlTableRewrite {
+        create_sql: super::render_table_written_again(&table, mode)?,
+        carried_columns,
+    })
 }
 
 /// Reads `ALTER TABLE <table> <option> [=] <value>` and nothing more, as the
@@ -752,6 +914,92 @@ mod tests {
         ] {
             assert_eq!(changed(sql), None, "{sql}");
         }
+    }
+
+    /// Gitea's `ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE c`, in
+    /// the spellings MySQL 8.4.11 takes.
+    #[test]
+    fn reads_a_conversion_written_alone() {
+        let mode = SessionSqlMode::default();
+        let converted = |sql: &str| {
+            table_conversion(sql, mode)
+                .map(|read| read.map(|(table, conversion)| (table.as_str().to_owned(), conversion)))
+        };
+        for (sql, conversion) in [
+            (
+                "ALTER TABLE `access` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+                MySqlTableConversion::To(MySqlTableCollation::Utf8mb4Bin),
+            ),
+            (
+                "alter table access convert to charset 'UTF8MB4' collate `utf8mb4_unicode_ci`;",
+                MySqlTableConversion::To(MySqlTableCollation::Utf8mb4UnicodeCi),
+            ),
+            (
+                "ALTER TABLE access CONVERT TO CHARACTER SET utf8mb4",
+                MySqlTableConversion::To(MySqlTableCollation::Utf8mb40900AiCi),
+            ),
+            (
+                "ALTER TABLE access CONVERT TO CHARACTER SET DEFAULT",
+                MySqlTableConversion::ToTheDatabases,
+            ),
+        ] {
+            assert_eq!(
+                converted(sql),
+                Ok(Some(("access".to_owned(), conversion))),
+                "{sql}"
+            );
+        }
+        for (sql, error) in [
+            (
+                "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE nope_ci",
+                ParseError::UnknownCollation,
+            ),
+            (
+                "ALTER TABLE t CONVERT TO CHARACTER SET nope",
+                ParseError::UnknownCharacterSet,
+            ),
+            (
+                "ALTER TABLE t CONVERT TO CHARACTER SET latin1 COLLATE utf8mb4_bin",
+                ParseError::CollationOfAnotherCharacterSet,
+            ),
+        ] {
+            assert_eq!(converted(sql), Err(error), "{sql}");
+        }
+        for sql in [
+            "ALTER TABLE t CONVERT TO CHARACTER SET latin1",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci",
+        ] {
+            assert!(
+                matches!(converted(sql), Err(ParseError::Unsupported { .. })),
+                "{sql}"
+            );
+        }
+        for sql in [
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4, ADD COLUMN n INT",
+            "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE",
+            "ALTER TABLE t ROW_FORMAT=DYNAMIC",
+        ] {
+            assert_eq!(converted(sql), Ok(None), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_conversion_writes_the_collation_on_every_column_of_words() {
+        let mode = SessionSqlMode::default();
+        let rewrite = table_with_its_words_in(
+            "CREATE TABLE `t` (`id` int NOT NULL PRIMARY KEY, `name` varchar(10) COLLATE utf8mb4_unicode_ci DEFAULT NULL, `kind` enum('a','b') CHARACTER SET utf8mb4 DEFAULT NULL, `js` json DEFAULT NULL) ENGINE = InnoDB COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC",
+            MySqlTableCollation::Utf8mb4Bin,
+            mode,
+        )
+        .unwrap();
+        assert_eq!(
+            rewrite.create_sql,
+            "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `name` VARCHAR(10) DEFAULT NULL COLLATE utf8mb4_bin, `kind` enum('a','b') DEFAULT NULL COLLATE utf8mb4_bin, `js` JSON DEFAULT NULL) COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC"
+        );
+        assert_eq!(
+            rewrite.carried_columns,
+            ["id", "name", "kind", "js"].map(|name| (name.to_owned(), name.to_owned()))
+        );
     }
 
     #[test]

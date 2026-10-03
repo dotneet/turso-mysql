@@ -27705,7 +27705,7 @@ fn a_table_takes_the_trailer_it_is_printed_with() {
         // Each of these is printed back by MySQL, so dropping it would print a
         // different table than the one the statement asked for.
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) DEFAULT CHARSET=latin1",
-        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_bin",
+        "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) COLLATE=utf8mb4_0900_as_cs",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=MyISAM",
         "CREATE TABLE refused (id INT NOT NULL, PRIMARY KEY (id)) ENGINE=InnoDB ROW_FORMAT=COMPACT",
     ] {

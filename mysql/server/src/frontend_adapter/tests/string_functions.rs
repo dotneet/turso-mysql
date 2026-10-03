@@ -396,6 +396,31 @@ fn sha1_and_sha2_write_the_digest_mysql_writes() {
     );
 }
 
+/// Measured on MySQL 8.4.11: a call over a `utf8mb4_bin` column answers that
+/// collation, so its answer is compared with a word case by case.
+#[test]
+fn a_string_call_compares_under_the_collation_of_its_column() {
+    let (_directory, mut adapter) = adapter();
+    let ids = |adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>, sql| {
+        rows(adapter, sql)
+            .into_iter()
+            .map(|row| row[0].clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert!(ids(
+        &mut adapter,
+        "SELECT id FROM s WHERE SUBSTRING_INDEX(ub, '.', 1) = 'a'"
+    )
+    .is_empty());
+    assert_eq!(
+        ids(
+            &mut adapter,
+            "SELECT id FROM s WHERE SUBSTRING_INDEX(ub, '.', 1) = 'A'"
+        ),
+        ["1"]
+    );
+}
+
 #[test]
 fn string_calls_refuse_what_mysql_answers_by_another_rule() {
     let (_directory, mut adapter) = adapter();
@@ -413,8 +438,6 @@ fn string_calls_refuse_what_mysql_answers_by_another_rule() {
         // A count read from the row leaves no width to answer with.
         "SELECT SUBSTRING_INDEX(a, '.', n) FROM s",
         "SELECT SUBSTR(a, n) FROM s",
-        // A word compared under another collation.
-        "SELECT id FROM s WHERE SUBSTRING_INDEX(ub, '.', 1) = 'a'",
     ] {
         assert!(adapter.execute_query(sql).is_err(), "{sql}");
         assert!(adapter.execute_stmt_prepare(sql).is_err(), "{sql}");
