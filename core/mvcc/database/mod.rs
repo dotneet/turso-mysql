@@ -1123,6 +1123,7 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// commit or abort.
     /// Hekaton Section 2.7: "A transaction cannot commit until this counter is zero."
     commit_dep_counter: AtomicU64,
+    dependencies_resolved: Mutex<Option<Completion>>,
     /// Flag: a depended-on transaction aborted; this transaction must abort too.
     /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
     abort_now: AtomicBool,
@@ -1170,6 +1171,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
+            dependencies_resolved: Mutex::new(None),
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
@@ -1432,6 +1434,27 @@ impl<A: RowVersionAllocator> Transaction<A> {
                 version_id
             );
             savepoint.deleted_index_versions.push((key, version_id));
+        }
+    }
+
+    fn wait_for_commit_dependencies(&self) -> Completion {
+        let mut resolved = self.dependencies_resolved.lock();
+        if self.commit_dep_counter.load(Ordering::Acquire) == 0 {
+            return Completion::new_yield();
+        }
+        resolved.get_or_insert_with(Completion::new_wait).clone()
+    }
+
+    fn resolve_one_commit_dependency(&self) {
+        let unresolved_before = self.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+        turso_assert!(
+            unresolved_before > 0,
+            "a transaction resolved more commit dependencies than it had"
+        );
+        if unresolved_before == 1 {
+            if let Some(resolved) = self.dependencies_resolved.lock().take() {
+                resolved.complete(0);
+            }
         }
     }
 }
@@ -7199,6 +7222,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.row_locks.enabled()
     }
 
+    pub(crate) fn sleep_until_commit_dependencies_resolve(
+        &self,
+        tx_id: TxID,
+        longest: std::time::Duration,
+    ) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value()
+                .wait_for_commit_dependencies()
+                .sleep_until_finished(longest);
+        }
+    }
+
     pub(crate) fn read_latest_committed_rows(&self, tx_id: TxID) {
         let Some(tx) = self.txs.get(&tx_id) else {
             return;
@@ -7833,7 +7868,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
                 let dep_tx = dep_tx_entry.value();
                 dep_tx.abort_now.store(true, Ordering::Release);
-                dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+                dep_tx.resolve_one_commit_dependency();
             }
         }
 
@@ -7933,10 +7968,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
         for dep_tx_id in dependents {
             if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
+                dep_tx_entry.value().resolve_one_commit_dependency();
             }
         }
     }

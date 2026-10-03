@@ -8069,6 +8069,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
+        dependencies_resolved: Mutex::new(None),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),
@@ -8346,7 +8347,7 @@ fn test_commit_dependency_cascade_abort() {
         if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
             let dep_tx = dep_tx_entry.value();
             dep_tx.abort_now.store(true, Ordering::Release);
-            dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+            dep_tx.resolve_one_commit_dependency();
         }
     }
 
@@ -8674,6 +8675,75 @@ fn test_commit_dep_threaded_abort_cascades() {
 }
 
 #[cfg(all(unix, not(shuttle)))]
+#[test]
+fn a_blocking_commit_sleeps_while_it_waits_for_a_transaction_it_read_from() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'initial')").unwrap();
+        conn.close().unwrap();
+    }
+    let mvcc_store = db.get_mvcc_store();
+    let writer_conn = db.connect();
+    writer_conn.execute("BEGIN CONCURRENT").unwrap();
+    writer_conn
+        .execute("UPDATE t SET value = 'modified' WHERE id = 1")
+        .unwrap();
+    let writer_tx_id = writer_conn.get_mv_tx_id().unwrap();
+    mvcc_store.get_commit_timestamp(|ts| {
+        mvcc_store
+            .txs
+            .get(&writer_tx_id)
+            .unwrap()
+            .value()
+            .state
+            .store(TransactionState::Preparing(ts));
+    });
+
+    let (read, was_read) = std::sync::mpsc::channel();
+    let db_arc = db.get_db();
+    let reader = std::thread::spawn(move || {
+        let reader_conn = db_arc.connect().unwrap();
+        reader_conn.execute("BEGIN CONCURRENT").unwrap();
+        reader_conn
+            .prepare("SELECT value FROM t WHERE id = 1")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        reader_conn
+            .execute("INSERT INTO t VALUES (2, 'reader_data')")
+            .unwrap();
+        read.send(()).unwrap();
+        let started = this_threads_cpu_time();
+        let commit = reader_conn.execute("COMMIT");
+        let cpu_time = this_threads_cpu_time() - started;
+        let _ = reader_conn.close();
+        (commit, cpu_time)
+    });
+    was_read.recv().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(!reader.is_finished());
+    mvcc_store.rollback_tx(
+        writer_tx_id,
+        writer_conn.pager.load().clone(),
+        &writer_conn,
+        crate::MAIN_DB_ID,
+    );
+    let (commit, cpu_time) = reader.join().unwrap();
+
+    assert!(
+        matches!(commit, Err(LimboError::CommitDependencyAborted)),
+        "{commit:?}"
+    );
+    assert!(
+        cpu_time < std::time::Duration::from_millis(100),
+        "the commit used {cpu_time:?} of CPU waiting 500 ms for the transaction it read from"
+    );
+}
+
+#[cfg(all(unix, not(shuttle)))]
 pub(super) fn this_threads_cpu_time() -> std::time::Duration {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -8863,10 +8933,7 @@ fn test_commit_dep_threaded_commit_resolves() {
         writer_tx.state.store(TransactionState::Committed(end_ts));
         for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
+                dep_tx_entry.value().resolve_one_commit_dependency();
             }
         }
     }
@@ -8986,7 +9053,7 @@ fn test_commit_dependency_counter_no_underflow() {
     assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
 
     // Simulate drain (as in CommitEnd): fetch_sub should go 1 → 0, not wrap
-    reader.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+    reader.resolve_one_commit_dependency();
     assert_eq!(
         reader.commit_dep_counter.load(Ordering::Acquire),
         0,
@@ -9113,10 +9180,7 @@ fn test_commit_dep_readonly_does_not_advance_timestamp() {
         writer_tx.state.store(TransactionState::Committed(end_ts));
         for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
+                dep_tx_entry.value().resolve_one_commit_dependency();
             }
         }
     }
@@ -9275,10 +9339,7 @@ fn test_commit_dep_readonly_does_not_cause_spurious_busy() {
         writer_tx.state.store(TransactionState::Committed(end_ts));
         for dep_tx_id in writer_tx.commit_dep_set.lock().drain() {
             if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                dep_tx_entry
-                    .value()
-                    .commit_dep_counter
-                    .fetch_sub(1, Ordering::AcqRel);
+                dep_tx_entry.value().resolve_one_commit_dependency();
             }
         }
     }
@@ -9779,6 +9840,7 @@ fn transaction_display() {
         pager_commit_lock_held: AtomicBool::new(false),
         log_appended: AtomicBool::new(false),
         commit_dep_counter: AtomicU64::new(0),
+        dependencies_resolved: Mutex::new(None),
         abort_now: AtomicBool::new(false),
         commit_dep_set: Mutex::new(HashSet::default()),
         holds_blocking_checkpoint_read: AtomicBool::new(false),

@@ -1077,12 +1077,27 @@ impl Statement {
     }
 
     fn wait_before_stepping_again(&mut self) -> Result<()> {
-        if let Some(io) = self.state.io_completions.as_ref() {
-            if io.0.is_wait() {
-                io.0.sleep_until_finished(LONGEST_SLEEP_ON_ANOTHER_CONNECTION);
+        match self.state.io_completions.as_ref() {
+            Some(io) if io.0.is_wait() => {
+                io.0.sleep_until_finished(LONGEST_SLEEP_ON_ANOTHER_CONNECTION)
             }
+            Some(_) => {}
+            None => self.sleep_while_commit_dependencies_are_unresolved(),
         }
         self.pager.io.step()
+    }
+
+    fn sleep_while_commit_dependencies_are_unresolved(&self) {
+        let connection = &self.program.connection;
+        let Some(tx_id) = connection.get_mv_tx_id() else {
+            return;
+        };
+        if let Some(mv_store) = connection.mv_store().as_ref() {
+            mv_store.sleep_until_commit_dependencies_resolve(
+                tx_id,
+                LONGEST_SLEEP_ON_ANOTHER_CONNECTION,
+            );
+        }
     }
 
     /// Waits before a blocking run steps again after the busy handler asked it
