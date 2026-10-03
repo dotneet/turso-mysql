@@ -89,6 +89,7 @@ pub(crate) fn static_result_column_metadata(
         | StaticSelectMetadata::ScalarCall { .. }
         | StaticSelectMetadata::RoundedAggregate { .. }
         | StaticSelectMetadata::CountedColumn { .. }
+        | StaticSelectMetadata::LateralDocument { .. }
         | StaticSelectMetadata::RolledUpKey { .. }
         | StaticSelectMetadata::FromARollup(_)
         | StaticSelectMetadata::FromTheGroupingTable { .. } => return None,

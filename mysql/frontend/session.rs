@@ -8202,8 +8202,9 @@ impl MySqlConnection {
                     })
                 })
         });
-        let typed_statement =
-            (typed_rendering && reads_type_specific_column).then(|| statement.clone());
+        let typed_statement = (typed_rendering
+            && (reads_type_specific_column || translated.reads_a_lateral_table()))
+        .then(|| statement.clone());
         let mut table_definitions = Vec::new();
         let mut source_columns = Vec::new();
         let mut untracked_source = false;
@@ -8641,6 +8642,12 @@ impl MySqlConnection {
                     .to_owned(),
             ));
         }
+        if typed.renders_a_lateral_table_without_column_kinds() {
+            return Err(MySqlQueryError::Unsupported(
+                "a LATERAL derived table needs the kinds of the columns its documents are built from"
+                    .to_owned(),
+            ));
+        }
         let rendered_differently = typed.as_sql() != untyped_sql;
         Ok((typed, rendered_differently))
     }
@@ -8792,6 +8799,7 @@ impl MySqlConnection {
             }
         }
         if !has_decimal_source
+            && !translated.reads_a_lateral_table()
             && translated
                 .source_tables()
                 .iter()

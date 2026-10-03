@@ -142,6 +142,19 @@ pub enum StaticSelectMetadata {
         column: String,
         length: u32,
     },
+    /// A column of a `LATERAL` derived table answering one JSON document for
+    /// each row the statement reads, named after the lateral table and the
+    /// body's own name for it.
+    LateralDocument {
+        table: String,
+        column: String,
+        shape: LateralShape,
+        /// Each column of a table the document is built out of, as the
+        /// reference the body reads it under and its name, which the server
+        /// holds to the kinds MySQL writes into a document the way the engine
+        /// does.
+        columns_written_into_it: Vec<(String, String)>,
+    },
     /// A grouping key of a statement grouping `WITH ROLLUP`, which answers the
     /// column's own shape as MySQL reports a rolled-up key: naming no table,
     /// and nullable, since a super total answers it as NULL.
@@ -487,6 +500,18 @@ pub enum ScalarFunction {
     Widest,
     /// `NULLIF`, which answers its first argument's shape but can always be null.
     NullsOnMatch,
+}
+
+/// What MySQL reports for a lateral derived table's document column, which
+/// turns on how it reads the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateralShape {
+    /// The body aggregates, so MySQL writes it out into a table of its own and
+    /// the column is that table's `JSON` column.
+    Stored,
+    /// The body reads a derived table cut to one row and MySQL reads it
+    /// through, so the column reports what `JSON_ARRAY` reports.
+    Built,
 }
 
 /// The aggregates whose result type is a rule over the argument column's type.

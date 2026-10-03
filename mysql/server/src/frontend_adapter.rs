@@ -8678,6 +8678,32 @@ impl TableResultMetadata {
         self.aggregate_definition_over(table, ordinal, name, kind)
     }
 
+    /// Holds each column a lateral derived table's document is built from to
+    /// the kinds MySQL writes into a document the way the engine does. Each
+    /// is named through the table the body reads, which only a subquery reads.
+    fn hold_columns_written_into_a_document(
+        &self,
+        columns: &[(String, String)],
+    ) -> Result<(), FrontendErrorKind> {
+        for (reference, column_name) in columns {
+            let mut named = self.tables.iter().filter(|table| {
+                table.subquery && table.table_reference.eq_ignore_ascii_case(reference)
+            });
+            let (Some(table), None) = (named.next(), named.next()) else {
+                return Err(FrontendErrorKind::Unsupported);
+            };
+            let column = table
+                .columns
+                .iter()
+                .find(|column| column.name().eq_ignore_ascii_case(column_name))
+                .ok_or(FrontendErrorKind::UnknownColumn)?;
+            if !writes_into_a_document_the_way_mysql_does(column) {
+                return Err(FrontendErrorKind::Unsupported);
+            }
+        }
+        Ok(())
+    }
+
     fn aggregate_definition_over(
         &self,
         table: &SourceTableColumns,
@@ -11607,7 +11633,8 @@ fn needs_source_columns(metadata: &turso_mysql_parser::StaticSelectMetadata) -> 
         | turso_mysql_parser::StaticSelectMetadata::QualifiedAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::RoundedAggregate { .. }
         | turso_mysql_parser::StaticSelectMetadata::RolledUpKey { .. }
-        | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. } => true,
+        | turso_mysql_parser::StaticSelectMetadata::WindowAggregate { .. }
+        | turso_mysql_parser::StaticSelectMetadata::LateralDocument { .. } => true,
         turso_mysql_parser::StaticSelectMetadata::FromARollup(inner) => needs_source_columns(inner),
         turso_mysql_parser::StaticSelectMetadata::ScalarSubquery(inner)
         | turso_mysql_parser::StaticSelectMetadata::DefaultedAggregate {
@@ -11774,6 +11801,41 @@ fn aggregate_column_definition(
         turso_mysql_parser::StaticSelectMetadata::RolledUpKey { column_name } => source_metadata
             .ok_or(FrontendErrorKind::Unsupported)?
             .rolled_up_key_definition(name, column_name),
+        // Measured on MySQL 8.4.11: a lateral derived table whose body
+        // aggregates is written out into a table of its own, and its column
+        // is that table's JSON column — 4294967295 long, no decimals, the
+        // binary collation, the BLOB and BINARY flags. One reading a derived
+        // table cut to one row is read through and reports what JSON_ARRAY
+        // reports. Either names the lateral table and the body's name for the
+        // column, and no database or original table.
+        turso_mysql_parser::StaticSelectMetadata::LateralDocument {
+            table,
+            column,
+            shape,
+            columns_written_into_it,
+        } => {
+            source_metadata
+                .ok_or(FrontendErrorKind::Unsupported)?
+                .hold_columns_written_into_a_document(columns_written_into_it)?;
+            let mut definition = column_definition(name, MYSQL_TYPE_JSON);
+            match shape {
+                turso_mysql_parser::LateralShape::Stored => {
+                    definition.column_length = u32::MAX;
+                    definition.character_set = MYSQL_BINARY_COLLATION;
+                    definition.decimals = 0;
+                    set_column_flags(&mut definition, MYSQL_BLOB_FLAG | MYSQL_BINARY_FLAG);
+                }
+                turso_mysql_parser::LateralShape::Built => {
+                    definition.column_length = u32::MAX - 3;
+                    definition.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+                    definition.decimals = NOT_FIXED_DECIMALS;
+                    set_column_flags(&mut definition, MYSQL_BINARY_FLAG);
+                }
+            }
+            definition.table.clone_from(table);
+            definition.original_name.clone_from(column);
+            Ok(definition)
+        }
         // Measured on MySQL 8.4.11: an aggregate of a statement grouping `WITH
         // ROLLUP` answers the shape it answers without one, apart from a
         // largest or smallest moment, which answers words of 76 there.

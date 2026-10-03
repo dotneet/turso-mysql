@@ -232,7 +232,8 @@ pub use statement_reads::{bytes_read, keep_reads, BytesRead, KeptReads};
 pub use statement_writes::{what_a_statement_writes, StatementWrites};
 pub use static_select_metadata::{
     ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
-    ScalarFunction, StaticIntegerSign, StaticSelectMetadata, StaticSelectProjectionMetadata,
+    LateralShape, ScalarFunction, StaticIntegerSign, StaticSelectMetadata,
+    StaticSelectProjectionMetadata,
 };
 pub use str_to_date::{format_reads, read_by_format, FormatShape};
 pub use table_collation::{
@@ -1134,6 +1135,8 @@ pub struct TranslatedSelect {
     calculates_found_rows: bool,
     columns_the_keys_decide: Option<MySqlColumnsTheKeysDecide>,
     bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
+    renders_a_lateral_table_without_column_kinds: bool,
+    reads_a_lateral_table: bool,
     collation_sensitive_call_columns: Vec<String>,
     collation_sensitive_joined_columns: Vec<(String, String)>,
     json_reading_columns: Vec<String>,
@@ -2022,7 +2025,8 @@ impl TranslatedSelect {
     /// two places it does, and both want the same answer: whether the column is
     /// text, and so wants MySQL's collation.
     pub fn needs_column_types(&self) -> bool {
-        self.orders_a_bare_column
+        self.renders_a_lateral_table_without_column_kinds
+            || self.orders_a_bare_column
             || self.checks_type_sensitive_expression
             || self.compares_a_placeholder
             || self.counts_distinct_column
@@ -2146,6 +2150,18 @@ impl TranslatedSelect {
     /// column of.
     pub fn bare_names_in_result_subqueries(&self) -> &[(MySqlTableName, String)] {
         &self.bare_names_in_result_subqueries
+    }
+
+    /// Reports whether a result column reads a lateral derived table, whose
+    /// documents are written by the kinds of the columns they are built from.
+    pub fn reads_a_lateral_table(&self) -> bool {
+        self.reads_a_lateral_table
+    }
+
+    /// Reports whether a lateral derived table was rendered before the kinds
+    /// of its columns were known, which a statement cannot run as.
+    pub fn renders_a_lateral_table_without_column_kinds(&self) -> bool {
+        self.renders_a_lateral_table_without_column_kinds
     }
 
     /// Returns which parameters stand where a row count is written.
@@ -4982,7 +4998,7 @@ pub fn parse_select_knowing_numeric_columns(
     integer_columns: &[String],
     real_columns: &[String],
 ) -> Result<TranslatedSelect, ParseError> {
-    parse_select_knowing_json_columns(
+    parse_select_inner(
         sql,
         mode,
         text_columns,
@@ -4994,6 +5010,8 @@ pub fn parse_select_knowing_numeric_columns(
         integer_columns,
         real_columns,
         &[],
+        false,
+        false,
     )
 }
 
@@ -5024,6 +5042,7 @@ pub fn parse_select_knowing_json_columns(
         real_columns,
         json_columns,
         false,
+        true,
     )
 }
 
@@ -5053,6 +5072,7 @@ pub fn parse_select_knowing_the_kinds_of_joined_columns(
         &[],
         &[],
         true,
+        false,
     )
 }
 
@@ -5083,9 +5103,14 @@ pub fn parse_select_with_column_types(
         &[],
         &[],
         false,
+        false,
     )
 }
 
+/// Parses a checked `SELECT` — what [`parse_select_knowing_json_columns`] and
+/// the narrower readings share. `knows_every_column_kind` says the caller
+/// named the kind of every column of every table the statement reads by name,
+/// which a lateral derived table's documents are written by.
 #[allow(clippy::too_many_arguments)]
 fn parse_select_inner(
     sql: &str,
@@ -5100,6 +5125,7 @@ fn parse_select_inner(
     real_columns: &[String],
     json_columns: &[String],
     knows_the_kinds_of_joined_columns: bool,
+    knows_every_column_kind: bool,
 ) -> Result<TranslatedSelect, ParseError> {
     let sql = &*without_utf8mb4_introducers(sql, mode)?;
     let read_statement = read_one_statement(sql, mode);
@@ -5117,6 +5143,7 @@ fn parse_select_inner(
         }
     }
     translate::leave_the_one_table_out(&mut query);
+    let lateral_tables = translate::take_lateral_tables_out_of_the_from(&mut query)?;
     let tokens = statement_reads::tokens(&SessionMySqlDialect::new(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
     let significant = tokens
@@ -5130,7 +5157,7 @@ fn parse_select_inner(
     {
         return unsupported("SELECT LIMIT ALL");
     }
-    let static_result_metadata = select_static_result_metadata(&query);
+    let mut static_result_metadata = select_static_result_metadata(&query);
     let RenderedSelect {
         sqlite_sql,
         collation_sensitive_call_columns,
@@ -5157,6 +5184,8 @@ fn parse_select_inner(
         calculates_found_rows,
         columns_the_keys_decide,
         bare_names_in_result_subqueries,
+        lateral_columns,
+        renders_a_lateral_table_without_column_kinds,
     } = translate_select_query(
         &query,
         sql,
@@ -5172,7 +5201,34 @@ fn parse_select_inner(
         json_columns,
         false,
         knows_the_kinds_of_joined_columns,
+        knows_every_column_kind,
+        lateral_tables,
     )?;
+    if let SetExpr::Select(select) = query.body.as_ref() {
+        for (item, metadata) in select.projection.iter().zip(&mut static_result_metadata) {
+            let (SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::CompoundIdentifier(parts),
+                ..
+            }) = item
+            else {
+                continue;
+            };
+            let Some(column) = lateral_columns
+                .iter()
+                .find(|column| parts[0].value.eq_ignore_ascii_case(&column.table))
+            else {
+                continue;
+            };
+            *metadata =
+                StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::LateralDocument {
+                    table: column.table.clone(),
+                    column: column.column.clone(),
+                    shape: column.shape,
+                    columns_written_into_it: column.columns_written_into_it.clone(),
+                });
+        }
+    }
     Ok(TranslatedSelect {
         collation_sensitive_call_columns,
         collation_sensitive_joined_columns,
@@ -5201,6 +5257,8 @@ fn parse_select_inner(
         calculates_found_rows,
         columns_the_keys_decide,
         bare_names_in_result_subqueries,
+        reads_a_lateral_table: !lateral_columns.is_empty(),
+        renders_a_lateral_table_without_column_kinds,
     })
 }
 

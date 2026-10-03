@@ -16,12 +16,14 @@ pub(crate) use derived_membership::{
     write_derived_tables_out_of_membership_tests, DerivedMembership,
 };
 pub(crate) use grouping::name_the_columns_grouped_by_place;
+pub(crate) use lateral::{take_lateral_tables_out_of_the_from, LateralColumn, LateralTables};
 pub(crate) use one_table_columns::leave_the_one_table_out;
 
 mod derived;
 mod derived_membership;
 mod grouping;
 mod json_condition;
+mod lateral;
 mod one_table_columns;
 mod recursive;
 mod rollup;
@@ -520,6 +522,11 @@ pub(crate) struct RenderedSelect {
     /// Each name a subquery standing as a result column reads without a
     /// table, with the table the subquery reads.
     pub(crate) bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
+    /// Each result column read out of a lateral derived table.
+    pub(crate) lateral_columns: Vec<LateralColumn>,
+    /// Whether a lateral derived table was rendered before the kinds of the
+    /// columns its documents are built from were known.
+    pub(crate) renders_a_lateral_table_without_column_kinds: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,6 +545,8 @@ pub(crate) fn translate_select_query(
     json_columns: &[String],
     writes_its_rows: bool,
     knows_the_kinds_of_joined_columns: bool,
+    knows_every_column_kind: bool,
+    lateral_tables: LateralTables,
 ) -> Result<RenderedSelect, ParseError> {
     if query.fetch.is_some()
         || query.for_clause.is_some()
@@ -564,6 +573,8 @@ pub(crate) fn translate_select_query(
     render_context.json_columns = json_columns;
     render_context.writes_its_rows = writes_its_rows;
     render_context.knows_the_kinds_of_joined_columns = knows_the_kinds_of_joined_columns;
+    render_context.knows_every_column_kind = knows_every_column_kind;
+    render_context.lateral_tables = lateral_tables;
     let (mut prefix, mut cte_tables) = (String::new(), Vec::new());
     let mut sequence = None;
     if let Some(with) = &query.with {
@@ -812,6 +823,9 @@ pub(crate) fn translate_select_query(
         calculates_found_rows: render_context.calculates_found_rows,
         columns_the_keys_decide: render_context.columns_the_keys_decide,
         bare_names_in_result_subqueries: render_context.bare_names_in_result_subqueries,
+        lateral_columns: render_context.lateral_columns,
+        renders_a_lateral_table_without_column_kinds: render_context
+            .renders_a_lateral_table_without_column_kinds,
     })
 }
 
@@ -3959,6 +3973,8 @@ pub(crate) fn translate_insert(
                     &[],
                     true,
                     false,
+                    false,
+                    LateralTables::default(),
                 )?;
                 // A SELECT that needs a second rendering pass to learn its
                 // column types is rendered by the frontend, which knows them,
@@ -7138,6 +7154,13 @@ pub(crate) struct SelectRenderContext<'a> {
     /// Each name a subquery standing as a result column reads without a
     /// table, with the table the subquery reads.
     bare_names_in_result_subqueries: Vec<(MySqlTableName, String)>,
+    /// Whether the caller said the kind of every column of every table the
+    /// statement reads, subqueries' included, by name.
+    knows_every_column_kind: bool,
+    /// The lateral derived tables taken out of the statement's `FROM`.
+    lateral_tables: LateralTables,
+    lateral_columns: Vec<LateralColumn>,
+    renders_a_lateral_table_without_column_kinds: bool,
 }
 
 impl<'a> SelectRenderContext<'a> {
@@ -7211,6 +7234,10 @@ impl<'a> SelectRenderContext<'a> {
             names_an_unprojected_group_concat: false,
             columns_the_keys_decide: None,
             bare_names_in_result_subqueries: Vec::new(),
+            knows_every_column_kind: false,
+            lateral_tables: LateralTables::default(),
+            lateral_columns: Vec::new(),
+            renders_a_lateral_table_without_column_kinds: false,
         }
     }
 
@@ -7245,6 +7272,19 @@ impl<'a> SelectRenderContext<'a> {
             .any(|column| column.eq_ignore_ascii_case(name))
     }
 
+    fn is_integer_column(&self, name: &str) -> bool {
+        self.integer_columns
+            .iter()
+            .any(|column| column.eq_ignore_ascii_case(name))
+    }
+
+    fn decimal_scale(&self, name: &str) -> Option<u32> {
+        self.decimal_columns
+            .iter()
+            .find(|(column, _)| column.eq_ignore_ascii_case(name))
+            .map(|(_, scale)| *scale)
+    }
+
     fn member_column(&self, name: &str) -> Option<&[String]> {
         self.member_columns
             .iter()
@@ -7275,6 +7315,9 @@ fn render_select_item(
     item: &SelectItem,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<String, ParseError> {
+    if let Some(rendered) = lateral::render_lateral_column(item, render_context)? {
+        return Ok(rendered);
+    }
     match item {
         // The engine names a result column after the expression text, which
         // quotes an identifier. MySQL names it after the call as written, so an
@@ -10167,19 +10210,28 @@ fn render_json_value_argument(
         }
         return render_scalar_argument_expr(expr);
     };
-    let rendered = render_ident(column);
-    if render_context.is_json_column(&column.value) {
+    render_column_into_a_document(&render_ident(column), &column.value, render_context)
+}
+
+/// Writes a column read as `rendered` into a document the way MySQL writes
+/// it, by the kind of the column `name` names.
+fn render_column_into_a_document(
+    rendered: &str,
+    name: &str,
+    render_context: &SelectRenderContext<'_>,
+) -> Result<String, ParseError> {
+    if render_context.is_json_column(name) {
         return Ok(format!("json({rendered})"));
     }
-    if render_context.is_moment_column(&column.value) {
+    if render_context.is_moment_column(name) {
         return Ok(format!(
             "substr({rendered} || CASE WHEN instr({rendered}, '.') > 0 THEN '000000' ELSE '.000000' END, 1, 26)"
         ));
     }
-    match decimal_operand_scale(expr, render_context.decimal_columns) {
+    match render_context.decimal_scale(name) {
         Some(0) => Ok(format!("json({rendered})")),
         Some(_) => unsupported("JSON document built from a DECIMAL with places"),
-        None => Ok(rendered),
+        None => Ok(rendered.to_owned()),
     }
 }
 

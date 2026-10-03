@@ -4659,6 +4659,80 @@ fn select_json_extract_takes_only_a_plain_path() {
     assert!(parse_select("SELECT JSON_EXTRACT(doc, '$.a', '$.b') FROM j", mode).is_err());
 }
 
+/// Drizzle's relational queries join a lateral derived table answering one
+/// document for each row, which is the scalar subquery written in its place.
+/// The documents are written by the kinds of the columns they are built
+/// from, so the statement is refused until those are known.
+#[test]
+fn a_lateral_table_answering_one_document_is_read_as_a_subquery() {
+    let mode = SessionSqlMode::default();
+    let sql = "SELECT p.id, a.data AS tags FROM posts p LEFT JOIN LATERAL (SELECT COALESCE(JSON_ARRAYAGG(JSON_ARRAY(pt.post_id, pt.tag_id, t.data)), JSON_ARRAY()) AS data FROM post_tags pt LEFT JOIN LATERAL (SELECT JSON_ARRAY(t.name, t.added_at) AS data FROM (SELECT * FROM tags t WHERE t.id = pt.tag_id LIMIT 1) t) t ON TRUE WHERE pt.post_id = p.id) a ON TRUE ORDER BY p.id";
+    let untyped = parse_select(sql, mode).unwrap();
+    assert!(untyped.renders_a_lateral_table_without_column_kinds());
+    assert!(untyped.needs_column_types());
+    let names = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let parse = |sql: &str| {
+        parse_select_knowing_json_columns(
+            sql,
+            mode,
+            &names(&["name"]),
+            &names(&["id"]),
+            &[],
+            &[],
+            &names(&["added_at"]),
+            &[
+                ("id".to_owned(), 0),
+                ("post_id".to_owned(), 0),
+                ("tag_id".to_owned(), 0),
+                ("user_id".to_owned(), 0),
+            ],
+            &names(&["id", "post_id", "tag_id", "user_id"]),
+            &[],
+            &[],
+        )
+    };
+    let typed = parse(sql).unwrap();
+    assert!(!typed.renders_a_lateral_table_without_column_kinds());
+    assert!(typed.reads_a_lateral_table());
+    assert_eq!(
+        typed.as_sql(),
+        "SELECT \"p\".\"id\", (SELECT CASE WHEN count(*) = 0 THEN '[]' ELSE mysql_json_document(json_group_array(json(mysql_json_document(json_array(json(\"pt\".\"post_id\"), json(\"pt\".\"tag_id\"), json((SELECT mysql_json_document(json_array(\"t\".\"name\", substr(\"t\".\"added_at\" || CASE WHEN instr(\"t\".\"added_at\", '.') > 0 THEN '000000' ELSE '.000000' END, 1, 26))) FROM (SELECT * FROM \"tags\" AS \"t\" WHERE \"t\".\"id\" = \"pt\".\"tag_id\" LIMIT 1 OFFSET 0) AS \"t\"))))))) END FROM \"post_tags\" AS \"pt\" WHERE \"pt\".\"post_id\" = \"p\".\"id\") AS \"tags\" FROM \"posts\" AS \"p\" ORDER BY \"p\".\"id\" ASC"
+    );
+    assert_eq!(
+        typed.static_result_metadata()[1],
+        StaticSelectProjectionMetadata::Literal(StaticSelectMetadata::LateralDocument {
+            table: "a".to_owned(),
+            column: "data".to_owned(),
+            shape: LateralShape::Stored,
+            columns_written_into_it: vec![
+                ("t".to_owned(), "name".to_owned()),
+                ("t".to_owned(), "added_at".to_owned()),
+                ("pt".to_owned(), "post_id".to_owned()),
+                ("pt".to_owned(), "tag_id".to_owned()),
+            ],
+        })
+    );
+    // The rows a numbered derived table holds are read in the window's order.
+    let numbered = parse("SELECT u.id, a.data FROM users u LEFT JOIN LATERAL (SELECT JSON_ARRAYAGG(JSON_ARRAY(p.id)) AS data FROM (SELECT *, ROW_NUMBER() OVER (ORDER BY p.id DESC) FROM posts p WHERE p.user_id = u.id LIMIT 2) p) a ON TRUE").unwrap();
+    assert!(numbered.as_sql().contains(
+        "FROM (SELECT *, row_number() OVER (ORDER BY \"p\".\"id\" DESC) FROM \"posts\" AS \"p\" WHERE \"p\".\"user_id\" = \"u\".\"id\" LIMIT 2 OFFSET 0) AS \"p\""
+    ));
+    for refused in [
+        "SELECT p.id FROM posts p LEFT JOIN LATERAL (SELECT JSON_ARRAYAGG(JSON_ARRAY(pt.tag_id)) AS data FROM post_tags pt WHERE pt.post_id = p.id) a ON TRUE WHERE a.data IS NULL",
+        "SELECT p.id, a.data FROM posts p JOIN LATERAL (SELECT JSON_ARRAYAGG(JSON_ARRAY(pt.tag_id)) AS data FROM post_tags pt WHERE pt.post_id = p.id) a ON TRUE",
+        "SELECT p.id, a.data FROM posts p LEFT JOIN LATERAL (SELECT JSON_ARRAY(pt.tag_id) AS data FROM post_tags pt WHERE pt.post_id = p.id) a ON TRUE",
+        "SELECT p.id, a.data FROM posts p LEFT JOIN LATERAL (SELECT JSON_ARRAYAGG(JSON_ARRAY(pt.tag_id)) AS data FROM post_tags pt WHERE pt.post_id = p.id GROUP BY pt.tag_id) a ON TRUE",
+        "SELECT p.id, a.data FROM posts p LEFT JOIN LATERAL (SELECT JSON_ARRAYAGG(JSON_ARRAY(pt.tag_id)) AS data FROM post_tags pt WHERE pt.post_id = p.name) a ON TRUE",
+    ] {
+        assert!(parse(refused).is_err(), "{refused}");
+    }
+}
+
 #[test]
 fn json_string_where_compares_the_document_string_as_bytes() {
     let json_columns = vec!["doc".to_owned()];
