@@ -533,10 +533,28 @@ What still fails on turso alone:
 - EF Core: the scaffold's catalog reads, the `Include` after `Take(1)`, and
   `Take(2)` with no order, each refused (see TODO.md).
 - Drizzle: relational queries built from `LATERAL` joins of JSON aggregates.
+  Taken since 2026-10-04: Drizzle passes 20/20.
 - dbtools: `getTablePrivileges`, `SHOW PLUGINS`, `information_schema.PARTITIONS`,
   Workbench's `performance_schema` join and `EXPLAIN`, left refused on purpose.
 
 # Gitea's own integration suite
+
+2026-10-04, turso alone (`E2E_TARGETS=turso E2E_GITEA_SHARDS=60`), after
+`utf8mb4_bin` databases and `CONVERT TO`: 385 of the 395 tests that pass on
+MySQL pass, and every test is reported (485). Gitea now gives its database
+`utf8mb4_bin` at startup, so every table is case-sensitive, as on MySQL (where
+it is `utf8mb4_0900_as_cs`). `TestDatabaseCollation` passes its first part and
+three of its four subtests; the one converting to `utf8mb4_general_ci` fails on
+that collation. `TestPackageNuGet` still meets its derived table cut by a
+`LIMIT` beside a join. `TestAPIOrg` refuses nothing: its background deletion of
+org3's repositories takes about a second a repository in the debug build (each
+of some 390 prepared statements about 16 ms), and the test waits two seconds.
+Six later tests of the same shard then fail loading their fixtures with 1205,
+the deletion still holding the write lock. A first run before orderings and
+comparisons of words read through a call followed the column's collation
+passed 347: the team, fork, issue and LFS lock tests were refused `ORDER BY
+CASE WHEN name LIKE 'Owners' THEN '' ELSE name END`, `LOWER(name) IN (?)` and
+`lower(path) = ?` over the now `utf8mb4_bin` tables.
 
 2026-10-03, the same run (`E2E_GITEA_SHARDS=60`): 392 of the 395 tests that pass
 on MySQL pass on turso, every test is reported on both (484), and none passes on
