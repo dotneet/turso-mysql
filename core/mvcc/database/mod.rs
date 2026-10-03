@@ -944,6 +944,7 @@ pub struct Savepoint<A: RowVersionAllocator = TursoAllocator> {
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
     newly_added_to_write_set: Vec<(RowID, RowVersions<A>)>,
+    older_rows_of_keys_it_wrote: Vec<RowID>,
 }
 
 impl<A: RowVersionAllocator> Default for Savepoint<A> {
@@ -958,6 +959,7 @@ impl<A: RowVersionAllocator> Default for Savepoint<A> {
             deleted_table_versions: Vec::new(),
             deleted_index_versions: Vec::new(),
             newly_added_to_write_set: Vec::new(),
+            older_rows_of_keys_it_wrote: Vec::new(),
         }
     }
 }
@@ -1006,6 +1008,8 @@ impl<A: RowVersionAllocator> Savepoint<A> {
             .append(&mut other.deleted_index_versions);
         self.newly_added_to_write_set
             .append(&mut other.newly_added_to_write_set);
+        self.older_rows_of_keys_it_wrote
+            .append(&mut other.older_rows_of_keys_it_wrote);
     }
 }
 
@@ -1111,6 +1115,8 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// Each savepoint tracks versions created/deleted during that statement.
     savepoint_stack: RwLock<Vec<Savepoint<A>>>,
     inserts_the_last_statement_undid: Mutex<Vec<RowID>>,
+    older_rows_of_keys_it_wrote: Mutex<Vec<RowID>>,
+    hides_older_rows: AtomicBool,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
     /// True once this transaction's commit record is in the logical log.
@@ -1168,6 +1174,8 @@ impl<A: RowVersionAllocator> Transaction<A> {
             header_dirty: AtomicBool::new(false),
             savepoint_stack: RwLock::new(Vec::new()),
             inserts_the_last_statement_undid: Mutex::new(Vec::new()),
+            older_rows_of_keys_it_wrote: Mutex::new(Vec::new()),
+            hides_older_rows: AtomicBool::new(false),
             pager_commit_lock_held: AtomicBool::new(false),
             log_appended: AtomicBool::new(false),
             commit_dep_counter: AtomicU64::new(0),
@@ -1200,6 +1208,38 @@ impl<A: RowVersionAllocator> Transaction<A> {
     fn conflict_floor(&self) -> u64 {
         self.begin_ts()
             .max(self.latest_read_ts.load(Ordering::Acquire))
+    }
+
+    fn hide_older_rows_of_keys_it_wrote(&self, rows: Vec<RowID>) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            savepoint
+                .older_rows_of_keys_it_wrote
+                .extend(rows.iter().cloned());
+        }
+        let mut hidden = self.older_rows_of_keys_it_wrote.lock();
+        hidden.extend(rows);
+        self.hides_older_rows.store(true, Ordering::Release);
+    }
+
+    fn show_older_rows_again(&self, rows: Vec<RowID>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut hidden = self.older_rows_of_keys_it_wrote.lock();
+        for row in rows {
+            let position = hidden.iter().position(|hidden_row| *hidden_row == row);
+            hidden.swap_remove(position.expect("a row shown again was hidden"));
+        }
+        self.hides_older_rows
+            .store(!hidden.is_empty(), Ordering::Release);
+    }
+
+    fn hides_the_older_row(&self, row: &RowID) -> bool {
+        self.hides_older_rows.load(Ordering::Acquire)
+            && self.older_rows_of_keys_it_wrote.lock().contains(row)
     }
 
     fn insert_to_write_set(&self, id: RowID, row_versions: RowVersions<A>) {
@@ -4622,6 +4662,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// deadlock.
     last_global_header_ts: AtomicU64,
     table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
+    table_of_index: RwLock<HashMap<MVTableId, MVTableId>>,
+    primary_key_of_table: RwLock<HashMap<MVTableId, Option<Arc<PrimaryKeyIndex>>>>,
     /// Per-sequence first value not guaranteed safe to read past based only on
     /// durable/current sequence state. Active allocations can lower this.
     sequence_watermarks: Mutex<HashMap<String, i64>>,
@@ -4804,6 +4846,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             last_committed_tx_ts: AtomicU64::new(0),
             last_global_header_ts: AtomicU64::new(0),
             table_id_to_last_rowid: RwLock::new(HashMap::default()),
+            table_of_index: RwLock::new(HashMap::default()),
+            primary_key_of_table: RwLock::new(HashMap::default()),
             sequence_watermarks: Mutex::new(HashMap::default()),
             sequence_allocations: Mutex::new(HashMap::default()),
             live_version_count_approx: AtomicUsize::new(0),
@@ -4922,6 +4966,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
         self.table_id_to_rootpage.remove(table_id);
         self.table_id_to_last_rowid.write().remove(table_id);
+        self.forget_the_table_of_index(table_id);
     }
 
     /// The current physical root page of `table_id`, if it is checkpointed and live.
@@ -5010,6 +5055,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         for key in &stale {
             self.table_id_to_rootpage.remove(key);
             self.table_id_to_last_rowid.write().remove(key);
+            self.forget_the_table_of_index(key);
         }
         stale.len()
     }
@@ -5110,6 +5156,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // would alias new objects after root-page reuse.
         self.table_id_to_rootpage.clear();
         self.table_id_to_last_rowid.write().clear();
+        self.table_of_index.write().clear();
+        self.primary_key_of_table.write().clear();
         // TODO: vacuum related code, not handling alloc errors for now
         self.insert_table_id_to_rootpage(SQLITE_SCHEMA_MVCC_TABLE_ID, Some(1));
         for root_page in root_pages {
@@ -5562,6 +5610,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.row_locks.enabled() {
                     self.refuse_an_index_key_another_transaction_holds(tx_id, &id)?;
                     self.refuse_an_insert_into_a_locked_gap(tx_id, &id)?;
+                    self.hide_older_rows_of_the_primary_key(tx, &id)?;
                 }
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
@@ -5904,6 +5953,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
 
                         let version_id = rv.id;
+                        let newer_than_the_snapshot = (self.row_locks.enabled()
+                            && self.committed_after(tx, rv.begin(), tx.begin_ts()))
+                        .then(|| rv.row.clone());
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
                         drop(row_versions_opt);
@@ -5914,12 +5966,95 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone(), row_versions.clone());
                         tx.record_deleted_table_version(id.clone(), version_id);
+                        if let Some(row) = newer_than_the_snapshot {
+                            self.hide_older_rows_of_the_primary_key_of(tx, &row)?;
+                        }
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
         }
+    }
+
+    fn hide_older_rows_of_the_primary_key(&self, tx: &Transaction<A>, entry: &RowID) -> Result<()> {
+        let Some(table_id) = self.table_of_index.read().get(&entry.table_id).copied() else {
+            return Ok(());
+        };
+        let Some(primary_key) = self.primary_key_of(table_id) else {
+            return Ok(());
+        };
+        if primary_key.index_id != entry.table_id {
+            return Ok(());
+        }
+        let RowKey::Record(record) = &entry.row_id else {
+            panic!("an index entry has a record key");
+        };
+        let Some(rowid) = rowid_of_index_key(record) else {
+            return Ok(());
+        };
+        let key = SortableIndexKey {
+            key: record.key.clone(),
+            metadata: primary_key.key.clone(),
+        };
+        let rows = self.older_rows_of_the_key(tx, table_id, &primary_key, &key, rowid)?;
+        tx.hide_older_rows_of_keys_it_wrote(rows);
+        Ok(())
+    }
+
+    fn hide_older_rows_of_the_primary_key_of(&self, tx: &Transaction<A>, row: &Row) -> Result<()> {
+        let Some(primary_key) = self.primary_key_of(row.id.table_id) else {
+            return Ok(());
+        };
+        let key = primary_key.key_of(row, self.alloc.clone())?;
+        let rows = self.older_rows_of_the_key(
+            tx,
+            row.id.table_id,
+            &primary_key,
+            &key,
+            row.id.row_id.to_int_or_panic(),
+        )?;
+        tx.hide_older_rows_of_keys_it_wrote(rows);
+        Ok(())
+    }
+
+    fn primary_key_of(&self, table_id: MVTableId) -> Option<Arc<PrimaryKeyIndex>> {
+        self.primary_key_of_table
+            .read()
+            .get(&table_id)
+            .cloned()
+            .flatten()
+    }
+
+    fn older_rows_of_the_key(
+        &self,
+        tx: &Transaction<A>,
+        table_id: MVTableId,
+        primary_key: &PrimaryKeyIndex,
+        key: &SortableIndexKey,
+        written_rowid: i64,
+    ) -> Result<Vec<RowID>> {
+        let mut rows = Vec::new();
+        let Some(index) = self.index_rows.get(&primary_key.index_id) else {
+            return Ok(rows);
+        };
+        for entry in index.value().range::<SortableIndexKey, _>(key..) {
+            if !key.matches_prefix(entry.key(), key.metadata.num_cols)? {
+                break;
+            }
+            let Some(rowid) = rowid_of_index_key(entry.key()) else {
+                continue;
+            };
+            let ended_after_the_snapshot = entry
+                .value()
+                .read()
+                .iter()
+                .any(|version| self.committed_after(tx, version.end(), tx.begin_ts()));
+            if rowid != written_rowid && ended_after_the_snapshot {
+                rows.push(RowID::new(table_id, RowKey::Int(rowid)));
+            }
+        }
+        Ok(rows)
     }
 
     fn refuse_an_insert_into_a_locked_gap(&self, tx_id: TxID, id: &RowID) -> Result<()> {
@@ -6112,17 +6247,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     panic!("Index reads must have a record row_id");
                 };
                 let row_versions_opt = rows.get(sortable_key);
-                if let Some(ref row_versions) = row_versions_opt {
-                    let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
-                        return Ok(Some(rv.row.clone()));
-                    }
-                }
-                Ok(None)
+                Ok(row_versions_opt.and_then(|row_versions| {
+                    self.read_visible_index_version(tx, row_versions.value(), |rv| rv.row.clone())
+                }))
             }
             None => {
                 if let Some(row_versions) = self.rows.get(id) {
@@ -6149,11 +6276,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
             return None;
         }
-        versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|rv| rv.row.clone())
+        self.visible_version(tx, versions).map(|rv| rv.row.clone())
     }
 
     /// Like the table branch of [`read_from_table_or_index`], but reads from an
@@ -6171,15 +6294,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
-        let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
-            return Ok(Some(rv.row.clone()));
-        }
-        Ok(None)
+        Ok(self.read_visible_version_of_chain(tx, versions, |rv| rv.row.clone()))
     }
 
     /// Like [`read_visible_from_versions`] but serializes the visible row's
@@ -6199,17 +6314,38 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
-        let versions = versions.read();
-        if let Some(rv) = versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-        {
+        let serialized = self.read_visible_version_of_chain(tx, versions, |rv| {
             record.invalidate();
-            record.start_serialization(rv.row.payload())?;
-            return Ok(true);
+            record.start_serialization(rv.row.payload())
+        });
+        match serialized {
+            Some(serialized) => {
+                serialized?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        Ok(false)
+    }
+
+    fn read_visible_version_of_chain<R>(
+        &self,
+        tx: &Transaction<A>,
+        versions: &RwLock<RowVersionChain<A>>,
+        read: impl FnOnce(&RowVersion) -> R,
+    ) -> Option<R> {
+        {
+            let chain = versions.read();
+            let holds_index_entries = chain
+                .first()
+                .is_some_and(|version| matches!(version.row.id.row_id, RowKey::Record(_)));
+            if !holds_index_entries
+                || !self.row_locks.enabled()
+                || !self.changed_since_the_read_view(tx, &chain)
+            {
+                return self.visible_version(tx, &chain).map(read);
+            }
+        }
+        self.read_visible_index_version(tx, versions, read)
     }
 
     /// Gets all row ids in the database.
@@ -6393,16 +6529,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> bool {
         self.txs
             .with_value(&tx_id, |tx| {
-                let versions = versions.read();
-                if versions.is_empty() {
-                    return false;
-                }
-                let table_id = versions[0].row.id.table_id;
-                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-                    return false;
-                }
-                versions.iter().rev().any(|version| {
-                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
+                self.read_index_chain(tx, versions, |versions, table_row| {
+                    if versions.is_empty() {
+                        return false;
+                    }
+                    let table_id = versions[0].row.id.table_id;
+                    if self.btree_covers_chain_for_tx(tx, table_id, versions) {
+                        return false;
+                    }
+                    match table_row {
+                        TableRowView::Snapshot => versions.iter().rev().any(|version| {
+                            version.is_btree_invalidating_version(
+                                tx,
+                                &self.txs,
+                                &self.finalized_tx_states,
+                            )
+                        }),
+                        TableRowView::Written => versions.iter().any(|version| {
+                            self.is_current_for_its_writer(tx, version)
+                                || self.is_ended_for_its_writer(tx, version)
+                        }),
+                        TableRowView::Hidden => true,
+                    }
                 })
             })
             .expect("transaction should exist in txs map")
@@ -6434,7 +6582,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .index_rows
                 .with_value(&table_id, |index_rows| {
                     index_rows.with_value(record.as_ref(), |versions| {
-                        self.btree_row_is_shown(tx_id, table_id, versions)
+                        !self.index_chain_invalidates_btree(versions, tx_id)
                     })
                 })
                 .flatten()
@@ -6453,6 +6601,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let versions = versions.read();
                 if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
                     return true;
+                }
+                if versions
+                    .first()
+                    .is_some_and(|version| tx.hides_the_older_row(&version.row.id))
+                {
+                    return false;
                 }
                 !versions.iter().rev().any(|version| {
                     version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
@@ -6473,10 +6627,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
                 return None;
             }
-            let occupying = versions
-                .iter()
-                .rev()
-                .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
+            let occupying = self.visible_version(tx, &versions)?;
             take_payload.then(|| occupying.row.clone())
         };
         Some((row.key().clone(), versions_arc.clone(), payload))
@@ -6487,15 +6638,154 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx: &Transaction<A>,
         row: &IndexRowEntry<'_, A>,
     ) -> Option<RowID> {
-        let versions = row.value().read();
-        if versions.is_empty() {
+        self.read_visible_index_version(tx, row.value(), |version| version.row.id.clone())
+    }
+
+    fn read_visible_index_version<R>(
+        &self,
+        tx: &Transaction<A>,
+        versions: &RwLock<RowVersionChain<A>>,
+        read: impl FnOnce(&RowVersion) -> R,
+    ) -> Option<R> {
+        self.read_index_chain(tx, versions, |versions, table_row| {
+            let version = match table_row {
+                TableRowView::Snapshot => self.visible_version(tx, versions),
+                TableRowView::Written => versions
+                    .iter()
+                    .rev()
+                    .find(|version| self.is_current_for_its_writer(tx, version)),
+                TableRowView::Hidden => None,
+            };
+            version.map(read)
+        })
+    }
+
+    fn read_index_chain<R>(
+        &self,
+        tx: &Transaction<A>,
+        versions: &RwLock<RowVersionChain<A>>,
+        read: impl FnOnce(&[RowVersion], TableRowView) -> R,
+    ) -> R {
+        let entry = {
+            let chain = versions.read();
+            if !self.row_locks.enabled() || !self.changed_since_the_read_view(tx, &chain) {
+                return read(&chain, TableRowView::Snapshot);
+            }
+            chain[0].row.id.clone()
+        };
+        let table_row = self.table_row_view(tx, &entry);
+        let chain = versions.read();
+        read(&chain, table_row)
+    }
+
+    fn changed_since_the_read_view(&self, tx: &Transaction<A>, versions: &[RowVersion]) -> bool {
+        versions.iter().any(|version| {
+            let read_ts = tx.read_ts_of(version);
+            self.committed_after(tx, version.begin(), read_ts)
+                || self.committed_after(tx, version.end(), read_ts)
+        })
+    }
+
+    fn committed_after(
+        &self,
+        tx: &Transaction<A>,
+        moment: Option<TxTimestampOrID>,
+        read_ts: u64,
+    ) -> bool {
+        let committed_at = match moment {
+            Some(TxTimestampOrID::Timestamp(ts)) => ts,
+            Some(TxTimestampOrID::TxID(tx_id)) if tx_id != tx.tx_id => {
+                match lookup_tx_state(&self.txs, &self.finalized_tx_states, tx_id) {
+                    Some(TransactionState::Committed(ts))
+                    | Some(TransactionState::Preparing(ts)) => ts,
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        };
+        committed_at > read_ts
+    }
+
+    fn table_row_view(&self, tx: &Transaction<A>, entry: &RowID) -> TableRowView {
+        let Some(table_id) = self.table_of_index.read().get(&entry.table_id).copied() else {
+            return TableRowView::Snapshot;
+        };
+        let RowKey::Record(key) = &entry.row_id else {
+            panic!("an index entry has a record key");
+        };
+        if !key.metadata.has_rowid {
+            return TableRowView::Snapshot;
+        }
+        let Some(rowid) = rowid_of_index_key(key) else {
+            return TableRowView::Snapshot;
+        };
+        let table_row = RowID::new(table_id, RowKey::Int(rowid));
+        if tx.hides_the_older_row(&table_row) {
+            return TableRowView::Hidden;
+        }
+        let own = Some(TxTimestampOrID::TxID(tx.tx_id));
+        let written = self
+            .rows
+            .with_value(&table_row, |versions| {
+                versions
+                    .read()
+                    .iter()
+                    .any(|version| version.begin() == own || version.end() == own)
+            })
+            .unwrap_or(false);
+        if written {
+            TableRowView::Written
+        } else {
+            TableRowView::Snapshot
+        }
+    }
+
+    fn is_current_for_its_writer(&self, tx: &Transaction<A>, version: &RowVersion) -> bool {
+        let begun = match version.begin() {
+            Some(TxTimestampOrID::Timestamp(_)) => true,
+            Some(TxTimestampOrID::TxID(tx_id)) => self.is_own_or_committed(tx, tx_id),
+            None => false,
+        };
+        begun && !self.is_ended_for_its_writer(tx, version)
+    }
+
+    fn is_ended_for_its_writer(&self, tx: &Transaction<A>, version: &RowVersion) -> bool {
+        match version.end() {
+            Some(TxTimestampOrID::Timestamp(_)) => true,
+            Some(TxTimestampOrID::TxID(tx_id)) => self.is_own_or_committed(tx, tx_id),
+            None => false,
+        }
+    }
+
+    fn is_own_or_committed(&self, tx: &Transaction<A>, tx_id: TxID) -> bool {
+        tx_id == tx.tx_id
+            || matches!(
+                lookup_tx_state(&self.txs, &self.finalized_tx_states, tx_id),
+                Some(TransactionState::Committed(_))
+            )
+    }
+
+    fn visible_version<'a>(
+        &self,
+        tx: &Transaction<A>,
+        versions: &'a [RowVersion],
+    ) -> Option<&'a RowVersion> {
+        if versions
+            .first()
+            .is_some_and(|version| tx.hides_the_older_row(&version.row.id))
+        {
             return None;
         }
-        versions
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|version| version.row.id.clone())
+        let ended_by_tx = Some(TxTimestampOrID::TxID(tx.tx_id));
+        for version in versions.iter().rev() {
+            if version.is_visible_to(tx, &self.txs, &self.finalized_tx_states) {
+                return Some(version);
+            }
+            if version.end() == ended_by_tx {
+                return None;
+            }
+        }
+        None
     }
 
     fn find_next_visible_index_row<'a, I>(
@@ -8131,8 +8421,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             deleted_table_versions,
             deleted_index_versions,
             newly_added_to_write_set,
+            older_rows_of_keys_it_wrote,
             ..
         } = savepoint;
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value()
+                .show_older_rows_again(older_rows_of_keys_it_wrote);
+        }
 
         tracing::debug!(
             "rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
@@ -11198,6 +11493,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .clone()
     }
 
+    pub(crate) fn knows_the_table_of_index(&self, index_id: MVTableId) -> bool {
+        self.table_of_index.read().contains_key(&index_id)
+    }
+
+    pub(crate) fn remember_the_table_of_index(&self, index_id: MVTableId, table_id: MVTableId) {
+        self.table_of_index.write().insert(index_id, table_id);
+    }
+
+    pub(crate) fn knows_the_primary_key_of(&self, table_id: MVTableId) -> bool {
+        self.primary_key_of_table.read().contains_key(&table_id)
+    }
+
+    pub(crate) fn remember_the_primary_key_of(
+        &self,
+        table_id: MVTableId,
+        primary_key: Option<PrimaryKeyIndex>,
+    ) {
+        self.primary_key_of_table
+            .write()
+            .insert(table_id, primary_key.map(Arc::new));
+    }
+
+    fn forget_the_table_of_index(&self, id: &MVTableId) {
+        self.table_of_index
+            .write()
+            .retain(|index_id, table_id| index_id != id && table_id != id);
+        self.primary_key_of_table
+            .write()
+            .retain(|table_id, primary_key| {
+                table_id != id && primary_key.as_ref().is_none_or(|key| key.index_id != *id)
+            });
+    }
+
     /// Whether `table_id` has a *currently live* checkpointed B-tree. Snapshot-agnostic; for
     /// transaction reads use [`Self::is_btree_readable_at`].
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
@@ -11384,6 +11712,59 @@ pub fn create_seek_range<K: Ord>(
         (limit_boundary, Bound::Unbounded)
     } else {
         (Bound::Unbounded, limit_boundary)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableRowView {
+    Snapshot,
+    Written,
+    Hidden,
+}
+
+fn rowid_of_index_key(key: &SortableIndexKey) -> Option<i64> {
+    match key.key.last_value() {
+        Some(Ok(crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(rowid)))) => {
+            Some(rowid)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PrimaryKeyIndex {
+    index_id: MVTableId,
+    key: Arc<IndexInfo>,
+    record_positions: Vec<usize>,
+}
+
+impl PrimaryKeyIndex {
+    pub(crate) fn new(index_id: MVTableId, key: IndexInfo, record_positions: Vec<usize>) -> Self {
+        turso_assert_eq!(key.num_cols, record_positions.len());
+        Self {
+            index_id,
+            key: Arc::new(key),
+            record_positions,
+        }
+    }
+
+    fn key_of<A: ConcurrentAllocator>(&self, row: &Row, alloc: A) -> Result<SortableIndexKey> {
+        let record = ImmutableRecordRef::from_bin_record(row.payload());
+        let values = self
+            .record_positions
+            .iter()
+            .map(|&position| {
+                record
+                    .get_value_opt(position)
+                    .expect("a table row holds the columns of its primary key")
+            })
+            .collect::<Vec<_>>();
+        let key = ImmutableRecord::from_values(values.iter(), values.len())?;
+        Ok(SortableIndexKey::new_from_payload_in(
+            key.get_payload(),
+            self.key.clone(),
+            alloc,
+        )?)
     }
 }
 

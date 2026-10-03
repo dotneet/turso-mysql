@@ -715,3 +715,321 @@ fn rows_of(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) 
         })
         .collect()
 }
+
+/// Measured on MySQL 8.4.11 at each level: a transaction that deletes a row
+/// another session changed after its snapshot no longer reads the row, by
+/// key, through a secondary index, in a scan or in a count, and a second
+/// delete of it deletes nothing.
+#[test]
+fn a_row_deleted_after_another_session_changed_it_is_gone_for_the_rest_of_the_transaction() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    for key in ISSUE_KEYS {
+        for level in ["REPEATABLE READ", "READ COMMITTED", "SERIALIZABLE"] {
+            let TwoSessions {
+                _directory,
+                mut one,
+                mut two,
+            } = two_sessions_with_issues(key);
+            run(
+                &mut one,
+                &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+            );
+            run(&mut one, "START TRANSACTION");
+            assert_eq!(n_of(&mut one, 1), "0");
+            run(&mut two, "UPDATE issue SET comments = 101 WHERE id = 1");
+
+            let deleted = affected(&mut one, "DELETE FROM issue WHERE id = 1");
+            assert_eq!(deleted, 1, "{key} {level}");
+            let seen = issues_seen(&mut one);
+            assert_eq!(seen, issues_seen_without_issue_1(), "{key} {level}");
+            let deleted_again = affected(&mut one, "DELETE FROM issue WHERE id = 1");
+            assert_eq!(deleted_again, 0, "{key} {level}");
+            run(&mut one, "COMMIT");
+            let seen = issues_seen(&mut two);
+            assert_eq!(seen, issues_seen_without_issue_1(), "{key} {level}");
+        }
+    }
+}
+
+/// Measured on MySQL 8.4.11: the deleted row is gone from its old and its
+/// new key alike after another session moved it to another key, and after
+/// another session deleted it and inserted it again.
+#[test]
+fn a_row_deleted_after_another_session_moved_or_put_it_back_is_gone_for_the_transaction() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    for key in ISSUE_KEYS {
+        for change in [
+            "UPDATE issue SET repo = 11 WHERE id = 1",
+            "DELETE FROM issue WHERE id = 1; INSERT INTO issue VALUES (1, 10, 101)",
+        ] {
+            let TwoSessions {
+                _directory,
+                mut one,
+                mut two,
+            } = two_sessions_with_issues(key);
+            run(&mut one, "START TRANSACTION");
+            assert_eq!(n_of(&mut one, 1), "0");
+            for sql in change.split("; ") {
+                run(&mut two, sql);
+            }
+
+            let deleted = affected(&mut one, "DELETE FROM issue WHERE id = 1");
+            assert_eq!(deleted, 1, "{key} {change}");
+            let seen = issues_seen(&mut one);
+            assert_eq!(seen, issues_seen_without_issue_1(), "{key} {change}");
+            run(&mut one, "COMMIT");
+        }
+    }
+}
+
+/// Measured on MySQL 8.4.11: a transaction that updates one column of a row
+/// another session moved to another key finds the row by the new key only,
+/// and one that updates a row another session deleted and inserted again
+/// reads that row once.
+#[test]
+fn a_row_updated_after_another_session_moved_or_put_it_back_is_read_once_as_it_left_it() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    for key in ISSUE_KEYS {
+        for change in [
+            "UPDATE issue SET repo = 11 WHERE id = 1",
+            "DELETE FROM issue WHERE id = 1; INSERT INTO issue VALUES (1, 11, 100)",
+        ] {
+            let TwoSessions {
+                _directory,
+                mut one,
+                mut two,
+            } = two_sessions_with_issues(key);
+            run(&mut one, "START TRANSACTION");
+            assert_eq!(n_of(&mut one, 1), "0");
+            for sql in change.split("; ") {
+                run(&mut two, sql);
+            }
+
+            let updated = affected(
+                &mut one,
+                "UPDATE issue SET comments = comments + 1 WHERE id = 1",
+            );
+            assert_eq!(updated, 1, "{key} {change}");
+            let as_it_left_it = IssuesSeen {
+                by_id: vec!["1 11 101".to_string()],
+                by_repo: vec!["1 11 101".to_string()],
+                in_repo_order: ["1 11", "2 20", "3 30"].map(String::from).to_vec(),
+                all: ["1 11 101", "2 20 200", "3 30 300"]
+                    .map(String::from)
+                    .to_vec(),
+                count: "3".to_string(),
+            };
+            assert_eq!(issues_seen(&mut one), as_it_left_it, "{key} {change}");
+            run(&mut one, "COMMIT");
+            assert_eq!(issues_seen(&mut two), as_it_left_it, "{key} {change}");
+        }
+    }
+}
+
+/// Measured on MySQL 8.4.11: a transaction that inserts the key of a row
+/// another session deleted after the snapshot reads only the row it
+/// inserted.
+#[test]
+fn a_key_inserted_after_another_session_deleted_it_is_read_once() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    for key in ISSUE_KEYS {
+        let TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        } = two_sessions_with_issues(key);
+        run(&mut one, "START TRANSACTION");
+        assert_eq!(n_of(&mut one, 1), "0");
+        run(&mut two, "DELETE FROM issue WHERE id = 1");
+
+        run(&mut one, "INSERT INTO issue VALUES (1, 12, 999)");
+        let inserted = IssuesSeen {
+            by_id: vec!["1 12 999".to_string()],
+            by_repo: vec!["1 12 999".to_string()],
+            in_repo_order: ["1 12", "2 20", "3 30"].map(String::from).to_vec(),
+            all: ["1 12 999", "2 20 200", "3 30 300"]
+                .map(String::from)
+                .to_vec(),
+            count: "3".to_string(),
+        };
+        assert_eq!(issues_seen(&mut one), inserted, "{key}");
+        run(&mut one, "COMMIT");
+        assert_eq!(issues_seen(&mut two), inserted, "{key}");
+    }
+}
+
+/// Measured on MySQL 8.4.11: rolling a write back to a savepoint gives the
+/// transaction its snapshot of the row again, though another session changed
+/// the row and its key, or deleted it and inserted it again, after the
+/// snapshot.
+#[test]
+fn a_write_rolled_back_to_a_savepoint_leaves_the_snapshot_of_the_row() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    for key in ISSUE_KEYS {
+        for (change, write) in [
+            (
+                "UPDATE issue SET repo = 11, comments = 101 WHERE id = 1",
+                "DELETE FROM issue WHERE id = 1",
+            ),
+            (
+                "DELETE FROM issue WHERE id = 1; INSERT INTO issue VALUES (1, 11, 101)",
+                "UPDATE issue SET comments = comments + 1 WHERE id = 1",
+            ),
+        ] {
+            let TwoSessions {
+                _directory,
+                mut one,
+                mut two,
+            } = two_sessions_with_issues(key);
+            run(&mut one, "START TRANSACTION");
+            assert_eq!(n_of(&mut one, 1), "0");
+            for sql in change.split("; ") {
+                run(&mut two, sql);
+            }
+
+            run(&mut one, "SAVEPOINT before_the_write");
+            assert_eq!(affected(&mut one, write), 1, "{key} {change}");
+            run(&mut one, "ROLLBACK TO SAVEPOINT before_the_write");
+            let seen = issues_seen(&mut one);
+            assert_eq!(seen, issues_as_inserted(), "{key} {change}");
+            run(&mut one, "COMMIT");
+        }
+    }
+}
+
+/// Gitea's `DeleteIssuesByRepoID` reads a batch of ids and deletes them one
+/// at a time until the batch comes back empty. Measured on MySQL 8.4.11: a
+/// row another session changed after the snapshot leaves the batch once the
+/// transaction deleted it, so the loop ends.
+#[test]
+fn deleting_a_batch_at_a_time_ends_when_another_session_changed_a_row_of_the_batch() {
+    if !turso_mysql::databases_open_in_mvcc() {
+        return;
+    }
+    let TwoSessions {
+        _directory,
+        mut one,
+        mut two,
+    } = two_sessions_with_issues(ISSUE_KEYS[0]);
+    run(&mut one, "START TRANSACTION");
+    assert_eq!(n_of(&mut one, 1), "0");
+    run(&mut two, "UPDATE issue SET comments = 101 WHERE id = 1");
+
+    let mut batches = Vec::new();
+    loop {
+        let batch = texts(&mut one, "SELECT id FROM issue ORDER BY id LIMIT 2");
+        if batch.is_empty() || batches.len() == 5 {
+            break;
+        }
+        for id in &batch {
+            assert_eq!(
+                affected(&mut one, &format!("DELETE FROM issue WHERE id = {id}")),
+                1
+            );
+        }
+        batches.push(batch);
+    }
+    assert_eq!(batches, [vec!["1", "2"], vec!["3"]]);
+    run(&mut one, "COMMIT");
+}
+
+const ISSUE_KEYS: [&str; 2] = [
+    "id INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+    "id INT NOT NULL PRIMARY KEY",
+];
+
+#[derive(Debug, PartialEq)]
+struct IssuesSeen {
+    by_id: Vec<String>,
+    by_repo: Vec<String>,
+    in_repo_order: Vec<String>,
+    all: Vec<String>,
+    count: String,
+}
+
+fn two_sessions_with_issues(key: &str) -> TwoSessions {
+    let mut sessions = two_sessions();
+    run(
+        &mut sessions.one,
+        &format!("CREATE TABLE issue ({key}, repo INT, comments INT, KEY by_repo (repo))"),
+    );
+    run(
+        &mut sessions.one,
+        "INSERT INTO issue VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
+    );
+    sessions
+}
+
+fn affected(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>, sql: &str) -> u64 {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => result.affected_rows,
+        outcome => panic!("{sql}: {outcome:?}"),
+    }
+}
+
+fn issues_seen(adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>) -> IssuesSeen {
+    IssuesSeen {
+        by_id: texts(adapter, "SELECT id, repo, comments FROM issue WHERE id = 1"),
+        by_repo: texts(
+            adapter,
+            "SELECT id, repo, comments FROM issue WHERE repo IN (10, 11, 12)",
+        ),
+        in_repo_order: texts(
+            adapter,
+            "SELECT id, repo FROM issue WHERE repo > 0 ORDER BY repo",
+        ),
+        all: texts(adapter, "SELECT id, repo, comments FROM issue ORDER BY id"),
+        count: texts(adapter, "SELECT COUNT(*) FROM issue").concat(),
+    }
+}
+
+fn issues_seen_without_issue_1() -> IssuesSeen {
+    IssuesSeen {
+        by_id: vec![],
+        by_repo: vec![],
+        in_repo_order: ["2 20", "3 30"].map(String::from).to_vec(),
+        all: ["2 20 200", "3 30 300"].map(String::from).to_vec(),
+        count: "2".to_string(),
+    }
+}
+
+fn issues_as_inserted() -> IssuesSeen {
+    IssuesSeen {
+        by_id: vec!["1 10 100".to_string()],
+        by_repo: vec!["1 10 100".to_string()],
+        in_repo_order: ["1 10", "2 20", "3 30"].map(String::from).to_vec(),
+        all: ["1 10 100", "2 20 200", "3 30 300"]
+            .map(String::from)
+            .to_vec(),
+        count: "3".to_string(),
+    }
+}
+
+fn texts(
+    adapter: &mut AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>,
+    sql: &str,
+) -> Vec<String> {
+    let Ok(CommandExecutionResult::ResultSet(result)) = adapter.execute_query(sql) else {
+        panic!("{sql} must return a result set");
+    };
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| String::from_utf8(cell.clone().unwrap()).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}

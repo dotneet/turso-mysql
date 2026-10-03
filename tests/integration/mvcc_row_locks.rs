@@ -215,6 +215,390 @@ fn a_row_found_through_an_index_after_a_checkpoint_still_has_its_table_row() {
 }
 
 #[test]
+fn a_row_deleted_after_another_transaction_changed_it_since_the_snapshot_is_gone_for_the_deleter() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET balance = 50 WHERE id = 1")
+        .unwrap();
+
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "accounts"), rows_seen_without_row_1());
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 0);
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_checkpointed_row_deleted_after_another_transaction_changed_it_since_the_snapshot_is_gone_for_the_deleter(
+) {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET balance = 50 WHERE id = 1")
+        .unwrap();
+
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "accounts"), rows_seen_without_row_1());
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_row_deleted_after_another_transaction_deleted_and_inserted_it_again_is_gone_for_the_deleter() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    other
+        .execute("INSERT INTO accounts VALUES (1, 11, 'a')")
+        .unwrap();
+
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "accounts"), rows_seen_without_row_1());
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_row_deleted_after_another_transaction_changed_its_index_key_is_gone_from_the_old_key() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET note = 'z' WHERE id = 1")
+        .unwrap();
+
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "accounts"), rows_seen_without_row_1());
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_row_updated_after_another_transaction_changed_its_index_key_is_found_by_the_new_key() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET note = 'z' WHERE id = 1")
+        .unwrap();
+
+    writer
+        .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1")
+        .unwrap();
+
+    let after_the_update = RowsSeen {
+        by_id: vec![(1, 11)],
+        by_scan: vec![(1, 11), (2, 20), (3, 30)],
+        by_index: vec![
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("z".to_string(), 1),
+        ],
+        count: 3,
+    };
+    assert_eq!(rows_seen(&writer, "accounts"), after_the_update);
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), after_the_update);
+}
+
+#[test]
+fn a_checkpointed_row_deleted_after_another_transaction_changed_its_index_key_is_gone_from_the_old_key(
+) {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET note = 'z' WHERE id = 1")
+        .unwrap();
+
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "accounts"), rows_seen_without_row_1());
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(rows_seen(&other, "accounts"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_checkpointed_row_updated_after_another_transaction_changed_its_index_key_is_found_by_the_new_key(
+) {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET note = 'z' WHERE id = 1")
+        .unwrap();
+
+    writer
+        .execute("UPDATE accounts SET balance = balance + 1 WHERE id = 1")
+        .unwrap();
+
+    let rows: Vec<(String, i64)> = writer.exec_rows(
+        "SELECT note, id FROM accounts INDEXED BY accounts_note WHERE note > '' ORDER BY note",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("z".to_string(), 1)
+        ]
+    );
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_row_whose_delete_was_rolled_back_to_a_savepoint_is_read_from_the_snapshot_again() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(balance(&writer, 1), 10);
+    other
+        .execute("UPDATE accounts SET balance = 50, note = 'z' WHERE id = 1")
+        .unwrap();
+
+    writer.execute("SAVEPOINT before_the_delete").unwrap();
+    writer.execute("DELETE FROM accounts WHERE id = 1").unwrap();
+    writer
+        .execute("ROLLBACK TO SAVEPOINT before_the_delete")
+        .unwrap();
+
+    let as_the_snapshot_saw_it = RowsSeen {
+        by_id: vec![(1, 10)],
+        by_scan: vec![(1, 10), (2, 20), (3, 30)],
+        by_index: vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ],
+        count: 3,
+    };
+    assert_eq!(rows_seen(&writer, "accounts"), as_the_snapshot_saw_it);
+    writer.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn a_row_deleted_after_another_transaction_put_its_primary_key_on_a_new_row_is_gone_for_the_deleter(
+) {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    create_keyed_accounts(&other);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    other.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    other
+        .execute("INSERT INTO keyed VALUES (1, 11, 'a')")
+        .unwrap();
+
+    writer.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "keyed"), rows_seen_without_row_1());
+    writer.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 0);
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "keyed"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_checkpointed_row_deleted_after_another_transaction_put_its_primary_key_on_a_new_row_is_gone_for_the_deleter(
+) {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    create_keyed_accounts(&other);
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    other.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    other
+        .execute("INSERT INTO keyed VALUES (1, 11, 'a')")
+        .unwrap();
+
+    writer.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    assert_eq!(rows_seen(&writer, "keyed"), rows_seen_without_row_1());
+    writer.execute("COMMIT").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(rows_seen(&other, "keyed"), rows_seen_without_row_1());
+}
+
+#[test]
+fn a_row_updated_after_another_transaction_put_its_primary_key_on_a_new_row_is_read_once() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    create_keyed_accounts(&other);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    other.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    other
+        .execute("INSERT INTO keyed VALUES (1, 11, 'z')")
+        .unwrap();
+
+    writer
+        .execute("UPDATE keyed SET balance = balance + 1 WHERE id = 1")
+        .unwrap();
+    assert_eq!(writer.changes(), 1);
+
+    let after_the_update = RowsSeen {
+        by_id: vec![(1, 12)],
+        by_scan: vec![(1, 12), (2, 20), (3, 30)],
+        by_index: vec![
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("z".to_string(), 1),
+        ],
+        count: 3,
+    };
+    assert_eq!(rows_seen(&writer, "keyed"), after_the_update);
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "keyed"), after_the_update);
+}
+
+#[test]
+fn a_primary_key_inserted_after_another_transaction_deleted_it_is_read_once() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    create_keyed_accounts(&other);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    other.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+
+    writer
+        .execute("INSERT INTO keyed VALUES (1, 99, 'y')")
+        .unwrap();
+
+    let after_the_insert = RowsSeen {
+        by_id: vec![(1, 99)],
+        by_scan: vec![(1, 99), (2, 20), (3, 30)],
+        by_index: vec![
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("y".to_string(), 1),
+        ],
+        count: 3,
+    };
+    assert_eq!(rows_seen(&writer, "keyed"), after_the_insert);
+    writer.execute("COMMIT").unwrap();
+    assert_eq!(rows_seen(&other, "keyed"), after_the_insert);
+}
+
+#[test]
+fn an_update_of_a_new_row_of_a_primary_key_rolled_back_to_a_savepoint_leaves_the_snapshot_row() {
+    let db = database_with_row_locks();
+    let other = session(&db);
+    let writer = session(&db);
+    create_keyed_accounts(&other);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    other.execute("DELETE FROM keyed WHERE id = 1").unwrap();
+    other
+        .execute("INSERT INTO keyed VALUES (1, 11, 'z')")
+        .unwrap();
+
+    writer.execute("SAVEPOINT before_the_update").unwrap();
+    writer
+        .execute("UPDATE keyed SET balance = balance + 1 WHERE id = 1")
+        .unwrap();
+    writer
+        .execute("ROLLBACK TO SAVEPOINT before_the_update")
+        .unwrap();
+
+    assert_eq!(rows_seen(&writer, "keyed"), rows_as_inserted());
+    writer.execute("COMMIT").unwrap();
+}
+
+fn create_keyed_accounts(conn: &Arc<Connection>) {
+    conn.execute("CREATE TABLE keyed (id INT NOT NULL PRIMARY KEY, balance INTEGER, note TEXT)")
+        .unwrap();
+    conn.execute("CREATE UNIQUE INDEX keyed_note ON keyed (note)")
+        .unwrap();
+    conn.execute("INSERT INTO keyed VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')")
+        .unwrap();
+}
+
+#[derive(Debug, PartialEq)]
+struct RowsSeen {
+    by_id: Vec<(i64, i64)>,
+    by_scan: Vec<(i64, i64)>,
+    by_index: Vec<(String, i64)>,
+    count: i64,
+}
+
+fn rows_seen(conn: &Arc<Connection>, table: &str) -> RowsSeen {
+    let count: Vec<(i64,)> = conn.exec_rows(&format!("SELECT COUNT(*) FROM {table}"));
+    RowsSeen {
+        by_id: conn.exec_rows(&format!("SELECT id, balance FROM {table} WHERE id = 1")),
+        by_scan: conn.exec_rows(&format!(
+            "SELECT id, balance FROM {table} NOT INDEXED ORDER BY id"
+        )),
+        by_index: conn.exec_rows(&format!(
+            "SELECT note, id FROM {table} INDEXED BY {table}_note WHERE note > '' ORDER BY note"
+        )),
+        count: count[0].0,
+    }
+}
+
+fn rows_as_inserted() -> RowsSeen {
+    RowsSeen {
+        by_id: vec![(1, 10)],
+        by_scan: vec![(1, 10), (2, 20), (3, 30)],
+        by_index: vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+        ],
+        count: 3,
+    }
+}
+
+fn rows_seen_without_row_1() -> RowsSeen {
+    RowsSeen {
+        by_id: vec![],
+        by_scan: vec![(2, 20), (3, 30)],
+        by_index: vec![("b".to_string(), 2), ("c".to_string(), 3)],
+        count: 2,
+    }
+}
+
+#[test]
 fn a_wait_longer_than_the_busy_timeout_fails_only_the_statement() {
     let db = database_with_row_locks();
     let holder = session(&db);

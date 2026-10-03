@@ -1422,6 +1422,9 @@ pub fn op_open_read(
                     mv_cursor_type,
                     btree_cursor,
                 )?;
+                if let CursorType::BTreeIndex(index) = cursor_type {
+                    remember_the_table_of_index(program, mv_store, index, mv_cursor.table_id());
+                }
                 if let Some(row_locks) = row_locks {
                     mv_cursor.lock_rows_it_reads(row_locks);
                 }
@@ -14551,13 +14554,22 @@ pub fn op_open_write(
                     .expect("mv_store should be Some when MVCC transaction is active")
                     .clone();
                 let mut mv_cursor = MvCursor::new(
-                    mv_store,
+                    mv_store.clone(),
                     &program.connection,
                     tx_id,
                     root_page,
                     mv_cursor_type,
                     btree_cursor,
                 )?;
+                match cursor_type {
+                    CursorType::BTreeIndex(index) => {
+                        remember_the_table_of_index(program, &mv_store, index, mv_cursor.table_id())
+                    }
+                    CursorType::BTreeTable(table) => {
+                        remember_the_primary_key_of(program, &mv_store, table, mv_cursor.table_id())
+                    }
+                    _ => {}
+                }
                 if let Some(row_locks) = row_locks {
                     mv_cursor.lock_rows_it_reads(row_locks);
                 }
@@ -14639,6 +14651,68 @@ pub fn op_open_write(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn remember_the_table_of_index(
+    program: &Program,
+    mv_store: &Arc<MvStore>,
+    index: &crate::schema::Index,
+    index_id: crate::mvcc::database::MVTableId,
+) {
+    if !mv_store.row_locks_enabled() || mv_store.knows_the_table_of_index(index_id) {
+        return;
+    }
+    let Some(table) = program
+        .connection
+        .schema
+        .read()
+        .get_btree_table(&index.table_name)
+    else {
+        return;
+    };
+    if let Some(table_id) = mv_store.try_get_table_id_from_root_page_at(table.root_page, u64::MAX) {
+        mv_store.remember_the_table_of_index(index_id, table_id);
+    }
+}
+
+fn remember_the_primary_key_of(
+    program: &Program,
+    mv_store: &Arc<MvStore>,
+    table: &crate::schema::BTreeTable,
+    table_id: crate::mvcc::database::MVTableId,
+) {
+    if !mv_store.row_locks_enabled() || mv_store.knows_the_primary_key_of(table_id) {
+        return;
+    }
+    let schema = program.connection.schema.read();
+    let Some(index) = schema
+        .get_indices(&table.name)
+        .find(|index| index.has_rowid && index_is_the_primary_key(index, table))
+    else {
+        mv_store.remember_the_primary_key_of(table_id, None);
+        return;
+    };
+    let Some(index_id) = mv_store.try_get_table_id_from_root_page_at(index.root_page, u64::MAX)
+    else {
+        return;
+    };
+    let Ok(mut key) = IndexInfo::new_from_index_in(index, mv_store.allocator()) else {
+        return;
+    };
+    key.num_cols = index.columns.len();
+    let record_positions = index
+        .columns
+        .iter()
+        .map(|column| table.logical_to_physical_column(column.pos_in_table))
+        .collect();
+    mv_store.remember_the_primary_key_of(
+        table_id,
+        Some(crate::mvcc::database::PrimaryKeyIndex::new(
+            index_id,
+            key,
+            record_positions,
+        )),
+    );
 }
 
 pub fn op_copy(
