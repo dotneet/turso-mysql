@@ -538,6 +538,20 @@ What still fails on turso alone:
 
 # Gitea's own integration suite
 
+2026-10-03, the same run (`E2E_GITEA_SHARDS=60`): 392 of the 395 tests that pass
+on MySQL pass on turso, every test is reported on both (484), and none passes on
+MySQL alone but for `TestDatabaseCollation` (`ALTER DATABASE ... COLLATE
+utf8mb4_bin`), `TestPackageNuGet` (a derived table cut by a `LIMIT` joined to
+`package_version`) and `TestViewIssuesKeyword` (the issue indexer not done
+within the test's one second while the debug build fills it). turso took 1534 s,
+MySQL 360 s. What changed since the run below: the heatmap's `DIV`, totals over
+joins, derived tables inside membership tests and `DELETE`, `MAX` over a joined
+column in a membership test and against a written number, `COUNT(DISTINCT(x))`,
+`LOWER(col) IN (...)`, the milestone completeness quotient written into an
+`INT`, a `VARBINARY` sent in a prepared statement's rows (it closed the
+connection), an `OR` inside a join's `ON`, and MVCC recovery that rebuilt the
+schema for every logged frame (a database with a long log took minutes to open).
+
 2026-09-29. Gitea v1.27.3's `tests/integration`, run through the harness
 (`run.sh gitea`, `E2E_GITEA_SHARDS=60`), with the 115 tests that drive Gitea
 Actions through a mock runner left out (they fail against MySQL here too).

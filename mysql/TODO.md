@@ -245,14 +245,16 @@ which this does not follow. `JSON_ARRAYAGG` over a built document takes
 
 ### What Gitea's integration suite still meets
 
-Gitea v1.27.3's own suite (`run.sh gitea`, xorm over go-sql-driver) passes 348
-of the 395 tests MySQL 8.4.11 passes in the harness. What stands in the way of
-the rest, by the tests it ends:
+Gitea v1.27.3's own suite (`run.sh gitea`, xorm over go-sql-driver,
+`E2E_GITEA_SHARDS=60`) passes 392 of the 395 tests MySQL 8.4.11 passes in the
+harness, and none that MySQL fails. What stands in the way of the rest, by the
+tests it ends:
 
 | Statement | State |
 |---|---|
-| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package` | refused: a derived table cut by a `LIMIT` joined beside another table. Most `TestPackage*` tests. The blob read comparing a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` and the newest-version join `LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` are taken |
+| Packages: `INNER JOIN (SELECT * FROM package WHERE ... ORDER BY package.name LIMIT n) package` | refused: a derived table cut by a `LIMIT` joined beside another table. `TestPackageNuGet`. The blob read comparing a number with `(SELECT max(team.authorize) FROM team INNER JOIN team_user ...)` and the newest-version join `LEFT JOIN package_version pv2 ON ... AND (a.created_unix < pv2.created_unix OR ...)` are taken |
 | `ALTER DATABASE ... COLLATE utf8mb4_bin`, `utf8mb4_0900_as_cs` | refused, a database collation other than `utf8mb4_0900_ai_ci` and `utf8mb4_unicode_ci`; Gitea logs it and runs on a case-insensitive database, and `TestDatabaseCollation` fails |
+| `TestViewIssuesKeyword` | no statement is refused: the test gives the issue indexer one second to index an issue, and in a shard's first tests the debug build is still filling the index Gitea builds when it starts, so the search finds nothing. It passes later in a longer shard |
 
 ### DDL
 
