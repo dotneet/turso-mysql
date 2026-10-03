@@ -154,7 +154,7 @@ jobs:
           path: coverage/
           retention-days: 14
 
-  mysql-mvcc:
+  mysql-wal:
     timeout-minutes: 40
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
@@ -164,13 +164,13 @@ jobs:
         uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-mysql-mvcc"
+          prefix-key: "v1-rust-mysql-wal"
           cache-on-failure: true
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: Test the MySQL crates with databases in MVCC
+      - name: Test the MySQL crates with databases in WAL
         env:
-          TURSO_MYSQL_JOURNAL_MODE: mvcc
+          TURSO_MYSQL_JOURNAL_MODE: wal
         run: >-
           cargo nextest run --locked --no-fail-fast --failure-output=final
           -p turso_mysql_parser -p turso_mysql -p turso_mysql_server

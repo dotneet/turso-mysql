@@ -107,7 +107,7 @@ services:
       E2E_BIN_DIR: ${E2E_BIN_DIR:-debug}
       # How every database opens: `mvcc`, the server's default, or `wal`; see
       # mysql/frontend/database_open.rs.
-      TURSO_MYSQL_JOURNAL_MODE: ${TURSO_MYSQL_JOURNAL_MODE:-wal}
+      TURSO_MYSQL_JOURNAL_MODE: ${TURSO_MYSQL_JOURNAL_MODE:-mvcc}
       # `1` keeps the databases on the turso-data volume instead of tmpfs.
       E2E_DATA_ON_DISK: ${E2E_DATA_ON_DISK:-}
     volumes:

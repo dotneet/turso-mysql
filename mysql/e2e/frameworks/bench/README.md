@@ -33,11 +33,11 @@ so every fsync reaches the Docker VM's disk; on Docker Desktop for Mac one
 36-byte append and fsync there took about 0.7 ms (tmpfs: 0.5 µs). Every `--up`
 and `--down` removes both volumes, so each run starts from empty databases.
 
-The turso server opens every database in WAL, its default, where writers take
-one write lock over the whole database. `TURSO_MYSQL_JOURNAL_MODE=mvcc` on
-`run.sh --up` starts it with every database in MVCC instead, where writers run
-side by side with InnoDB's row locks, to compare the two; `--up` again without
-it restarts the server on the same build.
+The turso server opens every database in MVCC, its default, where writers run
+side by side with InnoDB's row locks instead of under one write lock over the
+whole database. `TURSO_MYSQL_JOURNAL_MODE=wal` on `run.sh --up` starts it with
+every database in WAL instead, to compare the two; `--up` again without it
+restarts the server on the same build.
 
 ## Profiling the server under load
 

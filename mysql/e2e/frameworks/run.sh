@@ -10,8 +10,8 @@
 #   mysql/e2e/frameworks/run.sh --bench         # sysbench on running servers (bench/README.md)
 #
 # E2E_KEEP=1 leaves the servers running after a full run.
-# TURSO_MYSQL_JOURNAL_MODE=mvcc on a full run or `--up` opens turso's databases
-# in MVCC instead of WAL, the default.
+# TURSO_MYSQL_JOURNAL_MODE=wal on a full run or `--up` opens turso's databases
+# in WAL instead of MVCC, the default.
 #
 # To run a second copy of the harness next to this one (another checkout or
 # worktree), give it its own names so neither touches the other's containers,
@@ -45,8 +45,8 @@ export E2E_DATABASES="mysqlcli laravel prisma prisma_shadow typeorm django rails
 
 main() {
   if [[ -n "${TURSO_MYSQL_EXPERIMENTAL_MVCC+set}" ]]; then
-    echo "TURSO_MYSQL_EXPERIMENTAL_MVCC is no longer read: turso opens databases in WAL by default;" \
-      "unset it, and set TURSO_MYSQL_JOURNAL_MODE=mvcc for MVCC" >&2
+    echo "TURSO_MYSQL_EXPERIMENTAL_MVCC is no longer read: turso opens databases in MVCC by default;" \
+      "unset it, and set TURSO_MYSQL_JOURNAL_MODE=wal for WAL" >&2
     exit 2
   fi
   case "${1:-}" in
@@ -109,7 +109,7 @@ up() {
     || { tail -30 "${E2E_RUN_DIR}/build.log"; exit 1; }
   compose --profile build run --rm --name "${prefix}-sqlproxy-build" sqlproxy-build
 
-  log "starting turso (${TURSO_MYSQL_JOURNAL_MODE:-wal}) and mysql"
+  log "starting turso (${TURSO_MYSQL_JOURNAL_MODE:-mvcc}) and mysql"
   compose --profile servers down --remove-orphans --timeout 10 >/dev/null 2>&1 || true
   # Both servers start from empty data directories, on disk or on tmpfs.
   docker volume rm "${prefix}-turso-data" "${prefix}-mysql-data" >/dev/null 2>&1 || true

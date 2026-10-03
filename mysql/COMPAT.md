@@ -4,15 +4,12 @@ For what is *not* done yet, read [TODO.md](TODO.md) instead: this file explains
 what works and where it differs from MySQL, at length, while that one is the
 checklist you read to pick up the next piece of work.
 
-Databases open in WAL unless the server runs with `TURSO_MYSQL_JOURNAL_MODE=mvcc`.
-WAL is the default again until a known MVCC bug is fixed: under concurrent
-transactions that delete and re-insert rows with explicit ids in a table with an
-`AUTO_INCREMENT` column, MVCC can lose rows that were committed.
+Databases open in MVCC unless the server runs with `TURSO_MYSQL_JOURNAL_MODE=wal`.
 Where locks, lock waits and isolation differ between the two, a section describes
 WAL first, with the engine's one write lock over the whole database, and then
-MVCC in a paragraph that starts "In MVCC". The server refuses to start while
-`TURSO_MYSQL_EXPERIMENTAL_MVCC`, which turned MVCC on before
-`TURSO_MYSQL_JOURNAL_MODE`, is set at all. How a database moves from one to the other is at
+MVCC, the default, in a paragraph that starts "In MVCC". The server refuses to
+start while `TURSO_MYSQL_EXPERIMENTAL_MVCC`, which turned MVCC on while WAL was
+the default, is set at all. How a database moves from one to the other is at
 the end of the isolation levels below.
 
 This file records the currently verified surface. It is intentionally stricter
@@ -3804,7 +3801,7 @@ answers at once, and answers 1205 once the wait runs out. `NOWAIT` asks to be re
 it reads is held, which one lock over the whole database cannot tell, and `OF <table>` names
 which tables to lock; both are refused.
 
-In MVCC (`TURSO_MYSQL_JOURNAL_MODE=mvcc`), the locks are row locks, the way InnoDB's are, and
+In MVCC, the default, the locks are row locks, the way InnoDB's are, and
 each of the following was measured on 8.4.11 and is matched there. A write, or a locking read,
 that meets a row another open transaction changed or locked **waits** for that transaction for
 `innodb_lock_wait_timeout`, answers 1205 when the wait runs out, and undoes that statement alone:
@@ -3946,7 +3943,7 @@ write lock cannot. So is `LOW_PRIORITY WRITE`, which changes who waits for whom,
 `LOCK INSTANCE FOR BACKUP`. An `UNLOCK TABLES` holding nothing answers OK, the way MySQL's
 does.
 
-In MVCC (`TURSO_MYSQL_JOURNAL_MODE=mvcc`), tables are locked one by one with MySQL's metadata
+In MVCC, the default, tables are locked one by one with MySQL's metadata
 locks, and each of the following was measured on 8.4.11 (`performance_schema.metadata_locks`
 for the lock kinds) and is matched there. Every statement locks each table it reads with a
 shared read lock and each table it writes, or reads `FOR UPDATE`, with a shared write lock
@@ -5261,7 +5258,7 @@ change and its place in the WAL from the transaction's first write, both on
 the snapshot the transaction writes from, so `ROLLBACK TO` it undoes the
 transaction's writes and none of what other sessions committed meanwhile.
 
-In MVCC (`TURSO_MYSQL_JOURNAL_MODE=mvcc`), writers do not wait for one another,
+In MVCC, the default, writers do not wait for one another,
 and the levels are kept by moving a transaction's snapshot to the latest
 commit before a statement, which keeps every row the transaction wrote.
 `READ COMMITTED` moves it before every statement, also after the transaction
@@ -5288,26 +5285,26 @@ read waits for it, and a commit to rows it never read does not keep it from
 writing.
 
 A database opened in MVCC gets a `<file key>.turso-mysql-mvcc-log` file
-beside its other files. A database that was in WAL is turned to MVCC the first time a server running
-with `TURSO_MYSQL_JOURNAL_MODE=mvcc` opens it. Once it has the log
+beside its other files. A database that was in WAL, made before MVCC was the
+default or while the server ran with `TURSO_MYSQL_JOURNAL_MODE=wal`, is turned
+to MVCC the first time a server running in MVCC opens it. Once it has the log
 it keeps opening in MVCC even under `TURSO_MYSQL_JOURNAL_MODE=wal`, because that
 log can hold committed rows its main file does not have yet. To turn it back to
 WAL, stop the server and run
 
 ```sh
-turso-mysql-offline-mvcc-to-wal --data-root <data root> --database <name>
+TURSO_MYSQL_JOURNAL_MODE=wal turso-mysql-offline-mvcc-to-wal --data-root <data root> --database <name>
 ```
 
-and start the server without `TURSO_MYSQL_JOURNAL_MODE=mvcc` from then on; a
-server started with it turns the database to MVCC again when it opens it.
+and start the server with `TURSO_MYSQL_JOURNAL_MODE=wal` from then on; a
+server started without it turns the database to MVCC again when it opens it.
 
 It copies every row in the log into the main file, has the engine mark the
 file as WAL, syncs the main file, and only then removes the log, in one
 unlink. It refuses (exit 3) while another process has the data root open — a
 running server holds the root's lock until it stops, so no session can use
-the database meanwhile — and refuses (exit 2) when its own environment has
-`TURSO_MYSQL_JOURNAL_MODE=mvcc`, as a reminder that the server must not run
-with it either. A database that already opens in WAL is left as it
+the database meanwhile — and refuses (exit 2) unless its own environment has
+`TURSO_MYSQL_JOURNAL_MODE=wal`, as a reminder that the server needs it too. A database that already opens in WAL is left as it
 is. A crash at any point leaves a database that opens with every committed
 row: before the log is removed it opens in MVCC again from its empty log,
 and running the command again finishes the change. The schema and the
@@ -6087,7 +6084,7 @@ an ORM's update that writes every column as it stood checks nothing, and a row
 whose parent went missing while the checks were off can still be updated, but
 not moved to another primary key (1452).
 
-In MVCC (`TURSO_MYSQL_JOURNAL_MODE=mvcc`), the checks take InnoDB's row locks, and
+In MVCC, the default, the checks take InnoDB's row locks, and
 each of the following was measured on 8.4.11 with `performance_schema.data_locks`
 and is matched, under `REPEATABLE READ` and `READ COMMITTED` alike unless
 said. A child row's `INSERT`, or an `UPDATE` that changes its foreign key or
@@ -7642,7 +7639,7 @@ Named or conflicting nullable attributes remain rejected. Supported typed
 | `WHERE` comparison against `CURDATE()` / `NOW()` / `CURTIME()` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/lib.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-now-comparison.json), [P0 manifest](conformance/Makefile) | Each is rendered as the engine call answering the same value in the same form — `date('now')`, `datetime('now')`, `time('now')` — and meets the column whose form it answers in: a day meets a `DATE`, a moment a `DATETIME` or `TIMESTAMP`, and a time of day a `TIME`, for sameness only. Both spellings of each, with and without parentheses, are read. Any other call on the right of a comparison is still refused. Every answer is pinned to the 8.4.11 golden. |
 | `WHERE` comparison against a number written with a fraction — `money > 9.99` | partial | partial | n/a | n/a | partial | [`comparison reader`](parser/translate.rs), [`comparison validator`](frontend/session.rs), [oracle case](conformance/cases/p0/select-decimal-literal-comparison.json), [P0 manifest](conformance/Makefile) | Read as the number it names and carried into the rendered SQL as it was written, so the engine reads the same number. It meets any column that holds a number, whole or not; a text column is refused, the mirror of a string against an integer column. A direct comparison against a known exact `DECIMAL` column accepts whole numbers beyond `i64` up to 65 written digits; `IN` with those literals remains refused. A `HAVING` still takes only a whole number, being counted against a count. Every answer is pinned to the 8.4.11 golden. |
 | `LOCK TABLES` / `UNLOCK TABLES` | partial | partial | n/a | n/a | partial | [`lock parser`](parser/lock_tables.rs), [`write lock`](frontend/session.rs) | The lock is really held, until `UNLOCK TABLES`: it is the engine's write lock, held by the write transaction the statement opens, and a session that writes while it is held waits and answers 1205. One lock over the whole database rather than one for each table, so `READ` and `WRITE` take the same one and the names are read and let go. The statements between commit together at the unlock, so `START TRANSACTION`, `COMMIT` and `ROLLBACK` are refused while it is held rather than dropping the lock. `READ LOCAL`, `LOW_PRIORITY WRITE` and `LOCK INSTANCE FOR BACKUP` are refused. |
-| `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `SKIP LOCKED` takes the same lock, waiting for it where MySQL would skip the rows another session holds. `NOWAIT` and `OF <table>` are refused. `LOCK IN SHARE MODE` is read as `FOR SHARE`. In MVCC (`TURSO_MYSQL_JOURNAL_MODE=mvcc`), the locks are row locks with InnoDB's waits, 1205, 1213 deadlock victims, `NOWAIT` (3572) and `SKIP LOCKED`, and with InnoDB's gap and next-key locks under `REPEATABLE READ` and `SERIALIZABLE`. |
+| `SELECT ... FOR UPDATE` / `FOR SHARE` | partial | partial | n/a | n/a | partial | [`lock reader`](parser/translate.rs), [`write lock`](frontend/session.rs) | The lock is really held: the statement takes the engine's write lock by writing no row, and another session that writes while it is held waits for it and answers 1205 once the wait runs out, which starts at MySQL's fifty seconds and is changed by `SET SESSION innodb_lock_wait_timeout`. It is one lock over the whole database rather than one for each row, so it is stronger than MySQL's. Outside a transaction none is taken, which is what MySQL's amounts to there. `SKIP LOCKED` takes the same lock, waiting for it where MySQL would skip the rows another session holds. `NOWAIT` and `OF <table>` are refused. `LOCK IN SHARE MODE` is read as `FOR SHARE`. In MVCC, the default, the locks are row locks with InnoDB's waits, 1205, 1213 deadlock victims, `NOWAIT` (3572) and `SKIP LOCKED`, and with InnoDB's gap and next-key locks under `REPEATABLE READ` and `SERIALIZABLE`. |
 | `WHERE` comparison against a `DATE` / `DATETIME` / `TIMESTAMP` / `TIME` / `YEAR` / `DECIMAL` / `DOUBLE` / `FLOAT` / `ENUM` / `SET` column | partial | partial | n/a | n/a | partial | [`comparison validator`](frontend/session.rs), [`temporal values`](parser/temporal_value.rs), [oracle case](conformance/cases/p0/select-temporal-comparison.json), [P0 manifest](conformance/Makefile) | These columns hold the canonical form MySQL stores, so a comparison against a value already written that way answers the rows MySQL answers, whatever each row was written as. A day and a moment read in order read in time order, so every operator works; a `TIME` runs past a day and carries a sign, so only `=`, `!=`, `<=>` and `IN` are answered for one. A `YEAR` and a real are compared as numbers. A value written any other way is refused rather than rewritten — measured, `d = '2024-1-1'`, `dt = '2024-01-01'` and `y = 24` each find rows in MySQL that comparing the stored form would not — while a bound `?` is normalized for DATE, DATETIME and TIMESTAMP columns. Bound TIME and YEAR comparisons remain refused. An `ENUM` or `SET` member spelled the way it was declared is compared for sameness; a member spelled another way, a number naming a member's position, and any ordering comparison are refused, because MySQL reads each of those by a rule the stored spelling does not meet. Every answer above is pinned to the 8.4.11 golden. |
 | Signed `TINYINT` / `SMALLINT` / `MEDIUMINT` / `INT` / `BIGINT` assignment | partial | partial | rejected | planned | partial | [`numeric parser`](parser/lib.rs), [`assignment validator`](frontend/dialect.rs), [numeric oracle case](conformance/cases/p0/numeric-coercion.json), [MEDIUMINT oracle case](conformance/cases/p0/numeric-mediumint.json) | Strict signed ranges are checked before storage for marked columns: `TINYINT` −128..127, `SMALLINT` −32,768..32,767, `MEDIUMINT` −8,388,608..8,388,607, `INT` −2,147,483,648..2,147,483,647, and `BIGINT` `i64::MIN..i64::MAX`. The checked `INSERT`/`UPDATE` path covers parameters, multi-row rollback, triggers, TEMP/attached schemas, reopen, and `VACUUM`; durable DDL and metadata retain the width. String/real coercion, expressions, other widths, permissive warnings, casts, arithmetic, ordering, and protocol errors remain rejected or unimplemented. |
 | `SHOW COLUMNS` / `DESCRIBE` / `EXPLAIN table` | partial | partial | experimental | planned | partial | [`checked parser`](parser/lib.rs), [`frontend metadata`](frontend/session.rs), [`frontend adapter`](server/src/frontend_adapter.rs), [pinned case](conformance/cases/p0/show-columns.json) | Only plain `SHOW COLUMNS FROM table`, `DESCRIBE table`, `DESC table`, and `EXPLAIN table` — measured on MySQL 8.4.11, `EXPLAIN t` prints exactly what `DESCRIBE t` prints — with MySQL's own synonyms taken, `FIELDS` for `COLUMNS` and `IN` for `FROM`, since a schema reader written against MySQL reaches for either and measured on 8.4.11 all four spellings print the same rows — with one canonical unqualified table or one canonical marked view with a direct projection from one base table, plus an optional single semicolon, are accepted. The selected database is required; database-level `Query` authorization runs before metadata lookup, with an exact table `Select` grant as the narrow fallback. Table metadata comes from verified normalized MySQL DDL and typed defaults, including `PRI` and `auto_increment` for the checked primary auto-increment form. Direct-view metadata verifies persisted view rootpage, SQL, and base-column provenance; it preserves projected type and nullable metadata while clearing table-only `Key`, `Default`, and `Extra`. View chains, projection/source aliases, expressions, joins, qualified or system sources, and duplicate output names are rejected. Frontend metadata preserves declared `INT` versus `INTEGER` spelling, while the wire `Type` column canonicalizes both to `int`. Every type a `CREATE TABLE` here takes reads back, through one renderer shared with `SHOW CREATE TABLE`: a second table of type names had drifted five behind it — `DATE`, `TIME`, `YEAR`, `DOUBLE UNSIGNED` and `FLOAT UNSIGNED` — so a table holding any of them answered 1105 to `SHOW COLUMNS`, `SHOW FULL COLUMNS` and `DESCRIBE` alike while `SHOW CREATE TABLE` printed the same table without complaint. The two are one now, and all thirty-six types are measured on 8.4.11 and matched. Unknown extras fail closed. The pinned case/golden covers this metadata; scan, row, value, packet, and retained-memory bounds apply. A `LIKE` pattern names the columns to report, and `DESCRIBE t <name>` reads a name after the table the same way. `FULL` adds `Collation`, `Privileges` and `Comment`, the first from the stored column collation and the last always empty. `Privileges` reflects database or table grants; column-specific grants remain unsupported. Qualification outside an explicit selected database on `SHOW FULL COLUMNS`, comments, `WHERE`, `DESCRIBE TABLE t`, and a pattern after `EXPLAIN` remain rejected; `information_schema` is not a substitute and remains incomplete. |

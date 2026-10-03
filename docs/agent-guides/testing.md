@@ -30,11 +30,11 @@ make -C sqlite/conformance run-cli
 # Rust unit/integration tests (full workspace)
 cargo test
 
-# MySQL frontend: databases open in WAL by default, so run the suite a
-# second time in MVCC; WAL-only tests skip themselves under MVCC. CI runs the
-# MVCC pass as the `mysql-mvcc` job in .github/workflows/rust.yml
+# MySQL frontend: databases open in MVCC by default, so run the suite a
+# second time in WAL; WAL-only tests skip themselves under MVCC. CI runs the
+# WAL pass as the `mysql-wal` job in .github/workflows/rust.yml
 cargo test -p turso_mysql_parser -p turso_mysql -p turso_mysql_server -p turso_mysql_offline_provisioner -p turso_mysql_runtime
-TURSO_MYSQL_JOURNAL_MODE=mvcc cargo test -p turso_mysql_parser -p turso_mysql -p turso_mysql_server -p turso_mysql_offline_provisioner -p turso_mysql_runtime
+TURSO_MYSQL_JOURNAL_MODE=wal cargo test -p turso_mysql_parser -p turso_mysql -p turso_mysql_server -p turso_mysql_offline_provisioner -p turso_mysql_runtime
 
 # Memory leak check: repeated database open/workload/drop cycles must not
 # grow the heap (counting global allocator, separate test binary)
