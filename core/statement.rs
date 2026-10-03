@@ -37,6 +37,8 @@ type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
+const LONGEST_SLEEP_ON_ANOTHER_CONNECTION: Duration = Duration::from_millis(10);
+
 /// Classifies how a [`Statement`] participates in connection-level lifecycle
 /// and active-statement accounting.
 ///
@@ -933,7 +935,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    self.wait_before_stepping_again()?
+                }
                 vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
@@ -948,7 +952,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    self.wait_before_stepping_again()?
+                }
                 vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
@@ -969,7 +975,9 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => break,
-                vdbe::StepResult::IO | vdbe::StepResult::Yield => self.pager.io.step()?,
+                vdbe::StepResult::IO | vdbe::StepResult::Yield => {
+                    self.wait_before_stepping_again()?
+                }
                 vdbe::StepResult::Sleep { .. } => self.wait_out_busy_delay()?,
                 vdbe::StepResult::Row => {
                     func(self.row().expect("row should be present"))?;
@@ -1052,7 +1060,7 @@ impl Statement {
                 vdbe::StepResult::Done => break None,
                 vdbe::StepResult::IO | vdbe::StepResult::Yield => {
                     pre_io_func()?;
-                    self.pager.io.step()?;
+                    self.wait_before_stepping_again()?;
                     post_io_func()?;
                 }
                 vdbe::StepResult::Sleep { .. } => {
@@ -1066,6 +1074,15 @@ impl Statement {
             }
         };
         Ok(result)
+    }
+
+    fn wait_before_stepping_again(&mut self) -> Result<()> {
+        if let Some(io) = self.state.io_completions.as_ref() {
+            if io.0.is_wait() {
+                io.0.sleep_until_finished(LONGEST_SLEEP_ON_ANOTHER_CONNECTION);
+            }
+        }
+        self.pager.io.step()
     }
 
     /// Waits before a blocking run steps again after the busy handler asked it

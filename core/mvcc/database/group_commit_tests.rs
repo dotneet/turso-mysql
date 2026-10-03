@@ -1,3 +1,5 @@
+#[cfg(all(unix, not(shuttle)))]
+use super::this_threads_cpu_time;
 use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
 use crate::mvcc::yield_hooks::YieldPointMarker;
@@ -460,6 +462,41 @@ fn commit_parks_once_while_another_transaction_holds_the_commit_lock() {
         "releasing the commit lock wakes every parked commit"
     );
     step_until_done(&mut commit);
+    assert_eq!(
+        get_rows(&conn, "SELECT pk FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[cfg(all(unix, not(shuttle)))]
+#[test]
+fn a_blocking_commit_sleeps_while_another_transaction_holds_the_commit_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    let store = db.get_mvcc_store();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+
+    let committing = std::thread::spawn(move || {
+        let started = this_threads_cpu_time();
+        conn.execute("COMMIT").unwrap();
+        (conn, this_threads_cpu_time() - started)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!committing.is_finished());
+    coordinator.unlock_pager_commit_lock();
+    let (conn, cpu_time) = committing.join().unwrap();
+
+    assert!(
+        cpu_time < Duration::from_millis(100),
+        "the commit used {cpu_time:?} of CPU waiting 500 ms for the commit lock"
+    );
     assert_eq!(
         get_rows(&conn, "SELECT pk FROM t"),
         vec![vec![Value::from_i64(1)]]

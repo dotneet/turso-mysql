@@ -22,6 +22,26 @@ pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub(crate) type AfterFailedSync = dyn Fn(CompletionError) + Send + Sync;
 pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 
+#[cfg(not(any(shuttle, target_family = "wasm")))]
+struct ThreadWaker(std::thread::Thread);
+
+#[cfg(not(any(shuttle, target_family = "wasm")))]
+impl std::task::Wake for ThreadWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+#[cfg(not(any(shuttle, target_family = "wasm")))]
+thread_local! {
+    static THIS_THREADS_WAKER: Waker =
+        Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+}
+
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct Completion {
@@ -377,6 +397,20 @@ impl Completion {
             .as_ref()
             .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Yield))
     }
+
+    #[cfg(not(any(shuttle, target_family = "wasm")))]
+    pub fn sleep_until_finished(&self, longest: std::time::Duration) {
+        if self.finished() {
+            return;
+        }
+        THIS_THREADS_WAKER.with(|waker| self.set_waker(waker));
+        if !self.finished() {
+            std::thread::park_timeout(longest);
+        }
+    }
+
+    #[cfg(any(shuttle, target_family = "wasm"))]
+    pub fn sleep_until_finished(&self, _longest: std::time::Duration) {}
 
     pub fn wake(&self) {
         if let Some(inner) = &self.inner {

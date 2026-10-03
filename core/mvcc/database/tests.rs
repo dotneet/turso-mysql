@@ -8673,6 +8673,19 @@ fn test_commit_dep_threaded_abort_cascades() {
     }
 }
 
+#[cfg(all(unix, not(shuttle)))]
+pub(super) fn this_threads_cpu_time() -> std::time::Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
 /// Hekaton §2.7: multiple readers depending on the same Preparing writer
 /// all cascade-abort when the writer aborts.
 #[test]
