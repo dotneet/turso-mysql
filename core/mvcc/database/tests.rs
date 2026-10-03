@@ -4497,6 +4497,73 @@ fn reads_among_rows_changed_since_the_checkpoint_check_only_the_b_tree_rows_they
     assert_eq!(rows_and_checks("SELECT count(*) FROM t").0, vec![999]);
 }
 
+#[test]
+fn a_lookup_by_key_steps_over_no_b_tree_rows_past_that_key() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INT PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 1..=1000 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for id in 400..=600 {
+        conn.execute(format!("DELETE FROM t WHERE id = {id}"))
+            .unwrap();
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id} + 1000)"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    let rows_and_steps = |sql: &str| -> (Vec<i64>, u64) {
+        crate::mvcc::cursor::BTREE_ROWS_STEPPED.with(|stepped| stepped.set(0));
+        let rows = conn
+            .prepare(sql)
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .into_iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        (
+            rows,
+            crate::mvcc::cursor::BTREE_ROWS_STEPPED.with(|stepped| stepped.get()),
+        )
+    };
+
+    let (rows, stepped) = rows_and_steps("SELECT v FROM t WHERE id = 450");
+    assert_eq!(rows, vec![1450]);
+    assert!(
+        stepped <= 1,
+        "the lookup stepped over {stepped} B-tree rows"
+    );
+    let (rows, stepped) = rows_and_steps("SELECT v FROM t WHERE id = 300");
+    assert_eq!(rows, vec![300]);
+    assert!(
+        stepped <= 1,
+        "the lookup stepped over {stepped} B-tree rows"
+    );
+    assert_eq!(
+        rows_and_steps("SELECT count(*) FROM t WHERE id BETWEEN 390 AND 410").0,
+        vec![21]
+    );
+    conn.execute("DELETE FROM t WHERE id = 455").unwrap();
+    assert_eq!(
+        rows_and_steps("SELECT v FROM t WHERE id = 455").0,
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        rows_and_steps("SELECT v FROM t WHERE id = 456").0,
+        vec![1456]
+    );
+    assert_eq!(rows_and_steps("SELECT count(*) FROM t").0, vec![999]);
+}
+
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
 /// Why this matters: table and index roots are published independently, and stale index bytecode must not survive checkpoint.
 #[test]

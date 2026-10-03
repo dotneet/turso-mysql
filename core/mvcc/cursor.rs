@@ -32,6 +32,7 @@ pub(crate) use scan_locks::{RangeEnd, RecordLock, UndoneInsertNeighbor};
 #[cfg(test)]
 thread_local! {
     pub(crate) static BTREE_ROWS_CHECKED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static BTREE_ROWS_STEPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone)]
@@ -1106,6 +1107,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 Some(AdvanceBtreeState::NextBtree) => {
                     let peek = &mut self.dual_peek;
                     return_if_io!(self.btree_cursor.next());
+                    count_a_b_tree_step();
                     let found = self.btree_cursor.has_record();
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
@@ -1198,6 +1200,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
                     return_if_io!(self.btree_cursor.prev());
+                    count_a_b_tree_step();
                     let peek = &mut self.dual_peek;
                     let found = self.btree_cursor.has_record();
                     if !found {
@@ -1369,6 +1372,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                         }
                     }
                 }
+                SeekBtreeState::AdvanceBTree if op.eq_only() => {
+                    return_if_io!(match direction {
+                        IterationDirection::Forwards => self.btree_cursor.next(),
+                        IterationDirection::Backwards => self.btree_cursor.prev(),
+                    });
+                    count_a_b_tree_step();
+                    self.state.replace(MvccLazyCursorState::Seek(
+                        SeekState::SeekBtree(SeekBtreeState::CheckRow),
+                        direction,
+                    ));
+                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+                }
                 SeekBtreeState::AdvanceBTree => {
                     return_if_io!(match direction {
                         IterationDirection::Forwards => {
@@ -1387,6 +1402,17 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 SeekBtreeState::CheckRow => {
                     let key = self.get_btree_current_key()?;
                     match key {
+                        Some(k)
+                            if op.eq_only()
+                                && !current_pos_matches_seek_key(
+                                    &k,
+                                    &seek_key,
+                                    &self.mv_cursor_type,
+                                )? =>
+                        {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
                         Some(k)
                             if self.version_store_peeks_at(&k)
                                 || self.query_btree_version_is_valid(&k) =>
@@ -2583,4 +2609,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for MvccLazyCursor<Clock
             .field("btree_cursor", &())
             .finish()
     }
+}
+
+fn count_a_b_tree_step() {
+    #[cfg(test)]
+    BTREE_ROWS_STEPPED.with(|stepped| stepped.set(stepped.get() + 1));
 }
