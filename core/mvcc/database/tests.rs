@@ -8542,6 +8542,23 @@ fn a_read_only_commit_draws_no_timestamp() {
 }
 
 #[test]
+fn taking_up_an_unchanged_schema_draws_no_timestamp() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let mvcc_store = db.get_mvcc_store();
+    mvcc_store.enable_row_locks();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert!(get_rows(&conn, "SELECT id FROM t").is_empty());
+    let before = mvcc_store.get_begin_timestamp();
+    conn.take_up_the_latest_schema().unwrap();
+    assert_eq!(mvcc_store.get_begin_timestamp(), before + 1);
+    conn.execute("COMMIT").unwrap();
+}
+
+#[test]
 fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();

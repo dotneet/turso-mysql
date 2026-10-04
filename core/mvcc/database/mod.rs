@@ -7841,7 +7841,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = entry.value();
-        if tx.header_dirty.load(Ordering::Acquire) {
+        if tx.header_dirty.load(Ordering::Acquire) || self.has_the_latest_schema(tx) {
             return Ok(false);
         }
         let mut taken_up = false;
@@ -7865,6 +7865,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             taken_up = true;
         });
         Ok(taken_up)
+    }
+
+    fn has_the_latest_schema(&self, tx: &Transaction<A>) -> bool {
+        let header = self
+            .global_header
+            .read()
+            .expect("global_header is set once a transaction has begun");
+        header.schema_cookie == tx.header.read().schema_cookie
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::FinalizedTxStateInsert)]
