@@ -1,4 +1,5 @@
-use crate::sync::Mutex;
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::RwLock;
 
 /// No-op callback for use with [`LogicalClock::get_timestamp`] when no
 /// action needs to be taken atomically alongside timestamp generation
@@ -16,16 +17,22 @@ pub trait LogicalClock: Send + Sync {
     ///
     /// Pass [`no_op`] when no atomic side-effect is needed (begin timestamps).
     fn get_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64;
+    /// Like [`LogicalClock::get_timestamp`], except that other calls of this
+    /// method may run at the same time: only [`LogicalClock::get_timestamp`]
+    /// callers wait for `f`.
+    fn get_timestamp_beside_other_begins<F: FnOnce(u64)>(&self, f: F) -> u64;
     fn reset(&self, ts: u64);
 }
 
-/// A mutex-guarded clock for concurrent MVCC use.
+/// A lock-guarded clock for concurrent MVCC use.
 ///
 /// The lock is held across the `f` callback in [`get_timestamp`], ensuring
 /// that a commit timestamp is published (e.g. stored as `Preparing(ts)`)
 /// before any other transaction can generate a higher timestamp. This closes
 /// the TOCTOU window between timestamp generation and `Preparing` state
-/// publication in the commit protocol.
+/// publication in the commit protocol. Begins hold the lock shared, so they
+/// run side by side and only wait for, and hold back, the callers of
+/// [`get_timestamp`].
 ///
 /// ## Speculative reads
 ///
@@ -90,14 +97,13 @@ pub trait LogicalClock: Send + Sync {
 /// But it doesn't go into more detail about atomicity here.
 #[derive(Debug, Default)]
 pub struct MvccClock {
-    inner: Mutex<u64>,
+    next: AtomicU64,
+    order: RwLock<()>,
 }
 
 impl MvccClock {
     pub fn new() -> Self {
-        Self {
-            inner: Mutex::new(0),
-        }
+        Self::default()
     }
 
     /// Generate a begin timestamp. No side-effect needed alongside generation.
@@ -114,14 +120,80 @@ impl MvccClock {
 
 impl LogicalClock for MvccClock {
     fn get_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
-        let mut guard = self.inner.lock();
-        let ts = *guard;
-        *guard += 1;
+        let _alone = self.order.write();
+        let ts = self.next.fetch_add(1, Ordering::AcqRel);
+        f(ts);
+        ts
+    }
+
+    fn get_timestamp_beside_other_begins<F: FnOnce(u64)>(&self, f: F) -> u64 {
+        let _with_other_begins = self.order.read();
+        let ts = self.next.fetch_add(1, Ordering::AcqRel);
         f(ts);
         ts
     }
 
     fn reset(&self, ts: u64) {
-        *self.inner.lock() = ts;
+        let _alone = self.order.write();
+        self.next.store(ts, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{no_op, LogicalClock, MvccClock};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn begins_run_side_by_side_and_a_commit_waits_for_them() {
+        let clock = Arc::new(MvccClock::new());
+        let (inside_send, inside) = mpsc::channel();
+        let (let_go, wait_to_go) = mpsc::channel::<()>();
+        let first_begin = {
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                clock.get_timestamp_beside_other_begins(|_| {
+                    inside_send.send(()).unwrap();
+                    wait_to_go.recv().unwrap();
+                })
+            })
+        };
+        inside.recv().unwrap();
+        let (second_send, second) = mpsc::channel();
+        {
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                second_send
+                    .send(clock.get_timestamp_beside_other_begins(no_op))
+                    .unwrap()
+            });
+        }
+        let second_begin = second
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a begin must not wait for another begin");
+
+        let commit_drawn = Arc::new(AtomicBool::new(false));
+        let commit = {
+            let clock = Arc::clone(&clock);
+            let commit_drawn = Arc::clone(&commit_drawn);
+            std::thread::spawn(move || {
+                let ts = clock.get_timestamp(no_op);
+                commit_drawn.store(true, Ordering::SeqCst);
+                ts
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !commit_drawn.load(Ordering::SeqCst),
+            "a commit timestamp must wait for a begin still publishing"
+        );
+
+        let_go.send(()).unwrap();
+        let first_begin = first_begin.join().unwrap();
+        let commit = commit.join().unwrap();
+        assert_ne!(first_begin, second_begin);
+        assert!(commit > first_begin && commit > second_begin);
     }
 }

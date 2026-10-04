@@ -8520,6 +8520,28 @@ fn test_read_only_commit_does_not_cache_finalized_state() {
 }
 
 #[test]
+fn a_read_only_commit_draws_no_timestamp() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&conn, "SELECT v FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    let reader = conn.get_mv_tx_id().unwrap();
+    let begin_ts = mvcc_store.txs.get(&reader).unwrap().value().begin_ts();
+    conn.execute("COMMIT").unwrap();
+
+    assert!(mvcc_store.txs.get(&reader).is_none());
+    assert_eq!(mvcc_store.get_begin_timestamp(), begin_ts + 1);
+}
+
+#[test]
 fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();

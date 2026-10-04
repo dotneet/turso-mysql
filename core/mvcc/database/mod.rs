@@ -3287,6 +3287,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // Read only is not only exclusive to empty write set, we could be writing the
                 // database header here.
                 let read_only = write_set_is_empty && !header_write;
+                if read_only {
+                    return self.commit_read_only(mvcc_store, tx);
+                }
 
                 let mut schema_conflict = false;
                 let mut exclusive_conflict = false;
@@ -3353,12 +3356,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
 
                     let can_commit_tx = !(exclusive_conflict || schema_conflict);
-                    if can_commit_tx || read_only {
+                    if can_commit_tx {
                         tx.state.store(TransactionState::Preparing(ts));
                     }
                 });
-                // We allow reads from happening. Exlusive means there is a single writer.
-                if exclusive_conflict && !read_only {
+                if exclusive_conflict {
                     if mvcc_store
                         .writers_wait_for_exclusive_tx
                         .load(Ordering::SeqCst)
@@ -3367,7 +3369,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     }
                     return Err(LimboError::WriteWriteConflict);
                 }
-                if schema_conflict && !read_only {
+                if schema_conflict {
                     return Err(LimboError::SchemaConflict);
                 }
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
@@ -3454,42 +3456,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                  ** 2. Validate if there are no phantoms by walking the scans from scan_set
                  */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
-                // Header-only writes must not take this fast path; they need durable log records.
-                if read_only {
-                    turso_assert!(
-                        tx.commit_dep_set.lock().is_empty(),
-                        "MVCC read only transaction should not have commit dependencies on other txns"
-                    );
-                    // Abort eagerly if requested
-                    if tx.abort_now.load(Ordering::Acquire) {
-                        return Err(LimboError::CommitDependencyAborted);
-                    }
-                    // Even read-only transactions must honour commit dependencies.
-                    // A SELECT during normal processing may have speculatively read
-                    // from a Preparing transaction (Hekaton §2.7), incrementing our
-                    // CommitDepCounter. We must wait for those to resolve.
-                    if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
-                        // Unresolved dependencies — skip validation (no writes)
-                        // and go straight to WaitForDependencies.
-                        self.state = CommitState::WaitForDependencies { end_ts };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    // Check abort_now AFTER counter: rollback_tx stores abort_now
-                    // (Release) before fetch_sub (AcqRel). Once counter == 0, all
-                    // decrements have completed and the abort_now flag is visible.
-                    if tx.abort_now.load(Ordering::Acquire) {
-                        return Err(LimboError::CommitDependencyAborted);
-                    }
-                    tx.state.store(TransactionState::Committed(end_ts));
-                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                        mvcc_store.release_exclusive_tx(&self.tx_id);
-                    }
-                    mvcc_store.unlock_commit_lock_if_held(tx);
-                    mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
-                    inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                    self.finalize(mvcc_store)?;
-                    return Ok(TransitionResult::Done(()));
-                }
                 self.state = CommitState::Commit { end_ts };
                 inject_transition_yield!(self, CommitYieldPoint::CommitValidation);
                 Ok(TransitionResult::Continue)
@@ -3985,6 +3951,53 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
     fn is_finalized(&self) -> bool {
         self.is_finalized
+    }
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
+    /// Header-only writes must not take this path; they need durable log records.
+    fn commit_read_only(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+        tx: &Transaction<A>,
+    ) -> Result<TransitionResult<()>> {
+        let commits_at_its_snapshot = tx.begin_ts();
+        turso_assert!(
+            tx.commit_dep_set.lock().is_empty(),
+            "MVCC read only transaction should not have commit dependencies on other txns"
+        );
+        // Abort eagerly if requested
+        if tx.abort_now.load(Ordering::Acquire) {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        // Even read-only transactions must honour commit dependencies.
+        // A SELECT during normal processing may have speculatively read
+        // from a Preparing transaction (Hekaton §2.7), incrementing our
+        // CommitDepCounter. We must wait for those to resolve.
+        if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
+            // Unresolved dependencies — skip validation (no writes)
+            // and go straight to WaitForDependencies.
+            self.state = CommitState::WaitForDependencies {
+                end_ts: commits_at_its_snapshot,
+            };
+            return Ok(TransitionResult::Continue);
+        }
+        // Check abort_now AFTER counter: rollback_tx stores abort_now
+        // (Release) before fetch_sub (AcqRel). Once counter == 0, all
+        // decrements have completed and the abort_now flag is visible.
+        if tx.abort_now.load(Ordering::Acquire) {
+            return Err(LimboError::CommitDependencyAborted);
+        }
+        tx.state
+            .store(TransactionState::Committed(commits_at_its_snapshot));
+        if mvcc_store.is_exclusive_tx(&self.tx_id) {
+            mvcc_store.release_exclusive_tx(&self.tx_id);
+        }
+        mvcc_store.unlock_commit_lock_if_held(tx);
+        mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
+        inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
+        self.finalize(mvcc_store)?;
+        Ok(TransitionResult::Done(()))
     }
 }
 
@@ -7077,7 +7090,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             pager.mvcc_refresh_if_db_changed();
             let read_mark = WalPos::from_pair(pager.wal_pos());
             let mut schema_stale = false;
-            let begin_ts = self.clock.get_timestamp(|ts| {
+            let begin_ts = self.clock.get_timestamp_beside_other_begins(|ts| {
                 let schema_generation = self.schema_generation();
                 if expected_schema_generation.is_some_and(|exp| exp != schema_generation) {
                     schema_stale = true;
@@ -7304,7 +7317,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         pager.mvcc_refresh_if_db_changed();
         let read_mark = WalPos::from_pair(pager.wal_pos());
         let mut schema_stale = false;
-        let begin_ts = self.clock.get_timestamp(|ts| {
+        let begin_ts = self.clock.get_timestamp_beside_other_begins(|ts| {
             // Capture header (cookie) + schema_generation INSIDE the clock so they are
             // consistent with the root map at insert time: a passive publish runs under this
             // same clock, so it cannot interleave between this capture and the insert.
