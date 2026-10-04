@@ -2840,6 +2840,149 @@ mod tests {
         Ok(())
     }
 
+    /// A table written again takes a counter of its own. Whatever writes it
+    /// again — a change of its key, a table that starts counting, a column
+    /// placed first, `OPTIMIZE TABLE` — a crash right after the statement
+    /// commits leaves that counter past every id the rows hold, so the next
+    /// row takes a number no row has. A table made with `AUTO_INCREMENT=50`
+    /// starts there after the same crash.
+    #[test]
+    fn a_crash_right_after_a_table_is_written_again_hands_out_no_id_a_row_holds() -> CoreResult<()>
+    {
+        const COUNTED: &str =
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(20))";
+        for (made, written_again, next) in [
+            (
+                COUNTED,
+                "ALTER TABLE users MODIFY id BIGINT NOT NULL AUTO_INCREMENT",
+                4,
+            ),
+            (
+                "CREATE TABLE users (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+                "ALTER TABLE users MODIFY id INT NOT NULL AUTO_INCREMENT",
+                4,
+            ),
+            (COUNTED, "ALTER TABLE users ADD COLUMN note INT FIRST", 4),
+            (COUNTED, "OPTIMIZE TABLE users", 4),
+        ] {
+            for power_lost in [false, true] {
+                let directory = private_tempdir();
+                let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+                catalog.create("kept").unwrap();
+                let mut session = catalog.new_session(binary_context());
+                session.select_database("kept").unwrap();
+                let connection = session.connection().unwrap();
+                if power_lost && !connection.inner().mvcc_enabled() {
+                    continue;
+                }
+                connection.execute_schema_ddl(made).unwrap();
+                connection.execute(
+                    "INSERT INTO users (id, name) VALUES (1, 'ann'), (2, 'bob'), (3, 'cy')",
+                )?;
+                let committed = a_crash_right_after_the_commit_of(directory.path(), || {
+                    match written_again.strip_prefix("OPTIMIZE TABLE ") {
+                        Some(table) => connection
+                            .write_the_table_again_as_it_stands(
+                                &turso_mysql_parser::MySqlTableName::parse(table).unwrap(),
+                            )
+                            .unwrap(),
+                        None => connection.execute_schema_ddl(written_again).unwrap(),
+                    }
+                });
+
+                drop((session, catalog));
+                put_back(directory.path(), committed);
+                if power_lost {
+                    lose_the_unsynced_counter_records(directory.path());
+                }
+                assert_eq!(
+                    next_user_id_in(directory.path())?,
+                    next,
+                    "{written_again}, power lost: {power_lost}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_crash_right_after_a_table_counting_from_fifty_is_made_starts_it_at_fifty() -> CoreResult<()>
+    {
+        for made in [
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT) AUTO_INCREMENT=50",
+            "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT, KEY by_n (n)) AUTO_INCREMENT=50",
+        ] {
+            let directory = private_tempdir();
+            let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+            catalog.create("kept").unwrap();
+            let mut session = catalog.new_session(binary_context());
+            session.select_database("kept").unwrap();
+            let connection = session.connection().unwrap();
+            let mode = connection.parser_mode();
+            let committed = a_crash_right_after_the_commit_of(directory.path(), || {
+                match turso_mysql_parser::parse_optional_create_table_with_keys(made, mode)
+                    .unwrap()
+                {
+                    Some(checked) => connection.execute_create_table_with_keys(&checked),
+                    None => connection.execute_schema_ddl(made),
+                }
+                .unwrap()
+            });
+
+            drop((session, catalog));
+            put_back(directory.path(), committed);
+            let catalog = MySqlDatabaseCatalog::open(directory.path()).unwrap();
+            let mut session = catalog.new_session(binary_context());
+            session.select_database("kept").unwrap();
+            let connection = session.connection().unwrap();
+            connection.execute("INSERT INTO users (n) VALUES (1)")?;
+            assert_eq!(connection.last_insert_id(), 50, "{made}");
+        }
+        Ok(())
+    }
+
+    /// What the database's files hold right after `statement` commits its
+    /// schema change, which is what a crash right then leaves.
+    fn a_crash_right_after_the_commit_of(
+        directory: &Path,
+        statement: impl FnOnce(),
+    ) -> std::collections::HashMap<std::path::PathBuf, Vec<u8>> {
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let watch = {
+            let seen = seen.clone();
+            let directory = directory.to_owned();
+            crate::session::watch_crash_points(move |point| {
+                assert_eq!(point, crate::session::CrashPoint::SchemaChangeCommitted);
+                seen.borrow_mut()
+                    .get_or_insert_with(|| contents_of(&directory));
+            })
+        };
+        statement();
+        drop(watch);
+        let committed = seen.borrow_mut().take();
+        committed.expect("the statement committed a schema change")
+    }
+
+    /// Cuts the counter's sidecar back to its header, which is what a power
+    /// loss leaves of records an MVCC database's commits carry and nothing
+    /// synced yet.
+    fn lose_the_unsynced_counter_records(directory: &Path) {
+        let counter = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.to_string_lossy()
+                    .ends_with(".turso-mysql-auto-increment")
+            })
+            .unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(counter)
+            .unwrap()
+            .set_len(32)
+            .unwrap();
+    }
+
     /// Writes rows into a database the catalog opens in MVCC: the catalog
     /// hands the engine a log it finds there whatever the switch says.
     fn an_mvcc_database_with_rows(directory: &Path) -> CoreResult<()> {

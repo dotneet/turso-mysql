@@ -353,33 +353,24 @@ impl MySqlConnection {
             &triggers,
         );
         self.set_foreign_key_checks(checks);
-        let high_water = match written {
-            Ok(high_water) => high_water,
-            Err(error) => {
-                self.run_internal("ROLLBACK")?;
-                return Err(error);
-            }
-        };
+        if let Err(error) = written {
+            self.run_internal("ROLLBACK")?;
+            return Err(error);
+        }
         self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
         if !self.inner.get_auto_commit() {
             self.run_internal("ROLLBACK")?;
-        }
-        if let Some(high_water) = high_water.filter(|high_water| *high_water > 0) {
-            let Some(counted) = self
-                .load_auto_increment_table(table)
-                .map_err(MySqlQueryError::Engine)?
-            else {
-                return Err(MySqlQueryError::Engine(LimboError::InternalError(
-                    "a table written again to count stopped counting".to_string(),
-                )));
-            };
-            self.advance_auto_increment_past(&counted, high_water, None)?;
         }
         Ok(())
     }
 
-    /// The statements a table's rewrite is made of. Answers where the new
-    /// table's counter is to stand, for a table that counts.
+    /// The statements a table's rewrite is made of.
+    ///
+    /// The table written again takes a counter of its own, which starts at
+    /// one, so it is moved past every id the rows hold before the
+    /// transaction commits: a crash after the commit then finds the counter
+    /// already there, and one before it finds the old table and its counter.
     #[allow(clippy::too_many_arguments)]
     fn write_the_table_again_in_this_transaction(
         &self,
@@ -390,7 +381,7 @@ impl MySqlConnection {
         counter_before: Option<u64>,
         indexes: &[StoredIndexStatement],
         triggers: &[StoredTrigger],
-    ) -> std::result::Result<Option<u64>, MySqlQueryError> {
+    ) -> std::result::Result<(), MySqlQueryError> {
         for trigger in triggers {
             self.drop_a_trigger_to_write_again(&trigger.name)?;
         }
@@ -440,7 +431,7 @@ impl MySqlConnection {
             self.write_a_trigger_again(trigger)?;
         }
         let Some(numbered) = numbered else {
-            return Ok(None);
+            return Ok(());
         };
         // Measured on MySQL 8.4.11: a table that counted before counts on
         // from where it stood, `AUTO_INCREMENT=100` kept over rows reaching
@@ -449,7 +440,26 @@ impl MySqlConnection {
         let kept = counter_before
             .filter(|_| rewrite.counted_before.is_some())
             .unwrap_or(0);
-        Ok(Some(numbered.max(highest).max(kept)))
+        self.move_the_new_counter_past(table, numbered.max(highest).max(kept))
+    }
+
+    pub(super) fn move_the_new_counter_past(
+        &self,
+        table: &str,
+        high_water: u64,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        if high_water == 0 {
+            return Ok(());
+        }
+        let Some(counted) = self
+            .load_auto_increment_table(table)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Err(MySqlQueryError::Engine(LimboError::InternalError(
+                "a table written again to count stopped counting".to_string(),
+            )));
+        };
+        self.advance_auto_increment_past(&counted, high_water, None)
     }
 
     /// Whether a value too long for its column was copied from a column of

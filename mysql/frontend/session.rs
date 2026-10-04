@@ -312,6 +312,18 @@ struct AfterTheCopy {
     rename_the_new_one: Option<String>,
 }
 
+/// What one table's rewrite runs, in the order it runs them.
+struct RewriteStatements<'a> {
+    before: &'a [String],
+    copy: &'a str,
+    after_copy: &'a AfterTheCopy,
+    copied_into: &'a str,
+    indexes: &'a [StoredIndexStatement],
+    table: &'a str,
+    /// Where the old table's counter stood, for a table that counts.
+    counter: Option<u64>,
+}
+
 /// Whether a table's rewrite commits on its own, or runs inside the
 /// transaction an `ALTER TABLE` of several clauses holds for all of them.
 #[derive(Clone, Copy)]
@@ -5456,7 +5468,15 @@ impl MySqlConnection {
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
-        let result = statement.run_ignore_rows().map_err(MySqlQueryError::Engine);
+        let result = match &counter_start {
+            Some((table, start)) => {
+                self.create_a_table_counting_from(&mut statement, table, *start)
+            }
+            None => statement
+                .run_ignore_rows()
+                .map(|_| ())
+                .map_err(MySqlQueryError::Engine),
+        };
         drop(statement);
         if !self.inner.get_auto_commit() {
             self.inner
@@ -5464,10 +5484,29 @@ impl MySqlConnection {
                 .and_then(|mut statement| statement.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
-        result?;
-        if let Some((table, start)) = counter_start {
-            self.start_the_counter(&table, start)?;
+        result
+    }
+
+    /// Makes a table whose first row is to take `start`, moving its counter
+    /// in the transaction that makes it, so no crash leaves the table there
+    /// with its counter still at one.
+    fn create_a_table_counting_from(
+        &self,
+        create: &mut Statement,
+        table: &str,
+        start: u64,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.run_internal("BEGIN")?;
+        let made = create
+            .run_ignore_rows()
+            .map_err(MySqlQueryError::Engine)
+            .and_then(|_| self.start_the_counter(table, start));
+        if made.is_err() {
+            self.run_internal("ROLLBACK")?;
+            return made;
         }
+        self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
         Ok(())
     }
 
@@ -5867,57 +5906,45 @@ impl MySqlConnection {
         );
         let checks = self.inner.foreign_keys_enabled();
         self.set_foreign_key_checks(false);
-        let written = match commits {
-            TableRewriteCommits::OnItsOwn => self.write_the_table_again_between_commits(
-                &before,
-                &copy,
-                &after_copy,
-                &copied_into,
-                &indexes,
-            ),
+        let statements = RewriteStatements {
+            before: &before,
+            copy: &copy,
+            after_copy: &after_copy,
+            copied_into: &copied_into,
+            indexes: &indexes,
+            table,
+            counter,
+        };
+        let applied = match commits {
+            TableRewriteCommits::OnItsOwn => {
+                self.write_the_table_again_between_commits(&statements)
+            }
             TableRewriteCommits::InTheCallersTransaction => {
-                self.write_the_table_again_now(&before, &copy, &after_copy, &copied_into, &indexes)
+                self.write_the_table_again_now(&statements)
             }
         };
         self.set_foreign_key_checks(checks);
-        written?;
-        // The table counts from where it counted before: a table made again
-        // takes an allocator of its own, which starts at one.
-        if let Some(high_water) = counter {
-            let Some(table) = self
-                .load_auto_increment_table(table)
-                .map_err(MySqlQueryError::Engine)?
-            else {
-                return Err(MySqlQueryError::Engine(LimboError::InternalError(
-                    "a counted table stopped counting when it was written again".to_string(),
-                )));
-            };
-            self.advance_auto_increment_past(&table, high_water, None)?;
-        }
-        Ok(())
+        applied
     }
 
     /// Runs the statements one table's rewrite is made of, inside one
     /// transaction, with the rows carried across between them.
     fn write_the_table_again_between_commits(
         &self,
-        before: &[String],
-        copy: &str,
-        after_copy: &AfterTheCopy,
-        copied_into: &str,
-        after: &[StoredIndexStatement],
+        statements: &RewriteStatements<'_>,
     ) -> std::result::Result<(), MySqlQueryError> {
         // DDL commits what came before it, which is what MySQL does.
         if !self.inner.get_auto_commit() {
             self.run_internal("COMMIT")?;
         }
         self.run_internal("BEGIN")?;
-        let applied = self.write_the_table_again_now(before, copy, after_copy, copied_into, after);
+        let applied = self.write_the_table_again_now(statements);
         if applied.is_err() {
             self.run_internal("ROLLBACK")?;
             return applied;
         }
         self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
         if !self.inner.get_auto_commit() {
             self.run_internal("ROLLBACK")?;
         }
@@ -5927,14 +5954,12 @@ impl MySqlConnection {
     /// The statements one table's rewrite is made of, in order.
     ///
     /// The old table is dropped before its indexes are written again, holding
-    /// their names until then.
+    /// their names until then. A table made again takes a counter of its own,
+    /// which starts at one, so it is moved to where the old one stood before
+    /// the transaction commits.
     fn write_the_table_again_now(
         &self,
-        before: &[String],
-        copy: &str,
-        after_copy: &AfterTheCopy,
-        copied_into: &str,
-        after: &[StoredIndexStatement],
+        statements: &RewriteStatements<'_>,
     ) -> std::result::Result<(), MySqlQueryError> {
         let run = |statement: &String| -> std::result::Result<(), MySqlQueryError> {
             self.prepare(statement)
@@ -5942,15 +5967,23 @@ impl MySqlConnection {
                 .map(|_| ())
                 .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
         };
-        before.iter().try_for_each(run)?;
-        self.carry_the_rows_across(copy, copied_into)?;
-        self.run_internal(&after_copy.drop_the_old_table)?;
-        after_copy.rename_the_new_one.iter().try_for_each(run)?;
-        after.iter().try_for_each(|index| {
+        statements.before.iter().try_for_each(run)?;
+        self.carry_the_rows_across(statements.copy, statements.copied_into)?;
+        self.run_internal(&statements.after_copy.drop_the_old_table)?;
+        statements
+            .after_copy
+            .rename_the_new_one
+            .iter()
+            .try_for_each(run)?;
+        statements.indexes.iter().try_for_each(|index| {
             self.prepare_with_index_origin(&index.sql, index.implicit)
                 .and_then(|mut prepared| prepared.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)
-        })
+        })?;
+        match statements.counter {
+            Some(high_water) => self.move_the_new_counter_past(statements.table, high_water),
+            None => Ok(()),
+        }
     }
 
     /// Moves the rows of the table set aside into the one written again.
@@ -6327,6 +6360,7 @@ impl MySqlConnection {
             return applied;
         }
         self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
         if !self.inner.get_auto_commit() {
             self.run_internal("ROLLBACK")?;
         }
@@ -6524,7 +6558,14 @@ impl MySqlConnection {
             self.run_internal("COMMIT")?;
         }
         self.run_internal("BEGIN")?;
-        let applied = self.apply_create_table_with_keys(checked);
+        // The counter moves in the transaction that makes the table, so no
+        // crash leaves the table there with its counter still at one.
+        let applied =
+            self.apply_create_table_with_keys(checked)
+                .and_then(|()| match &counter_start {
+                    Some((table, start)) => self.start_the_counter(table, *start),
+                    None => Ok(()),
+                });
         if applied.is_err() {
             // A failed rollback leaves the connection in a state the caller
             // cannot reason about, so it replaces the original error.
@@ -6532,11 +6573,9 @@ impl MySqlConnection {
             return applied;
         }
         self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
         if !self.inner.get_auto_commit() {
             self.run_internal("ROLLBACK")?;
-        }
-        if let Some((table, start)) = counter_start {
-            self.start_the_counter(&table, start)?;
         }
         Ok(())
     }
@@ -16599,6 +16638,53 @@ fn new_allocator_identity() -> Result<[u8; 16]> {
             return Ok(identity);
         }
     }
+}
+
+/// A moment between two durable steps of a statement, where a test looks at
+/// what a crash right then would leave on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrashPoint {
+    /// A schema change has just committed, and the statement has not yet
+    /// returned.
+    SchemaChangeCommitted,
+}
+
+#[cfg(test)]
+type CrashPointWatcher = Box<dyn FnMut(CrashPoint)>;
+
+#[cfg(test)]
+thread_local! {
+    static CRASH_POINT_WATCHER: std::cell::RefCell<Option<CrashPointWatcher>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lets `watcher` see every crash point this thread reaches until the
+/// answer is dropped.
+#[cfg(test)]
+pub(crate) fn watch_crash_points(watcher: impl FnMut(CrashPoint) + 'static) -> CrashPointWatch {
+    CRASH_POINT_WATCHER.with(|slot| *slot.borrow_mut() = Some(Box::new(watcher)));
+    CrashPointWatch
+}
+
+#[cfg(test)]
+pub(crate) struct CrashPointWatch;
+
+#[cfg(test)]
+impl Drop for CrashPointWatch {
+    fn drop(&mut self) {
+        CRASH_POINT_WATCHER.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+fn crash_point(point: CrashPoint) {
+    #[cfg(test)]
+    CRASH_POINT_WATCHER.with(|slot| {
+        if let Some(watcher) = slot.borrow_mut().as_mut() {
+            watcher(point);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = point;
 }
 
 #[cfg(test)]

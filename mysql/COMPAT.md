@@ -4039,7 +4039,12 @@ finds its rows by is 1553; on the table's own foreign key column, a change of ty
 `AUTO_INCREMENT` 1832, and dropping the only key the foreign key's rows are found by 1553, while
 the index made for that foreign key goes once a key added over its columns finds them. As in
 MySQL, the statement waits for the table's metadata lock under MVCC, and commits what came
-before it.
+before it. The table made again counts with a counter of its own, which is moved past every id
+the rows hold in the same transaction that makes the table, so a crash at any moment leaves
+either the old table with its counter or the new one with its counter in place: under MVCC the
+commit carries the counter's mark, and in WAL mode the mark is synced before the commit. A
+`CREATE TABLE ... AUTO_INCREMENT=n` moves its counter in the transaction that makes the table
+the same way.
 
 An `INSERT` into an `AUTO_INCREMENT` table takes its ids once its first row is filled and
 before it waits for a key or a gap another transaction holds, as InnoDB does: measured on 8.4.11,
