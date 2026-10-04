@@ -1257,7 +1257,11 @@ impl MySqlConnection {
     /// Gives the table written again the name of the one it replaces.
     ///
     /// The engine's rename is asked for directly: nothing else names the new
-    /// table's own name, so no view or trigger has text the rename changes.
+    /// table's own name, so no view or trigger has text the rename changes,
+    /// and each is kept exactly as it was stored. The engine writes every
+    /// trigger again over a rename, which the session's own formatter refuses
+    /// for one made through this frontend, so a trigger of another table
+    /// would otherwise refuse the rewrite.
     fn rename_the_table_written_again(
         &self,
         made_new: &str,
@@ -1273,7 +1277,9 @@ impl MySqlConnection {
             .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser {
                 mode: self.parser_mode(),
             }))
-            .with_schema_sql_formatter(Arc::new(self.schema_context));
+            .with_schema_sql_formatter(Arc::new(ViewsAndTriggersKeptAsStored {
+                context: self.schema_context,
+            }));
         self.inner
             .prepare_translated_stmt_with_options(
                 statement,
@@ -1379,5 +1385,32 @@ impl SchemaSqlFormatter for StoredSchemaSqlFormatter {
     ) -> Result<String> {
         self.context
             .format_rewritten_schema_sql(kind, previous_sql, stmt)
+    }
+}
+
+/// Writes the rows a rename of a table written again touches: the table as
+/// the session writes it, and every view and trigger exactly as it was
+/// stored, none of them naming the name the table had until then.
+struct ViewsAndTriggersKeptAsStored {
+    context: SchemaSqlSessionContext,
+}
+
+impl SchemaSqlFormatter for ViewsAndTriggersKeptAsStored {
+    fn format_schema_sql(&self, kind: SchemaSqlKind, input: &str, stmt: &Stmt) -> Result<String> {
+        self.context.format_schema_sql(kind, input, stmt)
+    }
+
+    fn format_rewritten_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        previous_sql: &str,
+        stmt: &Stmt,
+    ) -> Result<String> {
+        match kind {
+            SchemaSqlKind::View | SchemaSqlKind::Trigger => Ok(previous_sql.to_owned()),
+            _ => self
+                .context
+                .format_rewritten_schema_sql(kind, previous_sql, stmt),
+        }
     }
 }

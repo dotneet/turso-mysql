@@ -676,6 +676,41 @@ fn triggers_and_views_stand_through_a_key_change() {
     );
 }
 
+/// A trigger of a table the statement does not touch, naming none of the
+/// tables it writes again, stands as it was made through every rewrite and
+/// fires as before.
+#[test]
+fn a_trigger_of_another_table_stands_through_a_rewrite() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE keyed (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE placed (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        "CREATE TABLE logged (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, n INT)",
+        "CREATE TABLE seen (n INT)",
+        "CREATE TRIGGER logged_ai AFTER INSERT ON logged FOR EACH ROW INSERT INTO seen (n) VALUES (NEW.n)",
+        "INSERT INTO keyed VALUES (1, 1)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let made_as = rows(&mut adapter, "SHOW CREATE TRIGGER logged_ai");
+    for sql in [
+        "ALTER TABLE keyed MODIFY id BIGINT NOT NULL",
+        "ALTER TABLE placed ADD COLUMN z INT FIRST",
+        "ALTER TABLE placed CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+        "OPTIMIZE TABLE keyed",
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(
+            rows(&mut adapter, "SHOW CREATE TRIGGER logged_ai"),
+            made_as,
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "INSERT INTO logged (n) VALUES (5)");
+    assert_eq!(rows(&mut adapter, "SELECT n FROM seen"), [["5"]]);
+    assert_eq!(rows(&mut adapter, "SELECT id, v FROM keyed"), [["1", "1"]]);
+}
+
 /// A column placed `FIRST` or `AFTER` another, a `CHECK` added and dropped,
 /// and `CONVERT TO CHARACTER SET` write a table with a trigger and views
 /// again as a change of its key does: the trigger stands as it was made and
