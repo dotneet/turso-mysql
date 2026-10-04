@@ -711,6 +711,9 @@ impl CheckedAutoIncrementInsert {
                     AutoIncrementSourceValue::Written(CheckedInsertValue::UnsignedInteger(id)) => {
                         Ok(AutoIncrementRowValue::Explicit(id as i128))
                     }
+                    AutoIncrementSourceValue::Written(CheckedInsertValue::PastEveryInteger(id)) => {
+                        Ok(AutoIncrementRowValue::Explicit(id))
+                    }
                     AutoIncrementSourceValue::Parameter(ordinal) => {
                         Ok(AutoIncrementRowValue::Parameter(ordinal))
                     }
@@ -5807,12 +5810,25 @@ pub enum CheckedInsertValue {
     SignedInteger(i64),
     /// A nonnegative whole number above the engine's signed width.
     UnsignedInteger(u64),
+    /// A whole number past every integer column, below `BIGINT`'s least or
+    /// above `BIGINT UNSIGNED`'s most, held at the nearest `i128` where it
+    /// is past that too.
+    PastEveryInteger(i128),
     /// A written NULL.
     Null,
     /// A written `DEFAULT`, which asks for the column's own default.
     Default,
     /// Anything else, a value bound at execution time included.
     Other,
+}
+
+/// Whether one MySQL `INSERT` is written `INSERT IGNORE`, which turns the
+/// errors its rows meet into warnings.
+pub fn insert_ignores_errors(sql: &str, mode: SessionSqlMode) -> bool {
+    matches!(
+        read_one_statement(sql, mode).as_ref(),
+        Ok(Statement::Insert(insert)) if insert.ignore
+    )
 }
 
 /// Returns what each row of one MySQL `INSERT` writes into `column`, or `None`
@@ -5890,7 +5906,37 @@ fn written_insert_value(value: &Expr, column: &str) -> CheckedInsertValue {
             },
             _ => None,
         })
+        .or_else(|| whole_number_past_every_integer(value))
         .unwrap_or(CheckedInsertValue::Other)
+}
+
+/// A written whole number no integer column holds, such as
+/// `-9223372036854775809` or `18446744073709551616`.
+fn whole_number_past_every_integer(value: &Expr) -> Option<CheckedInsertValue> {
+    let (negative, literal) = match value {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => (false, expr.as_ref()),
+        literal => (false, literal),
+    };
+    let Expr::Value(literal) = literal else {
+        return None;
+    };
+    let Value::Number(digits, false) = &literal.value else {
+        return None;
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = digits.parse::<i128>().unwrap_or(i128::MAX);
+    let number = if negative { -magnitude } else { magnitude };
+    (number < i128::from(i64::MIN) || number > i128::from(u64::MAX))
+        .then_some(CheckedInsertValue::PastEveryInteger(number))
 }
 
 /// Returns the unqualified target of one MySQL `INSERT`, without accepting it

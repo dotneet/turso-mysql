@@ -10376,3 +10376,30 @@ fn prisma_catalog_reads_are_recognized_and_nothing_near_them() {
         assert_eq!(read(other), None, "{other}");
     }
 }
+
+/// A whole number no integer column holds is read as one, so a counted column
+/// can answer it 1264 the way MySQL 8.4.11 does, where reading it as some
+/// other value would refuse the statement for the wrong reason.
+#[test]
+fn a_written_id_past_every_integer_is_read_as_a_whole_number() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO t (id, v) VALUES (1, 0), (-9223372036854775809, 0), \
+               (9223372036854775808, 0), (18446744073709551616, 0), ('7', 0), \
+               (+99999999999999999999999999999999999999999, 0)";
+    assert_eq!(
+        parse_insert_values_written_into(sql, mode, "id").unwrap(),
+        Some(vec![
+            CheckedInsertValue::SignedInteger(1),
+            CheckedInsertValue::PastEveryInteger(-9_223_372_036_854_775_809),
+            CheckedInsertValue::UnsignedInteger(9_223_372_036_854_775_808),
+            CheckedInsertValue::PastEveryInteger(18_446_744_073_709_551_616),
+            CheckedInsertValue::Other,
+            CheckedInsertValue::PastEveryInteger(i128::MAX),
+        ])
+    );
+    assert!(insert_ignores_errors(
+        "INSERT IGNORE INTO t VALUES (1, 0)",
+        mode
+    ));
+    assert!(!insert_ignores_errors("INSERT INTO t VALUES (1, 0)", mode));
+}

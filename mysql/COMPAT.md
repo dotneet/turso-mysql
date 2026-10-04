@@ -3274,6 +3274,14 @@ reads it once between all its rows: measured, forty rows stamped with `NOW(6)` b
 hold one moment, where the engine's clock, reading to the millisecond, would have run past
 several.
 
+An id written into a counted column is held to the column's type before anything is reserved
+or written: measured on 8.4.11, `-2147483649` and `2147483648` into an `INT AUTO_INCREMENT`
+key, `-1` into an `INT UNSIGNED` or `BIGINT UNSIGNED` one and `-9223372036854775809` into a
+`BIGINT` one are each 1264, in one row or beside others, bound or written, in an upsert, a
+`REPLACE`, a copy from a `SELECT` or an `UPDATE` of the key; no row is written, the counter
+does not move and `LAST_INSERT_ID()` keeps what it held. `INSERT IGNORE` writes the nearest id
+the column holds there and warns 1264, which is refused here.
+
 `INSERT INTO t (a, b) SELECT ...` into a table that counts its own ids is taken — Laravel's
 `insertUsing` and a data migration's copy both write it. The `SELECT` is held to the rules an
 ordinary `INSERT ... SELECT` is, and every row it answers is read before any is written, which
@@ -3386,7 +3394,10 @@ scalar but no DEFAULT clause at all on `text` or `blob`, and `PRIMARY KEY` /
 CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci` trailer is a fixed compatibility
 string, not a description of Turso's storage: MySQL always sends it and
 clients parse it. The table-level `AUTO_INCREMENT=<n>` is printed once the
-counter has moved past one, read from the durable allocator without moving it.
+counter has moved past one, read from the durable allocator without moving it,
+and never past the most the column holds: measured on 8.4.11, an `INT` key
+holding 2147483647 prints `AUTO_INCREMENT=2147483647`, before and after the
+next row asking for a number fails with 1062.
 Like InnoDB, the counter does not go back: deleting every row leaves it where
 it is, and a statement that fails or rolls back keeps the values it reserved.
 While another statement holds the allocator the counter is left out rather

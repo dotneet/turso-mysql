@@ -1766,3 +1766,140 @@ fn a_sysbench_insert_into_a_counted_table_is_tokenized_once() {
         vec![some(&["1", "50147"])]
     );
 }
+
+/// An id its counted column's type cannot hold is 1264, written as a number
+/// past `BIGINT` or as one within it, in one row or beside others, bound or
+/// written, in an upsert, a `REPLACE`, a copy or an `UPDATE`; the row is not
+/// written, the counter does not move and `LAST_INSERT_ID()` keeps what it
+/// held. Measured on MySQL 8.4.11, as is `INSERT IGNORE` writing the nearest
+/// id the column holds and warning, which is refused here.
+#[test]
+fn an_id_its_counted_column_cannot_hold_is_refused() {
+    let (_directory, mut adapter) = adapter();
+    for (table, key, refused, held) in [
+        (
+            "i",
+            "INT",
+            ["-2147483649", "2147483648"],
+            ["-2147483648", "2147483647"],
+        ),
+        (
+            "iu",
+            "INT UNSIGNED",
+            ["-1", "4294967296"],
+            ["1", "4294967295"],
+        ),
+        (
+            "b",
+            "BIGINT",
+            ["-9223372036854775809", "9223372036854775808"],
+            ["-9223372036854775808", "9223372036854775807"],
+        ),
+        (
+            "bu",
+            "BIGINT UNSIGNED",
+            ["-1", "18446744073709551616"],
+            ["1", "18446744073709551615"],
+        ),
+    ] {
+        run(
+            &mut adapter,
+            &format!("CREATE TABLE {table} (id {key} NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)"),
+        );
+        for id in refused {
+            for sql in [
+                format!("INSERT INTO {table} VALUES ({id}, 1)"),
+                format!("INSERT INTO {table} (id, v) VALUES (2, 2), ({id}, 1)"),
+                format!("INSERT INTO {table} VALUES ({id}, 1) ON DUPLICATE KEY UPDATE v = 9"),
+                format!("REPLACE INTO {table} VALUES ({id}, 1)"),
+                format!("INSERT INTO {table} SET id = {id}, v = 1"),
+            ] {
+                assert_eq!(
+                    adapter.execute_query(&sql).map(|_| ()),
+                    Err(FrontendErrorKind::OutOfRange),
+                    "{sql}"
+                );
+            }
+            let sql = format!("INSERT IGNORE INTO {table} VALUES ({id}, 1)");
+            assert_eq!(
+                adapter.execute_query(&sql).map(|_| ()),
+                Err(FrontendErrorKind::Unsupported),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            one(&mut adapter, &format!("SELECT COUNT(*) FROM {table}")),
+            "0"
+        );
+        assert_eq!(counter(&mut adapter, table), None);
+        assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "0");
+        for id in held {
+            run(
+                &mut adapter,
+                &format!("INSERT INTO {table} VALUES ({id}, 1)"),
+            );
+        }
+    }
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO i (id, v) SELECT 2147483648, 1")
+            .map(|_| ()),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    let statement = adapter
+        .execute_stmt_prepare("INSERT INTO i (id, v) VALUES (?, ?)")
+        .unwrap();
+    for id in [2_147_483_648, -2_147_483_649] {
+        assert_eq!(
+            adapter
+                .execute_stmt_execute(statement.statement_id, &integers(&[id, 1]))
+                .map(|_| ()),
+            Err(FrontendErrorKind::OutOfRange),
+            "{id}"
+        );
+    }
+    adapter.execute_stmt_close(statement.statement_id);
+    for id in ["-2147483649", "2147483648"] {
+        let sql = format!("UPDATE i SET id = {id} WHERE id = -2147483648");
+        assert_eq!(
+            adapter.execute_query(&sql).map(|_| ()),
+            Err(FrontendErrorKind::OutOfRange),
+            "{sql}"
+        );
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM i"),
+        vec![some(&["-2147483648"]), some(&["2147483647"])]
+    );
+
+    // Measured: once the key holds the most its type does, the table reads
+    // that as its next number, and a row asking for one is 1062 and leaves
+    // the number where it was.
+    assert_eq!(counter(&mut adapter, "i").as_deref(), Some("2147483647"));
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO i (v) VALUES (4)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    assert_eq!(counter(&mut adapter, "i").as_deref(), Some("2147483647"));
+    assert_eq!(counter(&mut adapter, "iu").as_deref(), Some("4294967295"));
+    assert_eq!(
+        counter(&mut adapter, "bu").as_deref(),
+        Some("18446744073709551615")
+    );
+}
+
+/// The null bitmap, the new-parameters flag and one LONGLONG parameter for
+/// each number.
+fn integers(values: &[i64]) -> Vec<u8> {
+    let mut payload = vec![0; values.len().div_ceil(8)];
+    payload.push(1);
+    for _ in values {
+        payload.extend_from_slice(&[MYSQL_TYPE_LONGLONG, 0]);
+    }
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    payload
+}

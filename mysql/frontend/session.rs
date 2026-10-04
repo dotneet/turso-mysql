@@ -10375,6 +10375,8 @@ impl MySqlConnection {
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         self.refuse_literals_their_columns_store_otherwise(sql, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        self.refuse_written_ids_the_counted_column_cannot_hold(sql)
+            .map_err(LimboError::from)?;
         match parse_auto_increment_insert(sql, self.parser_mode()) {
             Ok(insert) if insert.reads_the_clock() && self.time_zone_offset_seconds() != 0 => {
                 Err(LimboError::ParseError(
@@ -10485,6 +10487,7 @@ impl MySqlConnection {
             .map_err(mysql_query_parse_error)?;
         self.refuse_literals_their_columns_store_otherwise(sql, self.parser_mode())
             .map_err(mysql_query_parse_error)?;
+        self.refuse_written_ids_the_counted_column_cannot_hold(sql)?;
         let deadline = self.write_deadline(timeout);
         self.check_write_deadline(deadline)?;
         self.begin_implicit_transaction_for_write()?;
@@ -10596,6 +10599,56 @@ impl MySqlConnection {
         }
     }
 
+    /// Refuses an `INSERT` writing a counted column an id its type cannot
+    /// hold.
+    ///
+    /// Measured on MySQL 8.4.11: `-2147483649` or `2147483648` into an
+    /// `INT AUTO_INCREMENT` key is 1264, as `-1` into an `INT UNSIGNED` one
+    /// and `-9223372036854775809` into a `BIGINT` one are, in one row or
+    /// beside others, in an upsert and in a `REPLACE`, and nothing is written
+    /// and the counter does not move. `INSERT IGNORE` writes the nearest id
+    /// the type holds and warns instead, which is refused here.
+    fn refuse_written_ids_the_counted_column_cannot_hold(
+        &self,
+        sql: &str,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let mode = self.parser_mode();
+        let Ok(Some(target)) = parse_auto_increment_insert_target(sql, mode) else {
+            return Ok(());
+        };
+        let Some(table) = self
+            .load_auto_increment_table(&target)
+            .map_err(MySqlQueryError::Engine)?
+        else {
+            return Ok(());
+        };
+        let Ok(Some(written)) =
+            parse_insert_values_written_into(sql, mode, &table.definition.allocator_column_name)
+        else {
+            return Ok(());
+        };
+        let Some(id) = written
+            .into_iter()
+            .filter_map(|value| match value {
+                CheckedInsertValue::SignedInteger(id) => Some(i128::from(id)),
+                CheckedInsertValue::UnsignedInteger(id) => Some(i128::from(id)),
+                CheckedInsertValue::PastEveryInteger(id) => Some(id),
+                CheckedInsertValue::Null
+                | CheckedInsertValue::Default
+                | CheckedInsertValue::Other => None,
+            })
+            .find(|id| !counted_column_holds(&table, *id))
+        else {
+            return Ok(());
+        };
+        if turso_mysql_parser::insert_ignores_errors(sql, mode) {
+            return Err(MySqlQueryError::Unsupported(
+                "INSERT IGNORE writing a counted column an id its type cannot hold".to_string(),
+            ));
+        }
+        hold_the_id_to_the_counted_column(&table, id).map_err(MySqlQueryError::Engine)
+    }
+
     fn execute_ordinary_checked_write(
         &self,
         sql: &str,
@@ -10639,6 +10692,12 @@ impl MySqlConnection {
                         .column_name()
                         .eq_ignore_ascii_case(allocator_column)
                 }) {
+                    // Measured on MySQL 8.4.11: an id the column cannot hold
+                    // is 1264 here too, and the row keeps its own.
+                    if let CheckedUpdateAssignmentValue::SignedInteger(value) = assignment.value() {
+                        hold_the_id_to_the_counted_column(&table, i128::from(value))
+                            .map_err(MySqlQueryError::Engine)?;
+                    }
                     match assignment.value() {
                         CheckedUpdateAssignmentValue::SelfAssignment => {}
                         CheckedUpdateAssignmentValue::SignedInteger(value) if value > 0 => {
@@ -10962,7 +11021,10 @@ impl MySqlConnection {
         };
         match written {
             Some(0) if self.written_zero() == WrittenZero::AsksForTheNextNumber => Ok(None),
-            Some(id) => Ok(Some(id)),
+            Some(id) => {
+                hold_the_id_to_the_counted_column(table, id).map_err(MySqlQueryError::Engine)?;
+                Ok(Some(id))
+            }
             None => Err(MySqlQueryError::Unsupported(
                 "INSERT SELECT writing an AUTO_INCREMENT id that is not a whole number".to_string(),
             )),
@@ -12617,6 +12679,7 @@ impl MySqlConnection {
             .map(|value| match value {
                 AutoIncrementRowValue::Generated => Ok(InsertAutoIncrementValue::Generated),
                 AutoIncrementRowValue::Explicit(id) => {
+                    hold_the_id_to_the_counted_column(table, *id)?;
                     Ok(InsertAutoIncrementValue::Explicit((*id).max(0) as u64))
                 }
                 AutoIncrementRowValue::Parameter(ordinal) => match values.get(*ordinal) {
@@ -12627,18 +12690,22 @@ impl MySqlConnection {
                     {
                         Ok(InsertAutoIncrementValue::Generated)
                     }
-                    Some(value) if value.as_int().is_some() => Ok(
-                        InsertAutoIncrementValue::Explicit(value.as_int().unwrap().max(0) as u64),
-                    ),
+                    Some(value) if value.as_int().is_some() => {
+                        let id = value.as_int().unwrap();
+                        hold_the_id_to_the_counted_column(table, i128::from(id))?;
+                        Ok(InsertAutoIncrementValue::Explicit(id.max(0) as u64))
+                    }
                     Some(Value::Text(value))
                         if table.definition.allocator_column_type
                             == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned =>
                     {
-                        let id = value.as_str().parse::<u64>().map_err(|_| {
+                        let id = value.as_str().parse::<i128>().map_err(|_| {
                             LimboError::InvalidArgument(
                                 "AUTO_INCREMENT parameter must be an unsigned integer".to_string(),
                             )
                         })?;
+                        hold_the_id_to_the_counted_column(table, id)?;
+                        let id = id as u64;
                         Ok(
                             if id == 0 && self.written_zero() == WrittenZero::AsksForTheNextNumber {
                                 InsertAutoIncrementValue::Generated
@@ -15324,6 +15391,26 @@ struct AutoIncrementTable {
 fn auto_increment_ceiling(table: &AutoIncrementTable) -> u64 {
     let (_, max) = table.definition.allocator_column_type.bounds();
     max as u64
+}
+
+/// Whether a counted column's type holds `id`.
+fn counted_column_holds(table: &AutoIncrementTable, id: i128) -> bool {
+    let (least, most) = table.definition.allocator_column_type.bounds();
+    (least..=most).contains(&id)
+}
+
+/// Refuses an id written into a counted column that its type cannot hold,
+/// which MySQL answers 1264 for.
+fn hold_the_id_to_the_counted_column(table: &AutoIncrementTable, id: i128) -> Result<()> {
+    if counted_column_holds(table, id) {
+        return Ok(());
+    }
+    Err(LimboError::from(turso_core::AssignmentError::OutOfRange {
+        table: table.name.clone(),
+        column: table.definition.allocator_column_ordinal + 1,
+        type_name: table.definition.allocator_column_written_type.to_string(),
+        value: i64::try_from(id).unwrap_or(if id < 0 { i64::MIN } else { i64::MAX }),
+    }))
 }
 
 fn read_table_names(translated: &TranslatedDml) -> Vec<String> {

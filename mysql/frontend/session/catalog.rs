@@ -323,7 +323,7 @@ impl MySqlConnection {
         let Some(auto_increment) = auto_increment else {
             return Ok(None);
         };
-        self.peek_next_auto_increment(auto_increment.key)
+        self.peek_next_auto_increment(&auto_increment)
             .map_err(MySqlShowCreateTableError::Engine)
     }
 
@@ -350,7 +350,7 @@ impl MySqlConnection {
             let Some(table) = counted_table_from_stored_sql(sql, identity)? else {
                 continue;
             };
-            if let Some(next) = self.peek_next_auto_increment(table.key)? {
+            if let Some(next) = self.peek_next_auto_increment(&table)? {
                 values.push((name.clone(), next));
             }
         }
@@ -361,7 +361,14 @@ impl MySqlConnection {
     /// it has handed out none, or when a concurrent INSERT holds the
     /// allocator: a catalog read MySQL always answers answers no number
     /// rather than failing, the number being a snapshot either way.
-    fn peek_next_auto_increment(&self, key: AutoIncrementKey) -> Result<Option<u64>> {
+    ///
+    /// Measured on MySQL 8.4.11: once an `INT` key holds 2147483647 the
+    /// table reads `AUTO_INCREMENT=2147483647`, and it stays there after the
+    /// next row asking for a number fails, so the number is never past the
+    /// most the column holds.
+    fn peek_next_auto_increment(&self, table: &AutoIncrementTable) -> Result<Option<u64>> {
+        let key = table.key;
+        let most = super::auto_increment_ceiling(table);
         let capability = self.auto_increment.as_ref().ok_or_else(|| {
             LimboError::Corrupt(
                 "AUTO_INCREMENT table without a registry-backed allocator capability".to_string(),
@@ -370,7 +377,9 @@ impl MySqlConnection {
         for _ in 0..ALLOCATOR_PEEK_ATTEMPTS {
             let mut query = capability.allocator.peek_high_water(key)?;
             match capability.io.block(|| query.step()) {
-                Ok(high_water) => return Ok((high_water > 0).then_some(high_water + 1)),
+                Ok(high_water) => {
+                    return Ok((high_water > 0).then(|| high_water.saturating_add(1).min(most)))
+                }
                 Err(LimboError::Busy) => std::thread::yield_now(),
                 Err(error) => return Err(error),
             }
