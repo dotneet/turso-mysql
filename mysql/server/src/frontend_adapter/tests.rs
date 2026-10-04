@@ -9188,13 +9188,25 @@ fn alter_table_runs_against_a_table_with_a_primary_key() {
         vec![vec![Some(b"1".to_vec()), Some(b"ann".to_vec())]]
     );
 
-    // Replacing the key column itself is refused: MySQL keeps the key through
-    // a MODIFY and the engine's ALTER COLUMN would drop it.
-    assert!(adapter
+    // Restating the key column itself writes the table again, the key kept
+    // over the column as MySQL keeps it, renamed where a CHANGE renames it.
+    adapter
         .execute_query("ALTER TABLE k MODIFY COLUMN id BIGINT")
-        .is_err());
-    assert!(adapter
+        .unwrap();
+    adapter
         .execute_query("ALTER TABLE k CHANGE COLUMN id key_id INT")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(kept) =
+        adapter.execute_query("SELECT key_id, name FROM k").unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(
+        kept.rows,
+        vec![vec![Some(b"1".to_vec()), Some(b"ann".to_vec())]]
+    );
+    assert!(adapter
+        .execute_query("INSERT INTO k (key_id, name) VALUES (1, 'bo')")
         .is_err());
 }
 
@@ -25171,17 +25183,13 @@ fn a_counted_table_takes_an_alter() {
         ]
     );
 
-    // Taking the counted column away would leave a table counting on nothing,
-    // so every shape that does is refused. MySQL takes `DROP COLUMN id` and
-    // leaves an ordinary table behind.
-    for sql in [
-        "ALTER TABLE counted_moved DROP COLUMN id",
-        "ALTER TABLE counted_moved RENAME COLUMN id TO key_of_row",
-        "ALTER TABLE counted_moved MODIFY COLUMN id BIGINT NOT NULL",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
-    // The refusals leave the table as it stood, still counting.
+    // Dropping the counted column would leave a table counting on nothing,
+    // so it is refused. MySQL takes `DROP COLUMN id` and leaves an ordinary
+    // table behind.
+    assert!(adapter
+        .execute_query("ALTER TABLE counted_moved DROP COLUMN id")
+        .is_err());
+    // The refusal leaves the table as it stood, still counting.
     assert_eq!(
         written_id(&mut adapter, "INSERT INTO counted_moved (n) VALUES (5)"),
         5
@@ -30683,10 +30691,25 @@ fn an_alter_moves_a_column_the_table_already_has() {
         adapter.execute_query("ALTER TABLE counted CHANGE COLUMN word n INT FIRST"),
         Err(FrontendErrorKind::DuplicateColumn)
     );
-    // The column the table counts on and its key stay where they are.
-    assert!(adapter
-        .execute_query("ALTER TABLE counted MODIFY COLUMN id BIGINT FIRST")
-        .is_err());
+    // The column the table counts on moves with its key and its counter.
+    adapter
+        .execute_query("ALTER TABLE counted MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT AFTER n")
+        .unwrap();
+    adapter
+        .execute_query("ALTER TABLE counted MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT FIRST")
+        .unwrap();
+    assert_eq!(
+        printed_schema(&mut adapter, "counted"),
+        concat!(
+            "CREATE TABLE `counted` (\n",
+            "  `id` int NOT NULL AUTO_INCREMENT,\n",
+            "  `word` varchar(20) DEFAULT NULL,\n",
+            "  `n` bigint DEFAULT NULL,\n",
+            "  PRIMARY KEY (`id`),\n",
+            "  KEY `by_n` (`n`)\n",
+            ") ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        )
+    );
     // A column the table has not got.
     assert_eq!(
         adapter.execute_query("ALTER TABLE counted MODIFY COLUMN missing INT FIRST"),
@@ -31189,3 +31212,6 @@ mod foreign_keys;
 
 #[cfg(unix)]
 mod rowid_keys;
+
+#[cfg(unix)]
+mod primary_key_alters;

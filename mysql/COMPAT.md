@@ -4004,9 +4004,40 @@ The stored MySQL DDL of such a table carries the key's declared type — the eng
 integer key as `INTEGER` — and a v5 marker that says the key is the rowid; a server that
 predates the marker refuses the table rather than read it as one keyed by an index. A table
 made before keeps its key as an index until a statement writes the table again — `ADD COLUMN
-... FIRST` or `AFTER`, a `MODIFY` or `CHANGE` that moves a column, `CONVERT TO CHARACTER SET` —
-which makes it again through the same `CREATE TABLE`, the key then the rowid and the rows
-carried across.
+... FIRST` or `AFTER`, a `MODIFY` or `CHANGE` that moves a column, `CONVERT TO CHARACTER SET`,
+a change of its key — which makes it again through the same `CREATE TABLE`, the key then the
+rowid and the rows carried across.
+
+An `ALTER TABLE` that changes a table's key, a column the key is over, a column the table's
+own foreign key is over, or the column the table counts on writes the table again: `MODIFY` or
+`CHANGE` of such a column, `DROP PRIMARY KEY`, `ADD PRIMARY KEY` over one column or several,
+`AUTO_INCREMENT` given to the key or taken off it, `RENAME COLUMN` of the counted column, and
+any number of these and of other columns' `MODIFY` and `CHANGE` in one statement, applied in
+the order written. The new table takes the layout its key asks for — a key over one integer
+the rowid holds is the rowid, any other key an index of its own beside one — and the rows go
+across in key order through the same checks an `INSERT` makes, the table's other indexes, its
+own triggers, other tables' triggers that name it and its counter coming back as they were, the
+views over it and the foreign keys naming it standing throughout. Measured on 8.4.11 and
+matched: `INT` to `BIGINT`, `BIGINT UNSIGNED`, a word and back keeps every row, a `MODIFY`
+leaving out `NOT NULL` keeps the key `NOT NULL`, and an `ALTER COLUMN ... SET DEFAULT` gives
+the key a default; a value the new type cannot hold is 1264, a word naming no number 1366, a
+word too long for a narrower column of words 1265, a number too long for one 1406, two rows the
+new key makes one 1062, a NULL in a column the key is added over or made `NOT NULL` 1138, and
+each leaves the table as it was; `DROP PRIMARY KEY` with none is 1091, a second key 1068, a
+key column missing 1072, a key column declared `NULL` 1171, and a counted column no key starts
+with 1075, the key dropped from under it among them. A table that starts counting numbers each
+row whose id is NULL, or 0 unless `sql_mode` names `NO_AUTO_VALUE_ON_ZERO`, in the order the old
+key kept them (or written, with no key), from one past the highest id before it, and reserves
+as many numbers as the table has rows at the first such row, so rows `5, NULL, 0, NULL, 3, 0`
+take 6 to 9 and the table reads `AUTO_INCREMENT=12`; a number another row holds is 1062. A
+table that counted before keeps its counter, `AUTO_INCREMENT=100` over rows reaching 11
+included; one that stops counting forgets it. With another table's key naming this one's, a
+change of the named column's type is 3780 whatever `foreign_key_checks` says, `AUTO_INCREMENT`
+given or taken is 1833 with the checks on and taken with them off, and dropping the key it
+finds its rows by is 1553; on the table's own foreign key column, a change of type is 3780,
+`AUTO_INCREMENT` 1832, and dropping the only key the foreign key's rows are found by 1553. As in
+MySQL, the statement waits for the table's metadata lock under MVCC, and commits what came
+before it.
 
 An `INSERT` into an `AUTO_INCREMENT` table takes its ids once its first row is filled and
 before it waits for a key or a gap another transaction holds, as InnoDB does: measured on 8.4.11,

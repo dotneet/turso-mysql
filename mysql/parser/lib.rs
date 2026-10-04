@@ -33,6 +33,7 @@ mod network_address;
 mod nothing_to_run;
 mod number_format;
 mod pomelo_catalog;
+mod primary_key_change;
 mod prisma_catalog;
 mod raw_bytes_in_words;
 mod replace_view;
@@ -187,6 +188,7 @@ pub use named_tables::{tables_named_by, NamedTable};
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use nothing_to_run::{nothing_to_run, NothingToRun};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
+pub use primary_key_change::{table_with_its_key_changed, MySqlKeyChange, MySqlKeyRewrite};
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
 pub use safe_updates::{read_safe_update, ComparedValues, SafeUpdateConjunct, SafeUpdateReading};
 pub use select_projection_origins::{
@@ -4605,10 +4607,16 @@ pub fn alter_column_default_restated(
                 column_name.value.clone(),
             )));
         };
+        // The key stays over a column a `MODIFY` restates without it, so the
+        // key's words are left off: a `MODIFY` saying `PRIMARY KEY` again
+        // would ask for a second key, which MySQL answers 1068.
         let mut column = column.clone();
-        column
-            .options
-            .retain(|option| !matches!(option.option, ColumnOption::Default(_)));
+        column.options.retain(|option| {
+            !matches!(
+                option.option,
+                ColumnOption::Default(_) | ColumnOption::PrimaryKey(_)
+            )
+        });
         match op {
             // Measured on MySQL 8.4.11: 1101 for a default on a `TEXT`, which
             // a `CREATE TABLE` here still takes.

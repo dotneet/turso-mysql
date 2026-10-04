@@ -10403,3 +10403,92 @@ fn a_written_id_past_every_integer_is_read_as_a_whole_number() {
     ));
     assert!(!insert_ignores_errors("INSERT INTO t VALUES (1, 0)", mode));
 }
+
+/// An `ALTER TABLE` that changes the key, a column it is over or the column a
+/// table counts on is read as the table it leaves; every other `ALTER` is
+/// left to its own path, and each refusal MySQL 8.4.11 answers is named.
+#[test]
+fn a_key_change_is_read_as_the_table_it_leaves() {
+    let mode = SessionSqlMode::default();
+    let keyed = "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `v` INT)";
+    let change = |stored: &str, sql: &str| table_with_its_key_changed(stored, sql, mode).unwrap();
+    assert_eq!(change(keyed, "ALTER TABLE t MODIFY v BIGINT"), None);
+    assert_eq!(change(keyed, "ALTER TABLE t ADD COLUMN w INT"), None);
+    let Some(MySqlKeyChange::TableWrittenAgain(rewrite)) =
+        change(keyed, "ALTER TABLE t CHANGE id pk BIGINT FIRST")
+    else {
+        panic!("a key column restated writes the table again");
+    };
+    assert_eq!(
+        rewrite.table.create_sql,
+        "CREATE TABLE `t` (`pk` BIGINT NOT NULL PRIMARY KEY, `v` INT)"
+    );
+    assert_eq!(
+        rewrite.table.carried_columns,
+        [
+            ("pk".to_owned(), "id".to_owned()),
+            ("v".to_owned(), "v".to_owned())
+        ]
+    );
+    assert_eq!(rewrite.old_key, ["id"]);
+    assert_eq!(rewrite.new_key, ["pk"]);
+    assert_eq!(rewrite.retyped, [("pk".to_owned(), "id".to_owned())]);
+    let Some(MySqlKeyChange::TableWrittenAgain(rewrite)) = change(
+        keyed,
+        "ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (v, id)",
+    ) else {
+        panic!("a key exchanged for another writes the table again");
+    };
+    assert_eq!(
+        rewrite.table.create_sql,
+        "CREATE TABLE `t` (`id` INT NOT NULL, `v` INT NOT NULL, PRIMARY KEY (`v`, `id`))"
+    );
+    assert!(rewrite.retyped.is_empty());
+    let Some(MySqlKeyChange::TableWrittenAgain(rewrite)) =
+        change(keyed, "ALTER TABLE t MODIFY id INT NOT NULL AUTO_INCREMENT")
+    else {
+        panic!("a key given AUTO_INCREMENT writes the table again");
+    };
+    assert_eq!(rewrite.counted_before, None);
+    assert_eq!(rewrite.counted_after.as_deref(), Some("id"));
+    let unkeyed = "CREATE TABLE `n` (`id` INT, `v` INT)";
+    for (stored, sql, refused) in [
+        (
+            unkeyed,
+            "ALTER TABLE n DROP PRIMARY KEY",
+            MySqlKeyChange::NoKeyToDrop,
+        ),
+        (
+            unkeyed,
+            "ALTER TABLE n ADD PRIMARY KEY (nope)",
+            MySqlKeyChange::KeyColumnMissing("nope".to_owned()),
+        ),
+        (
+            keyed,
+            "ALTER TABLE t ADD PRIMARY KEY (v)",
+            MySqlKeyChange::SecondKey,
+        ),
+        (
+            keyed,
+            "ALTER TABLE t MODIFY id INT NULL",
+            MySqlKeyChange::KeyColumnMayBeNull,
+        ),
+        (
+            keyed,
+            "ALTER TABLE t MODIFY v INT AUTO_INCREMENT",
+            MySqlKeyChange::CountedColumnNotAKey("v".to_owned()),
+        ),
+        (
+            keyed,
+            "ALTER TABLE t MODIFY nope INT, DROP PRIMARY KEY",
+            MySqlKeyChange::NoSuchColumn("nope".to_owned()),
+        ),
+        (
+            keyed,
+            "ALTER TABLE t CHANGE id v INT NOT NULL",
+            MySqlKeyChange::DuplicateColumn("v".to_owned()),
+        ),
+    ] {
+        assert_eq!(change(stored, sql), Some(refused), "{sql}");
+    }
+}

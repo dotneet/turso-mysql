@@ -1,0 +1,593 @@
+//! `ALTER TABLE` statements that change a table's primary key, the columns it
+//! is over, or the column the table counts on: each writes the table again,
+//! keeping its rows, indexes, foreign keys, triggers, views and counter.
+//!
+//! Every expectation here was measured on MySQL 8.4.11.
+
+use super::*;
+
+type Adapter = AuthorizedDatabaseCommandAdapter<RecordingAuthorizer>;
+
+/// A key's column takes another type and the rows come across: `INT` to
+/// `BIGINT` (the migration Rails and Laravel write most), to `BIGINT
+/// UNSIGNED`, to a word and back, renamed by `CHANGE`. A `MODIFY` that does
+/// not say `NOT NULL` leaves the key `NOT NULL`, and the table's other index
+/// stays.
+#[test]
+fn a_key_column_takes_another_type_and_keeps_its_rows() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v VARCHAR(10), KEY kv (v))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO t VALUES (5, 'c'), (1, 'a'), (2, 'b')",
+    );
+    for (sql, printed) in [
+        ("ALTER TABLE t MODIFY id BIGINT NOT NULL", "bigint"),
+        ("ALTER TABLE t MODIFY id BIGINT", "bigint"),
+        (
+            "ALTER TABLE t MODIFY id BIGINT UNSIGNED NOT NULL",
+            "bigint unsigned",
+        ),
+        (
+            "ALTER TABLE t MODIFY id VARCHAR(20) NOT NULL",
+            "varchar(20)",
+        ),
+        ("ALTER TABLE t MODIFY id INT NOT NULL", "int"),
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(
+            created(&mut adapter, "t"),
+            format!(
+                "CREATE TABLE `t` (\n  `id` {printed} NOT NULL,\n  `v` varchar(10) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `kv` (`v`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            ),
+            "{sql}"
+        );
+        assert_eq!(
+            rows(&mut adapter, "SELECT id, v FROM t ORDER BY id"),
+            [["1", "a"], ["2", "b"], ["5", "c"]],
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "ALTER TABLE t CHANGE id pk BIGINT NOT NULL");
+    assert_eq!(
+        rows(&mut adapter, "SHOW INDEX FROM t")
+            .iter()
+            .map(|row| (row[2].clone(), row[4].clone()))
+            .collect::<Vec<_>>(),
+        [
+            ("PRIMARY".to_owned(), "pk".to_owned()),
+            ("kv".to_owned(), "v".to_owned()),
+        ]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT pk FROM t WHERE v = 'b'"),
+        [["2"]]
+    );
+    // The key is the table's rowid again, so a row it holds is refused as a
+    // duplicate and a row leaving it out is 1364.
+    for (sql, refused) in [
+        (
+            "INSERT INTO t VALUES (2, 'x')",
+            FrontendErrorKind::ConstraintViolation,
+        ),
+        (
+            "INSERT INTO t (v) VALUES ('x')",
+            FrontendErrorKind::MissingRequiredDefault,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    // A default given to the key is what a row leaving it out takes.
+    run(&mut adapter, "ALTER TABLE t ALTER COLUMN pk SET DEFAULT 7");
+    assert!(created(&mut adapter, "t").contains("`pk` bigint NOT NULL DEFAULT '7',"));
+    run(&mut adapter, "INSERT INTO t (v) VALUES ('d')");
+    assert_eq!(rows(&mut adapter, "SELECT v FROM t WHERE pk = 7"), [["d"]]);
+}
+
+/// A value the key's new type cannot hold refuses the statement and leaves
+/// the table as it was: 1264 for a number past the type, 1366 for a word
+/// naming no number, 1265 for a word cut short by a narrower word column,
+/// 1406 for a number too long for one, and 1062 for two rows the new type
+/// makes one.
+#[test]
+fn a_key_value_its_new_type_cannot_hold_changes_nothing() {
+    let (_directory, mut adapter) = adapter();
+    run(&mut adapter, "CREATE TABLE n (id INT NOT NULL PRIMARY KEY)");
+    run(&mut adapter, "INSERT INTO n VALUES (1), (300), (-3)");
+    run(
+        &mut adapter,
+        "CREATE TABLE w (id VARCHAR(10) NOT NULL PRIMARY KEY)",
+    );
+    run(&mut adapter, "INSERT INTO w VALUES ('1'), ('abc'), ('22')");
+    for (sql, refused) in [
+        (
+            "ALTER TABLE n MODIFY id TINYINT NOT NULL",
+            FrontendErrorKind::OutOfRange,
+        ),
+        (
+            "ALTER TABLE n MODIFY id INT UNSIGNED NOT NULL",
+            FrontendErrorKind::OutOfRange,
+        ),
+        (
+            "ALTER TABLE n MODIFY id VARCHAR(1) NOT NULL",
+            FrontendErrorKind::DataTooLong,
+        ),
+        (
+            "ALTER TABLE w MODIFY id INT NOT NULL",
+            FrontendErrorKind::IncorrectValue,
+        ),
+        (
+            "ALTER TABLE w MODIFY id VARCHAR(1) NOT NULL",
+            FrontendErrorKind::NotAMember,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    assert!(created(&mut adapter, "n").contains("`id` int NOT NULL"));
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM n ORDER BY id"),
+        [["-3"], ["1"], ["300"]]
+    );
+    assert!(created(&mut adapter, "w").contains("`id` varchar(10) NOT NULL"));
+    run(&mut adapter, "DELETE FROM w WHERE id = 'abc'");
+    run(&mut adapter, "ALTER TABLE w MODIFY id INT NOT NULL");
+    assert_eq!(
+        rows(&mut adapter, "SELECT id FROM w ORDER BY id"),
+        [["1"], ["22"]]
+    );
+}
+
+/// `DROP PRIMARY KEY` and `ADD PRIMARY KEY`, alone or together, over one
+/// column or several, each with the error MySQL answers when it refuses.
+#[test]
+fn a_primary_key_is_dropped_and_added() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT, KEY kv (v))",
+    );
+    run(&mut adapter, "INSERT INTO t VALUES (3, 1), (1, 2), (2, 3)");
+    run(&mut adapter, "ALTER TABLE t DROP PRIMARY KEY");
+    assert_eq!(
+        created(&mut adapter, "t"),
+        "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `v` int DEFAULT NULL,\n  KEY `kv` (`v`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    // Measured: the rows are copied in the old key's order, which is the
+    // order a table with no key reads them back in.
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM t"),
+        [["1", "2"], ["2", "3"], ["3", "1"]]
+    );
+    run(&mut adapter, "INSERT INTO t VALUES (1, 9)");
+    for (sql, refused) in [
+        (
+            "ALTER TABLE t DROP PRIMARY KEY",
+            FrontendErrorKind::CantDropKey,
+        ),
+        (
+            "ALTER TABLE t ADD PRIMARY KEY (id)",
+            FrontendErrorKind::ConstraintViolation,
+        ),
+        (
+            "ALTER TABLE t ADD PRIMARY KEY (nope)",
+            FrontendErrorKind::ForeignKeyColumnMissing,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "DELETE FROM t WHERE v = 9");
+    run(
+        &mut adapter,
+        "ALTER TABLE t ADD CONSTRAINT named PRIMARY KEY (id)",
+    );
+    assert_eq!(
+        created(&mut adapter, "t"),
+        "CREATE TABLE `t` (\n  `id` int NOT NULL,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `kv` (`v`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE t ADD PRIMARY KEY (v)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::SecondPrimaryKey)
+    );
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE t MODIFY id INT NULL")
+            .map(|_| ()),
+        Err(FrontendErrorKind::KeyColumnMayBeNull)
+    );
+
+    // A key over a column holding NULL is 1138; the column it is added over
+    // reads back NOT NULL.
+    run(&mut adapter, "CREATE TABLE n (id INT, v INT)");
+    run(&mut adapter, "INSERT INTO n VALUES (1, 1), (NULL, 2)");
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE n ADD PRIMARY KEY (id)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::InvalidUseOfNull)
+    );
+    run(&mut adapter, "DELETE FROM n WHERE id IS NULL");
+    run(&mut adapter, "ALTER TABLE n ADD PRIMARY KEY (id)");
+    assert!(created(&mut adapter, "n").contains("`id` int NOT NULL,"));
+
+    // A key over two columns, and one exchanged for another in one statement.
+    run(&mut adapter, "CREATE TABLE c (a INT, b VARCHAR(5), x INT)");
+    run(
+        &mut adapter,
+        "INSERT INTO c VALUES (1, 'y', 2), (1, 'x', 1)",
+    );
+    run(&mut adapter, "ALTER TABLE c ADD PRIMARY KEY (a, b)");
+    assert_eq!(
+        created(&mut adapter, "c"),
+        "CREATE TABLE `c` (\n  `a` int NOT NULL,\n  `b` varchar(5) NOT NULL,\n  `x` int DEFAULT NULL,\n  PRIMARY KEY (`a`,`b`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO c VALUES (1, 'x', 3)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE c DROP PRIMARY KEY, ADD PRIMARY KEY (x)",
+    );
+    assert_eq!(
+        created(&mut adapter, "c"),
+        "CREATE TABLE `c` (\n  `a` int NOT NULL,\n  `b` varchar(5) NOT NULL,\n  `x` int NOT NULL,\n  PRIMARY KEY (`x`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT x, b FROM c"),
+        [["1", "x"], ["2", "y"]]
+    );
+}
+
+/// `AUTO_INCREMENT` given to a key and taken off it. A table that starts
+/// counting numbers each row whose key is NULL or 0 as it copies the rows,
+/// reserving as many numbers as it has rows at the first, and counts on past
+/// those and its highest id; one that counted before keeps where its counter
+/// stood. The column it is given to must be the key.
+#[test]
+fn a_key_starts_and_stops_counting() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+    );
+    run(&mut adapter, "INSERT INTO t VALUES (5, 1), (0, 2), (9, 3)");
+    run(
+        &mut adapter,
+        "ALTER TABLE t MODIFY id INT NOT NULL AUTO_INCREMENT",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM t"),
+        [["1", "2"], ["5", "1"], ["9", "3"]]
+    );
+    assert_eq!(counter(&mut adapter, "t").as_deref(), Some("10"));
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (v) VALUES (4)"),
+        (1, 10)
+    );
+
+    run(&mut adapter, "ALTER TABLE t MODIFY id INT NOT NULL");
+    assert_eq!(counter(&mut adapter, "t"), None);
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO t (v) VALUES (5)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::MissingRequiredDefault)
+    );
+    run(&mut adapter, "INSERT INTO t VALUES (11, 5)");
+    // Rails' `change_column :t, :id, :bigint` keeps the column counting.
+    run(
+        &mut adapter,
+        "ALTER TABLE `t` CHANGE `id` `id` bigint NOT NULL AUTO_INCREMENT",
+    );
+    assert_eq!(counter(&mut adapter, "t").as_deref(), Some("12"));
+    run(&mut adapter, "ALTER TABLE t AUTO_INCREMENT = 100");
+    run(&mut adapter, "DELETE FROM t WHERE id = 11");
+    run(
+        &mut adapter,
+        "ALTER TABLE t MODIFY id INT NOT NULL AUTO_INCREMENT",
+    );
+    assert_eq!(counter(&mut adapter, "t").as_deref(), Some("100"));
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO t (v) VALUES (6)"),
+        (1, 100)
+    );
+
+    // Measured: rows 5, NULL, 0, NULL, 3, 0 in a table with no key take 6,
+    // 7, 8 and 9, and the table reads AUTO_INCREMENT=12.
+    run(&mut adapter, "CREATE TABLE n (id INT, v CHAR(1))");
+    run(
+        &mut adapter,
+        "INSERT INTO n VALUES (5, 'a'), (NULL, 'b'), (0, 'c'), (NULL, 'd'), (3, 'e'), (0, 'f')",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE n MODIFY id INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM n ORDER BY v"),
+        [
+            ["5", "a"],
+            ["6", "b"],
+            ["7", "c"],
+            ["8", "d"],
+            ["3", "e"],
+            ["9", "f"]
+        ]
+    );
+    assert_eq!(counter(&mut adapter, "n").as_deref(), Some("12"));
+
+    // A number the copy hands a row that another row already holds is 1062,
+    // and nothing changes.
+    run(&mut adapter, "CREATE TABLE d (id INT NOT NULL, v INT)");
+    run(&mut adapter, "INSERT INTO d VALUES (0, 1), (1, 2)");
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE d MODIFY id INT NOT NULL AUTO_INCREMENT PRIMARY KEY")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ConstraintViolation)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM d"),
+        [["0", "1"], ["1", "2"]]
+    );
+
+    // The counted column has to be the key: 1075 for one no key starts
+    // with, and for the key dropped from under it.
+    run(
+        &mut adapter,
+        "CREATE TABLE k (id INT NOT NULL PRIMARY KEY, v INT)",
+    );
+    run(
+        &mut adapter,
+        "CREATE TABLE c (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+    );
+    for sql in [
+        "ALTER TABLE k MODIFY v INT AUTO_INCREMENT",
+        "ALTER TABLE c DROP PRIMARY KEY",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(FrontendErrorKind::CountedColumnNotAKey),
+            "{sql}"
+        );
+    }
+
+    // The column a table counts on is renamed with the counter where it
+    // stood.
+    run(&mut adapter, "INSERT INTO c (v) VALUES (1), (2)");
+    run(&mut adapter, "ALTER TABLE c RENAME COLUMN id TO pk");
+    assert_eq!(
+        created(&mut adapter, "c"),
+        "CREATE TABLE `c` (\n  `pk` int NOT NULL AUTO_INCREMENT,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`pk`)\n) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO c (v) VALUES (3)"),
+        (1, 3)
+    );
+}
+
+/// A key change MySQL refuses for a foreign key's sake, and one it takes.
+/// With `fk` naming `p (id)` from `c (pid)`: the parent's key made `BIGINT`
+/// is 3780 whatever `foreign_key_checks` says, and so is the child's column;
+/// `AUTO_INCREMENT` given to the parent's key is 1833 with the checks on and
+/// taken with them off; given to the child's column it is 1832; the parent's
+/// key dropped is 1553, and so is the key of a child found only by it. The
+/// parent's key restated as it was is taken, and the key still holds.
+#[test]
+fn a_foreign_key_holds_a_key_change_to_what_mysql_allows() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT, CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id))",
+        "CREATE TABLE sole (pid INT NOT NULL PRIMARY KEY, CONSTRAINT fk_sole FOREIGN KEY (pid) REFERENCES p (id))",
+        "INSERT INTO p VALUES (1, 1), (2, 2)",
+        "INSERT INTO c VALUES (10, 1), (11, 2)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (sql, refused) in [
+        (
+            "ALTER TABLE p MODIFY id BIGINT NOT NULL",
+            FrontendErrorKind::ForeignKeyColumnsIncompatible,
+        ),
+        (
+            "ALTER TABLE c MODIFY pid BIGINT",
+            FrontendErrorKind::ForeignKeyColumnsIncompatible,
+        ),
+        (
+            "ALTER TABLE p MODIFY id INT NOT NULL AUTO_INCREMENT",
+            FrontendErrorKind::ReferencedColumnCannotChange,
+        ),
+        (
+            "ALTER TABLE c MODIFY pid INT NOT NULL AUTO_INCREMENT",
+            FrontendErrorKind::ForeignKeyColumnCannotChange,
+        ),
+        (
+            "ALTER TABLE p DROP PRIMARY KEY",
+            FrontendErrorKind::RequiredForeignKeyIndex,
+        ),
+        (
+            "ALTER TABLE sole DROP PRIMARY KEY",
+            FrontendErrorKind::RequiredForeignKeyIndex,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "ALTER TABLE p MODIFY id INT NOT NULL");
+    run(&mut adapter, "ALTER TABLE c MODIFY id BIGINT NOT NULL");
+    run(&mut adapter, "ALTER TABLE c DROP PRIMARY KEY");
+    assert_eq!(
+        created(&mut adapter, "c"),
+        "CREATE TABLE `c` (\n  `id` bigint NOT NULL,\n  `pid` int DEFAULT NULL,\n  KEY `fk` (`pid`),\n  CONSTRAINT `fk` FOREIGN KEY (`pid`) REFERENCES `p` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    for (sql, refused) in [
+        (
+            "INSERT INTO c VALUES (12, 3)",
+            FrontendErrorKind::ForeignKeyViolation,
+        ),
+        (
+            "DELETE FROM p WHERE id = 1",
+            FrontendErrorKind::ParentRowReferenced,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "SET foreign_key_checks = 0");
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE p MODIFY id BIGINT NOT NULL")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyColumnsIncompatible)
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE p MODIFY id INT NOT NULL AUTO_INCREMENT",
+    );
+    run(&mut adapter, "SET foreign_key_checks = 1");
+    assert_eq!(counter(&mut adapter, "p").as_deref(), Some("3"));
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO p (v) VALUES (3)"),
+        (1, 3)
+    );
+    assert_eq!(
+        adapter
+            .execute_query("DELETE FROM p WHERE id = 2")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ParentRowReferenced)
+    );
+}
+
+/// The table's own triggers, another table's trigger writing it and a view
+/// reading it all stand after the key changes, as MySQL leaves them: each
+/// trigger reads back as it was made and fires as before.
+#[test]
+fn triggers_and_views_stand_through_a_key_change() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE audit (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, tid BIGINT)",
+        "CREATE TABLE other (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW INSERT INTO audit (tid) VALUES (NEW.id)",
+        "CREATE TRIGGER other_ai AFTER INSERT ON other FOR EACH ROW INSERT INTO t (id, v) VALUES (NEW.id + 100, 0)",
+        "CREATE VIEW tv AS SELECT id, v FROM t",
+        "INSERT INTO t VALUES (1, 1)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let triggers = rows(&mut adapter, "SHOW TRIGGERS");
+    let made_as = rows(&mut adapter, "SHOW CREATE TRIGGER t_ai");
+    for sql in [
+        "ALTER TABLE t MODIFY id BIGINT NOT NULL",
+        "ALTER TABLE t MODIFY id BIGINT NOT NULL AUTO_INCREMENT",
+        "ALTER TABLE t DROP PRIMARY KEY, MODIFY id BIGINT NOT NULL",
+        "ALTER TABLE t ADD PRIMARY KEY (id)",
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(rows(&mut adapter, "SHOW TRIGGERS"), triggers, "{sql}");
+        assert_eq!(
+            rows(&mut adapter, "SHOW CREATE TRIGGER t_ai"),
+            made_as,
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "INSERT INTO t VALUES (2, 2)");
+    run(&mut adapter, "INSERT INTO other VALUES (5)");
+    assert_eq!(
+        rows(&mut adapter, "SELECT tid FROM audit ORDER BY id"),
+        [["1"], ["2"], ["105"]]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM tv ORDER BY id"),
+        [["1", "1"], ["2", "2"], ["105", "0"]]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW COLUMNS FROM tv")[0][..3],
+        ["id", "bigint", "NO"]
+    );
+}
+
+fn adapter() -> (tempfile::TempDir, Adapter) {
+    let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("root"));
+    let (directory, catalog, factory) = catalog_factory(authorizer);
+    catalog.create("probe").unwrap();
+    let mut adapter = factory
+        .build(AuthenticatedPrincipal::from_account_id_for_testing(
+            AccountId::from_bytes([167; 32]),
+        ))
+        .unwrap();
+    adapter.authorize_connection().unwrap();
+    adapter.execute_init_db("probe").unwrap();
+    (directory, adapter)
+}
+
+fn run(adapter: &mut Adapter, sql: &str) {
+    adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+}
+
+/// The affected rows and the id one write reports.
+fn written(adapter: &mut Adapter, sql: &str) -> (u64, u64) {
+    match adapter.execute_query(sql) {
+        Ok(CommandExecutionResult::Ok(result)) => (result.affected_rows, result.last_insert_id),
+        other => panic!("{sql} must answer OK, answered {other:?}"),
+    }
+}
+
+fn rows(adapter: &mut Adapter, sql: &str) -> Vec<Vec<String>> {
+    let result = adapter
+        .execute_query(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error:?}"));
+    let CommandExecutionResult::ResultSet(result) = result else {
+        panic!("{sql} must return a result set");
+    };
+    result
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| {
+                    value.map_or("NULL".to_owned(), |value| String::from_utf8(value).unwrap())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn created(adapter: &mut Adapter, table: &str) -> String {
+    rows(adapter, &format!("SHOW CREATE TABLE `{table}`"))[0][1].clone()
+}
+
+fn counter(adapter: &mut Adapter, table: &str) -> Option<String> {
+    created(adapter, table)
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("AUTO_INCREMENT="))
+        .map(str::to_owned)
+}

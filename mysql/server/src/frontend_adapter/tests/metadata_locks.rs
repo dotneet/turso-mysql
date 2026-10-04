@@ -281,6 +281,8 @@ fn every_definition_change_waits_for_a_transaction_that_read_the_table() {
     run(&mut two, "SET SESSION lock_wait_timeout = 1");
     for sql in [
         "TRUNCATE TABLE t",
+        "ALTER TABLE t MODIFY id BIGINT NOT NULL",
+        "ALTER TABLE t DROP PRIMARY KEY",
         "CREATE INDEX t_v ON t (v)",
         "RENAME TABLE t TO t9",
         "DROP TABLE t",

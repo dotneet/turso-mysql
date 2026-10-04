@@ -59,7 +59,7 @@ use turso_mysql::{
 use turso_mysql::{
     MySqlAffectedRowsMode, MySqlAlterTableIndexError, MySqlConnection,
     MySqlCreateTableAsSelectError, MySqlDropTableError, MySqlForeignKeyDefinitionError,
-    MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlKeyChangeError, MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
     MySqlPreparedResultColumnTypeMetadata, MySqlQueryError, MySqlRenameTableError,
     MySqlTruncateTableError,
 };
@@ -7032,6 +7032,7 @@ fn prepared_statement_error(error: MySqlPreparedStatementError) -> FrontendError
 fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::ForeignKeyDefinition(error) => foreign_key_definition_error_kind(&error),
+        MySqlQueryError::KeyChange(error) => key_change_error_kind(&error),
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,
@@ -7047,6 +7048,24 @@ fn frontend_query_error(error: MySqlQueryError) -> FrontendErrorKind {
         MySqlQueryError::Syntax(_) => FrontendErrorKind::Syntax,
         MySqlQueryError::Unsupported(_) => FrontendErrorKind::Unsupported,
         MySqlQueryError::Engine(error) => frontend_error_kind(error),
+    }
+}
+
+fn key_change_error_kind(error: &MySqlKeyChangeError) -> FrontendErrorKind {
+    match error {
+        MySqlKeyChangeError::KeyColumnMissing(_) => FrontendErrorKind::ForeignKeyColumnMissing,
+        MySqlKeyChangeError::NoKeyToDrop => FrontendErrorKind::CantDropKey,
+        MySqlKeyChangeError::SecondKey => FrontendErrorKind::SecondPrimaryKey,
+        MySqlKeyChangeError::KeyColumnMayBeNull => FrontendErrorKind::KeyColumnMayBeNull,
+        MySqlKeyChangeError::NullInANotNullColumn => FrontendErrorKind::InvalidUseOfNull,
+        MySqlKeyChangeError::WordCutShort => FrontendErrorKind::NotAMember,
+        MySqlKeyChangeError::CountedColumnNotAKey => FrontendErrorKind::CountedColumnNotAKey,
+        MySqlKeyChangeError::ForeignKeyColumnCountingChanges => {
+            FrontendErrorKind::ForeignKeyColumnCannotChange
+        }
+        MySqlKeyChangeError::ReferencedColumnCountingChanges => {
+            FrontendErrorKind::ReferencedColumnCannotChange
+        }
     }
 }
 
@@ -14143,6 +14162,7 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
 fn frontend_prepare_error(error: MySqlQueryError) -> FrontendErrorKind {
     match error {
         MySqlQueryError::ForeignKeyDefinition(error) => foreign_key_definition_error_kind(&error),
+        MySqlQueryError::KeyChange(error) => key_change_error_kind(&error),
         MySqlQueryError::MissingRequiredDefault(_) => FrontendErrorKind::MissingRequiredDefault,
         MySqlQueryError::DuplicateColumn(_) => FrontendErrorKind::DuplicateColumn,
         MySqlQueryError::DuplicateIndex => FrontendErrorKind::DuplicateKeyName,

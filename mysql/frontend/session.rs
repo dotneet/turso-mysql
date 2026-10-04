@@ -1,4 +1,5 @@
 mod catalog;
+mod table_rewrite;
 mod transaction_isolation;
 mod trigger_body;
 
@@ -368,8 +369,62 @@ pub enum MySqlQueryError {
     /// A `CHECK` was given a name another constraint already has.
     DuplicateCheckName(String),
     ForeignKeyDefinition(MySqlForeignKeyDefinitionError),
+    /// An `ALTER TABLE` changing a table's key asked for one MySQL refuses.
+    KeyChange(MySqlKeyChangeError),
     /// The checked Turso AST reached core, which then failed to prepare it.
     Engine(LimboError),
+}
+
+/// Why MySQL refuses an `ALTER TABLE` that changes a table's primary key or
+/// the column the table counts on. Each was measured on MySQL 8.4.11.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MySqlKeyChangeError {
+    /// `ADD PRIMARY KEY` over a column the table has not got: 1072.
+    KeyColumnMissing(String),
+    /// `DROP PRIMARY KEY` on a table without one: 1091.
+    NoKeyToDrop,
+    /// A key added beside the one the table has: 1068.
+    SecondKey,
+    /// A key column declared `NULL` or `DEFAULT NULL`: 1171.
+    KeyColumnMayBeNull,
+    /// A column made `NOT NULL`, or a key over one, holding NULL in some row:
+    /// 1138.
+    NullInANotNullColumn,
+    /// A word too long for the narrower column of words it is copied into:
+    /// 1265.
+    WordCutShort,
+    /// A counted column no key starts with: 1075.
+    CountedColumnNotAKey,
+    /// A column of the table's own foreign key would start or stop counting
+    /// while foreign key checks are on: 1832.
+    ForeignKeyColumnCountingChanges,
+    /// A column another table's foreign key names would start or stop
+    /// counting while foreign key checks are on: 1833.
+    ReferencedColumnCountingChanges,
+}
+
+impl MySqlKeyChangeError {
+    pub fn message(&self) -> String {
+        match self {
+            Self::KeyColumnMissing(column) => {
+                format!("Key column '{column}' doesn't exist in table")
+            }
+            Self::NoKeyToDrop => "Can't DROP 'PRIMARY'; check that column/key exists".to_string(),
+            Self::SecondKey => "Multiple primary key defined".to_string(),
+            Self::KeyColumnMayBeNull => "All parts of a PRIMARY KEY must be NOT NULL".to_string(),
+            Self::NullInANotNullColumn => "Invalid use of NULL value".to_string(),
+            Self::WordCutShort => "Data truncated for column".to_string(),
+            Self::CountedColumnNotAKey => {
+                "there can be only one auto column and it must be defined as a key".to_string()
+            }
+            Self::ForeignKeyColumnCountingChanges => {
+                "Cannot change column used in a foreign key constraint".to_string()
+            }
+            Self::ReferencedColumnCountingChanges => {
+                "Cannot change column used in a foreign key constraint of another table".to_string()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1594,6 +1649,7 @@ impl fmt::Display for MySqlQueryError {
                 write!(f, "Duplicate check constraint name '{name}'")
             }
             Self::ForeignKeyDefinition(error) => f.write_str(&error.message()),
+            Self::KeyChange(error) => f.write_str(&error.message()),
             Self::Syntax(error) => f.write_str(error),
             Self::Unsupported(error) => f.write_str(error),
             Self::Engine(error) => error.fmt(f),
@@ -1616,7 +1672,8 @@ impl Error for MySqlQueryError {
             | Self::NoSuchSavepoint
             | Self::NoSuchCheck(_)
             | Self::DuplicateCheckName(_)
-            | Self::ForeignKeyDefinition(_) => None,
+            | Self::ForeignKeyDefinition(_)
+            | Self::KeyChange(_) => None,
             Self::Syntax(_) => None,
             Self::Unsupported(_) => None,
             Self::Engine(error) => Some(error),
@@ -1629,6 +1686,7 @@ impl From<MySqlQueryError> for LimboError {
         match error {
             MySqlQueryError::MissingRequiredDefault(_) => Self::NullValue,
             MySqlQueryError::ForeignKeyDefinition(error) => Self::ParseError(error.message()),
+            MySqlQueryError::KeyChange(error) => Self::ParseError(error.message()),
             MySqlQueryError::DuplicateColumn(column) => {
                 Self::ParseError(format!("Duplicate column name '{column}'"))
             }
@@ -5305,6 +5363,9 @@ impl MySqlConnection {
         }
         if let Some(collated) = self.with_the_table_collation_on_each_text_column(sql)? {
             return self.execute_schema_ddl(&collated);
+        }
+        if let Some((table, change)) = self.key_an_alter_changes(sql)? {
+            return self.change_the_key(&table, change);
         }
         match self.column_an_alter_places(sql)? {
             Some(turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite)) => {

@@ -3054,6 +3054,74 @@ fn a_table_written_again_takes_its_key_as_the_rowid() -> Result<()> {
     Ok(())
 }
 
+/// A table made with its key as an index takes the key as its rowid when an
+/// `ALTER TABLE` changes the key's type, and one whose key changes into a
+/// type the rowid cannot hold takes the index layout; each keeps its rows
+/// and its kept index through a reopen.
+#[test]
+fn a_key_change_writes_the_table_in_the_layout_its_new_key_takes() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-key-change-layout.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.create_table_keyed_by_an_index(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(10))",
+        )?;
+        connection.execute("CREATE INDEX by_v ON t (v)")?;
+        connection.execute("INSERT INTO t (id, v) VALUES (3, 'c'), (1, 'a')")?;
+        assert!(!keyed_by_its_rowid(&connection, "t")?);
+        connection
+            .execute_schema_ddl("ALTER TABLE t MODIFY id INT NOT NULL")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(ids_of(&connection, "SELECT id FROM t")?, [1, 3]);
+        connection.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)")?;
+        connection.execute("INSERT INTO u (id, v) VALUES (2, 20), (1, 10)")?;
+        assert!(keyed_by_its_rowid(&connection, "u")?);
+        connection
+            .execute_schema_ddl("ALTER TABLE u MODIFY id BIGINT UNSIGNED NOT NULL")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert!(!keyed_by_its_rowid(&connection, "u")?);
+        connection.inner().close()?;
+    }
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    assert!(keyed_by_its_rowid_beside_its_indexes(&connection, "t")?);
+    assert_eq!(ids_of(&connection, "SELECT id FROM t")?, [1, 3]);
+    assert_eq!(ids_of(&connection, "SELECT id FROM t WHERE v = 'c'")?, [3]);
+    let columns = connection
+        .list_columns(&MySqlTableName::parse("t").unwrap())
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(columns[0].type_name(), "INT");
+    assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+    assert!(!keyed_by_its_rowid(&connection, "u")?);
+    assert_eq!(
+        ids_of(&connection, "SELECT v FROM u ORDER BY id")?,
+        [10, 20]
+    );
+    let columns = connection
+        .list_columns(&MySqlTableName::parse("u").unwrap())
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(columns[0].type_name(), "BIGINT UNSIGNED");
+    assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+    connection.inner().close()?;
+    Ok(())
+}
+
+/// Whether a table's key is its rowid, whatever other indexes it carries.
+fn keyed_by_its_rowid_beside_its_indexes(
+    connection: &MySqlConnection,
+    table_name: &str,
+) -> Result<bool> {
+    let schema = connection.inner().current_schema();
+    let btree = schema
+        .get_btree_table(table_name)
+        .ok_or_else(|| LimboError::InternalError(format!("missing table {table_name}")))?;
+    Ok(btree
+        .get_rowid_alias_column()
+        .is_some_and(|(_, column)| column.rowid_must_be_written()))
+}
+
 fn keyed_by_its_rowid(connection: &MySqlConnection, table_name: &str) -> Result<bool> {
     let rows = connection
         .inner()

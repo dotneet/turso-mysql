@@ -401,6 +401,19 @@ pub enum FrontendErrorKind {
     UnknownSystemVariable,
     /// A `DROP INDEX` named an index the table does not carry.
     CantDropKey,
+    /// An `ALTER TABLE` gave a table a primary key beside the one it has.
+    SecondPrimaryKey,
+    /// A counted column no key starts with.
+    CountedColumnNotAKey,
+    /// A primary key column declared `NULL`.
+    KeyColumnMayBeNull,
+    /// A primary key added over a column holding NULL in some row.
+    InvalidUseOfNull,
+    /// A column of a table's own foreign key would start or stop counting.
+    ForeignKeyColumnCannotChange,
+    /// A column another table's foreign key names would start or stop
+    /// counting.
+    ReferencedColumnCannotChange,
     /// A `RENAME INDEX` named an index the table does not carry.
     KeyDoesNotExist,
     /// A unique, or other constraint rejected the operation.
@@ -676,6 +689,35 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1553,
             *b"HY000",
             b"Cannot drop index: needed in a foreign key constraint".as_slice(),
+        ),
+        // Measured on MySQL 8.4.11, each with the message it answers there.
+        FrontendErrorKind::SecondPrimaryKey => {
+            (1068, *b"42000", b"Multiple primary key defined".as_slice())
+        }
+        FrontendErrorKind::CountedColumnNotAKey => (
+            1075,
+            *b"42000",
+            b"Incorrect table definition; there can be only one auto column and it must be defined as a key"
+                .as_slice(),
+        ),
+        FrontendErrorKind::KeyColumnMayBeNull => (
+            1171,
+            *b"42000",
+            b"All parts of a PRIMARY KEY must be NOT NULL; if you need NULL in a key, use UNIQUE instead"
+                .as_slice(),
+        ),
+        FrontendErrorKind::InvalidUseOfNull => {
+            (1138, *b"22004", b"Invalid use of NULL value".as_slice())
+        }
+        FrontendErrorKind::ForeignKeyColumnCannotChange => (
+            1832,
+            *b"HY000",
+            b"Cannot change column used in a foreign key constraint".as_slice(),
+        ),
+        FrontendErrorKind::ReferencedColumnCannotChange => (
+            1833,
+            *b"HY000",
+            b"Cannot change column used in a foreign key constraint of another table".as_slice(),
         ),
         FrontendErrorKind::CantDropKey => (
             1091,
@@ -2815,6 +2857,20 @@ mod tests {
             (FrontendErrorKind::CheckConstraintViolated, 3819, *b"HY000"),
             (FrontendErrorKind::NoSuchCheck, 3821, *b"HY000"),
             (FrontendErrorKind::ForeignKeyColumnMissing, 1072, *b"42000"),
+            (FrontendErrorKind::SecondPrimaryKey, 1068, *b"42000"),
+            (FrontendErrorKind::CountedColumnNotAKey, 1075, *b"42000"),
+            (FrontendErrorKind::KeyColumnMayBeNull, 1171, *b"42000"),
+            (FrontendErrorKind::InvalidUseOfNull, 1138, *b"22004"),
+            (
+                FrontendErrorKind::ForeignKeyColumnCannotChange,
+                1832,
+                *b"HY000",
+            ),
+            (
+                FrontendErrorKind::ReferencedColumnCannotChange,
+                1833,
+                *b"HY000",
+            ),
             (
                 FrontendErrorKind::ForeignKeyColumnCountMismatch,
                 1239,
