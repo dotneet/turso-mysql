@@ -1012,6 +1012,11 @@ fn emit_deferred_notnull_checks<'a>(
         if !updated_column_indices.get(idx) {
             continue;
         }
+        // A rowid alias's new value is in the rowid register, its column
+        // register holding NULL, and was checked where it was computed.
+        if table_column.is_rowid_alias() {
+            continue;
+        }
         let target_reg = column_ctx.layout.to_register(column_ctx.start, idx);
         emit_notnull_constraint_check(
             program,
