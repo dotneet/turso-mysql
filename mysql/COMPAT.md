@@ -3972,9 +3972,10 @@ inserted for rows 30, 10 and 20 come back 10, 20, 30 from `WHERE u IS NULL` ther
 `NOT NULL`, which InnoDB keeps its rows by in place of a primary key, orders a plain index's
 equal values by insertion here and by that unique key there.
 
-A table made with one signed integer primary key — `TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`,
-`INTEGER` or `BIGINT`, written on the column or as a `PRIMARY KEY (col)` clause, without
-`AUTO_INCREMENT` — keeps that key as the engine's rowid, the way a counted table keeps its
+A table made with one integer primary key whose every value the engine's rowid holds —
+`TINYINT`, `SMALLINT`, `MEDIUMINT`, `INT`, `INTEGER` or `BIGINT`, or one of the first five
+`UNSIGNED`, written on the column or as a `PRIMARY KEY (col)` clause, without `AUTO_INCREMENT`
+— keeps that key as the engine's rowid, the way a counted table keeps its
 counter. InnoDB keeps a table's rows in its primary key's order and finds a row by key in that
 one tree; this does the same. The rows come back in key order when nothing orders them, a plain
 index's entries end with the key, and a locking read of a range of keys locks the gaps between
@@ -3992,7 +3993,8 @@ value the row gives, held to the rules MySQL holds it to. Measured on 8.4.11 and
 leaving the key out answers 1364 unless the key has a `DEFAULT`, which it then takes; a NULL
 key, written, bound, selected or set by an `UPDATE` or an upsert, answers 1048; a key already
 taken 1062; and the key's value is read and checked as any other value of its declared type is
-— `'12'` is 12, `1e3` is 1000, 2147483648 into an `INT` key is 1264 and `'abc'` 1366. Every
+— `'12'` is 12, `1e3` is 1000, 2147483648 into an `INT` key is 1264 and `'abc'` 1366; `-1`
+and `'-1'` into an unsigned key are 1264, and so is one past its most, written or moved to. Every
 statement answers exactly what it answered when the key was an index of its own, which a test
 runs side by side over both. `LAST_INSERT_ID()` is left alone, the key not being counted, and
 `SHOW CREATE TABLE`, `SHOW INDEX`, `DESCRIBE`, `information_schema` and the result-set flags

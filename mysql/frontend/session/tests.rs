@@ -2815,6 +2815,27 @@ fn an_integer_primary_key_is_the_rowid_and_keeps_its_declared_type() -> Result<(
         ("smallint_keys", "SMALLINT", "SMALLINT"),
         ("mediumint_keys", "MEDIUMINT", "MEDIUMINT"),
         ("tinyint_keys", "TINYINT", "TINYINT"),
+        (
+            "tinyint_unsigned_keys",
+            "TINYINT UNSIGNED",
+            "TINYINT UNSIGNED",
+        ),
+        (
+            "smallint_unsigned_keys",
+            "SMALLINT UNSIGNED",
+            "SMALLINT UNSIGNED",
+        ),
+        (
+            "mediumint_unsigned_keys",
+            "MEDIUMINT UNSIGNED",
+            "MEDIUMINT UNSIGNED",
+        ),
+        ("int_unsigned_keys", "INT UNSIGNED", "INT UNSIGNED"),
+        (
+            "integer_unsigned_keys",
+            "INTEGER UNSIGNED",
+            "INTEGER UNSIGNED",
+        ),
     ];
     {
         let db = open_database(io.clone(), path, OpenFlags::Create)?;

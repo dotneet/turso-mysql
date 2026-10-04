@@ -338,6 +338,107 @@ fn a_key_of_each_integer_type_reads_back_as_declared() {
     );
 }
 
+/// An unsigned key below `BIGINT UNSIGNED` is the table's rowid as a signed
+/// one is: a key a row leaves out is 1364 and a NULL 1048, a value past
+/// either end of the type is 1264 written or moved to by an `UPDATE`, written
+/// as a number or as a word, and the rows come back in key order. Its type
+/// is printed and reported as declared, a display width dropped.
+#[test]
+fn an_unsigned_key_is_the_rowid_and_holds_what_its_type_holds() {
+    let (_directory, mut adapter) = adapter();
+    for (table, declared, printed, most) in [
+        ("tu", "TINYINT UNSIGNED", "tinyint unsigned", "255"),
+        ("su", "SMALLINT UNSIGNED", "smallint unsigned", "65535"),
+        ("mu", "MEDIUMINT UNSIGNED", "mediumint unsigned", "16777215"),
+        ("iu", "INT(10) UNSIGNED", "int unsigned", "4294967295"),
+        ("gu", "INTEGER UNSIGNED", "int unsigned", "4294967295"),
+    ] {
+        run(
+            &mut adapter,
+            &format!("CREATE TABLE {table} (id {declared} NOT NULL, v INT, PRIMARY KEY (id))"),
+        );
+        assert_eq!(
+            rows(&mut adapter, &format!("SHOW CREATE TABLE {table}"))[0][1],
+            format!(
+                "CREATE TABLE `{table}` (\n  `id` {printed} NOT NULL,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+            )
+        );
+        assert_eq!(
+            rows(&mut adapter, &format!("DESCRIBE {table}"))[0],
+            ["id", printed, "NO", "PRI", "NULL", ""]
+        );
+        let past = format!("{}", most.parse::<u64>().unwrap() + 1);
+        for (sql, refused) in [
+            (
+                format!("INSERT INTO {table} VALUES (-1, 1)"),
+                FrontendErrorKind::OutOfRange,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES ('-1', 1)"),
+                FrontendErrorKind::OutOfRange,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES ({past}, 1)"),
+                FrontendErrorKind::OutOfRange,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES ('abc', 1)"),
+                FrontendErrorKind::IncorrectValue,
+            ),
+            (
+                format!("INSERT INTO {table} (v) VALUES (1)"),
+                FrontendErrorKind::MissingRequiredDefault,
+            ),
+            (
+                format!("INSERT INTO {table} VALUES (NULL, 1)"),
+                FrontendErrorKind::NotNullViolation,
+            ),
+        ] {
+            assert_eq!(
+                adapter.execute_query(&sql).map(|_| ()),
+                Err(refused),
+                "{sql}"
+            );
+        }
+        run(
+            &mut adapter,
+            &format!("INSERT INTO {table} VALUES ({most}, 1), (0, 2), ('7', 3)"),
+        );
+        for sql in [
+            format!("UPDATE {table} SET id = -1 WHERE id = 7"),
+            format!("UPDATE {table} SET id = {past} WHERE id = 7"),
+        ] {
+            assert_eq!(
+                adapter.execute_query(&sql).map(|_| ()),
+                Err(FrontendErrorKind::OutOfRange),
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            rows(&mut adapter, &format!("SELECT id, v FROM {table}")),
+            [
+                ["0".to_owned(), "2".to_owned()],
+                ["7".to_owned(), "3".to_owned()],
+                [most.to_owned(), "1".to_owned()],
+            ]
+        );
+    }
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT TABLE_NAME, COLUMN_KEY, COLUMN_TYPE, DATA_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI' ORDER BY TABLE_NAME"
+        ),
+        [
+            ["gu", "PRI", "int unsigned", "int"],
+            ["iu", "PRI", "int unsigned", "int"],
+            ["mu", "PRI", "mediumint unsigned", "mediumint"],
+            ["su", "PRI", "smallint unsigned", "smallint"],
+            ["tu", "PRI", "tinyint unsigned", "tinyint"],
+        ]
+    );
+}
+
 fn adapter() -> (tempfile::TempDir, Adapter) {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (directory, _catalog, factory) = catalog_factory(authorizer);

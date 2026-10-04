@@ -42,6 +42,16 @@ pub enum CheckedPrimaryKeyIntegerType {
     MediumInt,
     /// The MySQL `TINYINT` spelling.
     TinyInt,
+    /// The MySQL `TINYINT UNSIGNED` spelling.
+    TinyIntUnsigned,
+    /// The MySQL `SMALLINT UNSIGNED` spelling.
+    SmallIntUnsigned,
+    /// The MySQL `MEDIUMINT UNSIGNED` spelling.
+    MediumIntUnsigned,
+    /// The MySQL `INT UNSIGNED` spelling.
+    IntUnsigned,
+    /// The MySQL `INTEGER UNSIGNED` spelling.
+    IntegerUnsigned,
 }
 
 impl CheckedPrimaryKeyIntegerType {
@@ -55,6 +65,11 @@ impl CheckedPrimaryKeyIntegerType {
             Self::SmallInt => "SMALLINT",
             Self::MediumInt => "MEDIUMINT",
             Self::TinyInt => "TINYINT",
+            Self::TinyIntUnsigned => "TINYINT UNSIGNED",
+            Self::SmallIntUnsigned => "SMALLINT UNSIGNED",
+            Self::MediumIntUnsigned => "MEDIUMINT UNSIGNED",
+            Self::IntUnsigned => "INT UNSIGNED",
+            Self::IntegerUnsigned => "INTEGER UNSIGNED",
         }
     }
 
@@ -202,6 +217,13 @@ fn check_columns(
         DataType::MediumInt(_) => Some(CheckedPrimaryKeyIntegerType::MediumInt),
         // A `TINYINT(1)` is the engine's `BOOLEAN`, which no key is kept as.
         DataType::TinyInt(width) if width != Some(1) => Some(CheckedPrimaryKeyIntegerType::TinyInt),
+        // The unsigned types below `BIGINT UNSIGNED` hold nothing past the
+        // engine's signed 64 bits, so a key of one is the rowid as well.
+        DataType::TinyIntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::TinyIntUnsigned),
+        DataType::SmallIntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::SmallIntUnsigned),
+        DataType::MediumIntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::MediumIntUnsigned),
+        DataType::IntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::IntUnsigned),
+        DataType::IntegerUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::IntegerUnsigned),
         // A key over bytes is what a table keyed by a UUID holds it in,
         // measured taken by MySQL 8.4.11 as `BINARY(16)` and `VARBINARY(16)`.
         DataType::Varchar(Some(_))
@@ -405,13 +427,18 @@ pub fn with_the_primary_key_as_declared(
 }
 
 /// The engine spellings of the MySQL integer types a key can be the rowid as.
-const ROWID_KEY_ENGINE_TYPES: [&str; 6] = [
+const ROWID_KEY_ENGINE_TYPES: [&str; 11] = [
     "INT",
     "INTEGER",
     "BIGINT",
     "SMALLINT",
     "MEDIUMINT",
     "TINYINT",
+    "TINYINT UNSIGNED",
+    "SMALLINT UNSIGNED",
+    "MEDIUMINT UNSIGNED",
+    "INT UNSIGNED",
+    "INTEGER UNSIGNED",
 ];
 
 fn the_primary_key_column(statement: &mut Stmt) -> Result<&mut ColumnDefinition, ParseError> {
@@ -685,13 +712,20 @@ mod tests {
         }
     }
 
-    /// Each signed integer key is written `INTEGER` to be the engine's rowid,
-    /// and the type it was declared with comes back from the stored DDL. A
-    /// key the rowid cannot hold every value of, or a key over a word, is no
-    /// rowid.
+    /// Each integer key the rowid holds every value of, every signed one and
+    /// every unsigned one below `BIGINT UNSIGNED`, is written `INTEGER` to be
+    /// the engine's rowid, and the type it was declared with comes back from
+    /// the stored DDL. A key the rowid cannot hold every value of, or a key
+    /// over a word, is no rowid.
     #[test]
-    fn a_signed_integer_key_becomes_the_rowid_and_comes_back_as_declared() {
+    fn an_integer_key_becomes_the_rowid_and_comes_back_as_declared() {
         for sql in [
+            "CREATE TABLE t (id TINYINT UNSIGNED PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id SMALLINT UNSIGNED PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id MEDIUMINT UNSIGNED PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id INT UNSIGNED PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id INTEGER UNSIGNED PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id INT(10) UNSIGNED NOT NULL, PRIMARY KEY (id))",
             "CREATE TABLE t (id TINYINT PRIMARY KEY, v INT)",
             "CREATE TABLE t (id SMALLINT PRIMARY KEY, v INT)",
             "CREATE TABLE t (id MEDIUMINT PRIMARY KEY, v INT)",
