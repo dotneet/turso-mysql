@@ -21,7 +21,7 @@ use sqlparser::ast::{
     ColumnDef, ColumnOption, CreateTable, CreateTableOptions, DataType, Expr, Statement,
     TableConstraint, Value,
 };
-use turso_parser::ast::Stmt;
+use turso_parser::ast::{ColumnConstraint, ColumnDefinition, CreateTableBody, Stmt, Type};
 
 /// The source spelling of an ordinary integer primary-key column.
 ///
@@ -36,6 +36,12 @@ pub enum CheckedPrimaryKeyIntegerType {
     BigInt,
     /// The MySQL `BIGINT UNSIGNED` spelling.
     BigIntUnsigned,
+    /// The MySQL `SMALLINT` spelling.
+    SmallInt,
+    /// The MySQL `MEDIUMINT` spelling.
+    MediumInt,
+    /// The MySQL `TINYINT` spelling.
+    TinyInt,
 }
 
 impl CheckedPrimaryKeyIntegerType {
@@ -46,7 +52,16 @@ impl CheckedPrimaryKeyIntegerType {
             Self::Integer => "INTEGER",
             Self::BigInt => "BIGINT",
             Self::BigIntUnsigned => "BIGINT UNSIGNED",
+            Self::SmallInt => "SMALLINT",
+            Self::MediumInt => "MEDIUMINT",
+            Self::TinyInt => "TINYINT",
         }
+    }
+
+    /// Whether every value of the type fits the engine's 64-bit signed
+    /// rowid, so a key of this type can be the rowid itself.
+    pub const fn fits_the_rowid(self) -> bool {
+        !matches!(self, Self::BigIntUnsigned)
     }
 }
 
@@ -183,6 +198,10 @@ fn check_columns(
         DataType::Integer(_) => Some(CheckedPrimaryKeyIntegerType::Integer),
         DataType::BigInt(_) => Some(CheckedPrimaryKeyIntegerType::BigInt),
         DataType::BigIntUnsigned(_) => Some(CheckedPrimaryKeyIntegerType::BigIntUnsigned),
+        DataType::SmallInt(_) => Some(CheckedPrimaryKeyIntegerType::SmallInt),
+        DataType::MediumInt(_) => Some(CheckedPrimaryKeyIntegerType::MediumInt),
+        // A `TINYINT(1)` is the engine's `BOOLEAN`, which no key is kept as.
+        DataType::TinyInt(width) if width != Some(1) => Some(CheckedPrimaryKeyIntegerType::TinyInt),
         // A key over bytes is what a table keyed by a UUID holds it in,
         // measured taken by MySQL 8.4.11 as `BINARY(16)` and `VARBINARY(16)`.
         DataType::Varchar(Some(_))
@@ -325,6 +344,94 @@ fn render_sqlite_primary_key_column(column: &ColumnDef) -> Result<String, ParseE
     }
     definition.push_str(" PRIMARY KEY");
     Ok(definition)
+}
+
+/// The engine's table with its one integer primary key made the table's rowid.
+///
+/// The key column is written `INTEGER`, the one spelling the engine takes as
+/// a rowid alias, so the rows are kept in key order and found by key without
+/// an index of their own. What type MySQL declared the key with is kept in
+/// the stored MySQL DDL; [`with_the_primary_key_as_declared`] writes it back.
+pub fn with_the_primary_key_as_the_rowid(statement: Stmt) -> Result<Stmt, ParseError> {
+    let mut statement = statement;
+    let key = the_primary_key_column(&mut statement)?;
+    let declared = key.col_type.as_ref().map(|written| written.name.as_str());
+    if !declared.is_some_and(|declared| ROWID_KEY_ENGINE_TYPES.contains(&declared)) {
+        return unsupported("PRIMARY KEY that cannot be the rowid");
+    }
+    if !key.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.constraint,
+            ColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            }
+        )
+    }) {
+        return unsupported("PRIMARY KEY that may be NULL");
+    }
+    key.col_type = Some(Type {
+        name: "INTEGER".to_owned(),
+        size: None,
+        array_dimensions: 0,
+    });
+    Ok(statement)
+}
+
+/// The engine's table with its rowid key written in the integer type the
+/// stored MySQL table `stored_mysql_ddl` declares the key with.
+///
+/// Every MySQL integer key is the engine's `INTEGER`, so a table the engine
+/// rewrote — a column added or renamed — names no type MySQL would print until
+/// the one it was declared with is put back.
+pub fn with_the_primary_key_as_declared(
+    statement: Stmt,
+    stored_mysql_ddl: &str,
+    mode: SessionSqlMode,
+) -> Result<Stmt, ParseError> {
+    let mut stored = super::parse_create_table_ast(stored_mysql_ddl, mode)?;
+    let declared = the_primary_key_column(&mut stored)?.col_type.clone();
+    let mut statement = statement;
+    let key = the_primary_key_column(&mut statement)?;
+    if key
+        .col_type
+        .as_ref()
+        .is_none_or(|written| written.name != "INTEGER")
+    {
+        return unsupported("rowid key written as another type");
+    }
+    key.col_type = declared;
+    Ok(statement)
+}
+
+/// The engine spellings of the MySQL integer types a key can be the rowid as.
+const ROWID_KEY_ENGINE_TYPES: [&str; 6] = [
+    "INT",
+    "INTEGER",
+    "BIGINT",
+    "SMALLINT",
+    "MEDIUMINT",
+    "TINYINT",
+];
+
+fn the_primary_key_column(statement: &mut Stmt) -> Result<&mut ColumnDefinition, ParseError> {
+    let Stmt::CreateTable {
+        body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+        ..
+    } = statement
+    else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let mut keys = columns.iter_mut().filter(|column| {
+        column
+            .constraints
+            .iter()
+            .any(|constraint| matches!(constraint.constraint, ColumnConstraint::PrimaryKey { .. }))
+    });
+    let (Some(key), None) = (keys.next(), keys.next()) else {
+        return unsupported("table without one PRIMARY KEY column");
+    };
+    Ok(key)
 }
 
 pub(crate) fn render_mysql_create_table(
@@ -575,6 +682,63 @@ mod tests {
                     }
                 ]
             ));
+        }
+    }
+
+    /// Each signed integer key is written `INTEGER` to be the engine's rowid,
+    /// and the type it was declared with comes back from the stored DDL. A
+    /// key the rowid cannot hold every value of, or a key over a word, is no
+    /// rowid.
+    #[test]
+    fn a_signed_integer_key_becomes_the_rowid_and_comes_back_as_declared() {
+        for sql in [
+            "CREATE TABLE t (id TINYINT PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id SMALLINT PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id MEDIUMINT PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)",
+            "CREATE TABLE t (v INT, id BIGINT(20) NOT NULL, PRIMARY KEY (id))",
+        ] {
+            let checked =
+                parse_checked_primary_key_create_table(sql, SessionSqlMode::default()).unwrap();
+            assert!(checked
+                .primary_key_integer_type
+                .is_some_and(CheckedPrimaryKeyIntegerType::fits_the_rowid));
+            let rowid =
+                with_the_primary_key_as_the_rowid(checked.sqlite_statement.clone()).unwrap();
+            let Stmt::CreateTable {
+                body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+                ..
+            } = &rowid
+            else {
+                panic!("expected CREATE TABLE");
+            };
+            let key = &columns[checked.primary_key_column_ordinal];
+            assert_eq!(key.col_type.as_ref().unwrap().name, "INTEGER", "{sql}");
+            assert_eq!(
+                with_the_primary_key_as_declared(
+                    rowid,
+                    &checked.normalized_mysql_ddl,
+                    SessionSqlMode::default()
+                )
+                .unwrap(),
+                checked.sqlite_statement,
+                "{sql}"
+            );
+        }
+        for sql in [
+            "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY)",
+            "CREATE TABLE t (id VARCHAR(10) PRIMARY KEY)",
+        ] {
+            let checked =
+                parse_checked_primary_key_create_table(sql, SessionSqlMode::default()).unwrap();
+            assert!(!checked
+                .primary_key_integer_type
+                .is_some_and(CheckedPrimaryKeyIntegerType::fits_the_rowid));
+            assert!(
+                with_the_primary_key_as_the_rowid(checked.sqlite_statement).is_err(),
+                "{sql}"
+            );
         }
     }
 

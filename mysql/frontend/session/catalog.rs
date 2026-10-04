@@ -780,7 +780,20 @@ impl MySqlConnection {
         let rowid_alias_ordinal = core_table
             .btree()
             .and_then(|table| table.get_rowid_alias_column().map(|(ordinal, _)| ordinal));
-        if auto_increment_column_ordinal.is_none() && rowid_alias_ordinal.is_some() {
+        // A table counting nothing has its key as its rowid exactly when its
+        // envelope says so, and then the rowid is the key.
+        let keyed_by_its_rowid = decoded.primary_key_is_the_rowid();
+        let rowid_is_the_key = match (auto_increment_column_ordinal, rowid_alias_ordinal) {
+            (Some(_), _) => !keyed_by_its_rowid,
+            (None, Some(ordinal)) => {
+                keyed_by_its_rowid
+                    && metadata
+                        .get(ordinal)
+                        .is_some_and(|column| column.key == MySqlColumnKey::Primary)
+            }
+            (None, None) => !keyed_by_its_rowid,
+        };
+        if !rowid_is_the_key {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
         let index_names = self

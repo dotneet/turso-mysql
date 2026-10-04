@@ -1084,6 +1084,68 @@ fn two_sessions_that_lock_one_gap_and_insert_into_it_end_in_a_deadlock() {
     assert_eq!(balances(&mut one), ["10", "20", "30", "50"]);
 }
 
+/// Measured on MySQL 8.4.11 over keys 5, 10, 15, 20 and 25, with another
+/// session trying each insert in turn under a one-second lock wait: a locking
+/// read of keys locks the gaps between the keys it read, in key order, and a
+/// read of a missing key locks the gap it would stand in.
+#[test]
+fn a_locking_read_of_keys_keeps_inserts_out_of_the_gaps_between_them() {
+    for (locking_read, inserts) in [
+        (
+            "SELECT id FROM lk WHERE id BETWEEN 10 AND 20 FOR UPDATE",
+            &[
+                (3, false),
+                (7, false),
+                (12, true),
+                (17, true),
+                (22, false),
+                (27, false),
+            ][..],
+        ),
+        (
+            "SELECT id FROM lk WHERE id = 12 FOR UPDATE",
+            &[(9, false), (11, true), (13, true), (16, false)][..],
+        ),
+        (
+            "SELECT id FROM lk WHERE id > 20 FOR UPDATE",
+            &[(17, false), (22, true), (27, true), (99, true)][..],
+        ),
+        (
+            "SELECT id FROM lk WHERE id < 12 FOR UPDATE",
+            &[(1, true), (7, true), (11, true), (13, true), (17, false)][..],
+        ),
+    ] {
+        if !turso_mysql::databases_open_in_mvcc() {
+            return;
+        }
+        let TwoSessions {
+            _directory,
+            mut one,
+            mut two,
+        } = two_sessions();
+        run(&mut one, "CREATE TABLE lk (id INT PRIMARY KEY, v INT)");
+        run(
+            &mut one,
+            "INSERT INTO lk VALUES (5, 5), (10, 10), (15, 15), (20, 20), (25, 25)",
+        );
+        run(&mut one, "BEGIN");
+        run(&mut one, locking_read);
+        run(&mut two, "SET SESSION innodb_lock_wait_timeout = 1");
+        for (key, waits) in inserts {
+            let answer = two
+                .execute_query(&format!("INSERT INTO lk VALUES ({key}, 0)"))
+                .map(|_| ());
+            let expected = if *waits {
+                Err(FrontendErrorKind::DatabaseBusy)
+            } else {
+                Ok(())
+            };
+            assert_eq!(answer, expected, "{locking_read}: insert {key}");
+        }
+        run(&mut one, "ROLLBACK");
+    }
+}
+
 #[test]
 fn a_range_read_through_a_plain_index_stops_on_the_lowest_primary_key_among_equal_values() {
     if !turso_mysql::databases_open_in_mvcc() {

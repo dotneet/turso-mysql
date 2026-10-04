@@ -17,6 +17,7 @@ const VERSION_PREFIX: &str = "v1:";
 const V2_VERSION_PREFIX: &str = "v2:";
 const V3_VERSION_PREFIX: &str = "v3:";
 const V4_VERSION_PREFIX: &str = "v4:";
+const V5_VERSION_PREFIX: &str = "v5:";
 const MARKER_END: &str = "*/ ";
 
 /// Largest accepted decoded creation context.
@@ -251,8 +252,17 @@ impl DecodedSchemaSql<'_> {
     pub const fn uses_uca9(&self) -> bool {
         matches!(
             self.version,
-            SchemaSqlEnvelopeVersion::V3 | SchemaSqlEnvelopeVersion::V4
+            SchemaSqlEnvelopeVersion::V3
+                | SchemaSqlEnvelopeVersion::V4
+                | SchemaSqlEnvelopeVersion::V5
         )
+    }
+
+    /// Whether this is a table whose one integer primary key is the engine's
+    /// rowid, which every table made with such a key since v5 is. A table made
+    /// before keeps its key as a unique index over a rowid of its own.
+    pub const fn primary_key_is_the_rowid(&self) -> bool {
+        matches!(self.version, SchemaSqlEnvelopeVersion::V5)
     }
 
     /// Returns the immutable database/table identities carried by a v2 envelope.
@@ -483,6 +493,17 @@ impl turso_core::SchemaSqlFormatter for SchemaSqlSessionContext {
                     counted.allocator_column_written_type,
                 )
             }
+            // A table keyed by its rowid holds every integer key as the
+            // engine's `INTEGER`, so the type MySQL declared the key with is
+            // read from the schema this one replaces.
+            SchemaSqlKind::Table if decoded.primary_key_is_the_rowid() => {
+                turso_mysql_parser::with_the_primary_key_as_declared(
+                    stmt.clone(),
+                    decoded.normalized_ddl,
+                    mode,
+                )
+                .and_then(|declared| render_create_table_mysql_with_mode(&declared, mode))
+            }
             SchemaSqlKind::Table => render_create_table_mysql_with_mode(stmt, mode),
             SchemaSqlKind::Index => render_create_index_mysql_with_mode(stmt, mode),
             SchemaSqlKind::View => {
@@ -696,6 +717,31 @@ pub fn encode_schema_sql_v3(
     ))
 }
 
+/// Encode a new table whose one integer primary key is the engine's rowid.
+///
+/// The context is the one a v3 table carries; the version alone says the key
+/// is the rowid. A server that predates it refuses the row rather than read
+/// the table as one whose key is an index.
+pub fn encode_schema_sql_v5(
+    context: SchemaSqlContext,
+    normalized_ddl: &str,
+) -> Result<String, SchemaSqlError> {
+    validate_context(context)?;
+    if context.kind != SchemaSqlKind::Table {
+        return Err(SchemaSqlError::InvalidContext);
+    }
+    validate_statement(normalized_ddl)?;
+    let stored = StoredSchemaSqlContext::from_context(context)?;
+    let context_json = canonical_context_json(&stored)?;
+    if context_json.len() > MAX_CONTEXT_JSON_BYTES {
+        return Err(SchemaSqlError::ContextTooLong);
+    }
+    let encoded_context = URL_SAFE_NO_PAD.encode(context_json);
+    Ok(format!(
+        "{RESERVED_PREFIX}{V5_VERSION_PREFIX}{encoded_context}{MARKER_END}{normalized_ddl}"
+    ))
+}
+
 /// Encode a view or trigger with the identity and settings that MySQL exposes.
 pub fn encode_schema_sql_v4(
     context: SchemaSqlContext,
@@ -734,6 +780,9 @@ pub(crate) fn reencode_schema_sql(
         }
         (SchemaSqlEnvelopeVersion::V3, metadata) => {
             encode_schema_sql_v3(decoded.context, metadata, normalized_ddl)
+        }
+        (SchemaSqlEnvelopeVersion::V5, None) => {
+            encode_schema_sql_v5(decoded.context, normalized_ddl)
         }
         (SchemaSqlEnvelopeVersion::V4, None) => {
             validate_statement(normalized_ddl)?;
@@ -813,6 +862,8 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
             (SchemaSqlEnvelopeVersion::V3, after_version)
         } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V4_VERSION_PREFIX) {
             (SchemaSqlEnvelopeVersion::V4, after_version)
+        } else if let Some(after_version) = after_reserved_prefix.strip_prefix(V5_VERSION_PREFIX) {
+            (SchemaSqlEnvelopeVersion::V5, after_version)
         } else {
             return Err(SchemaSqlError::UnsupportedVersion);
         };
@@ -874,6 +925,19 @@ pub fn decode_schema_sql_any(stored: &str) -> Result<Option<DecodedSchemaSql<'_>
                 (context, None)
             }
         }
+        SchemaSqlEnvelopeVersion::V5 => {
+            let stored_context: StoredSchemaSqlContext = serde_json::from_slice(&context_json)
+                .map_err(|_| SchemaSqlError::InvalidContext)?;
+            let context = stored_context.to_context()?;
+            validate_context(context)?;
+            if context.kind != SchemaSqlKind::Table {
+                return Err(SchemaSqlError::InvalidContext);
+            }
+            if canonical_context_json(&stored_context)? != context_json {
+                return Err(SchemaSqlError::NonCanonicalContext);
+            }
+            (context, None)
+        }
         SchemaSqlEnvelopeVersion::V4 => {
             let stored: StoredSchemaSqlContextV4 = serde_json::from_slice(&context_json)
                 .map_err(|_| SchemaSqlError::InvalidContext)?;
@@ -903,6 +967,7 @@ enum SchemaSqlEnvelopeVersion {
     V2,
     V3,
     V4,
+    V5,
 }
 
 /// Decode persisted schema SQL for the core schema loader.
@@ -996,6 +1061,16 @@ fn validate_decoded_catalog_entry(
             }
             if !allocator_ids.insert(metadata.allocator_id.into_bytes()) {
                 return Err(SchemaSqlError::CatalogAllocatorIdDuplicate);
+            }
+        }
+        None if decoded.primary_key_is_the_rowid() => {
+            let mode = parser_sql_mode(decoded.context.sql_mode);
+            let statement = parse_create_table_ast(decoded.normalized_ddl, mode)
+                .map_err(|_| SchemaSqlError::MalformedTableDefinition)?;
+            turso_mysql_parser::with_the_primary_key_as_the_rowid(statement)
+                .map_err(|_| SchemaSqlError::MalformedTableDefinition)?;
+            if parse_auto_increment_create_table(decoded.normalized_ddl, mode).is_ok() {
+                return Err(SchemaSqlError::MissingV2Metadata);
             }
         }
         None => match parse_auto_increment_create_table(
@@ -1593,6 +1668,54 @@ mod tests {
         }
     }
 
+    /// A v5 row is a table whose one integer key is its rowid. It carries the
+    /// v3 context, reads under UCA 9, keeps its version through a rewrite and
+    /// is a table's alone; the catalog takes it only over a key the rowid can
+    /// hold, and never over a counted one.
+    #[test]
+    fn v5_marks_a_table_keyed_by_its_rowid() {
+        let keyed = "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `v` INT)";
+        let encoded = encode_schema_sql_v5(table_context(), keyed).unwrap();
+        assert!(encoded.starts_with("/*@turso:mysql-schema:v5:"));
+        let decoded = decode_schema_sql(SchemaSqlKind::Table, &encoded)
+            .unwrap()
+            .unwrap();
+        assert!(decoded.primary_key_is_the_rowid());
+        assert!(decoded.uses_uca9());
+        assert_eq!(decoded.v2_metadata(), None);
+        assert_eq!(decoded.context, table_context());
+        assert_eq!(decoded.normalized_ddl, keyed);
+        let rewritten = reencode_schema_sql(decoded, TABLE_DDL).unwrap();
+        assert!(rewritten.starts_with("/*@turso:mysql-schema:v5:"));
+        let identity = v2_metadata().database_id;
+        validate_encoded_schema_sql_catalog(identity, [&encoded]).unwrap();
+
+        let ordinary = encode_schema_sql_v3(table_context(), None, keyed).unwrap();
+        assert!(!decode_schema_sql(SchemaSqlKind::Table, &ordinary)
+            .unwrap()
+            .unwrap()
+            .primary_key_is_the_rowid());
+
+        let mut index = table_context();
+        index.kind = SchemaSqlKind::Index;
+        assert_eq!(
+            encode_schema_sql_v5(index, "CREATE INDEX i ON t (id)"),
+            Err(SchemaSqlError::InvalidContext)
+        );
+        for not_a_rowid_key in [
+            "CREATE TABLE `t` (`id` VARCHAR(10) NOT NULL PRIMARY KEY)",
+            "CREATE TABLE `t` (`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY)",
+            TABLE_DDL,
+            &auto_increment_ddl("counted"),
+        ] {
+            let encoded = encode_schema_sql_v5(table_context(), not_a_rowid_key).unwrap();
+            assert!(
+                validate_encoded_schema_sql_catalog(identity, [&encoded]).is_err(),
+                "{not_a_rowid_key}"
+            );
+        }
+    }
+
     #[test]
     fn v3_rejects_identity_metadata_on_an_index() {
         let mut index = table_context();
@@ -1704,7 +1827,7 @@ mod tests {
         }
 
         let unknown_version = format!(
-            "{RESERVED_PREFIX}v5:{}{MARKER_END}{TABLE_DDL}",
+            "{RESERVED_PREFIX}v6:{}{MARKER_END}{TABLE_DDL}",
             URL_SAFE_NO_PAD.encode("{}")
         );
         assert_eq!(

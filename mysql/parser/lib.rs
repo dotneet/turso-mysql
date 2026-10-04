@@ -137,8 +137,8 @@ pub use check_constraints::{
     table_with_a_check_changed, MySqlCheckChange, MySqlCheckConstraint,
 };
 pub use checked_primary_key::{
-    parse_checked_primary_key_create_table, CheckedPrimaryKeyCreateTable,
-    CheckedPrimaryKeyIntegerType,
+    parse_checked_primary_key_create_table, with_the_primary_key_as_declared,
+    with_the_primary_key_as_the_rowid, CheckedPrimaryKeyCreateTable, CheckedPrimaryKeyIntegerType,
 };
 pub use column_statistics::{parse_optional_histogram_query, MySqlHistogramQuery};
 pub use create_table_as_select::{

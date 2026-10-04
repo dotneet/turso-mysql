@@ -2717,8 +2717,10 @@ fn scalar_text_calls_use_mysql_case_rules_or_refuse_unsupported_collations() -> 
     Ok(())
 }
 
+/// A table made before an integer key became the rowid keeps its key as a
+/// unique index over a rowid of its own, through a reopen and a `VACUUM`.
 #[test]
-fn ordinary_integer_primary_keys_keep_mysql_metadata_without_a_rowid_alias() -> Result<()> {
+fn an_integer_primary_key_made_as_an_index_keeps_its_mysql_metadata_and_its_index() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
     let path = "mysql-session-ordinary-primary-key-reopen.db";
     {
@@ -2728,7 +2730,7 @@ fn ordinary_integer_primary_keys_keep_mysql_metadata_without_a_rowid_alias() -> 
             let ddl = format!(
                 "CREATE TABLE `{table_name}` (`id` {type_name} PRIMARY KEY, `name` TEXT) ENGINE = InnoDB"
             );
-            connection.execute(&ddl)?;
+            connection.create_table_keyed_by_an_index(&ddl)?;
 
             let columns = connection
                 .list_columns(&MySqlTableName::parse(table_name).unwrap())
@@ -2796,6 +2798,278 @@ fn ordinary_integer_primary_keys_keep_mysql_metadata_without_a_rowid_alias() -> 
     }
     connection.inner().close()?;
     Ok(())
+}
+
+/// A table made with one integer primary key holds the key as its rowid: no
+/// index of its own and its rows kept in key order, as InnoDB keeps them. The
+/// type MySQL declared the key with lives in the stored MySQL DDL and is kept
+/// through a reopen, a `VACUUM` and the rewrites an `ALTER TABLE` makes.
+#[test]
+fn an_integer_primary_key_is_the_rowid_and_keeps_its_declared_type() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-rowid-primary-key-reopen.db";
+    let tables = [
+        ("int_keys", "INT", "INT"),
+        ("integer_keys", "INTEGER", "INT"),
+        ("bigint_keys", "BIGINT", "BIGINT"),
+        ("smallint_keys", "SMALLINT", "SMALLINT"),
+        ("mediumint_keys", "MEDIUMINT", "MEDIUMINT"),
+        ("tinyint_keys", "TINYINT", "TINYINT"),
+    ];
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        for (table_name, type_name, _) in tables {
+            connection.execute(&format!(
+                "CREATE TABLE `{table_name}` (`id` {type_name} PRIMARY KEY, `name` TEXT) ENGINE = InnoDB"
+            ))?;
+            connection.execute(&format!(
+                "INSERT INTO `{table_name}` (`id`, `name`) VALUES (3, 'c'), (1, 'a'), (2, 'b')"
+            ))?;
+        }
+        connection.inner().close()?;
+    }
+
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection.inner().execute("VACUUM")?;
+    for (table_name, _, reported_type) in tables {
+        assert!(keyed_by_its_rowid(&connection, table_name)?, "{table_name}");
+        let columns = connection
+            .list_columns(&MySqlTableName::parse(table_name).unwrap())
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        assert_eq!(columns[0].type_name(), reported_type, "{table_name}");
+        assert!(!columns[0].nullable());
+        assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+        assert!(columns[0].extra.is_empty());
+        assert_eq!(
+            ids_of(&connection, &format!("SELECT id FROM `{table_name}`"))?,
+            [1, 2, 3],
+            "{table_name}"
+        );
+    }
+
+    // A column added and a column renamed each keep the key's type and the
+    // key as the rowid.
+    connection.execute("ALTER TABLE `bigint_keys` ADD COLUMN `extra` INT")?;
+    connection.execute("ALTER TABLE `bigint_keys` RENAME COLUMN `id` TO `ident`")?;
+    assert!(keyed_by_its_rowid(&connection, "bigint_keys")?);
+    let columns = connection
+        .list_columns(&MySqlTableName::parse("bigint_keys").unwrap())
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        columns
+            .iter()
+            .map(|column| (column.name(), column.type_name(), column.key()))
+            .collect::<Vec<_>>(),
+        [
+            ("ident", "BIGINT", MySqlColumnKey::Primary),
+            ("name", "TEXT", MySqlColumnKey::None),
+            ("extra", "INT", MySqlColumnKey::None),
+        ]
+    );
+    connection.execute("INSERT INTO `bigint_keys` (`ident`) VALUES (1099511627776)")?;
+    assert!(connection
+        .execute("INSERT INTO `bigint_keys` (`ident`) VALUES (NULL)")
+        .is_err());
+    assert_eq!(
+        ids_of(&connection, "SELECT ident FROM `bigint_keys`")?,
+        [1, 2, 3, 1_099_511_627_776]
+    );
+    connection.inner().close()?;
+    Ok(())
+}
+
+/// A key that is the rowid answers every write the way a key kept as an index
+/// does: the same rows written, the same errors, the same counts. Only the
+/// order rows are read in without an `ORDER BY` differs, which is why each
+/// table is read in key order here.
+///
+/// Measured on MySQL 8.4.11 for the rows below: a row leaving out the key is
+/// 1364, a NULL key 1048, a key out of `INT`'s range 1264, a word that is no
+/// number 1366, a written key already taken 1062, and an `UPDATE` or an
+/// upsert moving a key onto NULL 1048. MySQL rounds `1.5` to 2 where this
+/// refuses it, under either layout.
+#[test]
+fn a_key_kept_as_the_rowid_answers_every_write_as_a_key_kept_as_an_index() -> Result<()> {
+    let statements = [
+        "INSERT INTO t (v) VALUES ('left out')",
+        "INSERT INTO t VALUES (NULL, 'null', 0)",
+        "INSERT INTO t VALUES (1, 'a', 1), (NULL, 'b', 2)",
+        "INSERT INTO t () VALUES ()",
+        "INSERT INTO t SET v = 'set'",
+        "REPLACE INTO t (v) VALUES ('replaced')",
+        "REPLACE INTO t VALUES (NULL, 'replaced', 0)",
+        "INSERT INTO t (v) VALUES ('a') ON DUPLICATE KEY UPDATE v = 'q'",
+        "INSERT IGNORE INTO t (v) VALUES ('ignored')",
+        "INSERT IGNORE INTO t VALUES (NULL, 'ignored', 0)",
+        "INSERT INTO t SELECT NULL, 'selected', 0",
+        "INSERT INTO t (v) SELECT 'selected'",
+        "INSERT INTO t VALUES ('12', 'twelve', 12)",
+        "INSERT INTO t VALUES ('13abc', 'thirteen', 13)",
+        "INSERT INTO t VALUES (1.5, 'fraction', 0)",
+        "INSERT INTO t VALUES ('3.5', 'fraction', 0)",
+        "INSERT INTO t VALUES (2147483648, 'past', 0)",
+        "INSERT INTO t VALUES (-2147483649, 'below', 0)",
+        "INSERT INTO t VALUES (0, 'zero', 0)",
+        "INSERT INTO t VALUES (-5, 'negative', -5)",
+        "INSERT INTO t VALUES ('abc', 'word', 0)",
+        "INSERT INTO t VALUES ('', 'empty', 0)",
+        "INSERT INTO t VALUES (1e3, 'float', 1000)",
+        "INSERT INTO t VALUES (12, 'taken', 0)",
+        "INSERT INTO t VALUES (2, 'b', 2), (3, 'c', 3), (2, 'again', 0)",
+        "INSERT INTO t VALUES (4, 'd', 4), (5, 'e', 5)",
+        "INSERT INTO t VALUES (4, 'dup', 0) ON DUPLICATE KEY UPDATE n = n + 100",
+        "INSERT INTO t VALUES (4, 'dup', 0) ON DUPLICATE KEY UPDATE id = 40",
+        "INSERT INTO t VALUES (5, 'dup', 0) ON DUPLICATE KEY UPDATE id = NULL",
+        "INSERT INTO t VALUES (5, 'dup', 0) ON DUPLICATE KEY UPDATE id = 12",
+        "INSERT INTO t VALUES (5, 'dup', 0) ON DUPLICATE KEY UPDATE id = '50'",
+        "REPLACE INTO t VALUES (12, 'replaced', 12)",
+        "INSERT INTO t VALUES (1, 'one', 1)",
+        "UPDATE t SET id = NULL WHERE id = 1",
+        "UPDATE t SET id = 12 WHERE id = 1",
+        "UPDATE t SET id = 100 WHERE id = 1",
+        "UPDATE t SET id = 2.5 WHERE id = 100",
+        "UPDATE t SET id = '7x' WHERE id = 100",
+        "UPDATE t SET id = '7' WHERE id = 100",
+        "UPDATE t SET id = 3000000000 WHERE id = 7",
+        "UPDATE t SET id = id + 28 WHERE id = 12",
+        "UPDATE t SET id = id + 1000 WHERE id > 0",
+        "UPDATE t SET id = id - 1000 WHERE id > 1000",
+        "DELETE FROM t WHERE id = 0",
+        "INSERT INTO d (v) VALUES ('defaulted')",
+        "INSERT INTO d (v) VALUES ('defaulted again')",
+        "INSERT INTO d VALUES (NULL, 'null')",
+    ];
+    let mut answers = Vec::new();
+    for as_the_rowid in [false, true] {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_database(io, "mysql-session-two-layouts.db", OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        for ddl in [
+            "CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(10), n INT)",
+            "CREATE TABLE d (id INT PRIMARY KEY DEFAULT 7, v VARCHAR(20))",
+        ] {
+            if as_the_rowid {
+                connection.execute(ddl)?;
+            } else {
+                connection.create_table_keyed_by_an_index(ddl)?;
+            }
+        }
+        assert_eq!(keyed_by_its_rowid(&connection, "t")?, as_the_rowid);
+        let mut answered = Vec::new();
+        for sql in statements {
+            let answer = connection
+                .execute_checked_write(sql, None)
+                .map(|written| written.affected_rows)
+                .map_err(|error| error.to_string());
+            answered.push(format!("{sql}: {answer:?}"));
+        }
+        for read in [
+            "SELECT id, v, n FROM t ORDER BY id",
+            "SELECT id, v FROM d ORDER BY id",
+        ] {
+            let rows = connection
+                .prepare_select(read)
+                .map_err(|error| LimboError::InternalError(error.to_string()))?
+                .run_collect_rows()?;
+            answered.push(format!("{read}: {rows:?}"));
+        }
+        connection.inner().close()?;
+        answers.push(answered);
+    }
+    let [kept_as_an_index, kept_as_the_rowid] = answers.as_slice() else {
+        unreachable!("one answer for each layout");
+    };
+    for (index, rowid) in kept_as_an_index.iter().zip(kept_as_the_rowid) {
+        assert_eq!(index, rowid);
+    }
+    for expected in [
+        "INSERT INTO t (v) VALUES ('left out'): Err(\"Field 'id' doesn't have a default value\")",
+        "INSERT INTO t VALUES (NULL, 'null', 0): Err(\"NOT NULL constraint failed: t.id\")",
+        "INSERT INTO t VALUES ('12', 'twelve', 12): Ok(1)",
+        "UPDATE t SET id = NULL WHERE id = 1: Err(\"NOT NULL constraint failed: t.id\")",
+        "UPDATE t SET id = 100 WHERE id = 1: Ok(1)",
+        "UPDATE t SET id = '7' WHERE id = 100: Ok(1)",
+        "UPDATE t SET id = id + 28 WHERE id = 12: Err(\"UNIQUE constraint failed: t.id\")",
+        "INSERT INTO d (v) VALUES ('defaulted'): Ok(1)",
+    ] {
+        assert!(
+            kept_as_the_rowid.iter().any(|answer| answer == expected),
+            "{expected}"
+        );
+    }
+    Ok(())
+}
+
+/// A table made with its key as an index takes the key as its rowid once a
+/// statement writes it again, that statement making the table through the
+/// same `CREATE TABLE` every table is made with now. Its rows and its key's
+/// declared type come across.
+#[test]
+fn a_table_written_again_takes_its_key_as_the_rowid() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = open_database(io, "mysql-session-written-again.db", OpenFlags::Create)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    connection
+        .create_table_keyed_by_an_index("CREATE TABLE t (id BIGINT PRIMARY KEY, v VARCHAR(10))")?;
+    connection.execute("INSERT INTO t (id, v) VALUES (3, 'c'), (1, 'a')")?;
+    assert!(!keyed_by_its_rowid(&connection, "t")?);
+    let table = MySqlTableName::parse("t").unwrap();
+    connection
+        .execute_table_conversion(
+            &table,
+            turso_mysql_parser::MySqlTableConversion::ToTheDatabases,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert!(keyed_by_its_rowid(&connection, "t")?);
+    assert_eq!(ids_of(&connection, "SELECT id FROM t")?, [1, 3]);
+    let columns = connection
+        .list_columns(&table)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(columns[0].type_name(), "BIGINT");
+    assert_eq!(columns[0].key(), MySqlColumnKey::Primary);
+    connection.inner().close()?;
+    Ok(())
+}
+
+fn keyed_by_its_rowid(connection: &MySqlConnection, table_name: &str) -> Result<bool> {
+    let rows = connection
+        .inner()
+        .prepare(format!(
+            "SELECT sql FROM sqlite_schema WHERE name = '{table_name}'"
+        ))?
+        .run_collect_rows()?;
+    let [row] = rows.as_slice() else {
+        return Err(LimboError::InternalError(format!(
+            "expected one sqlite_schema row for {table_name}"
+        )));
+    };
+    let stored = row[0].to_string();
+    let decoded = decode_schema_sql(SchemaSqlKind::Table, stored.trim_matches('\''))
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("missing MySQL marker for {table_name}"))
+        })?;
+    let schema = connection.inner().current_schema();
+    let btree = schema
+        .get_btree_table(table_name)
+        .ok_or_else(|| LimboError::InternalError(format!("missing table {table_name}")))?;
+    let key_is_the_rowid = btree
+        .get_rowid_alias_column()
+        .is_some_and(|(_, column)| column.rowid_must_be_written());
+    let has_an_index = schema.get_indices(table_name).next().is_some();
+    Ok(decoded.primary_key_is_the_rowid() && key_is_the_rowid && !has_an_index)
+}
+
+fn ids_of(connection: &MySqlConnection, sql: &str) -> Result<Vec<i64>> {
+    Ok(connection
+        .prepare_select(sql)
+        .map_err(|error| LimboError::InternalError(error.to_string()))?
+        .run_collect_rows()?
+        .into_iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect())
 }
 
 #[test]
@@ -8002,9 +8276,9 @@ fn a_plain_index_kept_in_insert_order_is_written_again_in_primary_key_order_by_e
             connection
                 .inner()
                 .execute(format!("PRAGMA journal_mode = '{journal_mode}'"))?;
-            connection
-                .prepare("CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT)")?
-                .run_ignore_rows()?;
+            connection.create_table_keyed_by_an_index(
+                "CREATE TABLE q (id INT NOT NULL PRIMARY KEY, k INT)",
+            )?;
             create_an_index_kept_in_insert_order(&connection, "q_k", "CREATE INDEX q_k ON q (k)")?;
             for id in [30, 10, 20] {
                 connection.execute(&format!("INSERT INTO q (id, k) VALUES ({id}, 5)"))?;

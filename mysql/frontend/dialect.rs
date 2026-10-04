@@ -161,6 +161,23 @@ impl Dialect for MySqlDialect {
             unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
         };
         let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
+        // A MySQL key is a value every row is given, never a number the
+        // engine picks: measured on 8.4.11, a row leaving it out is 1364 and
+        // a NULL is 1048.
+        if decode_persisted_schema_sql(SchemaSqlKind::Table, sql)?
+            .is_some_and(|decoded| decoded.primary_key_is_the_rowid())
+        {
+            let mut columns = table.columns_mut();
+            let key = columns
+                .iter_mut()
+                .find(|column| column.is_rowid_alias())
+                .ok_or_else(|| {
+                    LimboError::Corrupt(
+                        "a MySQL table keyed by its rowid has no rowid alias".to_string(),
+                    )
+                })?;
+            key.require_a_written_rowid();
+        }
         // SQLite's affinity rules read these type names as numbers', so a value
         // that looks like a number would be converted on the way in: the engine
         // stores the document `1e15` as the integer 1000000000000000, a `SET`
@@ -215,6 +232,13 @@ impl Dialect for MySqlDialect {
                     "cannot replay a schema-qualified MySQL AUTO_INCREMENT table".to_string(),
                 ));
             }
+            return reencode_schema_sql(decoded, decoded.normalized_ddl)
+                .map_err(|error| LimboError::Corrupt(error.to_string()));
+        }
+        // A table keyed by its rowid holds its key as the engine's `INTEGER`,
+        // which says nothing of the type MySQL declared it with, so its MySQL
+        // DDL is replayed as it was stored.
+        if decoded.primary_key_is_the_rowid() {
             return reencode_schema_sql(decoded, decoded.normalized_ddl)
                 .map_err(|error| LimboError::Corrupt(error.to_string()));
         }
@@ -2941,6 +2965,16 @@ fn parse_marked_table(decoded: DecodedSchemaSql<'_>) -> Result<Stmt> {
         ));
     }
     let mode = session_sql_mode(decoded.context.sql_mode);
+    if decoded.primary_key_is_the_rowid() {
+        let statement = parse_create_table_ast(decoded.normalized_ddl, mode)
+            .and_then(turso_mysql_parser::with_the_primary_key_as_the_rowid)
+            .map_err(|error| {
+                LimboError::Corrupt(format!(
+                    "invalid persisted MySQL table keyed by its rowid: {error}"
+                ))
+            })?;
+        return Ok(statement);
+    }
     if decoded.v2_metadata().is_some() {
         // A v2 envelope is an allocator identity, not a general table marker.
         // Check its AUTO_INCREMENT shape before the generic parser can lower

@@ -8051,6 +8051,32 @@ impl MySqlConnection {
         &self,
         checked: CheckedPrimaryKeyCreateTable,
     ) -> Result<Statement> {
+        if checked
+            .primary_key_integer_type
+            .is_some_and(|key| key.fits_the_rowid())
+        {
+            return self.prepare_rowid_keyed_create_table(checked);
+        }
+        self.prepare_index_keyed_create_table(checked)
+    }
+
+    /// Makes a table the way every table with a primary key was made before
+    /// an integer key became the rowid, for the tests that hold such a table
+    /// to the same rules a database made then still has.
+    #[cfg(test)]
+    pub(crate) fn create_table_keyed_by_an_index(&self, sql: &str) -> Result<()> {
+        let checked = parse_checked_primary_key_create_table(sql, self.parser_mode())
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        self.prepare_index_keyed_create_table(checked)?
+            .run_ignore_rows()
+    }
+
+    /// Makes a table whose primary key is a unique index over a rowid of its
+    /// own, which is how a key over a word or a `BIGINT UNSIGNED` is kept.
+    fn prepare_index_keyed_create_table(
+        &self,
+        checked: CheckedPrimaryKeyCreateTable,
+    ) -> Result<Statement> {
         let options = PrepareOptions::default()
             .with_reprepare_parser(Arc::new(FrozenSchemaDdlParser {
                 mode: self.parser_mode(),
@@ -8058,6 +8084,38 @@ impl MySqlConnection {
             .with_schema_sql_formatter(Arc::new(self.schema_context));
         self.inner.prepare_translated_stmt_with_options(
             checked.sqlite_statement,
+            &checked.normalized_mysql_ddl,
+            &options,
+        )
+    }
+
+    /// Makes a table whose one integer primary key is the engine's rowid.
+    ///
+    /// InnoDB keeps a table's rows in the order of its primary key and finds a
+    /// row by key in that one tree, which is what a rowid key does here: no
+    /// index of its own to keep beside the rows, and a range of keys reads and
+    /// locks the rows in key order. MySQL's rules for the key's value — a row
+    /// must give it, and NULL is refused — are kept by the engine for a column
+    /// that must be written.
+    fn prepare_rowid_keyed_create_table(
+        &self,
+        checked: CheckedPrimaryKeyCreateTable,
+    ) -> Result<Statement> {
+        let sqlite_statement =
+            turso_mysql_parser::with_the_primary_key_as_the_rowid(checked.sqlite_statement)
+                .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let formatter = RowidKeySchemaSqlFormatter {
+            context: self.schema_context,
+            normalized_mysql_ddl: checked.normalized_mysql_ddl.clone(),
+            sqlite_statement: sqlite_statement.clone(),
+        };
+        let options = PrepareOptions::default()
+            .with_reprepare_parser(Arc::new(FrozenRowidKeyDdlParser {
+                mode: self.parser_mode(),
+            }))
+            .with_schema_sql_formatter(Arc::new(formatter));
+        self.inner.prepare_translated_stmt_with_options(
+            sqlite_statement,
             &checked.normalized_mysql_ddl,
             &options,
         )
@@ -11077,9 +11135,13 @@ impl MySqlConnection {
         let set_by_a_trigger = self.columns_set_before_insert(table.as_str());
         let mut rules = InsertColumnRules::default();
         for column in core_table.columns() {
-            // A rowid alias and a generated column are filled in by the engine,
-            // so the statement never has to name either one.
-            if !column.notnull() || column.is_rowid_alias() || column.is_generated() {
+            // A counted table's rowid alias and a generated column are filled
+            // in by the engine, so the statement never has to name either one.
+            // A key that is the rowid of a table counting nothing is given by
+            // the row, as every other key is.
+            let filled_in_by_the_engine =
+                column.is_rowid_alias() && !column.rowid_must_be_written();
+            if !column.notnull() || filled_in_by_the_engine || column.is_generated() {
                 continue;
             }
             let Some(name) = column.name.clone() else {
@@ -15039,6 +15101,10 @@ struct FrozenAutoIncrementDdlParser {
     mode: SessionSqlMode,
 }
 
+struct FrozenRowidKeyDdlParser {
+    mode: SessionSqlMode,
+}
+
 struct FrozenDmlParser {
     mode: SessionSqlMode,
     column_types: DmlColumnTypes,
@@ -16354,6 +16420,53 @@ impl ReprepareParser for FrozenAutoIncrementDdlParser {
         let checked = parse_auto_increment_create_table(sql, self.mode)
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         Ok((Some(Cmd::Stmt(checked.sqlite_statement)), sql.len()))
+    }
+}
+
+impl ReprepareParser for FrozenRowidKeyDdlParser {
+    fn parse(&self, sql: &str, _context: &ReprepareContext<'_>) -> Result<(Option<Cmd>, usize)> {
+        let statement = parse_checked_primary_key_create_table(sql, self.mode)
+            .and_then(|checked| {
+                turso_mysql_parser::with_the_primary_key_as_the_rowid(checked.sqlite_statement)
+            })
+            .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        Ok((Some(Cmd::Stmt(statement)), sql.len()))
+    }
+}
+
+/// Stores a new table keyed by its rowid under the v5 envelope, which is
+/// what tells the table apart from one whose key is an index.
+struct RowidKeySchemaSqlFormatter {
+    context: SchemaSqlSessionContext,
+    normalized_mysql_ddl: String,
+    sqlite_statement: Stmt,
+}
+
+impl SchemaSqlFormatter for RowidKeySchemaSqlFormatter {
+    fn format_schema_sql(&self, kind: SchemaSqlKind, input: &str, stmt: &Stmt) -> Result<String> {
+        if kind != SchemaSqlKind::Table {
+            return self.context.format_schema_sql(kind, input, stmt);
+        }
+        if input != self.normalized_mysql_ddl || stmt != &self.sqlite_statement {
+            return Err(LimboError::InternalError(
+                "rowid key schema formatter received a different statement".to_string(),
+            ));
+        }
+        crate::schema_sql::encode_schema_sql_v5(
+            self.context.for_kind(SchemaSqlKind::Table),
+            &self.normalized_mysql_ddl,
+        )
+        .map_err(|error| LimboError::InternalError(error.to_string()))
+    }
+
+    fn format_rewritten_schema_sql(
+        &self,
+        kind: SchemaSqlKind,
+        previous_sql: &str,
+        stmt: &Stmt,
+    ) -> Result<String> {
+        self.context
+            .format_rewritten_schema_sql(kind, previous_sql, stmt)
     }
 }
 

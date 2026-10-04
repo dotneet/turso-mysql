@@ -31186,3 +31186,6 @@ mod gitea_statements;
 
 #[cfg(unix)]
 mod foreign_keys;
+
+#[cfg(unix)]
+mod rowid_keys;
