@@ -72,6 +72,12 @@ impl MySqlConnection {
             MySqlKeyChange::KeyColumnMayBeNull => {
                 return refused(MySqlKeyChangeError::KeyColumnMayBeNull);
             }
+            MySqlKeyChange::NoColumnToDrop(name) => {
+                return refused(MySqlKeyChangeError::NoColumnToDrop(name));
+            }
+            MySqlKeyChange::EveryColumnDropped => {
+                return refused(MySqlKeyChangeError::EveryColumnDropped);
+            }
             // MySQL takes a counted column some other key starts with, which
             // the counted path here cannot keep: it wants the counter to be
             // the table's key.
@@ -186,6 +192,49 @@ impl MySqlConnection {
         let references = schema
             .resolved_fks_referencing(table)
             .map_err(MySqlQueryError::Engine)?;
+        // Measured on MySQL 8.4.11: a column a foreign key is over cannot be
+        // dropped, 1829 for one another table's key names and 1828 for one the
+        // table's own key is over, whatever `foreign_key_checks` says.
+        let dropped = |column: &str| {
+            !rewrite
+                .table
+                .carried_columns
+                .iter()
+                .any(|(_, old)| old.eq_ignore_ascii_case(column))
+        };
+        for reference in &references {
+            if let Some(parent) = reference.parent_cols.iter().find(|parent| dropped(parent)) {
+                return Err(MySqlQueryError::KeyChange(
+                    MySqlKeyChangeError::ReferencedColumnDropped {
+                        column: parent.clone(),
+                        constraint: crate::show_create_table::foreign_key_name(
+                            &reference.child_table.name,
+                            &reference.fk,
+                            &reference.child_table.foreign_keys,
+                        ),
+                        table: reference.child_table.name.clone(),
+                    },
+                ));
+            }
+        }
+        for foreign_key in &btree.foreign_keys {
+            if let Some(child) = foreign_key
+                .child_columns
+                .iter()
+                .find(|child| dropped(child))
+            {
+                return Err(MySqlQueryError::KeyChange(
+                    MySqlKeyChangeError::ColumnOfAForeignKeyDropped {
+                        column: child.clone(),
+                        constraint: crate::show_create_table::foreign_key_name(
+                            table,
+                            foreign_key,
+                            &btree.foreign_keys,
+                        ),
+                    },
+                ));
+            }
+        }
         for reference in &references {
             for (child, parent) in reference
                 .fk
@@ -544,12 +593,31 @@ impl MySqlConnection {
         let counter_before = self
             .counter_of_a_stored_table(table)
             .map_err(MySqlQueryError::Engine)?;
+        let dropped = self
+            .inner
+            .current_schema()
+            .get_btree_table(table)
+            .ok_or(MySqlQueryError::MissingTable)?
+            .columns()
+            .iter()
+            .filter_map(|column| column.name.clone())
+            .filter(|name| {
+                !rewrite
+                    .table
+                    .carried_columns
+                    .iter()
+                    .any(|(_, old)| old.eq_ignore_ascii_case(name))
+            })
+            .collect::<Vec<_>>();
         let indexes = self
             .stored_index_statements(table)
             .map_err(MySqlQueryError::Engine)?
             .into_iter()
-            .map(|index| self.index_over_the_carried_columns(index, rewrite))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .map(|index| self.index_over_the_carried_columns(index, rewrite, &dropped))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         let triggers = self
             .triggers_naming(table)
             .map_err(MySqlQueryError::Engine)?;
@@ -607,13 +675,16 @@ impl MySqlConnection {
         for trigger in &rebuild.triggers {
             self.drop_a_trigger_to_write_again(&trigger.name)?;
         }
+        if rewrite.counted_column_is_new {
+            self.add_the_counted_column_to_the_old_table(table, rewrite)?;
+        }
         self.refuse_nulls_in_the_new_key(table, rewrite)?;
         let counted_before = rebuild
             .counter_before
-            .filter(|_| rewrite.counted_before.is_some());
+            .filter(|_| keeps_counting_on_the_same_column(rewrite));
         let numbered = match &rewrite.counted_after {
             Some(counted) if !keeps_counting_on_the_same_column(rewrite) => {
-                self.number_the_rows_asking_for_one(table, rewrite, counted, counted_before)?
+                self.number_the_rows_asking_for_one(table, rewrite, counted)?
             }
             _ => 0,
         };
@@ -667,6 +738,40 @@ impl MySqlConnection {
             table,
             numbered.max(highest).max(counted_before.unwrap_or(0)),
         )
+    }
+
+    /// Adds the column a statement starts counting on to the table it was
+    /// not in, empty, so the rows can be numbered in it as they are numbered
+    /// in a column that was there; the table goes once the rows are across.
+    fn add_the_counted_column_to_the_old_table(
+        &self,
+        table: &str,
+        rewrite: &MySqlKeyRewrite,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let Some(counted) = &rewrite.counted_after else {
+            return Ok(());
+        };
+        let statement = Stmt::AlterTable(turso_parser::ast::AlterTable {
+            name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                table.to_owned(),
+            )),
+            body: AlterTableBody::AddColumn(turso_parser::ast::ColumnDefinition {
+                col_name: turso_parser::ast::Name::exact(counted.clone()),
+                col_type: Some(turso_parser::ast::Type {
+                    name: "INTEGER".to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+                constraints: Vec::new(),
+            }),
+        });
+        let sql = statement.to_string();
+        let options =
+            PrepareOptions::default().with_schema_sql_formatter(Arc::new(self.schema_context));
+        self.inner
+            .prepare_translated_stmt_with_options(statement, &sql, &options)
+            .and_then(|mut prepared| prepared.run_ignore_rows())
+            .map_err(MySqlQueryError::Engine)
     }
 
     pub(super) fn move_the_new_counter_past(
@@ -871,15 +976,16 @@ impl MySqlConnection {
         &self,
         index: StoredIndexStatement,
         rewrite: &MySqlKeyRewrite,
-    ) -> std::result::Result<StoredIndexStatement, MySqlQueryError> {
+        dropped: &[String],
+    ) -> std::result::Result<Option<StoredIndexStatement>, MySqlQueryError> {
         let renames = rewrite
             .table
             .carried_columns
             .iter()
             .filter(|(new, old)| new != old)
             .collect::<Vec<_>>();
-        if renames.is_empty() {
-            return Ok(index);
+        if renames.is_empty() && dropped.is_empty() {
+            return Ok(Some(index));
         }
         let mode = self.parser_mode();
         let mut statement =
@@ -889,6 +995,20 @@ impl MySqlConnection {
                 "a stored index statement did not describe an index".to_string(),
             )));
         };
+        // Measured on MySQL 8.4.11: a dropped column leaves every index over
+        // it, `KEY kv (v, id)` reading `KEY kv (v)` once `id` is dropped, and
+        // an index over it alone goes with it.
+        let before = columns.len();
+        columns.retain(|column| {
+            !matches!(column.expr.as_ref(), Expr::Id(name)
+                if dropped.iter().any(|gone| gone.eq_ignore_ascii_case(name.as_str())))
+        });
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        if renames.is_empty() && columns.len() == before {
+            return Ok(Some(index));
+        }
         for column in columns.iter_mut() {
             let Expr::Id(name) = column.expr.as_mut() else {
                 continue;
@@ -900,11 +1020,11 @@ impl MySqlConnection {
                 *name = turso_parser::ast::Name::exact(new.clone());
             }
         }
-        Ok(StoredIndexStatement {
+        Ok(Some(StoredIndexStatement {
             sql: render_create_index_mysql_with_mode(&statement, mode)
                 .map_err(mysql_query_parse_error)?,
             ..index
-        })
+        }))
     }
 
     /// The triggers to write again once the table is: its own, which go with
@@ -1043,17 +1163,19 @@ impl MySqlConnection {
     /// Measured on MySQL 8.4.11: the rows go across in the order of the old
     /// table's key, or the order they were written where it had none; a NULL,
     /// and a 0 unless `sql_mode` names `NO_AUTO_VALUE_ON_ZERO`, takes the next
-    /// number, which is one past the counter the table had, or one past the
-    /// highest id copied before it; and the first such row reserves as many
-    /// numbers as the table has rows, so over rows `5, NULL, 0, NULL, 3, 0`
-    /// they take 6, 7, 8 and 9 and the table then reads `AUTO_INCREMENT=12`.
-    /// A number taken already is 1062, and nothing changes.
+    /// number, which is one past the highest id copied before it; and the
+    /// first such row reserves as many numbers as the table has rows, so over
+    /// rows `5, NULL, 0, NULL, 3, 0` they take 6, 7, 8 and 9 and the table
+    /// then reads `AUTO_INCREMENT=12`. A column the statement adds asks for a
+    /// number in every row: `ADD COLUMN id ... AUTO_INCREMENT PRIMARY KEY` over
+    /// three rows numbers them 1, 2 and 3 and leaves `AUTO_INCREMENT=4`, and
+    /// one taking the place of a counted column dropped beside it starts at 1
+    /// too. A number taken already is 1062, and nothing changes.
     fn number_the_rows_asking_for_one(
         &self,
         table: &str,
         rewrite: &MySqlKeyRewrite,
         counted: &str,
-        counter_before: Option<u64>,
     ) -> std::result::Result<u64, MySqlQueryError> {
         let Some((_, old)) = rewrite
             .table
@@ -1086,7 +1208,7 @@ impl MySqlConnection {
             .and_then(|mut statement| statement.run_collect_rows())
             .map_err(MySqlQueryError::Engine)?;
         let asks_for_zero = self.written_zero() == WrittenZero::AsksForTheNextNumber;
-        let mut next = counter_before.unwrap_or(0).saturating_add(1);
+        let mut next = 1_u64;
         let mut reserved_end: Option<u64> = None;
         let mut reservations = 0_u32;
         let mut numbered = Vec::new();

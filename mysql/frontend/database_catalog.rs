@@ -2842,7 +2842,8 @@ mod tests {
 
     /// A table written again takes a counter of its own. Whatever writes it
     /// again — a change of its key, a table that starts counting, a column
-    /// placed first, `OPTIMIZE TABLE` — a crash right after the statement
+    /// placed first, `OPTIMIZE TABLE`, a counted key column added in place of
+    /// one dropped — a crash right after the statement
     /// commits leaves that counter past every id the rows hold, so the next
     /// row takes a number no row has. A table made with `AUTO_INCREMENT=50`
     /// starts there after the same crash.
@@ -2864,6 +2865,11 @@ mod tests {
             ),
             (COUNTED, "ALTER TABLE users ADD COLUMN note INT FIRST", 4),
             (COUNTED, "OPTIMIZE TABLE users", 4),
+            (
+                "CREATE TABLE users (id INT NOT NULL PRIMARY KEY, name VARCHAR(20))",
+                "ALTER TABLE users DROP COLUMN id, ADD COLUMN number INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+                4,
+            ),
         ] {
             for power_lost in [false, true] {
                 let directory = private_tempdir();

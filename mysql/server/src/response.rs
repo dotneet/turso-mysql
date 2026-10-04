@@ -417,6 +417,12 @@ pub enum FrontendErrorKind {
     /// A column a foreign key is over renamed by a change that copies the
     /// rows.
     ForeignKeyColumnRenamedInACopy,
+    /// `DROP COLUMN` of every column a table has.
+    EveryColumnDropped,
+    /// `DROP COLUMN` of a column the table's own foreign key is over.
+    ColumnOfAForeignKeyDropped,
+    /// `DROP COLUMN` of a column another table's foreign key names.
+    ReferencedColumnDropped,
     /// A `RENAME INDEX` named an index the table does not carry.
     KeyDoesNotExist,
     /// A unique, or other constraint rejected the operation.
@@ -721,6 +727,21 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1833,
             *b"HY000",
             b"Cannot change column used in a foreign key constraint of another table".as_slice(),
+        ),
+        FrontendErrorKind::EveryColumnDropped => (
+            1090,
+            *b"42000",
+            b"You can't delete all columns with ALTER TABLE; use DROP TABLE instead".as_slice(),
+        ),
+        FrontendErrorKind::ColumnOfAForeignKeyDropped => (
+            1828,
+            *b"HY000",
+            b"Cannot drop column: needed in a foreign key constraint".as_slice(),
+        ),
+        FrontendErrorKind::ReferencedColumnDropped => (
+            1829,
+            *b"HY000",
+            b"Cannot drop column: needed in a foreign key constraint of another table".as_slice(),
         ),
         FrontendErrorKind::ForeignKeyColumnRenamedInACopy => (
             1846,
@@ -2885,6 +2906,13 @@ mod tests {
                 1846,
                 *b"0A000",
             ),
+            (FrontendErrorKind::EveryColumnDropped, 1090, *b"42000"),
+            (
+                FrontendErrorKind::ColumnOfAForeignKeyDropped,
+                1828,
+                *b"HY000",
+            ),
+            (FrontendErrorKind::ReferencedColumnDropped, 1829, *b"HY000"),
             (
                 FrontendErrorKind::ForeignKeyColumnCountMismatch,
                 1239,

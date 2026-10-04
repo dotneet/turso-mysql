@@ -25183,16 +25183,19 @@ fn a_counted_table_takes_an_alter() {
         ]
     );
 
-    // Dropping the counted column would leave a table counting on nothing,
-    // so it is refused. MySQL takes `DROP COLUMN id` and leaves an ordinary
-    // table behind.
-    assert!(adapter
+    // Measured on MySQL 8.4.11: `DROP COLUMN id` of the counted key leaves
+    // an ordinary table behind, its rows as they were and counting nothing.
+    adapter
         .execute_query("ALTER TABLE counted_moved DROP COLUMN id")
-        .is_err());
-    // The refusal leaves the table as it stood, still counting.
+        .unwrap();
+    adapter
+        .execute_query("INSERT INTO counted_moved (n) VALUES (5)")
+        .unwrap();
     assert_eq!(
-        written_id(&mut adapter, "INSERT INTO counted_moved (n) VALUES (5)"),
-        5
+        counted_rows(&mut adapter, "SELECT n FROM counted_moved ORDER BY n"),
+        (1..=5)
+            .map(|n| vec![Some(n.to_string())])
+            .collect::<Vec<_>>()
     );
 }
 

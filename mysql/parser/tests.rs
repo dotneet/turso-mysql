@@ -10559,6 +10559,81 @@ fn a_key_change_renames_the_columns_in_its_own_foreign_keys() {
     );
 }
 
+/// `DROP COLUMN` of a key's column and `ADD COLUMN` of a counted key are
+/// read as changes of the key: the dropped column leaves the table and the
+/// key, and the added counted column is carried under its own name to be
+/// numbered over the rows. A plain `ADD COLUMN` keeps its own path.
+#[test]
+fn a_key_column_dropped_or_added_is_read_as_a_change_of_the_key() {
+    let mode = SessionSqlMode::default();
+    let change = |stored: &str, sql: &str| table_with_its_key_changed(stored, sql, mode);
+    let keyed =
+        "CREATE TABLE `t` (`a` INT NOT NULL, `b` INT NOT NULL, `v` INT, PRIMARY KEY (`a`, `b`))";
+    let Ok(Some(MySqlKeyChange::TableWrittenAgain(rewrite))) =
+        change(keyed, "ALTER TABLE t DROP COLUMN b")
+    else {
+        panic!("a key column dropped writes the table again");
+    };
+    assert_eq!(
+        rewrite.table.create_sql,
+        "CREATE TABLE `t` (`a` INT NOT NULL PRIMARY KEY, `v` INT)"
+    );
+    assert_eq!(rewrite.new_key, ["a"]);
+    assert_eq!(
+        rewrite.table.carried_columns,
+        [
+            ("a".to_owned(), "a".to_owned()),
+            ("v".to_owned(), "v".to_owned())
+        ]
+    );
+    let unkeyed = "CREATE TABLE `n` (`v` INT)";
+    let Ok(Some(MySqlKeyChange::TableWrittenAgain(rewrite))) = change(
+        unkeyed,
+        "ALTER TABLE n ADD COLUMN id INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+    ) else {
+        panic!("a counted key added writes the table again");
+    };
+    assert!(rewrite.counted_column_is_new);
+    assert_eq!(rewrite.counted_after.as_deref(), Some("id"));
+    assert_eq!(rewrite.new_key, ["id"]);
+    assert_eq!(
+        rewrite.table.carried_columns,
+        [
+            ("v".to_owned(), "v".to_owned()),
+            ("id".to_owned(), "id".to_owned())
+        ]
+    );
+    assert!(rewrite
+        .table
+        .create_sql
+        .starts_with("CREATE TABLE `n` (`id` INT"));
+    assert_eq!(change(unkeyed, "ALTER TABLE n ADD COLUMN w INT"), Ok(None));
+    assert!(change(
+        unkeyed,
+        "ALTER TABLE n ADD COLUMN id INT NOT NULL PRIMARY KEY"
+    )
+    .is_err());
+    for (stored, sql, refused) in [
+        (
+            keyed,
+            "ALTER TABLE t DROP COLUMN b, DROP COLUMN nope",
+            MySqlKeyChange::NoColumnToDrop("nope".to_owned()),
+        ),
+        (
+            "CREATE TABLE `o` (`id` INT NOT NULL PRIMARY KEY)",
+            "ALTER TABLE o DROP COLUMN id",
+            MySqlKeyChange::EveryColumnDropped,
+        ),
+        (
+            "CREATE TABLE `c` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+            "ALTER TABLE c ADD COLUMN id2 INT NOT NULL AUTO_INCREMENT UNIQUE",
+            MySqlKeyChange::CountedColumnNotAKey("id2".to_owned()),
+        ),
+    ] {
+        assert_eq!(change(stored, sql), Ok(Some(refused)), "{sql}");
+    }
+}
+
 /// A table another `ALTER TABLE` writes again — a column moved by `CHANGE
 /// ... AFTER` — is read against the table it was, as a change of its key is:
 /// its key, its counted column, the columns renamed in its own foreign keys

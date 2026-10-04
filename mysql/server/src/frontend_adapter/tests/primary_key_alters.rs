@@ -676,6 +676,158 @@ fn triggers_and_views_stand_through_a_key_change() {
     );
 }
 
+/// `DROP COLUMN` of a key's column writes the table again without it: a
+/// counted key leaves an ordinary table with no key and no counter, a key
+/// over two columns goes on over the other (1062 where two rows then share
+/// it), and every index over the column leaves it. A counted key column
+/// added numbers the rows already there in the order they were written.
+#[test]
+fn a_key_column_is_dropped_or_added_counting() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE d1 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        "INSERT INTO d1 (v) VALUES (10), (20)",
+        "CREATE TABLE d2 (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE d3 (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b))",
+        "INSERT INTO d3 VALUES (1, 1, 0), (1, 2, 0)",
+        "CREATE TABLE d4 (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b))",
+        "INSERT INTO d4 VALUES (1, 1, 0), (2, 2, 0)",
+        "CREATE TABLE d5 (id INT NOT NULL PRIMARY KEY, v INT)",
+        "CREATE TABLE d5c (pid INT, FOREIGN KEY (pid) REFERENCES d5 (id))",
+        "CREATE TABLE d9p (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE d9 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, pid INT, FOREIGN KEY (id) REFERENCES d9p (id))",
+        "CREATE TABLE d6 (id INT NOT NULL AUTO_INCREMENT, v INT, PRIMARY KEY (id), KEY kv (v, id), KEY kid (id))",
+        "CREATE TABLE d10 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT)",
+        "CREATE TABLE d10log (x INT)",
+        "CREATE TRIGGER d10t AFTER INSERT ON d10 FOR EACH ROW INSERT INTO d10log (x) VALUES (NEW.v)",
+        "CREATE VIEW d10v AS SELECT v FROM d10",
+        "INSERT INTO d10 (v) VALUES (7)",
+        "CREATE TABLE d11 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=30",
+        "INSERT INTO d11 (v) VALUES (5), (6)",
+        "CREATE TABLE one (id INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE a1 (v INT, w VARCHAR(5))",
+        "INSERT INTO a1 VALUES (30, 'c'), (10, 'a'), (20, 'b')",
+        "CREATE TABLE a2 (v INT)",
+        "INSERT INTO a2 VALUES (5), (6), (7), (8), (9)",
+        "CREATE TABLE a3 (v INT NOT NULL PRIMARY KEY)",
+        "CREATE TABLE a5 (v INT)",
+        "CREATE TABLE u5 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let plain = |columns: &str| {
+        format!("CREATE TABLE {columns} ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+    };
+    run(&mut adapter, "ALTER TABLE d1 DROP COLUMN id");
+    assert_eq!(
+        created(&mut adapter, "d1"),
+        plain("`d1` (\n  `v` int DEFAULT NULL\n)")
+    );
+    assert_eq!(rows(&mut adapter, "SELECT v FROM d1"), [["10"], ["20"]]);
+    run(&mut adapter, "ALTER TABLE d2 DROP COLUMN id");
+    assert_eq!(
+        created(&mut adapter, "d2"),
+        plain("`d2` (\n  `v` int DEFAULT NULL\n)")
+    );
+    run(&mut adapter, "ALTER TABLE d4 DROP COLUMN b");
+    assert_eq!(
+        created(&mut adapter, "d4"),
+        plain("`d4` (\n  `a` int NOT NULL,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`a`)\n)")
+    );
+    run(&mut adapter, "ALTER TABLE d6 DROP COLUMN id");
+    assert_eq!(
+        created(&mut adapter, "d6"),
+        plain("`d6` (\n  `v` int DEFAULT NULL,\n  KEY `kv` (`v`)\n)")
+    );
+    run(&mut adapter, "ALTER TABLE d10 DROP COLUMN id");
+    run(&mut adapter, "INSERT INTO d10 VALUES (8)");
+    assert_eq!(rows(&mut adapter, "SELECT x FROM d10log"), [["7"], ["8"]]);
+    assert_eq!(rows(&mut adapter, "SELECT v FROM d10v"), [["7"], ["8"]]);
+    run(
+        &mut adapter,
+        "ALTER TABLE d11 DROP COLUMN id, ADD COLUMN nid BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+    );
+    assert_eq!(counter(&mut adapter, "d11").as_deref(), Some("3"));
+    assert_eq!(
+        rows(&mut adapter, "SELECT v, nid FROM d11"),
+        [["5", "1"], ["6", "2"]]
+    );
+    for (sql, refused) in [
+        (
+            "ALTER TABLE d3 DROP COLUMN b",
+            FrontendErrorKind::ConstraintViolation,
+        ),
+        (
+            "ALTER TABLE d3 DROP COLUMN b, DROP COLUMN nope",
+            FrontendErrorKind::CantDropKey,
+        ),
+        (
+            "ALTER TABLE d5 DROP COLUMN id",
+            FrontendErrorKind::ReferencedColumnDropped,
+        ),
+        (
+            "ALTER TABLE d9 DROP COLUMN id",
+            FrontendErrorKind::ColumnOfAForeignKeyDropped,
+        ),
+        (
+            "ALTER TABLE one DROP COLUMN id",
+            FrontendErrorKind::EveryColumnDropped,
+        ),
+        (
+            "ALTER TABLE a3 ADD COLUMN id INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+            FrontendErrorKind::SecondPrimaryKey,
+        ),
+        (
+            "ALTER TABLE a3 ADD COLUMN id INT NOT NULL AUTO_INCREMENT",
+            FrontendErrorKind::CountedColumnNotAKey,
+        ),
+        (
+            "ALTER TABLE u5 ADD COLUMN id2 INT NOT NULL AUTO_INCREMENT UNIQUE",
+            FrontendErrorKind::CountedColumnNotAKey,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+
+    run(
+        &mut adapter,
+        "ALTER TABLE a1 ADD COLUMN id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY",
+    );
+    assert_eq!(
+        created(&mut adapter, "a1"),
+        "CREATE TABLE `a1` (\n  `v` int DEFAULT NULL,\n  `w` varchar(5) DEFAULT NULL,\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT v, id FROM a1"),
+        [["30", "1"], ["10", "2"], ["20", "3"]]
+    );
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO a1 (v) VALUES (40)"),
+        (1, 4)
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE a2 ADD COLUMN id INT NOT NULL AUTO_INCREMENT PRIMARY KEY FIRST",
+    );
+    assert_eq!(
+        created(&mut adapter, "a2"),
+        "CREATE TABLE `a2` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM a2"),
+        [["1", "5"], ["2", "6"], ["3", "7"], ["4", "8"], ["5", "9"]]
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE a5 ADD COLUMN id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY",
+    );
+    assert_eq!(counter(&mut adapter, "a5"), None);
+}
+
 /// A trigger of a table the statement does not touch, naming none of the
 /// tables it writes again, stands as it was made through every rewrite and
 /// fires as before.

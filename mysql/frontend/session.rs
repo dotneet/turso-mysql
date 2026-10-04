@@ -387,6 +387,18 @@ pub enum MySqlKeyChangeError {
     /// A column a foreign key is over, on either side, renamed by a change
     /// MySQL makes by copying the rows: 1846.
     ForeignKeyColumnRenamedInACopy,
+    /// `DROP COLUMN` of a column the table has not got: 1091.
+    NoColumnToDrop(String),
+    /// `DROP COLUMN` of every column the table has: 1090.
+    EveryColumnDropped,
+    /// `DROP COLUMN` of a column the table's own foreign key is over: 1828.
+    ColumnOfAForeignKeyDropped { column: String, constraint: String },
+    /// `DROP COLUMN` of a column another table's foreign key names: 1829.
+    ReferencedColumnDropped {
+        column: String,
+        constraint: String,
+        table: String,
+    },
 }
 
 impl MySqlKeyChangeError {
@@ -410,6 +422,22 @@ impl MySqlKeyChangeError {
                 "Cannot change column used in a foreign key constraint of another table".to_string()
             }
             Self::ForeignKeyColumnRenamedInACopy => "ALGORITHM=COPY is not supported. Reason: Columns participating in a foreign key are renamed. Try ALGORITHM=INPLACE.".to_string(),
+            Self::NoColumnToDrop(column) => {
+                format!("Can't DROP '{column}'; check that column/key exists")
+            }
+            Self::EveryColumnDropped => {
+                "You can't delete all columns with ALTER TABLE; use DROP TABLE instead".to_string()
+            }
+            Self::ColumnOfAForeignKeyDropped { column, constraint } => format!(
+                "Cannot drop column '{column}': needed in a foreign key constraint '{constraint}'"
+            ),
+            Self::ReferencedColumnDropped {
+                column,
+                constraint,
+                table,
+            } => format!(
+                "Cannot drop column '{column}': needed in a foreign key constraint '{constraint}' of table '{table}'"
+            ),
         }
     }
 }

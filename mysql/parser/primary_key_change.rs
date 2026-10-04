@@ -33,8 +33,12 @@ pub enum MySqlKeyChange {
     SecondKey,
     /// A key column declared `NULL` or `DEFAULT NULL`: 1171.
     KeyColumnMayBeNull,
-    /// A counted column that no key starts with: 1075.
+    /// A counted column that no key starts with, or a second one: 1075.
     CountedColumnNotAKey(String),
+    /// `DROP COLUMN` of a column the table has not got: 1091.
+    NoColumnToDrop(String),
+    /// `DROP COLUMN` of every column the table has: 1090.
+    EveryColumnDropped,
 }
 
 /// The table one key-changing `ALTER TABLE` makes of another.
@@ -67,6 +71,10 @@ pub struct MySqlKeyRewrite {
     /// over, and holds one a foreign key is over to the column on the key's
     /// other side.
     pub recollated: Vec<(String, String)>,
+    /// Whether the counted column is one the statement adds, whose values the
+    /// rows are numbered in rather than carry across. It is among the carried
+    /// columns under its own name.
+    pub counted_column_is_new: bool,
 }
 
 /// Reads an `ALTER TABLE` against the table it changes, and answers what it
@@ -134,6 +142,18 @@ pub fn table_with_its_key_changed(
         } => counted_before
             .as_ref()
             .is_some_and(|counted| counted.eq_ignore_ascii_case(&old_column_name.value)),
+        AlterTableOperation::AddColumn { column_def, .. } => {
+            column_def.options.iter().any(|option| {
+                matches!(option.option, ColumnOption::PrimaryKey(_))
+                    || column_has_auto_increment(column_def)
+            })
+        }
+        AlterTableOperation::DropColumn { column_names, .. } => column_names.iter().any(|named| {
+            held_columns
+                .iter()
+                .chain(counted_before.iter())
+                .any(|held| held.eq_ignore_ascii_case(&named.value))
+        }),
         _ => false,
     });
     if !touches_the_key {
@@ -240,6 +260,36 @@ pub fn table_with_its_key_changed(
                     return Ok(Some(refused));
                 }
             }
+            AlterTableOperation::AddColumn {
+                column_def,
+                column_position,
+                if_not_exists: false,
+                ..
+            } => {
+                if let Some(refused) = add(
+                    &mut table,
+                    &mut carried_columns,
+                    &mut key,
+                    column_def.clone(),
+                    column_position.as_ref(),
+                )? {
+                    return Ok(Some(refused));
+                }
+            }
+            AlterTableOperation::DropColumn {
+                column_names,
+                if_exists: false,
+                drop_behavior: None,
+                ..
+            } => {
+                for named in column_names {
+                    if let Some(refused) =
+                        drop_a_column(&mut table, &mut carried_columns, &mut key, named)
+                    {
+                        return Ok(Some(refused));
+                    }
+                }
+            }
             _ => return unsupported("ALTER TABLE clause beside a change of the primary key"),
         }
     }
@@ -271,11 +321,15 @@ pub fn table_with_its_key_changed(
             );
         }
     }
-    let counted_after = table
+    let mut counted_columns = table
         .columns
         .iter()
-        .find(|column| column_has_auto_increment(column))
+        .filter(|column| column_has_auto_increment(column))
         .map(|column| column.name.value.clone());
+    let counted_after = counted_columns.next();
+    if let Some(second) = counted_columns.next() {
+        return Ok(Some(MySqlKeyChange::CountedColumnNotAKey(second)));
+    }
     if let Some(counted) = &counted_after {
         if !new_key
             .first()
@@ -377,6 +431,9 @@ fn described_rewrite(
         || (!old_key.is_empty() && new_key.is_empty())
         || retyped_in_a_copy(stored, written, carried_columns);
     let recollated = recollated_columns(stored, written, carried_columns);
+    let counted_column_is_new = counted_after
+        .as_ref()
+        .is_some_and(|counted| column_named(stored, counted).is_none());
     MySqlKeyRewrite {
         table: rewrite,
         old_key,
@@ -387,6 +444,7 @@ fn described_rewrite(
         words_kept_as_words,
         copies_the_rows,
         recollated,
+        counted_column_is_new,
     }
 }
 
@@ -422,6 +480,7 @@ pub fn table_as_it_stands(
         words_kept_as_words: Vec::new(),
         copies_the_rows: false,
         recollated: Vec::new(),
+        counted_column_is_new: false,
     })
 }
 
@@ -436,6 +495,8 @@ fn is_a_key_or_column_clause(operation: &AlterTableOperation) -> bool {
             | AlterTableOperation::ModifyColumn { .. }
             | AlterTableOperation::ChangeColumn { .. }
             | AlterTableOperation::RenameColumn { .. }
+            | AlterTableOperation::AddColumn { .. }
+            | AlterTableOperation::DropColumn { .. }
     )
 }
 
@@ -633,6 +694,104 @@ fn restate(
     table.columns.insert(to, restated);
     carried_columns.insert(to, carried);
     Ok(None)
+}
+
+/// Applies one `ADD COLUMN`: the column stands where the clause says, last
+/// where it says nothing, and the key goes over it where it declares one. A
+/// counted column is numbered over the rows already there, so it is carried
+/// under its own name; any other column takes its default in them.
+///
+/// Measured on MySQL 8.4.11: `ADD COLUMN id BIGINT UNSIGNED AUTO_INCREMENT
+/// PRIMARY KEY` over rows (30), (10), (20) numbers them 1, 2 and 3 in the
+/// order they were written and leaves `AUTO_INCREMENT=4`, `FIRST` puts it
+/// first, and a key added beside the one the table has is 1068.
+fn add(
+    table: &mut CreateTable,
+    carried_columns: &mut Vec<(String, String)>,
+    key: &mut Option<Vec<String>>,
+    mut added: ColumnDef,
+    position: Option<&MySQLColumnPosition>,
+) -> Result<Option<MySqlKeyChange>, ParseError> {
+    let name = added.name.value.clone();
+    if column_named(table, &name).is_some() {
+        return Ok(Some(MySqlKeyChange::DuplicateColumn(name)));
+    }
+    let counted = column_has_auto_increment(&added);
+    if added
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)))
+    {
+        if added.options.iter().any(|option| {
+            matches!(&option.option, ColumnOption::PrimaryKey(declared)
+                if !super::is_plain_inline_primary_key(&ColumnOption::PrimaryKey(declared.clone())))
+        }) {
+            return unsupported("PRIMARY KEY attribute");
+        }
+        if !counted {
+            return unsupported("a key over a column added beside the rows a table holds");
+        }
+        if key.is_some() {
+            return Ok(Some(MySqlKeyChange::SecondKey));
+        }
+        added
+            .options
+            .retain(|option| !matches!(option.option, ColumnOption::PrimaryKey(_)));
+        *key = Some(vec![name.clone()]);
+    }
+    let at = match position {
+        None => table.columns.len(),
+        Some(MySQLColumnPosition::First) => 0,
+        Some(MySQLColumnPosition::After(named)) => {
+            let Some(after) = table
+                .columns
+                .iter()
+                .position(|column| column.name.value.eq_ignore_ascii_case(&named.value))
+            else {
+                return Ok(Some(MySqlKeyChange::NoSuchColumn(named.value.clone())));
+            };
+            after + 1
+        }
+    };
+    table.columns.insert(at, added);
+    if counted {
+        carried_columns.push((name.clone(), name));
+    }
+    Ok(None)
+}
+
+/// Applies one column of a `DROP COLUMN`: it leaves the table, and the key
+/// goes on over the columns it had besides.
+///
+/// Measured on MySQL 8.4.11: dropping a counted key leaves a table with no
+/// key and no counter, its rows as they were; dropping one column of a key
+/// over two leaves the key over the other, 1062 where two rows then share
+/// it; a column the table has not got is 1091 and its last column 1090.
+fn drop_a_column(
+    table: &mut CreateTable,
+    carried_columns: &mut Vec<(String, String)>,
+    key: &mut Option<Vec<String>>,
+    named: &Ident,
+) -> Option<MySqlKeyChange> {
+    let Some(at) = table
+        .columns
+        .iter()
+        .position(|column| column.name.value.eq_ignore_ascii_case(&named.value))
+    else {
+        return Some(MySqlKeyChange::NoColumnToDrop(named.value.clone()));
+    };
+    if table.columns.len() == 1 {
+        return Some(MySqlKeyChange::EveryColumnDropped);
+    }
+    let dropped = table.columns.remove(at).name.value;
+    carried_columns.retain(|(new, _)| !new.eq_ignore_ascii_case(&dropped));
+    if let Some(columns) = key.as_mut() {
+        columns.retain(|column| !column.eq_ignore_ascii_case(&dropped));
+        if columns.is_empty() {
+            *key = None;
+        }
+    }
+    None
 }
 
 /// Whether a foreign key over a column of type `before` still pairs with the

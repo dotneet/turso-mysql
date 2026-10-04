@@ -7144,6 +7144,14 @@ fn key_change_error_kind(error: &MySqlKeyChangeError) -> FrontendErrorKind {
         MySqlKeyChangeError::ForeignKeyColumnRenamedInACopy => {
             FrontendErrorKind::ForeignKeyColumnRenamedInACopy
         }
+        MySqlKeyChangeError::NoColumnToDrop(_) => FrontendErrorKind::CantDropKey,
+        MySqlKeyChangeError::EveryColumnDropped => FrontendErrorKind::EveryColumnDropped,
+        MySqlKeyChangeError::ColumnOfAForeignKeyDropped { .. } => {
+            FrontendErrorKind::ColumnOfAForeignKeyDropped
+        }
+        MySqlKeyChangeError::ReferencedColumnDropped { .. } => {
+            FrontendErrorKind::ReferencedColumnDropped
+        }
     }
 }
 
