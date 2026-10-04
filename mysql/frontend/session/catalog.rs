@@ -1180,7 +1180,19 @@ impl MySqlConnection {
                 }
                 MySqlColumnMetadataError::Engine(error) => MySqlColumnMetadataError::Engine(error),
             })?;
+        // A key that is the table's rowid is the engine's `INTEGER` whatever
+        // integer type MySQL declared it with, and the view's column reads it
+        // as the engine has it.
+        let rowid_key = schema
+            .get_btree_table(source_table.as_str())
+            .and_then(|table| {
+                table
+                    .get_rowid_alias_column()
+                    .map(|(_, column)| column.name.clone())
+            })
+            .flatten();
         let mut metadata = Vec::with_capacity(projected_columns.len());
+        let mut reads_the_rowid = Vec::with_capacity(projected_columns.len());
         for (projected_name, source_name) in projected_columns {
             if metadata.iter().any(|column: &MySqlColumnMetadata| {
                 column.name.eq_ignore_ascii_case(&projected_name)
@@ -1191,6 +1203,11 @@ impl MySqlConnection {
                 .iter()
                 .find(|column| column.name.eq_ignore_ascii_case(&source_name))
                 .ok_or(MySqlColumnMetadataError::CorruptDefinition)?;
+            reads_the_rowid.push(
+                rowid_key
+                    .as_deref()
+                    .is_some_and(|key| key.eq_ignore_ascii_case(&source_name)),
+            );
             let mut column = source.clone();
             column.name = projected_name;
             metadata.push(column);
@@ -1198,9 +1215,19 @@ impl MySqlConnection {
         if core_view.columns.len() != metadata.len() {
             return Err(MySqlColumnMetadataError::CorruptDefinition);
         }
-        for (core_column, column) in core_view.columns.iter().zip(&mut metadata) {
+        for ((core_column, column), reads_the_rowid) in core_view
+            .columns
+            .iter()
+            .zip(&mut metadata)
+            .zip(reads_the_rowid)
+        {
+            let engine_type = if reads_the_rowid {
+                "INTEGER"
+            } else {
+                column.type_name.as_str()
+            };
             if core_column.name.as_deref() != Some(column.name.as_str())
-                || core_column.ty_str != column.type_name
+                || core_column.ty_str != engine_type
             {
                 return Err(MySqlColumnMetadataError::CorruptDefinition);
             }

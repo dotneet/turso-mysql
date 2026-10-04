@@ -255,6 +255,38 @@ fn a_view_reports_its_columns_the_way_its_table_does() {
     assert_eq!(counted[0].column_type, MYSQL_TYPE_LONGLONG);
 }
 
+/// Measured on MySQL 8.4.11: a view over a table that counts its ids reports
+/// the counted key the way the table does, and a column it has not got is
+/// 1054. The key is the engine's `INTEGER` there, which the view's column
+/// reads it as.
+#[test]
+fn a_view_over_a_counted_table_reports_its_key_the_way_the_table_does() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE cposts (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, title VARCHAR(20))",
+    );
+    run(&mut adapter, "INSERT INTO cposts (title) VALUES ('a')");
+    run(
+        &mut adapter,
+        "CREATE VIEW cv AS SELECT id, title FROM cposts",
+    );
+    let table = columns(&mut adapter, "SELECT id, title FROM cposts");
+    let view = columns(&mut adapter, "SELECT * FROM cv");
+    for (view, table) in view.iter().zip(&table) {
+        assert_eq!(view.original_table, "cv");
+        assert_eq!(
+            (&view.name, view.column_type, view.flags),
+            (&table.name, table.column_type, table.flags)
+        );
+    }
+    assert_eq!(rows(&mut adapter, "SELECT id, title FROM cv"), ["1|a"]);
+    assert_eq!(
+        adapter.execute_query("SELECT id FROM cv WHERE nope = 1"),
+        Err(FrontendErrorKind::UnknownColumn)
+    );
+}
+
 /// MySQL keeps a view with a condition as the text it prints back, every
 /// column qualified by its table as the table declares it and each comparison
 /// and each run of `AND` or `OR` in parentheses; the view is made from that
