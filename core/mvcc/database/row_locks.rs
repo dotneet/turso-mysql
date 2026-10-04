@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use super::{MVTableId, RowID, RowKey, TxID};
 use crate::storage::lock_release::LockReleaseSignal;
 use crate::sync::atomic::{AtomicBool, Ordering};
-use crate::sync::Mutex;
+use crate::sync::{Mutex, MutexGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowLockMode {
@@ -54,6 +54,7 @@ pub(crate) enum RowLockWaitEnd {
 pub(crate) struct RowLocks {
     enabled: AtomicBool,
     table: Mutex<LockTable>,
+    table_has_entries: AtomicBool,
     transaction_ended: LockReleaseSignal,
 }
 
@@ -171,7 +172,7 @@ impl RowLocks {
         row: &RowID,
         mode: RowLockMode,
     ) -> Result<bool, Vec<TxID>> {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let holders = table.rows.entry(row.clone()).or_default();
         let conflicting = holders.others_in_the_way(tx_id, mode);
         if !conflicting.is_empty() {
@@ -192,7 +193,7 @@ impl RowLocks {
     }
 
     pub(crate) fn holders_in_the_way_of_a_write(&self, tx_id: TxID, row: &RowID) -> Vec<TxID> {
-        let table = self.table.lock();
+        let table = self.lock_table();
         table
             .rows
             .get(row)
@@ -201,7 +202,7 @@ impl RowLocks {
     }
 
     pub(crate) fn lock_unique_key(&self, tx_id: TxID, key: &RowID) -> Option<TxID> {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         match table.unique_keys.get(key) {
             Some(holder) if *holder == tx_id => None,
             Some(holder) => Some(*holder),
@@ -218,7 +219,7 @@ impl RowLocks {
     }
 
     pub(crate) fn unlock(&self, tx_id: TxID, row: &RowID) {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let Some(holders) = table.rows.get_mut(row) else {
             return;
         };
@@ -243,7 +244,7 @@ impl RowLocks {
     }
 
     pub(crate) fn releases_before_the_end(&self, holders: &[TxID]) -> u64 {
-        let table = self.table.lock();
+        let table = self.lock_table();
         holders
             .iter()
             .map(|holder| {
@@ -257,7 +258,7 @@ impl RowLocks {
     }
 
     pub(crate) fn lock_insert(&self, tx_id: TxID, key: &RowID) -> Vec<TxID> {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let holders = table.gap_holders_around(tx_id, key);
         if !holders.is_empty() {
             return holders;
@@ -274,11 +275,11 @@ impl RowLocks {
     }
 
     pub(crate) fn holders_of_the_gaps_around(&self, tx_id: TxID, key: &RowID) -> Vec<TxID> {
-        self.table.lock().gap_holders_around(tx_id, key)
+        self.lock_table().gap_holders_around(tx_id, key)
     }
 
     pub(crate) fn forget_inserts(&self, tx_id: TxID, keys: &[RowID]) {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let forgotten: Vec<&RowID> = keys
             .iter()
             .filter(|key| table.inserted.get(*key) == Some(&tx_id))
@@ -309,7 +310,7 @@ impl RowLocks {
         place: impl Fn(&RowKey) -> GapKey,
         keeps_the_gap: bool,
     ) -> Vec<TxID> {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let found = FoundBounds {
             low: gap.low.clone(),
             high: gap.high.clone(),
@@ -344,7 +345,11 @@ impl RowLocks {
     }
 
     pub(crate) fn release(&self, tx_id: TxID, committed: bool) {
-        let mut table = self.table.lock();
+        if !self.table_has_entries.load(Ordering::SeqCst) {
+            self.transaction_ended.released();
+            return;
+        }
+        let mut table = self.lock_table();
         let mut undone_inserts = Vec::new();
         for lock in table.held.remove(&tx_id).unwrap_or_default() {
             match lock {
@@ -390,7 +395,7 @@ impl RowLocks {
         holders: &[TxID],
         weight: impl Fn(TxID) -> u64,
     ) -> Option<TxID> {
-        let mut table = self.table.lock();
+        let mut table = self.lock_table();
         let cycle = table.cycle_through(waiter, kind, holders);
         if cycle.is_empty() {
             table.waits_for.insert(waiter, (kind, holders.to_vec()));
@@ -418,7 +423,10 @@ impl RowLocks {
     }
 
     pub(crate) fn stop_waiting(&self, waiter: TxID) {
-        let mut table = self.table.lock();
+        if !self.table_has_entries.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut table = self.lock_table();
         table.waits_for.remove(&waiter);
         table.deadlock_victims.remove(&waiter);
     }
@@ -457,11 +465,53 @@ impl RowLocks {
     }
 
     fn chosen_as_deadlock_victim(&self, tx_id: TxID) -> bool {
-        self.table.lock().deadlock_victims.contains(&tx_id)
+        self.lock_table().deadlock_victims.contains(&tx_id)
+    }
+}
+
+impl RowLocks {
+    fn lock_table(&self) -> LockTableGuard<'_> {
+        LockTableGuard {
+            table: self.table.lock(),
+            has_entries: &self.table_has_entries,
+        }
+    }
+}
+
+struct LockTableGuard<'a> {
+    table: MutexGuard<'a, LockTable>,
+    has_entries: &'a AtomicBool,
+}
+
+impl std::ops::Deref for LockTableGuard<'_> {
+    type Target = LockTable;
+
+    fn deref(&self) -> &LockTable {
+        &self.table
+    }
+}
+
+impl std::ops::DerefMut for LockTableGuard<'_> {
+    fn deref_mut(&mut self) -> &mut LockTable {
+        &mut self.table
+    }
+}
+
+impl Drop for LockTableGuard<'_> {
+    fn drop(&mut self) {
+        self.has_entries
+            .store(self.table.has_entries(), Ordering::SeqCst);
     }
 }
 
 impl LockTable {
+    fn has_entries(&self) -> bool {
+        !(self.held.is_empty()
+            && self.released_before_the_end.is_empty()
+            && self.waits_for.is_empty()
+            && self.deadlock_victims.is_empty())
+    }
+
     fn inserted_between(
         &self,
         table_id: MVTableId,
@@ -766,5 +816,49 @@ impl Holders {
 
     fn is_empty(&self) -> bool {
         self.exclusive.is_none() && self.shared.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RowLockMode, RowLocks};
+    use crate::mvcc::database::{MVTableId, RowID, RowKey};
+
+    fn row(key: i64) -> RowID {
+        RowID::new(MVTableId::from(-2), RowKey::Int(key))
+    }
+
+    #[test]
+    fn a_transaction_that_took_no_row_lock_ends_without_the_lock_table() {
+        let locks = std::sync::Arc::new(RowLocks::default());
+        let held = locks.table.lock();
+        let (ended_send, ended) = std::sync::mpsc::channel();
+        let ending = {
+            let locks = std::sync::Arc::clone(&locks);
+            std::thread::spawn(move || {
+                locks.release(1, true);
+                locks.stop_waiting(1);
+                ended_send.send(()).unwrap();
+            })
+        };
+        assert_eq!(
+            ended.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(())
+        );
+        drop(held);
+        ending.join().unwrap();
+    }
+
+    #[test]
+    fn a_transaction_ending_releases_its_row_locks_to_the_next_one() {
+        let locks = RowLocks::default();
+        assert_eq!(locks.lock(1, &row(1), RowLockMode::Exclusive), Ok(true));
+        assert_eq!(locks.lock(2, &row(1), RowLockMode::Exclusive), Err(vec![1]));
+        locks.release(3, true);
+        assert_eq!(locks.lock(2, &row(1), RowLockMode::Exclusive), Err(vec![1]));
+        locks.release(1, true);
+        assert_eq!(locks.lock(2, &row(1), RowLockMode::Exclusive), Ok(true));
+        locks.release(2, true);
+        assert!(!locks.table.lock().has_entries());
     }
 }
