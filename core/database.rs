@@ -4162,7 +4162,7 @@ impl Database {
             .load(Ordering::Acquire);
         let reopened_max_frame = shared_wal.metadata.max_frame.load(Ordering::Acquire);
         let reopened_nbackfills = shared_wal.metadata.nbackfills.load(Ordering::Acquire);
-        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.lock().checkpoint_seq;
+        let reopened_checkpoint_seq = shared_wal.metadata.wal_header.read().checkpoint_seq;
         drop(shared_wal);
 
         #[cfg(host_shared_wal)]

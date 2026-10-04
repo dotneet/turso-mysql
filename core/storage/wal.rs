@@ -923,7 +923,7 @@ impl InProcessWalCoordination {
     }
 
     fn snapshot_of(shared: &WalFileShared) -> WalSnapshot {
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        let checkpoint_seq = shared.metadata.wal_header.read().checkpoint_seq;
         WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1279,7 +1279,7 @@ impl WalCoordination for InProcessWalCoordination {
         }
         let mut shared = self.shared.write();
         shared.restart_wal_header(io);
-        let checkpoint_seq = shared.metadata.wal_header.lock().checkpoint_seq;
+        let checkpoint_seq = shared.metadata.wal_header.read().checkpoint_seq;
         Ok(WalSnapshot {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1324,7 +1324,7 @@ impl WalCoordination for InProcessWalCoordination {
     }
 
     fn wal_header(&self) -> WalHeader {
-        *self.shared.read().metadata.wal_header.lock()
+        *self.shared.read().metadata.wal_header.read()
     }
 
     fn wal_file(&self) -> Result<Arc<dyn File>> {
@@ -1354,7 +1354,7 @@ impl WalCoordination for InProcessWalCoordination {
         }
 
         let (header, checksum) = {
-            let mut hdr = shared.metadata.wal_header.lock();
+            let mut hdr = shared.metadata.wal_header.write();
             hdr.magic = if cfg!(target_endian = "big") {
                 WAL_MAGIC_BE
             } else {
@@ -1534,7 +1534,7 @@ impl ShmWalCoordination {
         shared: &WalFileShared,
         authority_snapshot: SharedWalCoordinationHeader,
     ) -> SharedWalCoordinationHeader {
-        let header = shared.metadata.wal_header.lock();
+        let header = shared.metadata.wal_header.read();
         SharedWalCoordinationHeader {
             max_frame: shared.metadata.max_frame.load(Ordering::Acquire),
             nbackfills: shared.metadata.nbackfills.load(Ordering::Acquire),
@@ -1610,7 +1610,7 @@ impl ShmWalCoordination {
             .epoch
             .store(snapshot.checkpoint_epoch, Ordering::Release);
         if install_header {
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checkpoint_seq = snapshot.checkpoint_seq;
             header.page_size = snapshot.page_size;
             header.salt_1 = snapshot.salt_1;
@@ -1829,7 +1829,7 @@ impl ShmWalCoordination {
         authority_snapshot: SharedWalCoordinationHeader,
         shared: &WalFileShared,
     ) -> bool {
-        let header = shared.metadata.wal_header.lock();
+        let header = shared.metadata.wal_header.read();
         header.checkpoint_seq == authority_snapshot.checkpoint_seq
             && header.page_size == authority_snapshot.page_size
             && header.salt_1 == authority_snapshot.salt_1
@@ -2015,7 +2015,7 @@ impl WalCoordination for ShmWalCoordination {
                 .metadata
                 .transaction_count
                 .store(commit.transaction_count, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checksum_1 = commit.last_checksum.0;
             header.checksum_2 = commit.last_checksum.1;
         }
@@ -2978,7 +2978,7 @@ impl fmt::Debug for WalFile {
 /// Authoritative WAL metadata currently shared by all connections in a process.
 pub struct WalSharedMetadata {
     pub enabled: AtomicBool,
-    pub wal_header: Arc<SpinLock<WalHeader>>,
+    pub wal_header: Arc<RwLock<WalHeader>>,
     pub min_frame: AtomicU64,
     pub max_frame: AtomicU64,
     pub nbackfills: AtomicU64,
@@ -6021,7 +6021,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(RwLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(snapshot.max_frame),
                 nbackfills: AtomicU64::new(snapshot.nbackfills),
@@ -6108,7 +6108,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(false),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(RwLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -6151,7 +6151,7 @@ impl WalFileShared {
         let shared = WalFileShared {
             metadata: WalSharedMetadata {
                 enabled: AtomicBool::new(true),
-                wal_header: Arc::new(SpinLock::new(wal_header)),
+                wal_header: Arc::new(RwLock::new(wal_header)),
                 min_frame: AtomicU64::new(0),
                 max_frame: AtomicU64::new(0),
                 nbackfills: AtomicU64::new(0),
@@ -6180,7 +6180,7 @@ impl WalFileShared {
     }
 
     pub fn page_size(&self) -> u32 {
-        self.metadata.wal_header.lock().page_size
+        self.metadata.wal_header.read().page_size
     }
 
     /// Called after a successful RESTART/TRUNCATE mode checkpoint
@@ -6200,7 +6200,7 @@ impl WalFileShared {
     /// writing frames into the start of the log file.
     fn restart_wal_header(&mut self, io: &dyn IO) {
         {
-            let mut hdr = self.metadata.wal_header.lock();
+            let mut hdr = self.metadata.wal_header.write();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
             // keep hdr.magic, hdr.file_format, hdr.page_size as-is
             hdr.salt_1 = hdr.salt_1.wrapping_add(1);
@@ -7519,7 +7519,7 @@ pub mod test {
             .nbackfills
             .store(snapshot.nbackfills, Ordering::Release);
         guard.metadata.last_checksum = snapshot.last_checksum;
-        guard.metadata.wal_header.lock().checkpoint_seq = snapshot.checkpoint_seq;
+        guard.metadata.wal_header.write().checkpoint_seq = snapshot.checkpoint_seq;
         guard
             .metadata
             .transaction_count
@@ -7713,7 +7713,7 @@ pub mod test {
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
         // (checkpoint_seq, salt1, salt2, page_size)
         let shared_guard = shared.read();
-        let hdr = shared_guard.metadata.wal_header.lock();
+        let hdr = shared_guard.metadata.wal_header.read();
         (hdr.checkpoint_seq, hdr.salt_1, hdr.salt_2, hdr.page_size)
     }
 
@@ -7841,6 +7841,34 @@ pub mod test {
     }
 
     #[test]
+    fn a_snapshot_loads_while_another_reader_holds_the_wal_header() {
+        let (shared, _wal) = make_test_wal();
+        let coordination = Arc::new(make_test_coordination(&shared));
+        let snapshot = WalSnapshot {
+            max_frame: 9,
+            nbackfills: 3,
+            last_checksum: (55, 89),
+            checkpoint_seq: 7,
+            transaction_count: 11,
+        };
+        set_shared_snapshot(&shared, snapshot);
+        let header = Arc::clone(&shared.read().metadata.wal_header);
+        let held = header.read();
+
+        let (loaded_send, loaded) = std::sync::mpsc::channel();
+        let loading = {
+            let coordination = Arc::clone(&coordination);
+            std::thread::spawn(move || loaded_send.send(coordination.load_snapshot()).unwrap())
+        };
+        assert_eq!(
+            loaded.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(snapshot)
+        );
+        drop(held);
+        loading.join().unwrap();
+    }
+
+    #[test]
     fn test_in_process_coordination_publishes_checkpoint_and_restart_state() {
         let (shared, _wal) = make_test_wal();
         let coordination = make_test_coordination(&shared);
@@ -7855,7 +7883,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot);
         {
             let guard = shared.write();
-            let mut header = guard.metadata.wal_header.lock();
+            let mut header = guard.metadata.wal_header.write();
             header.page_size = 4096;
             header.checksum_1 = 144;
             header.checksum_2 = 233;
@@ -8180,7 +8208,7 @@ pub mod test {
         set_shared_snapshot(&shared, backfilled);
         {
             let shared = shared.write();
-            shared.metadata.wal_header.lock().page_size = 4096;
+            shared.metadata.wal_header.write().page_size = 4096;
         }
 
         let (authority, coordination) = make_test_shm_coordination(&shared, &shm_path);
@@ -8231,7 +8259,7 @@ pub mod test {
         set_shared_snapshot(&shared, empty);
         {
             let shared = shared.write();
-            shared.metadata.wal_header.lock().page_size = 4096;
+            shared.metadata.wal_header.write().page_size = 4096;
         }
 
         let (authority, checkpointer) = make_test_shm_coordination(&shared, &shm_path);
@@ -8295,7 +8323,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8380,7 +8408,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot);
         {
             let shared = shared.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8437,7 +8465,7 @@ pub mod test {
         set_shared_snapshot(&shared, snapshot_a);
         {
             let shared = shared.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8531,7 +8559,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8586,7 +8614,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, snapshot);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -8612,7 +8640,7 @@ pub mod test {
                 .store(42, Ordering::Release);
             shared.runtime.epoch.store(99, Ordering::Release);
             shared.metadata.initialized.store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checkpoint_seq = 88;
             header.page_size = 2048;
             header.salt_1 = 91;
@@ -8695,7 +8723,7 @@ pub mod test {
             set_shared_snapshot(&shared, snapshot);
             {
                 let shared = shared.write();
-                let mut header = shared.metadata.wal_header.lock();
+                let mut header = shared.metadata.wal_header.write();
                 header.page_size = 4096;
                 header.salt_1 = 17;
                 header.salt_2 = 23;
@@ -9492,7 +9520,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9522,7 +9550,7 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9569,7 +9597,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9591,7 +9619,7 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9647,7 +9675,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9671,7 +9699,7 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9778,7 +9806,7 @@ pub mod test {
         set_shared_snapshot(&shared_a, authoritative);
         {
             let shared = shared_a.write();
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.salt_1 = 17;
             header.salt_2 = 23;
@@ -9799,7 +9827,7 @@ pub mod test {
                 .metadata
                 .loaded_from_disk_scan
                 .store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.page_size = 4096;
             header.checkpoint_seq = authoritative.checkpoint_seq;
             header.salt_1 = 17;
@@ -9863,7 +9891,7 @@ pub mod test {
                 .transaction_count
                 .store(3, Ordering::Release);
             shared.metadata.initialized.store(true, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checkpoint_seq = 2;
             header.page_size = 4096;
             header.salt_1 = 7;
@@ -9884,7 +9912,7 @@ pub mod test {
                 !shared.metadata.initialized.load(Ordering::Acquire),
                 "stale local initialized state must be cleared"
             );
-            let header = shared.metadata.wal_header.lock();
+            let header = shared.metadata.wal_header.read();
             assert_eq!(header.checkpoint_seq, authoritative.checkpoint_seq);
             assert_eq!(header.page_size, authoritative.page_size);
             assert_eq!(header.salt_1, authoritative.salt_1);
@@ -9976,7 +10004,7 @@ pub mod test {
                 .transaction_count
                 .store(authoritative.transaction_count, Ordering::Release);
             shared.metadata.last_checksum = (31, 37);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checkpoint_seq = authoritative.checkpoint_seq;
             header.page_size = authoritative.page_size;
             header.salt_1 = authoritative.salt_1;
@@ -10010,7 +10038,7 @@ pub mod test {
                 .metadata
                 .transaction_count
                 .store(3, Ordering::Release);
-            let mut header = shared.metadata.wal_header.lock();
+            let mut header = shared.metadata.wal_header.write();
             header.checkpoint_seq = 2;
             header.page_size = 4096;
             header.salt_1 = 17;

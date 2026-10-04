@@ -1550,7 +1550,7 @@ impl BuildSharedWal {
     pub fn begin(file: &Arc<dyn File>) -> Result<Self> {
         let size = file.size()?;
 
-        let header = Arc::new(SpinLock::new(WalHeader::default()));
+        let header = Arc::new(RwLock::new(WalHeader::default()));
         let read_locks = std::array::from_fn(|_| TursoRwLock::new());
         for (i, l) in read_locks.iter().enumerate() {
             l.write();
@@ -1695,7 +1695,7 @@ pub fn build_shared_wal(
 pub(super) struct StreamingWalReader {
     file: Arc<dyn File>,
     wal_shared: Arc<RwLock<WalFileShared>>,
-    header: Arc<SpinLock<WalHeader>>,
+    header: Arc<RwLock<WalHeader>>,
     file_size: u64,
     state: RwLock<StreamingState>,
     off_atomic: AtomicU64,
@@ -1720,7 +1720,7 @@ impl StreamingWalReader {
     fn new(
         file: Arc<dyn File>,
         wal_shared: Arc<RwLock<WalFileShared>>,
-        header: Arc<SpinLock<WalHeader>>,
+        header: Arc<RwLock<WalHeader>>,
         file_size: u64,
     ) -> Self {
         Self {
@@ -1803,7 +1803,7 @@ impl StreamingWalReader {
         }
 
         let (page_sz, c1, c2, use_native, ok) = {
-            let mut h = self.header.lock();
+            let mut h = self.header.write();
             let s = buf.as_slice();
             h.magic = u32::from_be_bytes(s[0..4].try_into().unwrap());
             h.file_format = u32::from_be_bytes(s[4..8].try_into().unwrap());
@@ -1827,7 +1827,7 @@ impl StreamingWalReader {
         };
         #[cfg(debug_assertions)]
         {
-            let header = self.header.lock();
+            let header = self.header.read();
             tracing::debug!(
                 "WAL_SCAN header page_size={} checkpoint_seq={} salts=({}, {}) checksum=({}, {}) use_native={} valid={}",
                 page_sz,
@@ -1866,7 +1866,7 @@ impl StreamingWalReader {
         // Snapshot salts/endianness once to avoid per-frame header locks
         let (header_copy, use_native) = {
             let st = self.state.read();
-            let h = self.header.lock();
+            let h = self.header.read();
             (*h, st.use_native_endian)
         };
 
@@ -2001,7 +2001,7 @@ impl StreamingWalReader {
                 frames.retain(|&f| f <= max_frame);
             }
             frame_cache.retain(|_, frames| !frames.is_empty());
-            let header = wfs.metadata.wal_header.lock();
+            let header = wfs.metadata.wal_header.read();
             wfs.runtime.overflow_fallback_coverage.lock().record(
                 header.checkpoint_seq,
                 header.salt_1,
