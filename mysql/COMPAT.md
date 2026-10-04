@@ -4037,7 +4037,19 @@ change of the named column's type is 3780 whatever `foreign_key_checks` says, `A
 given or taken is 1833 with the checks on and taken with them off, and dropping the key it
 finds its rows by is 1553; on the table's own foreign key column, a change of type is 3780,
 `AUTO_INCREMENT` 1832, and dropping the only key the foreign key's rows are found by 1553, while
-the index made for that foreign key goes once a key added over its columns finds them. As in
+the index made for that foreign key goes once a key added over its columns finds them. A column
+a foreign key is over, on either side, may be renamed by such a statement — `CHANGE id pk INT
+NOT NULL`, `RENAME COLUMN` of a counted key — and the keys follow it: measured on 8.4.11 and
+matched, another table's key naming the column reads ``REFERENCES `p` (`pk`)`` in `SHOW CREATE
+TABLE` with its name and actions as they were, `KEY_COLUMN_USAGE` names the new column, the
+table's own key over a renamed column reads ``FOREIGN KEY (`parent`)``, a key naming the table
+itself follows the column on both sides, and every key holds its rows as before. MySQL renames
+such a column only where it changes the table in place: beside a change it copies the rows for
+— a column taking another type (a display width and a `VARCHAR` growing within one length byte
+aside), the table starting or stopping counting, its key going with none in its place, another
+collation for a column an index is over — it answers 1846, after 3780 and before 1833, and so
+does this. Here the other table's key is dropped and added again under the name it answers to,
+which leaves its rows and index alone. As in
 MySQL, the statement waits for the table's metadata lock under MVCC, and commits what came
 before it. The table made again counts with a counter of its own, which is moved past every id
 the rows hold in the same transaction that makes the table, so a crash at any moment leaves

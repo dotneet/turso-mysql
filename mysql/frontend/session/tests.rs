@@ -3527,6 +3527,55 @@ fn the_same_logical_index_name_on_two_tables_survives_drop_and_reopen() -> Resul
     Ok(())
 }
 
+/// A key column renamed while other tables' foreign keys name it is renamed
+/// in those keys' stored definitions, so they read the new name, keep their
+/// names and actions, and hold their rows after a reopen.
+#[test]
+fn foreign_keys_naming_a_renamed_key_column_read_its_new_name_after_a_reopen() -> Result<()> {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let path = "mysql-session-renamed-referenced-key.db";
+    {
+        let db = open_database(io.clone(), path, OpenFlags::Create)?;
+        let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+        connection.execute("CREATE TABLE parent (id INT PRIMARY KEY)")?;
+        let child = turso_mysql_parser::parse_optional_create_table_with_keys(
+            "CREATE TABLE child (a INT, b INT, CONSTRAINT fk_a FOREIGN KEY (a) REFERENCES parent(id) ON DELETE CASCADE, FOREIGN KEY (b) REFERENCES parent(id))",
+            connection.parser_mode(),
+        )
+        .unwrap()
+        .unwrap();
+        connection.execute_create_table_with_keys(&child)?;
+        connection.execute("INSERT INTO parent (id) VALUES (1)")?;
+        connection.execute("INSERT INTO child (a, b) VALUES (1, 1)")?;
+        connection
+            .execute_schema_ddl("ALTER TABLE parent CHANGE id pk INT NOT NULL")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?;
+        connection.inner().close()?;
+    }
+
+    let db = open_database(io, path, OpenFlags::None)?;
+    let connection = MySqlConnection::new(db.connect()?, binary_context())?;
+    let created = connection
+        .show_create_table(&MySqlTableName::parse("child").unwrap())
+        .unwrap()
+        .create_statement;
+    assert!(
+        created.contains(
+            "CONSTRAINT `child_ibfk_1` FOREIGN KEY (`b`) REFERENCES `parent` (`pk`),\n  CONSTRAINT `fk_a` FOREIGN KEY (`a`) REFERENCES `parent` (`pk`) ON DELETE CASCADE"
+        ),
+        "{created}"
+    );
+    connection.execute("INSERT INTO child (a, b) VALUES (1, 1)")?;
+    let refused = connection
+        .execute("INSERT INTO child (a, b) VALUES (2, 1)")
+        .unwrap_err();
+    assert!(
+        matches!(refused, LimboError::ForeignKeyConstraint(_)),
+        "{refused:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn foreign_keys_create_and_reuse_child_indexes() -> Result<()> {
     let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

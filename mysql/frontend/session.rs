@@ -412,6 +412,9 @@ pub enum MySqlKeyChangeError {
     /// A column another table's foreign key names would start or stop
     /// counting while foreign key checks are on: 1833.
     ReferencedColumnCountingChanges,
+    /// A column a foreign key is over, on either side, renamed by a change
+    /// MySQL makes by copying the rows: 1846.
+    ForeignKeyColumnRenamedInACopy,
 }
 
 impl MySqlKeyChangeError {
@@ -434,6 +437,7 @@ impl MySqlKeyChangeError {
             Self::ReferencedColumnCountingChanges => {
                 "Cannot change column used in a foreign key constraint of another table".to_string()
             }
+            Self::ForeignKeyColumnRenamedInACopy => "ALGORITHM=COPY is not supported. Reason: Columns participating in a foreign key are renamed. Try ALGORITHM=INPLACE.".to_string(),
         }
     }
 }

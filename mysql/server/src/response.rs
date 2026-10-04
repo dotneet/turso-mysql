@@ -414,6 +414,9 @@ pub enum FrontendErrorKind {
     /// A column another table's foreign key names would start or stop
     /// counting.
     ReferencedColumnCannotChange,
+    /// A column a foreign key is over renamed by a change that copies the
+    /// rows.
+    ForeignKeyColumnRenamedInACopy,
     /// A `RENAME INDEX` named an index the table does not carry.
     KeyDoesNotExist,
     /// A unique, or other constraint rejected the operation.
@@ -718,6 +721,12 @@ pub fn map_frontend_error(kind: FrontendErrorKind) -> ErrPacketConfig {
             1833,
             *b"HY000",
             b"Cannot change column used in a foreign key constraint of another table".as_slice(),
+        ),
+        FrontendErrorKind::ForeignKeyColumnRenamedInACopy => (
+            1846,
+            *b"0A000",
+            b"ALGORITHM=COPY is not supported. Reason: Columns participating in a foreign key are renamed. Try ALGORITHM=INPLACE."
+                .as_slice(),
         ),
         FrontendErrorKind::CantDropKey => (
             1091,
@@ -2870,6 +2879,11 @@ mod tests {
                 FrontendErrorKind::ReferencedColumnCannotChange,
                 1833,
                 *b"HY000",
+            ),
+            (
+                FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+                1846,
+                *b"0A000",
             ),
             (
                 FrontendErrorKind::ForeignKeyColumnCountMismatch,

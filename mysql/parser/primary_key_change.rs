@@ -6,9 +6,9 @@
 //! column is the rowid, so none of them can be made in place.
 
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable, DataType, Expr,
-    Ident, IndexColumn, MySQLColumnPosition, OrderByExpr, OrderByOptions, PrimaryKeyConstraint,
-    Statement, TableConstraint, Value,
+    AlterTableOperation, CharacterLength, ColumnDef, ColumnOption, ColumnOptionDef, CreateTable,
+    DataType, Expr, Ident, IndexColumn, MySQLColumnPosition, ObjectNamePart, OrderByExpr,
+    OrderByOptions, PrimaryKeyConstraint, Statement, TableConstraint, Value,
 };
 
 use super::{
@@ -58,6 +58,13 @@ pub struct MySqlKeyRewrite {
     /// MySQL 8.4.11, a word too long for such a column's new width is 1265
     /// as the rows are copied, where one written from a number is 1406.
     pub words_kept_as_words: Vec<String>,
+    /// Whether MySQL copies the rows to make the change rather than changing
+    /// the table in place: a column takes another type, the table starts or
+    /// stops counting, or its key goes with no key in its place.
+    pub copies_the_rows: bool,
+    /// Each column, by its new name, whose collation the statement changes.
+    /// MySQL copies the rows for one an index is over.
+    pub recollated: Vec<String>,
 }
 
 /// Reads an `ALTER TABLE` against the table it changes, and answers what it
@@ -287,6 +294,17 @@ pub fn table_with_its_key_changed(
         })
         .map(|(new, _)| new.clone())
         .collect();
+    let starts_or_stops_counting = match (&counted_before, &counted_after) {
+        (None, None) => false,
+        (Some(before), Some(after)) => !carried_columns
+            .iter()
+            .any(|(new, old)| new.eq_ignore_ascii_case(after) && old.eq_ignore_ascii_case(before)),
+        _ => true,
+    };
+    let copies_the_rows = starts_or_stops_counting
+        || (!old_key.is_empty() && new_key.is_empty())
+        || retyped_in_a_copy(&stored, &table, &carried_columns);
+    let recollated = recollated_columns(&stored, &table, &carried_columns);
     put_the_key_back(&mut table, &new_key);
     Ok(Some(MySqlKeyChange::TableWrittenAgain(MySqlKeyRewrite {
         table: MySqlTableRewrite {
@@ -299,6 +317,8 @@ pub fn table_with_its_key_changed(
         counted_after,
         retyped,
         words_kept_as_words,
+        copies_the_rows,
+        recollated,
     })))
 }
 
@@ -332,6 +352,8 @@ pub fn table_as_it_stands(
         counted_after: counted,
         retyped: Vec::new(),
         words_kept_as_words: Vec::new(),
+        copies_the_rows: false,
+        recollated: Vec::new(),
     })
 }
 
@@ -469,6 +491,10 @@ fn restate(
             .any(|column| column.name.value.eq_ignore_ascii_case(&new_name))
     {
         return Ok(Some(MySqlKeyChange::DuplicateColumn(new_name)));
+    }
+    if table.columns[at].name.value != new_name {
+        let old_name = table.columns[at].name.value.clone();
+        rename_in_the_foreign_keys(table, &old_name, &new_name);
     }
     let declares_the_key = restated
         .options
@@ -620,4 +646,152 @@ fn put_the_key_back(table: &mut CreateTable, key: &[String]) {
             }),
         ),
     }
+}
+
+/// Renames a column in the table's own foreign keys: among the columns a key
+/// is over, and among the columns it names where it names the table itself.
+/// Measured on MySQL 8.4.11, `CHANGE pid parent INT` leaves `FOREIGN KEY
+/// (parent)`, and `CHANGE id sid INT NOT NULL` on a table whose key names its
+/// own `id` leaves `REFERENCES s (sid)`.
+fn rename_in_the_foreign_keys(table: &mut CreateTable, old: &str, new: &str) {
+    let own_name = match table.name.0.as_slice() {
+        [.., ObjectNamePart::Identifier(name)] => name.value.clone(),
+        _ => String::new(),
+    };
+    let rename = |columns: &mut Vec<Ident>| {
+        for column in columns.iter_mut() {
+            if column.value.eq_ignore_ascii_case(old) {
+                new.clone_into(&mut column.value);
+            }
+        }
+    };
+    for constraint in &mut table.constraints {
+        let TableConstraint::ForeignKey(foreign_key) = constraint else {
+            continue;
+        };
+        rename(&mut foreign_key.columns);
+        let names_itself = matches!(foreign_key.foreign_table.0.as_slice(),
+            [ObjectNamePart::Identifier(parent)] if parent.value.eq_ignore_ascii_case(&own_name));
+        if names_itself {
+            rename(&mut foreign_key.referred_columns);
+        }
+    }
+}
+
+/// Whether a column carried across takes a type MySQL copies the rows for.
+fn retyped_in_a_copy(
+    stored: &CreateTable,
+    written: &CreateTable,
+    carried_columns: &[(String, String)],
+) -> bool {
+    carried_columns.iter().any(|(new, old)| {
+        match (column_named(stored, old), column_named(written, new)) {
+            (Some(before), Some(after)) => !kept_in_place(before, after),
+            _ => false,
+        }
+    })
+}
+
+/// Whether MySQL changes a column from `before` to `after` without copying
+/// the rows. Measured on MySQL 8.4.11, beside the rename of a column a
+/// foreign key names: a display width (`INT` to `INT(11)`) is taken, and so
+/// is a longer `VARCHAR` whose length still takes as many bytes to write —
+/// at most 255, or more than 255, counting the most bytes one character of
+/// its character set takes, so a `utf8mb4` column grows from 10 to 20 or from
+/// 70 to 100 characters and a `utf8mb3` one from 70 to 80 — while `INT
+/// UNSIGNED`, `BIGINT`, a `VARCHAR` growing from 10 to 70 characters, a
+/// `utf8mb3` one from 80 to 90, a shorter `VARCHAR`, `CHAR`, another
+/// `DECIMAL`, `DATETIME(3)` and `MEDIUMTEXT` are 1846.
+fn kept_in_place(before: &ColumnDef, after: &ColumnDef) -> bool {
+    let whole_number = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::TinyInt(_)
+                | DataType::SmallInt(_)
+                | DataType::MediumInt(_)
+                | DataType::Int(_)
+                | DataType::Integer(_)
+                | DataType::BigInt(_)
+                | DataType::TinyIntUnsigned(_)
+                | DataType::SmallIntUnsigned(_)
+                | DataType::MediumIntUnsigned(_)
+                | DataType::IntUnsigned(_)
+                | DataType::IntegerUnsigned(_)
+                | DataType::BigIntUnsigned(_)
+        )
+    };
+    match (&before.data_type, &after.data_type) {
+        (before, after) if before == after => true,
+        (before, after) if whole_number(before) && whole_number(after) => {
+            let canonical = |data_type: &DataType| match data_type {
+                DataType::Integer(_) => std::mem::discriminant(&DataType::Int(None)),
+                DataType::IntegerUnsigned(_) => {
+                    std::mem::discriminant(&DataType::IntUnsigned(None))
+                }
+                other => std::mem::discriminant(other),
+            };
+            canonical(before) == canonical(after)
+        }
+        (DataType::Varchar(Some(shorter)), DataType::Varchar(Some(longer))) => {
+            let widest = |column: &ColumnDef| {
+                super::widest_character_of_collation(
+                    collation_of(column).as_deref().unwrap_or("utf8mb4"),
+                )
+            };
+            let (widest_before, widest_after) = (widest(before), widest(after));
+            match (character_count(shorter), character_count(longer)) {
+                (Some(shorter), Some(longer)) if widest_before == widest_after => {
+                    const ONE_LENGTH_BYTE: u64 = 255;
+                    longer >= shorter
+                        && (shorter * widest_before <= ONE_LENGTH_BYTE)
+                            == (longer * widest_after <= ONE_LENGTH_BYTE)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn character_count(length: &CharacterLength) -> Option<u64> {
+    match length {
+        CharacterLength::IntegerLength { length, unit: None } => Some(*length),
+        _ => None,
+    }
+}
+
+/// The columns carried across, by their new names, whose collation the
+/// statement changes.
+fn recollated_columns(
+    stored: &CreateTable,
+    written: &CreateTable,
+    carried_columns: &[(String, String)],
+) -> Vec<String> {
+    carried_columns
+        .iter()
+        .filter(
+            |(new, old)| match (column_named(stored, old), column_named(written, new)) {
+                (Some(before), Some(after)) => collation_of(before) != collation_of(after),
+                _ => false,
+            },
+        )
+        .map(|(new, _)| new.clone())
+        .collect()
+}
+
+fn collation_of(column: &ColumnDef) -> Option<String> {
+    column
+        .options
+        .iter()
+        .find_map(|option| match &option.option {
+            ColumnOption::Collation(name) => Some(name.to_string().to_ascii_lowercase()),
+            _ => None,
+        })
+}
+
+fn column_named<'a>(table: &'a CreateTable, name: &str) -> Option<&'a ColumnDef> {
+    table
+        .columns
+        .iter()
+        .find(|column| column.name.value.eq_ignore_ascii_case(name))
 }

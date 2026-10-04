@@ -7141,6 +7141,9 @@ fn key_change_error_kind(error: &MySqlKeyChangeError) -> FrontendErrorKind {
         MySqlKeyChangeError::ReferencedColumnCountingChanges => {
             FrontendErrorKind::ReferencedColumnCannotChange
         }
+        MySqlKeyChangeError::ForeignKeyColumnRenamedInACopy => {
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy
+        }
     }
 }
 

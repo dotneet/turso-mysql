@@ -10493,6 +10493,72 @@ fn a_key_change_is_read_as_the_table_it_leaves() {
     }
 }
 
+/// A column renamed in a table written again is renamed in the table's own
+/// foreign keys, and in the columns one names where it names the table
+/// itself; the rewrite says whether MySQL copies the rows for it, which a
+/// display width and a `VARCHAR` growing within one length byte do not, and
+/// another type, another length byte, and a table starting to count do.
+#[test]
+fn a_key_change_renames_the_columns_in_its_own_foreign_keys() {
+    let mode = SessionSqlMode::default();
+    let rewrite = |stored: &str, sql: &str| match table_with_its_key_changed(stored, sql, mode) {
+        Ok(Some(MySqlKeyChange::TableWrittenAgain(rewrite))) => rewrite,
+        other => panic!("{sql}: {other:?}"),
+    };
+    let own = "CREATE TABLE `s` (`id` INT NOT NULL PRIMARY KEY, `parent` INT, `w` VARCHAR(10), `n` INT, CONSTRAINT `fk` FOREIGN KEY (`parent`) REFERENCES `s` (`id`), FOREIGN KEY (`n`) REFERENCES `p` (`id`))";
+    let renamed = rewrite(own, "ALTER TABLE s CHANGE id sid INT NOT NULL");
+    assert!(
+        renamed
+            .table
+            .create_sql
+            .contains("FOREIGN KEY (`parent`) REFERENCES `s`(`sid`)"),
+        "{}",
+        renamed.table.create_sql
+    );
+    assert!(renamed
+        .table
+        .create_sql
+        .contains("FOREIGN KEY (`n`) REFERENCES `p`(`id`)"));
+    assert!(!renamed.copies_the_rows);
+    let renamed = rewrite(own, "ALTER TABLE s CHANGE n m INT");
+    assert!(renamed
+        .table
+        .create_sql
+        .contains("FOREIGN KEY (`m`) REFERENCES `p`(`id`)"));
+    for (sql, copies) in [
+        ("ALTER TABLE s CHANGE n m INT(11)", false),
+        ("ALTER TABLE s CHANGE n m INT, MODIFY w VARCHAR(63)", false),
+        ("ALTER TABLE s CHANGE n m INT, MODIFY w VARCHAR(64)", true),
+        ("ALTER TABLE s CHANGE n m INT, MODIFY w VARCHAR(9)", true),
+        ("ALTER TABLE s CHANGE n m INT UNSIGNED", true),
+        ("ALTER TABLE s CHANGE n m INT NOT NULL", false),
+        ("ALTER TABLE s MODIFY id INT NOT NULL AUTO_INCREMENT", true),
+    ] {
+        assert_eq!(rewrite(own, sql).copies_the_rows, copies, "{sql}");
+    }
+    let three_bytes = "CREATE TABLE `t` (`id` INT NOT NULL PRIMARY KEY, `w` VARCHAR(70) COLLATE utf8mb3_unicode_ci, `x` VARCHAR(80) COLLATE utf8mb3_unicode_ci)";
+    for (sql, copies) in [
+        (
+            "ALTER TABLE t CHANGE id k INT NOT NULL, MODIFY w VARCHAR(80) COLLATE utf8mb3_unicode_ci",
+            false,
+        ),
+        (
+            "ALTER TABLE t CHANGE id k INT NOT NULL, MODIFY x VARCHAR(90) COLLATE utf8mb3_unicode_ci",
+            true,
+        ),
+    ] {
+        assert_eq!(rewrite(three_bytes, sql).copies_the_rows, copies, "{sql}");
+    }
+    assert_eq!(
+        rewrite(
+            own,
+            "ALTER TABLE s CHANGE n m INT, MODIFY w VARCHAR(10) COLLATE utf8mb4_bin"
+        )
+        .recollated,
+        ["w"]
+    );
+}
+
 /// `ALTER TABLE t FORCE` alone names the table it makes again; with anything
 /// beside it, it is some other statement.
 #[test]

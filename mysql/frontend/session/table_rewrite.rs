@@ -184,11 +184,6 @@ impl MySqlConnection {
             .resolved_fks_referencing(table)
             .map_err(MySqlQueryError::Engine)?;
         for reference in &references {
-            let constraint = crate::show_create_table::foreign_key_name(
-                &reference.child_table.name,
-                &reference.fk,
-                &reference.child_table.foreign_keys,
-            );
             for (child, parent) in reference
                 .fk
                 .child_columns
@@ -200,55 +195,111 @@ impl MySqlConnection {
                         MySqlForeignKeyDefinitionError::IncompatibleColumns {
                             child: child.clone(),
                             parent: parent.clone(),
-                            constraint,
+                            constraint: crate::show_create_table::foreign_key_name(
+                                &reference.child_table.name,
+                                &reference.fk,
+                                &reference.child_table.foreign_keys,
+                            ),
                         },
                     ));
                 }
-                if renamed(parent) {
-                    return Err(MySqlQueryError::Unsupported(
-                        "renaming a column another table's foreign key names, beside a change of the key"
-                            .to_string(),
+            }
+        }
+        for foreign_key in &btree.foreign_keys {
+            for (position, child) in foreign_key.child_columns.iter().enumerate() {
+                if retyped(child) {
+                    return Err(MySqlQueryError::ForeignKeyDefinition(
+                        MySqlForeignKeyDefinitionError::IncompatibleColumns {
+                            child: child.clone(),
+                            parent: foreign_key
+                                .parent_columns
+                                .get(position)
+                                .cloned()
+                                .unwrap_or_default(),
+                            constraint: crate::show_create_table::foreign_key_name(
+                                table,
+                                foreign_key,
+                                &btree.foreign_keys,
+                            ),
+                        },
                     ));
                 }
-                if checks && starts_or_stops_counting(parent) {
-                    return Err(MySqlQueryError::KeyChange(
-                        MySqlKeyChangeError::ReferencedColumnCountingChanges,
-                    ));
-                }
+            }
+        }
+        // Measured on MySQL 8.4.11: a column a foreign key is over, on either
+        // side, may be renamed only by a change MySQL makes in place; beside
+        // one that copies the rows it is 1846, after 3780 and before 1833.
+        let renames_a_key_column = references
+            .iter()
+            .any(|reference| reference.parent_cols.iter().any(|parent| renamed(parent)))
+            || btree
+                .foreign_keys
+                .iter()
+                .any(|foreign_key| foreign_key.child_columns.iter().any(|child| renamed(child)));
+        if renames_a_key_column && self.the_change_copies_the_rows(table, rewrite) {
+            return Err(MySqlQueryError::KeyChange(
+                MySqlKeyChangeError::ForeignKeyColumnRenamedInACopy,
+            ));
+        }
+        for reference in &references {
+            if checks
+                && reference
+                    .parent_cols
+                    .iter()
+                    .any(|parent| starts_or_stops_counting(parent))
+            {
+                return Err(MySqlQueryError::KeyChange(
+                    MySqlKeyChangeError::ReferencedColumnCountingChanges,
+                ));
             }
             if !self.a_key_still_finds(table, rewrite, &reference.parent_cols, true) {
                 return Err(MySqlQueryError::RequiredByForeignKey);
             }
         }
         for foreign_key in &btree.foreign_keys {
-            let constraint =
-                crate::show_create_table::foreign_key_name(table, foreign_key, &btree.foreign_keys);
-            for (position, child) in foreign_key.child_columns.iter().enumerate() {
-                if retyped(child) {
-                    let parent = foreign_key
-                        .parent_columns
-                        .get(position)
-                        .cloned()
-                        .unwrap_or_default();
-                    return Err(MySqlQueryError::ForeignKeyDefinition(
-                        MySqlForeignKeyDefinitionError::IncompatibleColumns {
-                            child: child.clone(),
-                            parent,
-                            constraint,
-                        },
-                    ));
-                }
-                if checks && starts_or_stops_counting(child) {
-                    return Err(MySqlQueryError::KeyChange(
-                        MySqlKeyChangeError::ForeignKeyColumnCountingChanges,
-                    ));
-                }
+            if checks
+                && foreign_key
+                    .child_columns
+                    .iter()
+                    .any(|child| starts_or_stops_counting(child))
+            {
+                return Err(MySqlQueryError::KeyChange(
+                    MySqlKeyChangeError::ForeignKeyColumnCountingChanges,
+                ));
             }
             if !self.a_key_still_finds(table, rewrite, &foreign_key.child_columns, false) {
                 return Err(MySqlQueryError::RequiredByForeignKey);
             }
         }
         Ok(())
+    }
+
+    /// Whether MySQL copies the rows to make the change: measured on 8.4.11,
+    /// a column taking another type, the table starting or stopping counting,
+    /// its key going with none in its place, and another collation for a
+    /// column an index is over, where a collation for any other column is
+    /// changed in place.
+    fn the_change_copies_the_rows(&self, table: &str, rewrite: &MySqlKeyRewrite) -> bool {
+        if rewrite.copies_the_rows {
+            return true;
+        }
+        let schema = self.inner.current_schema();
+        rewrite.recollated.iter().any(|recollated| {
+            let Some((_, old)) = rewrite
+                .table
+                .carried_columns
+                .iter()
+                .find(|(new, _)| new.eq_ignore_ascii_case(recollated))
+            else {
+                return false;
+            };
+            schema.get_indices(table).any(|index| {
+                index
+                    .columns
+                    .iter()
+                    .any(|column| column.name.eq_ignore_ascii_case(old))
+            })
+        })
     }
 
     /// Whether, once the key has changed, some key of the table still finds
@@ -325,6 +376,7 @@ impl MySqlConnection {
         let triggers = self
             .triggers_naming(table)
             .map_err(MySqlQueryError::Engine)?;
+        let referencing = self.keys_naming_renamed_columns(table, rewrite)?;
         let made_new = format!("{table}_turso_written");
         let written_prefix = format!("CREATE TABLE {} (", mysql_quoted(table));
         let Some(columns_onwards) = rewrite.table.create_sql.strip_prefix(&written_prefix) else {
@@ -351,6 +403,7 @@ impl MySqlConnection {
             counter_before,
             &indexes,
             &triggers,
+            &referencing,
         );
         self.set_foreign_key_checks(checks);
         if let Err(error) = written {
@@ -381,6 +434,7 @@ impl MySqlConnection {
         counter_before: Option<u64>,
         indexes: &[StoredIndexStatement],
         triggers: &[StoredTrigger],
+        referencing: &[ReferencingKey],
     ) -> std::result::Result<(), MySqlQueryError> {
         for trigger in triggers {
             self.drop_a_trigger_to_write_again(&trigger.name)?;
@@ -427,6 +481,9 @@ impl MySqlConnection {
         let named = MySqlTableName::parse(table)
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         self.remove_replaced_implicit_fk_indexes(&named)?;
+        for key in referencing {
+            self.point_a_key_at_the_renamed_columns(key)?;
+        }
         for trigger in triggers {
             self.write_a_trigger_again(trigger)?;
         }
@@ -460,6 +517,158 @@ impl MySqlConnection {
             )));
         };
         self.advance_auto_increment_past(&counted, high_water, None)
+    }
+
+    /// The foreign keys of other tables naming a column the statement
+    /// renames, each as it is to read once the table is written again.
+    ///
+    /// Measured on MySQL 8.4.11: after `CHANGE id pk INT NOT NULL` on a
+    /// table another table's `fk_c` names by `id`, `SHOW CREATE TABLE` of the
+    /// other table prints ``REFERENCES `p` (`pk`)`` with its actions as they
+    /// were, `KEY_COLUMN_USAGE` names `pk` as the referenced column, and the
+    /// key is held as before.
+    fn keys_naming_renamed_columns(
+        &self,
+        table: &str,
+        rewrite: &MySqlKeyRewrite,
+    ) -> std::result::Result<Vec<ReferencingKey>, MySqlQueryError> {
+        let renamed = |column: &str| {
+            rewrite
+                .table
+                .carried_columns
+                .iter()
+                .find(|(new, old)| new != old && old.eq_ignore_ascii_case(column))
+                .map(|(new, _)| new.clone())
+        };
+        let schema = self.inner.current_schema();
+        let references = schema
+            .resolved_fks_referencing(table)
+            .map_err(MySqlQueryError::Engine)?;
+        let mut children: Vec<String> = Vec::new();
+        for reference in &references {
+            let child = &reference.child_table.name;
+            if child.eq_ignore_ascii_case(table)
+                || children
+                    .iter()
+                    .any(|named| named.eq_ignore_ascii_case(child))
+                || !reference
+                    .parent_cols
+                    .iter()
+                    .any(|parent| renamed(parent).is_some())
+            {
+                continue;
+            }
+            children.push(child.clone());
+        }
+        let mut keys = Vec::new();
+        for child in children {
+            let (Some(stored), Some(btree)) =
+                (schema.table_sql(&child), schema.get_btree_table(&child))
+            else {
+                return Err(MySqlQueryError::MissingTable);
+            };
+            let names = btree
+                .foreign_keys
+                .iter()
+                .map(|foreign_key| {
+                    crate::show_create_table::foreign_key_name(
+                        &child,
+                        foreign_key,
+                        &btree.foreign_keys,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let statement = self
+                .inner
+                .dialect()
+                .parse_schema_sql(SchemaSqlKind::Table, stored)
+                .map_err(MySqlQueryError::Engine)?;
+            let Stmt::CreateTable {
+                body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { constraints, .. },
+                ..
+            } = statement
+            else {
+                return Err(MySqlQueryError::Engine(LimboError::Corrupt(
+                    "a stored table did not describe its columns".to_string(),
+                )));
+            };
+            let mut unnamed = 0;
+            for named in constraints {
+                let turso_parser::ast::TableConstraint::ForeignKey { clause, .. } =
+                    &named.constraint
+                else {
+                    continue;
+                };
+                let name = match &named.name {
+                    Some(name) => name.as_str().to_owned(),
+                    None => {
+                        unnamed += 1;
+                        format!("{child}_ibfk_{unnamed}")
+                    }
+                };
+                if !clause.tbl_name.as_str().eq_ignore_ascii_case(table) {
+                    continue;
+                }
+                let mut constraint = named.constraint.clone();
+                let turso_parser::ast::TableConstraint::ForeignKey { clause, .. } = &mut constraint
+                else {
+                    unreachable!("the constraint was read as a foreign key above");
+                };
+                let mut points_elsewhere = false;
+                for column in &mut clause.columns {
+                    if let Some(new) = renamed(column.col_name.as_str()) {
+                        column.col_name = turso_parser::ast::Name::exact(new);
+                        points_elsewhere = true;
+                    }
+                }
+                if !points_elsewhere {
+                    continue;
+                }
+                if !names.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+                    return Err(MySqlQueryError::Unsupported(
+                        "a foreign key whose stored place does not give its name".to_string(),
+                    ));
+                }
+                keys.push(ReferencingKey {
+                    table: child.clone(),
+                    name: name.clone(),
+                    constraint: turso_parser::ast::NamedTableConstraint {
+                        name: Some(turso_parser::ast::Name::exact(name)),
+                        constraint,
+                    },
+                });
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Points one foreign key of another table at the columns it names under
+    /// their new names, by dropping it and adding it again under the name it
+    /// answers to; the engine's own `DROP CONSTRAINT` keeps every other key
+    /// of the table under the name it answers to as well.
+    fn point_a_key_at_the_renamed_columns(
+        &self,
+        key: &ReferencingKey,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        for body in [
+            AlterTableBody::DropConstraint(turso_parser::ast::Name::exact(key.name.clone())),
+            AlterTableBody::AddConstraint(key.constraint.clone()),
+        ] {
+            let statement = Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
+                    key.table.clone(),
+                )),
+                body,
+            });
+            let sql = statement.to_string();
+            let options =
+                PrepareOptions::default().with_schema_sql_formatter(Arc::new(self.schema_context));
+            self.inner
+                .prepare_translated_stmt_with_options(statement, &sql, &options)
+                .and_then(|mut prepared| prepared.run_ignore_rows())
+                .map_err(MySqlQueryError::Engine)?;
+        }
+        Ok(())
     }
 
     /// Whether a value too long for its column was copied from a column of
@@ -928,6 +1137,14 @@ impl MySqlConnection {
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(0))
     }
+}
+
+/// A foreign key of another table, as it is to read once a column it names
+/// is renamed.
+pub(super) struct ReferencingKey {
+    table: String,
+    name: String,
+    constraint: turso_parser::ast::NamedTableConstraint,
 }
 
 /// One trigger's row of `sqlite_schema`, kept to be written again as it was.

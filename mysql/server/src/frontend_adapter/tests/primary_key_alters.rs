@@ -502,6 +502,129 @@ fn a_foreign_key_holds_a_key_change_to_what_mysql_allows() {
     );
 }
 
+/// A key column renamed by a change MySQL makes in place is renamed in every
+/// foreign key naming it: another table's (its name, its actions and its
+/// place among that table's keys kept), the table's own over the column, and
+/// one the table points at itself. `information_schema` names the new column
+/// and every key is held as before. Beside a change MySQL makes by copying
+/// the rows the rename is 1846, after 3780.
+#[test]
+fn a_renamed_key_column_is_renamed_in_the_foreign_keys_naming_it() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (id INT NOT NULL PRIMARY KEY, u INT NOT NULL, name VARCHAR(10), n INT, UNIQUE KEY uk (u))",
+        "CREATE TABLE c (cid INT NOT NULL PRIMARY KEY, pid INT, pu INT, x VARCHAR(10), CONSTRAINT fk_c FOREIGN KEY (pid) REFERENCES p (id) ON DELETE CASCADE, FOREIGN KEY (pu) REFERENCES p (u))",
+        "CREATE TABLE s (id INT NOT NULL PRIMARY KEY, parent INT, FOREIGN KEY (parent) REFERENCES s (id))",
+        "CREATE TABLE p2 (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT) AUTO_INCREMENT=50",
+        "CREATE TABLE c2 (pid INT, FOREIGN KEY (pid) REFERENCES p2 (id))",
+        "INSERT INTO p VALUES (1, 10, 'a', 0), (2, 20, 'b', 0)",
+        "INSERT INTO c VALUES (100, 1, NULL, 'x'), (200, 2, 20, 'y')",
+        "INSERT INTO s VALUES (1, NULL), (2, 1)",
+        "INSERT INTO p2 (v) VALUES (1), (2)",
+        "INSERT INTO c2 VALUES (50)",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for (sql, refused) in [
+        (
+            "ALTER TABLE p CHANGE id pk INT NOT NULL AUTO_INCREMENT",
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+        ),
+        (
+            "ALTER TABLE p CHANGE id pk INT NOT NULL, MODIFY n BIGINT",
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+        ),
+        (
+            "ALTER TABLE p CHANGE id pk INT NOT NULL, MODIFY name VARCHAR(70)",
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+        ),
+        (
+            "ALTER TABLE p CHANGE u u2 INT NOT NULL, MODIFY id BIGINT NOT NULL",
+            FrontendErrorKind::ForeignKeyColumnsIncompatible,
+        ),
+        (
+            "ALTER TABLE c CHANGE pid parent INT, MODIFY x VARCHAR(5)",
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+        ),
+        (
+            "ALTER TABLE p2 CHANGE id pk INT NOT NULL",
+            FrontendErrorKind::ForeignKeyColumnRenamedInACopy,
+        ),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
+    run(
+        &mut adapter,
+        "ALTER TABLE p CHANGE id pk INT NOT NULL, MODIFY name VARCHAR(20)",
+    );
+    assert_eq!(
+        created(&mut adapter, "c"),
+        "CREATE TABLE `c` (\n  `cid` int NOT NULL,\n  `pid` int DEFAULT NULL,\n  `pu` int DEFAULT NULL,\n  `x` varchar(10) DEFAULT NULL,\n  PRIMARY KEY (`cid`),\n  KEY `fk_c` (`pid`),\n  KEY `pu` (`pu`),\n  CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pu`) REFERENCES `p` (`u`),\n  CONSTRAINT `fk_c` FOREIGN KEY (`pid`) REFERENCES `p` (`pk`) ON DELETE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = 'probe' AND TABLE_NAME = 'c' AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME"
+        ),
+        [["c_ibfk_1", "pu", "p", "u"], ["fk_c", "pid", "p", "pk"]]
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO c VALUES (300, 3, 10, 'z')")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    run(&mut adapter, "DELETE FROM p WHERE pk = 1");
+    assert_eq!(rows(&mut adapter, "SELECT cid FROM c"), [["200"]]);
+
+    // The table's own key over a renamed column, and a key naming the table
+    // itself, follow the column.
+    run(&mut adapter, "ALTER TABLE c CHANGE pid parent INT");
+    assert!(created(&mut adapter, "c").contains(
+        "CONSTRAINT `fk_c` FOREIGN KEY (`parent`) REFERENCES `p` (`pk`) ON DELETE CASCADE"
+    ));
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO c VALUES (300, 3, 20, 'z')")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    run(&mut adapter, "ALTER TABLE s CHANGE id sid INT NOT NULL");
+    assert!(created(&mut adapter, "s")
+        .contains("CONSTRAINT `s_ibfk_1` FOREIGN KEY (`parent`) REFERENCES `s` (`sid`)"));
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO s VALUES (3, 9)")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+
+    // A counted key renamed alone keeps counting where it stood.
+    run(&mut adapter, "ALTER TABLE p2 RENAME COLUMN id TO pk");
+    assert!(created(&mut adapter, "c2")
+        .contains("CONSTRAINT `c2_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p2` (`pk`)"));
+    assert_eq!(counter(&mut adapter, "p2").as_deref(), Some("52"));
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO p2 (v) VALUES (3)"),
+        (1, 52)
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE p2 CHANGE pk id2 INT NOT NULL AUTO_INCREMENT",
+    );
+    assert!(created(&mut adapter, "c2").contains("REFERENCES `p2` (`id2`)"));
+    assert_eq!(
+        adapter
+            .execute_query("DELETE FROM p2 WHERE id2 = 50")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ParentRowReferenced)
+    );
+}
+
 /// The table's own triggers, another table's trigger writing it and a view
 /// reading it all stand after the key changes, as MySQL leaves them: each
 /// trigger reads back as it was made and fires as before.
