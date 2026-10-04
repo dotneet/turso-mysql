@@ -190,7 +190,8 @@ pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use nothing_to_run::{nothing_to_run, NothingToRun};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
 pub use primary_key_change::{
-    table_as_it_stands, table_with_its_key_changed, MySqlKeyChange, MySqlKeyRewrite,
+    table_as_it_stands, table_rewritten_as, table_with_its_key_changed, MySqlKeyChange,
+    MySqlKeyRewrite,
 };
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
 pub use safe_updates::{read_safe_update, ComparedValues, SafeUpdateConjunct, SafeUpdateReading};
@@ -4412,6 +4413,14 @@ pub fn table_with_a_column_placed(
             return Ok(Some(MySqlColumnPlacement::DuplicateColumn(
                 column_def.name.value,
             )));
+        }
+        if table.columns[at].name.value != column_def.name.value {
+            let old = table.columns[at].name.value.clone();
+            primary_key_change::rename_in_the_foreign_keys(
+                &mut table,
+                &old,
+                &column_def.name.value,
+            );
         }
         table.columns.remove(at);
         let mut renamed = carried_columns.remove(at);

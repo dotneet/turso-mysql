@@ -1,14 +1,17 @@
 //! Writing a table again under a definition an `ALTER TABLE` changed: its
 //! primary key, a column the key is over, the column it counts its ids on,
-//! or nothing at all, as `ENGINE=InnoDB`, `FORCE` and `OPTIMIZE TABLE` ask.
+//! the place of a column, its `CHECK` constraints, the collation of its
+//! columns of words, or nothing at all, as `ENGINE=InnoDB`, `FORCE` and
+//! `OPTIMIZE TABLE` ask.
 //!
 //! The key decides how the engine keeps the table — a key over one integer
 //! is the rowid, any other is an index of its own beside one — and the
 //! counted column is the rowid, so none of these can change the table in
-//! place. The table is made again under a name of its own, the rows are
-//! carried across in key order, the old table is dropped and the new one
-//! takes its name; its indexes, its triggers and the triggers of other
-//! tables that name it are written again after.
+//! place; nor can the engine move a column or give one another collation.
+//! The table is made again under a name of its own, the rows are carried
+//! across in key order, the old table is dropped and the new one takes its
+//! name; its indexes, its triggers and the triggers of other tables that
+//! name it are written again after.
 
 use super::*;
 use turso_mysql_parser::{MySqlKeyChange, MySqlKeyRewrite};
@@ -226,6 +229,9 @@ impl MySqlConnection {
                 }
             }
         }
+        if checks {
+            self.hold_recollated_key_columns(table, rewrite, &references, &btree.foreign_keys)?;
+        }
         // Measured on MySQL 8.4.11: a column a foreign key is over, on either
         // side, may be renamed only by a change MySQL makes in place; beside
         // one that copies the rows it is 1846, after 3780 and before 1833.
@@ -274,6 +280,112 @@ impl MySqlConnection {
         Ok(())
     }
 
+    /// Refuses a column a foreign key is over taking a collation the column on
+    /// the key's other side has not got. Measured on MySQL 8.4.11 with foreign
+    /// key checks on: `MODIFY code VARCHAR(10) COLLATE utf8mb4_bin` on either
+    /// side of a key over two `utf8mb4_0900_ai_ci` columns is 3780, and so is
+    /// `CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin` of either table,
+    /// until the other side has the collation too; with the checks off each is
+    /// taken.
+    fn hold_recollated_key_columns(
+        &self,
+        table: &str,
+        rewrite: &MySqlKeyRewrite,
+        references: &[turso_core::schema::ResolvedFkRef],
+        own: &[Arc<turso_core::schema::ForeignKey>],
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let incompatible = |child: &str, parent: &str, constraint: String| {
+            Err(MySqlQueryError::ForeignKeyDefinition(
+                MySqlForeignKeyDefinitionError::IncompatibleColumns {
+                    child: child.to_owned(),
+                    parent: parent.to_owned(),
+                    constraint,
+                },
+            ))
+        };
+        for (recollated, collation) in &rewrite.recollated {
+            let Some((_, old)) = rewrite
+                .table
+                .carried_columns
+                .iter()
+                .find(|(new, _)| new.eq_ignore_ascii_case(recollated))
+            else {
+                continue;
+            };
+            for reference in references {
+                let child_table = &reference.child_table.name;
+                if child_table.eq_ignore_ascii_case(table) {
+                    continue;
+                }
+                for (child, parent) in reference
+                    .fk
+                    .child_columns
+                    .iter()
+                    .zip(&reference.parent_cols)
+                {
+                    if parent.eq_ignore_ascii_case(old)
+                        && !self
+                            .collation_of_a_column(child_table, child)?
+                            .eq_ignore_ascii_case(collation)
+                    {
+                        return incompatible(
+                            child,
+                            parent,
+                            crate::show_create_table::foreign_key_name(
+                                child_table,
+                                &reference.fk,
+                                &reference.child_table.foreign_keys,
+                            ),
+                        );
+                    }
+                }
+            }
+            for foreign_key in own {
+                if foreign_key.parent_table.eq_ignore_ascii_case(table) {
+                    continue;
+                }
+                for (child, parent) in foreign_key
+                    .child_columns
+                    .iter()
+                    .zip(foreign_key.parent_columns.iter())
+                {
+                    if child.eq_ignore_ascii_case(old)
+                        && !self
+                            .collation_of_a_column(&foreign_key.parent_table, parent)?
+                            .eq_ignore_ascii_case(collation)
+                    {
+                        return incompatible(
+                            child,
+                            parent,
+                            crate::show_create_table::foreign_key_name(table, foreign_key, own),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn collation_of_a_column(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> std::result::Result<String, MySqlQueryError> {
+        let named = MySqlTableName::parse(table)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        let columns = self.list_shared_columns(&named).map_err(|error| {
+            MySqlQueryError::Engine(LimboError::InternalError(format!(
+                "the columns of {table} could not be read: {error:?}"
+            )))
+        })?;
+        Ok(columns
+            .iter()
+            .find(|held| held.name().eq_ignore_ascii_case(column))
+            .and_then(|held| held.collation_name())
+            .unwrap_or_default()
+            .to_owned())
+    }
+
     /// Whether MySQL copies the rows to make the change: measured on 8.4.11,
     /// a column taking another type, the table starting or stopping counting,
     /// its key going with none in its place, and another collation for a
@@ -284,7 +396,7 @@ impl MySqlConnection {
             return true;
         }
         let schema = self.inner.current_schema();
-        rewrite.recollated.iter().any(|recollated| {
+        rewrite.recollated.iter().any(|(recollated, _)| {
             let Some((_, old)) = rewrite
                 .table
                 .carried_columns
@@ -357,6 +469,47 @@ impl MySqlConnection {
         served
     }
 
+    /// Runs an `ALTER TABLE` that writes the table again for something other
+    /// than its key — a column placed `FIRST` or `AFTER` another, a `CHECK`
+    /// added or dropped, `CONVERT TO CHARACTER SET` — the way a change of the
+    /// key runs, so the table's triggers, the views over it and the foreign
+    /// keys naming it stand through it.
+    pub(super) fn write_the_table_again_as(
+        &self,
+        table: &str,
+        rewrite: &turso_mysql_parser::MySqlTableRewrite,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let rewrite = self.read_as_a_rewrite_of(table, rewrite)?;
+        self.hold_the_key_change_to_the_foreign_keys(table, &rewrite)?;
+        self.write_the_table_again_under(table, &rewrite)
+    }
+
+    /// Runs the same rewrite inside the transaction an `ALTER TABLE` of
+    /// several clauses holds for all of them.
+    pub(super) fn write_the_table_again_in_the_callers_transaction(
+        &self,
+        table: &str,
+        rewrite: &turso_mysql_parser::MySqlTableRewrite,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let rewrite = self.read_as_a_rewrite_of(table, rewrite)?;
+        self.hold_the_key_change_to_the_foreign_keys(table, &rewrite)?;
+        let rebuild = self.plan_the_rebuild(table, &rewrite)?;
+        self.rebuild_in_this_transaction(&rebuild)
+    }
+
+    fn read_as_a_rewrite_of(
+        &self,
+        table: &str,
+        rewrite: &turso_mysql_parser::MySqlTableRewrite,
+    ) -> std::result::Result<MySqlKeyRewrite, MySqlQueryError> {
+        let stored = self
+            .stored_table_statement(table)
+            .map_err(MySqlQueryError::Engine)?
+            .ok_or(MySqlQueryError::MissingTable)?;
+        turso_mysql_parser::table_rewritten_as(&stored, rewrite.clone(), self.parser_mode())
+            .map_err(mysql_query_parse_error)
+    }
+
     /// Makes the table again under the definition `rewrite` carries and
     /// carries its rows across, all in one transaction.
     fn write_the_table_again_under(
@@ -364,6 +517,30 @@ impl MySqlConnection {
         table: &str,
         rewrite: &MySqlKeyRewrite,
     ) -> std::result::Result<(), MySqlQueryError> {
+        let rebuild = self.plan_the_rebuild(table, rewrite)?;
+        // DDL commits what came before it, which is what MySQL does.
+        if !self.inner.get_auto_commit() {
+            self.run_internal("COMMIT")?;
+        }
+        self.run_internal("BEGIN")?;
+        if let Err(error) = self.rebuild_in_this_transaction(&rebuild) {
+            self.run_internal("ROLLBACK")?;
+            return Err(error);
+        }
+        self.run_internal("COMMIT")?;
+        crash_point(CrashPoint::SchemaChangeCommitted);
+        if !self.inner.get_auto_commit() {
+            self.run_internal("ROLLBACK")?;
+        }
+        Ok(())
+    }
+
+    /// What a rewrite of `table` needs to read before it starts.
+    fn plan_the_rebuild<'a>(
+        &self,
+        table: &'a str,
+        rewrite: &'a MySqlKeyRewrite,
+    ) -> std::result::Result<TableRebuild<'a>, MySqlQueryError> {
         let counter_before = self
             .counter_of_a_stored_table(table)
             .map_err(MySqlQueryError::Engine)?;
@@ -388,34 +565,31 @@ impl MySqlConnection {
             "CREATE TABLE {} ({columns_onwards}",
             mysql_quoted(&made_new)
         );
-        // DDL commits what came before it, which is what MySQL does.
-        if !self.inner.get_auto_commit() {
-            self.run_internal("COMMIT")?;
-        }
-        self.run_internal("BEGIN")?;
-        let checks = self.inner.foreign_keys_enabled();
-        self.set_foreign_key_checks(false);
-        let written = self.write_the_table_again_in_this_transaction(
+        Ok(TableRebuild {
             table,
             rewrite,
-            &made_new,
-            &create,
+            made_new,
+            create,
             counter_before,
-            &indexes,
-            &triggers,
-            &referencing,
-        );
+            indexes,
+            triggers,
+            referencing,
+        })
+    }
+
+    /// Writes the table again with foreign key checks off: every row is
+    /// carried across, so nothing a key names goes missing, and what the
+    /// checks would catch is the moment between the drop and the copy, which
+    /// no statement can see.
+    fn rebuild_in_this_transaction(
+        &self,
+        rebuild: &TableRebuild<'_>,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        let checks = self.inner.foreign_keys_enabled();
+        self.set_foreign_key_checks(false);
+        let written = self.write_the_table_again_in_this_transaction(rebuild);
         self.set_foreign_key_checks(checks);
-        if let Err(error) = written {
-            self.run_internal("ROLLBACK")?;
-            return Err(error);
-        }
-        self.run_internal("COMMIT")?;
-        crash_point(CrashPoint::SchemaChangeCommitted);
-        if !self.inner.get_auto_commit() {
-            self.run_internal("ROLLBACK")?;
-        }
-        Ok(())
+        written
     }
 
     /// The statements a table's rewrite is made of.
@@ -424,31 +598,26 @@ impl MySqlConnection {
     /// one, so it is moved past every id the rows hold before the
     /// transaction commits: a crash after the commit then finds the counter
     /// already there, and one before it finds the old table and its counter.
-    #[allow(clippy::too_many_arguments)]
     fn write_the_table_again_in_this_transaction(
         &self,
-        table: &str,
-        rewrite: &MySqlKeyRewrite,
-        made_new: &str,
-        create: &str,
-        counter_before: Option<u64>,
-        indexes: &[StoredIndexStatement],
-        triggers: &[StoredTrigger],
-        referencing: &[ReferencingKey],
+        rebuild: &TableRebuild<'_>,
     ) -> std::result::Result<(), MySqlQueryError> {
-        for trigger in triggers {
+        let (table, rewrite, made_new) =
+            (rebuild.table, rebuild.rewrite, rebuild.made_new.as_str());
+        for trigger in &rebuild.triggers {
             self.drop_a_trigger_to_write_again(&trigger.name)?;
         }
         self.refuse_nulls_in_the_new_key(table, rewrite)?;
+        let counted_before = rebuild
+            .counter_before
+            .filter(|_| rewrite.counted_before.is_some());
         let numbered = match &rewrite.counted_after {
-            Some(counted) => Some(self.number_the_rows_asking_for_one(
-                table,
-                rewrite,
-                counted,
-                counter_before.filter(|_| rewrite.counted_before.is_some()),
-            )?),
-            None => None,
+            Some(counted) if !keeps_counting_on_the_same_column(rewrite) => {
+                self.number_the_rows_asking_for_one(table, rewrite, counted, counted_before)?
+            }
+            _ => 0,
         };
+        let create = rebuild.create.as_str();
         self.prepare(create)
             .and_then(|mut statement| statement.run_ignore_rows())
             .map_err(|error| self.json_schema_prepare_error(create, error))?;
@@ -471,7 +640,7 @@ impl MySqlConnection {
             })?;
         self.run_internal(&format!("DROP TABLE {}", sqlite_quoted(table)))?;
         self.rename_the_table_written_again(made_new, table)?;
-        for index in indexes {
+        for index in &rebuild.indexes {
             self.prepare_with_index_origin(&index.sql, index.implicit)
                 .and_then(|mut prepared| prepared.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
@@ -481,23 +650,23 @@ impl MySqlConnection {
         let named = MySqlTableName::parse(table)
             .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
         self.remove_replaced_implicit_fk_indexes(&named)?;
-        for key in referencing {
+        for key in &rebuild.referencing {
             self.point_a_key_at_the_renamed_columns(key)?;
         }
-        for trigger in triggers {
+        for trigger in &rebuild.triggers {
             self.write_a_trigger_again(trigger)?;
         }
-        let Some(numbered) = numbered else {
+        if rewrite.counted_after.is_none() {
             return Ok(());
-        };
+        }
         // Measured on MySQL 8.4.11: a table that counted before counts on
         // from where it stood, `AUTO_INCREMENT=100` kept over rows reaching
         // 11, and one that starts counting goes on from its highest id.
         let highest = self.highest_id_held(table, rewrite)?;
-        let kept = counter_before
-            .filter(|_| rewrite.counted_before.is_some())
-            .unwrap_or(0);
-        self.move_the_new_counter_past(table, numbered.max(highest).max(kept))
+        self.move_the_new_counter_past(
+            table,
+            numbered.max(highest).max(counted_before.unwrap_or(0)),
+        )
     }
 
     pub(super) fn move_the_new_counter_past(
@@ -841,6 +1010,13 @@ impl MySqlConnection {
             else {
                 continue;
             };
+            if rewrite
+                .old_key
+                .iter()
+                .any(|held| held.eq_ignore_ascii_case(old))
+            {
+                continue;
+            }
             let sql = format!(
                 "SELECT 1 FROM {} WHERE {} IS NULL LIMIT 1",
                 sqlite_quoted(table),
@@ -1137,6 +1313,33 @@ impl MySqlConnection {
             .and_then(|id| u64::try_from(id).ok())
             .unwrap_or(0))
     }
+}
+
+/// Whether the table counts on the same column before and after the
+/// rewrite, whose rows then hold their numbers already.
+fn keeps_counting_on_the_same_column(rewrite: &MySqlKeyRewrite) -> bool {
+    let (Some(before), Some(after)) = (&rewrite.counted_before, &rewrite.counted_after) else {
+        return false;
+    };
+    rewrite
+        .table
+        .carried_columns
+        .iter()
+        .any(|(new, old)| new.eq_ignore_ascii_case(after) && old.eq_ignore_ascii_case(before))
+}
+
+/// What one table's rewrite reads before it starts, and runs by.
+struct TableRebuild<'a> {
+    table: &'a str,
+    rewrite: &'a MySqlKeyRewrite,
+    /// The name the new table is made under until the old one is gone.
+    made_new: String,
+    create: String,
+    /// Where the old table's counter stood, for a table that counts.
+    counter_before: Option<u64>,
+    indexes: Vec<StoredIndexStatement>,
+    triggers: Vec<StoredTrigger>,
+    referencing: Vec<ReferencingKey>,
 }
 
 /// A foreign key of another table, as it is to read once a column it names

@@ -1,6 +1,8 @@
 //! `ALTER TABLE` statements that change a table's primary key, the columns it
-//! is over, or the column the table counts on: each writes the table again,
-//! keeping its rows, indexes, foreign keys, triggers, views and counter.
+//! is over, or the column the table counts on, and every other statement that
+//! writes the table again (a column placed, a `CHECK`, `CONVERT TO CHARACTER
+//! SET`): each writes the table again, keeping its rows, indexes, foreign
+//! keys, triggers, views and counter.
 //!
 //! Every expectation here was measured on MySQL 8.4.11.
 
@@ -672,6 +674,157 @@ fn triggers_and_views_stand_through_a_key_change() {
         rows(&mut adapter, "SHOW COLUMNS FROM tv")[0][..3],
         ["id", "bigint", "NO"]
     );
+}
+
+/// A column placed `FIRST` or `AFTER` another, a `CHECK` added and dropped,
+/// and `CONVERT TO CHARACTER SET` write a table with a trigger and views
+/// again as a change of its key does: the trigger stands as it was made and
+/// fires, the views read the rows, and the counter goes on where it stood. A
+/// view or trigger naming a column a `CHANGE` renamed no longer reads, as in
+/// MySQL.
+#[test]
+fn a_table_with_a_trigger_and_views_is_written_again_for_any_rewrite() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT, b VARCHAR(10)) AUTO_INCREMENT=20",
+        "CREATE TABLE log (x INT, y VARCHAR(10))",
+        "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW INSERT INTO log (x, y) VALUES (NEW.a, NEW.b)",
+        "CREATE VIEW tv AS SELECT id, a, b FROM t",
+        "CREATE VIEW tv2 AS SELECT a, b FROM t",
+        "INSERT INTO t (a, b) VALUES (1, 'x')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let triggers = rows(&mut adapter, "SHOW TRIGGERS");
+    run(&mut adapter, "ALTER TABLE t ADD COLUMN z INT FIRST");
+    assert_eq!(
+        created(&mut adapter, "t"),
+        "CREATE TABLE `t` (\n  `z` int DEFAULT NULL,\n  `id` int NOT NULL AUTO_INCREMENT,\n  `a` int DEFAULT NULL,\n  `b` varchar(10) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=21 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    run(&mut adapter, "INSERT INTO t (a, b) VALUES (2, 'y')");
+    run(&mut adapter, "ALTER TABLE t MODIFY b VARCHAR(10) AFTER id");
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, a, b FROM tv"),
+        [["20", "1", "x"], ["21", "2", "y"]]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT a, b FROM tv2"),
+        [["1", "x"], ["2", "y"]]
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE t ADD CONSTRAINT ck CHECK (a > 0)",
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO t (a, b) VALUES (-1, 'n')")
+            .map(|_| ()),
+        Err(FrontendErrorKind::CheckConstraintViolated)
+    );
+    run(&mut adapter, "INSERT INTO t (a, b) VALUES (4, 'w')");
+    run(&mut adapter, "ALTER TABLE t DROP CHECK ck");
+    run(
+        &mut adapter,
+        "ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+    );
+    assert_eq!(
+        created(&mut adapter, "t"),
+        "CREATE TABLE `t` (\n  `z` int DEFAULT NULL,\n  `id` int NOT NULL AUTO_INCREMENT,\n  `b` varchar(10) COLLATE utf8mb4_bin DEFAULT NULL,\n  `a` int DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB AUTO_INCREMENT=24 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"
+    );
+    run(&mut adapter, "INSERT INTO t (a, b) VALUES (5, 'v')");
+    assert_eq!(
+        rows(&mut adapter, "SELECT x, y FROM log"),
+        [["1", "x"], ["2", "y"], ["4", "w"], ["5", "v"]]
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, a, b FROM tv"),
+        [
+            ["20", "1", "x"],
+            ["21", "2", "y"],
+            ["23", "4", "w"],
+            ["24", "5", "v"]
+        ]
+    );
+    assert_eq!(rows(&mut adapter, "SHOW TRIGGERS"), triggers);
+    run(&mut adapter, "ALTER TABLE t CHANGE a a2 INT AFTER b");
+    assert!(adapter.execute_query("SELECT a, b FROM tv2").is_err());
+    assert!(adapter
+        .execute_query("INSERT INTO t (a2, b) VALUES (6, 'u')")
+        .is_err());
+}
+
+/// `CONVERT TO CHARACTER SET` of either table of a foreign key over two
+/// columns of words, or a `MODIFY` giving either column another collation,
+/// is 3780 with the checks on until both have the collation, and taken with
+/// them off; a table whose keys hold no words takes it whatever names them.
+#[test]
+fn a_converted_table_keeps_its_foreign_keys_over_words_paired() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE p (code VARCHAR(10) NOT NULL PRIMARY KEY, n INT)",
+        "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, code VARCHAR(10), FOREIGN KEY (code) REFERENCES p (code))",
+        "CREATE TABLE q (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v VARCHAR(5))",
+        "CREATE TABLE qc (qid INT, FOREIGN KEY (qid) REFERENCES q (id))",
+        "INSERT INTO p VALUES ('a', 1)",
+        "INSERT INTO c VALUES (1, 'a')",
+    ] {
+        run(&mut adapter, sql);
+    }
+    for sql in [
+        "ALTER TABLE p CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+        "ALTER TABLE c CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+        "ALTER TABLE p MODIFY code VARCHAR(10) COLLATE utf8mb4_bin NOT NULL",
+        "ALTER TABLE c MODIFY code VARCHAR(10) COLLATE utf8mb4_bin",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(FrontendErrorKind::ForeignKeyColumnsIncompatible),
+            "{sql}"
+        );
+    }
+    run(&mut adapter, "SET foreign_key_checks = 0");
+    run(
+        &mut adapter,
+        "ALTER TABLE p CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+    );
+    run(&mut adapter, "SET foreign_key_checks = 1");
+    assert!(created(&mut adapter, "p").contains("`code` varchar(10) COLLATE utf8mb4_bin NOT NULL"));
+    run(
+        &mut adapter,
+        "ALTER TABLE c CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+    );
+    run(
+        &mut adapter,
+        "ALTER TABLE q CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO c VALUES (2, 'b')")
+            .map(|_| ()),
+        Err(FrontendErrorKind::ForeignKeyViolation)
+    );
+    // A `CHECK` comes and goes on a table another table's key names, which
+    // holds its rows throughout.
+    run(&mut adapter, "INSERT INTO q VALUES (1, 'a')");
+    run(&mut adapter, "INSERT INTO qc VALUES (1)");
+    run(
+        &mut adapter,
+        "ALTER TABLE q ADD CONSTRAINT qv CHECK (v <> 'zz')",
+    );
+    run(&mut adapter, "ALTER TABLE q DROP CHECK qv");
+    for (sql, refused) in [
+        (
+            "INSERT INTO qc VALUES (2)",
+            FrontendErrorKind::ForeignKeyViolation,
+        ),
+        ("DELETE FROM q", FrontendErrorKind::ParentRowReferenced),
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(refused),
+            "{sql}"
+        );
+    }
 }
 
 /// `ALTER TABLE t ENGINE=InnoDB`, `ALTER TABLE t FORCE` and `OPTIMIZE TABLE t`

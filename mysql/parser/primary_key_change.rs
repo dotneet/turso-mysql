@@ -62,9 +62,11 @@ pub struct MySqlKeyRewrite {
     /// the table in place: a column takes another type, the table starts or
     /// stops counting, or its key goes with no key in its place.
     pub copies_the_rows: bool,
-    /// Each column, by its new name, whose collation the statement changes.
-    /// MySQL copies the rows for one an index is over.
-    pub recollated: Vec<String>,
+    /// Each column, by its new name, whose collation the statement changes,
+    /// and the collation it takes. MySQL copies the rows for one an index is
+    /// over, and holds one a foreign key is over to the column on the key's
+    /// other side.
+    pub recollated: Vec<(String, String)>,
 }
 
 /// Reads an `ALTER TABLE` against the table it changes, and answers what it
@@ -282,15 +284,85 @@ pub fn table_with_its_key_changed(
             return Ok(Some(MySqlKeyChange::CountedColumnNotAKey(counted.clone())));
         }
     }
+    let written = table.clone();
+    put_the_key_back(&mut table, &new_key);
+    Ok(Some(MySqlKeyChange::TableWrittenAgain(described_rewrite(
+        &stored,
+        &written,
+        MySqlTableRewrite {
+            create_sql: render_table_written_again(&table, mode)?,
+            carried_columns,
+        },
+        old_key,
+        new_key,
+        retyped,
+    ))))
+}
+
+/// Reads a table written again by any other `ALTER TABLE` — a column placed
+/// `FIRST` or `AFTER` another, a `CHECK` added or dropped, `CONVERT TO
+/// CHARACTER SET` — against the table it was, so it goes through the same
+/// rewrite a change of the key does.
+pub fn table_rewritten_as(
+    stored_ddl: &str,
+    rewrite: MySqlTableRewrite,
+    mode: SessionSqlMode,
+) -> Result<MySqlKeyRewrite, ParseError> {
+    let Ok(Statement::CreateTable(stored)) = parse_one_statement(stored_ddl, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let Ok(Statement::CreateTable(written)) = parse_one_statement(&rewrite.create_sql, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let retyped = rewrite
+        .carried_columns
+        .iter()
+        .filter(
+            |(new, old)| match (column_named(&stored, old), column_named(&written, new)) {
+                (Some(before), Some(after)) => {
+                    !same_type_for_a_foreign_key(&before.data_type, &after.data_type)
+                }
+                _ => false,
+            },
+        )
+        .cloned()
+        .collect();
+    Ok(described_rewrite(
+        &stored,
+        &written,
+        rewrite,
+        key_columns(&stored),
+        key_columns(&written),
+        retyped,
+    ))
+}
+
+/// The rewrite of `stored` into `written`, with what the frontend needs to
+/// know about it to hold it to MySQL's rules.
+fn described_rewrite(
+    stored: &CreateTable,
+    written: &CreateTable,
+    rewrite: MySqlTableRewrite,
+    old_key: Vec<String>,
+    new_key: Vec<String>,
+    retyped: Vec<(String, String)>,
+) -> MySqlKeyRewrite {
+    let counted = |table: &CreateTable| {
+        table
+            .columns
+            .iter()
+            .find(|column| column_has_auto_increment(column))
+            .map(|column| column.name.value.clone())
+    };
+    let (counted_before, counted_after) = (counted(stored), counted(written));
+    let carried_columns = &rewrite.carried_columns;
     let words_kept_as_words = carried_columns
         .iter()
         .filter(|(new, old)| {
             let holds_words = |table: &CreateTable, name: &str| {
-                table.columns.iter().any(|column| {
-                    column.name.value.eq_ignore_ascii_case(name) && holds_words(&column.data_type)
-                })
+                column_named(table, name).is_some_and(|column| holds_words(&column.data_type))
             };
-            holds_words(&stored, old) && holds_words(&table, new)
+            holds_words(stored, old) && holds_words(written, new)
         })
         .map(|(new, _)| new.clone())
         .collect();
@@ -303,14 +375,10 @@ pub fn table_with_its_key_changed(
     };
     let copies_the_rows = starts_or_stops_counting
         || (!old_key.is_empty() && new_key.is_empty())
-        || retyped_in_a_copy(&stored, &table, &carried_columns);
-    let recollated = recollated_columns(&stored, &table, &carried_columns);
-    put_the_key_back(&mut table, &new_key);
-    Ok(Some(MySqlKeyChange::TableWrittenAgain(MySqlKeyRewrite {
-        table: MySqlTableRewrite {
-            create_sql: render_table_written_again(&table, mode)?,
-            carried_columns,
-        },
+        || retyped_in_a_copy(stored, written, carried_columns);
+    let recollated = recollated_columns(stored, written, carried_columns);
+    MySqlKeyRewrite {
+        table: rewrite,
         old_key,
         new_key,
         counted_before,
@@ -319,7 +387,7 @@ pub fn table_with_its_key_changed(
         words_kept_as_words,
         copies_the_rows,
         recollated,
-    })))
+    }
 }
 
 /// The table one `ALTER TABLE t ENGINE=InnoDB`, `FORCE` or `OPTIMIZE TABLE`
@@ -653,7 +721,7 @@ fn put_the_key_back(table: &mut CreateTable, key: &[String]) {
 /// Measured on MySQL 8.4.11, `CHANGE pid parent INT` leaves `FOREIGN KEY
 /// (parent)`, and `CHANGE id sid INT NOT NULL` on a table whose key names its
 /// own `id` leaves `REFERENCES s (sid)`.
-fn rename_in_the_foreign_keys(table: &mut CreateTable, old: &str, new: &str) {
+pub(crate) fn rename_in_the_foreign_keys(table: &mut CreateTable, old: &str, new: &str) {
     let own_name = match table.name.0.as_slice() {
         [.., ObjectNamePart::Identifier(name)] => name.value.clone(),
         _ => String::new(),
@@ -761,21 +829,25 @@ fn character_count(length: &CharacterLength) -> Option<u64> {
 }
 
 /// The columns carried across, by their new names, whose collation the
-/// statement changes.
+/// statement changes, each with the collation it takes.
 fn recollated_columns(
     stored: &CreateTable,
     written: &CreateTable,
     carried_columns: &[(String, String)],
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     carried_columns
         .iter()
-        .filter(
-            |(new, old)| match (column_named(stored, old), column_named(written, new)) {
-                (Some(before), Some(after)) => collation_of(before) != collation_of(after),
-                _ => false,
-            },
-        )
-        .map(|(new, _)| new.clone())
+        .filter_map(|(new, old)| {
+            let (before, after) = (column_named(stored, old)?, column_named(written, new)?);
+            let taken = collation_of(after);
+            (collation_of(before) != taken).then(|| {
+                (
+                    new.clone(),
+                    taken
+                        .unwrap_or_else(|| super::MySqlTableCollation::default().name().to_owned()),
+                )
+            })
+        })
         .collect()
 }
 

@@ -260,7 +260,7 @@ tests it ends:
 | Form | State |
 |---|---|
 | `ALTER TABLE` beyond `ADD COLUMN` / `DROP COLUMN` / `RENAME` / `MODIFY COLUMN` / `CHANGE COLUMN` / `ALTER COLUMN ... SET DEFAULT` / `DROP DEFAULT` / `COMMENT` / `ENGINE=InnoDB` / `AUTO_INCREMENT = n` / `ADD CHECK` / `DROP CHECK` / the index operations, `RENAME INDEX` among them | refused |
-| `ALTER TABLE ... CONVERT TO CHARACTER SET` beside another operation, to a character set but `utf8mb4` or a collation a table here cannot have, and over a table a trigger reads or another table's key names | refused; measured on 8.4.11, MySQL takes each. The conversion alone is taken (see COMPAT.md) |
+| `ALTER TABLE ... CONVERT TO CHARACTER SET` beside another operation, or to a character set but `utf8mb4` or a collation a table here cannot have | refused; measured on 8.4.11, MySQL takes each. The conversion alone is taken (see COMPAT.md) |
 | `ENGINE=InnoDB` or `AUTO_INCREMENT = n` beside any other operation in one `ALTER TABLE`, or naming a view | refused; each is read by its own words and only on its own. Measured, MySQL answers 1347 for a view |
 | `RENAME INDEX` or a table `COMMENT` beside any other operation in one `ALTER TABLE` | refused; `sqlparser` reads neither, so each is read by its own words and only on its own. Measured, MySQL takes both beside anything else |
 | `ALTER TABLE t COMMENT = '...'` while the database holds a view or a trigger | refused; the comment is written by an engine `ALTER TABLE`, which is refused then as every other `ALTER TABLE` is |
@@ -270,9 +270,9 @@ tests it ends:
 | `RENAME INDEX` of the key a column declares for itself — `email VARCHAR(255) UNIQUE` | refused; the engine keeps that one with no statement of its own to write again under the new name |
 | `ALTER COLUMN ... SET DEFAULT` on a column with a `COMMENT` or `ON UPDATE CURRENT_TIMESTAMP` | refused, for the reasons a `MODIFY COLUMN` of one is |
 | An `ALTER TABLE` placing an added column `AFTER` a column another of its clauses renames or drops — `ADD a AFTER b, RENAME COLUMN b TO c` | refused; measured on 8.4.11, MySQL answers 1054, renaming and dropping before it reads the place, and the clauses run in turn here |
-| `ALTER TABLE ... ADD COLUMN ... FIRST`/`AFTER` on a table carrying a trigger | refused; the table is written again and a trigger is not the table's own row, where MySQL leaves one where it stood |
 | `ALTER TABLE ... DROP COLUMN` of an `AUTO_INCREMENT` table's counted column | refused; MySQL drops it and leaves an ordinary table |
 | A column a foreign key is over renamed beside an `ENUM` given another member at its end; renaming a column a `CHECK` names beside a change of the key | 1846 for the first, where MySQL takes it in place, measured on 8.4.11 — every change of a type besides a display width and a `VARCHAR` growing within one length byte is read as one that copies the rows, which the types measured agree with; refused for the second, where MySQL answers 3959 |
+| A view or a trigger naming a column a table written again renamed — `CHANGE a a2 INT AFTER b` under `CREATE VIEW v AS SELECT a FROM t` | the view is kept as written and answers 1054 when read, and an `INSERT` setting off the trigger is refused; measured on 8.4.11, MySQL keeps both too and answers 1356 for the view and 1054 `Unknown column 'a' in 'NEW'` for the trigger |
 | `AUTO_INCREMENT` given to a column a key other than the primary one starts with | refused; measured on 8.4.11, MySQL takes it, answering 1075 only where no key starts with the column |
 | A change of a table's key beside a clause other than `MODIFY`, `CHANGE`, `RENAME COLUMN`, `ADD PRIMARY KEY` and `DROP PRIMARY KEY` in one `ALTER TABLE` | refused |
 | A table `CHARSET` or `COLLATE` naming anything but `utf8mb4` with `utf8mb4_0900_ai_ci`, `utf8mb4_unicode_ci`, `utf8mb4_general_ci` or `utf8mb4_bin`, or `utf8mb3`/`utf8` with `utf8mb3_unicode_ci`, or an `ENGINE` that is not InnoDB | refused; measured, MySQL prints each back. `CHARSET=utf8` alone takes `utf8mb3_general_ci`, whose comparison this server does not have |
@@ -487,7 +487,7 @@ speaks; anything measured here from now on has to pass that flag.
 | A `CREATE TABLE` giving a `CHECK` a name another table's `CHECK` already has | taken, where MySQL answers 3822, a name being the database's; `ALTER TABLE ... ADD CONSTRAINT` answers 3822 as MySQL does |
 | A `CREATE TABLE` writing an unnamed table-level `CHECK` before a column carrying an unnamed `CHECK` of its own | refused; MySQL numbers the two in the order written and the table is stored with its columns first |
 | A row a `CHECK` or `NOT NULL` refuses in a table that counts its own ids | uses up the id it was given; measured, MySQL's `CHECK` refusal leaves the counter where it stood |
-| `ALTER TABLE ... ADD`/`DROP` a `CHECK` beside any other operation, on a table another table's foreign key names, or on one carrying a trigger | refused; each is a rewrite of the table, which those rule out |
+| `ALTER TABLE ... ADD`/`DROP` a `CHECK` beside any other operation | refused |
 | A `CHECK` written `NOT ENFORCED` | refused; MySQL keeps it without checking, and the engine checks every one it keeps |
 | `SELECT *` over `information_schema.TABLES` | refused; it answers only some of MySQL's columns — `TABLES` has storage statistics and times this server does not keep |
 | A prepared `SELECT` executed after a table it reads was dropped and made again | refused; MySQL prepares it again and answers the new table's columns, which the column definitions sent with the rows would have to follow. A write is prepared again and run (see COMPAT.md) |

@@ -10555,8 +10555,44 @@ fn a_key_change_renames_the_columns_in_its_own_foreign_keys() {
             "ALTER TABLE s CHANGE n m INT, MODIFY w VARCHAR(10) COLLATE utf8mb4_bin"
         )
         .recollated,
-        ["w"]
+        [("w".to_owned(), "utf8mb4_bin".to_owned())]
     );
+}
+
+/// A table another `ALTER TABLE` writes again — a column moved by `CHANGE
+/// ... AFTER` — is read against the table it was, as a change of its key is:
+/// its key, its counted column, the columns renamed in its own foreign keys
+/// and whether MySQL copies its rows for it.
+#[test]
+fn a_placed_column_is_read_as_a_rewrite_of_the_table() {
+    let mode = SessionSqlMode::default();
+    let stored = "CREATE TABLE `c` (`id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY, `pid` INT, `w` VARCHAR(10), CONSTRAINT `fk` FOREIGN KEY (`pid`) REFERENCES `p` (`id`))";
+    let Ok(Some(MySqlColumnPlacement::TableWrittenAgain(placed))) = table_with_a_column_placed(
+        stored,
+        "ALTER TABLE c CHANGE w words VARCHAR(20) AFTER id",
+        mode,
+    ) else {
+        panic!("a column moved writes the table again");
+    };
+    let rewrite = table_rewritten_as(stored, placed, mode).unwrap();
+    assert_eq!(rewrite.old_key, ["id"]);
+    assert_eq!(rewrite.new_key, ["id"]);
+    assert_eq!(rewrite.counted_before.as_deref(), Some("id"));
+    assert_eq!(rewrite.counted_after.as_deref(), Some("id"));
+    assert_eq!(rewrite.words_kept_as_words, ["words"]);
+    assert!(rewrite.retyped.is_empty());
+    assert!(!rewrite.copies_the_rows);
+    let Ok(Some(MySqlColumnPlacement::TableWrittenAgain(placed))) =
+        table_with_a_column_placed(stored, "ALTER TABLE c CHANGE pid parent BIGINT FIRST", mode)
+    else {
+        panic!("a column moved writes the table again");
+    };
+    assert!(placed
+        .create_sql
+        .contains("FOREIGN KEY (`parent`) REFERENCES `p`(`id`)"));
+    let rewrite = table_rewritten_as(stored, placed, mode).unwrap();
+    assert_eq!(rewrite.retyped, [("parent".to_owned(), "pid".to_owned())]);
+    assert!(rewrite.copies_the_rows);
 }
 
 /// `ALTER TABLE t FORCE` alone names the table it makes again; with anything

@@ -304,34 +304,6 @@ struct StoredIndexStatement {
     implicit: bool,
 }
 
-/// What a table's rewrite runs once its rows are in the new table.
-struct AfterTheCopy {
-    drop_the_old_table: String,
-    /// Where the new table was made under a name of its own, the statement
-    /// giving it the table's name.
-    rename_the_new_one: Option<String>,
-}
-
-/// What one table's rewrite runs, in the order it runs them.
-struct RewriteStatements<'a> {
-    before: &'a [String],
-    copy: &'a str,
-    after_copy: &'a AfterTheCopy,
-    copied_into: &'a str,
-    indexes: &'a [StoredIndexStatement],
-    table: &'a str,
-    /// Where the old table's counter stood, for a table that counts.
-    counter: Option<u64>,
-}
-
-/// Whether a table's rewrite commits on its own, or runs inside the
-/// transaction an `ALTER TABLE` of several clauses holds for all of them.
-#[derive(Clone, Copy)]
-enum TableRewriteCommits {
-    OnItsOwn,
-    InTheCallersTransaction,
-}
-
 #[derive(Clone)]
 pub(crate) struct AutoIncrementExecutionCapability {
     allocator: DurableRangeAllocator,
@@ -5384,7 +5356,7 @@ impl MySqlConnection {
         }
         match self.column_an_alter_places(sql)? {
             Some(turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite)) => {
-                return self.write_the_table_again_with(
+                return self.write_the_table_again_as(
                     turso_mysql_parser::alter_table_target(sql, self.parser_mode())
                         .unwrap_or_default()
                         .as_str(),
@@ -5405,7 +5377,7 @@ impl MySqlConnection {
         if let Some((table, change)) = self.check_an_alter_changes(sql)? {
             return match change {
                 turso_mysql_parser::MySqlCheckChange::TableWrittenAgain(rewrite) => {
-                    self.write_the_table_again_with(&table, &rewrite)
+                    self.write_the_table_again_as(&table, &rewrite)
                 }
                 turso_mysql_parser::MySqlCheckChange::NoSuchCheck(name) => {
                     Err(MySqlQueryError::NoSuchCheck(name))
@@ -5796,200 +5768,6 @@ impl MySqlConnection {
         Ok(None)
     }
 
-    /// Writes one table again with a column where the statement asked for it.
-    ///
-    /// The engine puts a new column last, so the table is made again in the
-    /// shape MySQL would leave it in and its rows are carried across: the old
-    /// table is set aside under a name of its own, the new one is made under
-    /// the name they share, the rows are copied into it, and the old one is
-    /// dropped. Its indexes are written again after that, the old table having
-    /// held their names until then.
-    ///
-    /// Foreign key checks are off while this runs. Every row is carried across,
-    /// so nothing a key names goes missing; what the checks would catch is the
-    /// moment between the drop and the copy, which is not a state any statement
-    /// can see.
-    ///
-    /// A table another table's foreign key names is made the other way round:
-    /// the engine points a child's key at a renamed table's new name, so the
-    /// table cannot be set aside under a name of its own. The new one is made
-    /// under a name of its own instead, the rows are copied into it, the old
-    /// one is dropped, and the new one takes the name, which the child's key
-    /// still names.
-    fn write_the_table_again_with(
-        &self,
-        table: &str,
-        rewrite: &turso_mysql_parser::MySqlTableRewrite,
-    ) -> std::result::Result<(), MySqlQueryError> {
-        self.write_the_table_again(table, rewrite, TableRewriteCommits::OnItsOwn)
-    }
-
-    fn write_the_table_again(
-        &self,
-        table: &str,
-        rewrite: &turso_mysql_parser::MySqlTableRewrite,
-        commits: TableRewriteCommits,
-    ) -> std::result::Result<(), MySqlQueryError> {
-        // A trigger is not the table's own row and would not come back with
-        // it, where MySQL leaves one where it stood.
-        self.reject_insert_target_triggers(table)
-            .map_err(MySqlQueryError::Engine)?;
-        let referenced = self
-            .inner
-            .current_schema()
-            .any_resolved_fks_referencing(table);
-        let counter = self
-            .counter_of_a_stored_table(table)
-            .map_err(MySqlQueryError::Engine)?;
-        let indexes = self
-            .stored_index_statements(table)
-            .map_err(MySqlQueryError::Engine)?;
-        let quoted = mysql_quoted(table);
-        let set_aside = format!("{table}_turso_rewritten");
-        let (before, copied_into, copied_from, after_copy) = if referenced {
-            let made_new = format!("{table}_turso_written");
-            let written_prefix = format!("CREATE TABLE {quoted} (");
-            let Some(columns_onwards) = rewrite.create_sql.strip_prefix(&written_prefix) else {
-                return Err(MySqlQueryError::Unsupported(
-                    "writing again a table whose statement does not begin with its name"
-                        .to_string(),
-                ));
-            };
-            (
-                vec![format!(
-                    "CREATE TABLE {} ({columns_onwards}",
-                    mysql_quoted(&made_new)
-                )],
-                made_new.clone(),
-                table.to_owned(),
-                AfterTheCopy {
-                    drop_the_old_table: format!("DROP TABLE {}", sqlite_quoted(table)),
-                    rename_the_new_one: Some(format!(
-                        "ALTER TABLE {} RENAME TO {quoted}",
-                        mysql_quoted(&made_new)
-                    )),
-                },
-            )
-        } else {
-            (
-                vec![
-                    format!(
-                        "ALTER TABLE {quoted} RENAME TO {}",
-                        mysql_quoted(&set_aside)
-                    ),
-                    rewrite.create_sql.clone(),
-                ],
-                table.to_owned(),
-                set_aside.clone(),
-                AfterTheCopy {
-                    drop_the_old_table: format!("DROP TABLE {}", sqlite_quoted(&set_aside)),
-                    rename_the_new_one: None,
-                },
-            )
-        };
-        // The rows go across through the engine rather than through the
-        // frontend's own `INSERT`, which would refuse to write a counted
-        // column its numbers. These are the rows the table already has, with
-        // the numbers they already carry.
-        let written_into = rewrite
-            .carried_columns
-            .iter()
-            .map(|(column, _)| sqlite_quoted(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let read_from = rewrite
-            .carried_columns
-            .iter()
-            .map(|(_, column)| sqlite_quoted(column))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let copy = format!(
-            "INSERT INTO {} ({written_into}) SELECT {read_from} FROM {}",
-            sqlite_quoted(&copied_into),
-            sqlite_quoted(&copied_from)
-        );
-        let checks = self.inner.foreign_keys_enabled();
-        self.set_foreign_key_checks(false);
-        let statements = RewriteStatements {
-            before: &before,
-            copy: &copy,
-            after_copy: &after_copy,
-            copied_into: &copied_into,
-            indexes: &indexes,
-            table,
-            counter,
-        };
-        let applied = match commits {
-            TableRewriteCommits::OnItsOwn => {
-                self.write_the_table_again_between_commits(&statements)
-            }
-            TableRewriteCommits::InTheCallersTransaction => {
-                self.write_the_table_again_now(&statements)
-            }
-        };
-        self.set_foreign_key_checks(checks);
-        applied
-    }
-
-    /// Runs the statements one table's rewrite is made of, inside one
-    /// transaction, with the rows carried across between them.
-    fn write_the_table_again_between_commits(
-        &self,
-        statements: &RewriteStatements<'_>,
-    ) -> std::result::Result<(), MySqlQueryError> {
-        // DDL commits what came before it, which is what MySQL does.
-        if !self.inner.get_auto_commit() {
-            self.run_internal("COMMIT")?;
-        }
-        self.run_internal("BEGIN")?;
-        let applied = self.write_the_table_again_now(statements);
-        if applied.is_err() {
-            self.run_internal("ROLLBACK")?;
-            return applied;
-        }
-        self.run_internal("COMMIT")?;
-        crash_point(CrashPoint::SchemaChangeCommitted);
-        if !self.inner.get_auto_commit() {
-            self.run_internal("ROLLBACK")?;
-        }
-        Ok(())
-    }
-
-    /// The statements one table's rewrite is made of, in order.
-    ///
-    /// The old table is dropped before its indexes are written again, holding
-    /// their names until then. A table made again takes a counter of its own,
-    /// which starts at one, so it is moved to where the old one stood before
-    /// the transaction commits.
-    fn write_the_table_again_now(
-        &self,
-        statements: &RewriteStatements<'_>,
-    ) -> std::result::Result<(), MySqlQueryError> {
-        let run = |statement: &String| -> std::result::Result<(), MySqlQueryError> {
-            self.prepare(statement)
-                .and_then(|mut prepared| prepared.run_ignore_rows())
-                .map(|_| ())
-                .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))
-        };
-        statements.before.iter().try_for_each(run)?;
-        self.carry_the_rows_across(statements.copy, statements.copied_into)?;
-        self.run_internal(&statements.after_copy.drop_the_old_table)?;
-        statements
-            .after_copy
-            .rename_the_new_one
-            .iter()
-            .try_for_each(run)?;
-        statements.indexes.iter().try_for_each(|index| {
-            self.prepare_with_index_origin(&index.sql, index.implicit)
-                .and_then(|mut prepared| prepared.run_ignore_rows())
-                .map_err(MySqlQueryError::Engine)
-        })?;
-        match statements.counter {
-            Some(high_water) => self.move_the_new_counter_past(statements.table, high_water),
-            None => Ok(()),
-        }
-    }
-
     /// Moves the rows of the table set aside into the one written again.
     ///
     /// A table that counts its own ids refuses an ordinary `INSERT` that writes
@@ -6136,7 +5914,7 @@ impl MySqlConnection {
         let rewrite =
             turso_mysql_parser::table_with_its_words_in(&stored, collation, self.parser_mode())
                 .map_err(mysql_query_parse_error)?;
-        self.write_the_table_again_with(table.as_str(), &rewrite)
+        self.write_the_table_again_as(table.as_str(), &rewrite)
     }
 
     /// Runs an `ALTER TABLE t AUTO_INCREMENT = n`, which says where the table's
@@ -6380,12 +6158,11 @@ impl MySqlConnection {
     ) -> std::result::Result<(), MySqlQueryError> {
         match placement {
             turso_mysql_parser::MySqlColumnPlacement::TableWrittenAgain(rewrite) => self
-                .write_the_table_again(
+                .write_the_table_again_in_the_callers_transaction(
                     turso_mysql_parser::alter_table_target(statement, self.parser_mode())
                         .unwrap_or_default()
                         .as_str(),
                     &rewrite,
-                    TableRewriteCommits::InTheCallersTransaction,
                 ),
             turso_mysql_parser::MySqlColumnPlacement::AlreadyAtTheEnd(written) => {
                 let mut prepared = self
