@@ -1064,7 +1064,26 @@ pub fn emit_upsert(
 
     // The new index keys below are copied from the NEW row image, so a value
     // the dialect stores in a form of its own must be in that form first.
+    //
+    // The record checked here is the one written below, with the rowid alias
+    // as NULL: the write checks a record it was not shown again, and a value
+    // already in its stored form need not read as one the validator takes.
     if program.validates_assignments(connection) {
+        let rowid_alias_number = table
+            .columns()
+            .iter()
+            .position(|column| column.is_rowid_alias())
+            .map(|idx| {
+                let alias_reg = layout.to_register(new_start, idx);
+                let number_reg = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: alias_reg,
+                    dst_reg: number_reg,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::SoftNull { reg: alias_reg });
+                (alias_reg, number_reg)
+            });
         let record_reg = program.alloc_register();
         emit_make_record(program, table.columns().iter(), new_start, record_reg);
         program.emit_insn(Insn::StoreAssignedValues {
@@ -1074,6 +1093,13 @@ pub fn emit_upsert(
             flag: InsertFlags::new().assignment_is_update(),
             table_name: table.get_name().to_string(),
         });
+        if let Some((alias_reg, number_reg)) = rowid_alias_number {
+            program.emit_insn(Insn::Copy {
+                src_reg: number_reg,
+                dst_reg: alias_reg,
+                extra_amount: 0,
+            });
+        }
     }
 
     // Index maintenance (DELETE old key, INSERT new key), honoring

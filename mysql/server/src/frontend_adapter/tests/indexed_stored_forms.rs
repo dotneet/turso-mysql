@@ -186,44 +186,53 @@ fn a_unique_key_meets_a_moment_however_its_fraction_was_written() {
 }
 
 /// Every kind of column whose written value is stored rewritten, written by
-/// an `INSERT`, an `UPDATE` and an upsert.
+/// an `INSERT`, an `UPDATE` and an upsert, in a table whose key is its rowid,
+/// one that counts its ids and one whose key is an index of its own.
 #[test]
 fn every_value_stored_in_a_form_of_its_own_goes_into_its_key_that_way() {
-    for (column, written) in [
-        ("TIMESTAMP(6)", "'2024-01-02 03:04:05'"),
-        ("TIME(3)", "'03:04:05'"),
-        ("DATETIME", "'2024-01-02 03:04:05.4'"),
-        ("DATE", "'2024-1-2'"),
-        ("YEAR", "24"),
-        ("CHAR(4)", "'ab  '"),
-        ("SET('a','b')", "'b,a'"),
-        ("ENUM('a','b')", "'0'"),
-        ("FLOAT", "1.1"),
+    for key in [
+        "INT NOT NULL PRIMARY KEY",
+        "INT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+        "BIGINT UNSIGNED NOT NULL PRIMARY KEY",
     ] {
-        let (_directory, mut adapter) = adapter();
-        run(
-            &mut adapter,
-            &format!("CREATE TABLE b1 (id INT NOT NULL PRIMARY KEY, d {column} NULL, KEY k (d))"),
-        );
-        run(
-            &mut adapter,
-            &format!("INSERT INTO b1 (id, d) VALUES (1, {written}), (2, NULL), (3, NULL)"),
-        );
-        run(
-            &mut adapter,
-            &format!("UPDATE b1 SET d = {written} WHERE id = 2"),
-        );
-        run(
-            &mut adapter,
-            &format!(
-                "INSERT INTO b1 (id, d) VALUES (3, NULL) ON DUPLICATE KEY UPDATE d = {written}"
-            ),
-        );
-        assert_eq!(checked(&mut adapter, "b1"), "OK", "{column}");
-        run(&mut adapter, "DELETE FROM b1");
-        assert!(
-            rows(&mut adapter, "SELECT id FROM b1").is_empty(),
-            "{column}"
-        );
+        for (column, written) in [
+            ("TIMESTAMP(6)", "'2024-01-02 03:04:05'"),
+            ("TIME(3)", "'03:04:05'"),
+            ("DATETIME", "'2024-01-02 03:04:05.4'"),
+            ("DATE", "'2024-1-2'"),
+            ("YEAR", "24"),
+            ("CHAR(4)", "'ab  '"),
+            ("SET('a','b')", "'b,a'"),
+            ("ENUM('a','b')", "'0'"),
+            ("FLOAT", "1.1"),
+        ] {
+            every_value_written_into(key, column, written);
+        }
     }
+}
+
+fn every_value_written_into(key: &str, column: &str, written: &str) {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        &format!("CREATE TABLE b1 (id {key}, d {column} NULL, KEY k (d))"),
+    );
+    run(
+        &mut adapter,
+        &format!("INSERT INTO b1 (id, d) VALUES (1, {written}), (2, NULL), (3, NULL)"),
+    );
+    run(
+        &mut adapter,
+        &format!("UPDATE b1 SET d = {written} WHERE id = 2"),
+    );
+    run(
+        &mut adapter,
+        &format!("INSERT INTO b1 (id, d) VALUES (3, NULL) ON DUPLICATE KEY UPDATE d = {written}"),
+    );
+    assert_eq!(checked(&mut adapter, "b1"), "OK", "{key} {column}");
+    run(&mut adapter, "DELETE FROM b1");
+    assert!(
+        rows(&mut adapter, "SELECT id FROM b1").is_empty(),
+        "{key} {column}"
+    );
 }
