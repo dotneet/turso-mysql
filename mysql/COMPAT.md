@@ -4036,7 +4036,8 @@ included; one that stops counting forgets it. With another table's key naming th
 change of the named column's type is 3780 whatever `foreign_key_checks` says, `AUTO_INCREMENT`
 given or taken is 1833 with the checks on and taken with them off, and dropping the key it
 finds its rows by is 1553; on the table's own foreign key column, a change of type is 3780,
-`AUTO_INCREMENT` 1832, and dropping the only key the foreign key's rows are found by 1553. As in
+`AUTO_INCREMENT` 1832, and dropping the only key the foreign key's rows are found by 1553, while
+the index made for that foreign key goes once a key added over its columns finds them. As in
 MySQL, the statement waits for the table's metadata lock under MVCC, and commits what came
 before it.
 

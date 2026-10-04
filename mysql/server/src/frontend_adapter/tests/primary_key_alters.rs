@@ -482,6 +482,24 @@ fn a_foreign_key_holds_a_key_change_to_what_mysql_allows() {
             .map(|_| ()),
         Err(FrontendErrorKind::ParentRowReferenced)
     );
+
+    // The index made for a foreign key goes once a key added over its
+    // columns finds the rows instead, and that key cannot then be dropped.
+    run(
+        &mut adapter,
+        "CREATE TABLE fk_only (pid INT NOT NULL, v INT, CONSTRAINT fk9 FOREIGN KEY (pid) REFERENCES p (id))",
+    );
+    run(&mut adapter, "ALTER TABLE fk_only ADD PRIMARY KEY (pid)");
+    assert_eq!(
+        created(&mut adapter, "fk_only"),
+        "CREATE TABLE `fk_only` (\n  `pid` int NOT NULL,\n  `v` int DEFAULT NULL,\n  PRIMARY KEY (`pid`),\n  CONSTRAINT `fk9` FOREIGN KEY (`pid`) REFERENCES `p` (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+    );
+    assert_eq!(
+        adapter
+            .execute_query("ALTER TABLE fk_only DROP PRIMARY KEY")
+            .map(|_| ()),
+        Err(FrontendErrorKind::RequiredForeignKeyIndex)
+    );
 }
 
 /// The table's own triggers, another table's trigger writing it and a view

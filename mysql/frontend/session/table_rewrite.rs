@@ -431,6 +431,11 @@ impl MySqlConnection {
                 .and_then(|mut prepared| prepared.run_ignore_rows())
                 .map_err(MySqlQueryError::Engine)?;
         }
+        // Measured on MySQL 8.4.11: the index made for a foreign key goes once
+        // a primary key added over its columns finds the rows instead.
+        let named = MySqlTableName::parse(table)
+            .map_err(|error| MySqlQueryError::Unsupported(error.to_string()))?;
+        self.remove_replaced_implicit_fk_indexes(&named)?;
         for trigger in triggers {
             self.write_a_trigger_again(trigger)?;
         }
