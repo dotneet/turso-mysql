@@ -302,7 +302,6 @@ struct StoredIndexStatement {
     /// The name the engine holds the index under.
     stored_name: String,
     implicit: bool,
-    kept_in_insert_order: bool,
 }
 
 /// What a table's rewrite runs once its rows are in the new table.
@@ -6103,65 +6102,6 @@ impl MySqlConnection {
         self.write_the_table_again_with(table.as_str(), &rewrite)
     }
 
-    /// Runs an `ALTER TABLE t ENGINE=InnoDB`, which names the engine the table
-    /// already has.
-    ///
-    /// Measured on MySQL 8.4.11: the table is rebuilt and nothing a client can
-    /// see changes — its rows, its keys and where its counter stands are as
-    /// they were. Here it commits what came before, as every DDL statement
-    /// does, and writes again each plain index made before plain indexes ended
-    /// with the primary key, so its equal values come back in primary key order.
-    pub fn execute_table_engine_restated(
-        &self,
-        table: &MySqlTableName,
-    ) -> std::result::Result<(), MySqlQueryError> {
-        self.a_base_table_named(table)?;
-        if !self.inner.get_auto_commit() {
-            self.run_internal("COMMIT")?;
-        }
-        let indexes = self
-            .stored_index_statements(table.as_str())
-            .map_err(MySqlQueryError::Engine)?;
-        let Some(first) = indexes.iter().position(|index| index.kept_in_insert_order) else {
-            return Ok(());
-        };
-        self.run_internal("BEGIN")?;
-        let written = self.write_the_indexes_again(&indexes[first..]);
-        if written.is_err() {
-            self.run_internal("ROLLBACK")?;
-            return written;
-        }
-        self.run_internal("COMMIT")?;
-        if !self.inner.get_auto_commit() {
-            self.run_internal("ROLLBACK")?;
-        }
-        Ok(())
-    }
-
-    fn write_the_indexes_again(
-        &self,
-        indexes: &[StoredIndexStatement],
-    ) -> std::result::Result<(), MySqlQueryError> {
-        for index in indexes {
-            let stmt = Stmt::DropIndex {
-                if_exists: false,
-                idx_name: turso_parser::ast::QualifiedName::single(turso_parser::ast::Name::exact(
-                    index.stored_name.clone(),
-                )),
-            };
-            self.inner
-                .prepare_translated_stmt(stmt, &format!("DROP INDEX \"{}\"", index.stored_name))
-                .and_then(|mut statement| statement.run_ignore_rows())
-                .map_err(MySqlQueryError::Engine)?;
-        }
-        for index in indexes {
-            self.prepare_with_index_origin(&index.sql, index.implicit)
-                .and_then(|mut statement| statement.run_ignore_rows())
-                .map_err(MySqlQueryError::Engine)?;
-        }
-        Ok(())
-    }
-
     /// Runs an `ALTER TABLE t AUTO_INCREMENT = n`, which says where the table's
     /// numbering goes on from.
     ///
@@ -8028,10 +7968,7 @@ impl MySqlConnection {
             let mut statement = parse_schema_ddl_ast(decoded.normalized_ddl, self.parser_mode())
                 .map_err(|error| LimboError::Corrupt(error.to_string()))?;
             let Stmt::CreateIndex {
-                unique,
-                idx_name,
-                columns,
-                ..
+                idx_name, columns, ..
             } = &mut statement
             else {
                 return Err(LimboError::Corrupt(
@@ -8041,10 +7978,6 @@ impl MySqlConnection {
             let stored_name = idx_name.name.as_str().to_owned();
             columns.truncate(self.columns_mysql_shows_of(table, &stored_name)?);
             let implicit = is_implicit_index(&stored_name);
-            let kept_in_insert_order = !*unique
-                && !stored_index_kind(&stored_name).is_some_and(|kind| kind.ends_with_primary_key)
-                && !primary_key_a_plain_index_ends_with(&self.inner.current_schema(), table)
-                    .is_empty();
             if let Some(logical_name) = logical_mysql_index_name(&stored_name) {
                 idx_name.name = turso_parser::ast::Name::exact(logical_name);
             }
@@ -8053,7 +7986,6 @@ impl MySqlConnection {
                     .map_err(|error| LimboError::Corrupt(error.to_string()))?,
                 stored_name,
                 implicit,
-                kept_in_insert_order,
             });
         }
         Ok(statements)

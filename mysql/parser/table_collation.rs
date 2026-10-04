@@ -289,6 +289,31 @@ pub fn table_engine_restated(
     Ok(Some(table))
 }
 
+/// Reads an `ALTER TABLE t FORCE` that does nothing else, as the table it
+/// names. Measured on MySQL 8.4.11, it makes the table again as `ENGINE=InnoDB`
+/// does. Answers `None` for any other statement.
+pub fn table_forced(sql: &str, mode: SessionSqlMode) -> Option<super::MySqlTableName> {
+    let dialect = SessionMySqlDialect::new(mode);
+    let tokens = statement_reads::tokens(&dialect, sql).ok()?;
+    let mut words = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_) | Token::SemiColon | Token::EOF));
+    let named = |token: Option<&Token>, expected: &str| {
+        matches!(token, Some(Token::Word(word))
+            if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected))
+    };
+    if !named(words.next(), "ALTER") || !named(words.next(), "TABLE") {
+        return None;
+    }
+    let Some(Token::Word(table)) = words.next() else {
+        return None;
+    };
+    if !named(words.next(), "FORCE") || words.next().is_some() {
+        return None;
+    }
+    super::MySqlTableName::parse(&table.value).ok()
+}
+
 /// Reads an `ALTER TABLE t AUTO_INCREMENT = n` that does nothing else, as the
 /// table and the number its next row is to take.
 ///

@@ -33,6 +33,13 @@ pub fn tables_a_definition_changes(sql: &str, mode: SessionSqlMode) -> Definitio
         reader.name_into_tables();
     } else if reader.word("RENAME") {
         reader.renamed_tables();
+    } else if reader.word("OPTIMIZE") {
+        if !reader.word("NO_WRITE_TO_BINLOG") {
+            reader.word("LOCAL");
+        }
+        if reader.word("TABLE") || reader.word("TABLES") {
+            reader.names_into_tables();
+        }
     }
     reader.targets
 }
@@ -273,6 +280,9 @@ mod tests {
             ("TRUNCATE TABLE t", &["t"]),
             ("TRUNCATE t", &["t"]),
             ("RENAME TABLE a TO b, c TO d", &["a", "b", "c", "d"]),
+            ("OPTIMIZE TABLE a, b", &["a", "b"]),
+            ("OPTIMIZE NO_WRITE_TO_BINLOG TABLE a", &["a"]),
+            ("OPTIMIZE LOCAL TABLE a", &["a"]),
             ("SELECT * FROM t", &[]),
             ("ALTER DATABASE app CHARACTER SET utf8mb4", &[]),
             ("CREATE DATABASE app", &[]),

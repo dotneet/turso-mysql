@@ -10492,3 +10492,25 @@ fn a_key_change_is_read_as_the_table_it_leaves() {
         assert_eq!(change(stored, sql), Some(refused), "{sql}");
     }
 }
+
+/// `ALTER TABLE t FORCE` alone names the table it makes again; with anything
+/// beside it, it is some other statement.
+#[test]
+fn alter_table_force_names_its_table() {
+    let mode = SessionSqlMode::default();
+    for sql in ["ALTER TABLE t FORCE", "alter table `t` force;"] {
+        assert_eq!(
+            table_forced(sql, mode).map(|table| table.as_str().to_owned()),
+            Some("t".to_owned()),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "ALTER TABLE t FORCE, ADD COLUMN c INT",
+        "ALTER TABLE t ENGINE=InnoDB",
+        "ALTER TABLE FORCE",
+        "OPTIMIZE TABLE t",
+    ] {
+        assert_eq!(table_forced(sql, mode), None, "{sql}");
+    }
+}

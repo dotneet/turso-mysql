@@ -2338,6 +2338,67 @@ pub(super) fn check_table_result_to_execution_result(
     maintenance_result(database, table, "check", problem, status_flags)
 }
 
+/// What one `OPTIMIZE TABLE` did with one table it named.
+pub(super) enum OptimizedTable {
+    /// The table was made again, which is MySQL's optimize for InnoDB.
+    WrittenAgain,
+    /// No table of that name is there.
+    Missing,
+    /// The name is a view's.
+    NotABaseTable,
+    /// Another transaction held the table past `lock_wait_timeout`.
+    LockWaitTimedOut,
+}
+
+/// Reports what one `OPTIMIZE TABLE` did with each table it named, in the
+/// four columns `ANALYZE TABLE` answers in. Measured on MySQL 8.4.11.
+pub(super) fn optimize_table_result_to_execution_result(
+    database: &str,
+    tables: &[(String, OptimizedTable)],
+    status_flags: u16,
+) -> CommandExecutionResult {
+    let mut rows = Vec::with_capacity(tables.len() * 2);
+    for (table, outcome) in tables {
+        let named = format!("{database}.{table}");
+        let (message_type, message, status) = match outcome {
+            OptimizedTable::WrittenAgain => (
+                "note",
+                "Table does not support optimize, doing recreate + analyze instead".to_owned(),
+                "OK",
+            ),
+            OptimizedTable::Missing => (
+                "Error",
+                format!("Table '{named}' doesn't exist"),
+                "Operation failed",
+            ),
+            OptimizedTable::NotABaseTable => (
+                "Error",
+                format!("'{named}' is not BASE TABLE"),
+                "Operation failed",
+            ),
+            OptimizedTable::LockWaitTimedOut => (
+                "Error",
+                "Lock wait timeout exceeded; try restarting transaction".to_owned(),
+                "Operation failed",
+            ),
+        };
+        for (message_type, message) in [(message_type, message), ("status", status.to_owned())] {
+            rows.push(vec![
+                Some(named.clone().into_bytes()),
+                Some(b"optimize".to_vec()),
+                Some(message_type.as_bytes().to_vec()),
+                Some(message.into_bytes()),
+            ]);
+        }
+    }
+    CommandExecutionResult::ResultSet(TextResultSet {
+        columns: maintenance_columns(),
+        rows,
+        warnings: 0,
+        status_flags,
+    })
+}
+
 /// The one row a maintenance statement answers.
 fn maintenance_result(
     database: &str,
@@ -2346,23 +2407,12 @@ fn maintenance_result(
     problem: Option<String>,
     status_flags: u16,
 ) -> CommandExecutionResult {
-    let column = |name: &str, column_type: u8, column_length: u32| {
-        let mut column = ColumnDefinitionConfig::new(name, column_type);
-        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
-        column.column_length = column_length;
-        column
-    };
     let (message_type, message) = match problem {
         None => (b"status".to_vec(), b"OK".to_vec()),
         Some(problem) => (b"error".to_vec(), problem.into_bytes()),
     };
     CommandExecutionResult::ResultSet(TextResultSet {
-        columns: vec![
-            column("Table", MYSQL_TYPE_VAR_STRING, 512),
-            column("Op", MYSQL_TYPE_VAR_STRING, 40),
-            column("Msg_type", MYSQL_TYPE_VAR_STRING, 40),
-            column("Msg_text", MYSQL_TYPE_MEDIUM_BLOB, 1_572_864),
-        ],
+        columns: maintenance_columns(),
         rows: vec![vec![
             Some(format!("{database}.{table}").into_bytes()),
             Some(operation.as_bytes().to_vec()),
@@ -2372,6 +2422,22 @@ fn maintenance_result(
         warnings: 0,
         status_flags,
     })
+}
+
+/// The four columns a maintenance statement answers in.
+fn maintenance_columns() -> Vec<ColumnDefinitionConfig> {
+    let column = |name: &str, column_type: u8, column_length: u32| {
+        let mut column = ColumnDefinitionConfig::new(name, column_type);
+        column.character_set = u16::from(DEFAULT_UTF8MB4_COLLATION);
+        column.column_length = column_length;
+        column
+    };
+    vec![
+        column("Table", MYSQL_TYPE_VAR_STRING, 512),
+        column("Op", MYSQL_TYPE_VAR_STRING, 40),
+        column("Msg_type", MYSQL_TYPE_VAR_STRING, 40),
+        column("Msg_text", MYSQL_TYPE_MEDIUM_BLOB, 1_572_864),
+    ]
 }
 
 /// Describes each table in the selected database.

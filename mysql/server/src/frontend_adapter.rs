@@ -22,12 +22,14 @@ use catalog_results::{
     check_table_result_to_execution_result, gorm_columns_definitions, gorm_columns_result,
     gorm_current_database_result, information_schema_columns_result_to_execution_result,
     information_schema_schemata_result_to_execution_result,
-    information_schema_tables_result_to_execution_result, reject_other_database_qualifier,
+    information_schema_tables_result_to_execution_result,
+    optimize_table_result_to_execution_result, reject_other_database_qualifier,
     show_columns_result, show_create_table_error_kind,
     show_create_table_result_to_execution_result, show_create_trigger_result,
     show_create_view_result, show_full_tables_result_to_execution_result,
     show_index_result_to_execution_result, show_table_status_result_to_execution_result,
-    show_tables_result_to_execution_result, show_triggers_result, ShowTableStatusRow,
+    show_tables_result_to_execution_result, show_triggers_result, OptimizedTable,
+    ShowTableStatusRow,
 };
 
 use std::collections::HashMap;
@@ -78,12 +80,12 @@ use turso_mysql_parser::{
     parse_optional_gorm_information_schema_prepared_query,
     parse_optional_information_schema_columns, parse_optional_information_schema_schemata,
     parse_optional_information_schema_tables, parse_optional_lock_tables,
-    parse_optional_show_columns, parse_optional_show_create_table,
+    parse_optional_optimize_table, parse_optional_show_columns, parse_optional_show_create_table,
     parse_optional_show_create_trigger, parse_optional_show_full_tables, parse_optional_show_index,
     parse_optional_show_table_status, parse_optional_show_tables, parse_optional_show_triggers,
     renamed_tables, select_projection_origins, table_comment_change, table_conversion,
-    table_counter_change, table_engine_restated, table_row_format_change, ArithmeticOperand,
-    ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
+    table_counter_change, table_engine_restated, table_forced, table_row_format_change,
+    ArithmeticOperand, ArithmeticOperator, ArithmeticShape, Branch, ColumnAggregateKind,
     ConnectorJInformationSchemaQuery, ConnectorJSchemataListingQuery, ConnectorJTables,
     GormInformationSchemaPreparedQuery, MySqlAccountAdminCommand, MySqlCatalogTable,
     MySqlDatabaseName, MySqlDerivedColumns, MySqlInformationSchemaColumnsColumn,
@@ -4014,6 +4016,13 @@ where
                 self.status_flags(),
             ));
         }
+        if let Some(command) = parse_optional_optimize_table(sql, self.session.session_sql_mode())
+            .map_err(|error| match error {
+            turso_mysql_parser::ParseError::Unsupported { .. } => FrontendErrorKind::Unsupported,
+            _ => FrontendErrorKind::Syntax,
+        })? {
+            return self.optimize_tables(sql, command.tables());
+        }
         if let Some(command) = parse_optional_show_table_status(sql, SessionSqlMode::default())
             .map_err(|_| FrontendErrorKind::Syntax)?
         {
@@ -4526,6 +4535,66 @@ where
             )?;
         }
         Ok(result)
+    }
+
+    /// Runs one `OPTIMIZE TABLE`, which MySQL answers for an InnoDB table by
+    /// making it again, as `ALTER TABLE ... FORCE` does.
+    ///
+    /// Measured on MySQL 8.4.11: each table named answers a `note` that the
+    /// table does not support optimize and is recreated and analyzed instead,
+    /// and a `status` of `OK`; a table that is not there answers an `Error`
+    /// naming it and a `status` of `Operation failed`, and a view one saying
+    /// it is not a base table, and one another transaction holds past
+    /// `lock_wait_timeout` one saying the wait timed out. The tables are
+    /// taken in the order named, the
+    /// statement commits what came before it, and the table's rows, keys,
+    /// triggers and counter are as they were.
+    fn optimize_tables(
+        &mut self,
+        sql: &str,
+        tables: &[MySqlTableName],
+    ) -> Result<CommandExecutionResult, FrontendErrorKind> {
+        let selected_database = self
+            .session
+            .selected_database()
+            .ok_or(FrontendErrorKind::NoDatabaseSelected)?
+            .to_owned();
+        self.authorize(DatabaseAction::Query {
+            database: &selected_database,
+        })?;
+        let connection = self.session.connection().map_err(database_error_kind)?;
+        let mut outcomes = Vec::with_capacity(tables.len());
+        for table in tables {
+            let kind = connection
+                .list_tables()
+                .map_err(|_| FrontendErrorKind::Internal)?
+                .iter()
+                .find(|listed| listed.name().eq_ignore_ascii_case(table.as_str()))
+                .map(|listed| listed.kind());
+            let outcome = match kind {
+                None => OptimizedTable::Missing,
+                Some(MySqlTableKind::View) => OptimizedTable::NotABaseTable,
+                Some(MySqlTableKind::BaseTable) => match connection
+                    .waiting_for_metadata_locks(sql, || {
+                        connection.write_the_table_again_as_it_stands(table)
+                    })
+                    .and_then(|written| written)
+                    .map_err(frontend_query_error)
+                {
+                    Ok(()) => OptimizedTable::WrittenAgain,
+                    // Measured: a table another transaction holds answers its
+                    // lock wait timeout as a row, not as the statement's error.
+                    Err(FrontendErrorKind::DatabaseBusy) => OptimizedTable::LockWaitTimedOut,
+                    Err(error) => return Err(error),
+                },
+            };
+            outcomes.push((table.as_str().to_owned(), outcome));
+        }
+        Ok(optimize_table_result_to_execution_result(
+            &selected_database,
+            &outcomes,
+            self.status_flags(),
+        ))
     }
 
     /// Prepares one statement through the checked prepared path.
@@ -5541,11 +5610,17 @@ fn execute_checked_statement(
             ..CommandOkResult::default()
         }));
     }
-    if let Some(table) = table_engine_restated(sql, connection.parser_mode())
+    // Measured on MySQL 8.4.11: `ENGINE=InnoDB` naming the engine the table
+    // has and `FORCE` each make the table again.
+    let written_again = match table_engine_restated(sql, connection.parser_mode())
         .map_err(|_| FrontendErrorKind::Unsupported)?
     {
+        Some(table) => Some(table),
+        None => table_forced(sql, connection.parser_mode()),
+    };
+    if let Some(table) = written_again {
         connection
-            .execute_table_engine_restated(&table)
+            .write_the_table_again_as_it_stands(&table)
             .map_err(|error| match error {
                 MySqlQueryError::MissingTable => FrontendErrorKind::MissingObject,
                 error => frontend_query_error(error),

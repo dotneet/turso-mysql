@@ -302,6 +302,39 @@ pub fn table_with_its_key_changed(
     })))
 }
 
+/// The table one `ALTER TABLE t ENGINE=InnoDB`, `FORCE` or `OPTIMIZE TABLE`
+/// writes again: the one it is, every column carried across.
+pub fn table_as_it_stands(
+    stored_ddl: &str,
+    mode: SessionSqlMode,
+) -> Result<MySqlKeyRewrite, ParseError> {
+    let Ok(Statement::CreateTable(table)) = parse_one_statement(stored_ddl, mode) else {
+        return Err(ParseError::ExpectedCreateTable);
+    };
+    let key = key_columns(&table);
+    let counted = table
+        .columns
+        .iter()
+        .find(|column| column_has_auto_increment(column))
+        .map(|column| column.name.value.clone());
+    Ok(MySqlKeyRewrite {
+        table: MySqlTableRewrite {
+            create_sql: render_table_written_again(&table, mode)?,
+            carried_columns: table
+                .columns
+                .iter()
+                .map(|column| (column.name.value.clone(), column.name.value.clone()))
+                .collect(),
+        },
+        old_key: key.clone(),
+        new_key: key,
+        counted_before: counted.clone(),
+        counted_after: counted,
+        retyped: Vec::new(),
+        words_kept_as_words: Vec::new(),
+    })
+}
+
 fn is_a_key_or_column_clause(operation: &AlterTableOperation) -> bool {
     matches!(
         operation,

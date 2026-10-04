@@ -283,6 +283,8 @@ fn every_definition_change_waits_for_a_transaction_that_read_the_table() {
         "TRUNCATE TABLE t",
         "ALTER TABLE t MODIFY id BIGINT NOT NULL",
         "ALTER TABLE t DROP PRIMARY KEY",
+        "ALTER TABLE t FORCE",
+        "ALTER TABLE t ENGINE=InnoDB",
         "CREATE INDEX t_v ON t (v)",
         "RENAME TABLE t TO t9",
         "DROP TABLE t",
@@ -294,6 +296,29 @@ fn every_definition_change_waits_for_a_transaction_that_read_the_table() {
             "{sql}"
         );
     }
+    // Measured on MySQL 8.4.11: `OPTIMIZE TABLE` answers the timeout as a row
+    // of its result rather than as its error.
+    let Ok(CommandExecutionResult::ResultSet(optimized)) = two.execute_query("OPTIMIZE TABLE t")
+    else {
+        panic!("OPTIMIZE TABLE must answer a result set");
+    };
+    assert_eq!(
+        optimized.rows,
+        [
+            [
+                Some(b"shop.t".to_vec()),
+                Some(b"optimize".to_vec()),
+                Some(b"Error".to_vec()),
+                Some(b"Lock wait timeout exceeded; try restarting transaction".to_vec()),
+            ],
+            [
+                Some(b"shop.t".to_vec()),
+                Some(b"optimize".to_vec()),
+                Some(b"status".to_vec()),
+                Some(b"Operation failed".to_vec()),
+            ],
+        ]
+    );
     run(&mut two, "CREATE TABLE d (id INT NOT NULL PRIMARY KEY)");
     run(&mut one, "COMMIT");
     run(&mut two, "TRUNCATE TABLE t");

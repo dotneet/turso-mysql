@@ -1,5 +1,6 @@
 //! Writing a table again under a definition an `ALTER TABLE` changed: its
-//! primary key, a column the key is over, or the column it counts its ids on.
+//! primary key, a column the key is over, the column it counts its ids on,
+//! or nothing at all, as `ENGINE=InnoDB`, `FORCE` and `OPTIMIZE TABLE` ask.
 //!
 //! The key decides how the engine keeps the table — a key over one integer
 //! is the rowid, any other is an index of its own beside one — and the
@@ -86,6 +87,27 @@ impl MySqlConnection {
         };
         self.hold_the_key_change_to_the_foreign_keys(table, &rewrite)?;
         self.write_the_table_again_under(table, &rewrite)
+    }
+
+    /// Runs an `ALTER TABLE t ENGINE=InnoDB`, an `ALTER TABLE t FORCE` or an
+    /// `OPTIMIZE TABLE t`, each of which MySQL answers by making the table
+    /// again: measured on 8.4.11, its rows, keys, triggers and counter are as
+    /// they were. Here the table is made again through the `CREATE TABLE`
+    /// every table is made with now, so a table made before an integer key
+    /// was the rowid takes its key as the rowid, and a plain index made
+    /// before plain indexes ended with the key ends with it.
+    pub fn write_the_table_again_as_it_stands(
+        &self,
+        table: &MySqlTableName,
+    ) -> std::result::Result<(), MySqlQueryError> {
+        self.a_base_table_named(table)?;
+        let stored = self
+            .stored_table_statement(table.as_str())
+            .map_err(MySqlQueryError::Engine)?
+            .ok_or(MySqlQueryError::MissingTable)?;
+        let rewrite = turso_mysql_parser::table_as_it_stands(&stored, self.parser_mode())
+            .map_err(mysql_query_parse_error)?;
+        self.write_the_table_again_under(table.as_str(), &rewrite)
     }
 
     /// Whether `column` is one of the columns a foreign key of `table` is

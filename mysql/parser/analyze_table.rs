@@ -111,6 +111,62 @@ pub fn parse_optional_analyze_table(
     Ok(Some(MySqlAnalyzeTableCommand { table }))
 }
 
+/// The tables one `OPTIMIZE TABLE` names, in the order it names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MySqlOptimizeTableCommand {
+    tables: Vec<MySqlTableName>,
+}
+
+impl MySqlOptimizeTableCommand {
+    /// Returns the tables the statement names.
+    pub fn tables(&self) -> &[MySqlTableName] {
+        &self.tables
+    }
+}
+
+/// Accepts `OPTIMIZE [NO_WRITE_TO_BINLOG | LOCAL] TABLE` and a list of
+/// unqualified table names, with an optional single semicolon.
+///
+/// Measured on MySQL 8.4.11, `NO_WRITE_TO_BINLOG` and `LOCAL` change nothing
+/// a client sees: each answers the rows the bare statement answers. Comments
+/// and qualified names are unsupported.
+pub fn parse_optional_optimize_table(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<MySqlOptimizeTableCommand>, ParseError> {
+    let tokens = tokenize_admin_command(sql, mode)?;
+    let mut cursor = skip_admin_comments(&tokens, 0);
+    let had_leading_comment = cursor != 0;
+    if !consume_admin_word(&tokens, &mut cursor, "OPTIMIZE") {
+        return Ok(None);
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "NO_WRITE_TO_BINLOG") {
+        consume_admin_word(&tokens, &mut cursor, "LOCAL");
+    }
+    if !consume_admin_word(&tokens, &mut cursor, "TABLE")
+        && !consume_admin_word(&tokens, &mut cursor, "TABLES")
+    {
+        return Ok(None);
+    }
+    if had_leading_comment {
+        return Err(ParseError::Unsupported {
+            feature: "comments in OPTIMIZE TABLE command",
+        });
+    }
+    let mut tables = vec![consume_admin_table_name(&tokens, &mut cursor)?];
+    while matches!(tokens.get(cursor), Some(AdminToken::Comma)) {
+        cursor += 1;
+        tables.push(consume_admin_table_name(&tokens, &mut cursor)?);
+    }
+    if matches!(tokens.get(cursor), Some(AdminToken::Semicolon)) {
+        cursor += 1;
+    }
+    if cursor != tokens.len() {
+        return Err(ParseError::TrailingAdminCommandTokens);
+    }
+    Ok(Some(MySqlOptimizeTableCommand { tables }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +234,46 @@ mod tests {
         ] {
             assert!(
                 parse_optional_analyze_table(sql, SessionSqlMode::default()).is_err(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_optimize_table_and_the_tables_it_names() {
+        let tables = |sql: &str| {
+            parse_optional_optimize_table(sql, SessionSqlMode::default())
+                .unwrap()
+                .map(|command| {
+                    command
+                        .tables()
+                        .iter()
+                        .map(|table| table.as_str().to_owned())
+                        .collect::<Vec<_>>()
+                })
+        };
+        for (sql, named) in [
+            ("OPTIMIZE TABLE t", vec!["t"]),
+            ("optimize table `t`, u;", vec!["t", "u"]),
+            ("OPTIMIZE NO_WRITE_TO_BINLOG TABLE t", vec!["t"]),
+            ("OPTIMIZE LOCAL TABLES t", vec!["t"]),
+        ] {
+            assert_eq!(
+                tables(sql),
+                Some(named.into_iter().map(str::to_owned).collect()),
+                "{sql}"
+            );
+        }
+        for sql in ["ANALYZE TABLE t", "OPTIMIZE", "SELECT 1", ""] {
+            assert_eq!(tables(sql), None, "{sql}");
+        }
+        for sql in [
+            "OPTIMIZE TABLE app.t",
+            "OPTIMIZE TABLE t QUICK",
+            "/* hidden */ OPTIMIZE TABLE t",
+        ] {
+            assert!(
+                parse_optional_optimize_table(sql, SessionSqlMode::default()).is_err(),
                 "{sql}"
             );
         }

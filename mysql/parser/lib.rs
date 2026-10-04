@@ -130,7 +130,8 @@ pub use alter_table_indexes::{
 };
 pub use analyze_table::{
     parse_analyze_table, parse_check_table, parse_optional_analyze_table,
-    parse_optional_check_table, MySqlAnalyzeTableCommand, MySqlCheckTableCommand,
+    parse_optional_check_table, parse_optional_optimize_table, MySqlAnalyzeTableCommand,
+    MySqlCheckTableCommand, MySqlOptimizeTableCommand,
 };
 pub use catalog_qualifiers::leave_out_the_catalog_table_in_its_columns;
 pub use check_constraints::{
@@ -188,7 +189,9 @@ pub use named_tables::{tables_named_by, NamedTable};
 pub use network_address::{inet_aton, inet_ntoa, is_ipv4};
 pub use nothing_to_run::{nothing_to_run, NothingToRun};
 pub use number_format::{format_number, format_written_decimal, truncate_number};
-pub use primary_key_change::{table_with_its_key_changed, MySqlKeyChange, MySqlKeyRewrite};
+pub use primary_key_change::{
+    table_as_it_stands, table_with_its_key_changed, MySqlKeyChange, MySqlKeyRewrite,
+};
 pub use replace_view::{parse_optional_view_replacement, MySqlViewReplacement};
 pub use safe_updates::{read_safe_update, ComparedValues, SafeUpdateConjunct, SafeUpdateReading};
 pub use select_projection_origins::{
@@ -242,8 +245,9 @@ pub use table_collation::{
     alter_table_with_its_collation_on_each_text_column, character_set_of_collation,
     create_table_with_its_collation_on_each_text_column, create_table_with_the_database_collation,
     table_collation_of, table_comment_change, table_conversion, table_counter_change,
-    table_engine_restated, table_options_of, table_row_format_change, table_with_its_words_in,
-    widest_character_of_collation, MySqlTableCollation, MySqlTableConversion, MySqlTableOptions,
+    table_engine_restated, table_forced, table_options_of, table_row_format_change,
+    table_with_its_words_in, widest_character_of_collation, MySqlTableCollation,
+    MySqlTableConversion, MySqlTableOptions,
 };
 pub use temporal_value::{
     normalize_date, normalize_datetime, normalize_datetime_with_precision, normalize_time,

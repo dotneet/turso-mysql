@@ -533,6 +533,104 @@ fn triggers_and_views_stand_through_a_key_change() {
     );
 }
 
+/// `ALTER TABLE t ENGINE=InnoDB`, `ALTER TABLE t FORCE` and `OPTIMIZE TABLE t`
+/// each make the table again with its rows, indexes, triggers and counter as
+/// they were, committing what came before. `OPTIMIZE TABLE` answers a note
+/// and a status for each table it names, and an error row for a name that is
+/// not there or is a view's; `FORCE` and `ENGINE=InnoDB` answer 1146 for a
+/// name that is not there.
+#[test]
+fn a_table_is_written_again_as_it_stands() {
+    let (_directory, mut adapter) = adapter();
+    for sql in [
+        "CREATE TABLE ai (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT, KEY kv (v)) AUTO_INCREMENT=50",
+        "CREATE TABLE audit (tid INT)",
+        "CREATE TRIGGER ai_ai AFTER INSERT ON ai FOR EACH ROW INSERT INTO audit (tid) VALUES (NEW.id)",
+        "CREATE VIEW av AS SELECT id, v FROM ai",
+        "INSERT INTO ai (v) VALUES (1)",
+        "DELETE FROM ai",
+    ] {
+        run(&mut adapter, sql);
+    }
+    let table = created(&mut adapter, "ai");
+    let note = |table: &str| {
+        vec![
+            vec![
+                format!("probe.{table}"),
+                "optimize".to_owned(),
+                "note".to_owned(),
+                "Table does not support optimize, doing recreate + analyze instead".to_owned(),
+            ],
+            vec![
+                format!("probe.{table}"),
+                "optimize".to_owned(),
+                "status".to_owned(),
+                "OK".to_owned(),
+            ],
+        ]
+    };
+    assert_eq!(rows(&mut adapter, "OPTIMIZE TABLE ai"), note("ai"));
+    assert_eq!(created(&mut adapter, "ai"), table);
+    assert_eq!(counter(&mut adapter, "ai").as_deref(), Some("51"));
+    for sql in [
+        "ALTER TABLE ai FORCE",
+        "ALTER TABLE ai ENGINE=InnoDB",
+        "OPTIMIZE NO_WRITE_TO_BINLOG TABLE ai",
+        "OPTIMIZE LOCAL TABLE ai",
+    ] {
+        run(&mut adapter, sql);
+        assert_eq!(created(&mut adapter, "ai"), table, "{sql}");
+    }
+    // The statement commits the transaction it stands in.
+    run(&mut adapter, "BEGIN");
+    assert_eq!(
+        written(&mut adapter, "INSERT INTO ai (v) VALUES (2)"),
+        (1, 51)
+    );
+    assert_eq!(rows(&mut adapter, "OPTIMIZE TABLE ai"), note("ai"));
+    run(&mut adapter, "ROLLBACK");
+    assert_eq!(rows(&mut adapter, "SELECT id, v FROM av"), [["51", "2"]]);
+    assert_eq!(
+        rows(&mut adapter, "SELECT tid FROM audit ORDER BY tid"),
+        [["50"], ["51"]]
+    );
+    let mut several = note("ai");
+    several.extend([
+        vec![
+            "probe.nope".to_owned(),
+            "optimize".to_owned(),
+            "Error".to_owned(),
+            "Table 'probe.nope' doesn't exist".to_owned(),
+        ],
+        vec![
+            "probe.nope".to_owned(),
+            "optimize".to_owned(),
+            "status".to_owned(),
+            "Operation failed".to_owned(),
+        ],
+        vec![
+            "probe.av".to_owned(),
+            "optimize".to_owned(),
+            "Error".to_owned(),
+            "'probe.av' is not BASE TABLE".to_owned(),
+        ],
+        vec![
+            "probe.av".to_owned(),
+            "optimize".to_owned(),
+            "status".to_owned(),
+            "Operation failed".to_owned(),
+        ],
+    ]);
+    assert_eq!(rows(&mut adapter, "OPTIMIZE TABLE ai, nope, av"), several);
+    for sql in ["ALTER TABLE nope FORCE", "ALTER TABLE nope ENGINE=InnoDB"] {
+        assert_eq!(
+            adapter.execute_query(sql).map(|_| ()),
+            Err(FrontendErrorKind::MissingObject),
+            "{sql}"
+        );
+    }
+}
+
 fn adapter() -> (tempfile::TempDir, Adapter) {
     let authorizer = Arc::new(RecordingAuthorizer::with_schema_creator("root"));
     let (directory, catalog, factory) = catalog_factory(authorizer);

@@ -8376,8 +8376,9 @@ fn a_plain_index_kept_in_insert_order_is_written_again_in_primary_key_order_by_e
             assert_eq!(index_columns(&connection, &table), ["PRIMARY.id", "q_k.k"]);
 
             connection
-                .execute_table_engine_restated(&table)
+                .write_the_table_again_as_it_stands(&table)
                 .map_err(|error| LimboError::InternalError(error.to_string()))?;
+            assert!(keyed_by_its_rowid_beside_its_indexes(&connection, "q")?);
             assert_eq!(ids_with_k_5(&connection)?, [10, 20, 30], "{journal_mode}");
             assert_eq!(index_columns(&connection, &table), ["PRIMARY.id", "q_k.k"]);
             connection.close()?;
@@ -8385,6 +8386,7 @@ fn a_plain_index_kept_in_insert_order_is_written_again_in_primary_key_order_by_e
         let db = open_database(io, path, OpenFlags::None)?;
         let connection = MySqlConnection::new(db.connect()?, binary_context())?;
         assert_eq!(connection.inner().mvcc_enabled(), journal_mode == "mvcc");
+        assert!(keyed_by_its_rowid_beside_its_indexes(&connection, "q")?);
         connection.execute("INSERT INTO q (id, k) VALUES (15, 5)")?;
         assert_eq!(
             ids_with_k_5(&connection)?,
