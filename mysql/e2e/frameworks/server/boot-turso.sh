@@ -90,6 +90,9 @@ printf '%s' "${E2E_PASSWORD}" | provision initialize \
   --password-input-timeout-ms 5000
 provision reconcile
 
+# MySQL bounds the clients still signing in only by max_connections, so
+# --max-admissions is as large as --max-connections: at 32, 64 sysbench
+# clients connecting at once had half of them refused with 1040.
 run_as "${client_uid}" "${bin}/turso-mysql-server" \
   --data-root "${data}" \
   --account-store-root "${accounts}" \
@@ -102,7 +105,7 @@ run_as "${client_uid}" "${bin}/turso-mysql-server" \
   --authority-rpc-timeout-ms 5000 \
   --reload-interval-ms 1000 \
   --max-connections 256 \
-  --max-admissions 32 \
+  --max-admissions 256 \
   --max-write-bytes 67108864 \
   --max-write-frames 4096 \
   --checkpoint-timeout-ms 5000 \
