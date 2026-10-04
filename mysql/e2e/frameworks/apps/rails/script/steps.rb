@@ -276,6 +276,15 @@ def step_after_alter
   check conn.index_exists?(:posts, :slug), "no index on posts.slug"
   Post.where(slug: nil).update_all("slug = CONCAT('post-', id)")
   check Post.where(slug: "post-1").exists?, "slug was not filled"
+
+  key = conn.columns(:legacy_counters).find { |column| column.name == "id" }
+  check key.sql_type == "bigint", "legacy_counters.id is #{key.sql_type}"
+  check key.auto_increment?, "legacy_counters.id stopped counting"
+  check conn.primary_key(:legacy_counters) == "id", "legacy_counters lost its key"
+  check conn.select_value("SELECT name FROM legacy_counters WHERE id = 1") == "first", "the row was not kept"
+  conn.execute("INSERT INTO legacy_counters (name) VALUES ('second')")
+  check conn.select_value("SELECT id FROM legacy_counters WHERE name = 'second'").to_i == 2,
+        "the counter did not go on from where it stood"
 end
 
 def step_after_rollback
@@ -284,6 +293,7 @@ def step_after_rollback
   check !columns.key?("slug") && !columns.key?("content") && columns.key?("body"), "posts columns #{columns.keys}"
   check columns["views"].sql_type == "int", "views is #{columns['views'].sql_type}"
   check !conn.index_exists?(:posts, :slug), "the index on posts.slug is still there"
+  check !conn.table_exists?(:legacy_counters), "legacy_counters is still there"
 end
 
 def step_drop_tables

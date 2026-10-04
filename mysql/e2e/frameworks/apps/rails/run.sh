@@ -47,7 +47,7 @@ second_migration() {
 }
 
 roll_back_second_migration() {
-  bundle exec rake db:rollback || return 1
+  bundle exec rake db:rollback STEP=2 || return 1
   ruby_steps --check after-rollback
 }
 

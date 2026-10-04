@@ -457,6 +457,12 @@ class E2eStep extends Command
         DB::table('posts')->where('title', 'Hello')->update(['slug' => 'hello', 'title' => str_repeat('t', 400)]);
         $this->expect(DB::table('posts')->where('slug', 'hello')->value('view_count'), 10, 'lookup by slug');
         DB::table('posts')->where('slug', 'hello')->update(['title' => 'Hello']);
+
+        $key = collect(Schema::getColumns('legacy_counters'))->firstWhere('name', 'id');
+        $this->expect($key['type'], 'bigint unsigned', 'legacy_counters.id type');
+        $this->expect($key['auto_increment'], true, 'legacy_counters.id counts');
+        $this->expect(DB::table('legacy_counters')->where('id', 1)->value('name'), 'first', 'the row was kept');
+        $this->expect(DB::table('legacy_counters')->insertGetId(['name' => 'second']), 2, 'the next id');
     }
 
     private function checkRollback(): void
@@ -467,6 +473,7 @@ class E2eStep extends Command
         $this->expect(collect(Schema::getColumns('posts'))->firstWhere('name', 'title')['type'], 'varchar(255)', 'posts.title type');
         $this->expect(Post::where('title', 'Hello')->value('views'), 10, 'Hello views kept');
         $this->check(! DB::table('migrations')->where('migration', 'like', '%add_slug%')->exists(), 'the rolled back migration is still recorded');
+        $this->check(! Schema::hasTable('legacy_counters'), 'legacy_counters is still there');
     }
 
     private function checkFresh(): void
