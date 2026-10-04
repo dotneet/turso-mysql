@@ -6697,6 +6697,56 @@ fn prepared_integer_comparisons_recheck_schema_and_type_after_reprepare() -> Res
 }
 
 #[test]
+fn a_prepared_select_reads_what_its_parameters_meet_once_for_each_schema() -> Result<()> {
+    let (connection, _allocator, _io) = open_allocator_connection(
+        "mysql-session-prepared-select-parameter-readings.db",
+        [0x72; 16],
+    )?;
+    connection.execute("CREATE TABLE records (id INT)")?;
+    connection.execute("INSERT INTO records (id) VALUES (1), (2)")?;
+    let metadata = connection
+        .prepare_checked_statement("SELECT id FROM records WHERE id > ?")
+        .unwrap();
+    let kept_for = || {
+        connection
+            .prepared_statements
+            .lock()
+            .unwrap()
+            .statements
+            .get(&metadata.statement_id)
+            .and_then(|statement| statement.select_parameter_readings.as_ref())
+            .map(|readings| Arc::as_ptr(&readings.schema))
+    };
+    let execute = || {
+        connection
+            .execute_prepared_select(
+                metadata.statement_id,
+                &[MySqlPreparedValue::Integer(1)],
+                None,
+            )
+            .map_err(|error| LimboError::InternalError(error.to_string()))
+    };
+    assert_eq!(kept_for(), None);
+
+    assert_eq!(execute()?, vec![vec![MySqlPreparedValue::Integer(2)]]);
+    let first = kept_for().expect("an executed SELECT keeps what it read");
+    assert_eq!(first, Arc::as_ptr(&connection.inner.current_schema()));
+    assert_eq!(execute()?, vec![vec![MySqlPreparedValue::Integer(2)]]);
+    assert_eq!(kept_for(), Some(first));
+
+    connection.execute("ALTER TABLE records ADD COLUMN note TEXT")?;
+    assert_eq!(execute()?, vec![vec![MySqlPreparedValue::Integer(2)]]);
+    assert_eq!(
+        kept_for(),
+        Some(Arc::as_ptr(&connection.inner.current_schema()))
+    );
+    assert_ne!(kept_for(), Some(first));
+
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn executes_prepared_select_values_and_reuses_the_statement() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-prepared-select-execute.db", [0x6c; 16])?;

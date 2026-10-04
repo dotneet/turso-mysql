@@ -1281,6 +1281,16 @@ struct PreparedStatement {
     /// was bound one. Every later word is refused here rather than read
     /// either way.
     bound_a_number_to_a_json_reading: bool,
+    select_parameter_readings: Option<SelectParameterReadings>,
+}
+
+struct SelectParameterReadings {
+    schema: Arc<turso_core::schema::Schema>,
+    bound_temporal: Vec<BoundTemporalParameter>,
+    bound_decimal: Vec<usize>,
+    whole_number: Vec<usize>,
+    word: Vec<usize>,
+    byte: Vec<usize>,
 }
 
 enum PreparedExecutionPlan {
@@ -2349,6 +2359,7 @@ impl MySqlConnection {
                 execution_plan,
                 time_zone_offset_at_prepare: self.time_zone_offset_seconds(),
                 bound_a_number_to_a_json_reading: false,
+                select_parameter_readings: None,
             },
         );
         Ok(())
@@ -3664,7 +3675,11 @@ impl MySqlConnection {
         }
         if let PreparedExecutionPlan::CountedInsertSelect(copy) = &prepared.execution_plan {
             let values = self
-                .core_values_for(&prepared.execution_plan, values)
+                .core_values_for(
+                    &prepared.execution_plan,
+                    &mut prepared.select_parameter_readings,
+                    values,
+                )
                 .map_err(MySqlPreparedStatementError::Engine)?;
             return self
                 .execute_prepared_counted_insert_select(copy, &values, timeout, affected_rows_mode)
@@ -3746,7 +3761,11 @@ impl MySqlConnection {
             prepared.bound_a_number_to_a_json_reading |= binds_a_number;
             held?;
         }
-        let values = self.core_values_for(&prepared.execution_plan, values)?;
+        let values = self.core_values_for(
+            &prepared.execution_plan,
+            &mut prepared.select_parameter_readings,
+            values,
+        )?;
 
         match &prepared.execution_plan {
             PreparedExecutionPlan::Select {
@@ -3875,6 +3894,7 @@ impl MySqlConnection {
     fn core_values_for(
         &self,
         plan: &PreparedExecutionPlan,
+        select_parameter_readings: &mut Option<SelectParameterReadings>,
         values: &[MySqlPreparedValue],
     ) -> Result<Vec<Value>> {
         let mut bound_temporal = Vec::new();
@@ -3885,27 +3905,24 @@ impl MySqlConnection {
             row_count_parameters,
         }) = plan.select_comparisons()
         {
-            bound_temporal =
-                self.validate_select_comparison_columns(source_tables, checked_comparisons)?;
-            let bound_decimal =
-                self.decimal_comparison_parameters(source_tables, checked_comparisons)?;
-            whole_number_parameters =
-                self.whole_number_comparison_parameters(source_tables, checked_comparisons)?;
-            let word_parameters =
-                self.word_comparison_parameters(source_tables, checked_comparisons)?;
-            let byte_parameters =
-                self.byte_comparison_parameters(source_tables, checked_comparisons)?;
+            let readings = self.read_select_parameters(
+                source_tables,
+                checked_comparisons,
+                select_parameter_readings,
+            )?;
             Self::validate_select_comparison_values(
                 checked_comparisons,
                 values,
-                &bound_temporal,
-                &bound_decimal,
-                &whole_number_parameters,
-                &word_parameters,
-                &byte_parameters,
+                &readings.bound_temporal,
+                &readings.bound_decimal,
+                &readings.whole_number,
+                &readings.word,
+                &readings.byte,
             )?;
             Self::validate_row_count_values(row_count_parameters, values)?;
-            Self::refuse_untyped_wide_integer_select_parameters(values, &bound_decimal)?;
+            Self::refuse_untyped_wide_integer_select_parameters(values, &readings.bound_decimal)?;
+            bound_temporal.clone_from(&readings.bound_temporal);
+            whole_number_parameters.clone_from(&readings.whole_number);
         }
         if let PreparedExecutionPlan::OrdinaryWrite {
             insert_target,
@@ -3988,6 +4005,31 @@ impl MySqlConnection {
                 }
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    fn read_select_parameters<'a>(
+        &self,
+        source_tables: &[MySqlSelectSource],
+        comparisons: &[CheckedSelectComparison],
+        kept: &'a mut Option<SelectParameterReadings>,
+    ) -> Result<&'a SelectParameterReadings> {
+        self.inner.maybe_update_schema();
+        let schema = self.inner.current_schema();
+        if kept
+            .as_ref()
+            .is_some_and(|readings| Arc::ptr_eq(&readings.schema, &schema))
+        {
+            return Ok(kept.as_ref().expect("readings were just found"));
+        }
+        let readings = SelectParameterReadings {
+            bound_temporal: self.validate_select_comparison_columns(source_tables, comparisons)?,
+            bound_decimal: self.decimal_comparison_parameters(source_tables, comparisons)?,
+            whole_number: self.whole_number_comparison_parameters(source_tables, comparisons)?,
+            word: self.word_comparison_parameters(source_tables, comparisons)?,
+            byte: self.byte_comparison_parameters(source_tables, comparisons)?,
+            schema,
+        };
+        Ok(kept.insert(readings))
     }
 
     fn execute_prepared_auto_increment_insert(
