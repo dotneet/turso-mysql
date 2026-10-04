@@ -8,6 +8,7 @@
 //! up; once the database is gone, its statements on it answer 1049.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -21,9 +22,12 @@ pub const DEFAULT_METADATA_LOCK_WAIT: Duration = Duration::from_secs(31_536_000)
 pub(crate) struct DatabaseUsers {
     state: Mutex<UsersState>,
     changed: Condvar,
+    dropped: AtomicBool,
     /// How many transactions on the database have ended, which a statement
     /// that met another transaction's uncommitted write waits on to change.
-    transactions_ended: Mutex<u64>,
+    transactions_ended: AtomicU64,
+    waiting_for_a_transaction_to_end: AtomicUsize,
+    transaction_end_wait: Mutex<()>,
     a_transaction_ended: Condvar,
     #[cfg(test)]
     wakeups: std::sync::atomic::AtomicUsize,
@@ -36,7 +40,6 @@ struct UsersState {
     using: usize,
     /// Set while a `DROP DATABASE` waits for them or removes the database.
     dropping: bool,
-    dropped: bool,
 }
 
 /// Why a `DROP DATABASE` did not get to remove the database.
@@ -60,7 +63,7 @@ impl DatabaseUsers {
         while state.dropping {
             state = self.wait_until(state, deadline)?;
         }
-        if state.dropped {
+        if self.dropped.load(Ordering::SeqCst) {
             return Err(DropWaitError::AlreadyDropped);
         }
         state.dropping = true;
@@ -134,7 +137,7 @@ impl DropInProgress<'_> {
     /// and every later one answers 1049 for.
     pub(crate) fn finish(mut self) {
         let mut state = self.users.lock();
-        state.dropped = true;
+        self.users.dropped.store(true, Ordering::SeqCst);
         state.dropping = false;
         drop(state);
         self.finished = true;
@@ -221,7 +224,7 @@ impl DatabaseUser {
         let deadline = Instant::now().checked_add(wait);
         let mut state = self.users.lock();
         loop {
-            if state.dropped {
+            if self.users.dropped.load(Ordering::SeqCst) {
                 return Err(MySqlStatementNotStarted::Dropped(MySqlDatabaseDropped {
                     database: self.database.clone(),
                 }));
@@ -296,17 +299,24 @@ impl DatabaseUser {
     }
 
     pub(crate) fn database_was_dropped(&self) -> bool {
-        self.users.lock().dropped
+        self.users.dropped.load(Ordering::SeqCst)
     }
 
     pub(crate) fn transactions_ended(&self) -> u64 {
-        *self.lock_transactions_ended()
+        self.users.transactions_ended.load(Ordering::SeqCst)
     }
 
     pub(crate) fn note_a_transaction_ended(&self) {
-        let mut ended = self.lock_transactions_ended();
-        *ended = ended.wrapping_add(1);
-        drop(ended);
+        self.users.transactions_ended.fetch_add(1, Ordering::SeqCst);
+        if self
+            .users
+            .waiting_for_a_transaction_to_end
+            .load(Ordering::SeqCst)
+            == 0
+        {
+            return;
+        }
+        drop(self.lock_transaction_end_wait());
         self.users.a_transaction_ended.notify_all();
     }
 
@@ -318,13 +328,24 @@ impl DatabaseUser {
         ended_before: u64,
         deadline: Option<Instant>,
     ) -> bool {
-        let mut ended = self.lock_transactions_ended();
-        while *ended == ended_before {
-            ended = match deadline {
+        self.users
+            .waiting_for_a_transaction_to_end
+            .fetch_add(1, Ordering::SeqCst);
+        let ended = self.wait_while_no_transaction_ends(ended_before, deadline);
+        self.users
+            .waiting_for_a_transaction_to_end
+            .fetch_sub(1, Ordering::SeqCst);
+        ended
+    }
+
+    fn wait_while_no_transaction_ends(&self, ended_before: u64, deadline: Option<Instant>) -> bool {
+        let mut wait = self.lock_transaction_end_wait();
+        while self.users.transactions_ended.load(Ordering::SeqCst) == ended_before {
+            wait = match deadline {
                 None => self
                     .users
                     .a_transaction_ended
-                    .wait(ended)
+                    .wait(wait)
                     .expect("MySQL ended transactions mutex poisoned"),
                 Some(deadline) => {
                     let left = deadline.saturating_duration_since(Instant::now());
@@ -333,7 +354,7 @@ impl DatabaseUser {
                     }
                     self.users
                         .a_transaction_ended
-                        .wait_timeout(ended, left)
+                        .wait_timeout(wait, left)
                         .expect("MySQL ended transactions mutex poisoned")
                         .0
                 }
@@ -342,9 +363,9 @@ impl DatabaseUser {
         true
     }
 
-    fn lock_transactions_ended(&self) -> MutexGuard<'_, u64> {
+    fn lock_transaction_end_wait(&self) -> MutexGuard<'_, ()> {
         self.users
-            .transactions_ended
+            .transaction_end_wait
             .lock()
             .expect("MySQL ended transactions mutex poisoned")
     }
@@ -501,6 +522,57 @@ mod tests {
             busy.stop_using();
         }
         assert_eq!(users.wakeups.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_transaction_ending_wakes_a_statement_waiting_for_one() {
+        let users = Arc::new(DatabaseUsers::default());
+        let waiting = user(&users);
+        let ending = user(&users);
+        let before = waiting.transactions_ended();
+        let waiter = thread::spawn(move || {
+            waiting.wait_for_a_transaction_to_end(before, Instant::now().checked_add(A_LONG_WAIT))
+        });
+        while users
+            .waiting_for_a_transaction_to_end
+            .load(Ordering::SeqCst)
+            == 0
+        {
+            thread::yield_now();
+        }
+        ending.note_a_transaction_ended();
+        assert!(waiter.join().unwrap());
+        assert_eq!(ending.transactions_ended(), before + 1);
+        assert_eq!(
+            users
+                .waiting_for_a_transaction_to_end
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    fn a_statement_stops_waiting_for_a_transaction_end_at_its_deadline() {
+        let users = Arc::new(DatabaseUsers::default());
+        let waiting = user(&users);
+        let before = waiting.transactions_ended();
+        assert!(!waiting.wait_for_a_transaction_to_end(
+            before,
+            Instant::now().checked_add(Duration::from_millis(20))
+        ));
+        waiting.note_a_transaction_ended();
+        assert!(waiting.wait_for_a_transaction_to_end(before, Some(Instant::now())));
+    }
+
+    #[test]
+    fn a_transaction_ending_with_nobody_waiting_wakes_nobody() {
+        let users = Arc::new(DatabaseUsers::default());
+        let held = users.transaction_end_wait.lock().unwrap();
+        let ending = user(&users);
+        let ended = thread::spawn(move || ending.note_a_transaction_ended());
+        ended.join().unwrap();
+        drop(held);
+        assert_eq!(user(&users).transactions_ended(), 1);
     }
 
     #[test]
