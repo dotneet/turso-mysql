@@ -13373,6 +13373,50 @@ pub fn op_store_assigned_values(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_store_assigned_rowid(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        StoreAssignedRowid {
+            reg,
+            database_id,
+            table_name,
+            column_index,
+            column_count,
+            update,
+        },
+        insn
+    );
+    let dialect_validator = program.connection.dialect().assignment_validator();
+    let validator = program
+        .prepare_options()
+        .assignment_validator
+        .as_deref()
+        .or(dialect_validator.as_deref());
+    if let Some(validator) = validator {
+        let mut values = vec![Value::Null; *column_count];
+        values[*column_index] = state.registers[*reg].get_value().clone();
+        let table_sql = program.connection.with_schema(*database_id, |schema| {
+            schema.table_sql(table_name).map(str::to_owned)
+        });
+        let operation = if *update {
+            crate::AssignmentOperation::Update
+        } else {
+            crate::AssignmentOperation::Insert
+        };
+        if let Some(mut stored) =
+            validator.check_assignment(table_name, table_sql.as_deref(), operation, &values)?
+        {
+            state.registers[*reg] = Register::Value(stored.swap_remove(*column_index));
+        }
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// The values the connection's assignment validator stores in place of
 /// `values`, a row about to be written; `None` when it keeps them as they are.
 fn assigned_values_as_stored(

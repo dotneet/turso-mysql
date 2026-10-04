@@ -690,7 +690,7 @@ pub fn emit_upsert(
         );
         program.target_union_type = prev_union;
         translate_result?;
-        if col.notnull() && !col.is_rowid_alias() {
+        if col.notnull() && (!col.is_rowid_alias() || col.rowid_must_be_written()) {
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
@@ -705,6 +705,21 @@ pub fn emit_upsert(
                 dst_reg: r,
                 extra_amount: 0,
             });
+            if col.rowid_must_be_written() {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: r,
+                    count: NonZeroUsize::MIN,
+                    affinities: col.affinity().aff_mask().to_string(),
+                });
+                program.emit_insn(Insn::StoreAssignedRowid {
+                    reg: r,
+                    database_id: ctx.database_id,
+                    table_name: table.get_name().to_string(),
+                    column_index: layout.to_register(0, *col_idx),
+                    column_count: layout.num_non_virtual_cols(),
+                    update: true,
+                });
+            }
             program.emit_insn(Insn::MustBeInt {
                 reg: r,
                 target_pc: None,

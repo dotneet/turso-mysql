@@ -852,6 +852,22 @@ pub enum Insn {
         table_name: String,
     },
 
+    /// Puts the value in `reg`, about to become the rowid of a row written
+    /// into `table_name`, into the form the connection's assignment validator
+    /// stores its column's values in, and refuses it where the validator
+    /// refuses it. The validator is shown a row holding that value at
+    /// `column_index` and NULL in each of its other `column_count` columns.
+    /// A rowid alias stores no value of its own in the row's record, so this
+    /// is the only check its value gets.
+    StoreAssignedRowid {
+        reg: usize,
+        database_id: usize,
+        table_name: String,
+        column_index: usize,
+        column_count: usize,
+        update: bool,
+    },
+
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
@@ -2262,6 +2278,7 @@ impl InsnVariants {
             InsnVariants::IsType => execute::op_is_type,
             InsnVariants::TypeCheck => execute::op_type_check,
             InsnVariants::StoreAssignedValues => execute::op_store_assigned_values,
+            InsnVariants::StoreAssignedRowid => execute::op_store_assigned_rowid,
             InsnVariants::ArrayEncode => execute::op_array_encode,
             InsnVariants::ArrayDecode => execute::op_array_decode,
             InsnVariants::ArrayElement => execute::op_array_element,

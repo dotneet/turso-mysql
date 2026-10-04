@@ -2780,4 +2780,195 @@ mod tests {
             vec![vec![crate::Value::from_i64(42)]]
         );
     }
+
+    /// A dialect whose `INTEGER NOT NULL PRIMARY KEY` is a key every row must
+    /// be given, the way a MySQL key is, and whose validator reads a word in a
+    /// table's first column as the number it spells and refuses any other
+    /// word there.
+    struct WrittenKeyDialect;
+
+    impl Dialect for WrittenKeyDialect {
+        fn name(&self) -> &'static str {
+            "written-key-test"
+        }
+
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            let mut table = BTreeTable::from_sql(sql, root_page)?;
+            for column in table.columns_mut().iter_mut() {
+                if column.is_rowid_alias() && column.notnull() {
+                    column.require_a_written_rowid();
+                }
+            }
+            Ok(table)
+        }
+
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+
+        fn assignment_validator(&self) -> Option<Arc<dyn crate::AssignmentValidator>> {
+            Some(Arc::new(DigitsAreNumbers))
+        }
+
+        fn register_catalog(
+            &self,
+            schema: &mut crate::schema::Schema,
+            enable_custom_types: bool,
+        ) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+
+        fn resolve_function(
+            &self,
+            name: &str,
+            arg_count: usize,
+        ) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+    }
+
+    struct DigitsAreNumbers;
+
+    impl crate::AssignmentValidator for DigitsAreNumbers {
+        fn check_assignment(
+            &self,
+            table_name: &str,
+            _table_sql: Option<&str>,
+            _operation: crate::AssignmentOperation,
+            values: &[crate::Value],
+        ) -> crate::Result<Option<Vec<crate::Value>>> {
+            if table_name.starts_with("sqlite_") {
+                return Ok(None);
+            }
+            let Some(crate::Value::Text(text)) = values.first() else {
+                return Ok(None);
+            };
+            let number = text.as_str().parse::<i64>().map_err(|_| {
+                crate::LimboError::InvalidArgument(format!("not a number: {}", text.as_str()))
+            })?;
+            let mut stored = values.to_vec();
+            stored[0] = crate::Value::from_i64(number);
+            Ok(Some(stored))
+        }
+    }
+
+    #[test]
+    fn a_rowid_that_must_be_written_never_takes_a_new_rowid() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "written-key.db", Arc::new(WrittenKeyDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE d (id INTEGER NOT NULL PRIMARY KEY DEFAULT 7, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+
+        for sql in [
+            "INSERT INTO t (v) VALUES ('left out')",
+            "INSERT INTO t VALUES (NULL, 'null')",
+            "INSERT INTO t VALUES (1, 'a'), (NULL, 'b')",
+            "INSERT INTO t SELECT NULL, 'selected'",
+            "REPLACE INTO t VALUES (NULL, 'replaced')",
+        ] {
+            let result = conn.execute(sql);
+            assert!(
+                matches!(result, Err(crate::LimboError::NotNullConstraint { .. })),
+                "{sql}: {result:?}"
+            );
+        }
+        conn.execute("INSERT OR IGNORE INTO t VALUES (NULL, 'skipped'), (2, 'kept')")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('12', 'digits')")
+            .unwrap();
+        assert!(matches!(
+            conn.execute("INSERT INTO t VALUES ('twelve', 'word')"),
+            Err(crate::LimboError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            rows_of(&conn, "SELECT id, v FROM t"),
+            vec![
+                vec![crate::Value::from_i64(2), crate::Value::build_text("kept")],
+                vec![
+                    crate::Value::from_i64(12),
+                    crate::Value::build_text("digits")
+                ],
+            ]
+        );
+
+        assert!(fails_not_null(
+            conn.execute("UPDATE t SET id = NULL WHERE id = 2")
+        ));
+        conn.execute("UPDATE t SET id = '5' WHERE id = 2").unwrap();
+        assert!(matches!(
+            conn.execute("UPDATE t SET id = 'five' WHERE id = 5"),
+            Err(crate::LimboError::InvalidArgument(_))
+        ));
+        assert!(fails_not_null(conn.execute(
+            "INSERT INTO t VALUES (5, 'again') ON CONFLICT (id) DO UPDATE SET id = NULL"
+        )));
+        conn.execute("INSERT INTO t VALUES (5, 'again') ON CONFLICT (id) DO UPDATE SET id = '6'")
+            .unwrap();
+        assert_eq!(
+            rows_of(&conn, "SELECT id, v FROM t"),
+            vec![
+                vec![crate::Value::from_i64(6), crate::Value::build_text("kept")],
+                vec![
+                    crate::Value::from_i64(12),
+                    crate::Value::build_text("digits")
+                ],
+            ]
+        );
+
+        conn.execute("INSERT INTO d (v) VALUES ('defaulted')")
+            .unwrap();
+        assert!(matches!(
+            conn.execute("INSERT INTO d (v) VALUES ('defaulted again')"),
+            Err(crate::LimboError::Constraint(_))
+        ));
+        assert_eq!(
+            rows_of(&conn, "SELECT id, v FROM d"),
+            vec![vec![
+                crate::Value::from_i64(7),
+                crate::Value::build_text("defaulted")
+            ]]
+        );
+
+        conn.execute("INSERT INTO plain (v) VALUES ('numbered')")
+            .unwrap();
+        conn.execute("INSERT INTO plain VALUES (NULL, 'numbered')")
+            .unwrap();
+        assert_eq!(
+            rows_of(&conn, "SELECT id FROM plain"),
+            vec![
+                vec![crate::Value::from_i64(1)],
+                vec![crate::Value::from_i64(2)]
+            ]
+        );
+    }
+
+    fn rows_of(conn: &Arc<crate::Connection>, sql: &str) -> Vec<Vec<crate::Value>> {
+        conn.prepare(sql).unwrap().run_collect_rows().unwrap()
+    }
+
+    fn fails_not_null(result: crate::Result<()>) -> bool {
+        matches!(result, Err(crate::LimboError::NotNullConstraint { .. }))
+    }
 }

@@ -742,6 +742,20 @@ pub fn insn_to_row(
                 0,
                 format!("r[{start_reg}..] = stored forms of r[{record_reg}] for {table_name}"),
             ),
+            Insn::StoreAssignedRowid {
+                reg,
+                table_name,
+                column_index,
+                ..
+            } => (
+                "StoreAssignedRowid",
+                *reg as i64,
+                *column_index as i64,
+                0,
+                Value::build_text(table_name.clone()),
+                0,
+                format!("r[{reg}] = stored form of the rowid of {table_name}"),
+            ),
             Insn::ArrayEncode { data } => (
                 "ArrayEncode",
                 data.reg as i64,

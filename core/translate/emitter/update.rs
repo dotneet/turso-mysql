@@ -824,6 +824,19 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
 
+                    if table_column.rowid_must_be_written() {
+                        emit_check_for_written_rowid(
+                            program,
+                            table_references,
+                            rowid_set_clause_reg,
+                            table_column,
+                            idx,
+                            column_ctx,
+                            or_conflict,
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,
                         target_pc: None,
@@ -988,6 +1001,55 @@ fn emit_update_column_values<'a>(
             }
         }
     }
+    Ok(())
+}
+
+/// Checks the value an UPDATE gives a rowid that must be written: NULL fails
+/// the column's NOT NULL constraint rather than becoming a rowid, and any
+/// other value goes through the assignment validator before it must be an
+/// integer.
+#[allow(clippy::too_many_arguments)]
+fn emit_check_for_written_rowid(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    rowid_reg: usize,
+    table_column: &Column,
+    column_index: usize,
+    column_ctx: &UpdateColumnCtx<'_>,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    let notnull_conflict = if program.flags.has_statement_conflict() {
+        or_conflict
+    } else {
+        ResolveType::Abort
+    };
+    emit_notnull_constraint_check(
+        program,
+        table_references,
+        rowid_reg,
+        table_column,
+        column_ctx.table_name(),
+        notnull_conflict,
+        skip_row_label,
+        resolver,
+    )?;
+    // Every other column's value takes its column's affinity before the
+    // validator sees it, so the key's does too.
+    program.emit_insn(Insn::Affinity {
+        start_reg: rowid_reg,
+        count: NonZeroUsize::MIN,
+        affinities: table_column.affinity().aff_mask().to_string(),
+    });
+    program.emit_insn(Insn::StoreAssignedRowid {
+        reg: rowid_reg,
+        database_id: column_ctx.target_table.database_id,
+        table_name: column_ctx.table_name().to_string(),
+        column_index: column_ctx.layout.to_register(0, column_index),
+        column_count: column_ctx.layout.num_non_virtual_cols(),
+        update: true,
+    });
     Ok(())
 }
 

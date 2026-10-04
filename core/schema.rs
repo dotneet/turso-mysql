@@ -5890,6 +5890,27 @@ impl Column {
     pub fn set_rowid_alias(&mut self, v: bool) {
         self.info.set_rowid_alias(v)
     }
+    /// Whether every row must be given a value for this rowid alias, as a
+    /// MySQL primary key must. See [`Column::require_a_written_rowid`].
+    #[inline]
+    pub fn rowid_must_be_written(&self) -> bool {
+        self.info.rowid_must_be_written()
+    }
+    /// Makes this rowid alias a column every row must be given a value for,
+    /// the way a MySQL primary key is.
+    ///
+    /// A row that leaves it out takes the column's default; a row whose
+    /// value is NULL fails its NOT NULL constraint instead of taking a new
+    /// rowid; and a written value goes through the connection's assignment
+    /// validator before it becomes the rowid, the way every other column's
+    /// value does before it is stored.
+    pub fn require_a_written_rowid(&mut self) {
+        turso_assert!(
+            self.is_rowid_alias(),
+            "only a rowid alias can require a written rowid"
+        );
+        self.info.set_rowid_must_be_written();
+    }
     #[inline]
     pub fn set_unique(&mut self, v: bool) {
         self.info.set_unique(v)
@@ -8154,6 +8175,9 @@ mod column_info {
     const ARRAY_DIM_SHIFT: u32 = BASE_AFF_SHIFT + 3;
     const ARRAY_DIM_MASK: u32 = 0b111 << ARRAY_DIM_SHIFT;
 
+    // Bit 26: a rowid alias every row must be given a value for.
+    const F_ROWID_MUST_BE_WRITTEN: u32 = 1 << (ARRAY_DIM_SHIFT + 3);
+
     /// ColumnInfo packs information on a [Column] into a single `u32`.
     #[derive(Clone, Debug)]
     pub struct ColumnInfo(u32);
@@ -8239,6 +8263,16 @@ mod column_info {
         #[inline]
         pub fn hidden(&self) -> bool {
             self.0 & F_HIDDEN != 0
+        }
+
+        #[inline]
+        pub fn rowid_must_be_written(&self) -> bool {
+            self.0 & F_ROWID_MUST_BE_WRITTEN != 0
+        }
+
+        #[inline]
+        pub fn set_rowid_must_be_written(&mut self) {
+            self.set_flag(F_ROWID_MUST_BE_WRITTEN, true);
         }
 
         #[inline]
