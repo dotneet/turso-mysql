@@ -2340,20 +2340,25 @@ impl Connection {
     }
 
     fn adopt_shared_schema_if_changed(&self) {
-        let current_schema = self.schema.read().clone();
         let schema = self.db.schema.published();
-        // MVCC checkpoint can publish physical btree roots into the shared
-        // schema without changing SQLite's schema cookie. If this connection
-        // still has the older schema snapshot, prepared statements must be
-        // invalidated and recompiled with the published roots.
-        if current_schema.schema_version != schema.schema_version
-            || self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
-        {
+        let changed = {
+            let current_schema = self.schema.read();
+            // MVCC checkpoint can publish physical btree roots into the shared
+            // schema without changing SQLite's schema cookie. If this connection
+            // still has the older schema snapshot, prepared statements must be
+            // invalidated and recompiled with the published roots.
+            current_schema.schema_version != schema.schema_version
+                || self.has_mvcc_schema_snapshot_changed_with_same_version(&current_schema, &schema)
+        };
+        if changed {
             let mut adopted = schema.clone();
             // Resolve placeholder (negative) roots to the real pages a checkpoint has
             // materialized, so consumers that skip negative roots (integrity_check) see them.
             let mv_store_guard = self.db.get_mv_store();
-            if let Some(mv_store) = mv_store_guard.as_ref() {
+            if let Some(mv_store) = mv_store_guard
+                .as_ref()
+                .filter(|mv_store| mv_store.schema_has_roots_to_resolve(&adopted))
+            {
                 if let Ok(schema) = Schema::try_make_mut(&mut adopted) {
                     mv_store.resolve_schema_negative_roots(schema);
                 }

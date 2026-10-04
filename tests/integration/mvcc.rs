@@ -1913,3 +1913,23 @@ fn test_a_transaction_that_read_before_another_commit_cannot_take_the_exclusive_
 fn mvcc_database() -> TempDatabase {
     TempDatabase::builder().with_mvcc(true).build()
 }
+
+#[turso_macros::test(mvcc)]
+fn a_connection_keeps_its_schema_until_another_connection_changes_it(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let reader = tmp_db.connect_limbo();
+    let definer = tmp_db.connect_limbo();
+    definer.execute("CREATE TABLE t(x INTEGER)")?;
+    reader.maybe_update_schema();
+    let adopted = reader.current_schema();
+    assert!(adopted.get_btree_table("t").is_some());
+
+    reader.maybe_update_schema();
+    assert!(Arc::ptr_eq(&adopted, &reader.current_schema()));
+
+    definer.execute("CREATE TABLE u(x INTEGER)")?;
+    reader.maybe_update_schema();
+    assert!(reader.current_schema().get_btree_table("u").is_some());
+    Ok(())
+}

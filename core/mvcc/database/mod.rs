@@ -10420,6 +10420,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
+    pub(crate) fn schema_has_roots_to_resolve(&self, schema: &crate::schema::Schema) -> bool {
+        let resolves = |root_page: i64| root_page < 0 && self.resolve_root_page(root_page) >= 0;
+        schema
+            .tables
+            .values()
+            .filter_map(|table| table.btree())
+            .any(|btree| resolves(btree.root_page))
+            || schema
+                .indexes
+                .values()
+                .flatten()
+                .any(|index| resolves(index.root_page))
+    }
+
     /// Resolve a single (possibly placeholder/negative) root page to the real positive page a
     /// checkpoint has materialized for it, or return it unchanged if not yet materialized.
     pub(crate) fn resolve_root_page(&self, root_page: i64) -> i64 {
