@@ -1838,6 +1838,13 @@ impl MySqlConnection {
                 "the current MySQL table slice supports only binary character contexts".to_string(),
             ));
         }
+        // MySQL makes a session wait for a lock another session holds rather
+        // than answering straight away, and answers 1205 once the wait runs
+        // out. The engine waits the same way for the one write lock it holds
+        // over the database, so the wait is set to the one MySQL starts with.
+        // It is set before the first statement below, which waits like any
+        // other for a checkpoint that holds new transactions back.
+        inner.set_busy_timeout(Self::DEFAULT_LOCK_WAIT);
         reject_incompatible_legacy_tables(&inner)?;
         // MySQL has no SQLite DQS misfeature. Left on, an identifier that does
         // not resolve becomes a string literal, so `SELECT id, nosuchcolumn
@@ -1846,11 +1853,6 @@ impl MySqlConnection {
         // is what a real client's `select $$` probe reduces to, is 1054, and
         // `select $$` itself is 1064.
         inner.set_dqs_dml(false);
-        // MySQL makes a session wait for a lock another session holds rather
-        // than answering straight away, and answers 1205 once the wait runs
-        // out. The engine waits the same way for the one write lock it holds
-        // over the database, so the wait is set to the one MySQL starts with.
-        inner.set_busy_timeout(Self::DEFAULT_LOCK_WAIT);
         // A transaction that read and then writes is given up with 1213 only
         // when another session's commit changed a page it read; see
         // `Connection::set_write_after_unrelated_commits`.
@@ -1968,7 +1970,7 @@ impl MySqlConnection {
     }
 
     /// Has the WAL emptied once it holds more than
-    /// [`Self::WAL_FRAMES_BEFORE_TRUNCATING`] frames, between transactions.
+    /// [`crate::wal_keeper::WAL_FRAMES_BEFORE_TRUNCATING`] frames, between transactions.
     ///
     /// The engine's own checkpoint copies the WAL into the database after a
     /// write but leaves the file at its size, and a pooled connection may stay
@@ -1982,11 +1984,12 @@ impl MySqlConnection {
         if self.inner.mvcc_enabled() {
             return self.keep_the_mvcc_log_small();
         }
-        self.truncate_the_wal_past(Self::WAL_FRAMES_BEFORE_TRUNCATING)
+        self.truncate_the_wal_past(crate::wal_keeper::WAL_FRAMES_BEFORE_TRUNCATING)
     }
 
     /// Asks the keeper to checkpoint an MVCC database whose logical log grew
-    /// past twice the engine's own bound, or whose WAL did.
+    /// past the engine's checkpoint threshold, or whose WAL grew past its
+    /// bound. The keeper runs every checkpoint of such a database.
     ///
     /// The engine checkpoints the log at a commit only when no other
     /// transaction is open, which under a steady load of overlapping
@@ -2000,13 +2003,7 @@ impl MySqlConnection {
         let Some((keeper, database)) = &self.wal_keeper else {
             return Ok(());
         };
-        let log_past_its_bound = self.inner.mv_store().as_ref().is_some_and(|store| {
-            u64::try_from(store.checkpoint_threshold())
-                .is_ok_and(|threshold| store.logical_log_offset() >= threshold.saturating_mul(2))
-        });
-        if !log_past_its_bound
-            && self.inner.wal_state()?.max_frame <= Self::WAL_FRAMES_BEFORE_TRUNCATING
-        {
+        if !crate::wal_keeper::an_mvcc_checkpoint_is_due(&self.inner)? {
             return Ok(());
         }
         keeper.ask_to_truncate(
@@ -2017,15 +2014,19 @@ impl MySqlConnection {
         )
     }
 
-    /// 64 MiB of 4 KiB pages.
-    const WAL_FRAMES_BEFORE_TRUNCATING: u64 = 16_384;
-
-    /// Hands emptying this connection's WAL to a catalog's keeper.
+    /// Hands emptying this connection's WAL to a catalog's keeper, and
+    /// checkpointing its MVCC log: the keeper's checkpoint holds new
+    /// transactions back only for the rows committed while it waited for
+    /// the running ones to end, where one run by a committing session holds
+    /// them back for every row since the last checkpoint.
     pub(crate) fn with_wal_keeper(
         mut self,
         keeper: WalKeeperHandle,
         database: std::sync::Weak<turso_core::Database>,
     ) -> Self {
+        if let Some(store) = self.inner.mv_store().as_ref() {
+            store.leave_checkpoints_to_the_caller();
+        }
         self.wal_keeper = Some((keeper, database));
         self
     }

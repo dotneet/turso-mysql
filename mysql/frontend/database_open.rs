@@ -404,6 +404,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_session_opened_while_new_transactions_are_held_back_waits_for_them() -> Result<()> {
+        let (directory, main, wal) = files();
+        let log = FsOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(directory.path().join("main.db-log"))
+            .unwrap();
+        let db = open_preopened_database_with_wal(
+            Arc::new(NoPathIo),
+            main,
+            wal,
+            opaque_identity(),
+            identity(5),
+            "probe",
+            Some(log),
+            (),
+        )?;
+        crate::MySqlConnection::new(db.connect()?, binary_context())?
+            .execute("CREATE TABLE t (x INT)")?;
+        let store = db.get_mv_store().clone().unwrap();
+        store.hold_new_transactions();
+        let opening = std::thread::spawn({
+            let db = Arc::clone(&db);
+            move || crate::MySqlConnection::new(db.connect()?, binary_context())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!opening.is_finished());
+        store.let_new_transactions_begin();
+        let opened = opening.join().unwrap()?;
+        opened.execute("INSERT INTO t (x) VALUES (1)")?;
+        Ok(())
+    }
+
     /// Four sessions each keep beginning a transaction as soon as the last
     /// one ended, so one is nearly always open and the engine's own
     /// checkpoint, which needs none open, does not get to run.
@@ -429,7 +464,8 @@ mod tests {
         crate::MySqlConnection::new(db.connect()?, binary_context())?
             .execute("CREATE TABLE t (x INT)")?;
         let store = db.get_mv_store().clone().unwrap();
-        store.set_checkpoint_threshold(-1);
+        store.leave_checkpoints_to_the_caller();
+        store.set_checkpoint_threshold(1);
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let sessions = (0..4)
             .map(|_| {
@@ -447,7 +483,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(store.logical_log_offset() > 0);
+        let logged_before = store.logical_log_offset();
+        assert!(logged_before > 0);
 
         let checkpointed = crate::wal_keeper::checkpoint_the_mvcc_log(&db, None);
         stop.store(true, Ordering::SeqCst);
@@ -455,6 +492,10 @@ mod tests {
             session.join().unwrap();
         }
         assert_eq!(checkpointed?, crate::wal_keeper::Emptied::Yes);
+        assert!(
+            store.logical_log_offset() < logged_before,
+            "the checkpoint must have emptied the log"
+        );
         Ok(())
     }
 

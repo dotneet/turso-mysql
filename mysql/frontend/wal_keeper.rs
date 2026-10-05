@@ -17,7 +17,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use turso_core::storage::auto_increment::CommitLoggedMarks;
-use turso_core::{CheckpointMode, Database, LimboError, Result, IO};
+use turso_core::{
+    CheckpointMode, Database, LimboError, MvccCheckpointWritingRowsFirst, Result, IO,
+};
 
 use crate::database_users::DatabaseUser;
 
@@ -179,6 +181,22 @@ pub(crate) const TIME_TO_HOLD_NEW_TRANSACTIONS: Duration = Duration::from_millis
 /// new transactions back again, so that a long transaction costs the other
 /// sessions one short wait a second rather than one after every statement.
 pub(crate) const PAUSE_AFTER_A_LONG_TRANSACTION: Duration = Duration::from_secs(1);
+
+/// 64 MiB of 4 KiB pages.
+pub(crate) const WAL_FRAMES_BEFORE_TRUNCATING: u64 = 16_384;
+
+/// At most how many times the keeper writes, without holding new
+/// transactions back, the rows committed while it wrote the last ones.
+/// Each time writes fewer, and what is left is written while no
+/// transaction runs. Measured with sysbench `oltp_insert` at 64 threads,
+/// writing 17,000 rows the first time took 45 to 160 ms, in which
+/// sessions committed another 17,000 index and table rows, which then
+/// took 40 ms to write while new transactions waited.
+pub(crate) const TIMES_TO_WRITE_THE_ROWS_COMMITTED_MEANWHILE: usize = 3;
+
+/// Below how many rows written at once the keeper stops writing the rows
+/// committed meanwhile and holds new transactions back.
+pub(crate) const ROWS_FEW_ENOUGH_TO_WRITE_WHILE_HOLDING: usize = 1_024;
 
 /// How often the keeper syncs the records an MVCC database's counters wrote
 /// without a sync. InnoDB writes the counter into its redo log, which MySQL
@@ -399,10 +417,16 @@ fn copy_then_truncate(
 /// Checkpoints an MVCC database, which empties its logical log and its WAL,
 /// over a connection of its own.
 ///
-/// The checkpoint runs only once no transaction is open, so new ones are
-/// held back, answering `Busy` to the sessions' busy handlers, while the
-/// running ones end, for at most [`TIME_TO_HOLD_NEW_TRANSACTIONS`]. The
-/// keeper tries again each time a transaction on the database ends.
+/// The checkpoint first writes the rows committed so far while the
+/// sessions keep running, then holds new transactions back, answering
+/// `Busy` to the sessions' busy handlers, while the running ones end, for
+/// at most [`TIME_TO_HOLD_NEW_TRANSACTIONS`]; it tries each time a
+/// transaction on the database ends. Once none runs it writes what
+/// committed meanwhile and commits it all. The sweep of the row versions
+/// in memory, which needs no transaction held back, runs after they may
+/// begin again. Measured with sysbench `oltp_write_only` at 8 threads,
+/// that takes the writes of the rows (21 ms) and the sweep (30 ms) out of
+/// the 78 ms new transactions used to wait for one checkpoint.
 pub(crate) fn checkpoint_the_mvcc_log(
     database: &Arc<Database>,
     user: Option<&DatabaseUser>,
@@ -412,19 +436,71 @@ pub(crate) fn checkpoint_the_mvcc_log(
         .clone()
         .expect("an MVCC database has a store");
     let connection = database.connect()?;
-    store.hold_new_transactions();
+    if !an_mvcc_checkpoint_is_due(&connection)? {
+        connection.close()?;
+        return Ok(Emptied::Yes);
+    }
+    let checkpointed = match connection.begin_mvcc_checkpoint_writing_rows_first() {
+        Ok(mut checkpoint) => match write_the_rows_committed_meanwhile(&mut checkpoint) {
+            Ok(()) => {
+                store.hold_new_transactions();
+                let finished = finish_once_no_transaction_runs(&mut checkpoint, user);
+                store.let_new_transactions_begin();
+                finished
+            }
+            Err(error) => Err(error),
+        },
+        Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => Ok(Emptied::KeptBusy),
+        Err(error) => Err(error),
+    };
+    if matches!(checkpointed, Ok(Emptied::Yes)) {
+        store.sweep_what_the_checkpoint_left();
+    }
+    connection.close()?;
+    checkpointed
+}
+
+/// Whether an MVCC database's logical log grew past the engine's
+/// checkpoint threshold, or its WAL past [`WAL_FRAMES_BEFORE_TRUNCATING`].
+/// Sessions ask the keeper after every statement while it is, so the keeper
+/// reads it again before each checkpoint: the requests sent while it ran the
+/// last one would each run another.
+pub(crate) fn an_mvcc_checkpoint_is_due(connection: &turso_core::Connection) -> Result<bool> {
+    let log_past_its_bound = connection.mv_store().as_ref().is_some_and(|store| {
+        u64::try_from(store.checkpoint_threshold())
+            .is_ok_and(|threshold| store.logical_log_offset() >= threshold)
+    });
+    Ok(log_past_its_bound || connection.wal_state()?.max_frame > WAL_FRAMES_BEFORE_TRUNCATING)
+}
+
+fn write_the_rows_committed_meanwhile(
+    checkpoint: &mut MvccCheckpointWritingRowsFirst,
+) -> Result<()> {
+    let mut written = checkpoint.rows_written();
+    for _ in 0..TIMES_TO_WRITE_THE_ROWS_COMMITTED_MEANWHILE {
+        if written < ROWS_FEW_ENOUGH_TO_WRITE_WHILE_HOLDING {
+            break;
+        }
+        written = checkpoint.write_the_rows_committed_since()?;
+    }
+    Ok(())
+}
+
+fn finish_once_no_transaction_runs(
+    checkpoint: &mut MvccCheckpointWritingRowsFirst,
+    user: Option<&DatabaseUser>,
+) -> Result<Emptied> {
     let held_until = Instant::now() + TIME_TO_HOLD_NEW_TRANSACTIONS;
-    let checkpointed = loop {
+    loop {
         let ended_before = user.map(DatabaseUser::transactions_ended);
-        match connection.checkpoint(CheckpointMode::Truncate {
-            upper_bound_inclusive: None,
-        }) {
-            Ok(_) => break Ok(Emptied::Yes),
-            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => {}
-            Err(error) => break Err(error),
+        match checkpoint.finish_once_no_transaction_runs() {
+            Ok(Some(_)) => return Ok(Emptied::Yes),
+            Ok(None) => {}
+            Err(LimboError::Busy) | Err(LimboError::BusySnapshot) => return Ok(Emptied::KeptBusy),
+            Err(error) => return Err(error),
         }
         if Instant::now() >= held_until {
-            break Ok(Emptied::KeptBusy);
+            return Ok(Emptied::KeptBusy);
         }
         match (user, ended_before) {
             (Some(user), Some(ended_before)) => {
@@ -432,10 +508,7 @@ pub(crate) fn checkpoint_the_mvcc_log(
             }
             _ => std::thread::sleep(Duration::from_millis(1)),
         }
-    };
-    store.let_new_transactions_begin();
-    connection.close()?;
-    checkpointed
+    }
 }
 
 /// Copies what it can into the database file without the write lock, and
