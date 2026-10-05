@@ -23338,10 +23338,11 @@ fn a_written_value_can_be_the_moment_the_statement_runs() {
 
     // Measured: MySQL runs the moment together into a number and stores
     // 20260908170430. The engine writes the moment as text, which a number
-    // column refuses, so this is refused rather than stored as something else.
+    // column reads as a word with more after its number, so this is refused
+    // with 1265 rather than stored as something else.
     assert_eq!(
         adapter.execute_query("INSERT INTO marks (id, n) VALUES (5, NOW())"),
-        Err(FrontendErrorKind::IncorrectValue)
+        Err(FrontendErrorKind::NotAMember)
     );
     // A word too narrow for the moment is refused the way any oversized value
     // is, which is what MySQL answers 1406 for.

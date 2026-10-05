@@ -8127,6 +8127,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
                 checked_comparisons: Vec::new(),
                 row_count_parameters: Vec::new(),
             },
+            Vec::new(),
         ),
         Err(MySqlPreparedStatementError::Prepare(
             MySqlQueryError::Unsupported(message)
@@ -8159,6 +8160,7 @@ fn cleared_or_reset_in_flight_prepares_cannot_resurrect_a_statement(
                 checked_comparisons: Vec::new(),
                 row_count_parameters: Vec::new(),
             },
+            Vec::new(),
         ),
         Err(MySqlPreparedStatementError::Prepare(
             MySqlQueryError::Unsupported(message)

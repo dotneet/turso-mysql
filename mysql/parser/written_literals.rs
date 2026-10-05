@@ -7,11 +7,12 @@
 //! Only the frontend knows each column's type, so this reads the statement's
 //! literals out and leaves the frontend to hold them to their columns.
 
-use crate::{read_one_statement, ParseError, SessionSqlMode};
+use crate::{read_one_statement, statement_reads, ParseError, SessionMySqlDialect, SessionSqlMode};
 use sqlparser::ast::{
     AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName,
     ObjectNamePart, OnInsert, SetExpr, Statement, TableFactor, TableObject, UnaryOperator, Value,
 };
+use sqlparser::tokenizer::Token;
 
 /// A literal whose meaning turns on the column it is written into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +111,216 @@ pub fn literals_written_into_columns(
         _ => return Ok(None),
     };
     Ok((!columns.is_empty()).then_some(WrittenLiterals { tables, columns }))
+}
+
+/// A number or a word a statement writes straight into a column, for the
+/// frontend to write out as the whole number MySQL stores where the column
+/// holds whole numbers.
+///
+/// The engine reads a word naming a number, which is how a written number
+/// with a point reaches it, as a double before the frontend sees it, which
+/// loses the half a double puts on the other side of the point and the digits
+/// past a double's. MySQL reads each of the three exactly, by rules of their
+/// own, so the statement is read before the engine meets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueWrittenIntoAColumn {
+    pub column: WrittenColumn,
+    /// Where the number or the word stands in the statement, in bytes. A
+    /// sign written before a number stands outside it.
+    pub at: std::ops::Range<usize>,
+    pub value: WrittenValueKind,
+}
+
+/// How MySQL reads a value written straight into a column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WrittenValueKind {
+    /// A number written with an exponent, `2.5e0`, read as a double.
+    Double { digits: String, negative: bool },
+    /// A number written with a point and no exponent, `2.5`, read as a
+    /// decimal.
+    Decimal { digits: String, negative: bool },
+    /// A word in quotes.
+    Word(String),
+    /// A `?`, by its place among the statement's.
+    Bound(usize),
+}
+
+/// Reads the numbers and words a one-table `INSERT ... VALUES`, `INSERT ...
+/// SET`, upsert clause or `UPDATE` writes straight into its columns, and the
+/// table they are written into; `None` for every other statement.
+pub fn values_written_into_columns(
+    sql: &str,
+    mode: SessionSqlMode,
+) -> Result<Option<(String, Vec<ValueWrittenIntoAColumn>)>, ParseError> {
+    let read_statement = read_one_statement(sql, mode);
+    let statement = read_statement.as_ref().as_ref().map_err(Clone::clone)?;
+    let dialect = SessionMySqlDialect::new(mode);
+    let Some(placeholders) = statement_reads::tokens_with_location(&dialect, sql)
+        .map_err(|error| ParseError::Sqlparser(error.to_string()))?
+        .iter()
+        .filter(|token| matches!(&token.token, Token::Placeholder(marker) if marker == "?"))
+        .map(|token| crate::byte_offset_of_location(sql, token.span.start))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let sql = Written { sql, placeholders };
+    let mut written = Vec::new();
+    let table = match statement {
+        Statement::Insert(insert) => {
+            let TableObject::TableName(table) = &insert.table else {
+                return Ok(None);
+            };
+            let Some(table) = last_name(table) else {
+                return Ok(None);
+            };
+            for assignment in &insert.assignments {
+                note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+            }
+            if let Some(source) = insert.source.as_deref() {
+                if let SetExpr::Values(values) = source.body.as_ref() {
+                    for row in &values.rows {
+                        for (place, value) in row.iter().enumerate() {
+                            let column = if insert.columns.is_empty() {
+                                WrittenColumn::AtPlace(place)
+                            } else {
+                                match insert.columns.get(place).and_then(last_name) {
+                                    Some(name) => WrittenColumn::Named(name),
+                                    None => continue,
+                                }
+                            };
+                            if let Some((at, value)) = written_value(&sql, value) {
+                                written.push(ValueWrittenIntoAColumn { column, at, value });
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on {
+                for assignment in assignments {
+                    note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+                }
+            }
+            table
+        }
+        Statement::Update(update) if update.table.joins.is_empty() && update.from.is_none() => {
+            let TableFactor::Table { name, .. } = &update.table.relation else {
+                return Ok(None);
+            };
+            let Some(table) = last_name(name) else {
+                return Ok(None);
+            };
+            for assignment in &update.assignments {
+                note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+            }
+            table
+        }
+        _ => return Ok(None),
+    };
+    Ok((!written.is_empty()).then_some((table, written)))
+}
+
+/// A statement's text and where each of its `?` stands in it, in order.
+struct Written<'a> {
+    sql: &'a str,
+    placeholders: Vec<usize>,
+}
+
+fn note_written_value(
+    sql: &Written<'_>,
+    target: &AssignmentTarget,
+    value: &Expr,
+    written: &mut Vec<ValueWrittenIntoAColumn>,
+) {
+    let AssignmentTarget::ColumnName(column) = target else {
+        return;
+    };
+    let ([ObjectNamePart::Identifier(_)], Some(column)) = (column.0.as_slice(), last_name(column))
+    else {
+        return;
+    };
+    if let Some((at, value)) = written_value(sql, value) {
+        written.push(ValueWrittenIntoAColumn {
+            column: WrittenColumn::Named(column),
+            at,
+            value,
+        });
+    }
+}
+
+/// Reads one value written straight into a column — a number, a signed one,
+/// a word in quotes or a `?`, inside parentheses or not — and where it
+/// stands. A word is read only when it stands in the statement exactly as it
+/// reads, with no escape and no quote inside it.
+fn written_value(
+    written: &Written<'_>,
+    value: &Expr,
+) -> Option<(std::ops::Range<usize>, WrittenValueKind)> {
+    let sql = written.sql;
+    let (negative, value) = match value {
+        Expr::Nested(inner) => return written_value(written, inner),
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => (true, expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => (false, expr.as_ref()),
+        value => (false, value),
+    };
+    let Expr::Value(value) = value else {
+        return None;
+    };
+    let at = crate::byte_offset_of_location(sql, value.span.start)?
+        ..crate::byte_offset_of_location(sql, value.span.end)?;
+    let spelled = sql.get(at.clone())?;
+    let kind = match &value.value {
+        Value::Number(digits, false) if spelled == digits => {
+            if digits.contains(['e', 'E']) {
+                WrittenValueKind::Double {
+                    digits: digits.clone(),
+                    negative,
+                }
+            } else if digits.contains('.') {
+                WrittenValueKind::Decimal {
+                    digits: digits.clone(),
+                    negative,
+                }
+            } else {
+                return None;
+            }
+        }
+        Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)
+            if !negative && is_spelled_as_it_reads(spelled, word) =>
+        {
+            WrittenValueKind::Word(word.clone())
+        }
+        Value::Placeholder(marker) if marker == "?" && spelled == "?" && !negative => {
+            WrittenValueKind::Bound(
+                written
+                    .placeholders
+                    .iter()
+                    .position(|placeholder| *placeholder == at.start)?,
+            )
+        }
+        _ => return None,
+    };
+    Some((at, kind))
+}
+
+fn is_spelled_as_it_reads(spelled: &str, word: &str) -> bool {
+    let Some(quote) = spelled
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))
+    else {
+        return false;
+    };
+    spelled.len() == word.len() + 2
+        && spelled.ends_with(quote)
+        && &spelled[1..spelled.len() - 1] == word
+        && !word.contains(['\'', '"', '\\'])
 }
 
 fn note_assignment(

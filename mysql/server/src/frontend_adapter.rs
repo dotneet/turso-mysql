@@ -14256,7 +14256,11 @@ fn frontend_error_kind(error: LimboError) -> FrontendErrorKind {
             FrontendErrorKind::IncorrectTemporalValue
         }
         LimboError::Assignment(error)
-            if matches!(*error, turso_core::AssignmentError::NotAMember { .. }) =>
+            if matches!(
+                *error,
+                turso_core::AssignmentError::NotAMember { .. }
+                    | turso_core::AssignmentError::CutShort { .. }
+            ) =>
         {
             FrontendErrorKind::NotAMember
         }

@@ -81,52 +81,163 @@ pub enum WholeNumber {
 }
 
 /// Reads a word as the whole number MySQL stores for it in an integer column,
-/// or nothing where MySQL answers 1366.
-///
-/// Measured on MySQL 8.4.11 in strict mode: spaces around the number are
-/// passed over, a sign, a point and an exponent are read, and the number is
-/// rounded half away from zero exactly — `' 7.5 '` stores 8, `'-0.5'` stores
-/// -1, `'.5'` stores 1, `'2.5e0'` stores 3 and `'1e3'` stores 1000.
+/// or nothing where MySQL refuses it — 1366 for a word naming no number,
+/// 1265 for one with more after the number, as
+/// [`whole_number_mysql_reads_from`] reads them.
 pub fn whole_number_a_word_names(word: &str) -> Option<WholeNumber> {
-    let word = word.trim_matches(' ');
-    let (negative, unsigned) = match word.as_bytes().first() {
-        Some(b'-') => (true, &word[1..]),
-        Some(b'+') => (false, &word[1..]),
-        _ => (false, word),
-    };
-    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-        Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i64>().ok()?),
-        None => (unsigned, 0),
-    };
-    let (whole_digits, places) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    if whole_digits.is_empty() && places.is_empty()
-        || !whole_digits.bytes().all(|byte| byte.is_ascii_digit())
-        || !places.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
+    match whole_number_mysql_reads_from(word) {
+        WordAsWholeNumber::Number { whole, cut: false } => Some(whole),
+        _ => None,
     }
+}
+
+/// How MySQL reads a word written into a column of whole numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WordAsWholeNumber {
+    /// The word starts with no number, which MySQL answers 1366.
+    NoNumber,
+    /// The number the word starts with, rounded, and whether anything but
+    /// white space follows it, which MySQL answers 1265 once the number fits
+    /// the column.
+    Number { whole: WholeNumber, cut: bool },
+    /// A word MySQL reads by a rule not repeated here.
+    Unread,
+}
+
+/// Reads a word as MySQL reads it into a column of whole numbers.
+///
+/// Measured on MySQL 8.4.11 in strict mode: spaces and tabs before the number
+/// are passed over, where a newline or a carriage return is 1366, and spaces,
+/// tabs, newlines and carriage returns after it are passed over. Anything else
+/// after it is 1265 unless the number is past the column's range, which is
+/// 1264 — `'7x'`, `'1.5x'`, `'1,5'` and `'0x10'` are 1265 and `'1e19x'` is
+/// 1264. A sign, a point and an exponent are read, and the number is rounded
+/// half away from zero: `' 7.5 '` stores 8, `'.5'` stores 1 and `'2.5e0'`
+/// stores 3. An `e` with no digits after it is passed over, `'1e'` storing 1,
+/// and one followed by a bare sign that ends the word reads every digit as if
+/// there were no point: `'2.5e+'` stores 25 and `'12.345e-'` stores 12345.
+pub fn whole_number_mysql_reads_from(word: &str) -> WordAsWholeNumber {
+    let bytes = word.as_bytes();
+    let mut at = bytes
+        .iter()
+        .position(|byte| !matches!(byte, b' ' | b'\t'))
+        .unwrap_or(bytes.len());
+    let negative = match bytes.get(at) {
+        Some(b'-') => {
+            at += 1;
+            true
+        }
+        Some(b'+') => {
+            at += 1;
+            false
+        }
+        _ => false,
+    };
+    let whole_digits = digits_at(word, &mut at);
+    let places = if bytes.get(at) == Some(&b'.') {
+        at += 1;
+        digits_at(word, &mut at)
+    } else {
+        ""
+    };
+    if whole_digits.is_empty() && places.is_empty() {
+        return WordAsWholeNumber::NoNumber;
+    }
+    let mut exponent: i64 = 0;
+    if matches!(bytes.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        let mut exponent_is_negative = false;
+        if let Some(sign @ (b'+' | b'-')) = bytes.get(at) {
+            exponent_is_negative = *sign == b'-';
+            at += 1;
+            if at == bytes.len() {
+                return digits_read_without_their_point(negative, whole_digits, places);
+            }
+        }
+        for digit in digits_at(word, &mut at).bytes() {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i64::from(digit - b'0'));
+        }
+        if exponent_is_negative {
+            exponent = -exponent;
+        }
+    }
+    let cut = !bytes[at..]
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+    WordAsWholeNumber::Number {
+        whole: rounded_half_away_from_zero(negative, whole_digits, places, exponent),
+        cut,
+    }
+}
+
+/// The run of digits starting at `at`, moving `at` past it.
+fn digits_at<'a>(word: &'a str, at: &mut usize) -> &'a str {
+    let start = *at;
+    while word.as_bytes().get(*at).is_some_and(u8::is_ascii_digit) {
+        *at += 1;
+    }
+    &word[start..*at]
+}
+
+/// The digits of a number read whole, the point among them passed over,
+/// which is how MySQL reads a number whose exponent is a bare sign ending the
+/// word. Measured past eighteen digits MySQL answers yet another number —
+/// `'1234567890.123456789e+'` stores 1234567890123456800 — which is not
+/// repeated here.
+fn digits_read_without_their_point(
+    negative: bool,
+    whole_digits: &str,
+    places: &str,
+) -> WordAsWholeNumber {
     let written = format!("{whole_digits}{places}");
     let digits = written.trim_start_matches('0');
-    let leading_zeroes = i64::try_from(written.len() - digits.len()).ok()?;
+    if digits.len() > 18 {
+        return WordAsWholeNumber::Unread;
+    }
+    let magnitude: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits
+            .parse()
+            .expect("at most eighteen digits are a number")
+    };
+    WordAsWholeNumber::Number {
+        whole: WholeNumber::Within(if negative { -magnitude } else { magnitude }),
+        cut: false,
+    }
+}
+
+/// The number written as `whole_digits.places` times ten to `exponent`,
+/// rounded half away from zero.
+fn rounded_half_away_from_zero(
+    negative: bool,
+    whole_digits: &str,
+    places: &str,
+    exponent: i64,
+) -> WholeNumber {
+    let written = format!("{whole_digits}{places}");
+    let digits = written.trim_start_matches('0');
+    let leading_zeroes = (written.len() - digits.len()) as i64;
     // How many of `digits` stand before the point.
-    let point = i64::try_from(whole_digits.len())
-        .ok()?
+    let point = (whole_digits.len() as i64)
         .saturating_add(exponent)
         .saturating_sub(leading_zeroes);
     if digits.is_empty() || point < 0 {
-        return Some(WholeNumber::Within(0));
+        return WholeNumber::Within(0);
     }
     if point > 38 {
-        return Some(WholeNumber::Past { negative });
+        return WholeNumber::Past { negative };
     }
-    let point = usize::try_from(point).ok()?;
+    let point = point as usize;
     let whole = &digits[..point.min(digits.len())];
     let mut magnitude: i128 = if whole.is_empty() {
         0
     } else {
-        whole.parse().ok()?
+        whole.parse().expect("at most 38 digits are a number")
     };
-    magnitude *= 10_i128.pow(u32::try_from(point.saturating_sub(digits.len())).ok()?);
+    magnitude *= 10_i128.pow((point.saturating_sub(digits.len())) as u32);
     if digits
         .as_bytes()
         .get(point)
@@ -134,11 +245,7 @@ pub fn whole_number_a_word_names(word: &str) -> Option<WholeNumber> {
     {
         magnitude += 1;
     }
-    Some(WholeNumber::Within(if negative {
-        -magnitude
-    } else {
-        magnitude
-    }))
+    WholeNumber::Within(if negative { -magnitude } else { magnitude })
 }
 
 #[cfg(test)]
@@ -166,6 +273,7 @@ mod tests {
             ("1e-1", 0),
             ("15e-1", 2),
             ("007", 7),
+            ("1e", 1),
         ] {
             assert_eq!(
                 whole_number_a_word_names(word),
@@ -181,9 +289,87 @@ mod tests {
             whole_number_a_word_names("-1e40"),
             Some(WholeNumber::Past { negative: true })
         );
-        for word in ["", " ", "abc", "-", ".", "1e", "7x", "0x10", "1.2.3"] {
+        for word in ["", " ", "abc", "-", ".", "7x", "0x10", "1.2.3"] {
             assert_eq!(whole_number_a_word_names(word), None, "{word:?}");
         }
+    }
+
+    /// Every reading here was measured on MySQL 8.4.11 in strict mode, a word
+    /// written into an `INT`.
+    #[test]
+    fn a_word_is_read_into_a_whole_number_as_mysql_reads_it() {
+        let number = |whole: i128, cut: bool| WordAsWholeNumber::Number {
+            whole: WholeNumber::Within(whole),
+            cut,
+        };
+        for (word, read) in [
+            (" 7", number(7, false)),
+            ("7 ", number(7, false)),
+            ("\t7\t", number(7, false)),
+            (" \t 7 \t ", number(7, false)),
+            ("7\n", number(7, false)),
+            ("7\r", number(7, false)),
+            (" -7", number(-7, false)),
+            ("1e", number(1, false)),
+            ("1e+", number(1, false)),
+            ("1e-", number(1, false)),
+            ("1.e3", number(1000, false)),
+            ("+.5", number(1, false)),
+            ("7.", number(7, false)),
+            ("00007", number(7, false)),
+            ("1e-400", number(0, false)),
+            ("1.5e", number(2, false)),
+            ("2.5e+ ", number(3, false)),
+            ("2.5e+", number(25, false)),
+            ("2.56e+", number(256, false)),
+            ("2.5e-", number(25, false)),
+            ("-2.5e+", number(-25, false)),
+            ("0.5e+", number(5, false)),
+            ("12.345e+", number(12345, false)),
+            ("-0.4e+", number(-4, false)),
+            ("7x", number(7, true)),
+            ("7 x", number(7, true)),
+            ("7 \n x", number(7, true)),
+            ("1.5x", number(2, true)),
+            ("2.5 x", number(3, true)),
+            ("-.5x", number(-1, true)),
+            ("-0.4x", number(0, true)),
+            ("0x10", number(0, true)),
+            ("1,5", number(1, true)),
+            ("1_000", number(1, true)),
+            ("1e3x", number(1000, true)),
+            ("1e 3", number(1, true)),
+            ("1 e3", number(1, true)),
+            ("1ex", number(1, true)),
+            ("2.5e+x", number(3, true)),
+            ("7e0x", number(7, true)),
+            ("7\u{0b}", number(7, true)),
+            ("7\u{0c}", number(7, true)),
+            ("7\0", number(7, true)),
+        ] {
+            assert_eq!(whole_number_mysql_reads_from(word), read, "{word:?}");
+        }
+        for word in [
+            "", "   ", "\n7", "\r7", "\u{0b}7", "- 7", "++7", "+-7", ".", ".e3", "e3", "x7",
+            "\u{ff17}",
+        ] {
+            assert_eq!(
+                whole_number_mysql_reads_from(word),
+                WordAsWholeNumber::NoNumber,
+                "{word:?}"
+            );
+        }
+        assert_eq!(
+            whole_number_mysql_reads_from("1e400"),
+            WordAsWholeNumber::Number {
+                whole: WholeNumber::Past { negative: false },
+                cut: false
+            }
+        );
+        assert_eq!(
+            whole_number_mysql_reads_from("1234567890.123456789e+"),
+            WordAsWholeNumber::Unread
+        );
     }
 
     #[test]

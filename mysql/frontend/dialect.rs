@@ -13,8 +13,8 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, table_options_of, whole_number_a_word_names,
-    JsonNumberReading, SessionSqlMode, WholeNumber,
+    render_create_table_mysql_with_mode, table_options_of, whole_number_mysql_reads_from,
+    JsonNumberReading, SessionSqlMode, WholeNumber, WordAsWholeNumber,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -2552,13 +2552,22 @@ pub(crate) fn check_mysql_assignment(
             })?;
             continue;
         }
-        let Some(whole) = whole_number_mysql_stores(value) else {
-            return Err(AssignmentError::IncorrectType {
-                table: table_name.to_string(),
-                column: column_index + 1,
-                type_name,
+        let (whole, cut) = match whole_number_mysql_stores(value) {
+            WordAsWholeNumber::Number { whole, cut } => (whole, cut),
+            WordAsWholeNumber::NoNumber => {
+                return Err(AssignmentError::IncorrectType {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name,
+                }
+                .into());
             }
-            .into());
+            WordAsWholeNumber::Unread => {
+                return Err(LimboError::InvalidArgument(format!(
+                    "a word MySQL reads into column {} of {table_name} by a rule not repeated here",
+                    column_index + 1
+                )));
+            }
         };
         let (min, max) = integer_type.bounds();
         let stored = match whole {
@@ -2586,6 +2595,13 @@ pub(crate) fn check_mysql_assignment(
                 .into());
             }
         };
+        if cut {
+            return Err(AssignmentError::CutShort {
+                table: table_name.to_string(),
+                column: column_index + 1,
+            }
+            .into());
+        }
         if !matches!(value, Value::Numeric(Numeric::Integer(_))) {
             let stored = i64::try_from(stored).expect("an integer column's bounds fit an i64");
             rewritten.get_or_insert_with(|| values.to_vec())[column_index] =
@@ -2595,29 +2611,36 @@ pub(crate) fn check_mysql_assignment(
     Ok(rewritten)
 }
 
-/// Reads a value written to an integer column as the whole number MySQL
-/// stores, or `None` where MySQL answers 1366.
+/// Reads a value written to an integer column as MySQL reads it.
 ///
 /// Measured on MySQL 8.4.11 in strict mode: a number with a fraction is
 /// rounded half away from zero without a warning — `1.5` stores 2, `-0.5`
 /// stores -1, `'2.5'` stores 3 and `' 7.5 '` stores 8 — and so is a `DECIMAL`
-/// column's value copied in, which reaches here as the words it reads as. A
-/// word naming no number, `''` or `'abc'`, is 1366.
-fn whole_number_mysql_stores(value: &Value) -> Option<WholeNumber> {
+/// column's value copied in. The engine reads a word naming a number into an
+/// integer column's affinity before this sees it, so a word reaches here as a
+/// word only where it names no number the engine reads: `''` and `'abc'`,
+/// which are 1366, and `'7x'`, which is 1265.
+fn whole_number_mysql_stores(value: &Value) -> WordAsWholeNumber {
     match value {
-        Value::Numeric(Numeric::Integer(whole)) => Some(WholeNumber::Within(i128::from(*whole))),
+        Value::Numeric(Numeric::Integer(whole)) => WordAsWholeNumber::Number {
+            whole: WholeNumber::Within(i128::from(*whole)),
+            cut: false,
+        },
         Value::Numeric(Numeric::Float(number)) => {
             let rounded = f64::from(*number).round();
-            if rounded.abs() < 1e30 {
-                Some(WholeNumber::Within(rounded as i128))
-            } else {
-                Some(WholeNumber::Past {
-                    negative: rounded < 0.0,
-                })
+            WordAsWholeNumber::Number {
+                whole: if rounded.abs() < 1e30 {
+                    WholeNumber::Within(rounded as i128)
+                } else {
+                    WholeNumber::Past {
+                        negative: rounded < 0.0,
+                    }
+                },
+                cut: false,
             }
         }
-        Value::Text(text) => whole_number_a_word_names(text.as_str()),
-        Value::Blob(_) | Value::Null => None,
+        Value::Text(text) => whole_number_mysql_reads_from(text.as_str()),
+        Value::Blob(_) | Value::Null => WordAsWholeNumber::NoNumber,
     }
 }
 

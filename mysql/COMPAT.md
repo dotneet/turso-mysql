@@ -7102,20 +7102,51 @@ fraction (MySQL adds it as a decimal, `n + 0.5` over 1 storing 2), and an
 assignment validator does the rounding, on the record a statement is about to
 write, so every path that writes a row rounds the same way.
 
-Three differences remain, all at a value MySQL reads by a rule the record no
-longer shows. MySQL rounds a double — a number written with an exponent, a
-`DOUBLE` column copied in, a value bound as a `DOUBLE` — to the nearest even
-number at a half, `2.5e0` storing 2, and a word bound into an `INSERT`'s
-`VALUES` the same way; here each is rounded half away from zero like a
-decimal, so they differ at an exact half only. An id bound for a counted key is
-the exception and is rounded to even, as MySQL rounds it: mysql2 binding
-`100.5` writes id 100. A written negative decimal that rounds to zero is 1264 in
-an unsigned column in MySQL, `-0.4` refused where `'-0.4'` stores 0; here it
-stores 0. And a written number with a point reaches the validator as a double,
-so one with more digits than a double keeps is read as the nearest double:
-`0.49999999999999999999` becomes 0.5 and stores 1 where MySQL stores 0, and
-`9223372036854775807.4` becomes 2 to the 63rd and is 1264 in a `BIGINT` where
-MySQL stores 9223372036854775807.
+MySQL reads a value by what it was written as, and three kinds round apart.
+Measured on 8.4.11: a double — a number written with an exponent, a value
+bound as a `DOUBLE` — is rounded to the nearest even number at a half, `2.5e0`
+storing 2 and `3.5e0` 4, and `-0.4e0` storing 0 in an unsigned column; a
+number written with a point is a decimal, read exactly and rounded half away
+from zero, `0.49999999999999999999` storing 0 and `9223372036854775807.4`
+9223372036854775807 in a `BIGINT`, and one below zero is 1264 in an unsigned
+column even where it rounds to zero, `-0.4` and `-0.00001` alike; and a word
+is rounded half away from zero too, but `'-0.4'` stores 0 in an unsigned
+column. A word bound for a `?` is read as a written word, except that one
+below zero is 1264 in an unsigned column as a decimal is. Each holds in
+`VALUES`, `SET`, an upsert clause and an `UPDATE` alike, and for a counted
+key. The engine reads a word naming a number into such a column as a double
+before the check sees it, and a written number with a point reaches it as
+such a word, so the three are told apart before the engine meets them: a
+number or a word written straight into a column of whole numbers is written
+out as the whole number MySQL stores for it, and a double or a word bound for
+one is bound as that whole number. An id bound for a counted key is the one
+place a bound word is read as a double, and is rounded to even, as MySQL
+rounds it: mysql2 binding `100.5` or `'200.5'` writes id 100 or 200.
+
+A word with more after its number is 1265, `Data truncated for column`, unless
+the number is past the column's range, which is 1264 first. Measured on
+8.4.11 in strict mode: spaces and tabs before the number are passed over and a
+newline or a carriage return there is 1366; spaces, tabs, newlines and
+carriage returns after it are passed over and anything else is 1265 — `'7x'`,
+`'1.5x'`, `'1,5'`, `'0x10'` and `'-0.4x'` (into an unsigned column too) are
+1265, `'999x'` in a `TINYINT` and `'-0.5x'` in an unsigned column are 1264, and
+`'x7'`, `'- 7'` and `'.e3'` are 1366. An `e` with no digits after it is passed
+over, `'1e'` storing 1, and one followed by a bare sign that ends the word
+reads every digit as if there were no point, `'2.5e+'` storing 25 and
+`'12.345e-'` 12345.
+
+Some differences remain, each at a value that reaches the check without what
+it was written as. A double worked out by the engine — a `DOUBLE` column
+copied in, `n * 2.5e0` in a `SET` — is rounded half away from zero, where
+MySQL rounds it to even, so the two differ at an exact half only. A `DECIMAL`
+or a sum with a written fraction below zero that rounds to zero stores 0 in an
+unsigned column where MySQL answers 1264. A column of words copied in reaches
+the check as the engine read it, so `'0.49999999999999999999'` stores 1 and
+`'\n7'` stores 7 where MySQL stores 0 and answers 1366; a written word with an
+escape in it, `'\n7'` among them, is read the same way. A word bound with a
+tab before its number stores the number, where MySQL answers 1366 for a bound
+one. And a word whose bare exponent sign follows more than eighteen digits is
+refused, MySQL reading it by a rule of its own.
 
 `TINYINT UNSIGNED`, `SMALLINT UNSIGNED`, `MEDIUMINT UNSIGNED` and
 `INT UNSIGNED` are taken. The sign is kept as part of the declared type name —

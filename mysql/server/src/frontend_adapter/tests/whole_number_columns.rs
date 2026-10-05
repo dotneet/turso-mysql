@@ -316,3 +316,272 @@ fn an_id_bound_for_a_counted_key_is_rounded_half_to_even() {
         whole(&[100, 200, 302, 400, 401])
     );
 }
+
+/// A number written with an exponent is a double, rounded half to even, in
+/// `VALUES`, `SET`, an upsert clause and an `UPDATE` alike; one written with a
+/// point is a decimal, rounded half away from zero; a word is read as a word.
+#[test]
+fn a_written_double_is_rounded_half_to_even_and_a_decimal_half_away_from_zero() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE r (id INT PRIMARY KEY, i INT, u INT UNSIGNED, s VARCHAR(10))",
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO r (id, i) VALUES (1, 2.5e0), (2, 3.5e0), (3, -2.5e0), (4, 2.5), (5, '2.5'), (6, '2.5e0'), (7, (1.5E0)), (8, - 2.5)",
+    );
+    run(&mut adapter, "INSERT INTO r SET id = 9, i = 4.5e0");
+    run(&mut adapter, "INSERT INTO r VALUES (10, 0.5e0, 1.5e0, 'x')");
+    assert_eq!(
+        column(&mut adapter, "SELECT i FROM r ORDER BY id"),
+        whole(&[2, 4, -2, 3, 3, 3, 2, -3, 4, 0])
+    );
+    assert_eq!(
+        column(&mut adapter, "SELECT u FROM r WHERE id = 10"),
+        whole(&[2])
+    );
+    run(&mut adapter, "UPDATE r SET i = 4.5e0 WHERE id = 1");
+    run(
+        &mut adapter,
+        "INSERT INTO r (id, i) VALUES (2, 0) ON DUPLICATE KEY UPDATE i = 6.5e0",
+    );
+    assert_eq!(
+        column(
+            &mut adapter,
+            "SELECT i FROM r WHERE id IN (1, 2) ORDER BY id"
+        ),
+        whole(&[4, 6])
+    );
+
+    // A counted key reads a double the same way.
+    run(
+        &mut adapter,
+        "CREATE TABLE c (id INT AUTO_INCREMENT PRIMARY KEY, n INT)",
+    );
+    assert_eq!(
+        run(&mut adapter, "INSERT INTO c (id, n) VALUES (2.5e0, 1)").last_insert_id,
+        2
+    );
+    assert_eq!(
+        run(&mut adapter, "INSERT INTO c (id, n) VALUES ('4.5e0', 1)").last_insert_id,
+        5
+    );
+}
+
+/// A double bound for a column of whole numbers is rounded half to even, and
+/// a word bound for one is read as a written word.
+#[test]
+fn a_bound_double_is_rounded_half_to_even() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE b (id INT PRIMARY KEY, i INT, u INT UNSIGNED)",
+    );
+    let wrote = |adapter: &mut Adapter, sql: &str, values: &[Bound<'_>]| match prepared(
+        adapter, sql, values,
+    ) {
+        Ok(PreparedStatementExecutionResult::Ok(result)) => result.affected_rows,
+        other => panic!("{sql} answered {other:?}"),
+    };
+    wrote(
+        &mut adapter,
+        "INSERT INTO b (id, i) VALUES (1, ?), (2, ?), (3, ?), (4, ?), (5, ?), (6, ?)",
+        &[
+            Bound::Real(2.5),
+            Bound::Real(-2.5),
+            Bound::Word("2.5"),
+            Bound::Word("-2.5"),
+            Bound::Word(" 4.5 "),
+            Bound::Word("0.49999999999999999999"),
+        ],
+    );
+    wrote(
+        &mut adapter,
+        "INSERT INTO b SET id = 7, i = ?",
+        &[Bound::Real(2.5)],
+    );
+    assert_eq!(
+        column(&mut adapter, "SELECT i FROM b ORDER BY id"),
+        whole(&[2, -2, 3, -3, 5, 0, 2])
+    );
+    wrote(
+        &mut adapter,
+        "UPDATE b SET i = ? WHERE id = 1",
+        &[Bound::Real(4.5)],
+    );
+    wrote(
+        &mut adapter,
+        "UPDATE b SET i = ? WHERE id = 2",
+        &[Bound::Word("4.5")],
+    );
+    wrote(
+        &mut adapter,
+        "INSERT INTO b (id, i) VALUES (3, 0) ON DUPLICATE KEY UPDATE i = ?",
+        &[Bound::Real(6.5)],
+    );
+    wrote(
+        &mut adapter,
+        "INSERT INTO b (id, i) VALUES (4, 0) ON DUPLICATE KEY UPDATE i = ?",
+        &[Bound::Word("6.5")],
+    );
+    assert_eq!(
+        column(&mut adapter, "SELECT i FROM b WHERE id <= 4 ORDER BY id"),
+        whole(&[4, 5, 6, 7])
+    );
+}
+
+/// A number written with a point is a decimal: below zero it is 1264 in an
+/// unsigned column even where it rounds to zero, and it is read exactly, past
+/// the digits a double keeps. A word naming such a number stores 0 there, and
+/// a bound word is 1264 as the written number is.
+#[test]
+fn a_decimal_below_zero_is_out_of_range_for_an_unsigned_column() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE n (id INT PRIMARY KEY, i INT, u INT UNSIGNED, tu TINYINT UNSIGNED, b BIGINT)",
+    );
+    for sql in [
+        "INSERT INTO n (id, u) VALUES (1, -0.4)",
+        "INSERT INTO n (id, tu) VALUES (1, -0.00001)",
+        "INSERT INTO n SET id = 1, u = -0.4",
+    ] {
+        assert_eq!(
+            adapter.execute_query(sql),
+            Err(FrontendErrorKind::OutOfRange),
+            "{sql}"
+        );
+    }
+    run(
+        &mut adapter,
+        "INSERT INTO n (id, i, u, tu) VALUES (1, -0.4, '-0.4', -0.4e0), (2, 0.49999999999999999999, -0.0, -0)",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT i, u, tu FROM n ORDER BY id"),
+        vec![whole(&[0, 0, 0]), whole(&[0, 0, 0])]
+    );
+    run(
+        &mut adapter,
+        "INSERT INTO n (id, b) VALUES (3, 9223372036854775807.4), (4, '0.49999999999999999999')",
+    );
+    assert_eq!(
+        column(&mut adapter, "SELECT b FROM n WHERE id >= 3 ORDER BY id"),
+        whole(&[9_223_372_036_854_775_807, 0])
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE n SET u = -0.4 WHERE id = 1"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    assert_eq!(
+        run(&mut adapter, "UPDATE n SET u = -0.4 WHERE id = 100").affected_rows,
+        0
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO n (id, i) VALUES (1, 0) ON DUPLICATE KEY UPDATE u = -0.4"),
+        Err(FrontendErrorKind::OutOfRange)
+    );
+    for (bound, refused) in [
+        (Bound::Word("-0.4"), Some(FrontendErrorKind::OutOfRange)),
+        (Bound::Word(" -0.1"), Some(FrontendErrorKind::OutOfRange)),
+        (Bound::Word("-0"), None),
+        (Bound::Real(-0.4), None),
+    ] {
+        let answered = prepared(&mut adapter, "UPDATE n SET u = ? WHERE id = 1", &[bound]);
+        match refused {
+            Some(kind) => assert_eq!(answered.err(), Some(kind)),
+            None => assert!(answered.is_ok(), "{answered:?}"),
+        }
+    }
+}
+
+/// A word with more after its number is 1265, unless the number is past the
+/// column's range, which is 1264; a word starting with no number is 1366.
+#[test]
+fn a_word_with_more_after_its_number_is_data_truncated() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE w (id INT PRIMARY KEY, i INT, t TINYINT, u INT UNSIGNED, s VARCHAR(30))",
+    );
+    for (sql, refused) in [
+        (
+            "INSERT INTO w (id, i) VALUES (1, '7x')",
+            FrontendErrorKind::NotAMember,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '2.5 x')",
+            FrontendErrorKind::NotAMember,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '1,5')",
+            FrontendErrorKind::NotAMember,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '0x10')",
+            FrontendErrorKind::NotAMember,
+        ),
+        (
+            "INSERT INTO w (id, u) VALUES (1, '-0.4x')",
+            FrontendErrorKind::NotAMember,
+        ),
+        (
+            "INSERT INTO w (id, t) VALUES (1, '999x')",
+            FrontendErrorKind::OutOfRange,
+        ),
+        (
+            "INSERT INTO w (id, u) VALUES (1, '-0.5x')",
+            FrontendErrorKind::OutOfRange,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '1e19x')",
+            FrontendErrorKind::OutOfRange,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, 'x7')",
+            FrontendErrorKind::IncorrectValue,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '- 7')",
+            FrontendErrorKind::IncorrectValue,
+        ),
+        (
+            "INSERT INTO w (id, i) VALUES (1, '.e3')",
+            FrontendErrorKind::IncorrectValue,
+        ),
+    ] {
+        assert_eq!(adapter.execute_query(sql), Err(refused), "{sql}");
+    }
+    run(
+        &mut adapter,
+        "INSERT INTO w (id, i) VALUES (1, '1e'), (2, '1.e3'), (3, '2.5e+'), (4, '12.345e-'), (5, '\\t7\\t'), (6, '7.')",
+    );
+    assert_eq!(
+        column(&mut adapter, "SELECT i FROM w ORDER BY id"),
+        whole(&[1, 1000, 25, 12345, 7, 7])
+    );
+    assert_eq!(
+        adapter.execute_query("UPDATE w SET i = '7x' WHERE id = 1"),
+        Err(FrontendErrorKind::NotAMember)
+    );
+    assert_eq!(
+        adapter
+            .execute_query("INSERT INTO w (id, i) VALUES (1, 0) ON DUPLICATE KEY UPDATE i = '7x'"),
+        Err(FrontendErrorKind::NotAMember)
+    );
+    run(&mut adapter, "INSERT INTO w (id, s) VALUES (10, '7x')");
+    assert_eq!(
+        adapter.execute_query("INSERT INTO w (id, i) SELECT 11, s FROM w WHERE id = 10"),
+        Err(FrontendErrorKind::NotAMember)
+    );
+    assert_eq!(
+        prepared(
+            &mut adapter,
+            "INSERT INTO w (id, i) VALUES (12, ?)",
+            &[Bound::Word("7x")]
+        )
+        .err(),
+        Some(FrontendErrorKind::NotAMember)
+    );
+}

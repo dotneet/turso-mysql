@@ -41,6 +41,10 @@ pub enum AssignmentError {
     /// A value written to a document column was not a document.
     #[error("value is not a document for column {table}.{column}")]
     NotADocument { table: String, column: usize },
+    /// A value held more than its column's type keeps, the rest of it read
+    /// past and lost.
+    #[error("value was cut short for column {table}.{column}")]
+    CutShort { table: String, column: usize },
 }
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]

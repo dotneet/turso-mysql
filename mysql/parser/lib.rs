@@ -117,7 +117,8 @@ use translate::{
     translate_update, RenderedSelect, SelectRenderContext,
 };
 pub use written_literals::{
-    literals_written_into_columns, ColumnLiteral, WrittenColumn, WrittenLiterals,
+    literals_written_into_columns, values_written_into_columns, ColumnLiteral,
+    ValueWrittenIntoAColumn, WrittenColumn, WrittenLiterals, WrittenValueKind,
 };
 
 pub use account_admin::{
@@ -278,7 +279,8 @@ pub use written_bytes::{
     base64_length, crc32, first_byte, first_character_code, quoted_for_sql, to_base64,
 };
 pub use written_number::{
-    read_written_number, whole_number_a_word_names, WholeNumber, WrittenNumber,
+    read_written_number, whole_number_a_word_names, whole_number_mysql_reads_from, WholeNumber,
+    WordAsWholeNumber, WrittenNumber,
 };
 pub use written_value::WrittenValue;
 pub use xorm_version_test::{xorm_mariadb_test_answer, xorm_mariadb_test_span};

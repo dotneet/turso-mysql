@@ -10793,3 +10793,98 @@ fn alter_table_force_names_its_table() {
         assert_eq!(table_forced(sql, mode), None, "{sql}");
     }
 }
+
+/// The numbers, words and `?`s a statement writes straight into a column are
+/// read with where each stands, so the frontend can write them out as the
+/// whole numbers MySQL stores. A sign stays outside the number it stands
+/// before, and a word written with an escape is not read.
+#[test]
+fn values_written_straight_into_columns_are_read_with_where_they_stand() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO t (a, b, c, d) VALUES (2.5e0, -0.4, ' 7.5 ', ?), ((1.5), 'it''s', 7, x) ON DUPLICATE KEY UPDATE a = 1E3";
+    let (table, written) = values_written_into_columns(sql, mode).unwrap().unwrap();
+    assert_eq!(table, "t");
+    let read = written
+        .iter()
+        .map(|value| {
+            (
+                value.column.clone(),
+                &sql[value.at.clone()],
+                value.value.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let named = |name: &str| WrittenColumn::Named(name.to_owned());
+    assert_eq!(
+        read,
+        vec![
+            (
+                named("a"),
+                "2.5e0",
+                WrittenValueKind::Double {
+                    digits: "2.5e0".to_owned(),
+                    negative: false
+                }
+            ),
+            (
+                named("b"),
+                "0.4",
+                WrittenValueKind::Decimal {
+                    digits: "0.4".to_owned(),
+                    negative: true
+                }
+            ),
+            (
+                named("c"),
+                "' 7.5 '",
+                WrittenValueKind::Word(" 7.5 ".to_owned())
+            ),
+            (named("d"), "?", WrittenValueKind::Bound(0)),
+            (
+                named("a"),
+                "1.5",
+                WrittenValueKind::Decimal {
+                    digits: "1.5".to_owned(),
+                    negative: false
+                }
+            ),
+            (
+                named("a"),
+                "1E3",
+                WrittenValueKind::Double {
+                    digits: "1E3".to_owned(),
+                    negative: false
+                }
+            ),
+        ]
+    );
+
+    let sql = "UPDATE t SET a = ?, b = '2.5' WHERE c = ?";
+    let (_, written) = values_written_into_columns(sql, mode).unwrap().unwrap();
+    assert_eq!(
+        written
+            .iter()
+            .map(|value| value.value.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            WrittenValueKind::Bound(0),
+            WrittenValueKind::Word("2.5".to_owned())
+        ]
+    );
+    let (_, written) = values_written_into_columns("INSERT INTO t VALUES (1.5)", mode)
+        .unwrap()
+        .unwrap();
+    assert_eq!(written[0].column, WrittenColumn::AtPlace(0));
+    for sql in [
+        "INSERT INTO t (a) VALUES (1)",
+        "INSERT INTO t (a) SELECT 1.5",
+        "UPDATE t JOIN u ON t.id = u.id SET t.a = 1.5",
+        "DELETE FROM t WHERE a = 1.5",
+    ] {
+        assert_eq!(
+            values_written_into_columns(sql, mode).unwrap(),
+            None,
+            "{sql}"
+        );
+    }
+}

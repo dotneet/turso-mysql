@@ -1286,6 +1286,9 @@ struct PreparedStatement {
     /// reprepare happened, which is where MySQL returns a `?` column to its
     /// generic type.
     reprepares_at_last_refresh: u64,
+    /// The parameters the statement writes straight into a column of whole
+    /// numbers other than the one the table counts.
+    whole_number_parameters: Vec<WholeNumberParameter>,
     /// Whether an execution has bound a number where a JSON reading is
     /// compared with a word or looked in for a document.
     ///
@@ -1299,6 +1302,13 @@ struct PreparedStatement {
     select_parameter_readings: Option<SelectParameterReadings>,
     #[cfg(test)]
     metadata_rebuilds: usize,
+}
+
+/// A parameter a statement writes straight into a column of whole numbers.
+#[derive(Debug, Clone, Copy)]
+struct WholeNumberParameter {
+    ordinal: usize,
+    unsigned: bool,
 }
 
 struct SelectParameterReadings {
@@ -2337,6 +2347,10 @@ impl MySqlConnection {
                 Vec::new(),
             ),
         };
+        let whole_number_parameters = match execution_plan {
+            PreparedExecutionPlan::Select { .. } => Vec::new(),
+            _ => self.parameters_written_into_whole_numbers(sql),
+        };
         self.commit_prepared_statement(
             reservation,
             statement,
@@ -2344,10 +2358,12 @@ impl MySqlConnection {
             result_column_type_metadata,
             static_result_metadata,
             execution_plan,
+            whole_number_parameters,
         )?;
         Ok(metadata)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_prepared_statement(
         &self,
         mut reservation: PreparedStatementReservation,
@@ -2356,6 +2372,7 @@ impl MySqlConnection {
         result_column_type_metadata: Vec<MySqlPreparedResultColumnTypeMetadata>,
         static_result_projections: Vec<StaticSelectProjectionMetadata>,
         execution_plan: PreparedExecutionPlan,
+        whole_number_parameters: Vec<WholeNumberParameter>,
     ) -> std::result::Result<(), MySqlPreparedStatementError> {
         let mut registry = self
             .prepared_statements
@@ -2397,6 +2414,7 @@ impl MySqlConnection {
                 static_result_projections,
                 execution_plan,
                 time_zone_offset_at_prepare: self.time_zone_offset_seconds(),
+                whole_number_parameters,
                 bound_a_number_to_a_json_reading: false,
                 select_parameter_readings: None,
                 #[cfg(test)]
@@ -3020,6 +3038,8 @@ impl MySqlConnection {
         sql: &str,
     ) -> std::result::Result<(Option<Statement>, PreparedExecutionPlan), MySqlPreparedStatementError>
     {
+        let numbers_written_out = self.numbers_written_as_whole_numbers(sql);
+        let sql = numbers_written_out.as_deref().unwrap_or(sql);
         let mode = self.parser_mode();
         let (translated, column_types, table_definition) =
             match self.parse_checked_dml_translation(sql, mode) {
@@ -3709,7 +3729,10 @@ impl MySqlConnection {
         ) {
             values
         } else {
-            written_values = utf8_bytes_as_words(values);
+            written_values = bound_as_whole_numbers(
+                utf8_bytes_as_words(values),
+                &prepared.whole_number_parameters,
+            );
             &written_values
         };
 
@@ -7432,6 +7455,115 @@ impl MySqlConnection {
             .map_err(mysql_query_parse_error)
     }
 
+    /// Writes each number and word a statement writes straight into a column
+    /// of whole numbers as the whole number MySQL stores for it, or `None`
+    /// where that changes nothing.
+    ///
+    /// The engine reads a word naming a number into such a column as a
+    /// double before the frontend's check sees it, and a number written with
+    /// a point reaches it as such a word, so the check could not tell them
+    /// apart. Measured on MySQL 8.4.11: a number written with an exponent is
+    /// read as a double and rounded half to even, `2.5e0` storing 2 and
+    /// `3.5e0` 4; one written with a point is read as a decimal, exactly, and
+    /// rounded half away from zero, `2.5` storing 3 and
+    /// `0.49999999999999999999` 0, and one below zero is 1264 in an unsigned
+    /// column even where it rounds to zero, `-0.4`; and a word is read by
+    /// [`turso_mysql_parser::whole_number_mysql_reads_from`], `'-0.4'`
+    /// storing 0 in an unsigned column. A word with more after its number is
+    /// left for the check, which refuses it.
+    fn numbers_written_as_whole_numbers(&self, sql: &str) -> Option<String> {
+        let mut written = self.values_written_into_whole_numbers(sql);
+        written.sort_by_key(|(value, _)| std::cmp::Reverse(value.at.start));
+        let mut rewritten = sql.to_owned();
+        let mut changed = false;
+        for (value, column) in &written {
+            let unsigned = column.type_name().ends_with("UNSIGNED");
+            let Some(whole) = whole_number_written_for(&value.value, unsigned) else {
+                continue;
+            };
+            if rewritten[value.at.clone()] != whole {
+                rewritten.replace_range(value.at.clone(), &whole);
+                changed = true;
+            }
+        }
+        changed.then_some(rewritten)
+    }
+
+    /// The `?`s a statement writes straight into a column of whole numbers
+    /// the table does not count, which [`bound_as_whole_numbers`] reads.
+    fn parameters_written_into_whole_numbers(&self, sql: &str) -> Vec<WholeNumberParameter> {
+        self.values_written_into_whole_numbers(sql)
+            .into_iter()
+            .filter_map(|(value, column)| match value.value {
+                turso_mysql_parser::WrittenValueKind::Bound(ordinal)
+                    if !column.extra().eq_ignore_ascii_case("AUTO_INCREMENT") =>
+                {
+                    Some(WholeNumberParameter {
+                        ordinal,
+                        unsigned: column.type_name().ends_with("UNSIGNED"),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Each value a statement writes straight into a column of whole numbers
+    /// the engine keeps as an integer, with that column.
+    fn values_written_into_whole_numbers(
+        &self,
+        sql: &str,
+    ) -> Vec<(
+        turso_mysql_parser::ValueWrittenIntoAColumn,
+        MySqlColumnMetadata,
+    )> {
+        let Some((table, written)) =
+            turso_mysql_parser::values_written_into_columns(sql, self.parser_mode())
+                .ok()
+                .flatten()
+        else {
+            return Vec::new();
+        };
+        // A whole number written as a word reads the same either way, and a
+        // word the check refuses is left to it; reading the table's columns
+        // is spent only on a value that could come out otherwise.
+        let written = written
+            .into_iter()
+            .filter(|value| match &value.value {
+                turso_mysql_parser::WrittenValueKind::Word(word) => {
+                    word.parse::<i64>().is_err()
+                        && matches!(
+                            turso_mysql_parser::whole_number_mysql_reads_from(word),
+                            turso_mysql_parser::WordAsWholeNumber::Number { cut: false, .. }
+                        )
+                }
+                _ => true,
+            })
+            .collect::<Vec<_>>();
+        if written.is_empty() {
+            return Vec::new();
+        }
+        let Some(columns) = MySqlTableName::parse(&table)
+            .ok()
+            .and_then(|table| self.list_shared_columns(&table).ok())
+        else {
+            return Vec::new();
+        };
+        written
+            .into_iter()
+            .filter_map(|value| {
+                let column = match &value.column {
+                    turso_mysql_parser::WrittenColumn::Named(name) => columns
+                        .iter()
+                        .find(|column| column.name().eq_ignore_ascii_case(name)),
+                    turso_mysql_parser::WrittenColumn::AtPlace(place) => columns.get(*place),
+                }?;
+                (is_integer_type(column.type_name()) && column.type_name() != "BIGINT UNSIGNED")
+                    .then(|| (value, column.clone()))
+            })
+            .collect()
+    }
+
     /// Writes out the column list an `INSERT INTO t VALUES (...)` leaves off.
     ///
     /// Measured on MySQL 8.4.11: the form means every column of the table, in
@@ -10371,6 +10503,8 @@ impl MySqlConnection {
     }
 
     pub fn execute(&self, sql: &str) -> Result<()> {
+        let numbers_written_out = self.numbers_written_as_whole_numbers(sql);
+        let sql = numbers_written_out.as_deref().unwrap_or(sql);
         self.refuse_an_upsert_answered_otherwise(sql, self.parser_mode())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
         self.refuse_literals_their_columns_store_otherwise(sql, self.parser_mode())
@@ -10457,6 +10591,14 @@ impl MySqlConnection {
             Some(statement) => {
                 written_out = statement;
                 written_out.as_str()
+            }
+            None => sql,
+        };
+        let numbers_written_out;
+        let sql = match self.numbers_written_as_whole_numbers(sql) {
+            Some(statement) => {
+                numbers_written_out = statement;
+                numbers_written_out.as_str()
             }
             None => sql,
         };
@@ -13237,6 +13379,45 @@ impl MySqlConnection {
     }
 }
 
+/// The whole number to write in place of a value written into a column of
+/// whole numbers, as [`MySqlConnection::numbers_written_as_whole_numbers`]
+/// describes; a number's sign stays where it was written. `None` leaves the
+/// value as it was written, for the column's check to answer.
+fn whole_number_written_for(
+    value: &turso_mysql_parser::WrittenValueKind,
+    unsigned: bool,
+) -> Option<String> {
+    use turso_mysql_parser::{WholeNumber, WordAsWholeNumber, WrittenValueKind};
+    match value {
+        WrittenValueKind::Double { digits, .. } => {
+            let rounded = digits.parse::<f64>().ok()?.round_ties_even();
+            (rounded < 9.0e18).then(|| (rounded as i64).to_string())
+        }
+        WrittenValueKind::Decimal { digits, negative } => {
+            let WholeNumber::Within(magnitude) =
+                turso_mysql_parser::whole_number_a_word_names(digits)?
+            else {
+                return None;
+            };
+            let below_zero = *negative && digits.bytes().any(|digit| matches!(digit, b'1'..=b'9'));
+            if magnitude == 0 && below_zero && unsigned {
+                return Some("1".to_owned());
+            }
+            i64::try_from(magnitude).ok().map(|whole| whole.to_string())
+        }
+        WrittenValueKind::Word(word) => {
+            match turso_mysql_parser::whole_number_mysql_reads_from(word) {
+                WordAsWholeNumber::Number {
+                    whole: WholeNumber::Within(whole),
+                    cut: false,
+                } => i64::try_from(whole).ok().map(|whole| whole.to_string()),
+                _ => None,
+            }
+        }
+        WrittenValueKind::Bound(_) => None,
+    }
+}
+
 /// The bound values with each id bound for a counted column as a double or
 /// a word put into the whole number MySQL stores, or `None` where every id
 /// was bound as one already.
@@ -15633,6 +15814,60 @@ fn read_table_names(translated: &TranslatedDml) -> Vec<String> {
 /// A column of bytes turns the word back into the same bytes, so what lands
 /// there is unchanged. A `SELECT` keeps them bytes: `SELECT ?` answers a
 /// `BLOB`, and a comparison takes bytes only against a column of bytes.
+/// The bound values with each one bound for a column of whole numbers put
+/// into the whole number MySQL stores for it.
+///
+/// The engine would read a bound double, and a bound word naming a number, as
+/// a double whose half the column's check rounds away from zero. Measured on
+/// MySQL 8.4.11 through mysql2, in `VALUES`, `SET` and an upsert clause
+/// alike: a double is rounded half to even, `2.5` storing 2 and `-0.4` 0 in
+/// an unsigned column; a word is read as a written word is, `'2.5'` storing 3
+/// and `'0.49999999999999999999'` 0, but one below zero is 1264 in an
+/// unsigned column even where it rounds to zero, `'-0.4'` and `' -0.1'` alike.
+/// A word with more after its number, or with a tab before it, which MySQL
+/// reads otherwise when it is bound, is left as it was bound.
+fn bound_as_whole_numbers(
+    values: Vec<MySqlPreparedValue>,
+    parameters: &[WholeNumberParameter],
+) -> Vec<MySqlPreparedValue> {
+    let mut values = values;
+    for parameter in parameters {
+        let Some(value) = values.get_mut(parameter.ordinal) else {
+            continue;
+        };
+        let whole = match value {
+            MySqlPreparedValue::Real(number) if number.is_finite() => {
+                let rounded = number.round_ties_even();
+                (rounded.abs() < 9.0e18).then_some(rounded as i64)
+            }
+            MySqlPreparedValue::Text(word) if !word.trim_start_matches(' ').starts_with('\t') => {
+                match turso_mysql_parser::whole_number_mysql_reads_from(word) {
+                    turso_mysql_parser::WordAsWholeNumber::Number {
+                        whole: turso_mysql_parser::WholeNumber::Within(whole),
+                        cut: false,
+                    } => {
+                        let below_zero = word.trim_start_matches(' ').starts_with('-')
+                            && word.split(['e', 'E']).next().is_some_and(|mantissa| {
+                                mantissa.bytes().any(|digit| matches!(digit, b'1'..=b'9'))
+                            });
+                        if whole == 0 && below_zero && parameter.unsigned {
+                            Some(-1)
+                        } else {
+                            i64::try_from(whole).ok()
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(whole) = whole {
+            *value = MySqlPreparedValue::Integer(whole);
+        }
+    }
+    values
+}
+
 fn utf8_bytes_as_words(values: &[MySqlPreparedValue]) -> Vec<MySqlPreparedValue> {
     values
         .iter()
