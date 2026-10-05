@@ -1908,7 +1908,9 @@ subquery anywhere but a `WHERE`.
 An `UPDATE` may name the rows it changes through a join —
 `UPDATE a JOIN b ON a.id = b.a_id SET a.n = 0` — and the join is written the
 same way, as a subquery answering the target's own rowids. Every assignment
-names the table it changes, and they all have to name the same one. Refused:
+names the table it changes, and they all have to name the same one; a value
+may read that table's own columns, named through it or not — `SET a.n = a.n +
+1` reads the row being changed, measured on 8.4.11. Refused:
 an unqualified assignment target, which MySQL resolves against the joined
 tables and calls ambiguous when both carry the name; a value naming another
 table, which MySQL takes from whichever row the join happened to find —
@@ -3094,16 +3096,33 @@ measured on 8.4.11 and matched after a column is added to the table it copies fr
 instead of failing the statement — the engine's own `OR IGNORE`. Measured on
 8.4.11 over a table already holding row 1: inserting row 1 again leaves the
 stored row alone and counts 0, and a two-row statement where only the second is
-new counts 1. The engine answers the same for both. MySQL also raises warning
-1062, ``Duplicate entry '1' for key 't.PRIMARY'``, for each row it skips that
-way, and none is raised here; a row skipped for a foreign key does raise its
-warning (see below).
+new counts 1. The engine answers the same for both. `INSERT IGNORE ... SELECT`
+is taken the same way, with its columns named or not, but into a table that
+counts its own ids (see TODO.md).
+
+Each row skipped that way raises warning 1062, as MySQL raises it — measured
+on 8.4.11 and matched: one warning a row, in the order the rows were skipped,
+naming the key by its table and its name, `PRIMARY` for the primary key, and
+the row's value for it, the values of a key over several columns joined by
+`-` — ``Duplicate entry 'a-1' for key 'k.uk_sn'``. The value is written as the
+column holds it: a word as the row spelled it, `'abc'` against a stored
+`'Abc'`; a day, a moment and a `TIME` in their own form, `'10:00'` as
+`10:00:00`; a `DECIMAL` to its scale, `1.50`; a double as MySQL writes one,
+`22500000000`; a byte past printable ASCII as `\xFF`; and the whole cut at 64
+characters. The engine notes each row its `OR IGNORE` skips over a key, and
+the frontend names the key and writes the warning. A row skipped for a foreign
+key raises its own warning (see below); the two kinds are listed with every
+duplicate after every refused row, where MySQL lists them in row order, which
+differs only in a statement that meets both.
 
 `UPDATE IGNORE` is taken the same way, as the engine's `UPDATE OR IGNORE`:
 measured on 8.4.11 and matched, a row whose new key collides is left as it
-stood and the rows after it are updated — `SET u = u + 1` over 1, 2, 3 leaves
-1, 2, 4 — and so is one a foreign key refuses (see below). It is refused over
-a join, and a `NULL` written with it is refused as `INSERT IGNORE`'s is.
+stood, warned about with 1062 as above, and the rows after it are updated —
+`SET u = u + 1` over 1, 2, 3 leaves 1, 2, 4 — and so is one a foreign key
+refuses (see below). Over a join it is taken too, and changes the rows the
+join finds the way a joined `UPDATE` does: `UPDATE IGNORE k JOIN j ON j.kid =
+k.id SET k.u = 50` over two matching rows that would both take 50 leaves both
+and warns twice. A `NULL` written with it is refused as `INSERT IGNORE`'s is.
 `DELETE IGNORE` is taken as well; a foreign key is what it ignores.
 
 What MySQL's IGNORE also does is coerce a value it would otherwise refuse, and
@@ -6376,10 +6395,10 @@ an `ON UPDATE CASCADE` changes each child as InnoDB's read of the
 child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
-Around `IGNORE`, MySQL also warns 1062 for each row it skips as a duplicate,
-which is not done here, so a statement skipping duplicates beside rows a
-foreign key refuses counts fewer warnings; `INSERT IGNORE ... SELECT` and a
-joined `UPDATE IGNORE` stay refused; and a NULL that `IGNORE` would coerce
+Around `IGNORE`, a statement skipping duplicates beside rows a foreign key
+refuses lists the 1062 warnings after the 1452 ones rather than in row order;
+`INSERT IGNORE ... SELECT` into a table counting its own ids stays refused; and
+a NULL that `IGNORE` would coerce
 into a `NOT NULL` column is refused where it is written and skips the row
 where an expression yields it. A key `ALTER TABLE` adds without a name is
 numbered after the keys written without one, where MySQL numbers it past the

@@ -3766,6 +3766,8 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_checked_row_by_row: AtomicBool::new(false),
             foreign_key_refusals: crate::sync::Mutex::new(Vec::new()),
+            ignored_duplicates_noted: AtomicBool::new(false),
+            ignored_duplicates: crate::sync::Mutex::new(Vec::new()),
             fk_deferred_violations: AtomicIsize::new(0),
             n_active_writes: AtomicI32::new(0),
             n_active_root_statements: AtomicI32::new(0),

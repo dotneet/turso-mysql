@@ -559,6 +559,19 @@ pub enum RefusedRow {
     ParentRowWithChildren,
 }
 
+/// A row `OR IGNORE` left unwritten because a key of its table already held
+/// the row's value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IgnoredDuplicate {
+    pub table: String,
+    /// The unique index that already held the value, or `None` for the
+    /// table's own key.
+    pub index: Option<String>,
+    /// The row's value for each column of the key, as the row would have
+    /// stored it.
+    pub key: Vec<crate::Value>,
+}
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -735,6 +748,10 @@ pub struct Connection {
     pub(super) fk_pragma: AtomicBool,
     pub(super) fk_checked_row_by_row: AtomicBool,
     pub(crate) foreign_key_refusals: Mutex<Vec<ForeignKeyRefusal>>,
+    /// Whether a row `OR IGNORE` skips over a key it collides with is noted
+    /// in `ignored_duplicates`.
+    pub(super) ignored_duplicates_noted: AtomicBool,
+    pub(crate) ignored_duplicates: Mutex<Vec<IgnoredDuplicate>>,
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Number of active top-level write statements on this connection.
     ///
@@ -2280,6 +2297,26 @@ impl Connection {
 
     pub(crate) fn note_foreign_key_refusal(&self, refusal: ForeignKeyRefusal) {
         self.foreign_key_refusals.lock().push(refusal);
+    }
+
+    /// Asks every statement prepared from now on to note each row `OR IGNORE`
+    /// skips over a key it collides with, for `take_ignored_duplicates`.
+    pub fn set_ignored_duplicates_noted(&self, noted: bool) {
+        self.ignored_duplicates_noted
+            .store(noted, Ordering::Release);
+        self.bump_prepare_context_generation();
+    }
+
+    pub fn ignored_duplicates_noted(&self) -> bool {
+        self.ignored_duplicates_noted.load(Ordering::Acquire)
+    }
+
+    pub fn take_ignored_duplicates(&self) -> Vec<IgnoredDuplicate> {
+        std::mem::take(&mut *self.ignored_duplicates.lock())
+    }
+
+    pub(crate) fn note_ignored_duplicate(&self, duplicate: IgnoredDuplicate) {
+        self.ignored_duplicates.lock().push(duplicate);
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {

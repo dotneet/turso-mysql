@@ -2635,6 +2635,23 @@ pub fn insn_to_row(
             0,
             format!("{refused_row:?}"),
         ),
+        Insn::IgnoredDuplicate {
+            table_name,
+            index_name,
+            start_reg,
+            count,
+        } => (
+            "IgnoredDuplicate",
+            *start_reg as i64,
+            *count as i64,
+            0,
+            Value::build_text(format!(
+                "{table_name}.{}",
+                index_name.as_deref().unwrap_or("rowid")
+            )),
+            0,
+            String::new(),
+        ),
         Insn::FkCheck{ deferred } => (
         "FkCheck",
             *deferred as i64,

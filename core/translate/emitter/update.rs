@@ -1699,6 +1699,7 @@ fn emit_update_insns<'a>(
         match effective_rowid_alias_conflict {
             ResolveType::Ignore => {
                 // For IGNORE, skip this row's update but continue with other rows
+                program.emit_ignored_duplicate(table_name, None, target_reg, 1);
                 program.emit_insn(Insn::Goto {
                     target_pc: skip_row_label,
                 });
@@ -2067,6 +2068,12 @@ fn emit_update_insns<'a>(
             match idx_conflict {
                 ResolveType::Ignore => {
                     // For IGNORE, skip this row's update but continue with other rows
+                    program.emit_ignored_duplicate(
+                        target_table.table.get_name(),
+                        Some(index.name.as_str()),
+                        idx_start_reg,
+                        num_cols,
+                    );
                     program.emit_insn(Insn::Goto {
                         target_pc: skip_row_label,
                     });

@@ -215,6 +215,7 @@ pub fn translate_inner(
     }
 
     program.checks_foreign_keys_row_by_row = connection.foreign_keys_checked_row_by_row();
+    program.notes_ignored_duplicates = connection.ignored_duplicates_noted();
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
     let is_dml = matches!(

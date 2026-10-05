@@ -5227,10 +5227,7 @@ pub(crate) fn translate_update(
         if !render_context.rewritten_on_update.is_empty() {
             return unsupported("joined UPDATE on a table with an ON UPDATE column");
         }
-        if ignores {
-            return unsupported("joined UPDATE IGNORE");
-        }
-        return translate_joined_update(update, render_context);
+        return translate_joined_update(update, ignores, render_context);
     }
     let checked = checked_update(update)?;
     let verb = if ignores {
@@ -5390,6 +5387,30 @@ fn names_one_row_alone(expr: &Expr) -> bool {
     }
 }
 
+/// The value a joined `UPDATE` assigns, with each column it names through the
+/// table it changes — `k.u + 1000` in `SET k.u = k.u + 1000` — named without
+/// it, which is how the rendered `UPDATE` of that one table reads its own row.
+/// Measured on MySQL 8.4.11: the column is read from the row being changed.
+fn without_the_changed_tables_name(value: &Expr, table: &str) -> Expr {
+    match value {
+        Expr::CompoundIdentifier(parts) => match parts.as_slice() {
+            [qualifier, column] if qualifier.value == table => Expr::Identifier(column.clone()),
+            _ => value.clone(),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(without_the_changed_tables_name(expr, table)),
+        },
+        Expr::Nested(expr) => Expr::Nested(Box::new(without_the_changed_tables_name(expr, table))),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(without_the_changed_tables_name(left, table)),
+            op: op.clone(),
+            right: Box::new(without_the_changed_tables_name(right, table)),
+        },
+        _ => value.clone(),
+    }
+}
+
 /// Renders an `UPDATE` that names its rows through a join.
 ///
 /// The rows to change are the ones the join finds, so the join is written as a
@@ -5397,6 +5418,7 @@ fn names_one_row_alone(expr: &Expr) -> bool {
 /// the shape a `DELETE` naming its rows through a join already takes.
 fn translate_joined_update(
     update: &Update,
+    ignores: bool,
     render_context: &mut SelectRenderContext<'_>,
 ) -> Result<(String, Vec<MySqlSelectSource>, CheckedUpdate), ParseError> {
     // Measured on MySQL 8.4.11: a joined UPDATE takes neither, answering 1221.
@@ -5429,23 +5451,19 @@ fn translate_joined_update(
         if *target.get_or_insert(qualifier.value.as_str()) != qualifier.value {
             return unsupported("joined UPDATE changing more than one table");
         }
-        if !names_one_row_alone(&assignment.value) {
+        let value = without_the_changed_tables_name(&assignment.value, &qualifier.value);
+        if !names_one_row_alone(&value) {
             return unsupported("joined UPDATE assignment naming another table");
         }
         assignments.push(format!(
             "{} = {}",
             render_ident(column),
-            render_update_assignment_value(
-                &assignment.value,
-                &column.value,
-                &assigned,
-                render_context
-            )?
+            render_update_assignment_value(&value, &column.value, &assigned, render_context)?
         ));
         assigned.push(column.value.clone());
         columns.push(CheckedUpdateAssignment {
             column_name: column.value.clone(),
-            value: checked_update_assignment_value(&column.value, &assignment.value),
+            value: checked_update_assignment_value(&column.value, &value),
         });
     }
     let target = target.expect("an assignment was checked to name its table");
@@ -5469,9 +5487,18 @@ fn translate_joined_update(
         source.table.as_str(),
         render_context,
     )?);
+    // MySQL's `UPDATE IGNORE` over a join skips a row whose new key collides,
+    // as the one-table form does — measured on 8.4.11, `UPDATE IGNORE k JOIN
+    // j ON j.kid = k.id SET k.u = 50` over two matching rows leaves both and
+    // warns 1062 for each — which is the engine's `UPDATE OR IGNORE`.
+    let verb = if ignores {
+        "UPDATE OR IGNORE"
+    } else {
+        "UPDATE"
+    };
     Ok((
         format!(
-            "UPDATE {table} SET {} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})",
+            "{verb} {table} SET {} WHERE _rowid_ IN (SELECT {reference}._rowid_ FROM {rendered_from}{predicate})",
             assignments.join(", ")
         ),
         read,

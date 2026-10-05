@@ -19237,6 +19237,36 @@ pub fn op_foreign_key_refused(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_ignored_duplicate(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IgnoredDuplicate {
+            table_name,
+            index_name,
+            start_reg,
+            count,
+        },
+        insn
+    );
+    let key = state.registers[*start_reg..*start_reg + *count]
+        .iter()
+        .map(|register| register.get_value().clone())
+        .collect();
+    program
+        .connection
+        .note_ignored_duplicate(crate::IgnoredDuplicate {
+            table: table_name.clone(),
+            index: index_name.clone(),
+            key,
+        });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_hash_build(
     program: &Program,
     state: &mut ProgramState,

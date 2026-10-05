@@ -250,6 +250,9 @@ pub struct ProgramBuilder {
     row_lock_points: Vec<(BranchOffset, RowLockPoint)>,
     pub(crate) changes_rows_for_a_foreign_key: bool,
     pub(crate) checks_foreign_keys_row_by_row: bool,
+    /// Whether a row `OR IGNORE` skips over a key it collides with is noted on
+    /// the connection.
+    pub(crate) notes_ignored_duplicates: bool,
     pub(crate) skips_rows_foreign_keys_refuse: bool,
     pub(crate) skip_a_row_a_foreign_key_refuses: Option<BranchOffset>,
     /// Instruction, the function to execute it with, and its original index in the vector.
@@ -724,6 +727,7 @@ impl ProgramBuilder {
             row_lock_points: Vec::new(),
             changes_rows_for_a_foreign_key: false,
             checks_foreign_keys_row_by_row: false,
+            notes_ignored_duplicates: false,
             skips_rows_foreign_keys_refuse: false,
             skip_a_row_a_foreign_key_refuses: None,
             table_references: TableReferences::new(vec![], vec![]),
@@ -771,6 +775,25 @@ impl ProgramBuilder {
 
     pub(crate) fn schema_sql_formatter(&self) -> Option<&dyn crate::SchemaSqlFormatter> {
         self.schema_sql_formatter.as_deref()
+    }
+
+    /// Notes that `OR IGNORE` skips the row being written over the key in
+    /// `start_reg..start_reg + count`, when the connection asked for it.
+    pub(crate) fn emit_ignored_duplicate(
+        &mut self,
+        table_name: &str,
+        index_name: Option<&str>,
+        start_reg: usize,
+        count: usize,
+    ) {
+        if self.notes_ignored_duplicates {
+            self.emit_insn(Insn::IgnoredDuplicate {
+                table_name: table_name.to_owned(),
+                index_name: index_name.map(str::to_owned),
+                start_reg,
+                count,
+            });
+        }
     }
 
     pub(crate) fn set_prepared_with_assignment_validator(&mut self, prepared_with: bool) {

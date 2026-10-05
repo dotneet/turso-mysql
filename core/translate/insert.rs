@@ -3121,6 +3121,17 @@ fn emit_pk_uniqueness_check(
             num_regs: ctx.table.primary_key_columns.len(),
         });
         if let Some(position) = position.or(upsert_catch_all) {
+            if matches!(
+                preflight.upsert_actions[position].2.do_clause,
+                UpsertDo::Nothing
+            ) {
+                program.emit_ignored_duplicate(
+                    ctx.table.name.as_str(),
+                    None,
+                    pk_regs,
+                    ctx.table.primary_key_columns.len(),
+                );
+            }
             program.emit_insn(Insn::Goto {
                 target_pc: preflight.upsert_actions[position].1,
             });
@@ -3185,6 +3196,17 @@ fn emit_pk_uniqueness_check(
         if let Some(position) = position.or(upsert_catch_all) {
             // PK conflict: the conflicting rowid is exactly the attempted key.
             // Upsert clause takes precedence over column-level ON CONFLICT.
+            if matches!(
+                preflight.upsert_actions[position].2.do_clause,
+                UpsertDo::Nothing
+            ) {
+                program.emit_ignored_duplicate(
+                    ctx.table.name.as_str(),
+                    None,
+                    insertion.key_register(),
+                    1,
+                );
+            }
             program.emit_insn(Insn::Copy {
                 src_reg: insertion.key_register(),
                 dst_reg: ctx.conflict_rowid_reg,
@@ -3353,6 +3375,12 @@ fn emit_unique_index_check(
             match &preflight.upsert_actions[position].2.do_clause {
                 UpsertDo::Nothing => {
                     // Bail out without writing anything
+                    program.emit_ignored_duplicate(
+                        ctx.table.name.as_str(),
+                        Some(index.name.as_str()),
+                        idx_start_reg,
+                        num_cols,
+                    );
                     program.emit_insn(Insn::Goto {
                         target_pc: ctx.loop_labels.row_done,
                     });

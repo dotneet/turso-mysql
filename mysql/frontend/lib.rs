@@ -48,15 +48,15 @@ pub use group_concat::{DEFAULT_GROUP_CONCAT_MAX_LEN, GROUP_CONCAT_CUT_ERROR};
 pub use session::{
     MySqlAffectedRowsMode, MySqlColumnDefault, MySqlColumnKey, MySqlColumnMetadata,
     MySqlColumnMetadataError, MySqlConnection, MySqlDropViewError, MySqlForeignKeyDefinitionError,
-    MySqlIndexEntry, MySqlIsolationLevel, MySqlKeyChangeError, MySqlMarkerType,
-    MySqlPreparedExecutionResult, MySqlPreparedResultColumn, MySqlPreparedResultColumnTypeMetadata,
-    MySqlPreparedResultRow, MySqlPreparedResultRows, MySqlPreparedStatementAuthority,
-    MySqlPreparedStatementAuthorityError, MySqlPreparedStatementError,
-    MySqlPreparedStatementMetadata, MySqlPreparedStatementPlace, MySqlPreparedValue,
-    MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError, MySqlShowCreateTableError,
-    MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable, MySqlTableKind,
-    MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata, MySqlWriteResult,
-    ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
+    MySqlIgnoredDuplicate, MySqlIndexEntry, MySqlIsolationLevel, MySqlKeyChangeError,
+    MySqlMarkerType, MySqlPreparedExecutionResult, MySqlPreparedResultColumn,
+    MySqlPreparedResultColumnTypeMetadata, MySqlPreparedResultRow, MySqlPreparedResultRows,
+    MySqlPreparedStatementAuthority, MySqlPreparedStatementAuthorityError,
+    MySqlPreparedStatementError, MySqlPreparedStatementMetadata, MySqlPreparedStatementPlace,
+    MySqlPreparedValue, MySqlQueryError, MySqlRenameTableError, MySqlReplaceViewError,
+    MySqlShowCreateTableError, MySqlShowCreateTableResult, MySqlSkippedView, MySqlTable,
+    MySqlTableKind, MySqlTransactionOutcome, MySqlTriggerMetadata, MySqlViewMetadata,
+    MySqlWriteResult, ParameterMarker, DEFAULT_MAX_PREPARED_STMT_COUNT, MAX_PREPARED_STMT_COUNT,
 };
 pub use temporal_zone::shift_timestamp;
 pub use truncate_table::MySqlTruncateTableError;

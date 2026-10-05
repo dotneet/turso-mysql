@@ -2266,3 +2266,69 @@ fn assert_a_child_whose_parent_table_is_missing(conn: &Arc<Connection>) -> anyho
     assert_eq!(rows, [(1, -1, 1)]);
     Ok(())
 }
+
+#[turso_macros::test]
+fn each_row_or_ignore_skips_over_a_key_is_noted(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_each_row_or_ignore_skips_over_a_key_is_noted(&tmp_db.connect_limbo())
+}
+
+#[turso_macros::test(mvcc)]
+fn each_row_or_ignore_skips_over_a_key_is_noted_under_mvcc(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_each_row_or_ignore_skips_over_a_key_is_noted(&tmp_db.connect_limbo())
+}
+
+fn assert_each_row_or_ignore_skips_over_a_key_is_noted(
+    conn: &Arc<Connection>,
+) -> anyhow::Result<()> {
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u INT UNIQUE, s TEXT, n INT)")?;
+    conn.execute("CREATE UNIQUE INDEX t_sn ON t (s, n)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10, 'a', 1), (2, 20, 'b', 2)")?;
+
+    // Nothing is noted until the connection asks for it.
+    conn.execute("INSERT OR IGNORE INTO t VALUES (1, 30, 'c', 3)")?;
+    assert!(conn.take_ignored_duplicates().is_empty());
+
+    conn.set_ignored_duplicates_noted(true);
+    conn.execute(
+        "INSERT OR IGNORE INTO t VALUES (1, 30, 'c', 3), (3, 20, 'd', 4), (4, 40, 'a', 1), (5, 50, 'e', 5)",
+    )?;
+    let noted = conn.take_ignored_duplicates();
+    let described: Vec<(Option<&str>, &[Value])> = noted
+        .iter()
+        .map(|duplicate| (duplicate.index.as_deref(), duplicate.key.as_slice()))
+        .collect();
+    let u_index = noted[1]
+        .index
+        .clone()
+        .expect("the second row collides on u");
+    assert_eq!(
+        described,
+        [
+            (None, [Value::from_i64(1)].as_slice()),
+            (Some(u_index.as_str()), [Value::from_i64(20)].as_slice()),
+            (
+                Some("t_sn"),
+                [Value::build_text("a"), Value::from_i64(1)].as_slice()
+            ),
+        ]
+    );
+    assert!(noted.iter().all(|duplicate| duplicate.table == "t"));
+
+    conn.execute("UPDATE OR IGNORE t SET u = 10 WHERE id IN (2, 5)")?;
+    let noted = conn.take_ignored_duplicates();
+    assert_eq!(noted.len(), 2);
+    assert!(noted
+        .iter()
+        .all(|duplicate| duplicate.key == [Value::from_i64(10)]));
+    conn.execute("UPDATE OR IGNORE t SET id = 1 WHERE id = 5")?;
+    let noted = conn.take_ignored_duplicates();
+    assert_eq!(noted.len(), 1);
+    assert_eq!(noted[0].index, None);
+    assert_eq!(noted[0].key, [Value::from_i64(1)]);
+
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, u FROM t ORDER BY id");
+    assert_eq!(rows, [(1, 10), (2, 20), (5, 50)]);
+    Ok(())
+}

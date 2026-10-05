@@ -14,6 +14,7 @@ use sqlparser::tokenizer::{Location, Token};
 pub struct MySqlInsertSelectWithoutColumns {
     table: MySqlTableName,
     replaces: bool,
+    ignores: bool,
     select_sql: String,
 }
 
@@ -199,6 +200,11 @@ impl MySqlInsertSelectWithoutColumns {
         self.replaces
     }
 
+    /// Reports whether the statement was written `INSERT IGNORE`.
+    pub const fn ignores(&self) -> bool {
+        self.ignores
+    }
+
     /// Returns the `SELECT` as MySQL, for the statement written with the
     /// column list the table gives it.
     pub fn select_sql(&self) -> &str {
@@ -215,8 +221,9 @@ impl MySqlInsertSelectWithoutColumns {
 /// means.
 ///
 /// Returns `None` for anything else, so every other `INSERT` keeps its own
-/// path. A statement carrying `IGNORE` or an upsert clause is refused, as those
-/// forms are wherever they are written.
+/// path. `IGNORE` is kept, and the statement written out skips a colliding
+/// row as the one naming its columns does. A statement carrying an upsert
+/// clause is refused, as that form is wherever it is written.
 pub fn parse_optional_insert_select_without_columns(
     sql: &str,
     mode: SessionSqlMode,
@@ -234,7 +241,7 @@ pub fn parse_optional_insert_select_without_columns(
     if matches!(source.body.as_ref(), SetExpr::Values(_)) {
         return Ok(None);
     }
-    if insert.ignore || insert.on.is_some() || insert.partitioned.is_some() {
+    if insert.on.is_some() || insert.partitioned.is_some() {
         return unsupported("INSERT SELECT option");
     }
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
@@ -249,6 +256,7 @@ pub fn parse_optional_insert_select_without_columns(
     Ok(Some(MySqlInsertSelectWithoutColumns {
         table,
         replaces: insert.replace_into,
+        ignores: insert.ignore,
         select_sql: source.to_string(),
     }))
 }
@@ -733,6 +741,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(replaced.replaces());
+        assert!(!replaced.ignores());
+
+        let ignored = parse_optional_insert_select_without_columns(
+            "INSERT IGNORE INTO dst SELECT id FROM src",
+            SessionSqlMode::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(ignored.ignores());
+        assert!(!ignored.replaces());
+        assert_eq!(ignored.select_sql(), "SELECT id FROM src");
     }
 
     #[test]
@@ -756,7 +775,6 @@ mod tests {
     #[test]
     fn insert_select_without_columns_refuses_the_forms_it_cannot_write_out() {
         for sql in [
-            "INSERT IGNORE INTO dst SELECT id FROM src",
             "INSERT INTO dst SELECT id FROM src ON DUPLICATE KEY UPDATE id = 1",
             "INSERT INTO db.dst SELECT id FROM src",
         ] {

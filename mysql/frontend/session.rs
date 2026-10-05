@@ -657,6 +657,17 @@ pub enum MySqlTableKind {
     View,
 }
 
+/// A row `IGNORE` skipped because a key of its table already held its value,
+/// which MySQL warns 1062 about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MySqlIgnoredDuplicate {
+    pub table: String,
+    /// The key as MySQL names it: `PRIMARY`, or the index's own name.
+    pub key_name: String,
+    /// The row's value for each column of the key.
+    pub key: Vec<Value>,
+}
+
 /// One user-visible table or view from the selected MySQL database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlTable {
@@ -1811,6 +1822,9 @@ impl MySqlConnection {
         // durable MySQL table carries one.
         inner.set_foreign_keys_enabled(true);
         inner.set_foreign_keys_checked_row_by_row(true);
+        // Measured on MySQL 8.4.11: `IGNORE` warns 1062 for each row it skips
+        // over a key it collides with, so the engine notes each.
+        inner.set_ignored_duplicates_noted(true);
         Ok(Self {
             _closes_on_last_drop: Arc::new(CloseOnLastDrop {
                 connection: Arc::clone(&inner),
@@ -4444,6 +4458,59 @@ impl MySqlConnection {
 
     pub fn take_foreign_key_refusals(&self) -> Vec<turso_core::ForeignKeyRefusal> {
         self.inner.take_foreign_key_refusals()
+    }
+
+    /// Each row the statement that ran let `IGNORE` skip over a key it
+    /// collides with, in the order it skipped them, with the key named as
+    /// MySQL names it and a `DECIMAL` or `BIGINT UNSIGNED` value read out of
+    /// the form the engine keeps it in.
+    pub fn take_ignored_duplicates(&self) -> Vec<MySqlIgnoredDuplicate> {
+        let duplicates = self.inner.take_ignored_duplicates();
+        if duplicates.is_empty() {
+            return Vec::new();
+        }
+        let schema = self.inner.current_schema();
+        duplicates
+            .into_iter()
+            .map(|duplicate| {
+                let table = schema.get_btree_table(&duplicate.table);
+                let index = duplicate.index.as_deref().and_then(|name| {
+                    schema
+                        .get_indices(&duplicate.table)
+                        .find(|index| index.name == name)
+                        .cloned()
+                });
+                let key_name = match &index {
+                    Some(index)
+                        if !table.as_ref().is_some_and(|table| {
+                            is_the_primary_keys_own_index(index, &table.primary_key_columns)
+                        }) =>
+                    {
+                        mysql_index_name(index)
+                    }
+                    _ => "PRIMARY".to_owned(),
+                };
+                let key = duplicate
+                    .key
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, value)| {
+                        let declared = index
+                            .as_ref()
+                            .and_then(|index| index.columns.get(at))
+                            .zip(table.as_ref())
+                            .and_then(|(column, table)| table.columns().get(column.pos_in_table))
+                            .map(|column| column.ty_str.to_ascii_lowercase());
+                        key_value_as_mysql_reads_it(value, declared.as_deref())
+                    })
+                    .collect();
+                MySqlIgnoredDuplicate {
+                    table: duplicate.table,
+                    key_name,
+                    key,
+                }
+            })
+            .collect()
     }
 
     pub fn foreign_key_refusal_message(
@@ -7392,6 +7459,8 @@ impl MySqlConnection {
             "{} {} ({columns}) {}",
             if checked.replaces() {
                 "REPLACE INTO"
+            } else if checked.ignores() {
+                "INSERT IGNORE INTO"
             } else {
                 "INSERT INTO"
             },
@@ -13033,6 +13102,23 @@ fn ids_bound_as_whole_numbers(
         rounded.get_or_insert_with(|| values.to_vec())[*ordinal] = Value::from_i64(whole as i64);
     }
     rounded
+}
+
+/// A value of a key as MySQL reads it: a `DECIMAL` and a `BIGINT UNSIGNED`
+/// the engine keeps as bytes of its own are written out as their digits.
+fn key_value_as_mysql_reads_it(value: Value, declared_type: Option<&str>) -> Value {
+    let Value::Blob(bytes) = &value else {
+        return value;
+    };
+    match declared_type {
+        Some("mysql_decimal" | "mysql_decimal_unsigned") => turso_core::numeric_blob_text(bytes)
+            .map(Value::from_text)
+            .unwrap_or(value),
+        Some("mysql_uint64") => turso_core::mysql_uint64_from_blob(bytes)
+            .map(|number| Value::from_text(number.to_string()))
+            .unwrap_or(value),
+        _ => value,
+    }
 }
 
 fn reject_incompatible_legacy_tables(connection: &Arc<Connection>) -> Result<()> {

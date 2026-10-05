@@ -14723,14 +14723,18 @@ fn insert_select_without_a_column_list_takes_every_column() {
         .execute_query("INSERT INTO dst SELECT id, name FROM src")
         .is_err());
 
-    // The forms that carry their own rules are refused where they are
-    // written, not written out with a column list.
-    for sql in [
-        "INSERT IGNORE INTO dst SELECT * FROM src",
-        "INSERT INTO dst SELECT * FROM src ON DUPLICATE KEY UPDATE n = 1",
-    ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
-    }
+    // `IGNORE` is written out with the column list too, and copies every row
+    // a key does not refuse; an upsert clause is refused where it is written.
+    let CommandExecutionResult::Ok(ignored) = adapter
+        .execute_query("INSERT IGNORE INTO dst SELECT * FROM src")
+        .unwrap()
+    else {
+        panic!("INSERT IGNORE ... SELECT must answer OK");
+    };
+    assert_eq!(ignored.affected_rows, 2);
+    assert!(adapter
+        .execute_query("INSERT INTO dst SELECT * FROM src ON DUPLICATE KEY UPDATE n = 1")
+        .is_err());
 }
 
 /// An unsigned `DOUBLE` or `FLOAT` takes no negative value.
@@ -31227,3 +31231,6 @@ mod primary_key_alters;
 
 #[cfg(unix)]
 mod whole_number_columns;
+
+#[cfg(unix)]
+mod ignored_duplicates;

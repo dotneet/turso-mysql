@@ -4496,6 +4496,7 @@ where
             MySqlAffectedRowsMode::Changed
         };
         connection.take_foreign_key_refusals();
+        connection.take_ignored_duplicates();
         connection.take_explained_error();
         let result = execute_checked_query(
             connection,
@@ -5194,6 +5195,7 @@ where
             .set_group_concat_max_len(statement.group_concat_max_len);
         statement.connection.forget_group_concat_cuts();
         statement.connection.take_foreign_key_refusals();
+        statement.connection.take_ignored_duplicates();
         self.raised_warnings.clear();
         let result = execute_database_prepared_statement(
             statement,
@@ -5886,6 +5888,7 @@ fn answer_the_foreign_key_refusals(
     match result {
         Ok(CommandExecutionResult::Ok(mut ok)) => {
             warn_about_refused_rows(connection, database, &refusals, raised);
+            warn_about_ignored_duplicates(connection, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(CommandExecutionResult::Ok(ok))
         }
@@ -5917,6 +5920,7 @@ fn answer_the_foreign_key_refusals_of_a_prepared_statement(
     match result {
         Ok(PreparedStatementExecutionResult::Ok(mut ok)) => {
             warn_about_refused_rows(connection, database, &refusals, raised);
+            warn_about_ignored_duplicates(connection, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(PreparedStatementExecutionResult::Ok(ok))
         }
@@ -5943,6 +5947,17 @@ fn warn_about_refused_rows(
             connection.foreign_key_refusal_message(&database.to_ascii_lowercase(), refusal),
         )
     }));
+}
+
+/// Raises MySQL's warning 1062 for each row `IGNORE` skipped over a key it
+/// collides with.
+fn warn_about_ignored_duplicates(connection: &MySqlConnection, raised: &mut Vec<MySqlWarning>) {
+    raised.extend(
+        connection
+            .take_ignored_duplicates()
+            .iter()
+            .map(MySqlWarning::duplicate_entry),
+    );
 }
 
 fn name_the_refusing_foreign_key(
@@ -13355,6 +13370,36 @@ impl MySqlWarning {
         }
     }
 
+    /// The warning MySQL raises for each row `IGNORE` skips over a key it
+    /// collides with.
+    ///
+    /// Measured on MySQL 8.4.11: `Warning`, code 1062, naming the key by its
+    /// table and its name — `PRIMARY` for the primary key — and the row's
+    /// value for it, the values of a key over several columns joined by `-`:
+    /// ``Duplicate entry 'a-1' for key 'k.uk_sn'``. The value is written as
+    /// the column holds it, `1.50` for a `DECIMAL(5,2)`, `22500000000` for a
+    /// double, a byte outside printable ASCII as `\xFF`, and cut at 64
+    /// characters.
+    fn duplicate_entry(duplicate: &turso_mysql::MySqlIgnoredDuplicate) -> Self {
+        let mut entry = duplicate
+            .key
+            .iter()
+            .map(key_value_text)
+            .collect::<Vec<_>>()
+            .join("-");
+        if let Some((cut, _)) = entry.char_indices().nth(64) {
+            entry.truncate(cut);
+        }
+        Self {
+            level: "Warning",
+            code: 1062,
+            message: format!(
+                "Duplicate entry '{entry}' for key '{}.{}'",
+                duplicate.table, duplicate.key_name
+            ),
+        }
+    }
+
     /// The warning MySQL raises for `SQL_CALC_FOUND_ROWS`. Measured on MySQL
     /// 8.4.11: `Warning`, code 1287, and this message.
     fn calculating_found_rows_is_deprecated() -> Self {
@@ -14014,6 +14059,28 @@ fn is_exact_decimal_column(column: &ColumnDefinitionConfig) -> bool {
 /// `123456789012345.6` is written out in full at sixteen digits, so the switch
 /// is on where the point falls rather than on how many digits there are.
 const MYSQL_DOUBLE_PLAIN_DIGITS: i32 = 15;
+
+/// One value of a key the way MySQL writes it in warning 1062.
+fn key_value_text(value: &turso_core::Value) -> String {
+    match value {
+        turso_core::Value::Null => "NULL".to_owned(),
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(number)) => number.to_string(),
+        turso_core::Value::Numeric(turso_core::Numeric::Float(number)) => {
+            mysql_double_text(f64::from(*number))
+        }
+        turso_core::Value::Text(text) => text.as_str().to_owned(),
+        turso_core::Value::Blob(bytes) => bytes
+            .iter()
+            .map(|byte| {
+                if (0x20..0x7f).contains(byte) {
+                    char::from(*byte).to_string()
+                } else {
+                    format!("\\x{byte:02X}")
+                }
+            })
+            .collect(),
+    }
+}
 
 /// Renders a `DOUBLE` the way MySQL writes one.
 ///

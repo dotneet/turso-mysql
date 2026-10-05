@@ -2078,6 +2078,37 @@ fn a_joined_update_changes_the_rows_the_join_finds() {
     }
 }
 
+/// Measured on MySQL 8.4.11: a joined `UPDATE IGNORE` skips a row whose new
+/// key collides, as the one-table form does, and a value naming the changed
+/// table's own column through it — `SET k.u = k.u + 1000` — reads the row
+/// being changed.
+#[test]
+fn a_joined_update_ignore_is_the_engines_or_ignore() {
+    let mode = SessionSqlMode::default();
+    let translated = parse_dml(
+        "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = k.u + 1000",
+        mode,
+    )
+    .unwrap();
+    assert_eq!(
+        translated.as_sql(),
+        concat!(
+            "UPDATE OR IGNORE \"k\" SET \"u\" = (\"u\" + 1000) WHERE _rowid_ IN ",
+            "(SELECT \"k\"._rowid_ FROM \"k\" JOIN \"j\" ON (\"j\".\"kid\" = \"k\".\"id\"))"
+        )
+    );
+    assert!(parse_dml(
+        "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = NULL",
+        mode
+    )
+    .is_err());
+    assert!(parse_dml(
+        "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = j.id",
+        mode
+    )
+    .is_err());
+}
+
 /// MySQL names the rows a `DELETE` removes through a join, and names the table
 /// to remove them from either in front of the FROM or after a USING. The rows
 /// the join finds are the ones to delete, so the join is written as a subquery

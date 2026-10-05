@@ -2028,6 +2028,14 @@ pub enum Insn {
         foreign_key: Arc<ForeignKey>,
         refused_row: crate::RefusedRow,
     },
+    /// Notes on the connection that `OR IGNORE` skips this row because the
+    /// key in registers `start_reg..start_reg + count` collides.
+    IgnoredDuplicate {
+        table_name: String,
+        index_name: Option<String>,
+        start_reg: usize,
+        count: usize,
+    },
     // Check if there are any unresolved foreign key constraint violations.
     // If P1 is zero, check the statement constraint-counter (immediate FK violations).
     // If P1 is non-zero, check the database constraint-counter (deferred FK violations).
@@ -2428,6 +2436,7 @@ impl InsnVariants {
             InsnVariants::RefusedWrite => execute::op_refused_write,
             InsnVariants::KeepTheGapsOfRefusedWrites => execute::op_keep_the_gaps_of_refused_writes,
             InsnVariants::ForeignKeyRefused => execute::op_foreign_key_refused,
+            InsnVariants::IgnoredDuplicate => execute::op_ignored_duplicate,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,

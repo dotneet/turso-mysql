@@ -129,8 +129,8 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{
     resolve_ext_path, AssignmentOperation, AssignmentValidator, Connection, ForeignKeyRefusal,
-    PrepareOptions, RefusedRow, ReprepareContext, ReprepareParser, Row, StepResult, SymbolTable,
-    TriggerRowidSupplier,
+    IgnoredDuplicate, PrepareOptions, RefusedRow, ReprepareContext, ReprepareParser, Row,
+    StepResult, SymbolTable, TriggerRowidSupplier,
 };
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
@@ -172,6 +172,15 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::decimal::mysql_uint64_from_blob;
+
+/// The number a numeric blob holds — a MySQL `DECIMAL` among them — written
+/// out with every place of its scale, or `None` when the bytes are no such
+/// blob.
+pub fn numeric_blob_text(blob: &[u8]) -> Option<String> {
+    numeric::decimal::blob_to_bigdecimal(blob)
+        .ok()
+        .map(|number| numeric::decimal::format_numeric(&number))
+}
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use statement::{ColumnTypeInfo, ColumnTypeKind, Statement, StatementStatusCounter};
 pub use storage::{
