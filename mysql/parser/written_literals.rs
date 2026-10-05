@@ -113,22 +113,47 @@ pub fn literals_written_into_columns(
     Ok((!columns.is_empty()).then_some(WrittenLiterals { tables, columns }))
 }
 
-/// A number or a word a statement writes straight into a column, for the
-/// frontend to write out as the whole number MySQL stores where the column
-/// holds whole numbers.
+/// The values a one-table `INSERT` or `UPDATE` writes straight into its
+/// columns, for the frontend to put each into the form its column stores and
+/// to raise the warnings MySQL raises for it.
 ///
 /// The engine reads a word naming a number, which is how a written number
 /// with a point reaches it, as a double before the frontend sees it, which
 /// loses the half a double puts on the other side of the point and the digits
-/// past a double's. MySQL reads each of the three exactly, by rules of their
-/// own, so the statement is read before the engine meets it.
+/// past a double's. MySQL reads a double, a decimal and a word exactly, by
+/// rules of their own, so the statement is read before the engine meets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValuesWrittenIntoColumns {
+    pub table: String,
+    /// Whether the statement was written `IGNORE`.
+    pub ignores: bool,
+    /// Whether the statement is an `UPDATE`.
+    pub updates: bool,
+    /// How many rows an `INSERT` lists, one for its `SET` form.
+    pub rows: usize,
+    pub values: Vec<ValueWrittenIntoAColumn>,
+}
+
+/// One value a statement writes straight into a column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValueWrittenIntoAColumn {
     pub column: WrittenColumn,
-    /// Where the number or the word stands in the statement, in bytes. A
-    /// sign written before a number stands outside it.
+    pub place: WrittenPlace,
+    /// Where the value stands in the statement, in bytes. A sign written
+    /// before a number stands outside it.
     pub at: std::ops::Range<usize>,
     pub value: WrittenValueKind,
+}
+
+/// Which part of a statement writes a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrittenPlace {
+    /// A row of an `INSERT`, counting from 0; its `SET` form is row 0.
+    Row(usize),
+    /// The upsert clause of an `INSERT`.
+    Upsert,
+    /// The `SET` of an `UPDATE`.
+    Update,
 }
 
 /// How MySQL reads a value written straight into a column.
@@ -139,19 +164,23 @@ pub enum WrittenValueKind {
     /// A number written with a point and no exponent, `2.5`, read as a
     /// decimal.
     Decimal { digits: String, negative: bool },
+    /// A whole number written as one.
+    Whole { digits: String, negative: bool },
     /// A word in quotes.
     Word(String),
     /// A `?`, by its place among the statement's.
     Bound(usize),
+    /// `NULL`.
+    Null,
 }
 
-/// Reads the numbers and words a one-table `INSERT ... VALUES`, `INSERT ...
-/// SET`, upsert clause or `UPDATE` writes straight into its columns, and the
-/// table they are written into; `None` for every other statement.
+/// Reads the numbers, words, `?`s and `NULL`s a one-table `INSERT ...
+/// VALUES`, `INSERT ... SET`, upsert clause or `UPDATE` writes straight into
+/// its columns; `None` for every other statement.
 pub fn values_written_into_columns(
     sql: &str,
     mode: SessionSqlMode,
-) -> Result<Option<(String, Vec<ValueWrittenIntoAColumn>)>, ParseError> {
+) -> Result<Option<ValuesWrittenIntoColumns>, ParseError> {
     let read_statement = read_one_statement(sql, mode);
     let statement = read_statement.as_ref().as_ref().map_err(Clone::clone)?;
     let dialect = SessionMySqlDialect::new(mode);
@@ -166,7 +195,7 @@ pub fn values_written_into_columns(
     };
     let sql = Written { sql, placeholders };
     let mut written = Vec::new();
-    let table = match statement {
+    let (table, ignores, updates, rows) = match statement {
         Statement::Insert(insert) => {
             let TableObject::TableName(table) = &insert.table else {
                 return Ok(None);
@@ -174,12 +203,23 @@ pub fn values_written_into_columns(
             let Some(table) = last_name(table) else {
                 return Ok(None);
             };
+            let mut rows = 0;
+            if !insert.assignments.is_empty() {
+                rows = 1;
+            }
             for assignment in &insert.assignments {
-                note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+                note_written_value(
+                    &sql,
+                    WrittenPlace::Row(0),
+                    &assignment.target,
+                    &assignment.value,
+                    &mut written,
+                );
             }
             if let Some(source) = insert.source.as_deref() {
                 if let SetExpr::Values(values) = source.body.as_ref() {
-                    for row in &values.rows {
+                    rows = values.rows.len();
+                    for (row_at, row) in values.rows.iter().enumerate() {
                         for (place, value) in row.iter().enumerate() {
                             let column = if insert.columns.is_empty() {
                                 WrittenColumn::AtPlace(place)
@@ -190,7 +230,12 @@ pub fn values_written_into_columns(
                                 }
                             };
                             if let Some((at, value)) = written_value(&sql, value) {
-                                written.push(ValueWrittenIntoAColumn { column, at, value });
+                                written.push(ValueWrittenIntoAColumn {
+                                    column,
+                                    place: WrittenPlace::Row(row_at),
+                                    at,
+                                    value,
+                                });
                             }
                         }
                     }
@@ -198,10 +243,16 @@ pub fn values_written_into_columns(
             }
             if let Some(OnInsert::DuplicateKeyUpdate(assignments)) = &insert.on {
                 for assignment in assignments {
-                    note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+                    note_written_value(
+                        &sql,
+                        WrittenPlace::Upsert,
+                        &assignment.target,
+                        &assignment.value,
+                        &mut written,
+                    );
                 }
             }
-            table
+            (table, insert.ignore, false, rows)
         }
         Statement::Update(update) if update.table.joins.is_empty() && update.from.is_none() => {
             let TableFactor::Table { name, .. } = &update.table.relation else {
@@ -211,13 +262,26 @@ pub fn values_written_into_columns(
                 return Ok(None);
             };
             for assignment in &update.assignments {
-                note_written_value(&sql, &assignment.target, &assignment.value, &mut written);
+                note_written_value(
+                    &sql,
+                    WrittenPlace::Update,
+                    &assignment.target,
+                    &assignment.value,
+                    &mut written,
+                );
             }
-            table
+            let ignores = matches!(update.or, Some(sqlparser::ast::SqliteOnConflict::Ignore));
+            (table, ignores, true, 0)
         }
         _ => return Ok(None),
     };
-    Ok((!written.is_empty()).then_some((table, written)))
+    Ok((!written.is_empty()).then_some(ValuesWrittenIntoColumns {
+        table,
+        ignores,
+        updates,
+        rows,
+        values: written,
+    }))
 }
 
 /// A statement's text and where each of its `?` stands in it, in order.
@@ -228,6 +292,7 @@ struct Written<'a> {
 
 fn note_written_value(
     sql: &Written<'_>,
+    place: WrittenPlace,
     target: &AssignmentTarget,
     value: &Expr,
     written: &mut Vec<ValueWrittenIntoAColumn>,
@@ -242,6 +307,7 @@ fn note_written_value(
     if let Some((at, value)) = written_value(sql, value) {
         written.push(ValueWrittenIntoAColumn {
             column: WrittenColumn::Named(column),
+            place,
             at,
             value,
         });
@@ -249,8 +315,8 @@ fn note_written_value(
 }
 
 /// Reads one value written straight into a column — a number, a signed one,
-/// a word in quotes or a `?`, inside parentheses or not — and where it
-/// stands. A word is read only when it stands in the statement exactly as it
+/// a word in quotes, a `?` or `NULL`, inside parentheses or not — and where
+/// it stands. A word is read only when it stands in the statement exactly as it
 /// reads, with no escape and no quote inside it.
 fn written_value(
     written: &Written<'_>,
@@ -288,9 +354,13 @@ fn written_value(
                     negative,
                 }
             } else {
-                return None;
+                WrittenValueKind::Whole {
+                    digits: digits.clone(),
+                    negative,
+                }
             }
         }
+        Value::Null if !negative && spelled.eq_ignore_ascii_case("NULL") => WrittenValueKind::Null,
         Value::SingleQuotedString(word) | Value::DoubleQuotedString(word)
             if !negative && is_spelled_as_it_reads(spelled, word) =>
         {

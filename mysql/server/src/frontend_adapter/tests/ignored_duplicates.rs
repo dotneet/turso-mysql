@@ -57,6 +57,22 @@ fn duplicates(adapter: &mut Adapter) -> Vec<String> {
         .collect()
 }
 
+/// The messages of the warnings the last statement raised after its first,
+/// each a `Warning` 1062.
+fn duplicates_after_the_first(adapter: &mut Adapter) -> Vec<String> {
+    rows(adapter, "SHOW WARNINGS")
+        .into_iter()
+        .skip(1)
+        .map(|warning| {
+            assert_eq!(
+                warning[..2],
+                [Some("Warning".to_owned()), Some("1062".to_owned())]
+            );
+            warning[2].clone().unwrap()
+        })
+        .collect()
+}
+
 fn table_k(adapter: &mut Adapter) {
     run(
         adapter,
@@ -304,8 +320,8 @@ fn a_counted_table_and_a_prepared_statement_warn_the_same_way() {
 /// A NULL written with `IGNORE` into a column that takes NULL is stored as
 /// NULL with no warning, as Laravel's `insertOrIgnore` and Django's
 /// `bulk_create(ignore_conflicts=True)` write a nullable column. Into a
-/// column refusing NULL MySQL stores the type's empty value and warns 1048,
-/// which is refused here.
+/// column of words refusing NULL it stores `''` and warns 1048, and the row
+/// then meets the column's keys as that `''` does.
 #[test]
 fn ignore_writes_a_null_into_a_column_that_takes_one() {
     let (_directory, mut adapter) = adapter();
@@ -355,43 +371,97 @@ fn ignore_writes_a_null_into_a_column_that_takes_one() {
         rows(&mut adapter, "SELECT id, note, must FROM p"),
         [[Some("1".to_owned()), None, Some("x".to_owned())]]
     );
-    for sql in [
-        "INSERT IGNORE INTO tags (name, note) VALUES (NULL, 'x')",
-        "INSERT IGNORE INTO p VALUES (2, 'a', NULL)",
-        "INSERT IGNORE INTO p SET id = 3, must = NULL",
-        "UPDATE IGNORE tags SET name = NULL WHERE id = 1",
-        "UPDATE IGNORE p SET must = NULL",
+    let cannot_be_null = |column: &str| {
+        vec![
+            Some("Warning".to_owned()),
+            Some("1048".to_owned()),
+            Some(format!("Column '{column}' cannot be null")),
+        ]
+    };
+    for (sql, warned) in [
+        (
+            "INSERT IGNORE INTO tags (name, note) VALUES (NULL, 'x')",
+            "name",
+        ),
+        ("INSERT IGNORE INTO p VALUES (2, 'a', NULL)", "must"),
+        ("INSERT IGNORE INTO p SET id = 3, must = NULL", "must"),
     ] {
-        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+        assert_eq!(run(&mut adapter, sql).warnings, 1, "{sql}");
+        assert_eq!(
+            rows(&mut adapter, "SHOW WARNINGS"),
+            [cannot_be_null(warned)]
+        );
     }
+    // The empty name meets the one written above, so the row is skipped
+    // after its NULL is warned about.
+    assert_eq!(
+        run(
+            &mut adapter,
+            "UPDATE IGNORE tags SET name = NULL WHERE id = 1"
+        )
+        .warnings,
+        2
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW WARNINGS")[0],
+        cannot_be_null("name")
+    );
+    assert_eq!(
+        duplicates_after_the_first(&mut adapter),
+        ["Duplicate entry '' for key 'tags.name'"]
+    );
+    let updated = run(&mut adapter, "UPDATE IGNORE p SET must = NULL");
+    assert_eq!((updated.affected_rows, updated.warnings), (1, 3));
 
     // A NULL bound for a `?` is held to the column the same way.
     let bound_null = [1, 1, MYSQL_TYPE_NULL, 0];
-    for (sql, taken) in [
-        ("INSERT IGNORE INTO tags (name, note) VALUES ('d', ?)", true),
+    for (sql, written, warnings) in [
+        ("INSERT IGNORE INTO tags (name, note) VALUES ('d', ?)", 1, 0),
+        ("INSERT IGNORE INTO tags (name, note) VALUES (?, 'x')", 0, 2),
         (
-            "INSERT IGNORE INTO tags (name, note) VALUES (?, 'x')",
-            false,
+            "INSERT IGNORE INTO p (id, note, must) VALUES (4, ?, 'x')",
+            1,
+            0,
         ),
         (
-            "INSERT IGNORE INTO p (id, note, must) VALUES (2, ?, 'x')",
-            true,
-        ),
-        (
-            "INSERT IGNORE INTO p (id, note, must) VALUES (3, 'y', ?)",
-            false,
+            "INSERT IGNORE INTO p (id, note, must) VALUES (5, 'y', ?)",
+            1,
+            1,
         ),
     ] {
         let statement = adapter.execute_stmt_prepare(sql).unwrap();
         let result = adapter.execute_stmt_execute(statement.statement_id, &bound_null);
         adapter.execute_stmt_close(statement.statement_id);
-        assert_eq!(result.is_ok(), taken, "{sql}: {result:?}");
+        match result {
+            Ok(PreparedStatementExecutionResult::Ok(result)) => {
+                assert_eq!(
+                    (result.affected_rows, result.warnings),
+                    (written, warnings),
+                    "{sql}"
+                );
+            }
+            other => panic!("{sql} answered {other:?}"),
+        }
     }
+    let some = |values: [Option<&str>; 3]| values.map(|value| value.map(str::to_owned));
     assert_eq!(
         rows(&mut adapter, "SELECT id, note, must FROM p ORDER BY id"),
         [
-            [Some("1".to_owned()), None, Some("x".to_owned())],
-            [Some("2".to_owned()), None, Some("x".to_owned())],
+            some([Some("1"), None, Some("")]),
+            some([Some("2"), Some("a"), Some("")]),
+            some([Some("3"), None, Some("")]),
+            some([Some("4"), None, Some("x")]),
+            some([Some("5"), Some("y"), Some("")]),
+        ]
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, name FROM tags WHERE id > 4 ORDER BY id"
+        ),
+        [
+            [Some("5".to_owned()), Some(String::new())],
+            [Some("6".to_owned()), Some("d".to_owned())],
         ]
     );
 }

@@ -4497,6 +4497,7 @@ where
         };
         connection.take_foreign_key_refusals();
         connection.take_ignored_duplicates();
+        connection.take_value_warnings(0);
         connection.take_explained_error();
         let result = execute_checked_query(
             connection,
@@ -4516,6 +4517,7 @@ where
             connection,
             &selected_database,
             result,
+            self.session_variables.sql_notes(),
             &mut self.raised_warnings,
             &mut self.error_message,
         );
@@ -5196,6 +5198,7 @@ where
         statement.connection.forget_group_concat_cuts();
         statement.connection.take_foreign_key_refusals();
         statement.connection.take_ignored_duplicates();
+        statement.connection.take_value_warnings(0);
         self.raised_warnings.clear();
         let result = execute_database_prepared_statement(
             statement,
@@ -5208,6 +5211,7 @@ where
             &statement.connection,
             &statement.database,
             result,
+            self.session_variables.sql_notes(),
             &mut self.raised_warnings,
             &mut self.error_message,
         )?;
@@ -5881,14 +5885,17 @@ fn answer_the_foreign_key_refusals(
     connection: &MySqlConnection,
     database: &str,
     result: Result<CommandExecutionResult, FrontendErrorKind>,
+    sql_notes: bool,
     raised: &mut Vec<MySqlWarning>,
     error_message: &mut Option<Vec<u8>>,
 ) -> Result<CommandExecutionResult, FrontendErrorKind> {
     let refusals = connection.take_foreign_key_refusals();
     match result {
         Ok(CommandExecutionResult::Ok(mut ok)) => {
+            let duplicates = connection.take_ignored_duplicates();
+            warn_about_values_written(connection, sql_notes, &refusals, &duplicates, raised);
             warn_about_refused_rows(connection, database, &refusals, raised);
-            warn_about_ignored_duplicates(connection, raised);
+            warn_about_ignored_duplicates(&duplicates, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(CommandExecutionResult::Ok(ok))
         }
@@ -5913,14 +5920,17 @@ fn answer_the_foreign_key_refusals_of_a_prepared_statement(
     connection: &MySqlConnection,
     database: &str,
     result: Result<PreparedStatementExecutionResult, FrontendErrorKind>,
+    sql_notes: bool,
     raised: &mut Vec<MySqlWarning>,
     error_message: &mut Option<Vec<u8>>,
 ) -> Result<PreparedStatementExecutionResult, FrontendErrorKind> {
     let refusals = connection.take_foreign_key_refusals();
     match result {
         Ok(PreparedStatementExecutionResult::Ok(mut ok)) => {
+            let duplicates = connection.take_ignored_duplicates();
+            warn_about_values_written(connection, sql_notes, &refusals, &duplicates, raised);
             warn_about_refused_rows(connection, database, &refusals, raised);
-            warn_about_ignored_duplicates(connection, raised);
+            warn_about_ignored_duplicates(&duplicates, raised);
             ok.warnings = u16::try_from(raised.len()).unwrap_or(u16::MAX);
             Ok(PreparedStatementExecutionResult::Ok(ok))
         }
@@ -5949,15 +5959,34 @@ fn warn_about_refused_rows(
     }));
 }
 
-/// Raises MySQL's warning 1062 for each row `IGNORE` skipped over a key it
-/// collides with.
-fn warn_about_ignored_duplicates(connection: &MySqlConnection, raised: &mut Vec<MySqlWarning>) {
+/// Raises the warnings MySQL raises for the values a statement wrote into
+/// its columns, leaving the notes out under `sql_notes = 0`. They come
+/// before the warnings for rows a key or a foreign key refused, which MySQL
+/// raises for each row in turn, so a statement raising both lists them apart.
+fn warn_about_values_written(
+    connection: &MySqlConnection,
+    sql_notes: bool,
+    refusals: &[turso_core::ForeignKeyRefusal],
+    duplicates: &[turso_mysql::MySqlIgnoredDuplicate],
+    raised: &mut Vec<MySqlWarning>,
+) {
+    let skipped_rows = u64::try_from(refusals.len() + duplicates.len()).unwrap_or(u64::MAX);
     raised.extend(
         connection
-            .take_ignored_duplicates()
-            .iter()
-            .map(MySqlWarning::duplicate_entry),
+            .take_value_warnings(skipped_rows)
+            .into_iter()
+            .filter(|warning| sql_notes || warning.level != "Note")
+            .map(MySqlWarning::of_a_written_value),
     );
+}
+
+/// Raises MySQL's warning 1062 for each row `IGNORE` skipped over a key it
+/// collides with.
+fn warn_about_ignored_duplicates(
+    duplicates: &[turso_mysql::MySqlIgnoredDuplicate],
+    raised: &mut Vec<MySqlWarning>,
+) {
+    raised.extend(duplicates.iter().map(MySqlWarning::duplicate_entry));
 }
 
 fn name_the_refusing_foreign_key(
@@ -13380,6 +13409,16 @@ impl MySqlWarning {
     /// the column holds it, `1.50` for a `DECIMAL(5,2)`, `22500000000` for a
     /// double, a byte outside printable ASCII as `\xFF`, and cut at 64
     /// characters.
+    /// A warning or a note a value written into a column raised: 1264, 1048
+    /// or 1265, as the frontend words it.
+    fn of_a_written_value(warning: turso_mysql::MySqlValueWarning) -> Self {
+        Self {
+            level: warning.level,
+            code: warning.code,
+            message: warning.message,
+        }
+    }
+
     fn duplicate_entry(duplicate: &turso_mysql::MySqlIgnoredDuplicate) -> Self {
         let mut entry = duplicate
             .key

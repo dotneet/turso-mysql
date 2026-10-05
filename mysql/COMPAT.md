@@ -3139,21 +3139,35 @@ and warns twice. A `NULL` written with it is held to a column taking NULL, as
 `INSERT IGNORE`'s is (below). `DELETE IGNORE` is taken as well; a foreign key
 is what it ignores.
 
-What MySQL's IGNORE also does is coerce a value it would otherwise refuse, and
-that is not done here. Measured: `INSERT IGNORE` of 99999999999999 into an `INT`
-stores 2147483647, where this refuses the statement — an error rather than a row
-holding a number the client did not write. A NULL is the one case where the two
-IGNOREs part company silently: MySQL stores the type's empty value in a column
-refusing NULL — 0, `''`, `0000-00-00` — and warns 1048, ``Column 'must' cannot
-be null``, while the engine's `OR IGNORE` skips the row and stores nothing. So a
-NULL written into such a column with `IGNORE`, in an `INSERT` or an `UPDATE`,
-is refused rather than left to disagree. Into a column that takes NULL the two
-agree — measured on 8.4.11, it stores NULL and warns nothing — and that is
-taken, which is how Laravel's `insertOrIgnore` and Django's
-`bulk_create(ignore_conflicts=True)` write a nullable column. A NULL bound for
-an `INSERT IGNORE`'s `?` is held to its column the same way when the statement
-runs; one bound in an `UPDATE IGNORE`'s `SET` is not, and skips the row where it
-meets a column refusing NULL.
+What MySQL's IGNORE also does is put a value it would otherwise refuse into
+its column, with a warning, and for a value written straight into a column —
+written in the statement or bound for a `?`, in `VALUES`, `SET`, an upsert
+clause or an `UPDATE`'s `SET` — so does this. Measured on 8.4.11 and matched: a
+whole number past its column's range is cut to the nearest number the column
+holds and warns 1264, ``Out of range value for column 't' at row 2``, the row
+counted from 1 — 300 and `'300'` store 127 in a `TINYINT`, 99999999999999
+stores 2147483647 in an `INT`, `-5` and `-0.4` store 0 in an unsigned column;
+and a NULL meeting a column refusing NULL stores 0 in a column of numbers and
+`''` in one of words and warns 1048, ``Column 'must' cannot be null``, which
+then meets the column's keys as that value does (an empty name colliding with
+one already there warns 1048 and then 1062). An `UPDATE IGNORE` raises its
+warnings once for each row it matched, a row its `IGNORE` skips included, and
+a NULL bound in its `SET` stores the empty value rather than skipping the row.
+Into a column that takes NULL a NULL is stored as NULL and warns nothing, which
+is how Laravel's `insertOrIgnore` and Django's `bulk_create(ignore_conflicts=
+True)` write a nullable column.
+
+What is left refused is the rest of IGNORE's coercions: a NULL into a `NOT
+NULL` temporal, `ENUM`, `SET` or `JSON` column, whose empty values
+(`0000-00-00`, `''`, a JSON `null`) are not written here; a word with more
+after its number (1265), a word naming no number (1366), a word too long for
+its column and a `DECIMAL` past its range, each of which MySQL stores cut with
+a warning and this answers the strict error for; and any value an expression
+works out, which reaches the engine's `OR IGNORE` and is refused or, for a
+NULL, skips the row. An upsert clause of a statement writing several rows
+raises no 1264 for the value it cuts, which row met a row already there not
+being known here; and a statement raising both these warnings and 1062 lists
+the 1062 ones after them rather than row by row.
 
 An `INSERT ... ON DUPLICATE KEY UPDATE` reports what it did to each row rather
 than how many it touched, which is a rule of MySQL's own. Measured on 8.4.11 and
@@ -6417,7 +6431,7 @@ here the gap reaches the next child of another parent.
 
 Around `IGNORE`, a statement skipping duplicates beside rows a foreign key
 refuses lists the 1062 warnings after the 1452 ones rather than in row order,
-and a NULL that `IGNORE` would coerce into a `NOT NULL` column is refused where it is written and skips the row
+and a NULL that `IGNORE` would coerce into a `NOT NULL` column skips the row
 where an expression yields it. A key `ALTER TABLE` adds without a name is
 numbered after the keys written without one, where MySQL numbers it past the
 highest `t_ibfk_<n>` the table has, which differs only after a key was given
@@ -7147,6 +7161,17 @@ escape in it, `'\n7'` among them, is read the same way. A word bound with a
 tab before its number stores the number, where MySQL answers 1366 for a bound
 one. And a word whose bare exponent sign follows more than eighteen digits is
 refused, MySQL reading it by a rule of its own.
+
+A number rounded to a `DECIMAL`'s places raises note 1265, ``Data truncated
+for column 'd' at row 2``, for its row, where the places past the column's are
+not all zeros. Measured on 8.4.11 and matched for a value written straight into
+the column or bound for a `?`, in `VALUES`, `SET`, an `UPDATE` (once for each
+row it matched) and the upsert clause of a statement writing one row: `1.234`,
+`'1.234'`, `1.239e0`, a bound double 1.234 and `-0.004` each note, and
+`'1.230'`, `1.25e0` and `'1.2e0'` do not. A value an expression works out —
+`d * 1.001`, `VALUES(d) + 0.001` — and the upsert clause of a statement writing
+several rows are rounded the same way without the note, and `sql_notes = 0`
+leaves every note out.
 
 `TINYINT UNSIGNED`, `SMALLINT UNSIGNED`, `MEDIUMINT UNSIGNED` and
 `INT UNSIGNED` are taken. The sign is kept as part of the declared type name —

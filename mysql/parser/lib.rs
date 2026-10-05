@@ -118,7 +118,8 @@ use translate::{
 };
 pub use written_literals::{
     literals_written_into_columns, values_written_into_columns, ColumnLiteral,
-    ValueWrittenIntoAColumn, WrittenColumn, WrittenLiterals, WrittenValueKind,
+    ValueWrittenIntoAColumn, ValuesWrittenIntoColumns, WrittenColumn, WrittenLiterals,
+    WrittenPlace, WrittenValueKind,
 };
 
 pub use account_admin::{

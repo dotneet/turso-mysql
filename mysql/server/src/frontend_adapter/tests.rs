@@ -10751,14 +10751,13 @@ fn on_duplicate_key_update_writes_or_updates_the_row() {
 /// again leaves the stored row alone and counts 0, and a two-row statement
 /// where only the second is new counts 1.
 ///
-/// What MySQL also does under IGNORE — coerce a value it would otherwise
-/// refuse — is not done here. Measured: `INSERT IGNORE` of NULL into a NOT NULL
-/// INT stores 0, and of 99999999999999 into an INT stores 2147483647. Both are
-/// refused here, so a client sees an error rather than a row it did not ask
-/// for.
+/// Under IGNORE MySQL also puts a value it would otherwise refuse into its
+/// column. Measured: `INSERT IGNORE` of NULL into a NOT NULL INT stores 0
+/// with warning 1048, and of 99999999999999 into an INT stores 2147483647
+/// with warning 1264.
 #[cfg(unix)]
 #[test]
-fn insert_ignore_skips_a_colliding_row_and_still_refuses_a_coerced_value() {
+fn insert_ignore_skips_a_colliding_row_and_coerces_a_value_it_would_refuse() {
     let authorizer = Arc::new(RecordingAuthorizer::default());
     let (_directory, _catalog, factory) = catalog_factory(authorizer);
     let mut adapter = factory
@@ -10807,26 +10806,27 @@ fn insert_ignore_skips_a_colliding_row_and_still_refuses_a_coerced_value() {
         ]
     );
 
-    // A value MySQL would coerce under IGNORE is still refused, so no row
-    // appears holding a value the client never wrote. The range check is the
-    // frontend's own and fires whatever the verb; the NULL is refused by the
-    // parser, because the engine's OR IGNORE would skip the row where MySQL
-    // stores a coerced 0.
-    assert!(adapter
-        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (4, NULL)")
-        .is_err());
-    assert!(adapter
-        .execute_query("INSERT IGNORE INTO g (id, v) VALUES (5, 99999999999999)")
-        .is_err());
+    for sql in [
+        "INSERT IGNORE INTO g (id, v) VALUES (4, NULL)",
+        "INSERT IGNORE INTO g (id, v) VALUES (5, 99999999999999)",
+    ] {
+        let Ok(CommandExecutionResult::Ok(coerced)) = adapter.execute_query(sql) else {
+            panic!("{sql} must return an OK packet");
+        };
+        assert_eq!((coerced.affected_rows, coerced.warnings), (1, 1), "{sql}");
+    }
     let CommandExecutionResult::ResultSet(after) = adapter
-        .execute_query("SELECT id FROM g ORDER BY id")
+        .execute_query("SELECT id, v FROM g WHERE id > 3 ORDER BY id")
         .unwrap()
     else {
         panic!("SELECT must return a result set");
     };
     assert_eq!(
         after.rows,
-        vec![vec![Some(b"1".to_vec())], vec![Some(b"3".to_vec())]]
+        vec![
+            vec![Some(b"4".to_vec()), Some(b"0".to_vec())],
+            vec![Some(b"5".to_vec()), Some(b"2147483647".to_vec())]
+        ]
     );
 
     // A table that counts its own ids takes several generated rows too.
