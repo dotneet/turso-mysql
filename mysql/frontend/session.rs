@@ -2845,7 +2845,11 @@ impl MySqlConnection {
                         Some(read) => source_columns
                             .iter()
                             .find(|column| column.name().eq_ignore_ascii_case(read))
-                            .is_some_and(|source| source.decimal_size() == target.decimal_size()),
+                            .is_some_and(|source| {
+                                source.decimal_size() == target.decimal_size()
+                                    || (is_integer_type(target.type_name())
+                                        && target.type_name() != "BIGINT UNSIGNED")
+                            }),
                         None => target.decimal_size().is_none(),
                     })
                 })
@@ -4058,6 +4062,8 @@ impl MySqlConnection {
             .clone()
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        let rounded = ids_bound_as_whole_numbers(&bound, values);
+        let values = rounded.as_deref().unwrap_or(values);
         if bound.rowwise_conflicts() {
             return self
                 .execute_auto_increment_conflict_rows(
@@ -12982,6 +12988,51 @@ impl MySqlConnection {
         }
         Ok(())
     }
+}
+
+/// The bound values with each id bound for a counted column as a double or
+/// a word put into the whole number MySQL stores, or `None` where every id
+/// was bound as one already.
+///
+/// Measured on MySQL 8.4.11 through mysql2, which binds a number as a
+/// double: `100.5` bound for an `AUTO_INCREMENT` key stores 100, and the word
+/// `'200.5'` stores 200 — each read as a double and rounded half to even —
+/// and the counter goes on past each.
+fn ids_bound_as_whole_numbers(
+    bound: &BoundAutoIncrementInsert,
+    values: &[Value],
+) -> Option<Vec<Value>> {
+    let mut rounded: Option<Vec<Value>> = None;
+    for value in bound.row_values() {
+        let AutoIncrementRowValue::Parameter(ordinal) = value else {
+            continue;
+        };
+        let number = match values.get(*ordinal) {
+            Some(Value::Numeric(Numeric::Float(number))) => f64::from(*number),
+            Some(Value::Text(word)) => {
+                let word = word.as_str().trim_matches(' ');
+                if let Ok(whole) = word.parse::<i64>() {
+                    rounded.get_or_insert_with(|| values.to_vec())[*ordinal] =
+                        Value::from_i64(whole);
+                    continue;
+                }
+                if word.parse::<u64>().is_ok() {
+                    continue;
+                }
+                match word.parse::<f64>() {
+                    Ok(number) if number.is_finite() => number,
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        };
+        let whole = number.round_ties_even();
+        if whole.abs() >= 9.0e18 {
+            continue;
+        }
+        rounded.get_or_insert_with(|| values.to_vec())[*ordinal] = Value::from_i64(whole as i64);
+    }
+    rounded
 }
 
 fn reject_incompatible_legacy_tables(connection: &Arc<Connection>) -> Result<()> {

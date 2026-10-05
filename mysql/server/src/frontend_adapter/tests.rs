@@ -532,15 +532,21 @@ fn varchar_columns_answer_what_mysql_8_4_answers() {
 
     // A DOUBLE keeps its value: MySQL's DOUBLE and the engine's REAL are
     // both IEEE 754 binary64. A fractional value that meets an integer
-    // column is refused with 1366 instead; MySQL rounds it away from zero,
-    // measured, which a validator cannot do after the record is built.
+    // column is rounded half away from zero instead, measured: `1.5` names
+    // row 2.
     adapter
         .execute_query("INSERT INTO v (id, name, ratio) VALUES (6, 'x', 1.5)")
         .unwrap();
-    assert_eq!(
-        adapter.execute_query("INSERT INTO v (id, name, ratio) VALUES (1.5, 'y', 2.5)"),
-        Err(FrontendErrorKind::IncorrectValue)
-    );
+    adapter
+        .execute_query("INSERT INTO v (id, name, ratio) VALUES (1.5, 'y', 2.5)")
+        .unwrap();
+    let CommandExecutionResult::ResultSet(rounded) = adapter
+        .execute_query("SELECT name FROM v WHERE id = 2")
+        .unwrap()
+    else {
+        panic!("SELECT must return a result set");
+    };
+    assert_eq!(rounded.rows, vec![vec![Some(b"y".to_vec())]]);
     let CommandExecutionResult::ResultSet(ratio) = adapter
         .execute_query("SELECT ratio FROM v WHERE id = 6")
         .unwrap()
@@ -685,7 +691,7 @@ fn varchar_columns_answer_what_mysql_8_4_answers() {
             .iter()
             .map(|row| String::from_utf8(row[1].clone().unwrap()).unwrap())
             .collect::<Vec<_>>(),
-        vec!["abcd", "あいうえ", "x", "z", "q"]
+        vec!["abcd", "y", "あいうえ", "x", "z", "q"]
     );
 }
 
@@ -31218,3 +31224,6 @@ mod rowid_keys;
 
 #[cfg(unix)]
 mod primary_key_alters;
+
+#[cfg(unix)]
+mod whole_number_columns;

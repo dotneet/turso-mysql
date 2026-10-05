@@ -7050,13 +7050,35 @@ print `double`, and a result column reports type 5 with length 22 and 31
 decimals, the value that says the count of decimal places is not fixed — all
 measured.
 
-Taking it meant letting a DML statement carry a fractional literal at all, which
-it could not before. A fractional value that meets an integer column is refused
-with 1366 rather than stored. MySQL rounds it away from zero instead, without a
-warning — measured, `1.5` and `2.5` into an `INT` store 2 and 3, and `-1.5`
-stores -2. Rounding is not something the assignment validator can do, because it
-sees the record after it is built; refusing is the honest answer until the
-rounding has a place to happen.
+A number with a fraction that meets a column of whole numbers is rounded into
+it, as MySQL rounds it, and only then held to the column's range. Measured on
+8.4.11 in strict mode, with no warning: a written number and a word naming one
+are rounded half away from zero — `1.5`, `2.5`, `-0.5` and `-1.5` store 2, 3,
+-1 and -2, `'2.5'` stores 3, `' 7.5 '` stores 8, `'.5'` stores 1 and `'1e3'`
+1000 — and a value past the range once rounded is 1264, `127.5` in a `TINYINT`
+and `'2147483647.5'` in an `INT` alike. A word naming no number, `''` or
+`'abc'`, is 1366. The same holds for the key, a counted key included —
+`INSERT INTO t VALUES (1.5, ...)` writes id 2 and the counter goes on past it —
+for an `UPDATE`, an upsert's `ON DUPLICATE KEY UPDATE`, a sum with a written
+fraction (MySQL adds it as a decimal, `n + 0.5` over 1 storing 2), and an
+`INSERT ... SELECT` copying a `DECIMAL` column or a column of words. The
+assignment validator does the rounding, on the record a statement is about to
+write, so every path that writes a row rounds the same way.
+
+Three differences remain, all at a value MySQL reads by a rule the record no
+longer shows. MySQL rounds a double — a number written with an exponent, a
+`DOUBLE` column copied in, a value bound as a `DOUBLE` — to the nearest even
+number at a half, `2.5e0` storing 2, and a word bound into an `INSERT`'s
+`VALUES` the same way; here each is rounded half away from zero like a
+decimal, so they differ at an exact half only. An id bound for a counted key is
+the exception and is rounded to even, as MySQL rounds it: mysql2 binding
+`100.5` writes id 100. A written negative decimal that rounds to zero is 1264 in
+an unsigned column in MySQL, `-0.4` refused where `'-0.4'` stores 0; here it
+stores 0. And a written number with a point reaches the validator as a double,
+so one with more digits than a double keeps is read as the nearest double:
+`0.49999999999999999999` becomes 0.5 and stores 1 where MySQL stores 0, and
+`9223372036854775807.4` becomes 2 to the 63rd and is 1264 in a `BIGINT` where
+MySQL stores 9223372036854775807.
 
 `TINYINT UNSIGNED`, `SMALLINT UNSIGNED`, `MEDIUMINT UNSIGNED` and
 `INT UNSIGNED` are taken. The sign is kept as part of the declared type name —

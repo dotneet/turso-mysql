@@ -572,10 +572,17 @@ fn decimal_updates_keep_operand_precision_until_assignment() -> Result<()> {
             .run_collect_rows()?,
         vec![vec![Value::from_i64(0)]]
     );
+    // Measured on MySQL 8.4.11: a DECIMAL copied into a column of whole
+    // numbers is rounded half away from zero.
     connection.execute("CREATE TABLE insert_select_integer (i BIGINT)")?;
-    assert!(connection
-        .execute("INSERT INTO insert_select_integer (i) SELECT v FROM left_decimal")
-        .is_err());
+    connection.execute("INSERT INTO insert_select_integer (i) SELECT v FROM left_decimal")?;
+    assert_eq!(
+        connection
+            .prepare_select("SELECT i FROM insert_select_integer")
+            .map_err(|error| LimboError::InternalError(error.to_string()))?
+            .run_collect_rows()?,
+        vec![vec![Value::from_i64(1)]]
+    );
     connection.execute("CREATE TABLE insert_select_decimal (v DECIMAL(65,30))")?;
     assert!(connection
         .execute("INSERT INTO insert_select_decimal (v) SELECT v / 2 FROM left_decimal")
@@ -755,9 +762,18 @@ fn unreferenced_decimal_columns_do_not_block_checked_selects_or_copies() -> Resu
     assert!(connection
         .prepare_select("SELECT 1 FROM a UNION SELECT v FROM a")
         .is_err());
-    assert!(connection
-        .execute("INSERT INTO b (k) SELECT v FROM a")
-        .is_err());
+    connection.execute("INSERT INTO b (k) SELECT v FROM a")?;
+    let mut result = connection
+        .prepare_select("SELECT k FROM b ORDER BY k")
+        .map_err(|error| LimboError::InternalError(error.to_string()))?;
+    assert_eq!(
+        result.run_collect_rows()?,
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)]
+        ]
+    );
     Ok(())
 }
 
@@ -2951,8 +2967,8 @@ fn a_key_kept_as_the_rowid_answers_every_write_as_a_key_kept_as_an_index() -> Re
         "UPDATE t SET id = 12 WHERE id = 1",
         "UPDATE t SET id = 100 WHERE id = 1",
         "UPDATE t SET id = 2.5 WHERE id = 100",
-        "UPDATE t SET id = '7x' WHERE id = 100",
-        "UPDATE t SET id = '7' WHERE id = 100",
+        "UPDATE t SET id = '7x' WHERE id = 3",
+        "UPDATE t SET id = '7' WHERE id = 3",
         "UPDATE t SET id = 3000000000 WHERE id = 7",
         "UPDATE t SET id = id + 28 WHERE id = 12",
         "UPDATE t SET id = id + 1000 WHERE id > 0",
@@ -3011,7 +3027,8 @@ fn a_key_kept_as_the_rowid_answers_every_write_as_a_key_kept_as_an_index() -> Re
         "INSERT INTO t VALUES ('12', 'twelve', 12): Ok(1)",
         "UPDATE t SET id = NULL WHERE id = 1: Err(\"NOT NULL constraint failed: t.id\")",
         "UPDATE t SET id = 100 WHERE id = 1: Ok(1)",
-        "UPDATE t SET id = '7' WHERE id = 100: Ok(1)",
+        "UPDATE t SET id = 2.5 WHERE id = 100: Ok(1)",
+        "UPDATE t SET id = '7' WHERE id = 3: Ok(1)",
         "UPDATE t SET id = id + 28 WHERE id = 12: Err(\"UNIQUE constraint failed: t.id\")",
         "INSERT INTO d (v) VALUES ('defaulted'): Ok(1)",
     ] {

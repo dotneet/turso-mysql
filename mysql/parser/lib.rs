@@ -277,7 +277,9 @@ pub use view_definition::{
 pub use written_bytes::{
     base64_length, crc32, first_byte, first_character_code, quoted_for_sql, to_base64,
 };
-pub use written_number::{read_written_number, WrittenNumber};
+pub use written_number::{
+    read_written_number, whole_number_a_word_names, WholeNumber, WrittenNumber,
+};
 pub use written_value::WrittenValue;
 pub use xorm_version_test::{xorm_mariadb_test_answer, xorm_mariadb_test_span};
 
@@ -5928,7 +5930,47 @@ fn written_insert_value(value: &Expr, column: &str) -> CheckedInsertValue {
             _ => None,
         })
         .or_else(|| whole_number_past_every_integer(value))
+        .or_else(|| rounded_into_a_whole_number(value))
         .unwrap_or(CheckedInsertValue::Other)
+}
+
+/// A written number with a point or an exponent, or a word naming a number,
+/// as the whole number an integer column stores for it.
+///
+/// Measured on MySQL 8.4.11: `1.5` written into an `AUTO_INCREMENT` key
+/// stores 2 and `'5.5'` stores 6, and the counter goes on past each.
+fn rounded_into_a_whole_number(value: &Expr) -> Option<CheckedInsertValue> {
+    let (sign, literal) = match value {
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => ("-", expr.as_ref()),
+        Expr::UnaryOp {
+            op: UnaryOperator::Plus,
+            expr,
+        } => ("", expr.as_ref()),
+        literal => ("", literal),
+    };
+    let Expr::Value(literal) = literal else {
+        return None;
+    };
+    let written = match (&literal.value, sign) {
+        (Value::Number(digits, false), sign) => format!("{sign}{digits}"),
+        (Value::SingleQuotedString(word) | Value::DoubleQuotedString(word), "") => word.clone(),
+        _ => return None,
+    };
+    let whole = match whole_number_a_word_names(&written)? {
+        WholeNumber::Within(whole) => whole,
+        WholeNumber::Past { negative: true } => i128::MIN,
+        WholeNumber::Past { negative: false } => i128::MAX,
+    };
+    Some(if let Ok(whole) = i64::try_from(whole) {
+        CheckedInsertValue::SignedInteger(whole)
+    } else if let Ok(whole) = u64::try_from(whole) {
+        CheckedInsertValue::UnsignedInteger(whole)
+    } else {
+        CheckedInsertValue::PastEveryInteger(whole)
+    })
 }
 
 /// A written whole number no integer column holds, such as
@@ -6104,10 +6146,10 @@ fn is_direct_insert_literal(expr: &Expr) -> bool {
             let Value::Number(value, false) = &value.value else {
                 return false;
             };
-            let Ok(magnitude) = value.parse::<u64>() else {
-                return false;
-            };
-            magnitude <= (i64::MAX as u64) + 1
+            match value.parse::<u64>() {
+                Ok(magnitude) => magnitude <= (i64::MAX as u64) + 1,
+                Err(_) => value.contains('.') && value.parse::<f64>().is_ok_and(f64::is_finite),
+            }
         }
         _ => false,
     }

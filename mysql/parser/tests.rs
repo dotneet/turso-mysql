@@ -10393,7 +10393,7 @@ fn a_written_id_past_every_integer_is_read_as_a_whole_number() {
             CheckedInsertValue::PastEveryInteger(-9_223_372_036_854_775_809),
             CheckedInsertValue::UnsignedInteger(9_223_372_036_854_775_808),
             CheckedInsertValue::PastEveryInteger(18_446_744_073_709_551_616),
-            CheckedInsertValue::Other,
+            CheckedInsertValue::SignedInteger(7),
             CheckedInsertValue::PastEveryInteger(i128::MAX),
         ])
     );
@@ -10402,6 +10402,24 @@ fn a_written_id_past_every_integer_is_read_as_a_whole_number() {
         mode
     ));
     assert!(!insert_ignores_errors("INSERT INTO t VALUES (1, 0)", mode));
+}
+
+/// A written fraction and a word naming a number are read as the id an
+/// integer key stores for them. Measured on MySQL 8.4.11: `1.5` written into
+/// an `AUTO_INCREMENT` key names id 2, `'5.5'` names 6 and `-1.5` names -2,
+/// each rounded half away from zero, and a word naming no number is no id.
+#[test]
+fn a_written_fraction_is_read_as_the_id_it_rounds_to() {
+    let sql = "INSERT INTO t (id, v) VALUES (1.5, 0), ('5.5', 0), (-1.5, 0), ('abc', 0)";
+    assert_eq!(
+        parse_insert_values_written_into(sql, SessionSqlMode::default(), "id").unwrap(),
+        Some(vec![
+            CheckedInsertValue::SignedInteger(2),
+            CheckedInsertValue::SignedInteger(6),
+            CheckedInsertValue::SignedInteger(-2),
+            CheckedInsertValue::Other,
+        ])
+    );
 }
 
 /// An `ALTER TABLE` that changes the key, a column it is over or the column a

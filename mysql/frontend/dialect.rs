@@ -13,7 +13,8 @@ use turso_mysql_parser::{
     parse_auto_increment_create_table, parse_checked_primary_key_create_table,
     parse_create_index_ast, parse_create_table_ast, parse_create_trigger_ast,
     parse_create_view_ast, parse_mysql_numeric_spec, render_create_index_mysql_with_mode,
-    render_create_table_mysql_with_mode, table_options_of, JsonNumberReading, SessionSqlMode,
+    render_create_table_mysql_with_mode, table_options_of, whole_number_a_word_names,
+    JsonNumberReading, SessionSqlMode, WholeNumber,
 };
 use turso_parser::ast::{Cmd, ColumnConstraint, CreateTableBody, Stmt};
 
@@ -2551,7 +2552,7 @@ pub(crate) fn check_mysql_assignment(
             })?;
             continue;
         }
-        let Value::Numeric(Numeric::Integer(value)) = value else {
+        let Some(whole) = whole_number_mysql_stores(value) else {
             return Err(AssignmentError::IncorrectType {
                 table: table_name.to_string(),
                 column: column_index + 1,
@@ -2560,17 +2561,64 @@ pub(crate) fn check_mysql_assignment(
             .into());
         };
         let (min, max) = integer_type.bounds();
-        if i128::from(*value) < min || i128::from(*value) > max {
-            return Err(AssignmentError::OutOfRange {
-                table: table_name.to_string(),
-                column: column_index + 1,
-                type_name,
-                value: *value,
+        let stored = match whole {
+            WholeNumber::Within(whole) if whole >= min && whole <= max => whole,
+            WholeNumber::Within(whole) => {
+                return Err(AssignmentError::OutOfRange {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name,
+                    value: i64::try_from(whole).unwrap_or(if whole < 0 {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }),
+                }
+                .into());
             }
-            .into());
+            WholeNumber::Past { negative } => {
+                return Err(AssignmentError::OutOfRange {
+                    table: table_name.to_string(),
+                    column: column_index + 1,
+                    type_name,
+                    value: if negative { i64::MIN } else { i64::MAX },
+                }
+                .into());
+            }
+        };
+        if !matches!(value, Value::Numeric(Numeric::Integer(_))) {
+            let stored = i64::try_from(stored).expect("an integer column's bounds fit an i64");
+            rewritten.get_or_insert_with(|| values.to_vec())[column_index] =
+                Value::from_i64(stored);
         }
     }
     Ok(rewritten)
+}
+
+/// Reads a value written to an integer column as the whole number MySQL
+/// stores, or `None` where MySQL answers 1366.
+///
+/// Measured on MySQL 8.4.11 in strict mode: a number with a fraction is
+/// rounded half away from zero without a warning — `1.5` stores 2, `-0.5`
+/// stores -1, `'2.5'` stores 3 and `' 7.5 '` stores 8 — and so is a `DECIMAL`
+/// column's value copied in, which reaches here as the words it reads as. A
+/// word naming no number, `''` or `'abc'`, is 1366.
+fn whole_number_mysql_stores(value: &Value) -> Option<WholeNumber> {
+    match value {
+        Value::Numeric(Numeric::Integer(whole)) => Some(WholeNumber::Within(i128::from(*whole))),
+        Value::Numeric(Numeric::Float(number)) => {
+            let rounded = f64::from(*number).round();
+            if rounded.abs() < 1e30 {
+                Some(WholeNumber::Within(rounded as i128))
+            } else {
+                Some(WholeNumber::Past {
+                    negative: rounded < 0.0,
+                })
+            }
+        }
+        Value::Text(text) => whole_number_a_word_names(text.as_str()),
+        Value::Blob(_) | Value::Null => None,
+    }
 }
 
 #[cfg(test)]
