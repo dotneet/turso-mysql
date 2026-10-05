@@ -4560,6 +4560,15 @@ pub(crate) struct GcDebugSnapshot {
     pub backfill_floor: WalPos,
 }
 
+static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Default)]
+pub(crate) struct RootPageTableIds {
+    store_id: Option<u64>,
+    root_bindings_changed: u64,
+    table_ids: HashMap<u64, MVTableId>,
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
@@ -4578,6 +4587,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     ///
     /// Versioned root bindings; passive checkpoints update these at publish, not during collection.
     pub table_id_to_rootpage: SkipMap<MVTableId, RootEntry, BasicComparator, A>,
+    store_id: u64,
+    root_bindings_changed: AtomicU64,
+    #[cfg(test)]
+    root_binding_scans: AtomicUsize,
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
@@ -4833,6 +4846,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(Self {
             rows: SkipMap::new_in(alloc.clone()),
             table_id_to_rootpage,
+            store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            root_bindings_changed: AtomicU64::new(0),
+            #[cfg(test)]
+            root_binding_scans: AtomicUsize::new(0),
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
@@ -4938,6 +4955,54 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .map(|entry| *entry.key())
     }
 
+    pub(crate) fn table_id_of_root_page_remembering(
+        &self,
+        remembered: &mut RootPageTableIds,
+        root_page: i64,
+        snapshot_ts: u64,
+    ) -> Option<MVTableId> {
+        if root_page < 0 {
+            return Some(root_page.into());
+        }
+        let root_page = root_page as u64;
+        let changed = self.root_bindings_changed.load(Ordering::Acquire);
+        if remembered.store_id != Some(self.store_id) || remembered.root_bindings_changed != changed
+        {
+            remembered.table_ids.clear();
+            remembered.store_id = Some(self.store_id);
+            remembered.root_bindings_changed = changed;
+        }
+        if let Some(table_id) = remembered.table_ids.get(&root_page) {
+            return Some(*table_id);
+        }
+        #[cfg(test)]
+        self.root_binding_scans.fetch_add(1, Ordering::Relaxed);
+        let mut bindings_of_the_page = 0;
+        let mut only_live_bindings = true;
+        let mut owner: Option<(MVTableId, u64)> = None;
+        for entry in self.table_id_to_rootpage.iter() {
+            let binding = entry.value();
+            if binding.root_page != Some(root_page) {
+                continue;
+            }
+            bindings_of_the_page += 1;
+            only_live_bindings &= binding.is_live();
+            let seen = binding.is_live() || snapshot_ts < binding.end;
+            if seen && owner.is_none_or(|(_, end)| binding.end < end) {
+                owner = Some((*entry.key(), binding.end));
+            }
+        }
+        let owner = owner.map(|(table_id, _)| table_id);
+        if let (Some(table_id), 1, true) = (owner, bindings_of_the_page, only_live_bindings) {
+            remembered.table_ids.insert(root_page, table_id);
+        }
+        owner
+    }
+
+    fn note_that_root_bindings_changed(&self) {
+        self.root_bindings_changed.fetch_add(1, Ordering::AcqRel);
+    }
+
     /// Snapshot timestamp (`begin_ts`) of the given transaction, or `u64::MAX` if it is not
     /// tracked (resolving the live root-page binding). Used to make a transaction's root-page
     /// lookups snapshot-consistent.
@@ -4976,11 +5041,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn insert_table_id_to_rootpage(&self, table_id: MVTableId, root_page: Option<u64>) {
         self.table_id_to_rootpage
             .insert(table_id, RootEntry::live(root_page));
+        self.note_that_root_bindings_changed();
         self.bump_next_table_id_below(table_id, root_page);
     }
 
     pub fn remove_table_id_to_rootpage(&self, table_id: &MVTableId) {
         self.table_id_to_rootpage.remove(table_id);
+        self.note_that_root_bindings_changed();
         self.table_id_to_last_rowid.write().remove(table_id);
         self.forget_the_table_of_index(table_id);
     }
@@ -5029,6 +5096,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             entry.end = begin_ts;
             self.table_id_to_rootpage.insert(key, entry);
         }
+        self.note_that_root_bindings_changed();
         self.bump_next_table_id_below(table_id, Some(root_page));
     }
 
@@ -5041,6 +5109,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let mut e = *entry.value();
             e.materialized_at = materialized_at;
             self.table_id_to_rootpage.insert(table_id, e);
+            self.note_that_root_bindings_changed();
         }
     }
 
@@ -5052,6 +5121,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let mut e = *entry.value();
             e.end = end_ts;
             self.table_id_to_rootpage.insert(table_id, e);
+            self.note_that_root_bindings_changed();
         }
     }
 
@@ -5070,6 +5140,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .collect();
         for key in &stale {
             self.table_id_to_rootpage.remove(key);
+            self.note_that_root_bindings_changed();
             self.table_id_to_last_rowid.write().remove(key);
             self.forget_the_table_of_index(key);
         }
@@ -5172,6 +5243,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Clears live and retired bindings alike: both reference pre-VACUUM root pages that
         // would alias new objects after root-page reuse.
         self.table_id_to_rootpage.clear();
+        self.note_that_root_bindings_changed();
         self.table_id_to_last_rowid.write().clear();
         self.table_of_index.write().clear();
         self.primary_key_of_table.write().clear();

@@ -735,6 +735,7 @@ pub struct Connection {
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
     pub(super) begin_kept_waiting: Mutex<Option<KeptBegin>>,
+    pub(crate) mvcc_root_page_table_ids: Mutex<crate::mvcc::database::RootPageTableIds>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
     /// Maximum execution time for a single statement on this connection.

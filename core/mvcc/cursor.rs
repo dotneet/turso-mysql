@@ -744,7 +744,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             db.try_get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
                 .ok_or(LimboError::SchemaUpdated)?
         } else {
-            db.get_table_id_from_root_page_at(root_page_or_table_id, snapshot_ts)
+            db.table_id_of_root_page_remembering(
+                &mut connection.mvcc_root_page_table_ids.lock(),
+                root_page_or_table_id,
+                snapshot_ts,
+            )
+            .unwrap_or_else(|| {
+                panic!("Positive root page is not mapped to a table id: {root_page_or_table_id}")
+            })
         };
         Ok(Self {
             db,

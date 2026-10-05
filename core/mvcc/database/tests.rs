@@ -1021,6 +1021,53 @@ fn a_begin_held_back_sleeps_until_new_transactions_are_let_begin() {
 }
 
 #[test]
+fn a_cursor_finds_the_table_a_reused_root_page_now_belongs_to() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let store = db.get_mvcc_store();
+    let conn = db.connect();
+    let checkpoint = || {
+        conn.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    };
+    let root_page_of = |name: &str| {
+        get_rows(
+            &conn,
+            &format!("SELECT rootpage FROM sqlite_schema WHERE name = '{name}'"),
+        )
+    };
+    conn.execute("CREATE TABLE dropped (x INTEGER)").unwrap();
+    conn.execute("INSERT INTO dropped VALUES (1)").unwrap();
+    checkpoint();
+    let dropped_root = root_page_of("dropped");
+    let scans = || store.root_binding_scans.load(Ordering::Relaxed);
+    assert_eq!(
+        get_rows(&conn, "SELECT x FROM dropped"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    let scans_after_the_first_read = scans();
+    for _ in 0..3 {
+        assert_eq!(
+            get_rows(&conn, "SELECT x FROM dropped"),
+            vec![vec![Value::from_i64(1)]]
+        );
+    }
+    assert_eq!(scans(), scans_after_the_first_read);
+
+    conn.execute("DROP TABLE dropped").unwrap();
+    checkpoint();
+    conn.execute("CREATE TABLE created (y INTEGER)").unwrap();
+    conn.execute("INSERT INTO created VALUES (2)").unwrap();
+    checkpoint();
+    assert_eq!(root_page_of("created"), dropped_root);
+    assert_eq!(
+        get_rows(&conn, "SELECT y FROM created"),
+        vec![vec![Value::from_i64(2)]]
+    );
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the
