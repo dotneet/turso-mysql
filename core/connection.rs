@@ -532,6 +532,111 @@ pub(crate) struct ExplicitCheckpointGuard {
     pager: Arc<Pager>,
 }
 
+/// A blocking MVCC checkpoint that wrote the rows committed before it
+/// began and waits for no transaction to be running; see
+/// [`Connection::begin_mvcc_checkpoint_writing_rows_first`].
+pub struct MvccCheckpointWritingRowsFirst {
+    state_machine: Option<
+        crate::mvcc::database::CheckpointStateMachine<
+            crate::mvcc::MvccClock,
+            crate::alloc::DynAllocator,
+        >,
+    >,
+    io: Arc<dyn IO>,
+    _guard: ExplicitCheckpointGuard,
+}
+
+impl MvccCheckpointWritingRowsFirst {
+    /// How many table and index rows it has written so far.
+    pub fn rows_written(&self) -> usize {
+        self.state_machine
+            .as_ref()
+            .expect("a finished checkpoint has no rows waiting to commit")
+            .rows_written_before_the_lock()
+    }
+
+    /// Writes, still beside the running transactions, the rows committed
+    /// since the rows it wrote, so that fewer are left for the time no
+    /// transaction runs. Answers how many table and index rows it wrote.
+    pub fn write_the_rows_committed_since(&mut self) -> Result<usize> {
+        use crate::state_machine::{StateTransition, TransitionResult};
+        let written_before = self.rows_written();
+        let state_machine = self
+            .state_machine
+            .as_mut()
+            .expect("a finished checkpoint writes no more rows");
+        state_machine.write_the_rows_committed_since();
+        while !state_machine.waits_for_the_blocking_lock() {
+            let stepped = state_machine.step(&());
+            match stepped {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Io(io)) => {
+                    if let Err(err) = io.wait(self.io.as_ref()) {
+                        let cleaned = state_machine.cleanup_after_external_io_error(err.clone());
+                        self.state_machine = None;
+                        cleaned?;
+                        return Err(err);
+                    }
+                }
+                Ok(TransitionResult::Done(_)) => {
+                    unreachable!("rows written before the lock end waiting for the lock")
+                }
+                Err(err) => {
+                    self.state_machine = None;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(self.rows_written() - written_before)
+    }
+
+    /// Takes the blocking lock if no transaction is running, then writes
+    /// what committed since the rows were written and finishes the
+    /// checkpoint. Answers `None`, keeping what was written, while a
+    /// transaction still runs.
+    pub fn finish_once_no_transaction_runs(&mut self) -> Result<Option<CheckpointResult>> {
+        use crate::state_machine::{StateTransition, TransitionResult};
+        let state_machine = self
+            .state_machine
+            .as_mut()
+            .expect("a finished checkpoint is not finished again");
+        loop {
+            let waited_for_the_lock = state_machine.waits_for_the_blocking_lock();
+            let stepped = state_machine.step(&());
+            match stepped {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(result)) => {
+                    self.state_machine = None;
+                    return Ok(Some(result));
+                }
+                Ok(TransitionResult::Io(io)) => {
+                    if waited_for_the_lock && state_machine.waits_for_the_blocking_lock() {
+                        return Ok(None);
+                    }
+                    if let Err(err) = io.wait(self.io.as_ref()) {
+                        let cleaned = state_machine.cleanup_after_external_io_error(err.clone());
+                        self.state_machine = None;
+                        cleaned?;
+                        return Err(err);
+                    }
+                }
+                Err(err) => {
+                    self.state_machine = None;
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for MvccCheckpointWritingRowsFirst {
+    fn drop(&mut self) {
+        if let Some(state_machine) = self.state_machine.as_mut() {
+            state_machine.abandon_before_the_lock();
+        }
+    }
+}
+
 impl Drop for ExplicitCheckpointGuard {
     fn drop(&mut self) {
         if self.pager.is_checkpointing() {
@@ -2729,7 +2834,6 @@ impl Connection {
 
     pub fn checkpoint(self: &Arc<Self>, mode: CheckpointMode) -> Result<CheckpointResult> {
         use crate::mvcc::database::CheckpointStateMachine;
-        use crate::state_machine::{StateTransition, TransitionResult};
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -2755,8 +2859,7 @@ impl Connection {
                 }
             };
             let pager = self.pager.load().clone();
-            let io = pager.io.clone();
-            let mut ckpt_sm = CheckpointStateMachine::new(
+            let ckpt_sm = CheckpointStateMachine::new(
                 pager,
                 mv_store.clone(),
                 self.clone(),
@@ -2765,23 +2868,94 @@ impl Connection {
                 MAIN_DB_ID,
                 mode,
             );
-            loop {
-                match ckpt_sm.step(&()) {
-                    Ok(TransitionResult::Continue) => {}
-                    Ok(TransitionResult::Done(result)) => return Ok(result),
-                    Ok(TransitionResult::Io(iocompletions)) => {
-                        if let Err(err) = iocompletions.wait(io.as_ref()) {
-                            ckpt_sm.cleanup_after_external_io_error(err.clone())?;
-                            return Err(err);
-                        }
-                    }
-                    Err(err) => return Err(err),
-                }
-            }
+            Self::run_mvcc_checkpoint(ckpt_sm, &self.pager.load().io)
         } else {
             self.pager
                 .load()
                 .blocking_checkpoint(mode, self.get_sync_mode())
+        }
+    }
+
+    /// Starts a blocking MVCC checkpoint that writes the rows committed so
+    /// far into its pager transaction while other transactions keep
+    /// running. Nothing it writes is visible or durable until
+    /// [`MvccCheckpointWritingRowsFirst::finish_once_no_transaction_runs`]
+    /// commits it under the blocking lock, together with what committed in
+    /// between. Dropping it unfinished rolls the writes back.
+    pub fn begin_mvcc_checkpoint_writing_rows_first(
+        self: &Arc<Self>,
+    ) -> Result<MvccCheckpointWritingRowsFirst> {
+        use crate::mvcc::database::CheckpointStateMachine;
+        use crate::state_machine::{StateTransition, TransitionResult};
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        let guard = self.begin_explicit_checkpoint(self.pager.load().clone(), false)?;
+        let mv_store = self.mv_store();
+        let mv_store = mv_store
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("not an MVCC database".to_string()))?;
+        turso_assert!(
+            !self.experimental_mvcc_passive_checkpoint_enabled(),
+            "rows are written before the lock only without passive checkpoints"
+        );
+        let pager = self.pager.load().clone();
+        let mut state_machine = CheckpointStateMachine::new(
+            pager.clone(),
+            mv_store.clone(),
+            self.clone(),
+            true,
+            self.get_sync_mode(),
+            MAIN_DB_ID,
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+        );
+        state_machine.leave_the_version_sweep_to_the_caller();
+        state_machine.write_rows_before_the_lock();
+        while !state_machine.waits_for_the_blocking_lock() {
+            match state_machine.step(&())? {
+                TransitionResult::Continue => {}
+                TransitionResult::Io(io) => {
+                    if let Err(err) = io.wait(pager.io.as_ref()) {
+                        state_machine.cleanup_after_external_io_error(err.clone())?;
+                        return Err(err);
+                    }
+                }
+                TransitionResult::Done(_) => {
+                    unreachable!(
+                        "a checkpoint writing rows first waits for the lock before it ends"
+                    )
+                }
+            }
+        }
+        Ok(MvccCheckpointWritingRowsFirst {
+            state_machine: Some(state_machine),
+            io: pager.io.clone(),
+            _guard: guard,
+        })
+    }
+
+    fn run_mvcc_checkpoint(
+        mut ckpt_sm: crate::mvcc::database::CheckpointStateMachine<
+            crate::mvcc::MvccClock,
+            crate::alloc::DynAllocator,
+        >,
+        io: &Arc<dyn IO>,
+    ) -> Result<CheckpointResult> {
+        use crate::state_machine::{StateTransition, TransitionResult};
+        loop {
+            match ckpt_sm.step(&()) {
+                Ok(TransitionResult::Continue) => {}
+                Ok(TransitionResult::Done(result)) => return Ok(result),
+                Ok(TransitionResult::Io(iocompletions)) => {
+                    if let Err(err) = iocompletions.wait(io.as_ref()) {
+                        ckpt_sm.cleanup_after_external_io_error(err.clone())?;
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
         }
     }
 

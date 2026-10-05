@@ -3877,7 +3877,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 inject_transition_yield!(self, CommitYieldPoint::BeforeFinishCommittedTx);
                 mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id)?;
                 inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
-                if appended_to_log && mvcc_store.storage.should_checkpoint() {
+                if appended_to_log
+                    && mvcc_store.checkpoints_after_commits()
+                    && mvcc_store.storage.should_checkpoint()
+                {
                     let auto_checkpoint_mode = if mvcc_store.uses_passive_checkpoint() {
                         crate::storage::wal::CheckpointMode::Passive {
                             upper_bound_inclusive: None,
@@ -4663,6 +4666,22 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// contend on it; only one wins. Needed because the lock no longer guards the start
     /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
+    /// The id the first transaction to begin after the last blocking
+    /// checkpoint got or will get; see [`MvStore::sweep_what_the_checkpoint_left`].
+    first_tx_after_the_last_checkpoint: AtomicU64,
+    /// Held by a blocking checkpoint from its start to its end, including a
+    /// checkpoint that writes rows before it takes the blocking lock, so
+    /// that two never run at once.
+    checkpoint_gate: AtomicBool,
+    /// The timestamp through which a blocking checkpoint that has not
+    /// committed yet wrote, or is writing, rows into its pager transaction;
+    /// 0 when none does. Garbage collection counts a version that began at
+    /// or before it as one the B-tree holds, so that it keeps the version
+    /// until the checkpoint has written its end.
+    checkpoint_rows_written_through: AtomicU64,
+    /// Off once the caller runs every checkpoint itself; see
+    /// [`MvStore::leave_checkpoints_to_the_caller`].
+    checkpoints_after_commits: AtomicBool,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -4874,6 +4893,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
+            first_tx_after_the_last_checkpoint: AtomicU64::new(0),
+            checkpoint_gate: AtomicBool::new(false),
+            checkpoint_rows_written_through: AtomicU64::new(0),
+            checkpoints_after_commits: AtomicBool::new(true),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -9210,6 +9233,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             versions,
             lwm,
             ckpt_max,
+            ckpt_max.max(self.checkpoint_rows_written_through.load(Ordering::SeqCst)),
             self.experimental_mvcc_passive_checkpoint,
             min_reader_mark,
             drop_current_if_in_btree,
@@ -9221,21 +9245,97 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
-        self.drop_unused_row_versions_inner(false, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(false, true, WalPos::STAGED, TxID::MAX)
     }
 
     /// Like [`Self::drop_unused_row_versions`], and remove emptied SkipMap slots.
     /// Also drops last currents already in the B-tree (Truncate Finalize).
     /// Writers retry if GC unlinks their Arc (`insert_version` / `insert_index_version`).
     pub fn drop_unused_row_versions_and_slots(&self) -> usize {
-        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED)
+        self.drop_unused_row_versions_inner(true, true, WalPos::STAGED, TxID::MAX)
+    }
+
+    /// Does, beside running transactions, the sweep a blocking checkpoint
+    /// left undone: drops the row versions no transaction can read, removes
+    /// the emptied SkipMap slots, and forgets the final states of the
+    /// transactions that ended before that checkpoint.
+    ///
+    /// Only transactions that ended before the checkpoint are forgotten. One
+    /// that ended later may have left a version carrying its id in a running
+    /// reader's copy of a chain, which this sweep cannot see. One that ended
+    /// before it cannot: the checkpoint ran with no transaction open, and a
+    /// version that still carries such an id stays in its chain, where the
+    /// sweep finds it.
+    ///
+    /// Answers 0 without sweeping while a blocking checkpoint runs.
+    pub fn sweep_what_the_checkpoint_left(&self) -> usize {
+        if !self.blocking_checkpoint_lock.read() {
+            return 0;
+        }
+        let swept = self.drop_unused_row_versions_inner(
+            true,
+            true,
+            WalPos::STAGED,
+            self.first_tx_after_the_last_checkpoint
+                .load(Ordering::Acquire),
+        );
+        self.blocking_checkpoint_lock.unlock();
+        swept
+    }
+
+    /// Stops a commit that grew the logical log past the checkpoint
+    /// threshold from checkpointing, as it does when no other transaction
+    /// is open, for a caller that runs every checkpoint itself. Such a
+    /// checkpoint holds every new transaction back for all of its work,
+    /// in the committing session.
+    pub fn leave_checkpoints_to_the_caller(&self) {
+        self.checkpoints_after_commits
+            .store(false, Ordering::Release);
+    }
+
+    pub(crate) fn checkpoints_after_commits(&self) -> bool {
+        self.checkpoints_after_commits.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_the_checkpoint_gate(&self) -> bool {
+        self.checkpoint_gate
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn leave_the_checkpoint_gate(&self) {
+        self.checkpoint_rows_written_through
+            .store(0, Ordering::SeqCst);
+        let was_held = self.checkpoint_gate.swap(false, Ordering::AcqRel);
+        turso_assert!(was_held, "the checkpoint gate was left without being taken");
+    }
+
+    /// Marks the versions that began at or before `snapshot_ts` as ones the
+    /// checkpoint holding the gate may write into its pager transaction,
+    /// before it collects them.
+    pub(crate) fn note_the_checkpoint_writes_rows_through(&self, snapshot_ts: u64) {
+        turso_assert!(
+            self.checkpoint_gate.load(Ordering::Acquire),
+            "only the checkpoint holding the gate writes rows before the blocking lock"
+        );
+        self.checkpoint_rows_written_through
+            .fetch_max(snapshot_ts, Ordering::SeqCst);
+    }
+
+    pub(crate) fn note_the_first_tx_after_this_checkpoint(&self) {
+        turso_assert!(
+            self.txs.is_empty(),
+            "a blocking checkpoint runs with no transaction open"
+        );
+        self.first_tx_after_the_last_checkpoint
+            .store(self.tx_ids.load(Ordering::SeqCst), Ordering::Release);
     }
 
     /// Drop old versions and empty SkipMap slots, including the latest copy of each
     /// row once the B-tree has it (Rule 3). Passive Finalize uses this.
     /// `reader_mark_floor` should include pager-held readers, not only `txs`.
     pub fn drop_unused_row_versions_unlink_empty_at(&self, reader_mark_floor: WalPos) -> usize {
-        self.drop_unused_row_versions_inner(true, true, reader_mark_floor)
+        self.drop_unused_row_versions_inner(true, true, reader_mark_floor, TxID::MAX)
     }
 
     /// Incremental GC on the commit path: reclaim up to `max_chains` table chains
@@ -9453,6 +9553,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         remove_empty_slots: bool,
         drop_current_if_in_btree: bool,
         reader_mark_floor: WalPos,
+        forget_finalized_below: TxID,
     ) -> usize {
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         let lwm = self.sample_gc_lwm();
@@ -9474,7 +9575,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             reader_mark_floor,
         );
         self.dec_live_version_count_approx(dropped);
-        let pruned_finalized = self.prune_finalized_tx_states(&referenced_tx_ids);
+        let pruned_finalized =
+            self.prune_finalized_tx_states(&referenced_tx_ids, forget_finalized_below);
 
         tracing::trace!(
             "drop_unused_row_versions() -> dropped {dropped}, pruned_finalized={pruned_finalized}, txs: {}, finalized_tx_states: {}, rows: {}",
@@ -9583,7 +9685,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    fn prune_finalized_tx_states(&self, referenced_tx_ids: &HashSet<TxID>) -> usize {
+    fn prune_finalized_tx_states(
+        &self,
+        referenced_tx_ids: &HashSet<TxID>,
+        forget_below: TxID,
+    ) -> usize {
         if self.finalized_tx_states.is_empty() {
             return 0;
         }
@@ -9593,7 +9699,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .iter()
             .filter_map(|entry| {
                 let tx_id = *entry.key();
-                (!referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
+                (tx_id < forget_below && !referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
             })
             .collect();
 
@@ -9625,6 +9731,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         versions: &mut RowVersionChain<A>,
         lwm: u64,
         ckpt_max: u64,
+        in_btree_through: u64,
         passive: bool,
         min_reader_mark: WalPos,
         drop_current_if_in_btree: bool,
@@ -9653,10 +9760,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 } else {
                     // Keep until the delete is checkpointed. Tombstones without a committed
                     // current successor must survive, as must versions already in the B-tree
-                    // (btree_resident, or begin <= ckpt_max). Dropping the latter erases the
-                    // only evidence that a later delete must be written (#7638).
+                    // (btree_resident, or begin <= in_btree_through). Dropping the latter erases
+                    // the only evidence that a later delete must be written (#7638).
                     let in_btree = rv.btree_resident
-                        || matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if *b <= ckpt_max);
+                        || matches!(&rv.begin(), Some(TxTimestampOrID::Timestamp(b)) if *b <= in_btree_through);
                     *e > ckpt_max && (in_btree || !has_current)
                 }
             }

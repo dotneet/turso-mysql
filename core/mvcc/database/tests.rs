@@ -980,6 +980,507 @@ fn a_blocking_checkpoint_runs_once_new_transactions_are_held_back() {
 }
 
 #[test]
+fn a_checkpoint_leaving_the_sweep_empties_the_rows_it_wrote_and_the_sweep_removes_them_later() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let store = db.get_mvcc_store();
+    let writer = db.connect();
+    let reader = db.connect();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    writer.execute("CREATE INDEX t_k ON t (k)").unwrap();
+    writer
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    for id in 1..=20 {
+        writer
+            .execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    let before_the_checkpoint = writer.get_mv_tx_id().unwrap();
+    writer.execute("COMMIT").unwrap();
+    assert!(store
+        .finalized_tx_states
+        .contains_key(&before_the_checkpoint));
+
+    let mut checkpoint = writer.begin_mvcc_checkpoint_writing_rows_first().unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+    let chains_left = || {
+        let table_chains = store.rows.len();
+        let index_chains: usize = store.index_rows.iter().map(|e| e.value().len()).sum();
+        (table_chains, index_chains)
+    };
+    assert_eq!(chains_left(), (20, 20));
+    assert!(store
+        .rows
+        .iter()
+        .all(|entry| entry.value().read().is_empty()));
+    assert!(store
+        .finalized_tx_states
+        .contains_key(&before_the_checkpoint));
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    let after_the_checkpoint = writer.get_mv_tx_id().unwrap();
+    writer.execute("COMMIT").unwrap();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*), sum(k) FROM t"),
+        vec![vec![Value::from_i64(20), Value::from_i64(309)]]
+    );
+
+    store.sweep_what_the_checkpoint_left();
+    assert_eq!(chains_left(), (1, 2));
+    assert!(!store
+        .finalized_tx_states
+        .contains_key(&before_the_checkpoint));
+    assert!(store
+        .finalized_tx_states
+        .contains_key(&after_the_checkpoint));
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*), sum(k) FROM t"),
+        vec![vec![Value::from_i64(20), Value::from_i64(309)]]
+    );
+    assert_eq!(
+        get_rows(&reader, "SELECT id FROM t WHERE k = 100"),
+        vec![vec![Value::from_i64(1)]]
+    );
+    reader.execute("COMMIT").unwrap();
+}
+
+fn rows_of_t(conn: &Arc<Connection>) -> Vec<Vec<Value>> {
+    get_rows(conn, "SELECT id, k FROM t ORDER BY id")
+}
+
+fn ids_by_k(conn: &Arc<Connection>, k: i64) -> Vec<Vec<Value>> {
+    get_rows(conn, &format!("SELECT id FROM t WHERE k = {k} ORDER BY id"))
+}
+
+fn table_t_with_ten_rows_in_the_btree(db: &MvccTestDbNoConn) -> Arc<Connection> {
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)")
+        .unwrap();
+    conn.execute("CREATE INDEX t_k ON t (k)").unwrap();
+    for id in 1..=10 {
+        conn.execute(format!("INSERT INTO t VALUES ({id}, {id})"))
+            .unwrap();
+    }
+    conn.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })
+    .unwrap();
+    conn
+}
+
+fn finish_the_checkpoint(checkpoint: &mut crate::MvccCheckpointWritingRowsFirst) {
+    assert!(checkpoint
+        .finish_once_no_transaction_runs()
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn rows_written_before_the_lock_stay_out_of_every_running_snapshot() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let old_reader = db.connect();
+    let new_reader = db.connect();
+    let checkpointing = db.connect();
+    old_reader.execute("BEGIN CONCURRENT").unwrap();
+    let before = rows_of_t(&old_reader);
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 2").unwrap();
+    writer.execute("INSERT INTO t VALUES (11, 11)").unwrap();
+
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    assert_eq!(checkpoint.rows_written(), 7);
+    assert_eq!(rows_of_t(&old_reader), before);
+    assert_eq!(ids_by_k(&old_reader, 100), Vec::<Vec<Value>>::new());
+    assert_eq!(ids_by_k(&old_reader, 2), vec![vec![Value::from_i64(2)]]);
+    new_reader.execute("BEGIN CONCURRENT").unwrap();
+    let after_the_first_writes = rows_of_t(&new_reader);
+    assert_eq!(after_the_first_writes.len(), 10);
+    assert_eq!(ids_by_k(&new_reader, 100), vec![vec![Value::from_i64(1)]]);
+
+    writer.execute("UPDATE t SET k = 101 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 11").unwrap();
+    writer.execute("UPDATE t SET k = 300 WHERE id = 3").unwrap();
+    writer.execute("INSERT INTO t VALUES (12, 12)").unwrap();
+    assert!(checkpoint
+        .finish_once_no_transaction_runs()
+        .unwrap()
+        .is_none());
+    assert_eq!(rows_of_t(&old_reader), before);
+    assert_eq!(rows_of_t(&new_reader), after_the_first_writes);
+    old_reader.execute("COMMIT").unwrap();
+    assert!(checkpoint
+        .finish_once_no_transaction_runs()
+        .unwrap()
+        .is_none());
+    new_reader.execute("COMMIT").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+
+    let expected: Vec<Vec<Value>> = [
+        (1, 101),
+        (3, 300),
+        (4, 4),
+        (5, 5),
+        (6, 6),
+        (7, 7),
+        (8, 8),
+        (9, 9),
+        (10, 10),
+        (12, 12),
+    ]
+    .into_iter()
+    .map(|(id, k)| vec![Value::from_i64(id), Value::from_i64(k)])
+    .collect();
+    assert_eq!(rows_of_t(&writer), expected);
+    assert_eq!(ids_by_k(&writer, 101), vec![vec![Value::from_i64(1)]]);
+    assert_eq!(ids_by_k(&writer, 100), Vec::<Vec<Value>>::new());
+    assert_eq!(ids_by_k(&writer, 11), Vec::<Vec<Value>>::new());
+    assert!(db.get_mvcc_store().logical_log_offset() <= LOG_HDR_SIZE as u64);
+
+    drop((writer, old_reader, new_reader, checkpointing));
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(rows_of_t(&conn), expected);
+    assert_eq!(ids_by_k(&conn, 300), vec![vec![Value::from_i64(3)]]);
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
+fn rows_written_again_before_the_lock_cover_what_committed_between_the_passes() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let reader = db.connect();
+    let checkpointing = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    let before = rows_of_t(&reader);
+    writer.execute("INSERT INTO t VALUES (11, 11)").unwrap();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    assert_eq!(checkpoint.rows_written(), 5);
+
+    writer.execute("DELETE FROM t WHERE id = 11").unwrap();
+    writer.execute("UPDATE t SET k = 200 WHERE id = 1").unwrap();
+    writer.execute("INSERT INTO t VALUES (12, 12)").unwrap();
+    assert_eq!(checkpoint.write_the_rows_committed_since().unwrap(), 7);
+    assert_eq!(checkpoint.write_the_rows_committed_since().unwrap(), 0);
+    assert_eq!(rows_of_t(&reader), before);
+
+    writer.execute("INSERT INTO t VALUES (11, 111)").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 12").unwrap();
+    writer.execute("UPDATE t SET k = 300 WHERE id = 1").unwrap();
+    assert_eq!(rows_of_t(&reader), before);
+    reader.execute("COMMIT").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+
+    let mut expected = vec![vec![Value::from_i64(1), Value::from_i64(300)]];
+    expected.extend((2..=10).map(|id| vec![Value::from_i64(id), Value::from_i64(id)]));
+    expected.push(vec![Value::from_i64(11), Value::from_i64(111)]);
+    assert_eq!(rows_of_t(&writer), expected);
+    drop((writer, reader, checkpointing));
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(rows_of_t(&conn), expected);
+    for (k, ids) in [
+        (100, vec![]),
+        (200, vec![]),
+        (300, vec![1]),
+        (11, vec![]),
+        (111, vec![11]),
+        (12, vec![]),
+    ] {
+        assert_eq!(
+            ids_by_k(&conn, k),
+            ids.into_iter()
+                .map(|id| vec![Value::from_i64(id)])
+                .collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
+fn a_yield_before_taking_the_lock_leaves_the_written_rows_waiting() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let checkpointing = db.connect();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    checkpointing.set_yield_injector(Some(FixedYieldInjector::new([
+        CheckpointYieldPoint::BeforeTheLockAfterWritingRows.point(),
+    ])));
+    assert!(checkpoint
+        .finish_once_no_transaction_runs()
+        .unwrap()
+        .is_none());
+    writer.execute("UPDATE t SET k = 200 WHERE id = 2").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    checkpointing.set_yield_injector(None);
+    drop(checkpoint);
+    assert_eq!(ids_by_k(&writer, 100), vec![vec![Value::from_i64(1)]]);
+    assert_eq!(ids_by_k(&writer, 200), vec![vec![Value::from_i64(2)]]);
+}
+
+#[test]
+fn a_checkpoint_writing_rows_first_that_fails_after_its_commit_loses_no_row() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let expected = {
+        let writer = table_t_with_ten_rows_in_the_btree(&db);
+        let checkpointing = db.connect();
+        writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+        writer.execute("DELETE FROM t WHERE id = 2").unwrap();
+        let mut checkpoint = checkpointing
+            .begin_mvcc_checkpoint_writing_rows_first()
+            .unwrap();
+        writer.execute("DELETE FROM t WHERE id = 1").unwrap();
+        writer.execute("INSERT INTO t VALUES (2, 22)").unwrap();
+        checkpointing.set_failure_injector(Some(FixedFailureInjector::new([(
+            CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        )])));
+        assert!(checkpoint.finish_once_no_transaction_runs().is_err());
+        checkpointing.set_failure_injector(None);
+        drop(checkpoint);
+        writer.execute("UPDATE t SET k = 33 WHERE id = 3").unwrap();
+        let expected = rows_of_t(&writer);
+        assert_eq!(expected.len(), 9);
+        let mut checkpoint = checkpointing
+            .begin_mvcc_checkpoint_writing_rows_first()
+            .unwrap();
+        finish_the_checkpoint(&mut checkpoint);
+        assert_eq!(rows_of_t(&writer), expected);
+        expected
+    };
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(rows_of_t(&conn), expected);
+    assert_eq!(ids_by_k(&conn, 22), vec![vec![Value::from_i64(2)]]);
+    assert_eq!(ids_by_k(&conn, 100), Vec::<Vec<Value>>::new());
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+/// The first pass writes key (105, 1) of `t_k` and row 3's first update. Both
+/// are then replaced, put back, and replaced again before the lock;
+/// garbage collection in between must keep the versions the pass wrote,
+/// or the lock-holding pass no longer sees that the B-tree holds them and
+/// leaves them there.
+#[test]
+fn garbage_collection_keeps_the_versions_rows_written_before_the_lock_came_from() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let checkpointing = db.connect();
+    let store = db.get_mvcc_store();
+    writer.execute("UPDATE t SET k = 105 WHERE id = 1").unwrap();
+    writer.execute("UPDATE t SET k = 130 WHERE id = 3").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    writer.execute("UPDATE t SET k = 106 WHERE id = 1").unwrap();
+    writer.execute("UPDATE t SET k = 105 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 3").unwrap();
+    writer.execute("INSERT INTO t VALUES (3, 131)").unwrap();
+    store.drop_unused_row_versions();
+    writer.execute("UPDATE t SET k = 107 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 3").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+
+    let check = |conn: &Arc<Connection>| {
+        assert_eq!(ids_by_k(conn, 105), Vec::<Vec<Value>>::new());
+        assert_eq!(ids_by_k(conn, 107), vec![vec![Value::from_i64(1)]]);
+        assert_eq!(
+            get_rows(conn, "SELECT count(*) FROM t WHERE id = 3"),
+            vec![vec![Value::from_i64(0)]]
+        );
+        assert_eq!(
+            get_rows(conn, "SELECT count(*) FROM t INDEXED BY t_k WHERE k > -100"),
+            vec![vec![Value::from_i64(9)]]
+        );
+        assert_eq!(
+            get_rows(conn, "PRAGMA integrity_check"),
+            vec![vec![Value::build_text("ok")]]
+        );
+    };
+    check(&writer);
+    drop((writer, checkpointing, store));
+    db.restart();
+    check(&db.connect());
+}
+
+#[test]
+fn a_checkpoint_writing_rows_first_keeps_no_row_when_dropped_before_the_lock() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let checkpointing = db.connect();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 2").unwrap();
+    let checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (11, 11)").unwrap();
+    drop(checkpoint);
+    assert_eq!(checkpointing.pager.load().wal_state().unwrap().max_frame, 0);
+
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+    let mut expected = vec![vec![Value::from_i64(1), Value::from_i64(100)]];
+    expected.extend((3..=11).map(|id| vec![Value::from_i64(id), Value::from_i64(id)]));
+    assert_eq!(rows_of_t(&writer), expected);
+
+    drop((writer, checkpointing));
+    db.restart();
+    let conn = db.connect();
+    assert_eq!(rows_of_t(&conn), expected);
+    assert_eq!(
+        get_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::build_text("ok")]]
+    );
+}
+
+#[test]
+fn no_other_checkpoint_runs_while_rows_are_written_before_the_lock() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let checkpointing = db.connect();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    assert!(matches!(
+        writer.checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        }),
+        Err(LimboError::Busy)
+    ));
+    assert!(matches!(
+        db.connect().begin_mvcc_checkpoint_writing_rows_first(),
+        Err(LimboError::Busy)
+    ));
+    writer.execute("UPDATE t SET k = 200 WHERE id = 2").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+    assert_eq!(ids_by_k(&writer, 100), vec![vec![Value::from_i64(1)]]);
+    assert_eq!(ids_by_k(&writer, 200), vec![vec![Value::from_i64(2)]]);
+    writer
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_schema_change_before_or_after_the_rows_are_written_lands_in_the_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let checkpointing = db.connect();
+    writer
+        .execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("INSERT INTO u VALUES (1, 'a')").unwrap();
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    assert_eq!(checkpoint.rows_written(), 0);
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+
+    writer.execute("UPDATE t SET k = 200 WHERE id = 2").unwrap();
+    writer.execute("INSERT INTO u VALUES (2, 'b')").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    assert_eq!(checkpoint.rows_written(), 4);
+    writer.execute("DROP TABLE u").unwrap();
+    writer
+        .execute("CREATE TABLE w (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("INSERT INTO w VALUES (7, 'w')").unwrap();
+    writer.execute("CREATE INDEX t_id_k ON t (id, k)").unwrap();
+    writer.execute("UPDATE t SET k = 300 WHERE id = 3").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+    drop(checkpoint);
+
+    let check = |conn: &Arc<Connection>| {
+        assert_eq!(ids_by_k(conn, 100), vec![vec![Value::from_i64(1)]]);
+        assert_eq!(ids_by_k(conn, 200), vec![vec![Value::from_i64(2)]]);
+        assert_eq!(
+            get_rows(
+                conn,
+                "SELECT id FROM t INDEXED BY t_id_k WHERE id = 3 AND k = 300"
+            ),
+            vec![vec![Value::from_i64(3)]]
+        );
+        assert_eq!(
+            get_rows(conn, "SELECT id, v FROM w"),
+            vec![vec![Value::from_i64(7), Value::build_text("w")]]
+        );
+        assert!(conn.execute("SELECT * FROM u").is_err());
+        assert_eq!(
+            get_rows(conn, "PRAGMA integrity_check"),
+            vec![vec![Value::build_text("ok")]]
+        );
+    };
+    check(&writer);
+    drop((writer, checkpointing));
+    db.restart();
+    check(&db.connect());
+}
+
+#[test]
+fn a_transaction_moving_its_snapshot_during_the_checkpoint_reads_the_latest_rows() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let writer = table_t_with_ten_rows_in_the_btree(&db);
+    let reader = db.connect();
+    let checkpointing = db.connect();
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(ids_by_k(&reader, 1), vec![vec![Value::from_i64(1)]]);
+    writer.execute("UPDATE t SET k = 100 WHERE id = 1").unwrap();
+    writer.execute("DELETE FROM t WHERE id = 2").unwrap();
+    let mut checkpoint = checkpointing
+        .begin_mvcc_checkpoint_writing_rows_first()
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (2, 2)").unwrap();
+    reader.refresh_read_snapshot().unwrap();
+    assert_eq!(ids_by_k(&reader, 1), Vec::<Vec<Value>>::new());
+    assert_eq!(ids_by_k(&reader, 100), vec![vec![Value::from_i64(1)]]);
+    assert_eq!(ids_by_k(&reader, 2), vec![vec![Value::from_i64(2)]]);
+    assert_eq!(
+        get_rows(&reader, "SELECT count(*) FROM t"),
+        vec![vec![Value::from_i64(10)]]
+    );
+    reader.execute("COMMIT").unwrap();
+    finish_the_checkpoint(&mut checkpoint);
+}
+
+#[test]
 fn a_begin_held_back_sleeps_until_new_transactions_are_let_begin() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let store = db.get_mvcc_store();
@@ -1189,7 +1690,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // Reader pinned below the materialization frame: keep both current and delete.
     for mut v in [stamped_insert(), stamped_delete()] {
         let dropped =
-            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, true, frame(50), false);
+            MvStore::<MvccClock>::gc_version_chain(&mut v, 10, 10, 10, true, frame(50), false);
         assert_eq!(
             dropped, 0,
             "version needed by a reader pinned below frame 100 must be kept"
@@ -1201,7 +1702,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     // currents unless drop_current_if_in_btree (Truncate).
     let mut deleted = stamped_delete();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut deleted, 10, 10, 10, true, frame(100), false);
     assert_eq!(
         dropped, 1,
         "materialized + reader-reachable superseded delete must be reclaimed"
@@ -1210,7 +1711,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), false);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, 10, true, frame(100), false);
     assert_eq!(
         dropped, 0,
         "Passive keeps the current SkipMap version when drop_current_if_in_btree is false"
@@ -1219,7 +1720,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
 
     let mut current = stamped_insert();
     let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, true, frame(100), true);
+        MvStore::<MvccClock>::gc_version_chain(&mut current, 10, 10, 10, true, frame(100), true);
     assert_eq!(
         dropped, 0,
         "Passive keeps a live copy while a snapshot is open, even when materialized"
@@ -1227,8 +1728,15 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
     assert_eq!(current.len(), 1);
 
     let mut current = stamped_insert();
-    let dropped =
-        MvStore::<MvccClock>::gc_version_chain(&mut current, u64::MAX, 10, true, frame(100), true);
+    let dropped = MvStore::<MvccClock>::gc_version_chain(
+        &mut current,
+        u64::MAX,
+        10,
+        10,
+        true,
+        frame(100),
+        true,
+    );
     assert_eq!(
         dropped, 1,
         "Passive Rule 3 drops a materialized current once no snapshot is open"
@@ -1240,6 +1748,7 @@ fn mvcc_passive_gc_retains_until_reader_mark_reaches_materialization() {
         let mut v = crate::alloc::vec![make_rv(ts(5), None)];
         let dropped = MvStore::<MvccClock>::gc_version_chain(
             &mut v,
+            10,
             10,
             10,
             true,
@@ -11679,6 +12188,7 @@ fn test_gc_rule1_aborted_garbage_removed() {
         &mut versions,
         u64::MAX,
         0,
+        0,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11699,6 +12209,7 @@ fn test_gc_rule1_aborted_among_live_versions() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         2,
+        0,
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11727,6 +12238,7 @@ fn test_gc_rule2_superseded_below_lwm_with_current() {
         &mut versions,
         10,
         0,
+        0,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11746,6 +12258,7 @@ fn test_gc_rule2_superseded_above_lwm_retained() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
+        0,
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11770,6 +12283,7 @@ fn test_gc_rule2_tombstone_guard_uncheckpointed() {
         &mut versions,
         10,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11789,6 +12303,7 @@ fn test_gc_rule2_tombstone_guard_checkpointed() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11812,6 +12327,7 @@ fn test_gc_rule3_drop_current_when_in_btree() {
         &mut versions,
         u64::MAX,
         5,
+        5,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11828,6 +12344,7 @@ fn test_gc_rule3_truncate_idle_only() {
         &mut versions,
         10,
         5,
+        5,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11838,6 +12355,7 @@ fn test_gc_rule3_truncate_idle_only() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11860,6 +12378,7 @@ fn test_gc_rule3_not_checkpointed_retained() {
         &mut versions,
         u64::MAX,
         3,
+        3,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11880,6 +12399,7 @@ fn test_gc_rule3_visible_to_active_tx_retained() {
         &mut versions,
         5,
         10,
+        10,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11898,6 +12418,7 @@ fn test_gc_rule3_current_retained_before_first_checkpoint() {
         &mut versions,
         u64::MAX,
         0,
+        0,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11914,6 +12435,7 @@ fn test_gc_rule3_current_collected_after_checkpoint() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11937,6 +12459,7 @@ fn test_gc_rule3_after_history_reclaimed() {
         &mut versions,
         u64::MAX,
         5,
+        5,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11954,6 +12477,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
         &mut versions,
         10,
         10,
+        10,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -11968,6 +12492,7 @@ fn test_gc_rule3_keeps_unstamped_current_and_drops_stamped_one() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        10,
         10,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -11988,6 +12513,7 @@ fn test_gc_txid_refs_retained() {
         &mut versions,
         u64::MAX,
         u64::MAX,
+        u64::MAX,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12005,6 +12531,7 @@ fn test_gc_txid_end_retained() {
     let mut versions = crate::alloc::vec![make_rv(ts(3), txid(50))];
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
+        u64::MAX,
         u64::MAX,
         u64::MAX,
         false,
@@ -12032,6 +12559,7 @@ fn test_gc_rule2_pending_insert_does_not_disable_tombstone_guard() {
         &mut versions,
         10,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12058,6 +12586,7 @@ fn test_gc_rule2_committed_current_disables_non_btree_tombstone_guard() {
         &mut versions,
         10,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12083,6 +12612,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         &mut versions,
         u64::MAX,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12094,6 +12624,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12110,6 +12641,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
         &mut versions,
         u64::MAX,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12121,6 +12653,7 @@ fn test_gc_rule2_btree_resident_marker_with_current_retained_until_checkpoint() 
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12149,6 +12682,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
         &mut versions,
         u64::MAX,
         2,
+        2,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12161,6 +12695,7 @@ fn test_gc_rule2_checkpointed_insert_with_current_retained_until_checkpoint() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12185,6 +12720,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
         &mut versions,
         u64::MAX,
         3,
+        3,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12196,6 +12732,7 @@ fn test_gc_rule2_btree_tombstone_lifecycle() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12222,6 +12759,7 @@ fn test_gc_rule3_not_firing_with_unremovable_superseded() {
         &mut versions,
         10,
         20,
+        20,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12238,6 +12776,7 @@ fn test_gc_noop_on_empty() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         10,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12262,6 +12801,7 @@ fn test_gc_combined_rules() {
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         u64::MAX,
+        5,
         5,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -12376,6 +12916,7 @@ fn test_gc_shrinks_version_chain_capacity() {
         &mut versions,
         0,
         0,
+        0,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -12396,6 +12937,7 @@ fn test_gc_shrinks_version_chain_capacity() {
     let capacity_before = versions.capacity();
     let dropped = MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
+        0,
         0,
         0,
         false,
@@ -12419,6 +12961,7 @@ fn test_gc_shrinks_version_chain_capacity() {
     let capacity_before = small.capacity();
     MvStore::<MvccClock>::gc_version_chain(
         &mut small,
+        0,
         0,
         0,
         false,
@@ -13905,6 +14448,7 @@ fn prop_gc_never_increases_version_count(chain: ArbitraryVersionChain) -> bool {
         &mut versions,
         chain.lwm,
         chain.ckpt_max,
+        chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -13923,6 +14467,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
         &mut v1,
         chain.lwm,
         chain.ckpt_max,
+        chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -13931,6 +14476,7 @@ fn prop_gc_is_idempotent(chain: ArbitraryVersionChain) -> bool {
     MvStore::<MvccClock>::gc_version_chain(
         &mut v1,
         chain.lwm,
+        chain.ckpt_max,
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -13953,6 +14499,7 @@ fn prop_gc_removes_all_aborted_garbage(chain: ArbitraryVersionChain) -> bool {
     MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         chain.lwm,
+        chain.ckpt_max,
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -13977,6 +14524,7 @@ fn prop_gc_retains_txid_begins(chain: ArbitraryVersionChain) -> bool {
     MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         chain.lwm,
+        chain.ckpt_max,
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -14007,6 +14555,7 @@ fn prop_gc_retains_txid_ends(chain: ArbitraryVersionChain) -> bool {
         &mut versions,
         chain.lwm,
         chain.ckpt_max,
+        chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
         true,
@@ -14034,6 +14583,7 @@ fn prop_gc_current_versions_protected_before_checkpoint(chain: ArbitraryVersionC
     MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         chain.lwm,
+        0,
         0,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -14065,6 +14615,7 @@ fn prop_gc_tombstone_guard_preserves_btree_safety(chain: ArbitraryVersionChain) 
     MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         chain.lwm,
+        chain.ckpt_max,
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
@@ -14109,6 +14660,7 @@ fn prop_gc_no_orphaned_superseded_versions(chain: ArbitraryVersionChain) -> bool
     MvStore::<MvccClock>::gc_version_chain(
         &mut versions,
         chain.lwm,
+        chain.ckpt_max,
         chain.ckpt_max,
         false,
         crate::mvcc::database::WalPos::STAGED,
