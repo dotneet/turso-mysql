@@ -16,6 +16,11 @@ openssl req -newkey rsa:2048 -nodes -keyout client-key.pem -subj /CN=sysbench -o
 printf 'extendedKeyUsage=clientAuth\n' >client.ext
 openssl x509 -req -in client.csr -CA /e2e/tls/ca.pem -CAkey /e2e/tls/ca-key.pem -CAserial ca.srl -CAcreateserial \
   -days 2 -extfile client.ext -out client-cert.pem 2>/dev/null
+purge_mysql_binary_logs() {
+  mysql --host=mysql --port=3306 --user=e2e --password="${E2E_PASSWORD}" --ssl --ssl-ca=/e2e/tls/ca.pem \
+    --execute='FLUSH BINARY LOGS; PURGE BINARY LOGS BEFORE NOW()' 2>/dev/null \
+    || echo "mysql: could not purge binary logs"
+}
 workloads="${BENCH_WORKLOADS:-oltp_point_select oltp_read_only oltp_write_only oltp_read_write oltp_insert}"
 threads="${BENCH_THREADS:-1 8}"
 seconds="${BENCH_TIME:-30}"
@@ -30,6 +35,7 @@ for target in ${BENCH_TARGETS:-turso mysql}; do
   for workload in ${workloads}; do
     for t in ${threads}; do
       echo "${target} ${workload} threads=${t}"
+      [ "${target}" = mysql ] && purge_mysql_binary_logs
       # shellcheck disable=SC2086
       sysbench "${workload}" ${common} --threads="${t}" --time="${seconds}" --report-interval=0 \
         --db-ps-mode=auto --mysql-ignore-errors=1213,1205 run >"${out}/${target}-${workload}-${t}.txt" 2>&1 \
