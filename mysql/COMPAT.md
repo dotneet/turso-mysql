@@ -3097,8 +3097,21 @@ instead of failing the statement — the engine's own `OR IGNORE`. Measured on
 8.4.11 over a table already holding row 1: inserting row 1 again leaves the
 stored row alone and counts 0, and a two-row statement where only the second is
 new counts 1. The engine answers the same for both. `INSERT IGNORE ... SELECT`
-is taken the same way, with its columns named or not, but into a table that
-counts its own ids (see TODO.md).
+is taken the same way, with its columns named or not.
+
+Into a table that counts its own ids, `INSERT IGNORE ... SELECT` numbers its
+rows the way InnoDB does with `innodb_autoinc_lock_mode = 2`, MySQL 8.4's
+default. Measured on 8.4.11: each row asks the counter for a number, the
+statement taking numbers in batches of 1, 2, 4 and on up as a plain copy does,
+and a row `IGNORE` skips gives its number back to the row after it. Copying 1,
+2, 3 and 4 where 1 and 2 are taken, into a table counting at 3, writes 3 and 4
+as ids 3 and 4 and leaves `AUTO_INCREMENT=6`; a copy whose every row collides
+still spends the batch of one its first row took; and a row skipped after the
+last row written takes a batch of its own when the batch it would draw from is
+used up, copying 5 then 1 into a table counting at 7 writing 5 as 7 and leaving
+`AUTO_INCREMENT=10`. The statement reports the first id it wrote, and 0, with
+`LAST_INSERT_ID()` left as it was, when it wrote none. This copies the rows one
+at a time to repeat that. A copy naming its own ids stays refused.
 
 Each row skipped that way raises warning 1062, as MySQL raises it — measured
 on 8.4.11 and matched: one warning a row, in the order the rows were skipped,
@@ -6403,10 +6416,8 @@ child index reaches it, so InnoDB's gap lock stops at the first child it moved;
 here the gap reaches the next child of another parent.
 
 Around `IGNORE`, a statement skipping duplicates beside rows a foreign key
-refuses lists the 1062 warnings after the 1452 ones rather than in row order;
-`INSERT IGNORE ... SELECT` into a table counting its own ids stays refused; and
-a NULL that `IGNORE` would coerce
-into a `NOT NULL` column is refused where it is written and skips the row
+refuses lists the 1062 warnings after the 1452 ones rather than in row order,
+and a NULL that `IGNORE` would coerce into a `NOT NULL` column is refused where it is written and skips the row
 where an expression yields it. A key `ALTER TABLE` adds without a name is
 numbered after the keys written without one, where MySQL numbers it past the
 highest `t_ibfk_<n>` the table has, which differs only after a key was given

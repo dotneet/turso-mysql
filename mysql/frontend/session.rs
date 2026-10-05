@@ -10819,7 +10819,7 @@ impl MySqlConnection {
             .map_err(MySqlQueryError::Engine)?;
         let Stmt::Insert {
             with: None,
-            or_conflict: None,
+            or_conflict,
             body: InsertBody::Select(source, None),
             returning,
             ..
@@ -10831,7 +10831,15 @@ impl MySqlConnection {
                 "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
             ));
         };
-        if !returning.is_empty() || matches!(source.body.select, OneSelect::Values(_)) {
+        let resolves_as_written = match or_conflict {
+            None => !copy.ignores(),
+            Some(turso_parser::ast::ResolveType::Ignore) => copy.ignores(),
+            Some(_) => false,
+        };
+        if !resolves_as_written
+            || !returning.is_empty()
+            || matches!(source.body.select, OneSelect::Values(_))
+        {
             return Err(MySqlQueryError::Unsupported(
                 "INSERT SELECT into an AUTO_INCREMENT table".to_string(),
             ));
@@ -10858,7 +10866,12 @@ impl MySqlConnection {
             columns.insert(0, mysql_quoted(allocator_column));
         }
         let one_row = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
+            "{} {} ({}) VALUES ({})",
+            if copy.ignores() {
+                "INSERT IGNORE INTO"
+            } else {
+                "INSERT INTO"
+            },
             mysql_quoted(&table.name),
             columns.join(", "),
             vec!["?"; columns.len()].join(", ")
@@ -10890,6 +10903,22 @@ impl MySqlConnection {
                 .map(|row| self.id_a_copied_row_writes(&row[at], &table))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
+        if copy.ignores() {
+            if written_ids.iter().any(Option::is_some) {
+                return Err(MySqlQueryError::Unsupported(
+                    "INSERT IGNORE SELECT writing its own AUTO_INCREMENT ids".to_string(),
+                ));
+            }
+            return self.copy_rows_ignoring_collisions(
+                sql,
+                statement,
+                &table,
+                named_at,
+                rows,
+                deadline,
+                affected_rows_mode,
+            );
+        }
         let (ids, first_generated, reported_id) = if written_ids.iter().all(Option::is_none) {
             let first = self.reserve_ids_for_copied_rows(&table, rows.len(), deadline)?;
             let ids = (0..rows.len() as u64)
@@ -10961,6 +10990,93 @@ impl MySqlConnection {
                 self.run_internal(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?;
                 self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
                 Err(MySqlQueryError::Engine(error))
+            }
+        }
+    }
+
+    /// Copies the rows an `INSERT IGNORE ... SELECT` reads into a table that
+    /// counts its own ids, a row at a time.
+    ///
+    /// Measured on MySQL 8.4.11 with `innodb_autoinc_lock_mode = 2`: each row
+    /// asks the counter for a number, which it takes in batches of 1, 2, 4
+    /// and on up as a plain copy does, and a row `IGNORE` skips gives its
+    /// number back to the row after it. So copying 1, 2, 3 and 4 where 1 and
+    /// 2 are taken, into a table counting at 3, writes 3 and 4 as ids 3 and 4
+    /// and leaves `AUTO_INCREMENT=6`; a copy whose every row collides still
+    /// spends the batch of one its first row took; and a skipped row after the
+    /// last written one can take a batch of its own. The statement reports
+    /// the first id it wrote, and 0 with `LAST_INSERT_ID()` left alone when it
+    /// wrote none.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_rows_ignoring_collisions(
+        &self,
+        sql: &str,
+        statement: Stmt,
+        table: &AutoIncrementTable,
+        named_at: Option<usize>,
+        rows: Vec<Vec<Value>>,
+        deadline: Option<turso_core::MonotonicInstant>,
+        affected_rows_mode: MySqlAffectedRowsMode,
+    ) -> std::result::Result<MySqlWriteResult, MySqlQueryError> {
+        let options = injected_auto_increment_prepare_options(table, statement.clone());
+        let mut writing = self
+            .inner
+            .prepare_translated_stmt_with_options(statement, sql, &options)
+            .map_err(MySqlQueryError::Engine)?;
+        const SAVEPOINT: &str = "\"__turso_auto_increment_values\"";
+        self.run_internal(&format!("SAVEPOINT {SAVEPOINT}"))?;
+        let written = (|| -> std::result::Result<(u64, Option<u64>), MySqlQueryError> {
+            let mut numbers = NumbersInBatches::default();
+            let mut affected_rows = 0_u64;
+            let mut first_written = None;
+            for mut row in rows {
+                self.check_write_deadline(deadline)?;
+                let id = match numbers.next_unused() {
+                    Some(id) => id,
+                    None => {
+                        let first =
+                            self.reserve_counted_numbers(table, numbers.next_batch(), deadline)?;
+                        numbers.take_batch(first)
+                    }
+                };
+                let value = counted_id_value(table, id)?;
+                match named_at {
+                    Some(at) => row[at] = value,
+                    None => row.insert(0, value),
+                }
+                bind_prepared_values(&mut writing, &row).map_err(MySqlQueryError::Engine)?;
+                let timeout = self.remaining_write_timeout(deadline)?;
+                let run = run_checked_write_statement(&mut writing, timeout).map_err(|error| {
+                    self.map_unsigned_decimal_write_error(error, Some(&table.name))
+                });
+                writing.reset().map_err(MySqlQueryError::Engine)?;
+                run.map_err(MySqlQueryError::Engine)?;
+                let wrote = self.affected_rows(false, affected_rows_mode)?;
+                if wrote > 0 {
+                    numbers.spend(id);
+                    first_written.get_or_insert(id);
+                    affected_rows = affected_rows
+                        .checked_add(wrote)
+                        .ok_or(MySqlQueryError::Engine(LimboError::IntegerOverflow))?;
+                }
+            }
+            Ok((affected_rows, first_written))
+        })();
+        match written {
+            Ok((affected_rows, first_written)) => {
+                self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+                if let Some(first) = first_written {
+                    self.inner.set_mysql_last_insert_id(first);
+                }
+                Ok(MySqlWriteResult {
+                    affected_rows,
+                    last_insert_id: first_written.unwrap_or(0),
+                })
+            }
+            Err(error) => {
+                self.run_internal(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))?;
+                self.run_internal(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+                Err(error)
             }
         }
     }
@@ -11045,12 +11161,22 @@ impl MySqlConnection {
         rows: usize,
         deadline: Option<turso_core::MonotonicInstant>,
     ) -> std::result::Result<u64, MySqlQueryError> {
+        self.reserve_counted_numbers(table, numbers_spent_on_copied_rows(rows as u64), deadline)
+    }
+
+    /// Reserves `spent` numbers of a table's counter in one batch and answers
+    /// the first of them.
+    fn reserve_counted_numbers(
+        &self,
+        table: &AutoIncrementTable,
+        spent: u64,
+        deadline: Option<turso_core::MonotonicInstant>,
+    ) -> std::result::Result<u64, MySqlQueryError> {
         let capability = self.auto_increment.as_ref().ok_or_else(|| {
             MySqlQueryError::Unsupported(
                 "AUTO_INCREMENT INSERT requires a registry-backed allocator capability".to_string(),
             )
         })?;
-        let spent = numbers_spent_on_copied_rows(rows as u64);
         let ceiling = if table.definition.allocator_column_type
             == turso_mysql_parser::MySqlIntegerType::BigIntUnsigned
         {
@@ -15656,9 +15782,62 @@ fn numbers_spent_on_copied_rows(rows: u64) -> u64 {
     let (mut spent, mut batch) = (0_u64, 1_u64);
     while spent < rows {
         spent = spent.saturating_add(batch);
-        batch = (batch * 2).min(65535);
+        batch = next_batch_of_copied_rows(batch);
     }
     spent
+}
+
+/// How many numbers a copy takes in the batch after one of `batch`.
+fn next_batch_of_copied_rows(batch: u64) -> u64 {
+    (batch * 2).min(65535)
+}
+
+/// The numbers one copy has taken from a table's counter and not yet spent
+/// on a row it wrote.
+#[derive(Debug)]
+struct NumbersInBatches {
+    /// The next number a row would take, and the last of the batch it is in.
+    unused: Option<(u64, u64)>,
+    /// How many numbers the next batch takes.
+    batch: u64,
+}
+
+impl Default for NumbersInBatches {
+    fn default() -> Self {
+        Self {
+            unused: None,
+            batch: 1,
+        }
+    }
+}
+
+impl NumbersInBatches {
+    fn next_unused(&self) -> Option<u64> {
+        self.unused
+            .filter(|(next, last)| next <= last)
+            .map(|(next, _)| next)
+    }
+
+    fn next_batch(&self) -> u64 {
+        self.batch
+    }
+
+    /// Takes the batch the counter handed out from `first` and answers its
+    /// first number.
+    fn take_batch(&mut self, first: u64) -> u64 {
+        self.unused = Some((first, first + self.batch - 1));
+        self.batch = next_batch_of_copied_rows(self.batch);
+        first
+    }
+
+    /// Spends `id` on a row written, the next row taking the number after it.
+    fn spend(&mut self, id: u64) {
+        let (next, last) = self
+            .unused
+            .expect("a number is spent only out of a batch taken");
+        assert_eq!(next, id, "a copy spends its numbers in order");
+        self.unused = Some((next + 1, last));
+    }
 }
 
 /// One number the counter handed out, as the value bound into its column.

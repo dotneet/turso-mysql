@@ -687,7 +687,6 @@ fn a_counted_copy_is_held_to_the_rules_of_an_ordinary_insert() {
     );
     assert_eq!(counter(&mut adapter, "r1"), None);
     for sql in [
-        "INSERT IGNORE INTO r1 (name, must) SELECT name, n FROM src",
         "REPLACE INTO r1 (name, must) SELECT name, n FROM src",
         "INSERT INTO r1 (name, must) SELECT name, n FROM src ON DUPLICATE KEY UPDATE must = 0",
     ] {
@@ -698,6 +697,102 @@ fn a_counted_copy_is_held_to_the_rules_of_an_ordinary_insert() {
         );
     }
     assert_eq!(one(&mut adapter, "SELECT COUNT(*) FROM r1"), "0");
+}
+
+/// `INSERT IGNORE ... SELECT` takes numbers in the same batches, and a row it
+/// skips gives its number back to the row after it.
+#[test]
+fn a_counted_copy_ignoring_collisions_hands_a_skipped_rows_number_on() {
+    let (_directory, mut adapter) = adapter();
+    eight_words(&mut adapter);
+    run(
+        &mut adapter,
+        "CREATE TABLE a (id INT AUTO_INCREMENT PRIMARY KEY, v INT, UNIQUE KEY (v))",
+    );
+    run(&mut adapter, "INSERT INTO a (v) VALUES (1), (2)");
+
+    // 1 and 2 collide on the batch of one holding 3, which 3 then takes; 4
+    // takes a batch of two.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO a (v) SELECT n FROM src WHERE n <= 4 ORDER BY n"
+        ),
+        (2, 3)
+    );
+    assert_eq!(
+        rows(&mut adapter, "SHOW WARNINGS"),
+        vec![
+            vec![
+                Some("Warning".to_owned()),
+                Some("1062".to_owned()),
+                Some("Duplicate entry '1' for key 'a.v'".to_owned())
+            ],
+            vec![
+                Some("Warning".to_owned()),
+                Some("1062".to_owned()),
+                Some("Duplicate entry '2' for key 'a.v'".to_owned())
+            ],
+        ]
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "3");
+    assert_eq!(counter(&mut adapter, "a").as_deref(), Some("6"));
+
+    // Every row colliding still spends the batch its first row took, reports
+    // no id and leaves LAST_INSERT_ID() alone.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO a (v) SELECT n FROM src WHERE n <= 2"
+        ),
+        (0, 0)
+    );
+    assert_eq!(one(&mut adapter, "SELECT LAST_INSERT_ID()"), "3");
+    assert_eq!(counter(&mut adapter, "a").as_deref(), Some("7"));
+
+    // A row skipped after the last one written takes a batch of its own.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO a (v) SELECT n FROM src WHERE n IN (5, 1) ORDER BY n DESC"
+        ),
+        (1, 7)
+    );
+    assert_eq!(counter(&mut adapter, "a").as_deref(), Some("10"));
+
+    // Prepared, the five rows that collide share 10, which 6 takes.
+    assert_eq!(
+        prepared_write(
+            &mut adapter,
+            "INSERT IGNORE INTO a (v) SELECT n FROM src WHERE n <= ? ORDER BY n",
+            &integers(&[7])
+        ),
+        (2, 10)
+    );
+    assert_eq!(counter(&mut adapter, "a").as_deref(), Some("13"));
+
+    // No row copied leaves the counter where it stood.
+    assert_eq!(
+        written(
+            &mut adapter,
+            "INSERT IGNORE INTO a (v) SELECT n FROM src WHERE n > 100"
+        ),
+        (0, 0)
+    );
+    assert_eq!(counter(&mut adapter, "a").as_deref(), Some("13"));
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, v FROM a ORDER BY id"),
+        [(1, 1), (2, 2), (3, 3), (4, 4), (7, 5), (10, 6), (11, 7)]
+            .iter()
+            .map(|(id, v)| vec![Some(id.to_string()), Some(v.to_string())])
+            .collect::<Vec<_>>()
+    );
+
+    // A row naming its own id is refused.
+    assert_eq!(
+        adapter.execute_query("INSERT IGNORE INTO a (id, v) SELECT n + 100, n FROM src"),
+        Err(FrontendErrorKind::Unsupported)
+    );
 }
 
 /// Ids past the engine's signed range, and a `DECIMAL` carried across.

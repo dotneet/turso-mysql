@@ -267,6 +267,7 @@ pub fn parse_optional_insert_select_without_columns(
 pub struct MySqlInsertSelect {
     table: MySqlTableName,
     columns: Vec<String>,
+    ignores: bool,
 }
 
 impl MySqlInsertSelect {
@@ -279,13 +280,18 @@ impl MySqlInsertSelect {
     pub fn columns(&self) -> &[String] {
         &self.columns
     }
+
+    /// Whether the statement was written `INSERT IGNORE`.
+    pub fn ignores(&self) -> bool {
+        self.ignores
+    }
 }
 
-/// Reads an `INSERT INTO t (a, b) <SELECT>`.
+/// Reads an `INSERT INTO t (a, b) <SELECT>`, `IGNORE` or not.
 ///
 /// Returns `None` for anything else, so every other `INSERT` keeps its own
-/// path. `IGNORE`, `REPLACE` and an upsert clause are refused: each decides
-/// what a colliding row does, which has not been measured beside a `SELECT`.
+/// path. `REPLACE` and an upsert clause are refused: each decides what a
+/// colliding row does, which has not been measured beside a `SELECT`.
 pub fn parse_optional_insert_select(
     sql: &str,
     mode: SessionSqlMode,
@@ -303,7 +309,7 @@ pub fn parse_optional_insert_select(
     if matches!(source.body.as_ref(), SetExpr::Values(_)) {
         return Ok(None);
     }
-    if insert.ignore || insert.replace_into || insert.on.is_some() {
+    if insert.replace_into || insert.on.is_some() {
         return unsupported("INSERT SELECT option");
     }
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
@@ -323,7 +329,11 @@ pub fn parse_optional_insert_select(
             _ => unsupported("qualified INSERT column"),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Some(MySqlInsertSelect { table, columns }))
+    Ok(Some(MySqlInsertSelect {
+        table,
+        columns,
+        ignores: insert.ignore,
+    }))
 }
 
 /// Answers the `SELECT` of an `INSERT INTO t (a, b) <SELECT>` as it was
@@ -647,6 +657,12 @@ mod tests {
         .unwrap();
         assert_eq!(copy.table().as_str(), "users");
         assert_eq!(copy.columns(), ["name", "Email"]);
+        assert!(!copy.ignores());
+        let copy = parse_optional_insert_select("INSERT IGNORE INTO t (a) SELECT a FROM src", mode)
+            .unwrap()
+            .unwrap();
+        assert_eq!(copy.columns(), ["a"]);
+        assert!(copy.ignores());
         for sql in [
             "INSERT INTO t (a) VALUES (1)",
             "INSERT INTO t SELECT a FROM src",
@@ -660,7 +676,6 @@ mod tests {
             );
         }
         for sql in [
-            "INSERT IGNORE INTO t (a) SELECT a FROM src",
             "REPLACE INTO t (a) SELECT a FROM src",
             "INSERT INTO t (a) SELECT a FROM src ON DUPLICATE KEY UPDATE a = 1",
             "INSERT INTO db.t (a) SELECT a FROM src",
