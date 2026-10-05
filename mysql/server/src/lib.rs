@@ -263,6 +263,26 @@ pub fn encode_split_payload(sequence_id: u8, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+pub(crate) fn frame_with_room_for_its_header(payload_length: usize) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(PACKET_HEADER_LEN + payload_length);
+    frame.extend_from_slice(&[0; PACKET_HEADER_LEN]);
+    frame
+}
+
+pub(crate) fn write_the_header_before_the_payload(mut frame: Vec<u8>, sequence_id: u8) -> Vec<u8> {
+    let length = frame.len() - PACKET_HEADER_LEN;
+    if length >= MAX_PACKET_PAYLOAD_LEN {
+        return encode_split_payload(sequence_id, &frame[PACKET_HEADER_LEN..]);
+    }
+    frame[..PACKET_HEADER_LEN].copy_from_slice(&[
+        (length & 0xFF) as u8,
+        ((length >> 8) & 0xFF) as u8,
+        ((length >> 16) & 0xFF) as u8,
+        sequence_id,
+    ]);
+    frame
+}
+
 /// Counts the packets in a frame holding one payload, split or not, and
 /// checks that every packet but the last is full and the last is not.
 pub fn split_payload_packet_count(frame: &[u8]) -> Result<usize, PacketCodecError> {

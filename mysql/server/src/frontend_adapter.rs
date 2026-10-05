@@ -242,7 +242,7 @@ struct DatabasePreparedStatement {
     /// Whether this is a `SELECT`, which a session's `max_execution_time`
     /// holds to its limit whether or not it locks the rows it reads.
     selects: bool,
-    connection: MySqlConnection,
+    connection: Arc<MySqlConnection>,
     connection_statement_id: u32,
     parameter_types: Option<Vec<StatementParameterType>>,
     catalog_query: Option<GormInformationSchemaPreparedQuery>,
@@ -1602,7 +1602,7 @@ where
                 source_tables: Vec::new(),
                 read_only_select: true,
                 selects: false,
-                connection,
+                connection: Arc::new(connection),
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
                 catalog_query: Some(query),
@@ -2831,13 +2831,13 @@ where
             .get(&statement_id)
             .map(|statement| statement.text.as_str());
         refuse_a_write_while_read_only(
-            connection.as_ref(),
+            connection.as_deref(),
             &self.session_variables,
             text,
             self.session.session_sql_mode(),
         )?;
         refuse_an_update_without_a_key(
-            connection.as_ref(),
+            connection.as_deref(),
             &self.session_variables,
             text,
             self.session.session_sql_mode(),
@@ -4680,7 +4680,7 @@ where
                 read_only_select: parse_select(sql, self.session.session_sql_mode())
                     .is_ok_and(|select| !select.locks_rows()),
                 selects: parse_select(sql, self.session.session_sql_mode()).is_ok(),
-                connection,
+                connection: Arc::new(connection),
                 connection_statement_id,
                 parameter_types: None,
                 catalog_query: None,
@@ -4739,7 +4739,7 @@ where
                 source_tables: Vec::new(),
                 read_only_select: false,
                 selects: false,
-                connection,
+                connection: Arc::new(connection),
                 connection_statement_id: reserved.statement_id,
                 parameter_types: None,
                 catalog_query: None,
@@ -6241,13 +6241,14 @@ fn execute_prepared_values(
         .collect::<Result<Vec<_>, _>>()?;
     #[cfg(unix)]
     let columns = projection.shape_compound_columns(columns, source_metadata.as_ref())?;
+    let time_zone_offset = connection.time_zone_offset_seconds();
     let rows = rows
         .into_iter()
         .map(|row| {
             row.into_iter()
                 .zip(&columns)
                 .map(|(value, column)| {
-                    let value = shift_binary_timestamp_value(connection, value, column)?;
+                    let value = shift_binary_timestamp_value(time_zone_offset, value, column)?;
                     binary_result_value(value, column)
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -6280,11 +6281,10 @@ fn was_prepared_over_a_changed_table(error: &MySqlPreparedStatementError) -> boo
 }
 
 fn shift_binary_timestamp_value(
-    connection: &MySqlConnection,
+    offset: i32,
     value: MySqlPreparedValue,
     column: &ColumnDefinitionConfig,
 ) -> Result<MySqlPreparedValue, FrontendErrorKind> {
-    let offset = connection.time_zone_offset_seconds();
     if offset == 0 || column.column_type != MYSQL_TYPE_TIMESTAMP {
         return Ok(value);
     }
@@ -12395,7 +12395,7 @@ fn table_result_metadata_for_references(
         return Ok(None);
     };
     let listed = connection
-        .list_tables()
+        .list_shared_tables()
         .map_err(|_| FrontendErrorKind::Internal)?;
     let mut tables = Vec::with_capacity(source_tables.len());
     for source in source_tables {

@@ -8440,7 +8440,8 @@ fn member_type_members(declared_type: &str, keyword: &str) -> Option<Vec<String>
         .and_then(|rest| rest.strip_suffix('"'))
         .unwrap_or(declared_type);
     let members = inner
-        .strip_prefix(&format!("{keyword}("))
+        .strip_prefix(keyword)
+        .and_then(|rest| rest.strip_prefix('('))
         .and_then(|rest| rest.strip_suffix(')'))?;
     members
         .split(',')

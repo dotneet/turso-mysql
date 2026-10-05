@@ -6349,6 +6349,44 @@ fn prepared_metadata_refreshes_after_wildcard_reprepare() -> Result<()> {
 }
 
 #[test]
+fn prepared_select_rebuilds_its_metadata_only_after_a_reprepare() -> Result<()> {
+    let (connection, _allocator, _io) =
+        open_allocator_connection("mysql-session-prepared-metadata-rebuilds.db", [0xa2; 16])?;
+    connection.execute("CREATE TABLE rebuilt (id INT)")?;
+    connection.execute("INSERT INTO rebuilt (id) VALUES (1)")?;
+    let metadata = connection
+        .prepare_checked_statement("SELECT ? AS marker, id FROM rebuilt")
+        .unwrap();
+    let run = |value: MySqlPreparedValue| {
+        connection
+            .execute_prepared_select(metadata.statement_id, &[value], None)
+            .map_err(|error| LimboError::InternalError(error.to_string()))
+    };
+    let kept = || {
+        let registry = connection.prepared_statements.lock().unwrap();
+        let prepared = &registry.statements[&metadata.statement_id];
+        (
+            prepared.metadata_rebuilds,
+            prepared.result_column_type_metadata[0]
+                .parameter_marker
+                .map(|marker| marker.kind),
+        )
+    };
+    for _ in 0..3 {
+        assert_eq!(run(MySqlPreparedValue::Integer(7))?.len(), 1);
+    }
+    assert_eq!(kept(), (0, Some(MySqlMarkerType::Integer)));
+
+    connection.execute("ALTER TABLE rebuilt ADD COLUMN other TEXT")?;
+    assert_eq!(run(MySqlPreparedValue::Null)?.len(), 1);
+    assert_eq!(kept(), (1, Some(MySqlMarkerType::Untyped)));
+    assert_eq!(run(MySqlPreparedValue::Real(1.5))?.len(), 1);
+    assert_eq!(kept(), (1, Some(MySqlMarkerType::Real)));
+    connection.close()?;
+    Ok(())
+}
+
+#[test]
 fn prepared_select_checks_integer_comparison_parameters_and_null_logic() -> Result<()> {
     let (connection, _allocator, _io) =
         open_allocator_connection("mysql-session-prepared-select-comparison.db", [0x6d; 16])?;

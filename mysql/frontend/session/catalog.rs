@@ -26,6 +26,11 @@ impl MySqlConnection {
     /// A `SELECT` lists them to describe its result, so the list is kept for as
     /// long as the schema it was read from is the one in force.
     pub fn list_tables(&self) -> Result<Vec<MySqlTable>> {
+        self.list_shared_tables()
+            .map(|tables| tables.as_ref().clone())
+    }
+
+    pub fn list_shared_tables(&self) -> Result<Arc<Vec<MySqlTable>>> {
         self.inner.maybe_update_schema();
         let schema = self.inner.current_schema();
         if let Some(tables) = self
@@ -36,7 +41,7 @@ impl MySqlConnection {
         {
             return Ok(tables);
         }
-        let tables = self.read_tables()?;
+        let tables = Arc::new(self.read_tables()?);
         if Arc::ptr_eq(&schema, &self.inner.current_schema()) {
             self.schema_readings
                 .lock()

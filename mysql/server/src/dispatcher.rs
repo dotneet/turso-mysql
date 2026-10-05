@@ -1296,14 +1296,13 @@ fn encode_result_set(
         )?);
     }
 
-    for row in rows {
-        let values = row
-            .iter()
-            .map(|value| match value {
-                Some(bytes) => TextRowValue::Bytes(bytes),
-                None => TextRowValue::Null,
-            })
-            .collect::<Vec<_>>();
+    let mut values = Vec::with_capacity(columns.len());
+    for row in &rows {
+        values.clear();
+        values.extend(row.iter().map(|value| match value {
+            Some(bytes) => TextRowValue::Bytes(bytes),
+            None => TextRowValue::Null,
+        }));
         frames.push(TextRowPacket::encode(sequence.next_sequence_id(), &values)?);
     }
 
@@ -1369,20 +1368,18 @@ pub(crate) fn encode_binary_result_set(
             status_flags,
         )?);
     }
-    for (row_index, row) in rows.into_iter().enumerate() {
-        let values = row
-            .iter()
-            .enumerate()
-            .map(|(column, value)| {
-                binary_result_value_to_row_value(
-                    row_index,
-                    column,
-                    value,
-                    column_types[column],
-                    columns[column].column_type,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+    let mut values = Vec::with_capacity(columns.len());
+    for (row_index, row) in rows.iter().enumerate() {
+        values.clear();
+        for (column, value) in row.iter().enumerate() {
+            values.push(binary_result_value_to_row_value(
+                row_index,
+                column,
+                value,
+                column_types[column],
+                columns[column].column_type,
+            )?);
+        }
         frames.push(BinaryRowPacket::encode(
             sequence.next_sequence_id(),
             &values,

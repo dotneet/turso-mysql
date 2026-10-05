@@ -1492,7 +1492,7 @@ impl<'a> BinaryRowPacket<'a> {
         }
         check_row_payload_length(payload_length)?;
 
-        let mut payload = Vec::with_capacity(payload_length);
+        let mut payload = crate::frame_with_room_for_its_header(payload_length);
         payload.push(BINARY_ROW_HEADER);
         let null_bitmap_offset = payload.len();
         payload.resize(null_bitmap_offset + null_bitmap_length, 0);
@@ -1528,8 +1528,11 @@ impl<'a> BinaryRowPacket<'a> {
                 BinaryRowValue::String(value) => push_lenenc_bytes(&mut payload, value.as_bytes()),
             }
         }
-        debug_assert_eq!(payload.len(), payload_length);
-        Ok(crate::encode_split_payload(sequence_id, &payload))
+        debug_assert_eq!(payload.len(), crate::PACKET_HEADER_LEN + payload_length);
+        Ok(crate::write_the_header_before_the_payload(
+            payload,
+            sequence_id,
+        ))
     }
 
     /// Decodes one bounded binary row using its result-column types.
@@ -1658,7 +1661,7 @@ impl<'a> TextRowPacket<'a> {
                     })?;
         }
         check_row_payload_length(payload_length)?;
-        let mut payload = Vec::with_capacity(payload_length);
+        let mut payload = crate::frame_with_room_for_its_header(payload_length);
         for value in values {
             match value {
                 TextRowValue::Null => payload.push(0xfb),
@@ -1667,7 +1670,10 @@ impl<'a> TextRowPacket<'a> {
                 }
             }
         }
-        Ok(crate::encode_split_payload(sequence_id, &payload))
+        Ok(crate::write_the_header_before_the_payload(
+            payload,
+            sequence_id,
+        ))
     }
 
     /// Decodes one row with exactly `column_count` values.
@@ -3351,6 +3357,24 @@ mod tests {
                 0xfc, 0x01, // columns 0 through 6 map to bits 2 through 8
             ]
         );
+    }
+
+    #[test]
+    fn rows_of_a_full_packet_are_followed_by_an_empty_packet() {
+        let text_bytes = vec![b'x'; crate::MAX_PACKET_PAYLOAD_LEN - 4];
+        let text = TextRowPacket::encode(2, &[TextRowValue::Bytes(&text_bytes)]).unwrap();
+        let binary_bytes = vec![b'y'; crate::MAX_PACKET_PAYLOAD_LEN - 6];
+        let binary = BinaryRowPacket::encode(9, &[BinaryRowValue::Bytes(&binary_bytes)]).unwrap();
+        for (frame, sequence_id) in [(&text, 2u8), (&binary, 9u8)] {
+            assert_eq!(
+                frame.len(),
+                2 * crate::PACKET_HEADER_LEN + crate::MAX_PACKET_PAYLOAD_LEN
+            );
+            assert_eq!(frame[..4], [0xff, 0xff, 0xff, sequence_id]);
+            assert_eq!(frame[frame.len() - 4..], [0, 0, 0, sequence_id + 1]);
+        }
+        assert_eq!(text[4..8], [0xfd, 0xfb, 0xff, 0xff]);
+        assert_eq!(binary[4..10], [0x00, 0x00, 0xfd, 0xf9, 0xff, 0xff]);
     }
 
     #[test]

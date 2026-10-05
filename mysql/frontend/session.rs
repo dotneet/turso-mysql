@@ -121,7 +121,7 @@ pub struct MySqlConnection {
 #[derive(Default)]
 struct SchemaReadings {
     schema: Option<Arc<turso_core::schema::Schema>>,
-    tables: Option<Vec<MySqlTable>>,
+    tables: Option<Arc<Vec<MySqlTable>>>,
     columns: HashMap<String, Arc<Vec<MySqlColumnMetadata>>>,
     counted_tables_by_lowercase_name: HashMap<String, Option<AutoIncrementTable>>,
     /// How many times a table's columns were read rather than found here.
@@ -132,7 +132,7 @@ struct SchemaReadings {
 }
 
 impl SchemaReadings {
-    fn tables(&self, schema: &Arc<turso_core::schema::Schema>) -> Option<Vec<MySqlTable>> {
+    fn tables(&self, schema: &Arc<turso_core::schema::Schema>) -> Option<Arc<Vec<MySqlTable>>> {
         self.reads(schema).and_then(|kept| kept.tables.clone())
     }
 
@@ -145,8 +145,12 @@ impl SchemaReadings {
             .and_then(|kept| kept.columns.get(table).cloned())
     }
 
-    fn keep_tables(&mut self, schema: Arc<turso_core::schema::Schema>, tables: &[MySqlTable]) {
-        self.for_schema(schema).tables = Some(tables.to_vec());
+    fn keep_tables(
+        &mut self,
+        schema: Arc<turso_core::schema::Schema>,
+        tables: &Arc<Vec<MySqlTable>>,
+    ) {
+        self.for_schema(schema).tables = Some(Arc::clone(tables));
     }
 
     fn keep_columns(
@@ -1293,6 +1297,8 @@ struct PreparedStatement {
     /// either way.
     bound_a_number_to_a_json_reading: bool,
     select_parameter_readings: Option<SelectParameterReadings>,
+    #[cfg(test)]
+    metadata_rebuilds: usize,
 }
 
 struct SelectParameterReadings {
@@ -2393,6 +2399,8 @@ impl MySqlConnection {
                 time_zone_offset_at_prepare: self.time_zone_offset_seconds(),
                 bound_a_number_to_a_json_reading: false,
                 select_parameter_readings: None,
+                #[cfg(test)]
+                metadata_rebuilds: 0,
             },
         );
         Ok(())
@@ -13360,31 +13368,6 @@ fn prepared_statement_metadata(
     })
 }
 
-/// Keeps what the `?` columns settled on across a metadata rebuild.
-///
-/// The rebuild runs after every successful SELECT, not only after a schema
-/// reprepare, and MySQL keeps a marker's inferred type across ordinary
-/// executions and COM_STMT_RESET. The caller decides whether a reprepare
-/// happened; this only copies the state over.
-fn carry_parameter_markers(
-    previous: &[MySqlPreparedResultColumnTypeMetadata],
-    rebuilt: &mut [MySqlPreparedResultColumnTypeMetadata],
-) {
-    if previous.len() != rebuilt.len() {
-        return;
-    }
-
-    for (old, new) in previous.iter().zip(rebuilt) {
-        if let (Some(old_marker), Some(new_marker)) =
-            (old.parameter_marker, new.parameter_marker.as_mut())
-        {
-            if old_marker.ordinal == new_marker.ordinal {
-                new_marker.kind = old_marker.kind;
-            }
-        }
-    }
-}
-
 /// Applies one execution's bound values to the `?` result columns.
 ///
 /// A statement reset keeps this, matching COM_STMT_RESET, which MySQL leaves
@@ -13432,23 +13415,21 @@ fn refresh_prepared_statement_entry(
     let Some(statement) = prepared.statement.as_ref() else {
         return Ok(());
     };
-    let metadata = prepared_statement_metadata(statement_id, statement)?;
     let reprepares = statement.stmt_status(StatementStatusCounter::Reprepare);
-    let mut result_column_type_metadata =
-        prepared_result_column_type_metadata(statement, &prepared.static_result_projections);
     // A reprepare returns a `?` column to its generic type; an ordinary
     // execution leaves it alone.
     if reprepares == prepared.reprepares_at_last_refresh {
-        carry_parameter_markers(
-            &prepared.result_column_type_metadata,
-            &mut result_column_type_metadata,
-        );
+        return Ok(());
     }
+    let metadata = prepared_statement_metadata(statement_id, statement)?;
     prepared.reprepares_at_last_refresh = reprepares;
     prepared.metadata = metadata;
-    prepared
-        .result_column_type_metadata
-        .clone_from(&result_column_type_metadata);
+    prepared.result_column_type_metadata =
+        prepared_result_column_type_metadata(statement, &prepared.static_result_projections);
+    #[cfg(test)]
+    {
+        prepared.metadata_rebuilds += 1;
+    }
     Ok(())
 }
 
