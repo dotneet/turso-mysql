@@ -624,6 +624,28 @@ impl CheckedAutoIncrementInsert {
         self.ignores
     }
 
+    /// Whether an `INSERT IGNORE` hands a NULL bound for a `?` to a column
+    /// of `table` that refuses NULL, the counted column, where NULL asks for
+    /// the next number, aside. Measured on MySQL 8.4.11, such a row stores
+    /// the column's empty value and warns 1048, where the engine's
+    /// `OR IGNORE` skips it.
+    pub fn binds_null_where_the_table_refuses_one(
+        &self,
+        table: &CheckedAutoIncrementCreateTable,
+        bound_null: impl Fn(usize) -> bool,
+    ) -> bool {
+        self.ignores
+            && self.source_values.iter().any(|row| {
+                row.iter().zip(&self.columns).any(|(value, column)| {
+                    matches!(value, AutoIncrementSourceValue::Parameter(ordinal) if bound_null(*ordinal))
+                        && !column
+                            .as_str()
+                            .eq_ignore_ascii_case(&table.allocator_column_name)
+                        && !column_takes_null(&table.sqlite_statement, column.as_str())
+                })
+            })
+    }
+
     /// Whether a row writes a reading of the clock, such as `NOW()`.
     pub fn reads_the_clock(&self) -> bool {
         self.reads_the_clock
@@ -693,12 +715,17 @@ impl CheckedAutoIncrementInsert {
             .mixed_default_columns
             .iter()
             .any(|column| Some(*column) != named_at && !each_row_alone)
-            || self
-                .ignored_null_columns
-                .iter()
-                .any(|column| Some(*column) != named_at)
         {
             return unsupported("INSERT DEFAULT in some rows only");
+        }
+        // A NULL written with IGNORE into the counted column asks for the
+        // next number; into any other column it agrees with MySQL only where
+        // the column takes NULL. See `columns_ignore_writes_null`.
+        if self.ignored_null_columns.iter().any(|column| {
+            Some(*column) != named_at
+                && !column_takes_null(&table.sqlite_statement, self.columns[*column].as_str())
+        }) {
+            return unsupported("INSERT IGNORE writing NULL into a NOT NULL column");
         }
         let row_values = match named_at {
             None => vec![AutoIncrementRowValue::Generated; self.row_count.get()],
@@ -1083,6 +1110,50 @@ impl BoundAutoIncrementInsert {
         };
         TursoExpr::Literal(literal)
     }
+}
+
+/// Whether a column of a stored table takes NULL: it is declared neither
+/// `NOT NULL` nor as a primary key, alone or among others.
+fn column_takes_null(table: &Stmt, column: &str) -> bool {
+    let Stmt::CreateTable {
+        body:
+            TursoCreateTableBody::ColumnsAndConstraints {
+                columns,
+                constraints,
+                ..
+            },
+        ..
+    } = table
+    else {
+        return false;
+    };
+    let Some(definition) = columns
+        .iter()
+        .find(|definition| definition.col_name.as_str().eq_ignore_ascii_case(column))
+    else {
+        return false;
+    };
+    let declared_never_null = definition.constraints.iter().any(|named| {
+        matches!(
+            named.constraint,
+            TursoColumnConstraint::NotNull {
+                nullable: false,
+                ..
+            } | TursoColumnConstraint::PrimaryKey { .. }
+        )
+    });
+    let in_the_primary_key = constraints.iter().any(|named| {
+        matches!(
+            &named.constraint,
+            TursoTableConstraint::PrimaryKey { columns, .. }
+                if columns.iter().any(|key| matches!(
+                    key.expr.as_ref(),
+                    TursoExpr::Id(name) | TursoExpr::Name(name)
+                        if name.as_str().eq_ignore_ascii_case(column)
+                ))
+        )
+    });
+    !declared_never_null && !in_the_primary_key
 }
 
 /// A copy of a checked `INSERT ... VALUES` holding only one of its rows.
@@ -1616,6 +1687,9 @@ pub struct TranslatedDml {
     /// `CAST(... AS JSON)` into, which the frontend holds to being `JSON`
     /// columns.
     json_cast_columns: Option<(String, Vec<String>)>,
+    /// The table the statement writes and the columns its `IGNORE` writes a
+    /// written NULL into, which the frontend holds to taking NULL.
+    ignored_null_columns: Option<(String, Vec<String>)>,
     /// Whether an `UPDATE` reads a column through `COALESCE(col, n)`, which is
     /// held to the column's kind only on a reading that knows it.
     falls_back_in_a_set: bool,
@@ -1660,6 +1734,14 @@ impl TranslatedDml {
     /// `CAST(... AS JSON)` into, when it writes one.
     pub fn json_cast_columns(&self) -> Option<(&str, &[String])> {
         self.json_cast_columns
+            .as_ref()
+            .map(|(table, columns)| (table.as_str(), columns.as_slice()))
+    }
+
+    /// Returns the table the statement writes and the columns its `IGNORE`
+    /// writes a written NULL into, when it writes one.
+    pub fn ignored_null_columns(&self) -> Option<(&str, &[String])> {
+        self.ignored_null_columns
             .as_ref()
             .map(|(table, columns)| (table.as_str(), columns.as_slice()))
     }
@@ -5396,20 +5478,24 @@ fn translate_dml(
     let mut inherited_comparisons = Vec::new();
     let mut row_count_parameters = Vec::new();
     let mut json_cast_columns = None;
+    let mut ignored_null_columns = None;
     let (sqlite_sql, checked_update, source_table) = match statement {
         Statement::Insert(insert) => {
             let rendered = translate_insert(&insert, sql, mode, decimal_columns, None)?;
             read_tables = rendered.read_tables;
             inherited_comparisons = rendered.checked_comparisons;
             row_count_parameters = rendered.row_count_parameters;
-            if !rendered.json_cast_columns.is_empty() {
+            if !rendered.json_cast_columns.is_empty() || !rendered.ignored_null_columns.is_empty() {
                 let TableObject::TableName(table) = &insert.table else {
                     return unsupported("INSERT table source");
                 };
-                json_cast_columns = Some((
-                    insert_name(table)?.as_str().to_owned(),
-                    rendered.json_cast_columns,
-                ));
+                let table = insert_name(table)?.as_str().to_owned();
+                if !rendered.json_cast_columns.is_empty() {
+                    json_cast_columns = Some((table.clone(), rendered.json_cast_columns));
+                }
+                if !rendered.ignored_null_columns.is_empty() {
+                    ignored_null_columns = Some((table, rendered.ignored_null_columns));
+                }
             }
             // An INSERT ... SELECT compares against the table the SELECT reads,
             // not the one it writes, so that is the table the comparisons are
@@ -5430,6 +5516,12 @@ fn translate_dml(
                 json_cast_columns = Some((
                     table.clone(),
                     std::mem::take(&mut render_context.json_cast_columns),
+                ));
+            }
+            if !render_context.ignored_null_columns.is_empty() {
+                ignored_null_columns = Some((
+                    table.clone(),
+                    std::mem::take(&mut render_context.ignored_null_columns),
                 ));
             }
             (rendered, Some(checked), Some(table))
@@ -5491,6 +5583,7 @@ fn translate_dml(
         copies_a_select_rendered_knowing_its_types: false,
         bound_arithmetic_operands: render_context.bound_arithmetic_operands,
         json_cast_columns,
+        ignored_null_columns,
         falls_back_in_a_set: render_context.falls_back_in_a_set,
     })
 }
@@ -5536,6 +5629,7 @@ pub fn parse_insert_select_knowing_its_select(
         copies_a_select_rendered_knowing_its_types: true,
         bound_arithmetic_operands: Vec::new(),
         json_cast_columns: None,
+        ignored_null_columns: None,
         falls_back_in_a_set: false,
     })
 }
@@ -5678,12 +5772,6 @@ fn parse_checked_auto_increment_insert(
                 for at in &mixed_default_columns {
                     if names_the_columns_default(&row[*at], columns[*at].as_str()) {
                         row[*at] = Expr::Value(sqlparser::ast::Value::Null.into());
-                    }
-                }
-                for at in &ignored_null_columns {
-                    if matches!(&row[*at], Expr::Value(value) if matches!(value.value, Value::Null))
-                    {
-                        row[*at] = Expr::Value(Value::Number("0".to_string(), false).into());
                     }
                 }
             }

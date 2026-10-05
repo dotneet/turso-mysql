@@ -2078,6 +2078,39 @@ fn a_joined_update_changes_the_rows_the_join_finds() {
     }
 }
 
+/// An `INSERT IGNORE` writing a NULL renders it as written and names the
+/// columns it goes into, once each, for the frontend to hold each to taking
+/// NULL. Measured on MySQL 8.4.11: into a column taking NULL it is stored
+/// with no warning.
+#[test]
+fn insert_ignore_names_the_columns_it_writes_a_null_into() {
+    let mode = SessionSqlMode::default();
+    for (sql, columns) in [
+        (
+            "INSERT IGNORE INTO tags (name, note, n) VALUES ('a', NULL, NULL), ('b', 'x', NULL)",
+            vec!["note".to_owned(), "n".to_owned()],
+        ),
+        (
+            "INSERT IGNORE INTO tags SET name = 'c', note = NULL",
+            vec!["note".to_owned()],
+        ),
+    ] {
+        let translated = parse_dml(sql, mode).unwrap();
+        assert_eq!(
+            translated.ignored_null_columns(),
+            Some(("tags", columns.as_slice())),
+            "{sql}"
+        );
+        assert!(translated.as_sql().contains("NULL"), "{sql}");
+    }
+    assert_eq!(
+        parse_dml("INSERT INTO tags (name, note) VALUES ('a', NULL)", mode)
+            .unwrap()
+            .ignored_null_columns(),
+        None
+    );
+}
+
 /// Measured on MySQL 8.4.11: a joined `UPDATE IGNORE` skips a row whose new
 /// key collides, as the one-table form does, and a value naming the changed
 /// table's own column through it — `SET k.u = k.u + 1000` — reads the row
@@ -2097,11 +2130,15 @@ fn a_joined_update_ignore_is_the_engines_or_ignore() {
             "(SELECT \"k\"._rowid_ FROM \"k\" JOIN \"j\" ON (\"j\".\"kid\" = \"k\".\"id\"))"
         )
     );
-    assert!(parse_dml(
-        "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = NULL",
-        mode
-    )
-    .is_err());
+    assert_eq!(
+        parse_dml(
+            "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = NULL",
+            mode
+        )
+        .unwrap()
+        .ignored_null_columns(),
+        Some(("k", ["u".to_owned()].as_slice()))
+    );
     assert!(parse_dml(
         "UPDATE IGNORE k JOIN j ON j.kid = k.id SET k.u = j.id",
         mode
@@ -7036,10 +7073,11 @@ fn translates_update_ignore_and_delete_ignore() {
         parse_dml("UPDATE OR IGNORE users SET name = 'a'", mode),
         Err(ParseError::Sqlparser(_))
     ));
-    assert!(matches!(
-        parse_dml("UPDATE IGNORE users SET name = NULL", mode),
-        Err(ParseError::Unsupported { .. })
-    ));
+    let null_name = parse_dml("UPDATE IGNORE users SET name = NULL", mode).unwrap();
+    assert_eq!(
+        null_name.ignored_null_columns(),
+        Some(("users", ["name".to_owned()].as_slice()))
+    );
 }
 
 #[test]
@@ -7211,13 +7249,28 @@ fn rejects_unsupported_typed_auto_increment_insert_shapes() {
         generated_null.row_values(),
         [AutoIncrementRowValue::Generated; 3]
     );
-    assert!(parse_auto_increment_insert(
-        "INSERT IGNORE INTO users (id, name) VALUES (NULL, NULL), (DEFAULT, 'b')",
+    // A NULL written with IGNORE into a column that takes NULL is stored as
+    // NULL, as in MySQL; into one refusing NULL MySQL stores the type's empty
+    // value and warns 1048, which is refused here.
+    let insert_null_name =
+        "INSERT IGNORE INTO users (id, name) VALUES (NULL, NULL), (DEFAULT, 'b')";
+    assert!(
+        parse_auto_increment_insert(insert_null_name, SessionSqlMode::default())
+            .unwrap()
+            .bind_allocator_table(&table)
+            .is_ok()
+    );
+    let names_refuse_null = parse_auto_increment_create_table(
+        "CREATE TABLE users (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name TEXT NOT NULL)",
         SessionSqlMode::default(),
     )
-    .unwrap()
-    .bind_allocator_table(&table)
-    .is_err());
+    .unwrap();
+    assert!(
+        parse_auto_increment_insert(insert_null_name, SessionSqlMode::default())
+            .unwrap()
+            .bind_allocator_table(&names_refuse_null)
+            .is_err()
+    );
 
     // A fractional literal is taken, because it is a DOUBLE column's value.
     // The dialect's assignment validator is what holds a column to its own

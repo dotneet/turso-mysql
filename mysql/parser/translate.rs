@@ -3860,6 +3860,8 @@ pub(crate) struct RenderedInsert {
     pub(crate) row_count_parameters: Vec<usize>,
     /// The columns a `VALUES` row writes a `CAST(... AS JSON)` into.
     pub(crate) json_cast_columns: Vec<String>,
+    /// The columns an `INSERT IGNORE` writes a written NULL into.
+    pub(crate) ignored_null_columns: Vec<String>,
 }
 
 /// Renders one checked `INSERT`. An `INSERT ... SELECT` whose `SELECT` has to
@@ -4033,6 +4035,7 @@ pub(crate) fn translate_insert(
             checked_comparisons: rendered.checked_comparisons,
             row_count_parameters: rendered.row_count_parameters,
             json_cast_columns: Vec::new(),
+            ignored_null_columns: Vec::new(),
         });
     }
     if source.with.is_some()
@@ -4068,18 +4071,18 @@ pub(crate) fn translate_insert(
                 checked_comparisons: Vec::new(),
                 row_count_parameters: Vec::new(),
                 json_cast_columns: Vec::new(),
+                ignored_null_columns: Vec::new(),
             });
         }
         return unsupported("INSERT without an explicit column list");
     }
-    reject_ignored_null(
+    let ignored_null_columns = columns_ignore_writes_null(
         insert,
-        &values
+        values
             .rows
             .iter()
-            .flat_map(|row| row.iter())
-            .collect::<Vec<_>>(),
-    )?;
+            .flat_map(|row| column_names.iter().zip(row.iter())),
+    );
     for row in &values.rows {
         if row.is_empty() || row.len() != columns.len() {
             return unsupported("INSERT VALUES column count");
@@ -4145,6 +4148,7 @@ pub(crate) fn translate_insert(
             checked_comparisons: Vec::new(),
             row_count_parameters: Vec::new(),
             json_cast_columns: Vec::new(),
+            ignored_null_columns: Vec::new(),
         });
     }
     Ok(RenderedInsert {
@@ -4159,6 +4163,7 @@ pub(crate) fn translate_insert(
         checked_comparisons: Vec::new(),
         row_count_parameters: Vec::new(),
         json_cast_columns,
+        ignored_null_columns,
     })
 }
 
@@ -5051,14 +5056,26 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedIns
         columns.push(render_unqualified_name(name)?);
         values.push(render_inserted_value(&assignment.value)?);
     }
-    reject_ignored_null(
+    let written_names = insert
+        .assignments
+        .iter()
+        .map(|assignment| match &assignment.target {
+            sqlparser::ast::AssignmentTarget::ColumnName(name) => match name.0.as_slice() {
+                [ObjectNamePart::Identifier(ident)] => Ok(ident.value.as_str()),
+                _ => unsupported("INSERT SET assignment target"),
+            },
+            _ => unsupported("INSERT SET assignment target"),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ignored_null_columns = columns_ignore_writes_null(
         insert,
-        &insert
-            .assignments
-            .iter()
-            .map(|assignment| &assignment.value)
-            .collect::<Vec<_>>(),
-    )?;
+        written_names.iter().zip(
+            insert
+                .assignments
+                .iter()
+                .map(|assignment| &assignment.value),
+        ),
+    );
     // REPLACE and IGNORE both take the SET form too, and mean there what they
     // mean on the other one.
     let verb = insert_verb(insert);
@@ -5073,6 +5090,7 @@ fn render_insert_assignments(table: &str, insert: &Insert) -> Result<RenderedIns
         checked_comparisons: Vec::new(),
         row_count_parameters: Vec::new(),
         json_cast_columns: Vec::new(),
+        ignored_null_columns,
     })
 }
 
@@ -5094,26 +5112,33 @@ fn insert_verb(insert: &Insert) -> &'static str {
     }
 }
 
-/// Refuses an `INSERT IGNORE` that writes a NULL.
+/// The columns an `INSERT IGNORE` writes a written NULL into, each once.
 ///
 /// This is the one place the two engines' IGNORE part company. MySQL treats a
 /// NULL in a NOT NULL column as something to coerce rather than refuse —
-/// measured on 8.4.11, `INSERT IGNORE` of NULL into a NOT NULL INT stores 0 —
-/// while the engine's `OR IGNORE` skips the row and stores nothing. A row that
-/// exists in one and not the other is a difference a client cannot see, so the
-/// statement is refused instead. A NULL bound for a column that accepts one
-/// would agree, but the column is not known here, so all of them are refused.
-fn reject_ignored_null(insert: &Insert, values: &[&Expr]) -> Result<(), ParseError> {
+/// measured on 8.4.11, `INSERT IGNORE` of NULL into a NOT NULL INT stores 0
+/// and warns 1048 — while the engine's `OR IGNORE` skips the row and stores
+/// nothing. Into a column that takes NULL the two agree, so the frontend,
+/// which knows which columns those are, refuses the statement only when one
+/// of these is NOT NULL.
+fn columns_ignore_writes_null<'a>(
+    insert: &Insert,
+    written: impl Iterator<Item = (&'a &'a str, &'a Expr)>,
+) -> Vec<String> {
     if !insert.ignore {
-        return Ok(());
+        return Vec::new();
     }
-    if values
-        .iter()
-        .any(|value| matches!(value, Expr::Value(value) if matches!(value.value, Value::Null)))
-    {
-        return unsupported("INSERT IGNORE writing NULL");
+    let mut columns: Vec<String> = Vec::new();
+    for (column, value) in written {
+        if matches!(value, Expr::Value(value) if matches!(value.value, Value::Null))
+            && !columns
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(column))
+        {
+            columns.push((*column).to_owned());
+        }
     }
-    Ok(())
+    columns
 }
 
 /// The same rendered value with each of its parameters named by its ordinal.
@@ -5211,12 +5236,22 @@ pub(crate) fn translate_update(
     {
         return unsupported("UPDATE option");
     }
-    if ignores
-        && update.assignments.iter().any(|assignment| {
-            matches!(&assignment.value, Expr::Value(value) if matches!(value.value, Value::Null))
-        })
-    {
-        return unsupported("UPDATE IGNORE writing NULL");
+    // A NULL written with IGNORE is held by the frontend to a column that
+    // takes NULL, as `INSERT IGNORE`'s is; see `columns_ignore_writes_null`.
+    if ignores {
+        for assignment in &update.assignments {
+            let sqlparser::ast::AssignmentTarget::ColumnName(name) = &assignment.target else {
+                continue;
+            };
+            if matches!(&assignment.value, Expr::Value(value) if matches!(value.value, Value::Null))
+            {
+                if let Some(ObjectNamePart::Identifier(column)) = name.0.last() {
+                    render_context
+                        .ignored_null_columns
+                        .push(column.value.clone());
+                }
+            }
+        }
     }
     // MySQL updates the rows a join finds, naming the table to change through
     // the columns the SET names.
@@ -7141,6 +7176,8 @@ pub(crate) struct SelectRenderContext<'a> {
     pub(crate) bound_arithmetic_operands: Vec<crate::BoundArithmeticOperand>,
     /// The columns an `UPDATE` writes a `CAST(... AS JSON)` into.
     pub(crate) json_cast_columns: Vec<String>,
+    /// The columns an `UPDATE IGNORE` writes a written NULL into.
+    pub(crate) ignored_null_columns: Vec<String>,
     /// Whether an `UPDATE` reads a column through `COALESCE(col, n)` or writes
     /// a `COUNT` into one, which is only taken once the kinds of the table's
     /// columns are known.
@@ -7266,6 +7303,7 @@ impl<'a> SelectRenderContext<'a> {
             ordered_columns: Vec::new(),
             bound_arithmetic_operands: Vec::new(),
             json_cast_columns: Vec::new(),
+            ignored_null_columns: Vec::new(),
             falls_back_in_a_set: false,
             knows_the_integer_columns: false,
             parameter_count: 0,

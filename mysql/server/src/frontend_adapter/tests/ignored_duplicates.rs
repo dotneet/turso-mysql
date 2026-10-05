@@ -300,3 +300,98 @@ fn a_counted_table_and_a_prepared_statement_warn_the_same_way() {
         ["Duplicate entry '2' for key 'ai.PRIMARY'"]
     );
 }
+
+/// A NULL written with `IGNORE` into a column that takes NULL is stored as
+/// NULL with no warning, as Laravel's `insertOrIgnore` and Django's
+/// `bulk_create(ignore_conflicts=True)` write a nullable column. Into a
+/// column refusing NULL MySQL stores the type's empty value and warns 1048,
+/// which is refused here.
+#[test]
+fn ignore_writes_a_null_into_a_column_that_takes_one() {
+    let (_directory, mut adapter) = adapter();
+    run(
+        &mut adapter,
+        "CREATE TABLE tags (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(50) NOT NULL UNIQUE, note VARCHAR(50), n INT)",
+    );
+    let written = run(
+        &mut adapter,
+        "INSERT IGNORE INTO tags (name, note, n) VALUES ('a', NULL, NULL), ('b', 'x', NULL), ('a', NULL, 3)",
+    );
+    assert_eq!((written.affected_rows, written.warnings), (2, 1));
+    assert_eq!(
+        duplicates(&mut adapter),
+        ["Duplicate entry 'a' for key 'tags.name'"]
+    );
+    let updated = run(
+        &mut adapter,
+        "UPDATE IGNORE tags SET note = NULL, n = NULL WHERE name = 'b'",
+    );
+    assert_eq!((updated.affected_rows, updated.warnings), (1, 0));
+    run(
+        &mut adapter,
+        "INSERT IGNORE INTO tags SET name = 'c', note = NULL",
+    );
+    assert_eq!(
+        rows(
+            &mut adapter,
+            "SELECT id, name, note, n FROM tags ORDER BY id"
+        ),
+        [
+            [Some("1".to_owned()), Some("a".to_owned()), None, None],
+            [Some("2".to_owned()), Some("b".to_owned()), None, None],
+            [Some("4".to_owned()), Some("c".to_owned()), None, None],
+        ]
+    );
+
+    run(
+        &mut adapter,
+        "CREATE TABLE p (id INT PRIMARY KEY, note VARCHAR(5), must VARCHAR(5) NOT NULL)",
+    );
+    run(
+        &mut adapter,
+        "INSERT IGNORE INTO p VALUES (1, NULL, 'x'), (1, NULL, 'y')",
+    );
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, note, must FROM p"),
+        [[Some("1".to_owned()), None, Some("x".to_owned())]]
+    );
+    for sql in [
+        "INSERT IGNORE INTO tags (name, note) VALUES (NULL, 'x')",
+        "INSERT IGNORE INTO p VALUES (2, 'a', NULL)",
+        "INSERT IGNORE INTO p SET id = 3, must = NULL",
+        "UPDATE IGNORE tags SET name = NULL WHERE id = 1",
+        "UPDATE IGNORE p SET must = NULL",
+    ] {
+        assert!(adapter.execute_query(sql).is_err(), "{sql}");
+    }
+
+    // A NULL bound for a `?` is held to the column the same way.
+    let bound_null = [1, 1, MYSQL_TYPE_NULL, 0];
+    for (sql, taken) in [
+        ("INSERT IGNORE INTO tags (name, note) VALUES ('d', ?)", true),
+        (
+            "INSERT IGNORE INTO tags (name, note) VALUES (?, 'x')",
+            false,
+        ),
+        (
+            "INSERT IGNORE INTO p (id, note, must) VALUES (2, ?, 'x')",
+            true,
+        ),
+        (
+            "INSERT IGNORE INTO p (id, note, must) VALUES (3, 'y', ?)",
+            false,
+        ),
+    ] {
+        let statement = adapter.execute_stmt_prepare(sql).unwrap();
+        let result = adapter.execute_stmt_execute(statement.statement_id, &bound_null);
+        adapter.execute_stmt_close(statement.statement_id);
+        assert_eq!(result.is_ok(), taken, "{sql}: {result:?}");
+    }
+    assert_eq!(
+        rows(&mut adapter, "SELECT id, note, must FROM p ORDER BY id"),
+        [
+            [Some("1".to_owned()), None, Some("x".to_owned())],
+            [Some("2".to_owned()), None, Some("x".to_owned())],
+        ]
+    );
+}

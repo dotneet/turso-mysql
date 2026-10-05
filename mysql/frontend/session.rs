@@ -1525,6 +1525,8 @@ impl CheckedInsertTarget {
 
 struct ListedInsert {
     table: MySqlTableName,
+    /// Whether the statement was written `INSERT IGNORE`.
+    ignores: bool,
     /// Column names in the order the statement lists them.
     columns: Vec<String>,
     /// One entry per VALUES row, holding what each listed column receives.
@@ -1585,6 +1587,23 @@ impl ListedInsert {
                 && not_null
                     .iter()
                     .any(|name| name.eq_ignore_ascii_case(column))
+        })
+    }
+
+    /// Whether any row puts a NULL bound for a `?` in a NOT NULL column.
+    fn binds_null_to_a_not_null_column(
+        &self,
+        not_null: &[String],
+        bound: &[MySqlPreparedValue],
+    ) -> bool {
+        self.rows.iter().any(|row| {
+            row.iter().zip(&self.columns).any(|(value, column)| {
+                matches!(value, InsertedValue::Marker(index)
+                    if matches!(bound.get(*index), Some(MySqlPreparedValue::Null)))
+                    && not_null
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(column))
+            })
         })
     }
 
@@ -4076,6 +4095,17 @@ impl MySqlConnection {
             .clone()
             .bind_allocator_table_with(&table.definition, self.written_zero())
             .map_err(|error| LimboError::ParseError(error.to_string()))?;
+        if insert
+            .insert
+            .binds_null_where_the_table_refuses_one(&table.definition, |ordinal| {
+                matches!(values.get(ordinal), Some(Value::Null))
+            })
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                "IGNORE writing a bound NULL into a NOT NULL column of {}",
+                table.name
+            )));
+        }
         let rounded = ids_bound_as_whole_numbers(&bound, values);
         let values = rounded.as_deref().unwrap_or(values);
         if bound.rowwise_conflicts() {
@@ -9868,6 +9898,10 @@ impl MySqlConnection {
             }
         }
         refuse_dml_json_readings_mysql_reads_differently(&self.inner.current_schema(), translated)?;
+        refuse_a_null_ignore_writes_into_a_column_refusing_null(
+            &self.inner.current_schema(),
+            translated,
+        )?;
         self.validate_subquery_comparison_columns(
             translated.source_table(),
             translated.checked_subquery_comparisons(),
@@ -11133,6 +11167,16 @@ impl MySqlConnection {
             CheckedInsertTarget::DefaultValues(table) => self.missing_insert_default(table),
             CheckedInsertTarget::Listed(insert) => {
                 let rules = self.insert_column_rules(&insert.table)?;
+                // Measured on MySQL 8.4.11, `INSERT IGNORE` stores the type's
+                // empty value where a NULL meets a NOT NULL column and warns
+                // 1048, where the engine's `OR IGNORE` would skip the row.
+                if insert.ignores && insert.binds_null_to_a_not_null_column(&rules.not_null, bound)
+                {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "IGNORE writing a bound NULL into a NOT NULL column of {}",
+                        insert.table.as_str()
+                    )));
+                }
                 if insert.first_row_hands_null_to_a_not_null_column(&rules.not_null, bound) {
                     return Ok(None);
                 }
@@ -15222,6 +15266,7 @@ fn validate_dml_comparison_columns(
         }
     }
     refuse_dml_json_readings_mysql_reads_differently(schema, translated)?;
+    refuse_a_null_ignore_writes_into_a_column_refusing_null(schema, translated)?;
     validate_frozen_select_comparison_columns(
         schema,
         translated.source_table(),
@@ -15236,6 +15281,37 @@ fn validate_dml_comparison_columns(
 /// A bound value is refused outright. A prepared `SELECT` holds what binds
 /// against a JSON reading to a word or a number every time it runs, and a
 /// prepared DML statement has no such step.
+/// Refuses a written NULL that `IGNORE` writes into a column refusing NULL.
+///
+/// Measured on MySQL 8.4.11, `INSERT IGNORE` and `UPDATE IGNORE` store the
+/// type's own empty value there — 0, `''`, `0000-00-00` — and warn 1048,
+/// where the engine's `OR IGNORE` skips the row. Into a column that takes
+/// NULL both store NULL and warn nothing.
+fn refuse_a_null_ignore_writes_into_a_column_refusing_null(
+    schema: &turso_core::schema::Schema,
+    translated: &TranslatedDml,
+) -> Result<()> {
+    let Some((table, columns)) = translated.ignored_null_columns() else {
+        return Ok(());
+    };
+    let Some(btree) = schema.get_btree_table(table) else {
+        return Err(LimboError::InvalidArgument(format!(
+            "IGNORE writing NULL into {table}, whose columns are not known"
+        )));
+    };
+    for column in columns {
+        let takes_null = btree
+            .get_column(column)
+            .is_some_and(|(_, column)| !column.notnull() && !column.is_rowid_alias());
+        if !takes_null {
+            return Err(LimboError::InvalidArgument(format!(
+                "IGNORE writing NULL into {table}.{column}, which refuses NULL"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn refuse_dml_json_readings_mysql_reads_differently(
     schema: &turso_core::schema::Schema,
     translated: &TranslatedDml,
@@ -16166,6 +16242,7 @@ fn push_hex_byte(out: &mut String, byte: u8) {
 
 fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>> {
     let Stmt::Insert {
+        or_conflict,
         tbl_name,
         columns,
         body,
@@ -16176,6 +16253,7 @@ fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>
     };
     let table = MySqlTableName::parse(tbl_name.name.as_str())
         .map_err(|error| LimboError::ParseError(error.to_string()))?;
+    let ignores = matches!(or_conflict, Some(turso_parser::ast::ResolveType::Ignore));
     match body {
         InsertBody::DefaultValues => Ok(Some(CheckedInsertTarget::DefaultValues(table))),
         // The upsert clause changes what happens to a row that collides, not
@@ -16189,6 +16267,7 @@ fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>
             let OneSelect::Values(values) = &select.body.select else {
                 return Ok(Some(CheckedInsertTarget::Listed(ListedInsert {
                     table,
+                    ignores,
                     columns: columns
                         .iter()
                         .map(|name| name.as_str().to_owned())
@@ -16198,6 +16277,7 @@ fn checked_insert_target(statement: &Stmt) -> Result<Option<CheckedInsertTarget>
             };
             Ok(Some(CheckedInsertTarget::Listed(ListedInsert {
                 table,
+                ignores,
                 columns: columns
                     .iter()
                     .map(|name| name.as_str().to_owned())

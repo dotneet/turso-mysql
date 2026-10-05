@@ -3122,18 +3122,25 @@ stood, warned about with 1062 as above, and the rows after it are updated —
 refuses (see below). Over a join it is taken too, and changes the rows the
 join finds the way a joined `UPDATE` does: `UPDATE IGNORE k JOIN j ON j.kid =
 k.id SET k.u = 50` over two matching rows that would both take 50 leaves both
-and warns twice. A `NULL` written with it is refused as `INSERT IGNORE`'s is.
-`DELETE IGNORE` is taken as well; a foreign key is what it ignores.
+and warns twice. A `NULL` written with it is held to a column taking NULL, as
+`INSERT IGNORE`'s is (below). `DELETE IGNORE` is taken as well; a foreign key
+is what it ignores.
 
 What MySQL's IGNORE also does is coerce a value it would otherwise refuse, and
 that is not done here. Measured: `INSERT IGNORE` of 99999999999999 into an `INT`
 stores 2147483647, where this refuses the statement — an error rather than a row
 holding a number the client did not write. A NULL is the one case where the two
-IGNOREs part company silently: MySQL stores a coerced 0 in a NOT NULL column
-while the engine's `OR IGNORE` skips the row and stores nothing, so an
-`INSERT IGNORE` that writes a NULL is refused outright rather than left to
-disagree. That refuses a NULL bound for a column that accepts one too, which
-would have agreed; the column is not known where the refusal is made.
+IGNOREs part company silently: MySQL stores the type's empty value in a column
+refusing NULL — 0, `''`, `0000-00-00` — and warns 1048, ``Column 'must' cannot
+be null``, while the engine's `OR IGNORE` skips the row and stores nothing. So a
+NULL written into such a column with `IGNORE`, in an `INSERT` or an `UPDATE`,
+is refused rather than left to disagree. Into a column that takes NULL the two
+agree — measured on 8.4.11, it stores NULL and warns nothing — and that is
+taken, which is how Laravel's `insertOrIgnore` and Django's
+`bulk_create(ignore_conflicts=True)` write a nullable column. A NULL bound for
+an `INSERT IGNORE`'s `?` is held to its column the same way when the statement
+runs; one bound in an `UPDATE IGNORE`'s `SET` is not, and skips the row where it
+meets a column refusing NULL.
 
 An `INSERT ... ON DUPLICATE KEY UPDATE` reports what it did to each row rather
 than how many it touched, which is a rule of MySQL's own. Measured on 8.4.11 and
