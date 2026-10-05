@@ -3751,6 +3751,7 @@ impl Database {
             }),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
+            begin_kept_waiting: Mutex::new(None),
             progress_handler: ProgressHandler::new(),
             query_timeout_ms: AtomicU64::new(0),
             row_locks_read_committed: AtomicBool::new(false),

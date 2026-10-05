@@ -21,6 +21,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
+use crate::storage::lock_release::LockReleaseSignal;
 use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
@@ -4637,6 +4638,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// While above zero, a transaction that begins answers `Busy`; see
     /// [`MvStore::hold_new_transactions`].
     new_transactions_held: AtomicUsize,
+    new_transactions_let_begin: Arc<LockReleaseSignal>,
     /// Passive publish drain: set for the brief in-memory publish window so new `begin_tx`
     /// calls contend out instead of pinning a lifetime checkpoint read guard.
     checkpoint_publish_in_progress: AtomicBool,
@@ -4851,6 +4853,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             backfill_floor: Arc::new(RwLock::new(WalPos::ORIGIN)),
             blocking_checkpoint_lock: Arc::new(TursoRwLock::new()),
             new_transactions_held: AtomicUsize::new(0),
+            new_transactions_let_begin: Arc::default(),
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
@@ -5093,6 +5096,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Release the MVCC stop-the-world gate acquired by `try_begin_vacuum_gate`.
     pub(crate) fn release_vacuum_gate(&self) {
         self.blocking_checkpoint_lock.unlock();
+        self.new_transactions_let_begin.released();
     }
 
     /// VACUUM copies the physical DB image, so any MVCC logical-log bytes must
@@ -7461,6 +7465,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn let_new_transactions_begin(&self) {
         let held = self.new_transactions_held.fetch_sub(1, Ordering::SeqCst);
         turso_assert!(held > 0, "new transactions let go more often than held");
+        self.new_transactions_let_begin.released();
+    }
+
+    pub(crate) fn new_transactions_let_begin(&self) -> &Arc<LockReleaseSignal> {
+        &self.new_transactions_let_begin
+    }
+
+    pub(crate) fn note_the_blocking_checkpoint_ended(&self) {
+        self.new_transactions_let_begin.released();
     }
 
     pub fn remove_tx(&self, tx_id: TxID) -> Result<(), TryReserveError> {

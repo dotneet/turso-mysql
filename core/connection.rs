@@ -734,6 +734,7 @@ pub struct Connection {
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
     pub(super) busy_handler: RwLock<BusyHandler>,
+    pub(super) begin_kept_waiting: Mutex<Option<KeptBegin>>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
     /// Maximum execution time for a single statement on this connection.
@@ -814,6 +815,11 @@ pub struct Connection {
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
 crate::assert::assert_send_sync!(Connection);
+
+pub(crate) struct KeptBegin {
+    pub(crate) let_begin: Arc<crate::storage::lock_release::LockReleaseSignal>,
+    pub(crate) times_let_begin_before_trying: u64,
+}
 
 impl Drop for Connection {
     fn drop(&mut self) {
@@ -5656,6 +5662,14 @@ impl Connection {
     /// Get a reference to the busy handler.
     pub fn get_busy_handler(&self) -> crate::sync::RwLockReadGuard<'_, BusyHandler> {
         self.busy_handler.read()
+    }
+
+    pub(crate) fn note_a_begin_kept_waiting(&self, kept: KeptBegin) {
+        *self.begin_kept_waiting.lock() = Some(kept);
+    }
+
+    pub(crate) fn take_the_begin_kept_waiting(&self) -> Option<KeptBegin> {
+        self.begin_kept_waiting.lock().take()
     }
 
     /// Sets a progress handler invoked approximately every `ops` VM steps.

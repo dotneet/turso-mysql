@@ -980,6 +980,47 @@ fn a_blocking_checkpoint_runs_once_new_transactions_are_held_back() {
 }
 
 #[test]
+fn a_begin_held_back_sleeps_until_new_transactions_are_let_begin() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let store = db.get_mvcc_store();
+    let waiting = db.connect();
+    let checkpointing = db.connect();
+    waiting.execute("CREATE TABLE t (x INTEGER)").unwrap();
+    store.hold_new_transactions();
+    checkpointing
+        .checkpoint(CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })
+        .unwrap();
+    let busy_answers = Arc::new(AtomicUsize::new(0));
+    waiting.set_busy_handler(Some(Box::new({
+        let busy_answers = Arc::clone(&busy_answers);
+        move |_| {
+            busy_answers.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    })));
+    let inserting = std::thread::spawn(move || {
+        let inserted = waiting.execute("INSERT INTO t VALUES (1)");
+        (waiting, inserted)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!inserting.is_finished());
+    store.let_new_transactions_begin();
+    let (waiting, inserted) = inserting.join().unwrap();
+    inserted.unwrap();
+    let busy_answers = busy_answers.load(Ordering::SeqCst);
+    assert!(
+        busy_answers < 1000,
+        "the held-back begin tried again {busy_answers} times in 200 ms"
+    );
+    assert_eq!(
+        get_rows(&waiting, "SELECT x FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+}
+
+#[test]
 fn mvcc_pragma_page_size_propagates_to_global_header() {
     // MvStore captures global_header from the pager during bootstrap (before any user PRAGMA
     // can run), so without explicit propagation a later `PRAGMA page_size = N` updates the

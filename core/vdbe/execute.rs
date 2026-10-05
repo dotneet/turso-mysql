@@ -189,7 +189,7 @@ use crate::{
 use super::{Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
-use crate::connection::resolve_ext_path;
+use crate::connection::{resolve_ext_path, KeptBegin};
 use crate::vdbe::builder::CursorTypeExt;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
@@ -4459,8 +4459,19 @@ fn begin_fresh_mvcc_tx(
     connection: &Connection,
     expected_schema_generation: Option<u64>,
 ) -> Result<u64> {
+    let let_begin = mv_store.new_transactions_let_begin();
+    let times_let_begin_before_trying = let_begin.releases();
     let checkpoint_read_guard =
-        mv_store.try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin()?;
+        match mv_store.try_acquire_checkpoint_read_guard_for_fresh_mvcc_begin() {
+            Err(LimboError::Busy) => {
+                connection.note_a_begin_kept_waiting(KeptBegin {
+                    let_begin: Arc::clone(let_begin),
+                    times_let_begin_before_trying,
+                });
+                return Err(LimboError::Busy);
+            }
+            guard => guard?,
+        };
     let opened_pager_read_tx = !pager.holds_read_lock();
     if opened_pager_read_tx {
         if let Err(err) = pager.begin_read_tx() {

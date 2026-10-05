@@ -902,6 +902,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             tracing::debug!("Releasing blocking checkpoint lock");
             self.checkpoint_lock.unlock();
             self.lock_states.blocking_checkpoint_lock_held = false;
+            self.mvstore.note_the_blocking_checkpoint_ended();
         }
         if self.owns_checkpoint_in_progress {
             self.mvstore

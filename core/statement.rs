@@ -1149,7 +1149,13 @@ impl Statement {
         if delay.is_zero() {
             return Ok(());
         }
-        match self.pager.wait_for_lock_release(delay) {
+        let released = match self.program.connection.take_the_begin_kept_waiting() {
+            Some(kept) => kept
+                .let_begin
+                .wait_for_release_after(kept.times_let_begin_before_trying, delay),
+            None => self.pager.wait_for_lock_release(delay),
+        };
+        match released {
             Some(true) => busy_state.retry_now(self.pager.io.current_time_monotonic()),
             Some(false) => {}
             None => return self.pager.io.step(),
