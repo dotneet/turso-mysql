@@ -21,8 +21,8 @@ use sqlparser::ast::{
 use sqlparser::tokenizer::Token;
 
 use super::{
-    a_column_of_words, byte_offset_of_location, read_one_statement, unsupported, ParseError,
-    SessionMySqlDialect, SessionSqlMode,
+    a_column_of_words, read_one_statement, unsupported, ParseError, SessionMySqlDialect,
+    SessionSqlMode,
 };
 
 /// The collation a table gives the text columns that do not name one.
@@ -587,7 +587,7 @@ pub fn create_table_with_the_database_collation(
     }) else {
         return Ok(None);
     };
-    let Some(end) = byte_offset_of_location(sql, last.span.end) else {
+    let Some(end) = crate::ByteOffsets::of(sql).at(last.span.end) else {
         return unsupported("CREATE TABLE whose end is unknown");
     };
     Ok(Some(format!(
@@ -718,6 +718,7 @@ fn write_collation_after(
         .iter()
         .filter(|token| !matches!(token.token, Token::Whitespace(_)))
         .collect::<Vec<_>>();
+    let offsets = crate::ByteOffsets::of(sql);
     let mut ends = Vec::with_capacity(names.len());
     for name in names {
         let Some(start) = tokens
@@ -752,7 +753,7 @@ fn write_collation_after(
             }
             last = at;
         }
-        let Some(end) = byte_offset_of_location(sql, tokens[last].span.end) else {
+        let Some(end) = offsets.at(tokens[last].span.end) else {
             return unsupported("column whose place in the statement is unknown");
         };
         ends.push(end);

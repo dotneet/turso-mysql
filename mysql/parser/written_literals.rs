@@ -184,16 +184,21 @@ pub fn values_written_into_columns(
     let read_statement = read_one_statement(sql, mode);
     let statement = read_statement.as_ref().as_ref().map_err(Clone::clone)?;
     let dialect = SessionMySqlDialect::new(mode);
+    let offsets = crate::ByteOffsets::of(sql);
     let Some(placeholders) = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?
         .iter()
         .filter(|token| matches!(&token.token, Token::Placeholder(marker) if marker == "?"))
-        .map(|token| crate::byte_offset_of_location(sql, token.span.start))
+        .map(|token| offsets.at(token.span.start))
         .collect::<Option<Vec<_>>>()
     else {
         return Ok(None);
     };
-    let sql = Written { sql, placeholders };
+    let sql = Written {
+        sql,
+        offsets,
+        placeholders,
+    };
     let mut written = Vec::new();
     let (table, ignores, updates, rows) = match statement {
         Statement::Insert(insert) => {
@@ -287,6 +292,7 @@ pub fn values_written_into_columns(
 /// A statement's text and where each of its `?` stands in it, in order.
 struct Written<'a> {
     sql: &'a str,
+    offsets: crate::ByteOffsets<'a>,
     placeholders: Vec<usize>,
 }
 
@@ -338,8 +344,7 @@ fn written_value(
     let Expr::Value(value) = value else {
         return None;
     };
-    let at = crate::byte_offset_of_location(sql, value.span.start)?
-        ..crate::byte_offset_of_location(sql, value.span.end)?;
+    let at = written.offsets.at(value.span.start)?..written.offsets.at(value.span.end)?;
     let spelled = sql.get(at.clone())?;
     let kind = match &value.value {
         Value::Number(digits, false) if spelled == digits => {

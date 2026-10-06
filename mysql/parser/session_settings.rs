@@ -232,6 +232,7 @@ pub fn parse_optional_session_settings_with_parameters(
 ) -> Option<SessionSettingsWithParameters> {
     let dialect = crate::SessionMySqlDialect::without_executable_comments(mode);
     let tokens = crate::statement_reads::tokens_with_location(&dialect, sql).ok()?;
+    let offsets = crate::ByteOffsets::of(sql);
     let mut pieces = Vec::new();
     let mut copied_up_to = 0;
     let mut after_equals = false;
@@ -241,7 +242,7 @@ pub fn parse_optional_session_settings_with_parameters(
                 if !after_equals {
                     return None;
                 }
-                let at = crate::byte_offset_of_location(sql, token.span.start)?;
+                let at = offsets.at(token.span.start)?;
                 pieces.push(sql[copied_up_to..at].to_owned());
                 copied_up_to = at + 1;
             }

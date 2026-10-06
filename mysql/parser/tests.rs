@@ -10930,3 +10930,35 @@ fn values_written_straight_into_columns_are_read_with_where_they_stand() {
         );
     }
 }
+
+#[test]
+fn values_written_on_lines_with_wide_characters_are_read_where_they_stand() {
+    let mode = SessionSqlMode::default();
+    let sql = "INSERT INTO t (a, b)\nVALUES ('日本語', 2.5),\n  ('é', -1.5e0)";
+    let written = values_written_into_columns(sql, mode).unwrap().unwrap();
+    let read = written
+        .values
+        .iter()
+        .map(|value| &sql[value.at.clone()])
+        .collect::<Vec<_>>();
+    assert_eq!(read, ["'日本語'", "2.5", "'é'", "1.5e0"]);
+}
+
+#[test]
+fn reading_the_values_of_a_long_insert_takes_time_in_step_with_its_length() {
+    let mode = SessionSqlMode::default();
+    let rows = (1..=2000)
+        .map(|n| format!("({n}, {n}, '{}')", "c".repeat(119)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT INTO sb (id, k, c) VALUES {rows}");
+    let started = std::time::Instant::now();
+    let written = values_written_into_columns(&sql, mode).unwrap().unwrap();
+    let spent = started.elapsed();
+    assert_eq!(written.values.len(), 6000);
+    assert!(
+        spent < std::time::Duration::from_secs(8),
+        "reading the values of a {} byte INSERT took {spent:?}",
+        sql.len()
+    );
+}

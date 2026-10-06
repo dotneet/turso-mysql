@@ -7,10 +7,7 @@
 //! columns of the bound values report is MySQL's own for a bound value, which
 //! the caller works out from the cast each stands in.
 
-use super::{
-    byte_offset_of_location, read_one_statement, written_value, ParseError, SessionMySqlDialect,
-    SessionSqlMode,
-};
+use super::{read_one_statement, written_value, ParseError, SessionMySqlDialect, SessionSqlMode};
 use crate::statement_reads;
 use sqlparser::ast::{CastKind, DataType, Expr, SelectItem, SetExpr, Statement, Value};
 use sqlparser::tokenizer::Token;
@@ -145,10 +142,11 @@ pub fn parse_optional_bound_written_values(
     let dialect = SessionMySqlDialect::new(mode);
     let tokens = statement_reads::tokens_with_location(&dialect, sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let offsets = crate::ByteOffsets::of(sql);
     let placeholders = tokens
         .iter()
         .filter(|token| matches!(&token.token, Token::Placeholder(marker) if marker == "?"))
-        .map(|token| byte_offset_of_location(sql, token.span.start))
+        .map(|token| offsets.at(token.span.start))
         .collect::<Option<Vec<_>>>();
     let Some(placeholders) = placeholders else {
         return Ok(None);

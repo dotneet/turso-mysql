@@ -4809,7 +4809,7 @@ fn alter_without_its_column_position(
         length if length >= 2 && names_a_place(length - 2) => length - 2,
         _ => return unsupported("ALTER TABLE column position"),
     };
-    let Some(offset) = byte_offset_of_location(sql, words[at].span.start) else {
+    let Some(offset) = ByteOffsets::of(sql).at(words[at].span.start) else {
         return unsupported("ALTER TABLE column position");
     };
     Ok(sql[..offset].trim_end().to_owned())
@@ -4832,6 +4832,7 @@ fn without_utf8mb4_introducers(
     }
     let tokens = statement_reads::tokens_with_location(&SessionMySqlDialect::new(mode), sql)
         .map_err(|error| ParseError::Sqlparser(error.to_string()))?;
+    let offsets = ByteOffsets::of(sql);
     let mut cuts = Vec::new();
     for (at, token) in tokens.iter().enumerate() {
         let Token::Word(word) = &token.token else {
@@ -4853,8 +4854,8 @@ fn without_utf8mb4_introducers(
             continue;
         }
         let (Some(start), Some(end)) = (
-            byte_offset_of_location(sql, token.span.start),
-            byte_offset_of_location(sql, introduced.span.start),
+            offsets.at(token.span.start),
+            offsets.at(introduced.span.start),
         ) else {
             return unsupported("SELECT character set introducer");
         };
@@ -4873,24 +4874,65 @@ fn without_utf8mb4_introducers(
     Ok(std::borrow::Cow::Owned(kept))
 }
 
-/// The byte offset one line-and-column location stands at.
-fn byte_offset_of_location(sql: &str, location: sqlparser::tokenizer::Location) -> Option<usize> {
-    if location.line == 0 || location.column == 0 {
-        return None;
-    }
-    let (mut line, mut column) = (1, 1);
-    for (offset, character) in sql.char_indices() {
-        if line == location.line && column == location.column {
-            return Some(offset);
+/// The byte offsets of the line-and-column locations the tokenizer gives for
+/// one statement, found without reading the statement from its start for
+/// each one.
+pub(crate) struct ByteOffsets<'a> {
+    sql: &'a str,
+    lines: Vec<Line>,
+}
+
+struct Line {
+    start: usize,
+    end: usize,
+    character_offsets: Option<Vec<usize>>,
+}
+
+impl<'a> ByteOffsets<'a> {
+    pub(crate) fn of(sql: &'a str) -> Self {
+        let mut lines = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = sql[start..]
+                .find('\n')
+                .map_or(sql.len(), |newline| start + newline + 1);
+            let text = &sql[start..end];
+            let character_offsets =
+                (!text.is_ascii()).then(|| text.char_indices().map(|(offset, _)| offset).collect());
+            lines.push(Line {
+                start,
+                end,
+                character_offsets,
+            });
+            if !text.ends_with('\n') {
+                break;
+            }
+            start = end;
         }
-        if character == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
+        Self { sql, lines }
     }
-    (line == location.line && column == location.column).then_some(sql.len())
+
+    /// The byte offset one location stands at: a character of the
+    /// statement, or its end.
+    pub(crate) fn at(&self, location: sqlparser::tokenizer::Location) -> Option<usize> {
+        let line_at = usize::try_from(location.line).ok()?.checked_sub(1)?;
+        let column_at = usize::try_from(location.column).ok()?.checked_sub(1)?;
+        let line = self.lines.get(line_at)?;
+        let characters = match &line.character_offsets {
+            Some(offsets) => offsets.len(),
+            None => line.end - line.start,
+        };
+        if column_at == characters && line_at + 1 == self.lines.len() {
+            return Some(self.sql.len());
+        }
+        if column_at >= characters {
+            return None;
+        }
+        Some(match &line.character_offsets {
+            Some(offsets) => line.start + offsets[column_at],
+            None => line.start + column_at,
+        })
+    }
 }
 
 /// Parses the deliberately narrow MySQL `AUTO_INCREMENT` table shape.
